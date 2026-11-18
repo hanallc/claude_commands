@@ -77,12 +77,17 @@ class DispatchWaitingForRuns:
     reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply
 
 
+class NoMatchingDone(Enum):
+    UNRECORDED = "the transcript has no matching DONE for this stage"
+
+
 @dataclass(frozen=True)
 class DispatchAwaitingReply:
-    """A detached result has no worker reply yet."""
+    """A detached result requires a new matching DONE."""
 
-    last_reply: str = ""
-    runs: tuple[str, ...] = ()
+    last_reply: str
+    runs: tuple[str, ...]
+    matching_done: DispatchComplete | NoMatchingDone
 
 
 DispatchReceipt = (DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown
@@ -113,10 +118,15 @@ class FinalReply:
     """Accept the final message after the exact question."""
 
 
+class DoneTimeUnknown(Enum):
+    UNRECORDED = "the transcript does not record a DONE time"
+
+
 @dataclass(frozen=True)
 class TranscriptReceipt:
     receipt: DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown | DispatchAwaitingReply
     received_runs: frozenset[str]
+    done_at: float | DoneTimeUnknown = DoneTimeUnknown.UNRECORDED
 
 
 @dataclass(frozen=True)
@@ -127,6 +137,11 @@ class DispatchPrompt:
     include_stage_two: bool = False
 
 
+def _prompt_names_completion(text: str, completion_id: str) -> bool:
+    return (f"End your final reply with DONE {completion_id}." in text
+            or f"End your final reply with this line alone: DONE {completion_id}\n" in text)
+
+
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
                        stop_at_done: bool = False) -> TranscriptReceipt:
@@ -134,10 +149,15 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
     submitted = False
     responding = False
     incomplete = False
+    done_at: float | DoneTimeUnknown = DoneTimeUnknown.UNRECORDED
     received: set[str] = set()
     reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply = DispatchSubmitted()
+    completion_id = completion.dispatch_id if isinstance(completion, DoneReply) else ""
+    second_stage = (worker_panes.stage_two_completion_id(line.dispatch_id)
+                    if isinstance(line, DispatchPrompt) and line.include_stage_two else "")
     try:
         for entry in entries:
+            fields = entry if isinstance(entry, dict) else {}
             if isinstance(entry, worker_admission.TornTranscriptRecord):
                 incomplete = True
                 continue
@@ -152,14 +172,15 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                 results = {part.removeprefix("Detached run: ") for part in text.splitlines()
                            if part.startswith("Detached run: ")}
                 received.update(results)
+                if second_stage and completion_id != second_stage and _prompt_names_completion(text, second_stage):
+                    completion_id = second_stage
+                    reply = DispatchSubmitted()
                 if (text in (line.strip(), script_prompt(line).strip()) if isinstance(line, str) else
-                        any(f"End your final reply with DONE {identity}." in text
-                            or f"End your final reply with this line alone: DONE {identity}\n" in text for identity in
-                            ((line.dispatch_id, worker_panes.stage_two_completion_id(line.dispatch_id))
-                             if line.include_stage_two else (line.dispatch_id,)))):
+                        _prompt_names_completion(text, completion_id)):
                     submitted = True
                     responding = True
-                    reply = DispatchSubmitted()
+                    if isinstance(reply, DispatchSubmitted):
+                        reply = DispatchSubmitted()
                 elif isinstance(completion, FinalReply):
                     responding = False
                     reply = DispatchSubmitted()
@@ -167,30 +188,38 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                         "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
                     responding = False
                 elif submitted and responding and results:
-                    reply = DispatchAwaitingReply(
-                        reply.last_reply if isinstance(reply, DispatchAwaitingReply) else reply.reply,
-                        tuple(sorted(results.union(reply.runs if isinstance(reply, DispatchAwaitingReply) else ()))))
+                    if isinstance(reply, DispatchAwaitingReply):
+                        reply = replace(reply, runs=tuple(sorted(results.union(reply.runs))))
+                    else:
+                        matching_done = reply if isinstance(reply, DispatchComplete) else NoMatchingDone.UNRECORDED
+                        reply = DispatchAwaitingReply(reply.reply, tuple(sorted(results)), matching_done)
             elif (responding or isinstance(line, DispatchPrompt)) and entry.startswith("assistant:\n"):
                 text = entry.removeprefix("assistant:\n")
                 if isinstance(completion, FinalReply):
                     complete = bool(text.strip())
                 else:
-                    complete = worker_admission.reply_ends_dispatch(text, completion.dispatch_id)
-                    if isinstance(line, DispatchPrompt) and line.include_stage_two:
-                        complete = complete or worker_admission.reply_ends_dispatch(
-                            text, worker_panes.stage_two_completion_id(completion.dispatch_id))
+                    if second_stage and worker_admission.reply_ends_dispatch(text, second_stage):
+                        completion_id = second_stage
+                    complete = worker_admission.reply_ends_dispatch(text, completion_id)
                 if complete and stop_at_done and isinstance(completion, DoneReply):
                     return TranscriptReceipt(DispatchComplete(text), frozenset(received))
                 if complete and isinstance(line, DispatchPrompt):
                     submitted = True
                     responding = True
-                if complete or isinstance(completion, FinalReply) or not isinstance(reply, DispatchComplete):
-                    reply = DispatchComplete(text) if complete else DispatchSubmitted(text)
+                if complete:
+                    reply = DispatchComplete(text)
+                    at = rollouts.parse_timestamp(fields.get("timestamp"))
+                    done_at = at.timestamp() if at is not None else DoneTimeUnknown.UNRECORDED
+                    incomplete = False
+                elif isinstance(reply, DispatchAwaitingReply):
+                    reply = replace(reply, last_reply=text)
+                elif isinstance(completion, FinalReply) or isinstance(reply, DispatchSubmitted):
+                    reply = DispatchSubmitted(text)
     except (OSError, ValueError) as error:
         return TranscriptReceipt(DispatchEvidenceUnknown(str(error)), frozenset(received))
-    if incomplete and not isinstance(reply, DispatchComplete):
+    if incomplete:
         return TranscriptReceipt(DispatchEvidenceUnknown("worker transcript has incomplete records"), frozenset(received))
-    return TranscriptReceipt(reply if submitted else DispatchNotSubmitted(), frozenset(received))
+    return TranscriptReceipt(reply if submitted else DispatchNotSubmitted(), frozenset(received), done_at)
 
 
 def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: str) -> str:
@@ -246,25 +275,52 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     started = passed.get("started_at", 0)
     since = float(started) if isinstance(started, (int, float)) else 0
     directory = run / worker_lifecycle.DETACHED_RUNS_DIR
-    pending = detached_runs.delivered_worker_results(directory, row.name, since=since) - received
+    deliveries = detached_runs.worker_results(directory, row, since=since)
+    unseen = deliveries.keys() - received
     live = detached_runs.live_runs(directory, row.name)
-    pending.update(record["run_id"] for record in live)
+    pending = unseen.union(record["run_id"] for record in live)
     if isinstance(reply, DispatchAwaitingReply):
         pending.update(reply.runs)
-    if pending and not live and isinstance(reply, DispatchComplete):
-        return replace(reply, anomalies=tuple(
-            f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(pending)))
+    if unseen and isinstance(reply, DispatchComplete):
+        done_at = transcript.done_at
+        after_done = tuple(sorted(run_id for run_id in unseen if not (
+            isinstance(done_at, float) and isinstance(delivered_at := deliveries[run_id], (int, float))
+            and delivered_at < done_at)))
+        if after_done:
+            reply = DispatchAwaitingReply(reply.reply, after_done, reply)
+        elif not live:
+            return replace(reply, anomalies=tuple(
+                f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(unseen)))
     return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
 
 
-def completion_close_evidence(row: staff.StaffRow, line: str, completion_id: str, *,
-                              run: Path) -> worker_panes.CloseAllowed | worker_panes.Kept:
-    receipt = dispatch_receipt(row, line, completion_id, run=run, require_transcript=True)
+def completion_close_evidence(row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+                              run: Path, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
+    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
     if isinstance(receipt, DispatchComplete):
-        return worker_panes.CloseAllowed()
+        if not reply_file:
+            return worker_panes.Kept("the dispatch has no saved reply path")
+        try:
+            saved = Path(reply_file).read_text(encoding="utf-8")
+        except OSError as error:
+            return worker_panes.Kept(f"the dispatch reply is unavailable: {error}")
+        if saved.rstrip() == receipt.reply.rstrip():
+            return worker_panes.CloseAllowed()
+        return worker_panes.Kept("the saved reply differs from the dispatch receipt")
     if isinstance(receipt, DispatchEvidenceUnknown):
         return worker_panes.Kept(f"completion evidence is unavailable: {receipt.reason}")
     return worker_panes.Kept("the transcript has no completed dispatch receipt")
+
+
+def detached_reply_hold(row: staff.StaffRow, line: str, completion_id: str, *,
+                        run: Path) -> worker_panes.CloseAllowed | worker_panes.Kept:
+    """Keep a pane when a detached result requires a reply."""
+    receipt = dispatch_receipt(row, line, completion_id, run=run, require_transcript=True)
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        return worker_panes.Kept(f"completion evidence is unavailable: {receipt.reason}")
+    if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
+        return worker_panes.Kept("a detached run result awaits a matching DONE")
+    return worker_panes.CloseAllowed()
 
 
 def _client() -> herdr.Herdr:
@@ -488,8 +544,17 @@ def _prompt_conflict(conflict: progress_history.ActiveDispatchPromptConflict) ->
     return ExitCode.BUSY
 
 
+def _selection_changed(error: progress_history.DispatchSelectionChanged) -> ExitCode:
+    print(f"{error}; no prompt sent", file=sys.stderr)
+    return ExitCode.BUSY
+
+
 class CloseCompletedPane(Enum):
     CLOSE = "close the completed pane"
+
+
+class KeepCompletedPane(Enum):
+    KEEP = "refresh the saved reply for an explicit retry"
 
 
 @dataclass(frozen=True)
@@ -502,6 +567,7 @@ class CompletionRecovery(Enum):
     RECOVERED = "completion recovery finished"
     PENDING_CLOSE = "completion has pending pane cleanup"
     WAITING_ON_RUNS = "the completion waits for a detached run"
+    WAITING_ON_REPLY = "a detached run result awaits a matching DONE"
 
 
 class CompletionNotices(Protocol):
@@ -509,7 +575,7 @@ class CompletionNotices(Protocol):
 
     def recover_completion(self, row: staff.StaffRow, parent: staff.StaffRow, run: Path,
                            hold: worker_panes.WorkerLockHold, *, record: staff.StaffSnapshot,
-                           pane: CloseCompletedPane | ReuseCompletedPane = CloseCompletedPane.CLOSE,
+                           pane: CloseCompletedPane | ReuseCompletedPane | KeepCompletedPane = CloseCompletedPane.CLOSE,
                            ) -> CompletionRecovery: ...
 
     def repeat_completion_notice(self, worker_name: str, parent: staff.StaffRow, run: Path,
@@ -539,10 +605,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.BUSY
-        matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-            prompt=prompt, launcher_command=launcher_command)
-        if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
-            return _prompt_conflict(matched)
+        selection = progress_history.select_dispatch(session_dir, slot=slot, phase=phase, role=role,
+            prompt=prompt, launcher_command=launcher_command, work=progress_history.DispatchWork(kind, lens, fix_pass),
+            target=name)
+        if isinstance(selection, progress_history.ActiveDispatchPromptConflict):
+            return _prompt_conflict(selection)
+        matched = selection.action
         completion_notices = _completion_notices()
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
@@ -553,12 +621,15 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                 previous = worker_panes.worker_pass(row, recorded.directory, record=record)
                 same_pass = (isinstance(matched, progress_history.MatchedDispatch)
                              and matched.instance_id == previous.get("instance_id"))
-                pane = (CloseCompletedPane.CLOSE if same_pass
-                        else ReuseCompletedPane(completion_actions.held_role))
+                if same_pass:
+                    pane = (KeepCompletedPane.KEEP if completion_notices.completion_notice_delivered(previous)
+                            else CloseCompletedPane.CLOSE)
+                else:
+                    pane = ReuseCompletedPane(completion_actions.held_role)
                 awaiting_hook = (same_pass and previous.get("status") in ("active", "refused")
                                  and isinstance(progress_history.hook_completion(previous), progress_history.NoHookCompletion))
                 try:
-                    if not awaiting_hook and (not same_pass or not completion_notices.completion_notice_delivered(previous)):
+                    if not awaiting_hook:
                         recovered = completion_notices.recover_completion(row, owner, recorded.directory, hold,
                                                                          record=record, pane=pane)
                 except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
@@ -566,20 +637,20 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                     print(f"anomaly: {row.name}: pending completion notice for pass {previous.get('instance_id')}: {error}",
                           file=sys.stderr)
                     return ExitCode.UNCERTAIN
-                if recovered is CompletionRecovery.WAITING_ON_RUNS:
-                    print(f"{row.name}: completion waits for a detached run", file=sys.stderr)
+                if recovered in (CompletionRecovery.WAITING_ON_RUNS, CompletionRecovery.WAITING_ON_REPLY):
+                    print(f"{row.name}: {recovered.value}", file=sys.stderr)
                     return ExitCode.BUSY
                 if recovered is CompletionRecovery.PENDING_CLOSE:
                     return ExitCode.UNCERTAIN
-                if recovered is CompletionRecovery.RECOVERED and recorded.directory == session_dir:
-                    matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-                        prompt=prompt, launcher_command=launcher_command)
         if (isinstance(matched, progress_history.MatchedDispatch) and matched.worker_name == name.value
                 and row is not None):
-            if recovered is CompletionRecovery.RECOVERED and staff.snapshot().by_id(row.id) is None:
-                return DispatchSubmission.SUBMITTED
             passed = worker_panes.worker_pass(row, session_dir)
-            if passed.get("status") == "completed":
+            retired = recovered is CompletionRecovery.RECOVERED and staff.snapshot().by_id(row.id) is None
+            if retired or (passed.get("instance_id") == matched.instance_id and passed.get("status") == "completed"):
+                try:
+                    progress_history.validate_dispatch_selection(session_dir, selection)
+                except progress_history.DispatchSelectionChanged as error:
+                    return _selection_changed(error)
                 if recovered is CompletionRecovery.RECOVERED:
                     return DispatchSubmission.SUBMITTED
                 delivery = progress_history.dispatch_delivery(passed)
@@ -618,9 +689,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         try:
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
-                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row))
+                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
+                selection=selection)
         except progress_history.DispatchPromptRefused as refused:
             return _prompt_conflict(refused.conflict)
+        except progress_history.DispatchSelectionChanged as error:
+            return _selection_changed(error)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
@@ -946,7 +1020,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
     with ExitStack() as cleanup:
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-                prompt=prompt.resolve(), launcher_command=launcher_command)
+                prompt=prompt.resolve(), launcher_command=launcher_command,
+                work=progress_history.DispatchWork(kind, lens, fix_pass))
             if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
                 return _prompt_conflict(matched)
             if isinstance(matched, progress_history.MatchedDispatch):
@@ -1272,7 +1347,8 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if recovery is CompletionRecovery.RECOVERED:
                         changed = True
                         continue
-                    if recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS):
+                    if recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS,
+                                    CompletionRecovery.WAITING_ON_REPLY):
                         outcome = ExitCode.UNCERTAIN
                         continue
                     if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:

@@ -4272,6 +4272,11 @@ with patch.object(fcntl, "flock", admission):
                     _ = prompt.write_text(original_prompt)
             stage_two = self.root / "stage-two-prompt.txt"
             _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
+            stage_id = f"{first}-2"
+            stage_line = f"Stage 2: Read the unchanged prompt file {json.dumps(str(stage_two))}. DONE {stage_id}"
+            progress_history.save_dispatch_delivery(session, first, progress_history.DispatchDelivery(
+                stage_line, stage_id, str(self.root / "review.md"), str(self.root / "review.ready")))
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
             second_stage = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
                 worker_id=member.id,

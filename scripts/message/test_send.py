@@ -6170,7 +6170,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         sender = self.fixture.worker("sender")
         location = self.fixture.world.locations["w1:p1"]
         location.update({"label": "changed", "workspace_id": "w2", "tab_id": "w2:t2"})
-        location["agent_status"] = "working"
+        location["agent_status"] = "idle"
         observed = roster.Roster([roster.RosterEntry(
             "fixture", "claude", "worker", sibling.name, "working",
             roster.Messageable(f"session:{sibling.current_session}"), str(self.fixture.root),
@@ -6243,14 +6243,14 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(self.fixture.world.commands, [])
 
     def test_unavailable_workers_route_the_original_message_and_one_reason_to_the_holder(self) -> None:
-        for state in ("blocked", "stopped", "closed", "unknown", "uncertain"):
+        for state in ("blocked", "working", "stopped", "closed", "unknown", "uncertain"):
             with self.subTest(state=state):
                 row = self.fixture.worker(state)
                 pane = "w1:p" + str(10 + len(self.fixture.world.locations))
                 if state != "closed":
                     self.fixture.world.add(row, pane, live=state != "stopped")
-                if state == "blocked":
-                    self.fixture.world.locations[pane]["agent_status"] = "blocked"
+                if state in ("blocked", "working"):
+                    self.fixture.world.locations[pane]["agent_status"] = state
                 elif state == "unknown":
                     self.fixture.world.unknown[pane] = "process read unavailable"
                 elif state == "uncertain":
