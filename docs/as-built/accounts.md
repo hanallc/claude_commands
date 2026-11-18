@@ -449,7 +449,7 @@ Each sortable header reserves space for its arrow.
 `account_board_sort_orders` prepares both directions and uses `account_details_in_row_order` for each order.
 The browser moves the existing rows and restores the account details for each consecutive account run.
 The total row stays last.
-Sorting preserves the total values and upcoming moves.
+Sorting preserves the total values.
 Browser storage keeps each viewer's choice through refreshes and page visits.
 Failed storage reads use the default sort.
 Failed storage writes keep the current choice for the open page.
@@ -472,7 +472,7 @@ A selected Claude group shows its first target, or `none`, and an arrow button o
 A selected Codex workers line shows its first target, or `auto`, without a button.
 Other lines show a minus icon; the total cell stays empty.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
-One queue read supplies both the first targets and the unchanged upcoming list.
+One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
 Off the role-map host, first targets are unavailable.
 The menu marks the current target and can remove the group's first entry.
 Its `stale_at` is the next local midnight, when its reset text changes.

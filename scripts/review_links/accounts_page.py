@@ -159,7 +159,7 @@ def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: 
 
 
 def board(reading: accounts.StatusReading) -> str:
-    """The accounts board table, then the upcoming moves and the problems."""
+    """Render the accounts table and its problems."""
     table = accounts.status_board(reading)
     claude = {row.label for row in reading.rows if row.tool == "claude"}
     labels = {line["cells"]["label"][0]["text"]: line["cells"]["label"][0]
@@ -199,13 +199,11 @@ def board(reading: accounts.StatusReading) -> str:
                   + (f'<td class="left next-cell">{_next_cell(row, reading, labels)}</td>' if column["key"] == "roles" else "")
                   for column in table["columns"])
         + "</tr>" for row in table["rows"])
-    moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
     return (f'<section class="card" data-move-percent="{percent}" '
             + f'data-sort-orders="{html.escape(json.dumps(accounts.account_board_sort_orders(reading, table)), quote=True)}" '
             + f'data-move-targets="{html.escape(json.dumps(targets), quote=True)}"><div class="scroll"><table>'
             + f"<thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>"
-            + (f'<ul class="moves">{moves}</ul>' if moves else "")
             + (f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "") + "</section>")
 
 
@@ -304,8 +302,8 @@ background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .move-menu button:hover,.move-menu button:focus-visible{background:var(--hover);outline:none}
 .move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
 .move-empty{padding:6px 10px;color:var(--ink-3)}
-.moves,.problems{list-style:none;padding:0;margin:12px 0 0;font-size:.86rem;color:var(--ink-2)}
-.moves li,.problems li{padding:2px 0}.problems li{color:var(--warning)}.problems li::before{content:"• "}
+.problems{list-style:none;padding:0;margin:12px 0 0;font-size:.86rem}
+.problems li{padding:2px 0;color:var(--warning)}.problems li::before{content:"• "}
 </style>"""
 
 POPUP = '''<dialog class="color-picker" aria-labelledby="color-title" data-color-picker>
