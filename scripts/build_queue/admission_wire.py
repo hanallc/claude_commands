@@ -455,7 +455,6 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
                                    transport_for: Callable[[target_config.SshTarget], ExecutionTransport],
                                    read_bytes: Callable[[Path], bytes]) -> str:
     """Hash the configuration for placement or an adapter refusal."""
-    from scripts.build_queue import admission_records
     from scripts.lib import conf
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
@@ -467,7 +466,7 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
             if target.platform != "linux":
                 continue
             try:
-                transport = transport_for(admission_records.ssh_target_settings(target, settings))
+                transport = transport_for(records.ssh_target_settings(target, settings))
             except conf.Unusable:
                 continue
             if isinstance(transport, HanaControlTransport):

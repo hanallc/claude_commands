@@ -23,7 +23,9 @@ from scripts.build_queue.admission_test_support import only_admitted
 from scripts.aws_target import hana_box, hana_execution, hana_placement
 from scripts.aws_target.controller_lock import control_lock
 from scripts.build_targets import target_config
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 def hana_target(fixture: PlacementFixture) -> target_config.SshTarget:
@@ -31,6 +33,22 @@ def hana_target(fixture: PlacementFixture) -> target_config.SshTarget:
     _ = settings.write_text('execution_transport=hana-control\nhost=fixture-hana\n# whole: 1..\n'
         + 'aws_timeout_s=7\n# whole: 1..\nstep_memory_gib=24\n')
     return target_config.SshTarget('fixture-hana', 'linux', settings)
+
+
+def hana_fallback_request(fixture: PlacementFixture, *, include_mac: bool = False) -> wire.PlacementRequest:
+    target = hana_target(fixture)
+    _ = write_config_fixture(fixture.root / 'mac_test.conf', 'host=fixture-mac\n')
+    _ = write_config_fixture(fixture.root / 'build_targets.conf',
+        f'targets={target.name},mac,natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
+        + f'settings.{target.name}={target.settings.name}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n'
+        + 'kind.natedev=local\n')
+    request = placement_request(fixture)
+    mac = request.constraints.candidates[0]
+    remote = replace(mac, destination=replace(mac.destination, provider='ssh', target=target.name, host='fixture-hana'))
+    local = local_candidate(fixture)
+    candidates = (remote, mac, local) if include_mac else (remote, local)
+    return replace(request, prerequisite=placement.TokenNotRequired(),
+        constraints=replace(request.constraints, candidates=candidates))
 
 
 class HanaQueueTests(unittest.TestCase):
@@ -43,41 +61,29 @@ class HanaQueueTests(unittest.TestCase):
 
     def test_stale_image_refusal_keeps_the_same_episode_off_hana(self) -> None:
         with PlacementFixture() as fixture:
-            target = hana_target(fixture)
-            request = placement_request(fixture)
-            remote = replace(request.constraints.candidates[0], destination=replace(
-                request.constraints.candidates[0].destination, provider='ssh', target=target.name, host='fixture-hana'))
-            request = replace(request, prerequisite=placement.TokenNotRequired(),
-                constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
-            with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
-                _ = publish_candidate(fixture, request)
-                assignment = assignment_for(fixture, request)
-                cause = placement.HANA_IMAGE_STALE
-                claim = adopt_assignment(fixture, request, assignment)
-                _ = fixture.connect(wire.ExecutionReport('image-refusal', assignment, claim,
-                    placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
-                    placement.DispatchPathSettled())).replies()
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
-                closed = fixture.server.assignments[key]
-                self.assertEqual(closed.retry, placement.DoNotRetry(cause))
-                assert isinstance(closed.terminal_report, placement.TerminalAttemptReport)
-                self.assertEqual(closed.terminal_report.outcome, placement.HanaCommandAdmissionRefused(cause))
-                _ = publish_candidate(fixture, request)
-                fallback = fixture.connect(request).replies()[-1]
-                assert isinstance(fallback, wire.LocalPlacementGranted)
-                self.assertFalse(fallback.hana_image_stale)
+            request = hana_fallback_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            cause = placement.HANA_IMAGE_STALE
+            claim = adopt_assignment(fixture, request, assignment)
+            _ = fixture.connect(wire.ExecutionReport('image-refusal', assignment, claim,
+                placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
+                placement.DispatchPathSettled())).replies()
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            closed = fixture.server.assignments[key]
+            self.assertEqual(closed.retry, placement.DoNotRetry(cause))
+            assert isinstance(closed.terminal_report, placement.TerminalAttemptReport)
+            self.assertEqual(closed.terminal_report.outcome, placement.HanaCommandAdmissionRefused(cause))
+            _ = publish_candidate(fixture, request)
+            fallback = fixture.connect(request).replies()[-1]
+            assert isinstance(fallback, wire.LocalPlacementGranted)
+            self.assertFalse(fallback.hana_image_stale)
 
     def test_routed_fallback_prints_the_stale_hana_image_once(self) -> None:
         with PlacementFixture() as fixture:
-            target = hana_target(fixture)
-            request = placement_request(fixture)
-            remote = replace(request.constraints.candidates[0], destination=replace(
-                request.constraints.candidates[0].destination, provider='ssh', target=target.name, host='fixture-hana'))
-            request = replace(request, prerequisite=placement.TokenNotRequired(),
-                constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
-            with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
-                _ = publish_candidate(fixture, request, placement.FixedExclusion(placement.HANA_IMAGE_STALE))
-                reply = fixture.connect(request).replies()[-1]
+            request = hana_fallback_request(fixture)
+            _ = publish_candidate(fixture, request, placement.FixedExclusion(placement.HANA_IMAGE_STALE))
+            reply = fixture.connect(request).replies()[-1]
             assert isinstance(reply, wire.LocalPlacementGranted)
             with (mock.patch.dict(os.environ, {'BUILDLOG_HOLD_WAIT_FILE': str(fixture.root / 'seconds')}),
                     redirect_stderr(StringIO()) as output):
@@ -89,67 +95,49 @@ class HanaQueueTests(unittest.TestCase):
 
     def test_failed_boot_reports_terminal_outcome_before_capacity_and_fallback_release(self) -> None:
         with PlacementFixture() as fixture:
-            target = hana_target(fixture)
-            request = placement_request(fixture)
-            remote = replace(request.constraints.candidates[0], destination=replace(
-                request.constraints.candidates[0].destination, provider='ssh', target=target.name, host='fixture-hana'))
-            request = replace(request, prerequisite=placement.TokenNotRequired(),
-                constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
-            with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
-                _ = publish_candidate(fixture, request)
-                assignment = assignment_for(fixture, request)
-                reference = adopt_assignment(fixture, request, assignment)
-                report = wire.ExecutionReport('boot-failed', assignment, reference, placement.ExecutionNotStarted(),
-                    placement.PrelaunchRefused('boot failed'), placement.DispatchPathPending('start recovery'))
-                reply = fixture.connect(report).replies()[-1]
-                self.assertIsInstance(reply, wire.DispatchStatus)
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
-                pending = fixture.server.assignments[key]
-                self.assertIsInstance(pending.state, placement.CurrentAssignment)
-                self.assertIsInstance(pending.terminal_report, placement.TerminalAttemptReport)
-                self.assertIsInstance(pending.retry, placement.RetryAt)
-                deadline = pending.retry
-                self.assertEqual(fixture.server.current_assignments[request.episode], key)
-                self.assertNotIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
-                fixture.clock.advance(10)
-                _ = publish_candidate(fixture, request, placement.TemporaryExclusion('boot failed'))
-                _ = fixture.connect(replace(report, request_id='boot-settled', path=placement.DispatchPathSettled())).replies()
-                settled = fixture.server.assignments[key]
-                self.assertIsInstance(settled.state, placement.ClosedAssignment)
-                self.assertEqual(settled.retry, deadline)
-                self.assertNotEqual(fixture.server.current_assignments.get(request.episode), key)
-                fallback = fixture.connect(request).replies()[-1]
-                self.assertIsInstance(fallback, wire.LocalPlacementGranted)
-                assert isinstance(fallback, wire.LocalPlacementGranted)
-                self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
-                self.assertEqual(fallback.assignment.episode, assignment.episode)
+            request = hana_fallback_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            reference = adopt_assignment(fixture, request, assignment)
+            report = wire.ExecutionReport('boot-failed', assignment, reference, placement.ExecutionNotStarted(),
+                placement.PrelaunchRefused('boot failed'), placement.DispatchPathPending('start recovery'))
+            reply = fixture.connect(report).replies()[-1]
+            self.assertIsInstance(reply, wire.DispatchStatus)
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            pending = fixture.server.assignments[key]
+            self.assertIsInstance(pending.state, placement.CurrentAssignment)
+            self.assertIsInstance(pending.terminal_report, placement.TerminalAttemptReport)
+            self.assertIsInstance(pending.retry, placement.RetryAt)
+            deadline = pending.retry
+            self.assertEqual(fixture.server.current_assignments[request.episode], key)
+            self.assertNotIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
+            fixture.clock.advance(10)
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion('boot failed'))
+            _ = fixture.connect(replace(report, request_id='boot-settled', path=placement.DispatchPathSettled())).replies()
+            settled = fixture.server.assignments[key]
+            self.assertIsInstance(settled.state, placement.ClosedAssignment)
+            self.assertEqual(settled.retry, deadline)
+            self.assertNotEqual(fixture.server.current_assignments.get(request.episode), key)
+            fallback = fixture.connect(request).replies()[-1]
+            self.assertIsInstance(fallback, wire.LocalPlacementGranted)
+            assert isinstance(fallback, wire.LocalPlacementGranted)
+            self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
+            self.assertEqual(fallback.assignment.episode, assignment.episode)
 
     def test_command_admission_refusal_excludes_hana_from_the_same_build(self) -> None:
         for next_target, stale_absence, stale_image in (
                 ('natedev', False, False), ('mac', False, False), ('natedev', True, False), ('natedev', False, True)):
             with (self.subTest(next_target=next_target, stale_absence=stale_absence, stale_image=stale_image),
                   PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker)):
-                target = hana_target(fixture)
-                request = placement_request(fixture)
-                mac = request.constraints.candidates[0]
-                remote = replace(mac, destination=replace(mac.destination,
-                    provider='ssh', target=target.name, host='fixture-hana'))
-                local = local_candidate(fixture)
-                candidates = (remote, mac, local) if next_target == 'mac' else (remote, local)
-                request = replace(request, prerequisite=placement.TokenNotRequired(),
-                    constraints=replace(request.constraints, candidates=candidates))
-                _ = (fixture.root / 'build_targets.conf').write_text(
-                    f'targets={target.name},mac,natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
-                    + f'settings.{target.name}={target.settings.name}\n'
-                    + 'kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n'
-                    + 'kind.natedev=local\nplatform.natedev=linux\n')
-                _ = (fixture.root / 'mac_test.conf').write_text('# range: 0.01..\nprobe_timeout_s=5\n')
+                request = hana_fallback_request(fixture, include_mac=next_target == 'mac')
+                remote = request.constraints.candidates[0]
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
                 claim = adopt_assignment(fixture, request, assignment)
                 self.assertIsInstance(fixture.connect(consume_permission('consume', assignment, claim)).replies()[-1],
                                       wire.FirstAuthorization)
                 if next_target == 'mac':
+                    mac = request.constraints.candidates[1]
                     _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(mac,))))
                 other = replace(placement_request(fixture), prerequisite=placement.TokenNotRequired(),
                     constraints=replace(request.constraints, candidates=(remote,)))
@@ -457,7 +445,9 @@ class HanaQueueTests(unittest.TestCase):
             with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
                     mock.patch.object(hana_placement, 'read_evidence', return_value=answer) as read):
                 self.assertEqual(fixture.server.read_provider_evidence(key), answer)
-                read.assert_called_once_with(key, request)
+                read.assert_called_once_with(key, request,
+                    transport=hana_placement.HanaControlTransport(settings, 'fixture-hana'),
+                    workload=conf.read(settings, load=conf.read_bytes))
 
     def test_worker_evidence_marks_the_snapshot_stale_on_the_loop_thread(self) -> None:
         with PlacementFixture() as fixture:

@@ -958,6 +958,8 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         review = self.events("review_regime.py")
         self.assertEqual(len(review), 1)
+        self.assertIn("--checkpoint", review[0])
+        self.assertEqual(review[0][review[0].index("--checkpoint") + 1], sha)
         for flag, value in (("--ux-findings", "2"), ("--code-findings", "3"),
                             ("--review-minutes", "14"), ("--ux-check-minutes", "4"),
                             ("--ux-repair-minutes", "1")):

@@ -435,11 +435,13 @@ class HanaController:
         return hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
             hana_spend.read_settings(conf.read(self.workload_path)))
 
-    def image_is_current(self, identity: DeploymentIdentity) -> bool:
+    def image_is_current(self, identity: DeploymentIdentity, *,
+                         workload: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> bool:
         """Check the digest setup recorded for this instance."""
-        check = cast(Callable[[Path, str, str, Path], bool],
+        check = cast(Callable[[Path, str, str, Path | conf.ConfigRead], bool],
             import_module('scripts.aws_target.hana_image').deployed_image_is_current)
-        return check(self.directory, identity.deployment, identity.instance, self.workload_path)
+        configuration = self.workload_path if isinstance(workload, conf.UseConfiguredValue) else workload
+        return check(self.directory, identity.deployment, identity.instance, configuration)
 
     def register(self, identity: DeploymentIdentity, *, state: Lifecycle = Lifecycle.IDLE_STOPPED) -> None:
         """Register D2's approved identities without provisioning or enabling placement."""

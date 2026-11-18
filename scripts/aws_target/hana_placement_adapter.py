@@ -273,7 +273,8 @@ def configured_route(configuration: conf.ConfigRead, repository: str, kind: str)
     return settings
 
 
-def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) -> placement.HostEvidence:
+def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                  transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
     """Project existing lifecycle and execution records without provider mutations."""
     from functools import partial
     import time
@@ -281,22 +282,15 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) 
     from scripts.aws_target.hana_execution import (
         HanaSettled, claim_admission_refused, read_claim_execution, settle_unpublished_claim,
     )
-    from scripts.build_queue import admission_records, placement
-    from scripts.build_targets import target_config
-    from scripts.lib import conf, process_start
+    from scripts.build_queue import placement
+    from scripts.lib import process_start
     from scripts.mac_test import claim_state, mac_test
     from scripts.build_hold.owning_session import NoOwningSession, OwningSession
     from scripts.buildlog import store
 
     now = time.time()
-    target = admission_records.effective_target(key.destination.target, key.settings)
-    if not isinstance(target, target_config.SshTarget):
-        return placement.HostEvidenceUnavailable(key, now, 'The SSH target is no longer configured')
-    configuration = conf.read(target.settings, load=conf.read_bytes)
-    transport = target_config.read_execution_transport(target, configuration=configuration)
-    if not isinstance(transport, HanaControlTransport):
-        return placement.HostEvidenceUnavailable(key, now, 'The target does not use Hana control')
-    policy = configured_route(configuration, request.constraints.repository,
+    target_name = key.destination.target
+    policy = configured_route(workload, request.constraints.repository,
         request.constraints.command_kind if isinstance(request.constraints.command_kind, str) else '')
     if isinstance(policy, HanaStepRefused):
         return placement.FreshHostEvidence(key, now, '', placement.FixedExclusion(policy.reason))
@@ -304,7 +298,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) 
     if isinstance(step, HanaStepRefused):
         return placement.FreshHostEvidence(key, now, '', placement.FixedExclusion('command'))
     controller = controller_for(transport, read_only=True)
-    paths = claim_state.state_paths(target.name)
+    paths = claim_state.state_paths(target_name)
     with claim_state.locked(paths.lock):
         snapshot = controller.inspect()
         if isinstance(snapshot, HanaUnprovisioned):
@@ -325,7 +319,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) 
             owner = process_start.process_start(record['pid'])
             if isinstance(owner, (process_start.Gone, process_start.Zombie)) or (
                     isinstance(owner, process_start.Started) and owner.start != record['proc_start']):
-                reference = placement.ProviderClaimReference('ssh', target.name, claim.scope,
+                reference = placement.ProviderClaimReference('ssh', target_name, claim.scope,
                     execution, record['episode'], record['attempt'])
                 release = partial(_release_claims, controller, execution, (claim,), detached_only=True)
                 if claim_admission_refused(controller.directory, reference):
@@ -348,10 +342,10 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) 
     own_claim = False
     for held_claim in held:
         record = held_claim.record
-        reference = placement.ProviderClaimReference('ssh', target.name, held_claim.scope,
+        reference = placement.ProviderClaimReference('ssh', target_name, held_claim.scope,
             record['claim_id'], record['episode'], record['attempt'])
         own_claim = own_claim or record['episode'] == request.episode
-        diagnostic = placement.BusyProviderDiagnostic(target.name, record['what'], record['since'])
+        diagnostic = placement.BusyProviderDiagnostic(target_name, record['what'], record['since'])
         session = OwningSession(record['submitting_session']) if record['submitting_session'] else NoOwningSession()
         if isinstance(session, OwningSession):
             holder = placement.ResourceHolderSession(session.session_id)
@@ -367,7 +361,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) 
     if any(not any(row.record['claim_id'] == claim.execution for row in held) for claim in snapshot.claims):
         return placement.HostEvidenceUnavailable(key, snapshot.observed_at, 'A lifecycle claim has no readable target claim')
     eligibility: placement.HostEligibility = placement.AllowedHost()
-    if not controller.image_is_current(snapshot.deployment):
+    if not controller.image_is_current(snapshot.deployment, workload=workload):
         eligibility = placement.FixedExclusion(placement.HANA_IMAGE_STALE)
     elif not isinstance(block, mac_test.NoMacBlock):
         eligibility = placement.TemporaryExclusion('blocked')
@@ -383,7 +377,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) 
         eligibility = placement.TemporaryExclusion('starting')
     elif snapshot.state == box.Lifecycle.IDLE_STOPPED:
         preview = hana_spend.preview_placement_start(ledger.CostLedger(controller.directory),
-            controller.settings_path, configuration, controller.path)
+            controller.settings_path, workload, controller.path)
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,

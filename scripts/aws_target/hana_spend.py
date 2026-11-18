@@ -39,44 +39,35 @@ class PermitSettings(StartPermitSettings):
 def _positive_amount(value: str) -> Decimal:
     amount = conf.decimal(value)
     if amount <= 0:
-        raise ValueError("expected a positive amount")
+        raise ValueError('expected a positive amount')
     return amount
 
 
-def read_permit_settings(configuration: conf.ConfigRead) -> StartPermitSettings:
-    """Read the limits for a projected or reserved start."""
+def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
+                         ) -> StartPermitSettings:
     instance_type = configuration.text('instance_type')
-    fallback = tuple(item.strip() for item in configuration.text('fallback_instance_types').split(','))
-    if not all(fallback) or len(set((instance_type, *fallback))) != 1 + len(fallback):
-        raise ValueError('fallback_instance_types must contain distinct types and no empty items')
-    return StartPermitSettings(
-        enabled=configuration.value('enabled', conf.on_off),
-        region=configuration.text('region'),
-        instance_type=instance_type,
-        fallback_instance_types=fallback,
-        spot_max_usd_per_hour=configuration.value('spot_max_usd_per_hour', _positive_amount),
-        root_gib=configuration.value('root_gib', conf.positive_whole),
-        data_gib=configuration.value('data_gib', conf.positive_whole),
-        daily_budget_usd=configuration.value('daily_budget_usd', _positive_amount),
-        gp3_usd_per_gib_month=configuration.value('gp3_usd_per_gib_month', _positive_amount),
-        permit_max_seconds=configuration.value('permit_max_seconds', conf.positive_whole),
-    )
+
+    def fallback_types(value: str) -> tuple[str, ...]:
+        types = tuple(item.strip() for item in value.split(','))
+        if not all(types) or len(set((instance_type, *types))) != 1 + len(types):
+            raise ValueError('expected distinct types and no empty items')
+        return types
+
+    return StartPermitSettings(enabled, configuration.text('region'), instance_type,
+        configuration.value('fallback_instance_types', fallback_types),
+        configuration.value('spot_max_usd_per_hour', _positive_amount),
+        configuration.value('root_gib', conf.positive_whole), configuration.value('data_gib', conf.positive_whole),
+        configuration.value('daily_budget_usd', _positive_amount),
+        configuration.value('gp3_usd_per_gib_month', _positive_amount), permit_max_seconds)
 
 
 def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
-    """Check guest settings before execution."""
-    start = read_permit_settings(configuration)
-    grace = configuration.value('guard_grace_seconds', conf.positive_whole)
-    guest: dict[str, object] = {
-        'enabled': start.enabled, 'permit_max_seconds': start.permit_max_seconds,
-        'guard_grace_seconds': grace,
-    }
-    for key in ('watchdog_check_seconds', 'step_cpu_limit', 'step_memory_gib', 'mount_timeout_seconds'):
-        guest[key] = configuration.whole(key)
-    _ = hana_guest.decode_settings(guest)
+    """Read spending and guest safety limits before execution."""
+    safety = hana_guest.read_settings(configuration)
+    start = _read_start_settings(configuration, enabled=safety.enabled, permit_max_seconds=safety.permit_max_seconds)
     return PermitSettings(start.enabled, start.region, start.instance_type, start.fallback_instance_types,
-        start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd, start.gp3_usd_per_gib_month,
-        start.permit_max_seconds, grace)
+        start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd,
+        start.gp3_usd_per_gib_month, start.permit_max_seconds, safety.guard_grace_seconds)
 
 
 @dataclass(frozen=True)
@@ -121,9 +112,13 @@ type _PreviewInputs = dict[Path, _PreviewFileVersion | _PreviewFileAbsent]
 _REPOSITORY_GATE_CONFIG = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
 
 
+def _setup_record_path(book: ledger.CostLedger) -> Path:
+    return book.directory / 'hana' / 'setup.json'
+
+
 def _preview_inputs(book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path) -> _PreviewInputs:
     versions: _PreviewInputs = {}
-    for path in (book.path, book.launch_history_path, account, workload, lifecycle,
+    for path in (book.path, book.launch_history_path, account, workload, lifecycle, _setup_record_path(book),
                  conf.path('cloud_gate'), _REPOSITORY_GATE_CONFIG, *book.bill_paths()):
         try:
             stat = path.stat()
@@ -169,7 +164,9 @@ class _PlacementPreview:
                 return saved.result
             self.cached = _NoPlacementPreview()
             with conf.diagnostics() as configuration_warnings:
-                settings = read_permit_settings(configuration)
+                permit = hana_guest.read_permit_window(configuration)
+                settings = _read_start_settings(configuration, enabled=permit.enabled,
+                                                permit_max_seconds=permit.permit_max_seconds)
                 try:
                     max_age = configuration.whole('preview_max_age_s')
                 except conf.Unusable:
@@ -250,7 +247,7 @@ class HanaSpending[Settings: StartPermitSettings = PermitSettings]:
                                   else row for row in state.hana_compute]
 
     def _provisioned_instance_type(self) -> str:
-        path = self.book.directory / 'hana' / 'setup.json'
+        path = _setup_record_path(self.book)
         try:
             saved = remote.read_record(path)
         except FileNotFoundError:

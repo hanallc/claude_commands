@@ -2829,9 +2829,12 @@ class AdmissionServer:
         if isinstance(target, target_config.SshTarget):
             from scripts.aws_target import hana_placement
 
-            if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
-                return hana_placement.read_evidence(key, request)
-        configuration = conf.read(target.settings if isinstance(target, target_config.SshTarget) else "mac_test")
+            configuration = conf.read(target.settings, load=conf.read_bytes)
+            transport = target_config.read_execution_transport(target, configuration=configuration)
+            if isinstance(transport, hana_placement.HanaControlTransport):
+                return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
+        else:
+            configuration = conf.read("mac_test")
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
