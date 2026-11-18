@@ -1070,12 +1070,41 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         return ActiveDispatchUnavailable(f"worker {worker_id}: {error}")
 
 
+@dataclass(frozen=True)
+class ValidatedDispatchReply:
+    text: str
+
+
+@dataclass(frozen=True)
+class NoValidatedDispatchReply:
+    """The saved file does not supply a valid reply for a retained pass."""
+
+
+def read_completed_reply(run: Path, reply: Path) -> ValidatedDispatchReply | NoValidatedDispatchReply:
+    """Read the saved DONE reply for a pass retained in current state."""
+    from scripts.production import worker_admission
+
+    completion_ids = {
+        delivery.completion_id
+        for item in _pass_slots(_read_state(run)).values()
+        if isinstance(completion := hook_completion(item), HookCompletion)
+        and completion.reply_file and Path(completion.reply_file) == reply
+        and (delivery := dispatch_delivery(item)).completion_id
+    }
+    if not completion_ids:
+        return NoValidatedDispatchReply()
+    try:
+        text = reply.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return NoValidatedDispatchReply()
+    if any(worker_admission.reply_ends_dispatch(text, completion_id) for completion_id in completion_ids):
+        return ValidatedDispatchReply(text)
+    return NoValidatedDispatchReply()
+
+
 def reply_completed(run: Path, reply: Path) -> bool:
-    """Read a saved reply only after the hook completes its recorded pass."""
-    state = _read_state(run)
-    return any(item.get("status") == "completed" and
-               Path(dispatch_delivery(item).reply_file) == reply
-               for item in _pass_slots(state).values())
+    """Check whether the saved reply has a matching DONE."""
+    return isinstance(read_completed_reply(run, reply), ValidatedDispatchReply)
 
 
 class DispatchDetailNotRecorded(Enum):
@@ -2159,16 +2188,13 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
-    """Record completion for the exact dispatch, including DONE after a launcher error."""
+    """Record completion for the exact open dispatch."""
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             state = _read_state(session_dir)
-            opened = _pass_slots(state).get(slot)
+            opened = _open_passes(state).get(slot)
             if opened is not None and opened.get("instance_id") == instance_id:
-                if opened.get("status") == "error" and status == "completed":
-                    # Close the corrected pass through the existing recorder event.
-                    opened["status"] = "active"
                 _ = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
