@@ -11,7 +11,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 from scripts.lib.shell_test_support import shell_functions
@@ -25,7 +25,17 @@ from scripts.direct.verify_hold_wait_test_support import (
 )
 
 
+SIGNAL_EXIT_SECONDS = 5
+_SIGNAL_FIXTURE_PARENT = Path("/dev/shm")
+
+
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
+    @classmethod
+    @override
+    def setUpClass(cls, *, fixture_parent: Path | None = _SIGNAL_FIXTURE_PARENT) -> None:
+        # Keep fixture copies and cleanup writes off the disk shared by other tests.
+        super().setUpClass(fixture_parent=fixture_parent)
+
     def assert_group_stop_clears_memory_wait(self, signum: signal.Signals) -> None:
         process = self.start_memory_queued_lint()
         queued = self.memory_queue_pids()
@@ -36,14 +46,16 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         send_process_group(process.pid, signum)
         # Drain the log pipes while the coordinator records the interrupted call.
         code, output = self.finish(process)
-        survivors = self.wait_for_owned_exit()
+        survivors = self.wait_for_owned_exit(max(0, started + SIGNAL_EXIT_SECONDS - time.monotonic()))
+        elapsed = time.monotonic() - started
         remaining = self.memory_queue_pids()
-        diagnostic = (f"{signum.name}: exit={code}, elapsed={time.monotonic() - started:.3f}s, "
+        diagnostic = (f"{signum.name}: exit={code}, elapsed={elapsed:.3f}s, "
                       + f"queued={sorted(queued)}, remaining={sorted(remaining)}, survivors={sorted(survivors)}\n"
                       + "\n".join(output.splitlines()[-80:]))
         self.assertEqual(survivors, set(), diagnostic)
         self.assertTrue(queued.isdisjoint(remaining), diagnostic)
         self.assertEqual(code, 128 + signum, diagnostic)
+        self.assertLessEqual(elapsed, SIGNAL_EXIT_SECONDS, diagnostic)
         self.assertEqual(self.fixture.last_call()["outcome"], "interrupted", output)
         self.assertEqual(self.fixture.saved_results(), [], output)
 
