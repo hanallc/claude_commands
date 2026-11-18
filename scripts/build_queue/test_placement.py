@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import select
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -24,12 +25,13 @@ from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
+from scripts.build_queue.admission_test_support import AdmissionFixture, InjectedCrash, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
@@ -1680,6 +1682,104 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             self.assertTrue(watched.call_args_list)
             self.assertEqual({call.args[0] for call in watched.call_args_list}, {request.owner.pid})
 
+    def test_grant_reaches_the_socket_before_queue_history_sync(self) -> None:
+        with PlacementFixture() as fixture:
+            request = fixture.request()
+            syncing, finish = threading.Event(), threading.Event()
+            append = gate.append_queue_time
+
+            def blocked_history(directory: Path, event: dict[str, object], now: float) -> None:
+                if event["kind"] == "admitted":
+                    syncing.set()
+                    _ = finish.wait()
+                append(directory, event, now)
+
+            with (mock.patch.object(gate, "append_queue_time", side_effect=blocked_history),
+                  socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer):
+                peer.settimeout(TEST_HANG_GUARD_SECS)
+                peer.connect(str(fixture.socket_path))
+                peer.sendall(wire.encode_request(request).encode())
+                with fixture.serving():
+                    try:
+                        self.assertTrue(syncing.wait(TEST_HANG_GUARD_SECS))
+                        self.assertTrue(select.select([peer], [], [], 0)[0],
+                                        "the grant must reach the socket before the history sync")
+                        with peer.makefile("rb") as stream:
+                            grant = only_admitted([wire.parse_reply(stream.readline())])
+                        saved = service.read_state(fixture.state_dir)
+                        self.assertEqual(saved.reservations[request.episode].reservation_id, grant.reservation)
+                        self.assertEqual(saved.ledger[request.episode].reply, grant)
+                        self.assertEqual(len(saved.lifecycle_outbox), 1)
+                    finally:
+                        finish.set()
+            lifetime, = gate.read_queue_lifetimes(fixture.state_dir)
+            interval, = lifetime.intervals
+            self.assertEqual(interval.reservation_id, grant.reservation)
+
+    def test_release_replays_history_after_a_stop_between_send_and_sync(self) -> None:
+        for appended in (False, True):
+            with self.subTest(appended=appended), PlacementFixture() as fixture:
+                local = fixture.request()
+                grant = only_admitted(fixture.server.handle_request(local))
+                caller = records.run_owner(os.getpid(), str(records.process_start_time(os.getpid())))
+                self.assertNotIn(caller, fixture.server.caller_versions)
+                release = wire.ReleaseRequest("release-before-history", grant.reservation, 137,
+                                              code_version=client.LOADED_ADMISSION_CODE_VERSION)
+                peer = fixture.connect(release)
+                append_end = gate.append_queue_end
+
+                def stop_at_sync(directory: Path, event: gate.EndedEvent) -> None:
+                    if appended:
+                        append_end(directory, event)
+                    raise InjectedCrash("stop at the end sync")
+
+                with (mock.patch.object(service, "write_text_atomic", wraps=write_text_atomic) as writes,
+                      mock.patch.object(gate, "append_queue_end", side_effect=stop_at_sync)):
+                    with self.assertRaisesRegex(InjectedCrash, "stop at the end sync"):
+                        fixture.server.run_once(0)
+
+                self.assertEqual(writes.call_count, 1)
+                self.assertTrue(select.select([peer.socket], [], [], 0)[0])
+                self.assertEqual(wire.parse_reply(peer.socket.recv(65536)), wire.Ok())
+                saved = service.read_state(fixture.state_dir)
+                self.assertNotIn(local.episode, saved.reservations)
+                self.assertEqual(saved.ledger[release.request_id].reply, wire.Ok())
+                self.assertEqual(saved.caller_versions[caller], release.code_version)
+                pending, = saved.lifecycle_outbox
+                assert isinstance(pending, service.PendingRelease)
+                self.assertEqual(pending.event["reservation_id"], grant.reservation)
+                lifetime, = gate.read_queue_lifetimes(fixture.state_dir)
+                self.assertIsInstance(lifetime.end, gate.ReservationEnded if appended else gate.StepStillOpen)
+
+                for _restart in range(2):
+                    fixture.restart()
+                    self.assertNotIn(local.episode, fixture.server.reservations)
+                    self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+                    path = fixture.state_dir / "queue_times.jsonl"
+                    events = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+                    ended, = (event for event in events if event["kind"] == "ended")
+                    self.assertEqual(ended["event_id"], pending.event["event_id"])
+                    self.assertEqual(ended["outcome"], "killed")
+
+    def test_release_saves_the_intent_and_reply_in_two_state_writes(self) -> None:
+        with PlacementFixture() as fixture:
+            local = fixture.request()
+            grant = only_admitted(fixture.server.handle_request(local))
+            release = wire.ReleaseRequest("release-state-writes", grant.reservation, 137)
+            with mock.patch.object(service, "write_text_atomic", wraps=write_text_atomic) as writes:
+                self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+
+            states = [wire.parse_record(cast(str, call.args[1]), service.ServiceState) for call in writes.call_args_list]
+            intent_state, completed_state = states
+            record = intent_state.reservations[local.episode]
+            self.assertEqual(record.ending, service.ReleaseStatus(release.request_id, 137))
+            self.assertIsInstance(record.finalization, dict)
+            self.assertNotIn(release.request_id, intent_state.ledger)
+            self.assertNotIn(local.episode, completed_state.reservations)
+            self.assertEqual(completed_state.ledger[release.request_id].reply, wire.Ok())
+            fixture.restart()
+            self.assertEqual(fixture.server.handle_request(release), [wire.Ok()])
+
     def test_blocked_remote_evidence_keeps_socket_requests_fast_and_retains_the_claim(self) -> None:
         with PlacementFixture() as fixture:
             fixture.configure(waiting_pass_seconds=0.05)
@@ -1700,14 +1800,18 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             before = provider.read_bytes()
             local = fixture.request()
             granted = only_admitted(fixture.server.handle_request(local))
-            entered, finish = threading.Event(), threading.Event()
+            entered, probing, finish = threading.Event(), threading.Event(), threading.Event()
             read_started: list[float] = []
 
             def blocked_probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
                 read_started.append(fixture.clock.now())
+                probing.set()
                 entered.set()
-                if not finish.wait(5):
-                    raise AssertionError("the test did not release the blocked probe")
+                try:
+                    if not finish.wait(5):
+                        raise AssertionError("the test did not release the blocked probe")
+                finally:
+                    probing.clear()
                 return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", placement.AllowedHost())
 
             fixture.server.host_probe = blocked_probe
@@ -1724,9 +1828,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 fixture.allow_next_start()
                 for operation in (wire.ViewRequest(), wire.ReleaseRequest("release-local", granted.reservation, 0),
                                   fixture.request()):
-                    started = time.monotonic()
-                    replies = fixture.connect(operation).replies()
-                    self.assertLess(time.monotonic() - started, 1, type(operation).__name__)
+                    replies, elapsed = fixture.read_terminal_replies(operation)
+                    self.assertLess(elapsed, 1, type(operation).__name__)
+                    self.assertTrue(probing.is_set(), type(operation).__name__)
                     self.assertTrue(replies)
                     self.assertIsInstance(replies[-1], wire.ViewReply if isinstance(operation, wire.ViewRequest)
                                           else wire.Ok if isinstance(operation, wire.ReleaseRequest) else wire.Admitted)

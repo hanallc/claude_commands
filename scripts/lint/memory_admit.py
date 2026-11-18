@@ -18,7 +18,7 @@ import subprocess
 import sys
 import uuid
 from collections import deque
-from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2517,10 +2517,16 @@ class FinalizationIntents(Protocol):
     def clear(self, row: Reservation) -> None: ...
 
 
+def append_queue_end(directory: Path, event: EndedEvent) -> None:
+    """Write an end event with its saved time and identity."""
+    append_queue_time(directory, cast(dict[str, object], codec.snapshot_value(event)), event["ended_at"])
+
+
 def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, now: datetime,
                          status: int | OutcomeNotRecorded = OUTCOME_NOT_RECORDED, *,
-                         intents: FinalizationIntents,
-                         end_kind: StepEnd | TokenReturn) -> HistoryRecorded | NoHistoryRecorded:
+                         intents: FinalizationIntents, end_kind: StepEnd | TokenReturn,
+                         write_queue_end: Callable[[Path, EndedEvent], None] = append_queue_end
+                         ) -> HistoryRecorded | NoHistoryRecorded:
     """Save the peak before removing evidence; the service owns reservation state."""
     maximum = path.with_suffix(".max")
     history_path = path.parent / "anon_peaks.jsonl"
@@ -2599,7 +2605,7 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
             "end_kind": TokenReturn() if intent.get("end_kind") == "token_return" else StepEnd(),
             "peak": PeakSampled(intent["peak"]) if intent["peak"] > 0 else NoPositiveSample(),
         }
-        append_queue_time(path.parent, cast(dict[str, object], codec.snapshot_value(event)), ended_at)
+        write_queue_end(path.parent, event)
     maximum.unlink(missing_ok=True)
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:

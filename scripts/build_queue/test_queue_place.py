@@ -1356,31 +1356,37 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                  mock.patch.object(queue, "in_builds_slice", return_value=False), \
                  mock.patch.object(queue.QueuePlace, "_sample", return_value=None):
                 read_fd, write_fd = os.pipe()
+                program_read, program_write = os.pipe()
                 holder = os.fork()
                 if holder == 0:
                     os.close(fixture.lifeline_write)
                     _ = signal.alarm(TEST_HANG_GUARD_SECS)
-                    os.close(read_fd)
+                    for fd in (read_fd, program_read):
+                        os.close(fd)
                     try:
                         fixture.supply_process(os.getpid(), 0, parent=1)
                         with queue.queue_place("rust-analyzer", fixture.root) as place:
-                            program = ("import os; pid=os.fork(); os._exit(0) if pid else " + LIFELINE_WAIT
-                                       if leader_exits else "import os; " + LIFELINE_WAIT)
-                            child = place.popen([sys.executable, "-c", program],
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            program = ("import os; os._exit(0) if os.fork() else None; " + BLOCKING_CHILD
+                                       if leader_exits else BLOCKING_CHILD)
+                            child = place.popen([sys.executable, "-c", program], stdout=program_write)
                             scope_at_return = place.sidecar.read_text().strip()
+                            status_at_return = child.poll()
+                            os.close(program_write)
                             place.observe(GIB, GIB)
                             _ = os.write(write_fd, json.dumps({"pid": child.pid, "scope": scope_at_return,
-                                                               "status": child.poll()}).encode())
+                                                               "status": status_at_return}).encode())
                             _ = os.read(fixture.lifeline_read, 1)
                     finally:
                         os._exit(99)
-                os.close(write_fd)
+                for fd in (write_fd, program_write):
+                    os.close(fd)
                 program_pid = 0
                 scope_name = ""
                 try:
                     self.assertTrue(select.select([read_fd], [], [], 10)[0], "holder never returned from popen")
-                    message = cast(dict[str, object], json.loads(os.read(read_fd, 4096)))
+                    report = os.read(read_fd, 4096)
+                    self.assertTrue(report, "the holder exited before reporting the scope")
+                    message = cast(dict[str, object], json.loads(report))
                     program_pid = cast(int, message["pid"])
                     scope_name = cast(str, message["scope"])
                     self.assertTrue(scope_name, "popen returned before the scope reached the sidecar")
@@ -1390,6 +1396,9 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(message["status"], 0 if leader_exits else None)
                     _, row = fixture.reservation()
                     self.assertEqual(Path(row["sidecar"]).read_text().strip(), scope_name)
+                    self.assertTrue(select.select([program_read], [], [], TEST_HANG_GUARD_SECS)[0],
+                                    "the program did not announce readiness")
+                    self.assertEqual(os.read(program_read, 64), b"ready\n")
                     os.kill(holder, signal.SIGKILL)
                     _ = os.waitpid(holder, 0)
                     shutil.rmtree(fixture.proc / str(holder))
@@ -1410,7 +1419,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     check()
                     fixture.assert_released(self, reservation_id, outcome="owner_gone")
                 finally:
-                    os.close(read_fd)
+                    for fd in (read_fd, program_read):
+                        os.close(fd)
                     try:
                         os.kill(holder, signal.SIGKILL)
                         _ = os.waitpid(holder, 0)

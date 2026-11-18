@@ -155,9 +155,9 @@ class ObservedAdmissionServer(service.AdmissionServer):
         return paths
 
     @override
-    def persist(self) -> None:
+    def persist(self, *, publish_lifecycle: bool = True) -> None:
         self.check_access("persist")
-        super().persist()
+        super().persist(publish_lifecycle=publish_lifecycle)
 
     @override
     def run_pass(self) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
@@ -627,6 +627,18 @@ class AdmissionFixture(ExitStack):
         peer = SocketPeer(self, request)
         _ = self.callback(peer.close)
         return peer
+
+    def read_terminal_replies(self, request: wire.Request) -> tuple[list[wire.Reply], float]:
+        """Read replies with the request ready on the first service turn."""
+        started = time.monotonic()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(3)
+            peer.connect(str(self.socket_path))
+            peer.sendall(wire.encode_request(request).encode())
+            with self.serving(), peer.makefile("rb") as stream:
+                replies = [wire.parse_reply(line) for line in stream]
+                elapsed = time.monotonic() - started
+                return replies, elapsed
 
     def completed_queue_change(self, request: wire.Request) -> list[wire.Reply]:
         """Run the private loop until this change replies through its socket."""

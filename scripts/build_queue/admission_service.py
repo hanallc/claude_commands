@@ -455,6 +455,14 @@ class PendingLeft:
 
 
 @dataclass(frozen=True)
+class PendingRelease:
+    """A release history event saved with its replay reply."""
+
+    request_id: str
+    event: gate.EndedEvent
+
+
+@dataclass(frozen=True)
 class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
@@ -465,7 +473,7 @@ class ServiceState:
 
     run_places: dict[str, wire.RunPlace] = field(default_factory=dict)
     caller_versions: dict[str, str] = field(default_factory=dict)
-    lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
+    lifecycle_outbox: tuple[PendingAdmission | PendingLeft | PendingRelease, ...] = ()
     placement_requests: dict[str, wire.PlacementRequest] = field(default_factory=dict)
     assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
     current_assignments: dict[str, str] = field(default_factory=dict)
@@ -1192,11 +1200,13 @@ class RegisteredServiceWrites:
 
 
 class StateIntents:
-    """Persist finalization before history; remove the entry only after history."""
+    """Save finalization state and the completed reservation change."""
     def __init__(self, reservations: dict[str, ReservationRecord],
                  advance_generation: Callable[[], None], episode: str,
                  persist: Callable[[], None], fault: Callable[[str], None],
-                 places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites) -> None:
+                 places: dict[str, WaiterPlace], writes: ServiceStateWrites | RegisteredServiceWrites, *,
+                 record_completion: Callable[[ReservationRecord], None] = lambda _record: None,
+                 persist_prepared_intent: bool = True) -> None:
         boundary = writes.writes if isinstance(writes, RegisteredServiceWrites) else writes
         selected = (reservations[episode],) if isinstance(writes, RegisteredServiceWrites) else reservations.values()
         boundary.require(*(Path(record.path) for record in selected),
@@ -1208,6 +1218,8 @@ class StateIntents:
         self.episode: str = episode
         self.persist: Callable[[], None] = persist
         self.fault: Callable[[str], None] = fault
+        self.record_completion: Callable[[ReservationRecord], None] = record_completion
+        self.persist_prepared_intent: bool = persist_prepared_intent
 
     def _require_record(self) -> None:
         record = self.reservations[self.episode]
@@ -1220,8 +1232,9 @@ class StateIntents:
         if record.reservation_id != row.get("reservation_id"):
             raise ValueError("finalization reservation changed")
         self.reservations[self.episode] = replace(record, finalization=intent)
-        self.persist()
-        self.fault("after_finalization_intent")
+        if self.persist_prepared_intent:
+            self.persist()
+            self.fault("after_finalization_intent")
 
     def published(self, row: records.Reservation) -> None:
         self._require_record()
@@ -1237,6 +1250,7 @@ class StateIntents:
         if not isinstance(record.ending, TokenWaiting):
             _ = self.places.pop(_place_key(record.owner, record.queue_waiter["since"]), None)
         del self.reservations[self.episode]
+        self.record_completion(record)
         self.persist()
 
 
@@ -1299,7 +1313,7 @@ class AdmissionServer:
         self.waiters: dict[str, WaitingAdmission] = {}
         self.repository_slot_waiters: dict[str, WaitingRepositorySlot] = {}
         self.reservations: dict[str, ReservationRecord] = {}
-        self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
+        self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft | PendingRelease, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
         self.run_places: dict[str, wire.RunPlace] = {}
         self.build_history_generation: int = 0
@@ -1475,7 +1489,7 @@ class AdmissionServer:
         return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
                        occupied_cargo_folders=occupied)
 
-    def persist(self) -> None:
+    def persist(self, *, publish_lifecycle: bool = True) -> None:
         now = self.clock.now()
         live_callers: dict[str, str] = {}
         for key, version in self.caller_versions.items():
@@ -1537,7 +1551,8 @@ class AdmissionServer:
                 self._persisted = encoded
                 self.fault("after_state_write")
         self.durable_encodings = encodings
-        self._drain_lifecycle()
+        if publish_lifecycle:
+            self._drain_lifecycle()
 
     def _unwatch(self, descriptor: int) -> None:
         _ = self.watchers.pop(descriptor, None)
@@ -2447,8 +2462,7 @@ class AdmissionServer:
 
     def _drain_lifecycle(self) -> None:
         """Publish saved lifecycle facts after each durable state transition."""
-        while self.lifecycle_outbox:
-            pending = self.lifecycle_outbox[0]
+        for pending in self.lifecycle_outbox:
             if isinstance(pending, PendingAdmission):
                 record = self.reservations[pending.episode]
                 admitted_at = datetime.fromisoformat(record.admitted_at).timestamp()
@@ -2461,6 +2475,12 @@ class AdmissionServer:
                 }
                 gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
                 self.fault("after_admitted_append")
+            elif isinstance(pending, PendingRelease):
+                if any(isinstance(connection.request, wire.ReleaseRequest)
+                       and connection.request.request_id == pending.request_id
+                       and connection.sending for connection in self.connections.values()):
+                    continue
+                gate.append_queue_end(self.state_dir, pending.event)
             else:
                 left: gate.LeftEvent = {
                     **gate.lifecycle_event(pending.identity, "left", pending.episode + ":" + pending.reason),
@@ -2468,7 +2488,7 @@ class AdmissionServer:
                 }
                 gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(left)), pending.ended_at)
                 self.fault("after_left_append")
-            self.lifecycle_outbox = self.lifecycle_outbox[1:]
+            self.lifecycle_outbox = tuple(event for event in self.lifecycle_outbox if event is not pending)
 
     def _record_left(self, episode: str, identity: records.QueueLifeIdentity, reason: gate.LeftReason) -> None:
         self.lifecycle_outbox = (*self.lifecycle_outbox, PendingLeft(identity, episode, reason, self.clock.now()))
@@ -2526,16 +2546,37 @@ class AdmissionServer:
             self.ledger[request.episode] = ReplayEntry(reply, LiveGrant())
             self._watch_owner(request.owner)
         self._save_place(waiting)
-        # Durable grant and replay reply precede any terminal reply.
-        self.persist()
+        # The normal send path gives the service a pass to sample runner memory.
+        connection = (NO_CONNECTION if isinstance(request, (wire.LaunchRequest, ServiceEstimatedAdmission))
+                      else waiting.connection)
+        # Save the grant and replay reply before sending the terminal reply.
+        self.persist(publish_lifecycle=isinstance(connection, NoConnection))
         del self.waiters[request.episode]
         self._deliver(waiting, reply)
+        if isinstance(connection, Connection):
+            # Flush what the socket accepts before syncing the queue history.
+            self._connection_event(connection, select.EPOLLOUT)
+            self._drain_lifecycle()
 
-    def _end(self, episode: str, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting) -> None:
+    def _end(self, episode: str, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting, *,
+             connection: Connection | NoConnection = NO_CONNECTION) -> None:
         record = self.reservations[episode]
         record = replace(record, ending=ending)
         self.reservations[episode] = record
-        self.persist()
+        # A new release saves the ending with the finalization intent.
+        saves_ending_with_intent = isinstance(ending, ReleaseStatus) and isinstance(record.finalization, NoFinalizationIntent)
+        if not saves_ending_with_intent:
+            self.persist()
+        try:
+            self._finish_reservation(record, connection)
+        except (OSError, ValueError, TypeError, KeyError):
+            if saves_ending_with_intent and episode in self.reservations:
+                # Keep the ending for retry if finalization could not finish.
+                self.persist()
+            raise
+
+    def _finish_reservation(self, record: ReservationRecord, connection: Connection | NoConnection) -> None:
+        episode, ending = record.episode, record.ending
         row = reservation_row(record)
         if isinstance(ending, (OwnerExited, NotEnding)):
             lifetime = self._lifetime(record)
@@ -2555,10 +2596,29 @@ class AdmissionServer:
             row_waiter = record.queue_waiter.copy()
             row_waiter["token_left_at"] = ending.left_at
             self.places[_place_key(record.owner, row_waiter["since"])] = waiter_place(row_waiter, record.episode)
+        defer_release_event = isinstance(connection, Connection) and isinstance(ending, ReleaseStatus)
+        # Save only the completion when there are no sampler files to protect.
+        persist_prepared_intent = (not defer_release_event or bool(record.sidecar)
+            or path.with_suffix(".max").exists(follow_symlinks=False)
+            or path.with_suffix(".wave").exists(follow_symlinks=False))
+        pending: list[PendingRelease] = []
+
+        def defer_queue_end(_directory: Path, event: gate.EndedEvent) -> None:
+            assert isinstance(ending, ReleaseStatus)
+            pending.append(PendingRelease(ending.request_id, event))
+
+        def record_completion(completed: ReservationRecord) -> None:
+            self._record_reservation_completion(completed)
+            self.lifecycle_outbox += tuple(pending)
+
+        def persist_finalization() -> None:
+            self.persist(publish_lifecycle=not defer_release_event)
+
+        intents = StateIntents(self.reservations, self._advance_build_history, episode, persist_finalization, self.fault,
+                              self.places, RegisteredServiceWrites(self.writes),
+                              record_completion=record_completion, persist_prepared_intent=persist_prepared_intent)
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
-            intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault,
-                                self.places, RegisteredServiceWrites(self.writes)),
-            end_kind=end_kind)
+            intents=intents, end_kind=end_kind, write_queue_end=defer_queue_end if defer_release_event else gate.append_queue_end)
         if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
@@ -2567,15 +2627,15 @@ class AdmissionServer:
                 self.slots[slot.reservation] = slot
         self._prune_watches()
         self._prune_host_evidence()
+
+    def _record_reservation_completion(self, record: ReservationRecord) -> None:
+        """Save the release reply in the state write that removes the reservation."""
+        now = self.clock.now()
         for key, entry in list(self.ledger.items()):
-            if entry.reservation == record.reservation_id:
-                self.ledger[key] = replace(entry, ended_at=self.clock.now())
-        previous = self.ledger.get(episode)
-        if previous is not None:
-            self.ledger[episode] = replace(previous, ended_at=self.clock.now())
-        if isinstance(ending, (ReleaseStatus, TokenWaiting)):
-            self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
-        self.persist()
+            if key == record.episode or entry.reservation == record.reservation_id:
+                self.ledger[key] = replace(entry, ended_at=now)
+        if isinstance(record.ending, (ReleaseStatus, TokenWaiting)):
+            self.ledger[record.ending.request_id] = ReplayEntry(wire.Ok(), now)
 
     def host_evidence_key(self, request: wire.PlacementRequest,
                           destination: placement.PlacementDestination) -> placement.HostEvidenceKey:
@@ -3851,7 +3911,8 @@ done
         if isinstance(request, wire.RepositorySlotRequest):
             return self._repository_slot(request, connection)
         if isinstance(connection, Connection):
-            self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
+            self._record_caller_version(request, connection,
+                persist_change=not isinstance(request, (wire.ConsumePermission, wire.ReleaseRequest)))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             replies = self._handle_placement(request, connection)
@@ -3898,6 +3959,8 @@ done
         key = request.episode if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)) else request.request_id
         replay = self.ledger.get(key)
         if replay is not None:
+            if isinstance(request, wire.ReleaseRequest) and isinstance(connection, Connection) and request.code_version:
+                self.next_pass = min(self.next_pass, self.clock.monotonic())
             return [replay.reply]
         if isinstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest)):
             return self._submit_queue_change(request, connection)
@@ -3927,8 +3990,10 @@ done
         elif isinstance(request, wire.ReleaseRequest):
             episode = next((episode for episode, record in self.reservations.items() if record.reservation_id == request.reservation), None)
             if episode is not None:
-                self._end(episode, ReleaseStatus(key, request.status))
-            self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
+                self._end(episode, ReleaseStatus(key, request.status), connection=connection)
+            else:
+                self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
+                self.persist()
         elif isinstance(request, wire.WidthRequest):
             if request.width <= 0:
                 return self._mutation_reply(key, wire.Refused("test width must be positive"), request.reservation)
@@ -3947,15 +4012,20 @@ done
             for episode, record in list(self.reservations.items()):
                 if record.reservation_id == request.reservation:
                     self._end(episode, TokenWaiting(key, self.clock.now()))
-            self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
+            if key not in self.ledger:
+                self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
+                self.persist()
         if isinstance(request, (wire.ReleaseRequest, wire.TokenWaitRequest)):
-            self.persist()
             if (isinstance(self.last_inputs, records.QueueInputs)
                     and isinstance(self.last_policy, records.AdmissionPolicy)):
                 self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
                 self.pass_stale = True
             self.next_pass = self.clock.monotonic()
-            return [self.ledger[key].reply]
+            reply = self.ledger[key].reply
+            if isinstance(request, wire.ReleaseRequest) and isinstance(connection, Connection):
+                self._send(connection, reply)
+                self._connection_event(connection, select.EPOLLOUT)
+            return [reply]
         if isinstance(connection, Connection):
             # The pass delivers admission replies on the connection, now or at the next pass.
             ran = self._pass_when_open(configuration)
@@ -4427,6 +4497,8 @@ done
         self._finish_priority_roster()
         if self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
             _ = self.run_pass()
+        # Keep completed releases in the outbox through this turn's state write.
+        self._drain_lifecycle()
         if self.clock.monotonic() >= self.next_source_check:
             self._check_sources()
         self._check_outage_alert()

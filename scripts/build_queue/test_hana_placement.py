@@ -6,7 +6,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 import threading
-import time
 from typing import cast, override
 import unittest
 from unittest import mock
@@ -163,11 +162,13 @@ class HanaQueueTests(unittest.TestCase):
                     fixture.proc.kill(wire.Owner(assignment.owner.pid, assignment.owner.start_time))
                     queue_pass = workers.submit(fixture.run_pass)
                     _ = queue_pass.result(timeout=1)
+                    self.assertFalse(lock_owner.done())
                     self.assertTrue(reading.wait(1))
-                    began = time.monotonic()
-                    reply = fixture.connect(wire.ReleaseRequest('release-with-controller-lock', grant.reservation, 0)).replies()
+                    reply, elapsed = fixture.read_terminal_replies(wire.ReleaseRequest(
+                        'release-with-controller-lock', grant.reservation, 0))
                     self.assertEqual(reply, [wire.Ok()])
-                    self.assertLess(time.monotonic() - began, 1)
+                    self.assertLess(elapsed, 1)
+                    self.assertFalse(lock_owner.done())
                     key = placement.attempt_key(assignment.episode, assignment.attempt)
                     self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                 finally:
