@@ -291,7 +291,8 @@ class Roots:
                         yield entry
             return
         for entry in listing(root):
-            if root not in self.temp or self.judged_temp(root, entry):
+            if (root not in self.temp or self.judged_temp(root, entry)
+                    or isinstance(build_folders.classify_removal_target(entry.name), build_folders.UnverifiedSidecarName)):
                 yield entry
 
     def judged_temp(self, root: str, entry: os.DirEntry[str]) -> bool:
@@ -321,10 +322,17 @@ class Roots:
             lint_settings = conf.read("lint")
         if isinstance(scratch_settings, UseConfiguredValue):
             scratch_settings = conf.read("scratch")
-        verify = self.verify_temp_name.fullmatch(entry.name) if root in self.temp else None
+        candidate = build_folders.classify_removal_target(entry.name)
+        name = candidate.folder if isinstance(candidate, build_folders.UnverifiedSidecarName) else entry.name
+        verify = self.verify_temp_name.fullmatch(name) if root in self.temp else None
         if verify is not None and verify.group(1):
             try:
-                made = entry.stat(follow_symlinks=False).st_mtime
+                made = Path(entry.path).with_name(name).stat(follow_symlinks=False).st_mtime
+            except FileNotFoundError:
+                try:
+                    made = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    made = now
             except OSError:
                 made = now
             running = verify_running(int(verify.group(1)), made, now, proc)
@@ -1047,6 +1055,28 @@ class ClosedPhaseEntry(RemovableEntry):
     """The phase is closed under a director or session worktree guard."""
 
 
+@dataclass(frozen=True)
+class SweepLeaseSource:
+    entry: RemovableEntry
+    identity: os.stat_result
+
+
+@dataclass(frozen=True)
+class AbsentLeaseSource:
+    """The source folder is absent and only sidecars remain."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class LeaseSidecarCandidate(RemovableEntry):
+    identity: build_folders.SidecarIdentity
+
+
+@dataclass(frozen=True, kw_only=True)
+class LeaseGroupEntry(RemovableEntry):
+    source: SweepLeaseSource | AbsentLeaseSource | KeptEntry
+    members: tuple[LeaseSidecarCandidate, ...]
+
+
 def judge_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -1148,6 +1178,23 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
             if root in inner and size < SESSION_ENTRY_MIN_BYTES:
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
+            candidate = build_folders.classify_removal_target(entry.name)
+            if isinstance(candidate, build_folders.UnverifiedSidecarName):
+                try:
+                    status = os.stat(entry.path, follow_symlinks=False)
+                except OSError:
+                    yield KeptEntry(entry.path, UNREADABLE)
+                    continue
+                if (not stat.S_ISREG(status.st_mode) or status.st_nlink != 1
+                        or max(status.st_mtime, status.st_ctime) > newest):
+                    yield KeptEntry(entry.path, "unverified lease sidecar")
+                    continue
+                yield LeaseSidecarCandidate(entry.path, root, newest, size,
+                                            identity=build_folders.removal_sidecar_identity(status))
+                continue
+            if isinstance(candidate, build_folders.RemovalSidecarConflict):
+                yield KeptEntry(entry.path, "conflicting lease sidecar name")
+                continue
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
             # The coordinator checks pending sources against the intent under the removal lock.
             git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
@@ -1168,6 +1215,124 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     return remove_idle_entry(entry, result, dry_run, scratch_settings=scratch_settings)
 
 
+def group_lease_entries(entries: Iterator[KeptEntry | RemovableEntry]) -> Iterator[KeptEntry | RemovableEntry]:
+    """Join sidecar decisions to the decision for their folder."""
+    pending: dict[str, KeptEntry | RemovableEntry] = {}
+    groups: dict[Path, list[KeptEntry | RemovableEntry]] = {}
+    for entry in entries:
+        path = Path(entry.path)
+        candidate = build_folders.classify_removal_target(path.name)
+        if isinstance(candidate, build_folders.UnverifiedSidecarName):
+            groups.setdefault(path.with_name(candidate.folder), []).append(entry)
+        else:
+            pending[entry.path] = entry
+    for folder, members in groups.items():
+        owner = pending.get(str(folder))
+        kept = next((member for member in members if isinstance(member, KeptEntry)), None)
+        if kept is not None:
+            for member in members:
+                yield member if isinstance(member, KeptEntry) else KeptEntry(member.path, kept.reason)
+            if isinstance(owner, RemovableEntry):
+                pending[owner.path] = KeptEntry(owner.path, kept.reason)
+            continue
+        eligible = tuple(member for member in members if isinstance(member, LeaseSidecarCandidate))
+        if not eligible:
+            continue
+        source: SweepLeaseSource | AbsentLeaseSource | KeptEntry
+        try:
+            status = folder.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            source = AbsentLeaseSource()
+        except OSError:
+            source = KeptEntry(str(folder), UNREADABLE)
+        else:
+            if isinstance(owner, RemovableEntry) and stat.S_ISDIR(status.st_mode):
+                source = SweepLeaseSource(owner, status)
+            else:
+                source = owner if isinstance(owner, KeptEntry) else KeptEntry(str(folder), "the folder stays")
+        if isinstance(owner, RemovableEntry):
+            _ = pending.pop(owner.path)
+        first = eligible[0]
+        yield LeaseGroupEntry(str(folder), first.root, first.newest, first.size,
+                              source=source, members=eligible)
+    yield from pending.values()
+
+
+def keep_lease_group(entry: LeaseGroupEntry, result: Sweep, reason: str) -> None:
+    """Report the retained files in the lease group."""
+    for sidecar in entry.members:
+        result.keep(sidecar.path, reason)
+    if isinstance(entry.source, SweepLeaseSource):
+        result.keep(entry.path, reason)
+
+
+def removed_entry(entry: RemovableEntry, result: Sweep) -> None:
+    result.freed += entry.size
+    result.deleted.append(DeletedEntry(path=entry.path, gib=round(entry.size / GIB, 3),
+                                       last_change=when(entry.newest), reason=entry.reason))
+
+
+def remove_lease_group(entry: LeaseGroupEntry, result: Sweep, dry_run: bool,
+                       scratch_settings: conf.ConfigRead) -> bool:
+    """Use the same folder and sidecar checks for both sweep modes."""
+    path = Path(entry.path)
+    source = entry.source
+    lock_name, record_name = path.name + ".lock", path.name + ".lease.json"
+    expected = {Path(member.path).name: member.identity for member in entry.members}
+    if lock_name not in expected or record_name not in expected:
+        keep_lease_group(entry, result, "unverified lease sidecars")
+        return False
+    with scratch.removal_lock(path, dry_run=dry_run or isinstance(source, KeptEntry), wait=False) as idle:
+        if not idle:
+            keep_lease_group(entry, result, "busy: .claude-busy is locked")
+            return False
+        if isinstance(source, KeptEntry):
+            keep_lease_group(entry, result, source.reason)
+            return False
+        lease = build_folders.current_folder_removal_lease(path)
+        if isinstance(lease, build_folders.UnreservedRemovalFolder):
+            keep_lease_group(entry, result, "unverified lease sidecars")
+            return False
+        lease.guard().check_path()
+        names = build_folders.sidecar_names_for(path.name, os.listdir(lease.directory))
+        if set(names) != expected.keys():
+            keep_lease_group(entry, result, "the lease group changed")
+            return False
+        sidecars = lease.group_sidecars(names, build_folders.SidecarOwnership.DISCOVERY)
+        if isinstance(sidecars, build_folders.RemovalSidecarConflict):
+            keep_lease_group(entry, result, "unverified lease sidecars")
+            return False
+        if dict(sidecars.entries) != expected:
+            keep_lease_group(entry, result, "the lease group changed")
+            return False
+        if isinstance(source, SweepLeaseSource):
+            current = os.stat(path.name, dir_fd=lease.directory, follow_symlinks=False)
+            if not os.path.samestat(current, source.identity):
+                keep_lease_group(entry, result, "the folder changed")
+                return False
+            outcome = scratch.remove_folder(path, scratch.ExpiredFolderRemoval(time.time()),
+                                            source_deletion=scratch.SourceDeletion.SWEEP, dry_run=dry_run,
+                                            scratch_settings=scratch_settings)
+            if isinstance(outcome, scratch.KeptFolder):
+                keep_lease_group(entry, result, outcome.reason)
+                return False
+        elif os.path.lexists(path) or not isinstance(
+                scratch.pending_removal(path, scratch_settings=scratch_settings), copy_record.NotRegistered):
+            keep_lease_group(entry, result, "the folder or its removal intent stays")
+            return False
+        if not dry_run:
+            lease.guard().check_path()
+            cleanup = lease.unlink_sidecars(sidecars)
+            if isinstance(cleanup, build_folders.CleanupIncomplete):
+                result.failed.append(FailedEntry(path=entry.path, error=cleanup.reason))
+                return False
+    for sidecar in entry.members:
+        removed_entry(sidecar, result)
+    if isinstance(source, SweepLeaseSource):
+        removed_entry(source.entry, result)
+    return True
+
+
 def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> bool:
@@ -1177,6 +1342,10 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
             result.keep(entry.path, "its phases parent changed")
             return False
     try:
+        if isinstance(entry, LeaseGroupEntry):
+            if isinstance(scratch_settings, UseConfiguredValue):
+                scratch_settings = conf.read("scratch")
+            return remove_lease_group(entry, result, dry_run, scratch_settings)
         outcome = scratch.remove_folder(Path(entry.path), scratch.ExpiredFolderRemoval(time.time()),
                                         source_deletion=scratch.SourceDeletion.SWEEP, dry_run=dry_run,
                                         scratch_settings=scratch_settings)
@@ -1192,12 +1361,10 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
         result.keep(entry.path, str(error))
         return False
     except OSError as error:
-        if os.path.lexists(entry.path):
+        if isinstance(entry, LeaseGroupEntry) or os.path.lexists(entry.path):
             result.failed.append(FailedEntry(path=entry.path, error=str(error)))
         return False
-    result.freed += entry.size
-    result.deleted.append(DeletedEntry(path=entry.path, gib=round(entry.size / GIB, 3),
-                                       last_change=when(entry.newest), reason=entry.reason))
+    removed_entry(entry, result)
     return True
 
 
@@ -1341,33 +1508,55 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs() if isinstance(pane_use, ReadPaneRuns) else pane_use
-    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
-        if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
-            yield entry
-            continue
-        name = Path(entry.path).name
-        if any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, roots.verify_temp_name)):
-            yield entry
-            continue
-        ended = cleanup_end_reason(entry, roots, now, proc, pane_use=pane_use, scratch_settings=scratch_settings)
-        if isinstance(ended, CleanupEndReason):
-            yield replace(entry, reason=ended.value)
-            continue
-        if ended is CleanupKeepReason.UNREADABLE:
-            yield KeptEntry(entry.path, ended.value)
-            continue
-        change = last_change(entry.path, Limit(now - wide_idle_seconds(lint_settings=lint_settings), NO_END_RECENT))
-        if isinstance(change, str):
-            yield KeptEntry(entry.path, change)
-            continue
-        newest, size = change
-        yield replace(entry, newest=newest, size=size, reason=NO_END_OLD)
+    def aged_entries() -> Iterator[KeptEntry | RemovableEntry]:
+        for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+            if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
+                yield entry
+                continue
+            name = Path(entry.path).name
+            if any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, roots.verify_temp_name)):
+                yield entry
+                continue
+            ended = cleanup_end_reason(entry, roots, now, proc, pane_use=pane_use, scratch_settings=scratch_settings)
+            if isinstance(ended, CleanupEndReason):
+                yield replace(entry, reason=ended.value)
+                continue
+            if ended is CleanupKeepReason.UNREADABLE:
+                yield KeptEntry(entry.path, ended.value)
+                continue
+            change = last_change(entry.path, Limit(now - wide_idle_seconds(lint_settings=lint_settings), NO_END_RECENT))
+            if isinstance(change, str):
+                yield KeptEntry(entry.path, change)
+                continue
+            newest, size = change
+            yield replace(entry, newest=newest, size=size, reason=NO_END_OLD)
+    yield from group_lease_entries(aged_entries())
 
 
 class PlanEntry(TypedDict):
     path: str
     action: str
     reason: str
+
+
+class PlanRemovalEntry(PlanEntry):
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class PlannedRemovalIdentity:
+    device: int
+    inode: int
+
+    @classmethod
+    def from_stat(cls, status: os.stat_result) -> PlannedRemovalIdentity:
+        return cls(status.st_dev, status.st_ino)
+
+
+@dataclass(frozen=True)
+class LegacyPlanRemoval:
+    """The plan lists the path without an identity."""
 
 
 @dataclass(frozen=True)
@@ -1386,16 +1575,29 @@ def cleanup_entries(roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs()
     result: list[KeptEntry | CleanupRemoval] = []
-    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+    candidates = judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use)
+    for entry in group_lease_entries(candidates):
         if isinstance(entry, KeptEntry):
             result.append(entry)
             continue
-        reason = cleanup_end_reason(entry, roots, now, proc, pane_use=pane_use, scratch_settings=scratch_settings)
+        if isinstance(entry, LeaseGroupEntry) and isinstance(entry.source, KeptEntry):
+            result.extend(KeptEntry(member.path, entry.source.reason) for member in entry.members)
+            continue
+        source = entry.source.entry if isinstance(entry, LeaseGroupEntry) and isinstance(entry.source, SweepLeaseSource) else entry
+        reason = cleanup_end_reason(source, roots, now, proc, pane_use=pane_use, scratch_settings=scratch_settings)
         if isinstance(reason, CleanupKeepReason):
             result.append(KeptEntry(entry.path, reason.value))
         else:
             result.append(CleanupRemoval(entry, reason))
     return result
+
+
+def lease_plan_identities(entry: LeaseGroupEntry) -> dict[str, PlannedRemovalIdentity]:
+    """List the entries selected for removal under one lease."""
+    identities = {member.path: PlannedRemovalIdentity(*member.identity[:2]) for member in entry.members}
+    if isinstance(entry.source, SweepLeaseSource):
+        identities[entry.path] = PlannedRemovalIdentity.from_stat(entry.source.identity)
+    return identities
 
 
 def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
@@ -1408,16 +1610,28 @@ def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     rows: list[PlanEntry] = []
     for entry in cleanup_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings):
-        action = "keep" if isinstance(entry, KeptEntry) else "remove"
-        reason = entry.reason if isinstance(entry, KeptEntry) else entry.reason.value
-        path = entry.path if isinstance(entry, KeptEntry) else entry.entry.path
-        rows.append(PlanEntry(path=path, action=action, reason=reason))
-    # An existing plan is never replaced; apply uses exactly the reviewed remove list.
+        if isinstance(entry, KeptEntry):
+            rows.append(PlanEntry(path=entry.path, action="keep", reason=entry.reason))
+            continue
+        candidate = entry.entry
+        if isinstance(candidate, LeaseGroupEntry):
+            identities = lease_plan_identities(candidate)
+        else:
+            try:
+                identity = PlannedRemovalIdentity.from_stat(os.lstat(candidate.path))
+            except OSError:
+                rows.append(PlanEntry(path=candidate.path, action="keep", reason=UNREADABLE))
+                continue
+            identities = {candidate.path: identity}
+        rows.extend(PlanRemovalEntry(path=path, action="remove", reason=entry.reason.value,
+                                    device=identity.device, inode=identity.inode)
+                    for path, identity in identities.items())
+    # Keep an existing plan so apply uses the reviewed entries.
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=plan.parent,
                                      prefix=f".{plan.name}.", delete=False) as handle:
         temporary = Path(handle.name)
         try:
-            _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
+            _ = handle.write(json.dumps({"version": 2, "entries": rows}, indent=2) + "\n")
             handle.close()
             os.link(temporary, plan)
         except FileExistsError:
@@ -1430,11 +1644,11 @@ def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
     return 0
 
 
-def planned_removals(plan: Path) -> list[str]:
+def read_planned_removals(plan: Path) -> dict[str, PlannedRemovalIdentity | LegacyPlanRemoval]:
     record = record_object(plan)
-    if not isinstance(record, dict) or record.get("version") != 1 or not isinstance(record.get("entries"), list):
+    if not isinstance(record, dict) or record.get("version") not in (1, 2) or not isinstance(record.get("entries"), list):
         raise ValueError("invalid cleanup plan")
-    paths: list[str] = []
+    removals: dict[str, PlannedRemovalIdentity | LegacyPlanRemoval] = {}
     for value in cast(list[object], record["entries"]):
         if not isinstance(value, dict):
             raise ValueError("invalid cleanup plan entry")
@@ -1442,9 +1656,53 @@ def planned_removals(plan: Path) -> list[str]:
         path, action = row.get("path"), row.get("action")
         if not isinstance(path, str) or not os.path.isabs(path) or action not in ("keep", "remove"):
             raise ValueError("invalid cleanup plan path or action")
-        if action == "remove" and path not in paths:
-            paths.append(path)
-    return paths
+        if action == "remove":
+            if record["version"] == 1:
+                removals[path] = LegacyPlanRemoval()
+                continue
+            device, inode = row.get("device"), row.get("inode")
+            if type(device) is not int or type(inode) is not int:
+                raise ValueError("invalid cleanup plan identity")
+            identity = PlannedRemovalIdentity(device, inode)
+            if removals.setdefault(path, identity) != identity:
+                raise ValueError("conflicting cleanup plan identities")
+    return removals
+
+
+def planned_removals(plan: Path) -> list[str]:
+    return list(read_planned_removals(plan))
+
+
+def remove_planned_entry(entry: RemovableEntry, removals: dict[str, PlannedRemovalIdentity | LegacyPlanRemoval],
+                         result: Sweep, scratch_settings: conf.ConfigRead) -> None:
+    """Check the reviewed entries while the removal lock is held."""
+    path = Path(entry.path)
+    try:
+        with scratch.removal_lock(path, wait=False) as idle:
+            if not idle:
+                result.keep(entry.path, "busy: .claude-busy is locked")
+                return
+            if isinstance(entry, LeaseGroupEntry):
+                if any(removals.get(member) != identity for member, identity in lease_plan_identities(entry).items()):
+                    keep_lease_group(entry, result, "the planned lease group changed")
+                    return
+            elif isinstance(removals[entry.path], LegacyPlanRemoval):
+                result.keep(entry.path, "the plan has no entry identity")
+                return
+            elif PlannedRemovalIdentity.from_stat(path.lstat()) != removals[entry.path]:
+                result.keep(entry.path, "the planned entry changed")
+                return
+            pending = scratch.pending_removal(path, scratch_settings=scratch_settings)
+            if isinstance(pending, copy_record.Registered) and "removal_lease_sidecars" in pending.fields:
+                result.keep(entry.path, "a separate removal intent owns the lease sidecars")
+                return
+            _ = remove_entry(entry, result, False, scratch_settings=scratch_settings)
+    except FileNotFoundError:
+        result.keep(entry.path, "the planned entry changed")
+    except scratch.ScratchError as error:
+        result.keep(entry.path, str(error))
+    except OSError as error:
+        result.failed.append(FailedEntry(path=entry.path, error=str(error)))
 
 
 def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
@@ -1456,20 +1714,32 @@ def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     result = Sweep()
-    removals = planned_removals(plan)
-    # Judge every candidate again once, after the plan; the timed sweep has the same window.
-    current = {entry.path if isinstance(entry, KeptEntry) else entry.entry.path: entry
-               for entry in cleanup_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings)}
+    removals = read_planned_removals(plan)
+    current: dict[str, KeptEntry | CleanupRemoval] = {}
+    for entry in cleanup_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings):
+        if isinstance(entry, KeptEntry):
+            current[entry.path] = entry
+        else:
+            current[entry.entry.path] = entry
+            if isinstance(entry.entry, LeaseGroupEntry):
+                current.update((member.path, entry) for member in entry.entry.members)
+    processed: set[str] = set()
     for path in removals:
         entry = current.get(path)
         if not isinstance(entry, CleanupRemoval):
             reason = entry.reason if isinstance(entry, KeptEntry) else "no current sweep candidate"
-            print(f"keep {path}: {reason}")
             result.keep(path, reason)
             continue
-        if remove_entry(entry.entry, result, False, scratch_settings=scratch_settings):
-            removed = result.deleted[-1]
-            print(f"tmp sweep: deleted {path} ({removed['gib']:.1f} GiB), last changed {removed['last_change']}")
+        candidate = entry.entry
+        if candidate.path in processed:
+            continue
+        processed.add(candidate.path)
+        remove_planned_entry(candidate, removals, result, scratch_settings)
+    for reason, paths in result.kept.items():
+        for path in paths:
+            print(f"keep {path}: {reason}")
+    for removed in result.deleted:
+        print(f"tmp sweep: deleted {removed['path']} ({removed['gib']:.1f} GiB), last changed {removed['last_change']}")
     for failure in result.failed:
         print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
     append_log(state_dir() / LOG_NAME, record(result, False, now, lint_settings=lint_settings), now,

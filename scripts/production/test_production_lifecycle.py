@@ -10,6 +10,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 import contextlib
 from dataclasses import replace
+import fcntl
 import io
 import json
 import os
@@ -67,6 +68,35 @@ class ProductionReaderTests(StaffTestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    def test_wrap_keeps_a_leased_worktree_and_removes_its_files_after_release(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
+        row = unit_membership("example", "alpha")
+        lease = self.alpha.with_suffix(".lease.json")
+        lock = self.alpha.with_suffix(".lock")
+        contents = json.dumps({"purpose": self.alpha.name, "pid": os.getpid()}) + "\n"
+        self.write(lease, contents)
+
+        with lock.open("wb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            identity = os.fstat(holder.fileno())
+            result = self.run_lifecycle("wrap", "--no-ci")
+
+            self.assert_step(result, "held")
+            self.assertIn(f"{self.alpha}: the build folder lock is held", result.stdout)
+            self.assertTrue(self.alpha.is_dir())
+            self.assertEqual(staff.by_id(row.id), row)
+            self.assertEqual(lease.read_text(), contents)
+            self.assertTrue(os.path.samestat(lock.stat(), identity))
+
+        result = self.run_lifecycle("wrap", "--no-ci")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.alpha.exists())
+        self.assertFalse(lease.exists())
+        self.assertFalse(lock.exists())
+
     def test_wrap_preserves_each_units_standing_responsibilities_in_its_parked_file(self) -> None:
         runner, alpha, beta, child = self.staff_tree()
         original = unit_config.read(self.alpha)

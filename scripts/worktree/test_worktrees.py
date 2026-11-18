@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ from scripts.lint.memory_test_support import config_environment
 CHECKOUT = Path(__file__).resolve().parents[2]
 MAKE_WORKTREE = CHECKOUT / "scripts/worktree/make_worktree.sh"
 WORKTREES = CHECKOUT / "scripts/worktree/worktrees.py"
+DELETION = CHECKOUT / "scripts/worktree_delete"
 
 END_LANDED = """
 import json
@@ -165,6 +167,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
     def make(self, tree: Path, branch: str) -> None:
         result = self.command(self.repository, ["bash", str(MAKE_WORKTREE), str(tree), branch])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def delete(self, tree: Path, branch: str, *, confirmed: bool = False) -> subprocess.CompletedProcess[str]:
+        if confirmed:
+            result = self.command(self.repository, ["bash", str(DELETION / "record_confirmation.sh"),
+                                                    str(tree), branch])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return self.command(self.repository, ["bash", str(DELETION / "perform_deletion.sh"), str(tree), branch])
 
     def commit(self, tree: Path, path: str, contents: str) -> str:
         destination = tree / path
@@ -350,6 +359,77 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertFalse(scratch.cargo_removal_mark(tree).exists())
         self.assert_ended(tree, "seeded")
 
+    def test_delete_removes_sidecars_after_normal_forced_and_residual_removal(self) -> None:
+        for branch in ("normal-remove", "force-remove", "residual-remove"):
+            with self.subTest(branch=branch):
+                confirmed = branch != "normal-remove"
+                tree = self.trees / branch
+                self.make(tree, branch)
+                _ = self.commit(tree, "topic.txt", "landed work\n")
+                self.land(branch)
+                if confirmed:
+                    _ = (tree / "dirty.txt").write_text("confirmed removal\n")
+                sidecars = (tree.with_suffix(".lease.json"), tree.with_suffix(".lock"))
+                for sidecar in sidecars:
+                    self.assertTrue(sidecar.is_file())
+
+                with patch.dict(self.environment):
+                    if branch == "residual-remove":
+                        self.refuse_worktree_remove()
+                    result = self.delete(tree, branch, confirmed=confirmed)
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if confirmed:
+                    self.assertIn("Standard removal failed, forcing", result.stdout)
+                if branch == "residual-remove":
+                    self.assertIn("Removing residual directory", result.stdout)
+                self.assertFalse(tree.exists())
+                for sidecar in sidecars:
+                    self.assertFalse(sidecar.exists())
+
+    def test_delete_keeps_sidecars_if_the_lock_is_held_or_git_fails(self) -> None:
+        branch = "retain"
+        tree = self.trees / branch
+        self.make(tree, branch)
+        _ = self.commit(tree, "topic.txt", "landed work\n")
+        self.publish(tree, branch)
+        self.land(branch)
+        lease, lock = tree.with_suffix(".lease.json"), tree.with_suffix(".lock")
+        contents = lease.read_bytes()
+        inode = lock.stat()
+        before = self.repository_state()
+
+        with lock.open("rb+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.delete(tree, branch)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("the build folder lock is held", result.stdout)
+            self.assertEqual(self.repository_state(), before)
+            self.assertEqual(lease.read_bytes(), contents)
+            self.assertTrue(os.path.samestat(lock.stat(), inode))
+
+        with patch.dict(self.environment):
+            self.refuse_worktree_remove()
+            result = self.delete(tree, branch)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("the tree changed after the cleanup check", result.stdout)
+        self.assertTrue(tree.is_dir())
+        self.assertEqual(lease.read_bytes(), contents)
+        self.assertTrue(os.path.samestat(lock.stat(), inode))
+
+    def refuse_worktree_remove(self) -> None:
+        bin_dir = self.root / "no-worktree-remove"
+        bin_dir.mkdir()
+        git = bin_dir / "git"
+        real_git = shutil.which("git")
+        assert real_git is not None
+        _ = git.write_text("#!/bin/sh\n"
+                           + 'if [ "$1" = worktree ] && [ "$2" = remove ]; then exit 1; fi\n'
+                           + f'exec {shlex.quote(real_git)} "$@"\n')
+        git.chmod(0o755)
+        self.environment["PATH"] = str(bin_dir) + os.pathsep + self.environment["PATH"]
+
     def test_failed_worktree_removal_keeps_the_mapping_until_retry(self) -> None:
         tree, build, _limits = self.landed_cargo_worktree()
         build.mkdir()
@@ -361,12 +441,16 @@ class WorktreeLifecycleTests(unittest.TestCase):
                            + '    echo "fixture refuses worktree remove" >&2\n    exit 1\nfi\n'
                            + f'exec {shlex.quote(real_git)} "$@"\n')
         git.chmod(0o755)
+        lease, lock = tree.with_suffix(".lease.json"), tree.with_suffix(".lock")
+        contents, inode = lease.read_bytes(), lock.stat()
         self.assertEqual(self.finish_landed(), [{"kind": "Kept", "path": str(tree),
                                                 "detail": "stderr: fixture refuses worktree remove"}])
         marker = scratch.cargo_removal_mark(tree)
         self.assertIn(str(build), marker.read_text())
         self.assertFalse(build.exists())
         self.assertTrue(tree.is_dir())
+        self.assertEqual(lease.read_bytes(), contents)
+        self.assertTrue(os.path.samestat(lock.stat(), inode))
         git.unlink()
         self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
         self.assertFalse(marker.exists())

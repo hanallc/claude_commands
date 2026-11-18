@@ -1,6 +1,7 @@
 """Test the agents CLI with private staff rows and temporary repositories."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import math
@@ -753,11 +754,12 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         _ = (folder / f"{DIRECTOR}.jsonl").write_text(json.dumps({"entrypoint": "cli", "cwd": str(cwd)}) + "\n")
 
     def fake_run(self, argv: list[str], cwd: Path | None = None, *,
-                 settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
+                 settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                 lock_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
         """Git runs for real; every other command is recorded and answered."""
         del settings
         if argv[0] == "git":
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False, pass_fds=lock_fds)
         call = [Path(argv[1]).name, *argv[2:]] if argv[0] == sys.executable else argv
         self.calls.append(call)
         if call[:2] == ["build_hold.py", "release"]:
@@ -840,8 +842,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         return result
 
                     def run_step(argv: list[str], cwd: Path | None = None, *,
-                                 settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
-                        result = run(argv, cwd=cwd, settings=settings)
+                                 settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                                 lock_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
+                        result = run(argv, cwd=cwd, settings=settings, lock_fds=lock_fds)
                         if result.returncode == 0 and ((step == "worktree" and argv[3:5] == ["worktree", "remove"])
                                 or (step == "local branch" and argv[3:5] == ["branch", "-D"])
                                 or (step == "origin branch" and argv[3:6] == ["push", "-q", "origin"])):
@@ -1308,6 +1311,31 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertFalse(self.worktree.exists())
         self.assertEqual((transcript.read_bytes(), transcript.stat().st_mtime_ns), before)
 
+
+    def test_retirement_keeps_a_leased_worktree_and_removes_its_files_after_release(self) -> None:
+        lease = self.worktree.with_suffix(".lease.json")
+        lock = self.worktree.with_suffix(".lock")
+        contents = json.dumps({"purpose": self.worktree.name, "pid": os.getpid()}) + "\n"
+        _ = lease.write_text(contents)
+
+        with lock.open("wb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            identity = os.fstat(holder.fileno())
+            code, output = self.retire()
+
+            self.assertEqual(code, 1, output)
+            self.assertIn(f"{self.worktree}: the build folder lock is held", output)
+            self.assertTrue(self.worktree.is_dir())
+            self.assertEqual(self.unit_worktree(), staff.PresentWorktree(remote.local_machine(), self.worktree))
+            self.assertEqual(lease.read_text(), contents)
+            self.assertTrue(os.path.samestat(lock.stat(), identity))
+
+        code, output = self.retire()
+
+        self.assertEqual(code, 0, output)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse(lease.exists())
+        self.assertFalse(lock.exists())
 
     def test_retirement_removes_a_worktree_with_only_the_project_started_line(self) -> None:
         plan = self.worktree / "work.txt"

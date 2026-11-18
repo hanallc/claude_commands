@@ -1,9 +1,10 @@
 """Repository slots retain work, reuse files, and enforce their locks."""
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime, timedelta
+import fcntl
 import io
 import json
 import os
@@ -624,6 +625,62 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
         self.assertTrue(any(self.git(self.source, "show", ref + ":change.txt") == "old slot work" for ref in refs))
 
+    def test_sweep_removes_the_lease_and_lock_only_after_the_holder_releases_the_slot(self) -> None:
+        with self.take() as slot:
+            path = slot.path
+        self.age_lease(path)
+        record = build_slots.lease_path(path)
+        lock = path.with_name(path.name + ".lock")
+        record_contents = record.read_bytes()
+        with lock.open("r+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                build_slots.sweep_slots()
+            self.assertIn(f"keeps {path.name}: the build folder lock is held", errors.getvalue())
+            self.assertTrue(path.is_dir())
+            self.assertEqual(record.read_bytes(), record_contents)
+            self.assertTrue(os.path.samestat(lock.stat(), os.fstat(holder.fileno())))
+
+        build_slots.sweep_slots()
+        self.assertFalse(path.exists())
+        self.assertFalse(record.exists())
+        self.assertFalse(lock.exists())
+
+    def test_sweep_removes_a_slot_with_only_one_lease_file(self) -> None:
+        self.slot_root.mkdir(parents=True, exist_ok=True)
+        for number, suffix in enumerate((".lock", ".lease.json"), 1):
+            with self.subTest(suffix=suffix):
+                path = self.slot_root / f"widget-slot{number}"
+                sidecar = path.with_name(path.name + suffix)
+                sidecar.touch()
+                cargo = self.cargo_root / path.name
+                cargo.mkdir(parents=True, exist_ok=True)
+                build_slots.sweep_slots()
+                self.assertFalse(sidecar.exists())
+                self.assertFalse(cargo.exists())
+                self.assertFalse(path.with_name(path.name + ".lock").exists())
+
+    def test_mac_waiter_retries_acquisition_when_the_lock_has_disappeared(self) -> None:
+        with self.take() as slot:
+            path = slot.path
+        lock = path.with_name(path.name + ".lock")
+        lock.unlink()
+
+        @contextmanager
+        def full() -> Generator[build_slots.Slot]:
+            if not lock.exists():
+                raise build_slots.SlotsFull(slot.repository, self.machine, slot.number)
+            yield slot
+
+        with (mock.patch.object(build_slots, "_try_slot", side_effect=[full(), nullcontext(slot)]) as try_slot,
+              mock.patch.object(sys, "platform", "darwin"),
+              redirect_stderr(io.StringIO()),
+              build_slots.take_slot(self.source, "HEAD", showrunner="builds", unit="queue",
+                                    work="proof", purpose="test") as acquired):
+            self.assertEqual(acquired, slot)
+            self.assertEqual(try_slot.call_count, 2)
+
     def test_sweep_deletes_oversized_cargo_once_and_keeps_the_source(self) -> None:
         with self.take() as slot:
             path, cargo = slot.path, slot.cargo_dir
@@ -687,6 +744,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         build_slots.sweep_slots()
         self.assertFalse(cargo.exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+        self.assertFalse(path.with_name(path.name + ".lock").exists())
         with self.take() as replacement:
             self.assertEqual(replacement.path, path)
             self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)

@@ -10,6 +10,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
@@ -19,7 +20,7 @@ import stat
 import subprocess
 import sys
 
-from scripts.lib import git_files, git_rescue, scratch
+from scripts.lib import build_folders, git_files, git_rescue, scratch
 from scripts.lint.sweep import gib
 
 
@@ -73,13 +74,18 @@ class KeptNotFolder:
 
 
 @dataclass(frozen=True)
+class KeptSidecarConflict:
+    path: Path
+
+
+@dataclass(frozen=True)
 class KeptFilesystemError:
     path: Path
     error: str
 
 
 FolderDecision = (Deleted | WouldDelete | KeptBusy | KeptRepository | KeptRescueFailure
-                  | KeptRootEntry | KeptNotFolder | KeptFilesystemError)
+                  | KeptRootEntry | KeptNotFolder | KeptSidecarConflict | KeptFilesystemError)
 
 
 def decision_line(decision: FolderDecision) -> str:
@@ -101,6 +107,8 @@ def decision_line(decision: FolderDecision) -> str:
         reason = "root entry"
     elif isinstance(decision, KeptNotFolder):
         reason = "not a folder"
+    elif isinstance(decision, KeptSidecarConflict):
+        reason = "unverified lease sidecars"
     else:
         reason = decision.error
     return f"kept {decision.path}: {reason}"
@@ -138,13 +146,13 @@ def inspect_folder(path: Path) -> GateContents:
     return GateContents(size, tuple(sorted(worktrees)), tuple(sorted(repositories)))
 
 
-def prune_sources(sources: set[Path]) -> tuple[PruneFailure, ...]:
+def prune_sources(sources: set[Path], lock_fds: tuple[int, ...]) -> tuple[PruneFailure, ...]:
     """Prune each source once after its linked worktrees are deleted."""
     failures: list[PruneFailure] = []
     for source in sorted(sources):
         try:
             result = subprocess.run(["git", "-C", str(source), "worktree", "prune", "--expire", "now"],
-                                    capture_output=True, text=True, errors="replace", check=False)
+                                    capture_output=True, text=True, errors="replace", check=False, pass_fds=lock_fds)
         except OSError as error:
             failures.append(PruneFailure(source, str(error)))
             continue
@@ -153,38 +161,183 @@ def prune_sources(sources: set[Path]) -> tuple[PruneFailure, ...]:
     return tuple(failures)
 
 
-def remove_gate(path: Path, dry_run: bool) -> FolderDecision:
-    try:
-        with scratch.judgment_lock(path) if dry_run else scratch.removal_lock(path) as idle:
-            if not idle:
-                return KeptBusy(path)
-            contents = inspect_folder(path)
-            if contents.repositories:
+@dataclass(frozen=True)
+class ExistingGate:
+    identity: os.stat_result
+
+
+@dataclass(frozen=True)
+class AbsentGate:
+    """The gate folder is absent and only the selected sidecars remain."""
+
+
+@dataclass(frozen=True)
+class GateGroup:
+    path: Path
+    source: ExistingGate | AbsentGate
+    sidecar_names: tuple[str, ...]
+
+    def check_source(self, directory: int) -> None:
+        """Check that the source still matches the discovered folder."""
+        if not os.path.samestat(self.path.parent.stat(follow_symlinks=False), os.fstat(directory)):
+            raise build_folders.RemovalPathChanged(f"{self.path}: the gate parent changed")
+        try:
+            current = os.stat(self.path.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            if isinstance(self.source, AbsentGate):
+                return
+        else:
+            if isinstance(self.source, ExistingGate) and os.path.samestat(current, self.source.identity):
+                return
+        raise build_folders.RemovalPathChanged(f"{self.path}: the gate folder changed")
+
+
+def gate_groups(repository: Path, directory: int, entries: set[str]) -> list[GateGroup | KeptNotFolder]:
+    """Group sidecar names with an existing folder or a gate named in a lease."""
+    sidecars: dict[str, list[str]] = {}
+    sources: dict[str, ExistingGate | AbsentGate] = {}
+    for name in sorted(entries):
+        candidate = build_folders.classify_removal_target(name)
+        if isinstance(candidate, build_folders.UnverifiedSidecarName):
+            sidecars.setdefault(candidate.folder, []).append(name)
+        elif isinstance(candidate, build_folders.FolderTarget):
+            status = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(status.st_mode):
+                sources[name] = ExistingGate(status)
+    for folder, names in sidecars.items():
+        if folder not in entries:
+            group = build_folders.classify_removal_target(folder, directory=directory, sidecars=names,
+                                                          ownership=build_folders.SidecarOwnership.GATE)
+            if isinstance(group, build_folders.VerifiedSidecarGroup):
+                sources[folder] = AbsentGate()
+
+    groups = [GateGroup(repository / name, source, tuple(sidecars.get(name, ())))
+              for name, source in sources.items()]
+    assigned = set(sources)
+    assigned.update(name for group in groups for name in group.sidecar_names)
+    return sorted([*groups, *(KeptNotFolder(repository / name) for name in entries - assigned)],
+                  key=lambda item: item.path)
+
+
+@dataclass(frozen=True)
+class PreparedGateRemoval:
+    group: GateGroup
+    sidecars: build_folders.VerifiedRemovalSidecars
+    lease: build_folders.HeldFolderRemovalLease | build_folders.UnreservedRemovalFolder
+    contents: GateContents
+    sources: set[Path]
+    lock_fds: tuple[int, ...]
+
+    def consumed_names(self) -> tuple[str, ...]:
+        """List the repository entries that removal consumes."""
+        sidecars = tuple(name for name, _ in self.sidecars.entries)
+        if isinstance(self.group.source, ExistingGate):
+            return (self.group.path.name, *sidecars)
+        return sidecars
+
+
+def prepare_gate(group: GateGroup, directory: int, locks: ExitStack, *,
+                 dry_run: bool) -> PreparedGateRemoval | KeptSidecarConflict | KeptBusy | KeptRescueFailure | KeptRepository:
+    """Verify the same removal group for the dry run and real run."""
+    path = group.path
+    verified = build_folders.classify_removal_target(path.name, directory=directory, sidecars=group.sidecar_names,
+                                                     ownership=build_folders.SidecarOwnership.GATE)
+    if isinstance(verified, build_folders.VerifiedSidecarGroup):
+        sidecars = verified.sidecars
+    elif isinstance(verified, build_folders.FolderTarget):
+        sidecars = build_folders.VerifiedRemovalSidecars()
+    else:
+        return KeptSidecarConflict(path)
+    lease = locks.enter_context(build_folders.folder_removal_lease(
+        path, children=True, wait=not scratch.removal_mark(path).is_file(), dir_fd=directory))
+    if isinstance(lease, build_folders.RefusedRemovalLease):
+        return KeptBusy(path)
+
+    names = build_folders.sidecar_names_for(path.name, os.listdir(directory))
+    if names != group.sidecar_names:
+        return KeptSidecarConflict(path)
+    if isinstance(lease, build_folders.HeldFolderRemovalLease):
+        lease.guard().check_path()
+        lease.check_sidecars(sidecars)
+        current = build_folders.classify_removal_target(path.name, directory=directory, sidecars=names,
+                                                        ownership=build_folders.SidecarOwnership.GATE)
+        if current != verified:
+            return KeptSidecarConflict(path)
+    elif sidecars.entries:
+        return KeptSidecarConflict(path)
+    group.check_source(directory)
+    busy_fds: list[int] = []
+    contents = GateContents(0, (), ())
+    sources: set[Path] = set()
+    if isinstance(group.source, ExistingGate):
+        if not locks.enter_context(scratch.busy_locks(path, create=not dry_run, inherited_fds=busy_fds)):
+            return KeptBusy(path)
+        contents = inspect_folder(path)
+        if contents.repositories:
+            return KeptRepository(path)
+        for worktree in contents.worktrees:
+            try:
+                source = git_files.at(worktree).common_dir
+            except git_files.GitFilesError as error:
+                return KeptRescueFailure(path, str(error))
+            if source.is_relative_to(path.resolve()):
                 return KeptRepository(path)
-            sources: set[Path] = set()
-            for worktree in contents.worktrees:
-                try:
-                    source = git_files.at(worktree).common_dir
-                except git_files.GitFilesError as error:
-                    return KeptRescueFailure(path, str(error))
-                if source.is_relative_to(path.resolve()):
-                    return KeptRepository(path)
-                sources.add(source)
+            sources.add(source)
+    return PreparedGateRemoval(group, sidecars, lease, contents, sources,
+                               (*build_folders.held_build_folder_descriptors(), *busy_fds))
+
+
+def remove_prepared_gate(prepared: PreparedGateRemoval, directory: int) -> FolderDecision:
+    """Remove the prepared source and its verified sidecars."""
+    group, lease, contents = prepared.group, prepared.lease, prepared.contents
+    path = group.path
+    failures: list[PruneFailure] = []
+
+    def cleanup(guard: build_folders.FolderRemovalGuard | None) -> build_folders.CleanupCompleted:
+        for worktree in contents.worktrees:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            if guard is not None:
+                guard.check_path()
+            _ = git_rescue.rescue(worktree, f"{worktree.name}-{stamp}", generated=[worktree / "target"],
+                                  pass_fds=prepared.lock_fds)
+        if isinstance(lease, build_folders.HeldFolderRemovalLease):
+            lease.guard().check_path()
+            lease.check_sidecars(prepared.sidecars)
+        group.check_source(directory)
+        if isinstance(group.source, ExistingGate):
+            shutil.rmtree(path.name, dir_fd=directory)
+        failures.extend(prune_sources(prepared.sources, prepared.lock_fds))
+        return build_folders.CleanupCompleted()
+
+    if isinstance(lease, build_folders.HeldFolderRemovalLease):
+        result = lease.remove(cleanup, sidecars=prepared.sidecars)
+        if isinstance(result, build_folders.RefusedRemovalLease):
+            return KeptBusy(path)
+        if isinstance(result, build_folders.IncompleteBuildFolderRemoval):
+            return KeptFilesystemError(path, result.reason)
+    else:
+        _ = cleanup(None)
+    if failures:
+        return DeletedWithPruneFailures(path, contents.size, tuple(failures))
+    return Deleted(path, contents.size)
+
+
+def decide_gate(group: GateGroup, directory: int, remaining: set[str], dry_run: bool) -> FolderDecision:
+    try:
+        with ExitStack() as locks:
+            prepared = prepare_gate(group, directory, locks, dry_run=dry_run)
+            if not isinstance(prepared, PreparedGateRemoval):
+                return prepared
             if dry_run:
-                return WouldDelete(path, contents.size)
-            for worktree in contents.worktrees:
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                try:
-                    _ = git_rescue.rescue(worktree, f"{worktree.name}-{stamp}", generated=[worktree / "target"])
-                except git_rescue.RescueError as error:
-                    return KeptRescueFailure(path, str(error))
-            shutil.rmtree(path)
-            failures = prune_sources(sources)
-            if failures:
-                return DeletedWithPruneFailures(path, contents.size, failures)
-            return Deleted(path, contents.size)
+                remaining.difference_update(prepared.consumed_names())
+                return WouldDelete(group.path, prepared.contents.size)
+            return remove_prepared_gate(prepared, directory)
+    except git_rescue.RescueError as error:
+        return KeptRescueFailure(group.path, str(error))
+    except build_folders.RemovalPathChanged:
+        return KeptBusy(group.path)
     except OSError as error:
-        return KeptFilesystemError(path, str(error))
+        return KeptFilesystemError(group.path, str(error))
 
 
 def delete_gate_folders(root: Path, dry_run: bool = False) -> tuple[FolderDecision, ...]:
@@ -200,23 +353,23 @@ def delete_gate_folders(root: Path, dry_run: bool = False) -> tuple[FolderDecisi
         if repository.name.startswith(".") or repository.is_symlink() or not repository.is_dir():
             report(KeptRootEntry(repository))
             continue
-        children = sorted(repository.iterdir())
-        for gate in children:
-            if gate.is_symlink() or not gate.is_dir():
-                report(KeptNotFolder(gate))
-            else:
-                report(remove_gate(gate, dry_run))
-        if dry_run:
-            removable = {decision.path for decision in decisions if isinstance(decision, WouldDelete)}
-            if all(child in removable for child in children):
-                report(WouldDelete(repository, 0))
-        else:
+        try:
+            directory = os.open(repository, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
-                if not any(repository.iterdir()):
+                entries = set(os.listdir(directory))
+                for group in gate_groups(repository, directory, entries):
+                    report(decide_gate(group, directory, entries, dry_run) if isinstance(group, GateGroup) else group)
+                if dry_run:
+                    if not entries:
+                        report(WouldDelete(repository, 0))
+                elif not os.listdir(directory) and os.path.samestat(
+                        repository.stat(follow_symlinks=False), os.fstat(directory)):
                     repository.rmdir()
                     report(Deleted(repository, 0))
-            except OSError as error:
-                report(KeptFilesystemError(repository, str(error)))
+            finally:
+                os.close(directory)
+        except OSError as error:
+            report(KeptFilesystemError(repository, str(error)))
     return tuple(decisions)
 
 

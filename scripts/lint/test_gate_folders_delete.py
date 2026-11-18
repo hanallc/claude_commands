@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import fcntl
 import io
+import json
 import os
-from contextlib import ExitStack, redirect_stdout
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,10 +14,11 @@ import sys
 import tempfile
 from typing import override
 import unittest
+from unittest import mock
 
 from scripts.lint import gate_folders_delete
 from scripts.lint.sweep import gib
-from scripts.lib import scratch
+from scripts.lib import build_folders, scratch
 
 
 class GateFoldersDeleteTests(unittest.TestCase):
@@ -104,6 +107,205 @@ class GateFoldersDeleteTests(unittest.TestCase):
             self.assertEqual((gate / "target" / "output").read_bytes(), b"generated output")
         _ = self.delete()
         self.assertEqual(list(self.gates.iterdir()), [])
+
+    def test_a_held_gate_lease_keeps_its_files_until_the_gate_is_deleted(self) -> None:
+        gate = self.gate()
+        record = gate.with_name(gate.name + ".lease.json")
+        lock = gate.with_name(gate.name + ".lock")
+        contents = json.dumps({"kind": "standing", "folder": gate.name})
+        _ = record.write_text(contents)
+        with lock.open("w") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lines = self.delete()
+            self.assertIn(f"kept {gate}: busy", lines)
+            self.assertEqual(self.delete(dry_run=True), lines)
+            self.assertTrue(gate.is_dir())
+            self.assertEqual(record.read_text(), contents)
+            self.assertTrue(os.path.samestat(lock.stat(), os.fstat(holder.fileno())))
+
+        lines = self.delete()
+        self.assertTrue(any(line.startswith(f"deleted {gate}: ") for line in lines))
+        self.assertFalse(gate.exists())
+        self.assertFalse(record.exists())
+        self.assertFalse(lock.exists())
+        self.assertFalse(gate.parent.exists())
+
+    def test_cleanup_finishes_orphaned_gate_lease_files_after_the_holder_releases(self) -> None:
+        spec = build_folders.BuildFolderSpec(kind="standing", parent=self.gates, repository="repository",
+                                             owner="fixture", suffix_length=0)
+        with build_folders.leased_build_folder(spec) as gate:
+            shutil.rmtree(gate)
+        record = gate.with_suffix(".lease.json")
+        lock = gate.with_suffix(".lock")
+        with lock.open("r+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lines = self.delete()
+            self.assertIn(f"kept {gate}: busy", lines)
+            self.assertEqual(self.delete(dry_run=True), lines)
+            self.assertTrue(record.is_file())
+            self.assertTrue(os.path.samestat(lock.stat(), os.fstat(holder.fileno())))
+        orphan = gate.with_name("lease-only")
+        orphan_record = orphan.with_suffix(".lease.json")
+        _ = orphan_record.write_text(json.dumps({"kind": "standing", "folder": orphan.name}))
+        self.assertIn(f"kept {orphan_record}: not a folder", self.delete(dry_run=True))
+        orphan.with_suffix(".lock").touch()
+        preview = self.delete(dry_run=True)
+        lines = self.delete()
+        self.assertEqual(lines, [line.replace("would delete ", "deleted ", 1) for line in preview])
+        self.assertIn(f"deleted {gate}: {gib(0)}", lines)
+        self.assertIn(f"deleted {orphan}: {gib(0)}", lines)
+        self.assertFalse(gate.parent.exists())
+
+    def test_dry_run_accounts_for_managed_gate_sidecars_and_the_empty_repository(self) -> None:
+        gate = self.gate()
+        record = gate.with_suffix(".lease.json")
+        lock = gate.with_suffix(".lock")
+        contents = json.dumps({"kind": "gate", "folder": gate.name})
+        _ = record.write_text(contents)
+        lock.touch()
+        partial = record.with_name(record.name + ".0123456789abcdef.tmp")
+        _ = partial.write_text("incomplete lease write")
+        preview = self.delete(dry_run=True)
+        self.assertIn(f"would delete {gate.parent}: {gib(0)}", preview)
+        self.assertTrue(gate.is_dir())
+        self.assertEqual(record.read_text(), contents)
+        self.assertTrue(lock.is_file())
+        self.assertTrue(partial.is_file())
+        self.assertEqual(self.delete(), [line.replace("would delete ", "deleted ", 1) for line in preview])
+        self.assertFalse(gate.parent.exists())
+
+    def test_gate_retries_when_an_unfinished_record_cannot_be_removed(self) -> None:
+        gate = self.gate()
+        record = gate.with_suffix(".lease.json")
+        _ = record.write_text(json.dumps({"kind": "gate", "folder": gate.name}))
+        lock = gate.with_suffix(".lock")
+        lock.touch()
+        unfinished = record.with_name(record.name + ".0123456789abcdef.tmp")
+        unfinished.touch()
+        unlink = os.unlink
+
+        def fail_unfinished(name: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
+            if name == unfinished.name and dir_fd is not None:
+                raise OSError("unfinished gate record removal failed")
+            unlink(name, dir_fd=dir_fd)
+
+        with mock.patch.object(os, "unlink", side_effect=fail_unfinished):
+            self.assertTrue(any("unfinished gate record removal failed" in line for line in self.delete()))
+        self.assertFalse(gate.exists())
+        self.assertTrue(all(path.is_file() for path in (record, lock, unfinished)))
+        self.assertIn(f"deleted {gate}: {gib(0)}", self.delete())
+        self.assertFalse(gate.parent.exists())
+
+    def test_both_modes_keep_a_gate_with_a_symlink_lease_record(self) -> None:
+        gate = self.gate()
+        record = gate.with_suffix(".lease.json")
+        lock = gate.with_suffix(".lock")
+        lock.touch()
+        external = self.root / "outside.json"
+        _ = external.write_text(json.dumps({"kind": "gate", "folder": gate.name}))
+        record.symlink_to(external)
+        preview = self.delete(dry_run=True)
+        self.assertEqual(preview, [f"kept {gate}: unverified lease sidecars"])
+        self.assertEqual(record.readlink(), external)
+        self.assertTrue(gate.is_dir())
+
+        self.assertEqual(self.delete(), preview)
+        self.assertTrue(gate.parent.is_dir())
+        self.assertEqual(record.readlink(), external)
+        self.assertTrue(lock.is_file())
+        self.assertTrue(gate.is_dir())
+        self.assertEqual(json.loads(external.read_text()), {"kind": "gate", "folder": gate.name})
+
+    def test_both_modes_keep_a_gate_with_a_sidecar_directory(self) -> None:
+        gate = self.gate()
+        record = gate.with_suffix(".lease.json")
+        record.mkdir()
+        _ = (record / "contents").write_text("keep the directory")
+        lock = gate.with_suffix(".lock")
+        lock.touch()
+        preview = self.delete(dry_run=True)
+        self.assertEqual(preview, [f"kept {gate}: unverified lease sidecars"])
+        self.assertEqual(self.delete(), preview)
+        self.assertTrue(gate.is_dir())
+        self.assertEqual((record / "contents").read_text(), "keep the directory")
+        self.assertTrue(lock.is_file())
+        self.assertTrue(gate.parent.is_dir())
+
+    def test_both_modes_keep_a_gate_with_a_sidecar_that_has_two_links(self) -> None:
+        gate = self.gate()
+        record = gate.with_suffix(".lease.json")
+        gate.with_suffix(".lock").touch()
+        external = self.root / "record"
+        contents = json.dumps({"kind": "gate", "folder": gate.name})
+        _ = external.write_text(contents)
+        record.hardlink_to(external)
+        preview = self.delete(dry_run=True)
+        self.assertEqual(preview, [f"kept {gate}: unverified lease sidecars"])
+        self.assertEqual(self.delete(), preview)
+        self.assertTrue(gate.is_dir())
+        self.assertEqual(record.read_text(), contents)
+        self.assertTrue(os.path.samestat(record.stat(), external.stat()))
+
+    def test_both_modes_keep_a_folder_with_an_unrelated_lock(self) -> None:
+        gate = self.gate("Cargo")
+        lock = gate.with_suffix(".lock")
+        _ = lock.write_text("Cargo dependencies")
+        preview = self.delete(dry_run=True)
+        self.assertEqual(preview, [f"kept {gate}: unverified lease sidecars"])
+        self.assertEqual(self.delete(), preview)
+        self.assertTrue((gate / "target" / "output").is_file())
+        self.assertEqual(lock.read_text(), "Cargo dependencies")
+        self.assertTrue(gate.parent.is_dir())
+
+    def test_both_modes_keep_a_gate_when_a_sidecar_changes_after_lock_acquisition(self) -> None:
+        gate = self.gate()
+        record = gate.with_suffix(".lease.json")
+        lock = gate.with_suffix(".lock")
+        lock.touch()
+        contents = json.dumps({"kind": "standing", "folder": gate.name})
+        take_lease = build_folders.folder_removal_lease
+
+        @contextmanager
+        def replace_record(path: Path, *, children: bool, wait: bool,
+                           dir_fd: int) -> Generator[build_folders.FolderRemovalLease]:
+            with take_lease(path, children=children, wait=wait, dir_fd=dir_fd) as lease:
+                replacement = record.with_name("replacement")
+                _ = replacement.write_text(contents)
+                _ = replacement.replace(record)
+                yield lease
+
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                _ = record.write_text(contents)
+                before = record.stat()
+                with mock.patch.object(build_folders, "folder_removal_lease", side_effect=replace_record):
+                    self.assertEqual(self.delete(dry_run=dry_run), [f"kept {gate}: busy"])
+                self.assertFalse(os.path.samestat(before, record.stat()))
+                self.assertEqual(record.read_text(), contents)
+                self.assertTrue(gate.is_dir())
+                self.assertTrue(lock.is_file())
+
+    def test_cleanup_keeps_unrelated_lock_files_and_their_repositories(self) -> None:
+        files = {
+            self.gates / "cargo" / "Cargo.lock": "Cargo output",
+            self.gates / "unrelated" / "another-gate.lock": "other lock",
+            self.gates / "invalid" / "bad-gate.lock": "",
+            self.gates / "invalid" / "bad-gate.lease.json": "{",
+            self.gates / "mismatch" / "wrong-gate.lock": "",
+            self.gates / "mismatch" / "wrong-gate.lease.json": '{"kind": "standing", "folder": "other-gate"}',
+            self.gates / "nongate" / "other-gate.lock": "",
+            self.gates / "nongate" / "other-gate.lease.json": '{"kind": "slot", "folder": "other-gate"}',
+        }
+        for path, contents in files.items():
+            path.parent.mkdir(exist_ok=True)
+            _ = path.write_text(contents)
+        preview = self.delete(dry_run=True)
+        self.assertEqual(self.delete(), preview)
+        for path, contents in files.items():
+            with self.subTest(path=path):
+                self.assertIn(f"kept {path}: not a folder", preview)
+                self.assertEqual(path.read_text(), contents)
+                self.assertTrue(path.parent.is_dir())
 
     def test_a_linked_worktree_edit_is_rescued_in_the_source_before_deletion(self) -> None:
         gate = self.gate()

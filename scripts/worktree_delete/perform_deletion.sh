@@ -68,15 +68,6 @@ if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "${ORIGIN_DEFAULT#origin/}" 
     exit 1
 fi
 
-cleanup_residual_directory() {
-    local project_dir="$1"
-
-    if [[ -e "$project_dir" ]]; then
-        echo "Removing residual directory: $project_dir"
-        rm -rf "$project_dir"
-    fi
-}
-
 # Every git call below runs against the ambient cwd. When the caller's cwd is
 # inside the worktree being removed, that directory stops existing partway
 # through and git aborts with "Unable to read current working directory". Move
@@ -100,43 +91,60 @@ if [[ "$HAS_CONFIRMATION" == true ]]; then
     fi
 fi
 
-if [[ -n "$CHECKED_ORIGIN_TIP" ]]; then
-    echo "Deleting origin/$BRANCH_NAME"
-    if ! git push "--force-with-lease=refs/heads/$BRANCH_NAME:$CHECKED_ORIGIN_TIP" origin --delete "$BRANCH_NAME"; then
-        echo "Error: origin branch deletion failed; the worktree and local branch stay."
+"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/build_folders.py" remove-with-command "$WORKTREE_PATH" \
+    bash -euo pipefail -c '
+    WORKTREE_PATH="$1"
+    BRANCH_NAME="$2"
+    CHECKED_ORIGIN_TIP="$3"
+    CHECKED_LOCAL_TIP="$4"
+    HAS_CONFIRMATION="$5"
+    SCRIPT_DIR="$6"
+
+    check_removal_path() {
+        "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/build_folders.py" check-removal-path "$WORKTREE_PATH"
+    }
+
+    if [[ -n "$CHECKED_ORIGIN_TIP" ]]; then
+        check_removal_path
+        echo "Deleting origin/$BRANCH_NAME"
+        if ! git push "--force-with-lease=refs/heads/$BRANCH_NAME:$CHECKED_ORIGIN_TIP" origin --delete "$BRANCH_NAME"; then
+            echo "Error: origin branch deletion failed; the worktree and local branch stay."
+            exit 1
+        fi
+        echo "Remote branch deleted."
+    fi
+
+    check_removal_path
+    "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-save "$WORKTREE_PATH"
+
+    echo "Removing worktree: $WORKTREE_PATH"
+    if [[ -n "$CHECKED_LOCAL_TIP" ]] && [[ "$(git rev-parse --verify "refs/heads/$BRANCH_NAME")" != "$CHECKED_LOCAL_TIP" ]]; then
+        echo "Error: the local branch changed after the cleanup check; the worktree stays."
         exit 1
     fi
-    echo "Remote branch deleted."
-fi
 
-"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-save "$WORKTREE_PATH"
-
-echo "Removing worktree: $WORKTREE_PATH"
-if [[ -n "$CHECKED_LOCAL_TIP" ]] && [[ "$(git rev-parse --verify "refs/heads/$BRANCH_NAME")" != "$CHECKED_LOCAL_TIP" ]]; then
-    echo "Error: the local branch changed after the cleanup check; the worktree stays."
-    exit 1
-fi
-
-if ! git worktree remove "$WORKTREE_PATH" 2>/dev/null; then
-    if [[ "$HAS_CONFIRMATION" == false ]]; then
-        echo "Error: the tree changed after the cleanup check; deletion stops."
-        exit 1
+    check_removal_path
+    if ! git worktree remove "$WORKTREE_PATH" 2>/dev/null; then
+        if [[ "$HAS_CONFIRMATION" == false ]]; then
+            echo "Error: the tree changed after the cleanup check; deletion stops."
+            exit 1
+        fi
+        echo "Standard removal failed, forcing..."
+        check_removal_path
+        if ! git worktree remove --force "$WORKTREE_PATH" 2>/dev/null; then
+            echo "Force removal failed, pruning and cleaning up manually..."
+            check_removal_path
+            git worktree prune
+        fi
     fi
-    echo "Standard removal failed, forcing..."
-    if ! git worktree remove --force "$WORKTREE_PATH" 2>/dev/null; then
-        echo "Force removal failed, pruning and cleaning up manually..."
-        git worktree prune
+
+    if [[ "$HAS_CONFIRMATION" == true && -e "$WORKTREE_PATH" ]]; then
+        check_removal_path
+        echo "Removing residual directory: $WORKTREE_PATH"
+        rm -rf "$WORKTREE_PATH"
     fi
-fi
-
-if [[ "$HAS_CONFIRMATION" == true ]]; then
-    cleanup_residual_directory "$WORKTREE_PATH"
-fi
-
-if [[ -e "$WORKTREE_PATH" ]]; then
-    echo "Error: Worktree path still exists after cleanup: $WORKTREE_PATH"
-    exit 1
-fi
+' remove-worktree "$WORKTREE_PATH" "$BRANCH_NAME" "$CHECKED_ORIGIN_TIP" \
+    "$CHECKED_LOCAL_TIP" "$HAS_CONFIRMATION" "$SCRIPT_DIR"
 
 "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-clean "$WORKTREE_PATH"
 

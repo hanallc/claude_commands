@@ -1105,6 +1105,10 @@ The data disk retains one bare mirror for each repository under `/var/lib/hana/m
 The shared maker allocates mirror metadata and temporary bundle files.
 `build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
 The slot API provides rescue before reset, stable Cargo output, and existing capacity refusal.
+The slot sweep keeps slots with live holders.
+It reports the held lock for each slot it keeps.
+It rescues an expired free slot and removes its worktree and Cargo output under the folder lock.
+It removes the lease record and lock file after cleanup succeeds.
 The slot's `rust-toolchain.toml` digest must equal the manifest before execution.
 
 The guest must use host name `aws-hana`.

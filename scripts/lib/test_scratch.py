@@ -489,18 +489,21 @@ class ScratchTests(unittest.TestCase):
         self.assertTrue(clone.with_name(clone.name + ".lease.json").is_file())
         self.git(worktree, "cat-file", "-e", "HEAD^{commit}")
 
-    def test_task_end_completes_removal_when_a_sidecar_unlink_fails(self) -> None:
+    def test_task_end_retries_when_a_sidecar_unlink_fails(self) -> None:
         source = self.base / "source"
         source.mkdir()
         self.git(source, "init", "-q")
         self.git(source, "commit", "--allow-empty", "-qm", "source")
         unlink = os.unlink
-        for suffix in (".lease.json", ".lock"):
+        unfinished_suffix = ".lease.json.0123456789abcdef.tmp"
+        for suffix in (unfinished_suffix, ".lease.json", ".lock"):
             with self.subTest(suffix=suffix):
                 task = f"gate:sidecar-{suffix[1:]}"
                 clone = copies.clone(source, task)
                 lease = clone.with_name(clone.name + ".lease.json")
                 lock = clone.with_name(clone.name + ".lock")
+                unfinished = clone.with_name(clone.name + unfinished_suffix)
+                _ = unfinished.write_text(lease.read_text())
                 selected = clone.name + suffix
                 mark = scratch.removal_mark(clone)
 
@@ -508,7 +511,7 @@ class ScratchTests(unittest.TestCase):
                            dir_fd: int | None = None) -> None:
                     if dir_fd is not None and name == selected:
                         self.assertFalse(clone.exists())
-                        self.assertFalse(mark.exists())
+                        self.assertTrue(mark.is_file())
                         with lock.open("rb") as contender, self.assertRaises(BlockingIOError):
                             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         raise PermissionError("sidecar unlink denied")
@@ -516,12 +519,19 @@ class ScratchTests(unittest.TestCase):
 
                 with mock.patch.object(os, "unlink", side_effect=refuse):
                     result = scratch.end(task)
-                self.assertEqual(result, [clone])
-                self.assertEqual(result.kept, [])
+                self.assertEqual(result, [])
+                self.assertEqual(len(result.kept), 1)
+                self.assertIn("sidecar unlink denied", result.kept[0].reason)
                 self.assertFalse(clone.exists())
-                self.assertFalse(mark.exists())
-                self.assertEqual(lease.is_file(), suffix == ".lease.json")
-                self.assertEqual(lock.is_file(), suffix == ".lock")
+                self.assertTrue(mark.is_file())
+                self.assertEqual(lease.is_file(), suffix != ".lock")
+                self.assertEqual(unfinished.is_file(), suffix == unfinished_suffix)
+                self.assertTrue(lock.is_file())
+
+                retry = scratch.end(task)
+                self.assertEqual(retry, [clone])
+                self.assertEqual(retry.kept, [])
+                self.assertFalse(any(path.exists() for path in (clone, lease, lock, unfinished, mark)))
 
     def test_ending_a_session_hold_keeps_a_busy_or_borrowed_descendant(self) -> None:
         source = self.base / "source"
@@ -757,24 +767,24 @@ for descriptor in descriptors:
         mark = scratch.removal_mark(clone)
         lease = clone.with_name(clone.name + ".lease.json")
         lock = clone.with_name(clone.name + ".lock")
-        unlink = os.unlink
+        remove = scratch.remove
 
-        def replace_parent(name: str | bytes | os.PathLike[str] | os.PathLike[bytes], *,
-                           dir_fd: int | None = None) -> None:
-            unlink(name, dir_fd=dir_fd)
-            if name == mark and dir_fd is None:
+        def replace_parent(path: Path) -> None:
+            remove(path)
+            if path == clone:
                 _ = parent.rename(old_parent)
                 parent.mkdir()
-                for path in (mark, lease, lock):
-                    _ = path.write_text("replacement")
+                for replacement in (mark, lease, lock):
+                    _ = replacement.write_text("replacement")
 
-        with mock.patch.object(os, "unlink", side_effect=replace_parent):
+        with mock.patch.object(scratch, "remove", side_effect=replace_parent):
             result = scratch.end(task)
 
-        self.assertEqual(result, [clone])
-        self.assertEqual(result.kept, [])
+        self.assertEqual(result, [])
+        self.assertEqual(len(result.kept), 1)
+        self.assertIn("removal parent or lock changed", result.kept[0].reason)
         self.assertFalse((old_parent / clone.name).exists())
-        self.assertFalse((old_parent / mark.name).exists())
+        self.assertTrue((old_parent / mark.name).is_file())
         for path in (lease, lock):
             self.assertTrue((old_parent / path.name).is_file())
         for path in (mark, lease, lock):
@@ -1498,7 +1508,7 @@ print(scratch.target('gate:proof', 'tree', False))
             self.assertFalse(scratch.busy_path(path).exists())
             self.assertEqual(build_folders.build_folder_state(path), "held")
 
-    def test_a_held_folders_lock_and_lease_record_are_busy_until_the_lease_is_free(self) -> None:
+    def test_removal_and_judgment_reject_sidecar_targets(self) -> None:
         request = build_folders.UniqueBuildFolder("leased-", build_folders.ExplicitBuildParent(self.base))
         with build_folders.temporary_build_folder(request) as path:
             records = [path.with_name(path.name + suffix) for suffix in (".lock", ".lease.json")]
@@ -1507,8 +1517,11 @@ print(scratch.target('gate:proof', 'tree', False))
                     self.assertFalse(idle)
         residue = self.base / "ended-run.lease.json"
         residue.touch()
-        with scratch.removal_lock(residue) as idle:
-            self.assertTrue(idle)
+        for lock in (scratch.removal_lock, scratch.judgment_lock):
+            with self.subTest(lock=lock.__name__), lock(residue) as idle:
+                self.assertFalse(idle)
+        self.assertTrue(residue.is_file())
+        self.assertFalse(residue.with_name(residue.name + ".lock").exists())
 
     def test_removal_finds_a_held_lease_below_the_folder_but_judgment_does_not_walk(self) -> None:
         parent = self.base / "runs"

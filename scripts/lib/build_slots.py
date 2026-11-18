@@ -153,10 +153,19 @@ def lease_path(path: Path) -> Path:
 
 
 def slot_paths(root: Path) -> list[tuple[Path, str, int]]:
-    """List each slot's path, repository, and number from its folder or lease record."""
-    names = {entry.name.removesuffix(LEASE_SUFFIX) for entry in root.iterdir()}
-    return [(root / name, match[1], int(match[2])) for name in sorted(names)
-            if (match := SLOT_NAME.fullmatch(name)) is not None]
+    """List each slot from its folder, lease record, or lock file."""
+    slots: set[tuple[Path, str, int]] = set()
+    for entry in root.iterdir():
+        candidate = build_folders.classify_removal_target(entry.name)
+        if isinstance(candidate, build_folders.UnverifiedSidecarName):
+            match = SLOT_NAME.fullmatch(candidate.folder)
+        elif isinstance(candidate, build_folders.FolderTarget):
+            match = SLOT_NAME.fullmatch(candidate.name)
+        else:
+            continue
+        if match is not None:
+            slots.add((root / match[0], match[1], int(match[2])))
+    return sorted(slots)
 
 
 def unused(last_use: datetime, settings: conf.ConfigRead, now: datetime) -> bool:
@@ -238,7 +247,7 @@ def _slot_commit(repository: Path, source: Path, commit: str) -> Generator[None]
         _ = _git(repository, "update-ref", "-d", reference)
 
 
-def _rescue(path: Path) -> None:
+def _rescue(path: Path, *, removal_guard: build_folders.FolderRemovalGuard | None = None) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
     try:
@@ -248,17 +257,27 @@ def _rescue(path: Path) -> None:
         if "status" not in error.command or "index" not in error.stderr:
             raise
         index = git_files.at(path).git_dir / "index"
+        if removal_guard is not None:
+            removal_guard.check_path()
         with tempfile.NamedTemporaryFile(prefix=".rescue-index-", dir=path, delete=False) as backup:
             saved_index = Path(backup.name)
         _ = index.replace(saved_index)
         try:
             descriptor = build_folders.build_folder_lock_fd(path)
+            if removal_guard is not None:
+                removal_guard.check_path()
             _ = _git(path, "read-tree", "HEAD", pass_fds=(descriptor,))
+            if removal_guard is not None:
+                removal_guard.check_path()
             _ = git_rescue.rescue(path, name, generated=[path / "target"],
                                  pass_fds=build_folders.held_build_folder_descriptors())
         except BaseException:
+            if removal_guard is not None:
+                removal_guard.check_path()
             _ = saved_index.replace(index)
             raise
+        if removal_guard is not None:
+            removal_guard.check_path()
         saved_index.unlink()
 
 
@@ -355,13 +374,24 @@ class SlotWaitPolicy(Enum):
     REFUSE = auto()
 
 
-def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -> None:
+class MacSlotWake(Enum):
+    """A change that permits another slot acquisition attempt."""
+
+    LOCK_FREE = auto()
+    LOCK_REMOVED = auto()
+
+
+def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -> MacSlotWake:
     """Wait for any kernel lock, with a finite deadline and no polling."""
     from scripts.build_queue.slot_wait import SlotWaitExpired
 
     script = ("import fcntl, sys\n"
-              "with open(sys.argv[1], 'rb') as lock:\n"
-              " fcntl.flock(lock, fcntl.LOCK_SH)\n"
+              "try:\n"
+              " with open(sys.argv[1], 'rb') as lock:\n"
+              "  fcntl.flock(lock, fcntl.LOCK_SH)\n"
+              "except FileNotFoundError:\n"
+              " sys.stdout.write('removed\\n')\n"
+              "else:\n"
               " sys.stdout.write('free\\n')\n")
     helpers: list[subprocess.Popen[bytes]] = []
     try:
@@ -377,8 +407,12 @@ def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -
             if not events:
                 raise SlotWaitExpired(f"slots: wait ended for {repository}; all {maximum} slots remain held")
             stream = cast(BinaryIO, events[0][0].fileobj)
-            if stream.readline() != b"free\n":
-                raise RuntimeError(f"slots: cannot read a free-slot notification for {repository}")
+            notification = stream.readline()
+            if notification == b"free\n":
+                return MacSlotWake.LOCK_FREE
+            if notification == b"removed\n":
+                return MacSlotWake.LOCK_REMOVED
+            raise RuntimeError(f"slots: cannot read a free-slot notification for {repository}")
     finally:
         for helper in helpers:
             if helper.poll() is None:
@@ -410,7 +444,7 @@ def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                     raise
                 if sys.platform == "darwin":
                     _ = sys.stderr.write(str(error) + "; waiting for a free slot\n")
-                    _wait_mac_slot(configured_slot_root(), error.repository, error.maximum, deadline)
+                    _ = _wait_mac_slot(configured_slot_root(), error.repository, error.maximum, deadline)
                 else:
                     slot_wait.wait_for_slot(error.repository, error.machine, configured_slot_root(), error.maximum,
                         episode=episode, since=since, showrunner=showrunner, unit=unit, work=work, purpose=purpose,
@@ -429,6 +463,32 @@ def _size(path: Path) -> int:
     return total
 
 
+def _remove_slot(lease: build_folders.HeldFolderRemovalLease, cargo: Path) -> None:
+    path = lease.folder
+
+    def cleanup(guard: build_folders.FolderRemovalGuard) -> build_folders.CleanupCompleted:
+        if path.exists():
+            _rescue(path, removal_guard=guard)
+            source = source_checkout(path)
+            guard.check_path()
+            _ = _git(source, "worktree", "remove", "--force", str(path), pass_fds=guard.lock_fds)
+        if cargo.exists():
+            guard.check_path()
+            shutil.rmtree(cargo)
+        return build_folders.CleanupCompleted()
+
+    try:
+        result = lease.remove(cleanup)
+    except git_rescue.RescueError as error:
+        detail = " ".join(str(error).splitlines())
+        _ = sys.stderr.write(f"slots: keeps {path.name}: {detail}\n")
+        return
+    if isinstance(result, build_folders.IncompleteBuildFolderRemoval):
+        raise SlotGitFailure(f"slots: {path}: {result.reason}")
+    if isinstance(result, build_folders.RefusedRemovalLease):
+        _ = sys.stderr.write(f"slots: keeps {path.name}: {result.reason}\n")
+
+
 def sweep_slots() -> None:
     """Remove old free slots and delete oversized build output under their locks."""
     machine = host_name()
@@ -441,37 +501,32 @@ def sweep_slots() -> None:
     if not root.exists():
         return
     for path, repository, _ in slot_paths(root):
-        with build_folders.collector_lease(path, wait=False) as free:
-            if not free:
+        with build_folders.folder_removal_lease(path, wait=False, create=True) as removal_lease:
+            if isinstance(removal_lease, build_folders.RefusedRemovalLease):
+                _ = sys.stderr.write(f"slots: keeps {path.name}: {removal_lease.reason}\n")
+                continue
+            if not isinstance(removal_lease, build_folders.HeldFolderRemovalLease):
                 continue
             settings = conf.read_or_repository("build_folders")
             record_path = lease_path(path)
             cargo = cargo_root / path.name
             if not path.exists():
-                if cargo.exists():
-                    shutil.rmtree(cargo)
-                record_path.unlink()
+                _remove_slot(removal_lease, cargo)
                 continue
-            lease = cast(dict[str, object], json.loads(record_path.read_text()))
+            try:
+                lease = cast(dict[str, object], json.loads(record_path.read_text()))
+            except FileNotFoundError:
+                continue
             last_use = datetime.fromisoformat(cast(str, lease["last_use"]))
             if unused(last_use, settings, datetime.now(timezone.utc)):
-                try:
-                    _rescue(path)
-                except git_rescue.RescueError as error:
-                    detail = " ".join(str(error).splitlines())
-                    _ = sys.stderr.write(f"slots: keeps {path.name}: {detail}\n")
-                    continue
-                descriptor = build_folders.build_folder_lock_fd(path)
-                _ = _git(source_checkout(path), "worktree", "remove", "--force", str(path), pass_fds=(descriptor,))
-                if cargo.exists():
-                    shutil.rmtree(cargo)
-                record_path.unlink()
+                _remove_slot(removal_lease, cargo)
                 continue
             key = f"slots.{machine}.{repository}.max_bytes"
             if key in settings.values():
                 limit = settings.whole(key)
                 size = _size(path) + _size(cargo)
                 if size > limit and cargo.exists():
+                    removal_lease.guard().check_path()
                     shutil.rmtree(cargo)
                     _ = sys.stdout.write(
                         f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "

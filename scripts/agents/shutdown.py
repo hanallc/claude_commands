@@ -851,7 +851,9 @@ class MacClaim(NamedTuple):
     pid: int
     proc_start: str
 
-def retirement_run(argv: list[str], cwd: Path | None = None, *, settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
+def retirement_run(argv: list[str], cwd: Path | None = None, *,
+                   settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                   lock_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
     """One command, without this session's id: shutdown then finds the account that holds the unit."""
     if isinstance(settings, UseConfiguredValue):
         settings = conf.read("production")
@@ -863,7 +865,7 @@ def retirement_run(argv: list[str], cwd: Path | None = None, *, settings: conf.C
         remaining = operation_limit - time.monotonic()
         if remaining <= 0:
             raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
-    return subprocess.run(argv, pass_fds=staff.operation_fds(), cwd=cwd, env=environment, capture_output=True, text=True, check=False,
+    return subprocess.run(argv, pass_fds=(*staff.operation_fds(), *lock_fds), cwd=cwd, env=environment, capture_output=True, text=True, check=False,
                           timeout=min(limit, remaining))
 
 def retirement_branch(folder: Path) -> str:
@@ -884,8 +886,9 @@ def retirement_production_of(production_name: str, *, record: staff.StaffSnapsho
         raise ValueError(f"{production_name}: run retire on {found.row.doc.machine}")
     return read_production(found.row)
 
-def retirement_git(unit: RetiringUnit, *arguments: str, settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:
-    return retirement_run(["git", "-C", str(unit.production.checkout), *arguments], settings=settings)
+def retirement_git(unit: RetiringUnit, *arguments: str, settings: conf.ConfigRead,
+                   lock_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
+    return retirement_run(["git", "-C", str(unit.production.checkout), *arguments], settings=settings, lock_fds=lock_fds)
 
 def retirement_recorder_line_only(worktree: Path, path: str, *, settings: conf.ConfigRead) -> bool:
     """Whether the file's whole change against HEAD is one added `Project started` line."""
@@ -1227,12 +1230,28 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
     return [unit.staff_member, *record.find(kind="worker", parent=unit.staff_member.id)]
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+    path = unit.worktree
+
+    def cleanup(guard: build_folders.FolderRemovalGuard) -> build_folders.CleanupCompleted:
+        if path.exists():
+            guard.check_path()
+            result = retirement_git(unit, "worktree", "remove", "--force", str(path), settings=settings,
+                                    lock_fds=guard.lock_fds)
+            if result.returncode:
+                raise RetirementRefused(retirement_failure(result))
+            print(f"removed: worktree {path}")
+        return build_folders.CleanupCompleted()
+
+    try:
+        removal = build_folders.remove_folder_with_lease(path, cleanup)
+    except (RetirementRefused, OSError, ValueError) as error:
+        return [str(error)]
+    if isinstance(removal, build_folders.RefusedRemovalLease):
+        return [f"{path}: {removal.reason}; the worktree stays"]
+    if isinstance(removal, build_folders.IncompleteBuildFolderRemoval):
+        return [f"{path}: the worktree still exists after removal"]
+
     failed: list[str] = []
-    if unit.worktree.exists():
-        result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
-        if result.returncode:
-            return [retirement_failure(result)]
-        print(f"removed: worktree {unit.worktree}")
     if unit.branch:
         if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
             result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)

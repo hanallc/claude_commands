@@ -20,8 +20,9 @@ from typing import NamedTuple, cast
 
 from scripts.production import session_staff, staff, unit_config
 from scripts.agents import stop_resume
-from scripts.lib import land_main, main_publish, main_push_lock
+from scripts.lib import build_folders, land_main, main_publish, main_push_lock
 from scripts.herdr import worker_panes
+from scripts.worktree import worktrees
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -549,6 +550,31 @@ def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tup
     return tuple(prepared)
 
 
+def retire_wrap_worktree(production: Production, item: PreparedWrapUnit) -> None:
+    unit = item.unit
+    path = unit.worktree
+
+    def cleanup(guard: build_folders.FolderRemovalGuard) -> build_folders.CleanupCompleted:
+        _ = unit_config.park(unit.member.id, path, item.retirement)
+        guard.check_path()
+        _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), path, staff.ParkedBranch(unit.branch)),
+                               expected=unit.member.worktree)
+        if path.exists():
+            guard.check_path()
+            retire_reservations(path)
+            guard.check_path()
+            result = worktrees.git(production.checkout, "worktree", "remove", str(path), check=False, lock_fds=guard.lock_fds)
+            _ = good(result, "retire")
+            report("retire", "ok", f"removed {unit.name} worktree")
+        return build_folders.CleanupCompleted()
+
+    removal = build_folders.remove_folder_with_lease(path, cleanup)
+    if isinstance(removal, build_folders.RefusedRemovalLease):
+        raise LifecycleStop("retire", "held", f"{path}: {removal.reason}; the worktree stays")
+    if isinstance(removal, build_folders.IncompleteBuildFolderRemoval):
+        raise LifecycleStop("retire", "failed", f"{path}: the worktree still exists after removal")
+
+
 def retire_wrap_rows(rows: tuple[UnitRow, ...], record: staff.StaffSnapshot, runner: staff.StaffRow) -> bool:
     """Keep worker and parent rows; removal is proved by the wrap's file step."""
     pending: list[staff.StaffId] = []
@@ -631,13 +657,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         if any(isinstance(state, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for state in remaining):
             held = True
             continue
-        _ = unit_config.park(unit.member.id, unit.worktree, item.retirement)
-        _ = staff.set_worktree(unit.member.id, staff.RemovedWorktree(local_machine(), unit.worktree, staff.ParkedBranch(unit.branch)),
-                               expected=unit.member.worktree)
-        if unit.worktree.exists():
-            retire_reservations(unit.worktree)
-            _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
-            report("retire", "ok", f"removed {unit.name} worktree")
+        retire_wrap_worktree(production, item)
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
             if not branch_is_landed(production.checkout, unit.branch, production.merge_branch):
                 raise LifecycleStop("retire", "held", f"{unit.branch} has work absent from {production.merge_branch}")

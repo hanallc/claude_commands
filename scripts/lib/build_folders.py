@@ -6,10 +6,12 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from enum import Enum
 import fcntl
 import json
 import os
@@ -22,6 +24,7 @@ import stat
 from pathlib import Path
 import sys
 import tempfile
+from threading import get_ident
 import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
@@ -212,9 +215,14 @@ def _parent(parent: BuildFolderParent) -> Path:
     return parent.path
 
 
-def _check_name(name: str) -> None:
+def _check_name_component(name: str) -> None:
     if name in (".", "..") or "/" in name or "\x00" in name:
         raise ValueError("a build folder name must be one path component")
+
+
+def _check_name(name: str) -> None:
+    if not isinstance(classify_removal_target(name), FolderTarget):
+        raise ValueError(f"{name!r}: invalid folder name or name reserved for lease sidecars")
 
 
 BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror", "target", "shell-cache",
@@ -297,10 +305,12 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     """Apply the configured name rule without creating a folder."""
     settings = _settings()
     if spec.kind == "slot":
-        _check_name(spec.repository)
-        return spec.parent / f"{spec.repository}-slot{spec.slot}"
+        _check_name_component(spec.repository)
+        name = f"{spec.repository}-slot{spec.slot}"
+        _check_name(name)
+        return spec.parent / name
     for component in (spec.repository, spec.owner, spec.purpose, spec.suffix, spec.showrunner, spec.unit, spec.work):
-        _check_name(component)
+        _check_name_component(component)
     if spec.suffix_length < 0:
         raise ValueError("a suffix length cannot be negative")
     suffix = spec.suffix
@@ -322,6 +332,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     path = spec.parent / relative
     if not path.is_relative_to(spec.parent) or path == spec.parent:
         raise ValueError("a build folder must stay below its parent")
+    _check_name(path.name)
     return path
 
 
@@ -350,8 +361,10 @@ def _folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
 
 
 _locks: dict[int, Path] = {}
-# A folder's lock file, lease record, or unfinished lease record.
-_METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
+# Match a sidecar name relative to an explicit folder name.
+LEASE_SIDECAR_NAME = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
+CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
 
 def _open_lock(path: Path, directory: int, *, create: bool) -> int:
     flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -449,6 +462,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
             record = cast(dict[str, str | int], json.loads(path.with_name(path.name + ".lease.json").read_text()))
         record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
                       commit=spec.slot_checkout.commit, last_use=now, ready=ready)
+    record.update(kind=spec.kind, folder=path.name)
     name = path.name + ".lease.json"
     try:
         existing = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -489,13 +503,16 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
         return request
     if isinstance(request, (LinkedEditableRepository, RemoteEditableRepository)):
         path = request.path.expanduser().absolute()
+        if not path.name:
+            raise ValueError("an editable repository needs a destination name")
+        _check_name(path.name)
         if isinstance(request, RemoteEditableRepository) and request.depth < 1:
             raise ValueError("an editable clone needs a positive depth")
         return BuildFolderSpec(kind="editable", parent=path.parent, purpose=path.name, suffix_length=0)
     else:
         stable = isinstance(request, StableOwnerFolder)
         name = request.name if isinstance(request, StableOwnerFolder) else request.prefix
-        _check_name(name)
+        _check_name_component(name)
         if stable and not name:
             raise ValueError("a stable build folder needs an owner name")
         spec = BuildFolderSpec(kind="legacy-stable" if stable else "legacy-unique", parent=_parent(request.parent),
@@ -670,7 +687,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 except BaseException:
                     _ = _locks.pop(descriptor, None)
                     if (made_inode is not None or (new_folder and not stable)) and _take_lock(descriptor, fcntl.LOCK_EX):
-                        _remove_failed_allocation(path, directory, made_inode)
+                        _remove_failed_allocation(HeldFolderRemovalLease(path, directory, descriptor), made_inode)
                         if isinstance(original, LinkedEditableRepository):
                             import subprocess
 
@@ -698,11 +715,16 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
         raise
 
 
-def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
+def _remove_failed_allocation(lease: HeldFolderRemovalLease, allocated: os.stat_result | None) -> None:
+    path, directory = lease.folder, lease.directory
     if allocated is not None:
         _remove_folder(path, directory, allocated)
     if not _folder_exists(path, directory):
-        _unlink_metadata(path, directory)
+        sidecars = lease.allocation_sidecars(temporary=True)
+        if isinstance(sidecars, VerifiedRemovalSidecars):
+            cleanup = lease.unlink_sidecars(sidecars)
+            if isinstance(cleanup, CleanupIncomplete):
+                print(f"build folders: {cleanup.reason}", file=sys.stderr)
 
 
 def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
@@ -733,24 +755,11 @@ def _folder_exists(path: Path, directory: int) -> bool:
     return True
 
 
-def _unlink_metadata(path: Path, directory: int) -> None:
-    temporary = re.compile(re.escape(path.name) + r"\.lease\.json\.[0-9a-f]{16}\.tmp")
-    for name in os.listdir(directory):
-        if temporary.fullmatch(name):
-            try:
-                os.unlink(name, dir_fd=directory)
-            except FileNotFoundError:
-                pass
-    for suffix in (".lease.json", ".lock"):
-        try:
-            os.unlink(path.name + suffix, dir_fd=directory)
-        except FileNotFoundError:
-            pass
-
-
 @dataclass(frozen=True)
 class RefusedRemovalLease:
     """A busy or unreadable lock prevents removal."""
+
+    reason: str = "the build folder lock is held"
 
 
 @dataclass(frozen=True)
@@ -762,6 +771,187 @@ SidecarIdentity = tuple[int, int, int]
 
 
 @dataclass(frozen=True)
+class VerifiedRemovalSidecars:
+    """The exact sidecar names and identities to remove."""
+
+    entries: tuple[tuple[str, SidecarIdentity], ...] = ()
+
+
+@dataclass(frozen=True)
+class RemovalSidecarConflict:
+    """A name or file conflicts with the expected lease group."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class FolderTarget:
+    """The name can identify a folder."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class UnverifiedSidecarName:
+    """The name matches a sidecar pattern."""
+
+    name: str
+    folder: str
+
+
+@dataclass(frozen=True)
+class VerifiedSidecarGroup:
+    """The sidecars have ownership evidence for this folder."""
+
+    folder: str
+    sidecars: VerifiedRemovalSidecars
+
+
+class SidecarOwnership(Enum):
+    DISCOVERY = "a lease record identifies the folder"
+    GATE = "a gate record identifies the folder"
+    ALLOCATION = "the caller identifies a reserved allocation"
+
+
+@dataclass(frozen=True)
+class AllocationSidecars:
+    """Use the sidecars of a folder from a trusted allocation path."""
+
+
+ALLOCATION_SIDECARS = AllocationSidecars()
+
+
+def removal_sidecar_identity(status: os.stat_result) -> SidecarIdentity:
+    return status.st_dev, status.st_ino, status.st_ctime_ns
+
+
+def read_removal_sidecars(directory: int, names: Iterable[str]) -> VerifiedRemovalSidecars | RemovalSidecarConflict:
+    """Read each selected regular file through the parent descriptor."""
+    entries: list[tuple[str, SidecarIdentity]] = []
+    for name in sorted(names):
+        try:
+            status = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except OSError:
+            return RemovalSidecarConflict(name)
+        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+            return RemovalSidecarConflict(name)
+        entries.append((name, removal_sidecar_identity(status)))
+    return VerifiedRemovalSidecars(tuple(entries))
+
+
+def lease_record_identity(name: str, folder: str, directory: int, ownership: SidecarOwnership
+                          ) -> SidecarIdentity | RemovalSidecarConflict:
+    """Read ownership evidence from a regular lease record."""
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(descriptor, encoding="utf-8") as contents:
+            status = os.fstat(contents.fileno())
+            if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+                return RemovalSidecarConflict(name)
+            raw = cast(object, json.loads(contents.read(65537)))
+    except (OSError, ValueError):
+        return RemovalSidecarConflict(name)
+    if not isinstance(raw, dict):
+        return RemovalSidecarConflict(name)
+    record = cast(dict[str, object], raw)
+    if ownership is SidecarOwnership.GATE:
+        owned = record.get("folder") == folder and record.get("kind") in ("gate", "standing")
+    elif "folder" in record or "kind" in record:
+        owned = record.get("folder") == folder and record.get("kind") in (
+            "temporary", "gate", "standing", "editable", "mirror", "target", "shell-cache",
+            "scratch", "legacy-unique", "legacy-stable", "tool", "slot")
+    else:
+        owned = (type(record.get("pid")) is int
+                 and all(isinstance(record.get(field), str)
+                         for field in ("showrunner", "unit", "work", "purpose", "start_time")))
+    return removal_sidecar_identity(status) if owned else RemovalSidecarConflict(name)
+
+
+def classify_removal_target(
+    name: str, *, directory: int | None = None, sidecars: Iterable[str] = (),
+    ownership: SidecarOwnership = SidecarOwnership.DISCOVERY,
+) -> FolderTarget | UnverifiedSidecarName | VerifiedSidecarGroup | RemovalSidecarConflict:
+    """Classify a name or verify a group in an open parent."""
+    if name in ("", ".", "..") or "/" in name or CONTROL_CHARACTER.search(name):
+        return RemovalSidecarConflict(name)
+    match = LEASE_SIDECAR_NAME.fullmatch(name)
+    if match is not None:
+        folder = match[1]
+        if folder in (".", "..") or LEASE_SIDECAR_NAME.fullmatch(folder):
+            return RemovalSidecarConflict(name)
+        return UnverifiedSidecarName(name, folder)
+    names = tuple(sidecars)
+    if not names:
+        return FolderTarget(name)
+    if directory is None:
+        return RemovalSidecarConflict(name)
+    for sidecar in names:
+        candidate = classify_removal_target(sidecar)
+        if not isinstance(candidate, UnverifiedSidecarName) or candidate.folder != name:
+            return RemovalSidecarConflict(sidecar)
+    verified = read_removal_sidecars(directory, names)
+    if isinstance(verified, RemovalSidecarConflict):
+        return verified
+    if ownership is not SidecarOwnership.ALLOCATION:
+        record_name = name + ".lease.json"
+        entries = dict(verified.entries)
+        identity = lease_record_identity(record_name, name, directory, ownership)
+        if isinstance(identity, RemovalSidecarConflict) or entries.get(record_name) != identity:
+            return RemovalSidecarConflict(record_name)
+        if name + ".lock" not in entries:
+            return RemovalSidecarConflict(name + ".lock")
+    return VerifiedSidecarGroup(name, verified)
+
+
+def sidecar_names_for(folder: str, names: Iterable[str]) -> tuple[str, ...]:
+    """List names that can belong to the specified folder."""
+    return tuple(sorted(name for name in names
+                        if isinstance(candidate := classify_removal_target(name), UnverifiedSidecarName)
+                        and candidate.folder == folder))
+
+
+class RemovalPathChanged(OSError):
+    """The visible parent or lock no longer identifies the held folder."""
+
+
+@dataclass(frozen=True)
+class FolderRemovalGuard:
+    folder: Path
+    parent_descriptor: int | None
+    lock_fds: tuple[int, ...]
+
+    def check_path(self) -> None:
+        """Verify the visible path before a removal step."""
+        if self.parent_descriptor is None:
+            if not os.path.lexists(self.folder.parent):
+                return
+        else:
+            try:
+                parent = self.folder.parent.stat()
+                if (os.path.samestat(parent, os.fstat(self.parent_descriptor))
+                        and _lock_current(self.folder, self.parent_descriptor, self.lock_fds[0])):
+                    return
+            except OSError:
+                pass
+        raise RemovalPathChanged(f"{self.folder}: the removal parent or lock changed")
+
+
+@dataclass(frozen=True)
+class CleanupCompleted:
+    """The callback completed all removal steps."""
+
+
+@dataclass(frozen=True)
+class CleanupIncomplete:
+    """The callback could not complete all removal steps."""
+
+    reason: str = "folder cleanup is incomplete"
+
+
+FolderCleanup = Callable[[FolderRemovalGuard], CleanupCompleted | CleanupIncomplete]
+
+
+@dataclass(frozen=True)
 class HeldFolderRemovalLease:
     """The descriptor reserves the folder name until lock removal."""
 
@@ -769,59 +959,102 @@ class HeldFolderRemovalLease:
     directory: int
     descriptor: int
 
+    def guard(self) -> FolderRemovalGuard:
+        """Provide the path check and descriptors for removal steps."""
+        return FolderRemovalGuard(self.folder, self.directory, (self.descriptor,))
+
+    def remove(
+        self, cleanup: FolderCleanup, *, sidecars: VerifiedRemovalSidecars | AllocationSidecars = ALLOCATION_SIDECARS,
+        temporary: bool = True,
+    ) -> RemovedBuildFolder | RefusedRemovalLease | IncompleteBuildFolderRemoval:
+        """Run cleanup that uses the visible path under this lock."""
+        guard = self.guard()
+
+        def verified_cleanup() -> CleanupCompleted | CleanupIncomplete:
+            guard.check_path()
+            outcome = cleanup(guard)
+            guard.check_path()
+            return outcome
+
+        selected = self.allocation_sidecars(temporary=temporary) if isinstance(sidecars, AllocationSidecars) else sidecars
+        if isinstance(selected, RemovalSidecarConflict):
+            return RefusedRemovalLease(f"{self.folder}: cannot verify {selected.name}")
+        return _remove_from_locked_parent(self, verified_cleanup, sidecars=selected)
+
+    def allocation_sidecars(self, *, temporary: bool) -> VerifiedRemovalSidecars | RemovalSidecarConflict:
+        """Select sidecars for a folder identified by its allocation path."""
+        if not temporary:
+            return VerifiedRemovalSidecars()
+        return self.group_sidecars(sidecar_names_for(self.folder.name, os.listdir(self.directory)),
+                                   SidecarOwnership.ALLOCATION)
+
+    def group_sidecars(self, names: Iterable[str], ownership: SidecarOwnership
+                       ) -> VerifiedRemovalSidecars | RemovalSidecarConflict:
+        """Verify the selected sidecars and their held lock."""
+        result = classify_removal_target(self.folder.name, directory=self.directory, sidecars=names, ownership=ownership)
+        if isinstance(result, VerifiedSidecarGroup):
+            self.check_sidecars(result.sidecars)
+            return result.sidecars
+        return result if isinstance(result, RemovalSidecarConflict) else RemovalSidecarConflict(self.folder.name)
+
+    def check_sidecars(self, sidecars: VerifiedRemovalSidecars) -> None:
+        """Check that the selected files still have their verified identities."""
+        lock_name = self.folder.name + ".lock"
+        lock_identity = removal_sidecar_identity(os.fstat(self.descriptor))
+        for name, identity in sidecars.entries:
+            match = classify_removal_target(name)
+            if (not isinstance(match, UnverifiedSidecarName) or match.folder != self.folder.name
+                    or self._sidecar_identity(name) != identity
+                    or name == lock_name and identity != lock_identity):
+                raise RemovalPathChanged(f"{self.folder}: sidecar changed: {name}")
+
     def _sidecar_identity(self, name: str) -> SidecarIdentity | None:
         try:
             inode = os.stat(name, dir_fd=self.directory, follow_symlinks=False)
         except OSError:
             return None
         if stat.S_ISREG(inode.st_mode) and inode.st_nlink == 1:
-            return inode.st_dev, inode.st_ino, inode.st_ctime_ns
+            return removal_sidecar_identity(inode)
         return None
 
-    def sidecar_identities(self) -> dict[str, SidecarIdentity]:
-        """Read the identities for this removal while the lock is held."""
-        try:
-            lock = os.fstat(self.descriptor)
-        except OSError:
-            return {}
+    def unlink_sidecars(self, expected: VerifiedRemovalSidecars) -> CleanupCompleted | CleanupIncomplete:
+        """Remove the interrupted records, canonical record, and lock in order."""
+        self.check_sidecars(expected)
         lock_name = self.folder.name + ".lock"
-        lock_identity = (lock.st_dev, lock.st_ino, lock.st_ctime_ns)
-        if self._sidecar_identity(lock_name) != lock_identity:
-            return {}
-        lease_name = self.folder.name + ".lease.json"
-        lease_identity = self._sidecar_identity(lease_name)
-        identities = {lease_name: lease_identity} if lease_identity is not None else {}
-        identities[lock_name] = lock_identity
-        return identities
-
-    def _source_removed(self) -> bool:
-        try:
-            return (os.path.samestat(os.fstat(self.directory), self.folder.parent.stat())
-                    and not _folder_exists(self.folder, self.directory))
-        except OSError:
-            return False
-
-    def unlink_sidecars(self, expected: dict[str, SidecarIdentity]) -> None:
-        """Remove the original sidecars after the source and marks are gone."""
-        lock_name = self.folder.name + ".lock"
-        lock_identity = expected.get(lock_name)
-        if lock_identity is None:
-            return
-        for name in (self.folder.name + ".lease.json", lock_name):
-            identity = expected.get(name)
-            if (identity is not None and self._source_removed() and self._sidecar_identity(name) == identity
-                    and (name == lock_name or self._sidecar_identity(lock_name) == lock_identity)):
-                with suppress(OSError):
-                    os.unlink(name, dir_fd=self.directory)
+        record_name = self.folder.name + ".lease.json"
+        for name, identity in sorted(expected.entries, key=lambda entry: (entry[0] == lock_name, entry[0] == record_name)):
+            if _folder_exists(self.folder, self.directory) or not _lock_current(self.folder, self.directory, self.descriptor):
+                raise RemovalPathChanged(f"{self.folder}: the folder or lock changed")
+            self.check_sidecars(VerifiedRemovalSidecars(((name, identity),)))
+            try:
+                os.unlink(name, dir_fd=self.directory)
+            except OSError as error:
+                return CleanupIncomplete(f"{self.folder}: cannot remove {name}: {error}")
+        return CleanupCompleted()
 
 
 FolderRemovalLease = RefusedRemovalLease | UnreservedRemovalFolder | HeldFolderRemovalLease
 
 
-def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> FolderRemovalLease:
+_COLLECTOR_LEASES: ContextVar[tuple[tuple[int, int, HeldFolderRemovalLease], ...]] = ContextVar(
+    "build_folder_collector_leases", default=())
+
+
+def current_folder_removal_lease(path: Path) -> HeldFolderRemovalLease | UnreservedRemovalFolder:
+    """Find the lease that the current collector already holds for this folder."""
+    path = path.absolute()
+    for process, thread, lease in reversed(_COLLECTOR_LEASES.get()):
+        if (process == os.getpid() and thread == get_ident() and lease.folder.absolute() == path
+                and _locks.get(lease.descriptor) == lease.folder):
+            return lease
+    return UnreservedRemovalFolder()
+
+
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
+                     create: bool = False) -> FolderRemovalLease:
     """Hold the lock if it is free. The stack owns the descriptor."""
     try:
-        descriptor = _open_lock(path, directory, create=False)
+        descriptor = _open_lock(path, directory, create=create)
     except FileNotFoundError:
         return UnreservedRemovalFolder()
     _ = stack.callback(os.close, descriptor)
@@ -832,42 +1065,61 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     return HeldFolderRemovalLease(path, directory, descriptor)
 
 
-def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
-    """Hold every lease lock below path without following links. False when an owner holds one."""
+def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> CleanupCompleted | RefusedRemovalLease:
+    """Hold child locks next to folders or lease records."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
             raise error
 
     for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
-        for name in files:
-            stem = name.removesuffix(".lock")
-            if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if isinstance(_hold_free_lease(Path(top) / stem, directory, stack, wait=wait), RefusedRemovalLease):
-                    return False
-    return True
+        directories = set(folders)
+        children = directories.copy()
+        entries = directories.union(files)
+        for name in entries:
+            candidate = classify_removal_target(name)
+            if name in directories and not isinstance(candidate, FolderTarget):
+                return RefusedRemovalLease(f"{Path(top) / name}: conflicting sidecar name")
+            if isinstance(candidate, UnverifiedSidecarName) and name != candidate.folder + ".lock":
+                children.add(candidate.folder)
+        for child in children:
+            if child + ".lock" not in entries:
+                continue
+            lease = _hold_free_lease(Path(top) / child, directory, stack, wait=wait)
+            if not isinstance(lease, HeldFolderRemovalLease):
+                return RefusedRemovalLease(f"{Path(top) / child}: cannot hold the child lease")
+    return CleanupCompleted()
 
 
 @contextmanager
-def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = True) -> Generator[FolderRemovalLease]:
-    """Hold the collector's locks and return the reservation for a folder."""
-    metadata = _METADATA.fullmatch(path.name)
-    folder = path.with_name(metadata[1]) if metadata else path
+def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = True,
+                         create: bool = False, dir_fd: int | None = None) -> Generator[FolderRemovalLease]:
+    """Hold the collector's locks for the specified folder."""
+    if not isinstance(classify_removal_target(path.name), FolderTarget):
+        yield RefusedRemovalLease(f"{path}: the removal target is reserved for lease sidecars")
+        return
     with ExitStack() as stack:
         try:
-            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
-            lease = _hold_free_lease(folder, directory, stack, wait=wait)
-            if not isinstance(lease, RefusedRemovalLease):
-                if metadata is not None:
-                    lease = UnreservedRemovalFolder()
-                elif children:
-                    with suppress(FileNotFoundError):
-                        if not _hold_child_leases(folder, stack):
-                            lease = RefusedRemovalLease()
+            directory = dir_fd if dir_fd is not None else stack.enter_context(
+                _folder_parent(path, path.parent, create=False))
+            lease = _hold_free_lease(path, directory, stack, wait=wait, create=create)
+            if not isinstance(lease, RefusedRemovalLease) and children:
+                with suppress(FileNotFoundError):
+                    children_lease = _hold_child_leases(path, stack, wait=wait)
+                    if isinstance(children_lease, RefusedRemovalLease):
+                        lease = children_lease
         except FileNotFoundError:
             lease = UnreservedRemovalFolder()
         except (OSError, ValueError):
             lease = RefusedRemovalLease()
-        yield lease
+        if isinstance(lease, HeldFolderRemovalLease):
+            entry = (os.getpid(), get_ident(), lease)
+            token = _COLLECTOR_LEASES.set((*_COLLECTOR_LEASES.get(), entry))
+            try:
+                yield lease
+            finally:
+                _COLLECTOR_LEASES.reset(token)
+        else:
+            yield lease
 
 
 @contextmanager
@@ -876,8 +1128,8 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
     Yield False when an owner holds the lease. A folder without a lock file has no lease.
     Use build_folder_lock_fd while the collector holds the lock.
-    A lock file or lease record is judged by its folder's lease. With children, also hold every lease below the folder; a held one, or an unreadable
-    folder, is busy.
+    With children, also hold each lease below the folder.
+    A held lease or an unreadable folder is busy.
     """
     with folder_removal_lease(path, children=children, wait=wait) as lease:
         yield not isinstance(lease, RefusedRemovalLease)
@@ -907,31 +1159,80 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             _release_build_folder(path)
 
 
-def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
-                        dir_fd: int | None = None, wait: bool = True) -> bool:
-    """Run cleanup under the free folder's lock, then remove temporary metadata."""
+@dataclass(frozen=True)
+class RemovedBuildFolder:
+    """Cleanup succeeded and the folder is absent."""
+
+
+@dataclass(frozen=True)
+class IncompleteBuildFolderRemoval:
+    """Cleanup failed or left the folder in place."""
+
+    reason: str = "folder cleanup is incomplete"
+
+
+def _remove_from_locked_parent(
+    lease: HeldFolderRemovalLease, cleanup: Callable[[], CleanupCompleted | CleanupIncomplete], *,
+    sidecars: VerifiedRemovalSidecars,
+) -> RemovedBuildFolder | RefusedRemovalLease | IncompleteBuildFolderRemoval:
+    """Remove only the selected files through the held parent descriptor."""
+    path, directory, descriptor = lease.folder, lease.directory, lease.descriptor
+    if not _lock_current(path, directory, descriptor):
+        return RefusedRemovalLease()
+    try:
+        lease.check_sidecars(sidecars)
+        outcome = cleanup()
+        if isinstance(outcome, CleanupIncomplete):
+            return IncompleteBuildFolderRemoval(outcome.reason)
+        if _folder_exists(path, directory):
+            return IncompleteBuildFolderRemoval()
+        if not _lock_current(path, directory, descriptor):
+            return RefusedRemovalLease()
+        outcome = lease.unlink_sidecars(sidecars)
+        if isinstance(outcome, CleanupIncomplete):
+            return IncompleteBuildFolderRemoval(outcome.reason)
+    except RemovalPathChanged as error:
+        return RefusedRemovalLease(str(error))
+    return RemovedBuildFolder()
+
+
+def remove_folder_with_lease(path: Path, cleanup: FolderCleanup, *, temporary: bool = True,
+                             dir_fd: int | None = None, wait: bool = True
+                             ) -> RemovedBuildFolder | RefusedRemovalLease | IncompleteBuildFolderRemoval:
+    """Run cleanup with the folder lock held. Pass the lock to any removal subprocess."""
+    if not isinstance(classify_removal_target(path.name), FolderTarget):
+        return RefusedRemovalLease(f"{path}: the removal target is reserved for lease sidecars")
     with ExitStack() as parents:
         try:
             directory = dir_fd if dir_fd is not None else parents.enter_context(
                 _folder_parent(path, path.parent, create=False))
         except FileNotFoundError:
             # An absent parent has no folder or metadata to lock.
-            return cleanup() is not False
+            guard = FolderRemovalGuard(path, None, ())
+            try:
+                guard.check_path()
+                outcome = cleanup(guard)
+                guard.check_path()
+            except RemovalPathChanged as error:
+                return RefusedRemovalLease(str(error))
+            return IncompleteBuildFolderRemoval(outcome.reason) if isinstance(outcome, CleanupIncomplete) else RemovedBuildFolder()
         descriptor = _open_lock(path, directory, create=True)
         try:
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
-                return False
-            if not _lock_current(path, directory, descriptor):
-                return False
-            if cleanup() is False:
-                return False
-            if _folder_exists(path, directory):
-                return False
-            if temporary:
-                _unlink_metadata(path, directory)
-            return True
+                return RefusedRemovalLease()
+            return HeldFolderRemovalLease(path, directory, descriptor).remove(cleanup, temporary=temporary)
         finally:
             os.close(descriptor)
+
+
+def remove_build_folder(path: Path, cleanup: Callable[[], bool | None], *, temporary: bool = True,
+                        dir_fd: int | None = None, wait: bool = True) -> bool:
+    """Run cleanup under the free folder's lock, then remove temporary metadata."""
+    def compatible_cleanup(_guard: FolderRemovalGuard) -> CleanupCompleted | CleanupIncomplete:
+        return CleanupIncomplete() if cleanup() is False else CleanupCompleted()
+
+    return isinstance(remove_folder_with_lease(path, compatible_cleanup, temporary=temporary,
+                                               dir_fd=dir_fd, wait=wait), RemovedBuildFolder)
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
@@ -939,28 +1240,42 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
-                            temporary=temporary, dir_fd=directory)
+
+    def cleanup() -> CleanupCompleted:
+        _remove_folder(path, directory, allocated)
+        return CleanupCompleted()
+
+    with ExitStack() as locks:
+        lease = _hold_free_lease(path, directory, locks)
+        if isinstance(lease, HeldFolderRemovalLease):
+            sidecars = lease.allocation_sidecars(temporary=temporary)
+            if isinstance(sidecars, VerifiedRemovalSidecars):
+                result = _remove_from_locked_parent(lease, cleanup, sidecars=sidecars)
+                if isinstance(result, IncompleteBuildFolderRemoval):
+                    print(f"build folders: {result.reason}", file=sys.stderr)
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
     """Remove a folder and its records when no process holds its lock or a lease below it."""
-    def cleanup() -> bool:
+    def cleanup(guard: FolderRemovalGuard) -> CleanupCompleted | CleanupIncomplete:
         try:
             allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:
-            return True
+            return CleanupCompleted()
         with ExitStack() as children:
             # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
             try:
-                if not _hold_child_leases(path, children, wait=wait):
-                    return False
+                child_leases = _hold_child_leases(path, children, wait=wait)
+                if isinstance(child_leases, RefusedRemovalLease):
+                    print(f"build folders: {child_leases.reason}", file=sys.stderr)
+                    return CleanupIncomplete(child_leases.reason)
             except OSError:
-                return False
+                return CleanupIncomplete()
+            guard.check_path()
             _remove_folder(path, directory, allocated)
-        return True
+        return CleanupCompleted()
 
-    return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+    return isinstance(remove_folder_with_lease(path, cleanup, dir_fd=directory, wait=wait), RemovedBuildFolder)
 
 
 def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
@@ -970,9 +1285,11 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
         with _folder_parent(parent / "entry", parent, create=False) as directory:
             names: set[str] = set()
             for entry in os.listdir(directory):
-                match = _METADATA.fullmatch(entry)
-                if match is not None:
-                    names.add(match[1])
+                candidate = classify_removal_target(entry)
+                if isinstance(candidate, UnverifiedSidecarName):
+                    names.add(candidate.folder)
+                elif isinstance(candidate, RemovalSidecarConflict):
+                    print(f"build folders: conflicting sidecar name: {parent / entry}", file=sys.stderr)
             for name in sorted(names):
                 _ = _remove_free(parent / name, directory, wait=wait)
     except FileNotFoundError:
@@ -1160,6 +1477,11 @@ def main(argv: Sequence[str]) -> int:
     _ = tool.add_argument("--owner-pid", type=int, required=True)
     remove = commands.add_parser("remove")
     _ = remove.add_argument("path", type=Path)
+    remove_with = commands.add_parser("remove-with-command")
+    _ = remove_with.add_argument("path", type=Path)
+    _ = remove_with.add_argument("argv", nargs=argparse.REMAINDER)
+    check_removal = commands.add_parser("check-removal-path")
+    _ = check_removal.add_argument("path", type=Path)
     run_temp = commands.add_parser("run-temp-path")
     _ = run_temp.add_argument("run", type=Path)
     run = commands.add_parser("run")
@@ -1220,6 +1542,47 @@ def main(argv: Sequence[str]) -> int:
                 except FileNotFoundError:
                     pass
             return 0 if remove_build_folder(path, cleanup) else 1
+        if command == "remove-with-command":
+            import subprocess
+
+            path = cast(Path, args.path).absolute()
+            arguments = cast(list[str], args.argv)
+            if not arguments:
+                raise ValueError("remove-with-command requires a removal command")
+
+            def run_removal(guard: FolderRemovalGuard) -> CleanupCompleted:
+                parent = guard.parent_descriptor
+                descriptors = () if parent is None else (parent, *guard.lock_fds)
+                environment = {**os.environ, "BUILD_FOLDER_REMOVAL_FDS": " ".join(map(str, descriptors))}
+                _ = subprocess.run(arguments, check=True, pass_fds=descriptors, env=environment)
+                return CleanupCompleted()
+
+            try:
+                removal = remove_folder_with_lease(path, run_removal)
+            except subprocess.CalledProcessError as error:
+                return error.returncode if error.returncode > 0 else 128 - error.returncode
+            if isinstance(removal, RefusedRemovalLease):
+                print(f"Error: {removal.reason}; the worktree stays: {path}")
+                return 1
+            if isinstance(removal, IncompleteBuildFolderRemoval):
+                if path.exists():
+                    print(f"Error: Worktree path still exists after cleanup: {path}")
+                else:
+                    print(f"Error: Worktree cleanup is incomplete: {path}: {removal.reason}")
+                return 1
+            return 0
+        if command == "check-removal-path":
+            path = cast(Path, args.path).absolute()
+            descriptors = os.environ.get("BUILD_FOLDER_REMOVAL_FDS")
+            if descriptors is None:
+                raise ValueError("check-removal-path requires a removal command")
+            if descriptors:
+                parent_fd, lock_fd = map(int, descriptors.split())
+                guard = FolderRemovalGuard(path, parent_fd, (lock_fd,))
+            else:
+                guard = FolderRemovalGuard(path, None, ())
+            guard.check_path()
+            return 0
         if command == "run-temp-path":
             from scripts.lib import unit_runs
 

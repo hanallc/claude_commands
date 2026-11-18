@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -268,19 +269,93 @@ class TmpSweepCase(unittest.TestCase):
 
 
 class CopyTests(TmpSweepCase):
-    def test_expired_lock_removal_leaves_the_fresh_lease_without_a_folder(self) -> None:
+    def test_held_folder_lock_keeps_its_old_lease_records(self) -> None:
+        folder = self.tmp / "scratch" / "report"
+        lock = write(folder.with_suffix(".lock"))
+        record = write(folder.with_suffix(".lease.json"), '{"kind": "scratch", "folder": "report"}')
+        unfinished = write(record.with_name(record.name + ".0123456789abcdef.tmp"), "unfinished record")
+
+        with lock.open("r+") as descriptor:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for dry_run in (True, False):
+                with self.subTest(dry_run=dry_run):
+                    with mock.patch.object(scratch, "remove_folder", wraps=scratch.remove_folder) as remove:
+                        result = self.sweep(dry_run=dry_run)
+                    for path in (record, unfinished, lock):
+                        self.assertIn(str(path), result.kept["busy: .claude-busy is locked"])
+                        self.assertTrue(path.is_file())
+                    self.assertEqual(result.failed, [])
+                    self.assertEqual(result.deleted, [])
+                    remove.assert_not_called()
+
+        result = self.sweep()
+        self.assertCountEqual([entry["path"] for entry in result.deleted], [str(record), str(unfinished), str(lock)])
+        self.assertEqual(result.failed, [])
+        for path in (record, unfinished, lock):
+            self.assertFalse(path.exists())
+
+    def test_fresh_lease_keeps_the_expired_lock_without_a_folder(self) -> None:
         folder = self.tmp / "scratch" / "report"
         lock = write(folder.with_name(folder.name + ".lock"))
-        lease = write(folder.with_name(folder.name + ".lease.json"), "fresh lease")
+        record = '{"kind": "scratch", "folder": "report"}'
+        lease = write(folder.with_name(folder.name + ".lease.json"), record)
         os.utime(lock, (self.now - 10 * DAY, self.now - 10 * DAY))
         self.recent(lease)
 
         result = self.sweep()
 
-        self.assertEqual([entry["path"] for entry in result.deleted], [str(lock)])
+        self.assertEqual(result.deleted, [])
         self.assertFalse(folder.exists())
-        self.assertFalse(lock.exists())
-        self.assertEqual(lease.read_text(), "fresh lease")
+        self.assertTrue(lock.is_file())
+        self.assertEqual(lease.read_text(), record)
+
+    def test_sidecar_group_requires_ownership_and_a_removable_folder(self) -> None:
+        parent = self.tmp / "scratch"
+        cargo = write(parent / "Cargo.lock", "a dependency lock")
+        orphan = write(parent / "orphan.lease.json", '{"kind": "scratch", "folder": "orphan"}')
+        folder = parent / "live"
+        payload = write(folder / "output")
+        self.recent(payload)
+        record = write(folder.with_suffix(".lease.json"), '{"kind": "scratch", "folder": "live"}')
+        lock = write(folder.with_suffix(".lock"))
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                result = self.sweep(dry_run=dry_run)
+                self.assertEqual(result.deleted, [])
+                self.assertIn(str(cargo), result.kept["unverified lease sidecars"])
+                self.assertIn(str(orphan), result.kept["unverified lease sidecars"])
+                for path in (record, lock, folder):
+                    self.assertIn(str(path), result.kept[tmp_sweep.RECENT])
+                self.assertTrue(all(path.is_file() for path in (cargo, orphan, record, lock, payload)))
+
+    def test_sweep_retries_a_group_after_unfinished_record_removal_fails(self) -> None:
+        path = self.tmp / "scratch" / "retry"
+        _ = write(path / "payload")
+        record = write(path.with_suffix(".lease.json"), '{"kind": "scratch", "folder": "retry"}')
+        lock = write(path.with_suffix(".lock"))
+        unfinished = write(record.with_name(record.name + ".0123456789abcdef.tmp"), "incomplete record")
+        unlink = os.unlink
+
+        def fail_unfinished(name: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
+            if name == unfinished.name and dir_fd is not None:
+                raise OSError("unfinished record removal failed")
+            unlink(name, dir_fd=dir_fd)
+
+        preview = self.sweep(dry_run=True)
+        self.assertCountEqual([entry["path"] for entry in preview.deleted],
+                              [str(member) for member in (path, record, lock, unfinished)])
+        with mock.patch.object(os, "unlink", side_effect=fail_unfinished):
+            failure = self.sweep()
+        self.assertEqual(failure.deleted, [])
+        self.assertEqual(len(failure.failed), 1)
+        self.assertIn("unfinished record removal failed", failure.failed[0]["error"])
+        self.assertFalse(path.exists())
+        self.assertTrue(all(member.is_file() for member in (record, lock, unfinished)))
+        retry = self.sweep()
+        self.assertEqual(retry.failed, [])
+        self.assertCountEqual([entry["path"] for entry in retry.deleted],
+                              [str(member) for member in (record, lock, unfinished)])
+        self.assertFalse(any(member.exists() for member in (record, lock, unfinished)))
 
     def test_busy_absent_copy_does_not_block_later_recovery_or_the_sweep(self) -> None:
         pair = self.tmp / "copies/pair"
@@ -1515,7 +1590,7 @@ class HandCleanupTests(TmpSweepCase):
         self.assertEqual([entry["path"] for entry in deleted], [str(ended)])
 
     def test_apply_rechecks_worker_marker_process_and_unreadable_record(self) -> None:
-        for change in ("worker", "marker", "process", "unreadable"):
+        for change in ("worker", "marker", "process", "unreadable", "replacement"):
             with self.subTest(change=change):
                 run = self.ended_run(change)
                 plan = self.tmp.parent / f"{change}.json"
@@ -1531,6 +1606,9 @@ class HandCleanupTests(TmpSweepCase):
                     _ = self.open_run(run, change)
                 elif change == "process":
                     fake_process(self.proc, 123, cwd=str(run))
+                elif change == "replacement":
+                    moved = run.rename(self.tmp.parent / "original-run")
+                    _ = shutil.copytree(moved, run)
                 else:
                     write_text_atomic(run / unit_runs.STATE_FILE, "{")
                 status, output = self.command("--apply", str(plan))
@@ -1538,6 +1616,39 @@ class HandCleanupTests(TmpSweepCase):
                 self.assertTrue((run / "board.log").is_file())
                 self.assertIn(f"keep {run}:", output)
                 self.assertNotIn(f"deleted {run}", output)
+
+    def test_apply_checks_each_planned_sidecar(self) -> None:
+        for change in ("added", "replaced", "unchanged"):
+            with self.subTest(change=change):
+                run = self.ended_run(change)
+                lock = write(run.with_suffix(".lock"))
+                record = write(run.with_suffix(".lease.json"), json.dumps({"kind": "temporary", "folder": run.name}))
+                unfinished = record.with_name(record.name + ".0123456789abcdef.tmp")
+                plan = self.tmp.parent / f"{change}.json"
+                status, output = self.command("--plan", str(plan))
+                self.assertEqual(status, 0, output)
+                planned = tmp_sweep.read_planned_removals(plan)
+                for path in (run, lock, record):
+                    self.assertEqual(planned[str(path)], tmp_sweep.PlannedRemovalIdentity.from_stat(path.stat()))
+                self.assertNotIn(str(unfinished), planned)
+                if change == "added":
+                    _ = write(unfinished)
+                elif change == "replaced":
+                    replacement = write(self.tmp.parent / "replacement-record", record.read_text())
+                    _ = replacement.replace(record)
+                status, output = self.command("--apply", str(plan))
+                self.assertEqual(status, 0, output)
+                if change == "unchanged":
+                    for path in (run, lock, record):
+                        self.assertFalse(path.exists())
+                        self.assertIn(f"tmp sweep: deleted {path}", output)
+                else:
+                    self.assertIn(f"keep {run}: the planned lease group changed", output)
+                    self.assertTrue(run.is_dir())
+                    self.assertTrue(lock.is_file())
+                    self.assertTrue(record.is_file())
+                    if change == "added":
+                        self.assertTrue(unfinished.is_file())
 
     def test_apply_cannot_delete_a_path_outside_the_current_candidates(self) -> None:
         outside = write(self.tmp.parent / "outside" / "file").parent

@@ -64,12 +64,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
-from typing import Protocol, cast
+from typing import Protocol, Self, cast, override
 
 from scripts.lint import sweep, tmp_sweep
 from scripts.message import session_send
 from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
-from scripts.lib import cargo_output, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lint.tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
@@ -224,6 +224,9 @@ def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None, *
                 if entry.is_symlink() or not entry.is_dir() or entry.stat().st_uid != os.getuid():
                     continue
             except OSError:
+                continue
+            if not isinstance(build_folders.classify_removal_target(entry.name), build_folders.FolderTarget):
+                print(f"folder audit: keep {entry}: the name is reserved for lease sidecars", file=sys.stderr)
                 continue
             if not keep(entry):
                 found.append(entry)
@@ -402,10 +405,54 @@ def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue
                 pending = read_pending_prune(record)
                 # A partial delete must pass the normal removal checks again.
                 if not os.path.lexists(pending.removed_path):
-                    scratch.remove_marked(pending.removed_path)
+                    remove_audited_source(pending.removed_path)
                     finish_pending_prune(record, pending)
             except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
                 print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)
+
+
+class CheckedRemovalPath(Path):
+    """Check the locked path when scratch uses it or derives another path."""
+
+    def __new__(cls, guard: build_folders.FolderRemovalGuard) -> Self:
+        return super().__new__(cls, guard.folder.absolute())
+
+    def __init__(self, guard: build_folders.FolderRemovalGuard) -> None:
+        super().__init__(guard.folder.absolute())
+        self.guard: build_folders.FolderRemovalGuard = guard
+
+    @override
+    def __str__(self) -> str:
+        self.guard.check_path()
+        return super().__str__()
+
+    @override
+    def with_segments(self, *pathsegments: str | os.PathLike[str]) -> Path:
+        self.guard.check_path()
+        return Path(*pathsegments)
+
+
+def remove_audited_source(path: Path, *, source_deletion: scratch.SourceDeletion = scratch.SourceDeletion.STANDARD,
+                          scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    """Finish scratch removal and clear any lease files under the same lock."""
+    with scratch.removal_lock(path) as idle:
+        if not idle:
+            raise scratch.ScratchError(f"{path}: {scratch.BUSY_REASON}")
+        lease = build_folders.current_folder_removal_lease(path)
+        if isinstance(lease, build_folders.UnreservedRemovalFolder):
+            scratch.remove_marked(path, source_deletion=source_deletion, scratch_settings=scratch_settings)
+            return
+
+        def cleanup(guard: build_folders.FolderRemovalGuard) -> build_folders.CleanupCompleted:
+            scratch.remove_marked(CheckedRemovalPath(guard), source_deletion=source_deletion,
+                                  scratch_settings=scratch_settings)
+            return build_folders.CleanupCompleted()
+
+        removal = lease.remove(cleanup)
+        if isinstance(removal, build_folders.RefusedRemovalLease):
+            raise scratch.ScratchError(removal.reason)
+        if isinstance(removal, build_folders.IncompleteBuildFolderRemoval):
+            raise scratch.ScratchError(f"{path}: {removal.reason}")
 
 
 def remove(path: Path, changed: float, now: float, *,
@@ -436,7 +483,7 @@ def remove(path: Path, changed: float, now: float, *,
                     os.replace(temporary, record)
                 finally:
                     temporary.unlink(missing_ok=True)
-            scratch.remove_marked(path, source_deletion=scratch.SourceDeletion.SWEEP, scratch_settings=scratch_settings)
+            remove_audited_source(path, source_deletion=scratch.SourceDeletion.SWEEP, scratch_settings=scratch_settings)
             if sources:
                 finish_pending_prune(record, PendingWorktreePrune(path, sources))
         except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:

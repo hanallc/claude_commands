@@ -93,7 +93,7 @@ from pathlib import Path
 from threading import get_ident
 from typing import Protocol, TypedDict, cast
 
-from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder  # noqa: E402
+from scripts.lib import build_folders, cargo_output, conf, copy_record, git_files, session_folder  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
 from scripts.lib.build_folders import (  # noqa: E402
@@ -398,7 +398,7 @@ def _held_removal_lock(path: Path) -> _HeldRemovalLock | None:
 
 
 @contextmanager
-def removal_lock(path: Path) -> Generator[bool]:
+def removal_lock(path: Path, *, dry_run: bool = False, wait: bool = True) -> Generator[bool]:
     """Claim the lease locks and the busy mark, even when absent, and hold them through removal.
     A held lease on the folder or on any folder below it is busy, and the busy mark is then
     not created."""
@@ -406,10 +406,10 @@ def removal_lock(path: Path) -> Generator[bool]:
     if _held_removal_lock(key) is not None:
         yield True
         return
-    with folder_removal_lease(path, children=True, wait=not removal_mark(path).is_file()) as lease:
+    with folder_removal_lease(path, children=True, wait=wait and not removal_mark(path).is_file()) as lease:
         free = not isinstance(lease, RefusedRemovalLease)
         marks = BusyMarkScope()
-        with busy_locks(path, create=free, scope=marks) as idle:
+        with busy_locks(path, create=free and not dry_run, scope=marks) as idle:
             if not free or not idle:
                 yield False
                 return
@@ -1523,16 +1523,63 @@ def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: 
     removal_mark(path).unlink(missing_ok=True)
 
 
+def clone_sidecars(lease: HeldFolderRemovalLease
+                   ) -> build_folders.VerifiedRemovalSidecars | build_folders.RemovalSidecarConflict:
+    """Select the records that identify the task clone."""
+    folder = lease.folder.name
+    canonical = folder + ".lease.json"
+    names = [canonical, folder + ".lock"]
+    for name in build_folders.sidecar_names_for(folder, os.listdir(lease.directory)):
+        if name not in names and not isinstance(build_folders.lease_record_identity(
+                name, folder, lease.directory, build_folders.SidecarOwnership.DISCOVERY),
+                build_folders.RemovalSidecarConflict):
+            names.append(name)
+    return lease.group_sidecars(names, build_folders.SidecarOwnership.DISCOVERY)
+
+
+def recorded_clone_sidecars(path: Path, pending: copy_record.Registered,
+                            lease: FolderRemovalLease) -> build_folders.VerifiedRemovalSidecars | KeptFolder:
+    """Recheck the remaining files from the original removal intent."""
+    raw = pending.fields.get("removal_lease_sidecars")
+    if not isinstance(raw, dict):
+        return KeptFolder(path, "the lease removal record is invalid")
+    entries: list[tuple[str, build_folders.SidecarIdentity]] = []
+    for name, value in cast(dict[str, object], raw).items():
+        candidate = build_folders.classify_removal_target(name)
+        if (not isinstance(candidate, build_folders.UnverifiedSidecarName) or candidate.folder != path.name
+                or not isinstance(value, list)):
+            return KeptFolder(path, "the lease removal record is invalid")
+        identity = cast(list[object], value)
+        if len(identity) != 3 or any(type(item) is not int for item in identity):
+            return KeptFolder(path, "the lease removal record is invalid")
+        if os.path.lexists(path.with_name(name)):
+            device, inode, changed = cast(list[int], value)
+            entries.append((name, (device, inode, changed)))
+    expected = build_folders.VerifiedRemovalSidecars(tuple(entries))
+    if entries:
+        if not isinstance(lease, HeldFolderRemovalLease):
+            return KeptFolder(path, "the remaining lease files have no lock")
+        try:
+            lease.guard().check_path()
+            lease.check_sidecars(expected)
+        except build_folders.RemovalPathChanged as error:
+            return KeptFolder(path, str(error))
+    return expected
+
+
 def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | ExpiredFolderRemoval = FOLDER_REMOVAL, *,
                   source_deletion: SourceDeletion = SourceDeletion.STANDARD, dry_run: bool = False,
                   scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> RemovedCopy | KeptFolder:
     """Own removal locks, safety checks, preparation, deletion intent, source deletion, and completion."""
+    if not isinstance(build_folders.classify_removal_target(path.name), build_folders.FolderTarget):
+        return KeptFolder(path, "the removal target is reserved for lease sidecars")
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     path = path.absolute()
     scope = BusyMarkScope()
-    lock = judgment_lock(path, scope=scope) if dry_run else removal_lock(path)
+    lock = removal_lock(path) if not dry_run else (
+        judgment_lock(path, scope=scope) if _held_removal_lock(path) is None else nullcontext(True))
     with lock as idle:
         if not idle:
             pending = pending_removal(path, scratch_settings=scratch_settings)
@@ -1563,6 +1610,14 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             record = task_of(path, scratch_settings=scratch_settings)
             if isinstance(record, copy_record.UnreadableRecord):
                 return KeptFolder(path, record.reason)
+            held = _held_removal_lock(path)
+            lease = held.lease if held is not None else build_folders.UnreservedRemovalFolder()
+            sidecars = build_folders.VerifiedRemovalSidecars()
+            if isinstance(pending, copy_record.Registered) and "removal_lease_sidecars" in pending.fields:
+                remaining = recorded_clone_sidecars(path, pending, lease)
+                if isinstance(remaining, KeptFolder):
+                    return remaining
+                sidecars = remaining
             selected = isinstance(request, SelectedCopyRemoval)
             if isinstance(request, SelectedCopyRemoval):
                 if not isinstance(record, copy_record.Registered) or record.fields != request.expected.fields:
@@ -1581,11 +1636,14 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 if isinstance(request, SelectedCopyRemoval):
                     request.validate()
                 if not dry_run:
+                    if isinstance(lease, HeldFolderRemovalLease) and sidecars.entries:
+                        cleanup = lease.unlink_sidecars(sidecars)
+                        if isinstance(cleanup, build_folders.CleanupIncomplete):
+                            return KeptFolder(path, cleanup.reason)
                     finish_removal(path)
                 return RemovedCopy()
             if isinstance(request, SelectedCopyRemoval):
                 request.validate()
-            held = _held_removal_lock(path)
             if held is not None:
                 scope = held.marks
             if path.is_dir() and not path.is_symlink():
@@ -1651,10 +1709,13 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 else:
                     path.unlink()
                 return RemovedCopy()
-            lease = (held.lease if isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered)
-                     and record.fields.get("test_hana_clone") is True and held is not None
-                     and isinstance(held.lease, HeldFolderRemovalLease) and held.lease.folder == path else None)
-            sidecars = lease.sidecar_identities() if lease is not None else {}
+            if (isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered)
+                    and record.fields.get("test_hana_clone") is True and isinstance(lease, HeldFolderRemovalLease)
+                    and lease.folder == path and isinstance(pending, copy_record.NotRegistered)):
+                selected_sidecars = clone_sidecars(lease)
+                if isinstance(selected_sidecars, build_folders.RemovalSidecarConflict):
+                    return KeptFolder(path, f"cannot verify lease file {selected_sidecars.name}")
+                sidecars = selected_sidecars
             saved = save_cargo_outputs(path)
             clean_cargo_outputs(path, saved)
             if isinstance(pending, copy_record.NotRegistered):
@@ -1665,6 +1726,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                               copy_device=directory.st_dev, copy_inode=directory.st_ino,
                               removal_repositories=[] if empty_run_worktree else repository_removal_evidence(path, scratch_settings=scratch_settings),
                               removal_files=sorted(removal_source_files(path)), removal_intent_ns=time.time_ns())
+                if sidecars.entries:
+                    fields["removal_lease_sidecars"] = dict(sidecars.entries)
                 atomic_record(removal_mark(path), fields)
             if source_deletion is SourceDeletion.SWEEP:
                 cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))
@@ -1672,9 +1735,12 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 cast(_RunSourceRemoval, cast(object, import_module("scripts.direct.remove_run_scratch"))).remove_tree(path)
             else:
                 remove(path)
+            if isinstance(lease, HeldFolderRemovalLease) and sidecars.entries:
+                lease.guard().check_path()
+                cleanup = lease.unlink_sidecars(sidecars)
+                if isinstance(cleanup, build_folders.CleanupIncomplete):
+                    return KeptFolder(path, cleanup.reason)
             finish_removal(path, cargo_cleaned=True)
-            if lease is not None:
-                lease.unlink_sidecars(sidecars)
             return RemovedCopy()
 
 

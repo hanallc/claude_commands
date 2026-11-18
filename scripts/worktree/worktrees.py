@@ -92,9 +92,10 @@ class Refused(Exception):
         self.code: int = code
 
 
-def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def git(repo: Path, *arguments: str, check: bool = True,
+        lock_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(["git", "-C", str(repo), *arguments],
-                            capture_output=True, text=True, check=False)
+                            capture_output=True, text=True, check=False, pass_fds=lock_fds)
     if check and result.returncode:
         raise Refused(1, failure_detail(result))
     return result
@@ -340,21 +341,29 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         return origin
     cargo_mark = scratch.cargo_removal_mark(path.resolve())
     with ExitStack() as guards:
+        def cleanup(guard: build_folders.FolderRemovalGuard) -> build_folders.CleanupCompleted:
+            try:
+                _guard_cargo_cleanup(guard, guards)
+            except (OSError, ValueError) as error:
+                raise Refused(1, f"Cargo output kept: {error}") from error
+            if isinstance(origin, CheckedOriginTip):
+                guard.check_path()
+                deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
+                               "origin", "--delete", record.branch, check=False, lock_fds=guard.lock_fds)
+                if deletion.returncode:
+                    raise Refused(1, "origin branch deletion failed; the worktree stays: " + failure_detail(deletion))
+            registered = path in worktree_branches(repo)
+            if local_branch_tip(repo, record.branch) != local:
+                raise Refused(1, "the local branch changed after the cleanup check; the worktree stays")
+            if path.exists() or registered:
+                guard.check_path()
+                _ = git(repo, "worktree", "remove", str(path), lock_fds=guard.lock_fds)
+            return build_folders.CleanupCompleted()
+
         try:
-            _guard_cargo_cleanup(path, guards)
-        except (OSError, ValueError) as error:
-            return Kept(path, f"Cargo output kept: {error}")
-        if isinstance(origin, CheckedOriginTip):
-            deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
-                           "origin", "--delete", record.branch, check=False)
-            if deletion.returncode:
-                return Kept(path, "origin branch deletion failed; the worktree stays: " + failure_detail(deletion))
-        registered = path in worktree_branches(repo)
-        if local_branch_tip(repo, record.branch) != local:
-            return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
-        if not build_folders.remove_build_folder(
-                path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True):
-            return Kept(path, "the build folder lock is held; the worktree stays")
+            remove_worktree(path, cleanup)
+        except Refused as error:
+            return Kept(path, str(error))
         cargo_mark.unlink(missing_ok=True)
     if isinstance(local, CheckedLocalTip):
         deletion = git(repo, "update-ref", "-d", f"refs/heads/{record.branch}", local.sha, check=False)
@@ -371,10 +380,20 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     return Ended(path, record.branch)
 
 
-def _guard_cargo_cleanup(path: Path, guards: ExitStack) -> None:
+def remove_worktree(path: Path, cleanup: build_folders.FolderCleanup) -> None:
+    """Remove a worktree and its lease files, or report the cause of failure."""
+    removal = build_folders.remove_folder_with_lease(path, cleanup)
+    if isinstance(removal, build_folders.RefusedRemovalLease):
+        raise Refused(1, f"{removal.reason}; the worktree stays")
+    if isinstance(removal, build_folders.IncompleteBuildFolderRemoval):
+        raise Refused(1, "the worktree still exists after removal")
+
+
+def _guard_cargo_cleanup(guard: build_folders.FolderRemovalGuard, guards: ExitStack) -> None:
     from scripts.buildlog.store import host_name
     from scripts.lib import cargo_seed, conf
 
+    path = guard.folder
     checkout = path.resolve()
     if path.exists() and sys.platform == "linux":
         try:
@@ -397,14 +416,19 @@ def _guard_cargo_cleanup(path: Path, guards: ExitStack) -> None:
                 raise OSError(f"Cargo seed holds an output lock: {checkout}") from error
     target = checkout / "target"
     mark = scratch.cargo_removal_mark(checkout)
-    scratch.atomic_record(mark, [{
+    cargo_record = {
         "workspace_root": str(checkout),
         "target_directory": str(target),
         "build_directory": str(directory),
         "other_checkouts": [str(peer) for peer in scratch.cargo_checkout_peers(checkout)],
         "shared_output_roots": [str(target.resolve())] if target.is_symlink() else [],
-    }])
-    scratch.clean_cargo_outputs(checkout, scratch.save_cargo_outputs(checkout))
+    }
+    guard.check_path()
+    scratch.atomic_record(mark, [cargo_record])
+    guard.check_path()
+    saved = scratch.save_cargo_outputs(checkout)
+    guard.check_path()
+    scratch.clean_cargo_outputs(checkout, saved)
 
 
 def end_landed(repo: Path, merge_branch: str) -> list[Ended | Kept]:
@@ -446,7 +470,11 @@ def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.Staf
     try:
         write_record(record)
     except OSError:
-        _ = build_folders.remove_build_folder(path, lambda: git(caller, "worktree", "remove", str(path)))
+        def rollback(guard: build_folders.FolderRemovalGuard) -> build_folders.CleanupCompleted:
+            _ = git(caller, "worktree", "remove", str(path), lock_fds=guard.lock_fds)
+            return build_folders.CleanupCompleted()
+
+        remove_worktree(path, rollback)
         _ = git(caller, "branch", "-D", branch)
         raise
     print(f"made worktree {path} on {branch}")

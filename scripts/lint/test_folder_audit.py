@@ -437,10 +437,13 @@ class FolderAuditTests(unittest.TestCase):
     def test_candidates_keep_the_configured_visible_root_under_rust(self) -> None:
         visible = folder(self.rust / "private-visible")
         loose = folder(self.rust / "loose")
+        ambiguous = folder(self.rust / "report.lease.json")
         _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={visible}\n")
-        with unittest.mock.patch.dict(os.environ):
+        with unittest.mock.patch.dict(os.environ), redirect_stderr(io.StringIO()) as warnings:
             del os.environ["SCRATCH_VISIBLE_ROOT"]
             self.assertEqual(folder_audit.candidates(self.rust, [], frozenset()), [loose])
+        self.assertIn(f"keep {ambiguous}", warnings.getvalue())
+        self.assertTrue(ambiguous.is_dir())
 
     def test_folder_age_skips_the_names_from_scratch_config(self) -> None:
         _ = write_config_fixture(self.root / "config/scratch.conf", "repo_skip=generated-private\n")
@@ -585,6 +588,53 @@ class FolderAuditTests(unittest.TestCase):
         age(parent, 3 / 24)
         self.assertEqual(self.judge_clones([parent])[parent], folder_audit.REMOVED)
         self.assertFalse(parent.exists())
+
+    def test_audit_removes_a_managed_clone_and_its_lease_files_together(self) -> None:
+        clone = self.clone_folder("managed-clone", 3)
+        record = clone.with_name(clone.name + ".lease.json")
+        lock = clone.with_name(clone.name + ".lock")
+        contents = record.read_bytes()
+        with lock.open("r+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.judge_clones([clone])[clone], scratch.BUSY_REASON)
+            self.assertTrue(clone.is_dir())
+            self.assertEqual(record.read_bytes(), contents)
+            self.assertTrue(os.path.samestat(lock.stat(), os.fstat(owner.fileno())))
+        self.assertEqual(self.judge_clones([clone])[clone], folder_audit.REMOVED)
+        self.assertFalse(clone.exists())
+        self.assertFalse(record.exists())
+        self.assertFalse(lock.exists())
+
+    def test_audit_refuses_source_deletion_when_cargo_cleanup_replaces_the_parent(self) -> None:
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                clone = self.clone_folder(f"managed-clone-{pending}", 3)
+                record = clone.with_name(clone.name + ".lease.json")
+                lock = clone.with_name(clone.name + ".lock")
+                contents = record.read_bytes()
+                before = lock.stat()
+                moved = clone.parent.with_name(f"moved-scratch-{pending}")
+                if pending:
+                    with unittest.mock.patch.object(tmp_sweep, "delete_tree", side_effect=OSError("interrupted")):
+                        self.assertIn("interrupted", self.judge_clones([clone])[clone])
+                    self.assertTrue(scratch.removal_mark(clone).is_file())
+
+                def replace_parent(path: Path, _saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+                    self.assertEqual(path, clone)
+                    _ = clone.parent.rename(moved)
+                    clone.mkdir(parents=True)
+                    _ = (clone / "asset").write_text("replacement source")
+
+                with unittest.mock.patch.object(scratch, "clean_cargo_outputs", side_effect=replace_parent) as clean:
+                    outcome = self.judge_clones([clone])[clone]
+
+                clean.assert_called_once()
+                self.assertIn("the removal parent or lock changed", outcome)
+                self.assertEqual((clone / "asset").read_text(), "replacement source")
+                self.assertEqual((moved / clone.name / "asset").read_text(), "saved source")
+                self.assertEqual((moved / record.name).read_bytes(), contents)
+                self.assertTrue(os.path.samestat((moved / lock.name).stat(), before))
+                self.assertFalse(scratch.removal_mark(clone).exists())
 
     def test_config_failure_keeps_an_active_hold_and_its_clone(self) -> None:
         clone = self.clone_folder("config-held", 3)
