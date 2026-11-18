@@ -3447,9 +3447,12 @@ def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
+MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+
+
 def quote_sender_lines(text: str) -> str:
     """Separate caller text from generated sender metadata."""
-    normalized = re.sub(r"\r\n|[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", "\n", text)
+    normalized = MESSAGE_LINE_BREAK.sub("\n", text)
     return re.sub(r"(?m)^([^\S\n]*Sender native id:)", r"> \1", normalized)
 
 
@@ -3467,9 +3470,12 @@ def agent_text(message: Message, *, via_relay: bool = False) -> str:
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
-    return stamped_text(
-        f"Message from {message.sender} via postmaster: {quote_sender_lines(message.summary)} [{entry_id[:8]}]"
-        + shown_sender_line(message.sender, message.shown_sender), "\n\n" + message.text, message.stamp)
+    name = MESSAGE_LINE_BREAK.sub(" ", message.sender.removeprefix("send.py in "))
+    summary = MESSAGE_LINE_BREAK.sub(" ", message.summary)
+    shown = shown_sender_line(message.sender, message.shown_sender)
+    if shown:
+        shown = "\n" + MESSAGE_LINE_BREAK.sub(" ", shown.removeprefix("\n"))
+    return stamped_text(f"{name}: {summary}{shown}\nTag: {entry_id[:8]}", "\n\n" + message.text, message.stamp)
 
 
 def send(options: Options) -> Result:
