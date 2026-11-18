@@ -1306,6 +1306,30 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(item.state, review_items.ReviewState.DONE)
             self.assertIsInstance(item.times.later, datetime)
 
+            with self.subTest('Question log rollback'):
+                path = review_items.source_path(item)
+                prior_log = path.read_bytes()
+                prior_deadline = review_later.path().read_bytes()
+                note = 'Keep the previous deadline if this note rolls back.'
+                sync = atomic_file.sync_folder
+                failed = False
+
+                def fail_question_sync(folder: Path) -> None:
+                    nonlocal failed
+                    if folder == path.parent and not failed:
+                        self.assertIn(note, path.read_text(encoding='utf-8'))
+                        failed = True
+                        raise OSError('The Question directory sync failed.')
+                    sync(folder)
+
+                with patch.object(atomic_file, 'sync_folder', side_effect=fail_question_sync):
+                    status, reply = self.post(review_page.PAGE_PATH,
+                        case.card_body(cache.get(), key, 'later', note)+'&later=2030-12-03T18%3A30')
+                self.assertTrue(failed)
+                self.assertEqual(status, 503, reply)
+                self.assertEqual(path.read_bytes(), prior_log)
+                self.assertEqual(review_later.path().read_bytes(), prior_deadline)
+
     def test_review_returns_conflict_for_a_deleted_investigation(self) -> None:
         case = self.review_fixture()
         report = case.investigation()

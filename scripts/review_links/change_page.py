@@ -58,6 +58,7 @@ CONSOLE_FOLDER = "console"
 SEND_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 SENDER = Path(__file__).stem
 DELIVERY_PREFIX = ".review-link-delivery-"
+CLOSEOUT_PREFIX = ".review-link-closeout-alert-"
 IMAGE_QUESTION_ROW_PREFIX = "Images "
 
 
@@ -173,11 +174,23 @@ class StoredReviewMessage(TypedDict):
     submission_delivered: NotRequired[bool]
 
 
-class SentCloseoutAlerts(TypedDict):
+class StoredDeliveryCloseout(TypedDict):
     review_list: str
     row: str
     messages: list[str]
     failed_delivery: NotRequired[StoredFailedDelivery]
+    review_dispatch: NotRequired[StoredReviewDispatch]
+    pending_alerts: NotRequired[list[PendingDeliveryAlert]]
+
+
+class PendingDeliveryAlert(TypedDict):
+    recipient: staff.StaffId
+    message: str
+
+
+class StoredReviewDispatch(TypedDict):
+    attempt: str
+    state: Literal["started", "finished"]
 
 
 class StoredFailedDelivery(TypedDict):
@@ -385,15 +398,38 @@ class DeliveryStatus:
 
     def closeout_path(self, page: ReviewPage, row: str) -> Path:
         name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
-        return self.root / (".review-link-closeout-alert-" + name + ".json")
+        return self.root / (CLOSEOUT_PREFIX + name + ".json")
+
+    def review_save_receipt(self, page: ReviewPage, row: str) -> Path:
+        name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
+        return self.root / (".review-link-saved-" + name)
+
+    def mark_review_saved(self, page: ReviewMessagePage | UserQuestionPage, row: str, slots: DeliverySlots,
+                          intent: DeliveryIntent) -> None:
+        """Keep proof of a saved action while the caller holds the delivery lock."""
+        try:
+            self.write_slots(page, row, slots)
+        except Exception as error:
+            print(f"review-links delivery save mark {row}: {error}", file=sys.stderr)
+            try:
+                atomic_file.write_text_atomic(self.review_save_receipt(page, row), intent.attempt + "\n",
+                                              new_file_mode=0o600)
+            except OSError as failure:
+                print(f"review-links delivery save receipt {row}: {failure}", file=sys.stderr)
+
+    def has_review_save_receipt(self, page: ReviewPage, row: str, intent: DeliveryIntent | NoDelivery) -> bool:
+        """Check that the receipt confirms this delivery attempt."""
+        if not isinstance(intent, DeliveryIntent):
+            return False
+        try:
+            receipt = self.review_save_receipt(page, row).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return False
+        return receipt == intent.attempt
 
     def failed_delivery(self, page: ReviewPage, row: str) -> FailedDelivery | NoFailedDelivery:
         """Read a failure unless an earlier send may have reached the owner."""
-        try:
-            fields = cast(SentCloseoutAlerts, json.loads(self.closeout_path(page, row).read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            return NoFailedDelivery()
-        failed = fields.get("failed_delivery")
+        failed = self.closeout_fields(page, row).get("failed_delivery")
         if failed is None:
             return NoFailedDelivery()
         dispatch = self.image_question_dispatch(page, row)
@@ -402,23 +438,76 @@ class DeliveryStatus:
             return NoFailedDelivery()
         return FailedDelivery(failed["attempt"], Path(failed["review_list"]), failed["row"], failed["last_error"])
 
-    def record_result_locked(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery) -> None:
+    def closeout_fields(self, page: ReviewPage, row: str) -> StoredDeliveryCloseout:
+        try:
+            return cast(StoredDeliveryCloseout, json.loads(self.closeout_path(page, row).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            return {"review_list": str(page.review_list.resolve()), "row": row, "messages": []}
+
+    @staticmethod
+    def write_closeout(path: Path, fields: StoredDeliveryCloseout) -> None:
+        atomic_file.write_bytes_atomic(path, (json.dumps(fields) + "\n").encode("utf-8"), mode=0o600)
+
+    def start_review_dispatch_locked(self, delivery: MessageDelivery, slots: DeliverySlots,
+                                     intent: DeliveryIntent) -> bool:
+        """Save the attempt before sending. Finish an attempt that already has a result."""
+        page, row = delivery.page, delivery.row
+        fields = self.closeout_fields(page, row)
+        dispatch = fields.get("review_dispatch")
+        if dispatch is not None and dispatch["attempt"] == intent.attempt:
+            if dispatch["state"] != "finished":
+                print(f"review-links delivery {row}: send result unknown for attempt {intent.attempt}; message kept",
+                      file=sys.stderr)
+                return False
+            failed = fields.get("failed_delivery")
+            if not (isinstance(page, ReviewMessagePage) and page.saved.get("submission_request")
+                    and failed is not None and failed["attempt"] == intent.attempt):
+                self.finish_intent_locked(delivery, slots, intent)
+                return False
+        path = self.closeout_path(page, row)
+        started: StoredDeliveryCloseout = {**fields, "review_dispatch": {"attempt": intent.attempt, "state": "started"}}
+        try:
+            self.write_closeout(path, started)
+        except atomic_file.AtomicDurabilityUnconfirmed:
+            # Restore the previous state. The sender has not run.
+            self.write_closeout(path, fields)
+            raise
+        return True
+
+    def record_result_locked(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery,
+                             alerts: tuple[PendingDeliveryAlert, ...] = ()) -> None:
         """Keep alert history and the delivery result while the caller holds the delivery lock."""
         path = self.closeout_path(delivery.page, delivery.row)
-        fields: SentCloseoutAlerts
-        try:
-            fields = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            fields = {"review_list": str(delivery.page.review_list.resolve()), "row": delivery.row, "messages": []}
+        fields = self.closeout_fields(delivery.page, delivery.row)
+        dispatch = fields.get("review_dispatch")
+        if dispatch is not None and dispatch["attempt"] == delivery.attempt:
+            dispatch["state"] = "finished"
+        if alerts:
+            fields["pending_alerts"] = [*fields.get("pending_alerts", []), *alerts]
         if isinstance(result, FailedDelivery):
             fields["failed_delivery"] = {"attempt": result.attempt, "review_list": str(result.review_list.resolve()),
                                          "row": result.row, "last_error": result.last_error}
         else:
             _ = fields.pop("failed_delivery", None)
-            if not fields["messages"]:
+            if not fields["messages"] and dispatch is None and not fields.get("pending_alerts"):
                 path.unlink(missing_ok=True)
                 return
-        atomic_file.write_bytes_atomic(path, (json.dumps(fields) + "\n").encode("utf-8"), mode=0o600)
+        self.write_closeout(path, fields)
+
+    def send_pending_alerts(self, path: Path) -> None:
+        """Keep each failure alert until the sender accepts it."""
+        try:
+            with self.locked():
+                fields = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
+                alerts = fields.get("pending_alerts", [])
+                for index, alert in enumerate(alerts):
+                    send_to_staff(alert["recipient"], SENDER, alert["message"])
+                    fields["pending_alerts"] = alerts[index + 1:]
+                    self.write_closeout(path, fields)
+        except FileNotFoundError:
+            pass
+        except (*SEND_ERRORS, ValueError, TypeError, KeyError) as error:
+            print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
 
     def notify_closeout_failure(self, page: ReviewPage, row: str, message: str,
                                 recipients: tuple[staff.StaffId, ...]) -> None:
@@ -427,16 +516,13 @@ class DeliveryStatus:
             return
         path = self.closeout_path(page, row)
         with self.locked():
-            try:
-                sent: SentCloseoutAlerts = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
-            except FileNotFoundError:
-                sent = {"review_list": str(page.review_list.resolve()), "row": row, "messages": []}
+            sent = self.closeout_fields(page, row)
             if message in sent["messages"]:
                 return
             for identity in recipients:
                 send_to_staff(identity, SENDER, message)
             sent["messages"].append(message)
-            atomic_file.write_bytes_atomic(path, (json.dumps(sent) + "\n").encode("utf-8"), mode=0o600)
+            self.write_closeout(path, sent)
 
     def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
         return read_change_delivery(self.path(page, row))
@@ -527,7 +613,8 @@ class DeliveryStatus:
         self.request_attempts[attempt] = AttemptOwnership(self.path(page, row), "claimed")
         return attempt
 
-    def record(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery = NO_FAILED_DELIVERY) -> None:
+    def record(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery = NO_FAILED_DELIVERY,
+               *, alerts: tuple[PendingDeliveryAlert, ...] = ()) -> None:
         with self.locked():
             _ = self.request_attempts.pop(delivery.attempt, None)
             page, row = delivery.page, delivery.row
@@ -544,19 +631,27 @@ class DeliveryStatus:
                     return
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
-                    if isinstance(page, ReviewMessagePage) and page.saved.get('submission_request'):
-                        if isinstance(result, NoFailedDelivery):
-                            completed = replace(page, saved={**page.saved, 'submission_delivered': True})
-                            self.write_slots(completed, row, slots.updated('verdict', NoDelivery()))
-                        self.record_result_locked(delivery, result)
+                    self.record_result_locked(delivery, result, alerts)
+                    if (isinstance(result, FailedDelivery) and isinstance(page, ReviewMessagePage)
+                            and page.saved.get("submission_request")):
                         return
-                    self.record_result_locked(delivery, result)
-                    if current.kind == "validation":
-                        updated = replace(slots, validation=ValidationRequested(current.attempt, current.feedback))
-                    else:
-                        updated = slots.updated(current.kind, NoDelivery())
-                    self.write_slots(delivery.page, delivery.row, updated)
+                    self.finish_intent_locked(delivery, slots, current)
                     return
+
+    def finish_intent_locked(self, delivery: MessageDelivery, slots: DeliverySlots, intent: DeliveryIntent) -> None:
+        page, row = delivery.page, delivery.row
+        if intent.kind == "validation":
+            updated = replace(slots, validation=ValidationRequested(intent.attempt, intent.feedback))
+        else:
+            updated = slots.updated(intent.kind, NoDelivery())
+        if intent.kind == "verdict" and isinstance(page, ReviewMessagePage) and page.saved.get("submission_request"):
+            page = replace(page, saved={**page.saved, "submission_delivered": True})
+        self.write_slots(page, row, updated)
+        if intent.kind == "verdict" and isinstance(page, (ReviewMessagePage, UserQuestionPage)):
+            try:
+                self.review_save_receipt(page, row).unlink(missing_ok=True)
+            except OSError as error:
+                print(f"review-links delivery save receipt {row}: {error}", file=sys.stderr)
 
     def clear(self, page: ReviewPage, row: str, kind: Literal["verdict", "validation", "question"]) -> None:
         with self.locked():
@@ -1428,6 +1523,7 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
     settings = conf.read("review_links")
     tries = settings.whole("delivery_tries")
     pause = settings.number("delivery_pause_seconds")
+    tracked_review = False
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
         ownership = status.request_attempts.get(delivery.attempt)
@@ -1445,14 +1541,35 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
                 "attempt": delivery.attempt, "state": "started_after_unconfirmed" if unconfirmed else "started"}})
             # Save the send mark before the sender can accept the message.
             status.write_slots(started, delivery.row, slots.updated("verdict", NoDelivery()))
+        elif (isinstance(page, (ReviewMessagePage, UserQuestionPage)) and isinstance(slots.verdict, DeliveryIntent)
+                and slots.verdict.attempt == delivery.attempt):
+            _ = status.request_attempts.pop(delivery.attempt, None)
+            if not status.start_review_dispatch_locked(delivery, slots, slots.verdict):
+                return
+            tracked_review = True
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
     result = (FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, failures[-1].error)
               if failures else NoFailedDelivery())
+    if tracked_review and failures and delivery.alert_recipients:
+        alerts: tuple[PendingDeliveryAlert, ...] = tuple(
+            PendingDeliveryAlert(recipient=recipient, message=delivery_failure_alert(
+                failure, tries, delivery.page.review_list, delivery.row, delivery.message))
+            for failure in failures for recipient in delivery.alert_recipients)
+        status.record(delivery, result, alerts=alerts)
+        status.send_pending_alerts(status.closeout_path(delivery.page, delivery.row))
+        return
     status.record(delivery, result)
     _ = alert_delivery_failures(failures, tries, source=delivery.page.review_list, row=delivery.row,
                             message=delivery.message, recipients=delivery.alert_recipients)
+
+
+def delivery_failure_alert(failure: DeliveryFailure, tries: int, source: Path, row: str, message: str,
+                           title: str = "Change review delivery needs attention") -> str:
+    target = "no recipient" if isinstance(failure.recipient, MissingRecipient) else failure.recipient
+    return "\n".join((title, f"List: {source}", f"Row: {row}", f"Recipient: {target}", f"Tries: {tries}",
+                      f"Last error: {failure.error}", "The user's answer is saved. Pass it on by hand.", message))
 
 
 def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, source: Path, row: str,
@@ -1460,13 +1577,9 @@ def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, sour
                             title: str = "Change review delivery needs attention") -> bool:
     reached = False
     for failure in failures:
-        target = "no recipient" if isinstance(failure.recipient, MissingRecipient) else failure.recipient
-        error = failure.error
-        alert = "\n".join((title, f"List: {source}",
-                           f"Row: {row}", f"Recipient: {target}", f"Tries: {tries}",
-                           f"Last error: {error}", "The user's answer is saved. Pass it on by hand.", message))
+        alert = delivery_failure_alert(failure, tries, source, row, message, title)
         if not recipients:
-            print(f"review-links delivery {row}: {error}; no showrunner for the alert", file=sys.stderr)
+            print(f"review-links delivery {row}: {failure.error}; no showrunner for the alert", file=sys.stderr)
         for runner in recipients:
             try:
                 send_to_staff(runner, SENDER, alert)
@@ -1523,6 +1636,10 @@ def recover_pending(status: DeliveryStatus, *,
                     only: change_review.PendingVerdictCleanup | change_review.NoVerdictCleanup = change_review.NO_VERDICT_CLEANUP) -> None:
     """Recover scratch cleanup before the saved deliveries."""
     targeted = isinstance(only, change_review.PendingVerdictCleanup)
+    if not targeted:
+        for path in status.root.glob(CLOSEOUT_PREFIX + "*.json"):
+            if not path.is_symlink():
+                status.send_pending_alerts(path)
     intents = (only.intent,) if targeted else tuple(sorted(status.root.glob(change_review.VERDICT_CLEANUP_PREFIX+'*')))
     if not intents and not status.read_view().paths:
         return
@@ -1630,8 +1747,16 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 page = ReviewMessagePage(source,source.parent,(row,),'',saved)
                 slots = status.slots(page,row)
                 if not saved['saved']:
-                    status.clear_locked(page,row,slots,'verdict')
-                    continue
+                    if row.startswith(IMAGE_QUESTION_ROW_PREFIX):
+                        status.clear_locked(page,row,slots,'verdict')
+                        continue
+                    if not isinstance(slots.verdict, DeliveryIntent):
+                        continue
+                    if not status.has_review_save_receipt(page, row, slots.verdict):
+                        print(f'review-links recovery {path.name}: review save state unknown; message kept',
+                              file=sys.stderr)
+                        continue
+                    page = replace(page, saved={**saved, 'saved': True})
                 claimed = tuple(intent.attempt for intent in slots.intents())
                 for attempt in claimed:
                     status.request_attempts[attempt] = AttemptOwnership(path,'claimed')
@@ -1664,26 +1789,33 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                     continue
                 page = UserQuestionPage(Path(saved["source"]), Path(saved["production"]),
                                         (Path(saved["source"]).stem,), "", saved)
-                identities = update_registration.QuestionStaff.read()
-                owner = identities.record.by_id(staff.StaffId(saved["owner"]))
-                source = owner if owner is not None and owner.kind == "producer" else page.production
-                question = next((item for item in update_registration.question_records_for_document(source, identities)
-                                 if item.path == page.review_list), None)
+                try:
+                    questions = update_registration.selected_question_records(
+                        [page.review_list], (), None, owner=saved["owner"], strict=True)
+                except OSError as error:
+                    # The strict reader wraps errors from the source file.
+                    if not isinstance(error.__cause__, FileNotFoundError):
+                        raise
+                    questions = []
+                question = next(iter(questions), None)
                 # An answer closes its question; a follow-up or a skip leaves it open.
                 if question is None or question.status != ("closed" if saved.get("kind", "answer") in ("answer", "feedback") else "open"):
                     status.clear_locked(page, page.rows[0], slots, "verdict")
                     continue
                 if not saved.get("saved", False):
-                    status.clear_locked(page, page.rows[0], slots, "verdict")
-                    print(f"review-links recovery {path.name}: answer save state unknown; not sent", file=sys.stderr)
-                    continue
+                    if not status.has_review_save_receipt(page, page.rows[0], slots.verdict):
+                        status.clear_locked(page, page.rows[0], slots, "verdict")
+                        print(f"review-links recovery {path.name}: answer save state unknown; not sent", file=sys.stderr)
+                        continue
+                    page = replace(page, saved={**saved, "saved": True})
                 claimed = tuple(intent.attempt for intent in intents)
                 for attempt in claimed:
                     status.request_attempts[attempt] = AttemptOwnership(path, "claimed")
             for intent in intents:
                 deliver(MessageDelivery(page, page.rows[0], intent.recipients, saved["message"], intent.attempt,
                                         (staff.StaffId(saved["owner"]),)), status)
-        except (OSError, ValueError, KeyError, TypeError) as error:
+        except (OSError, ValueError, KeyError, TypeError, update_registration.RegistrationFailure,
+                update_registration.InputError) as error:
             print(f"review-links recovery {path.name}: {error}", file=sys.stderr)
         finally:
             with status.locked():

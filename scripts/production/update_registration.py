@@ -2590,7 +2590,8 @@ def main() -> int:
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "reply", "questions-table", "migrate-questions"):
         subcommand = commands.add_parser(action, description=ASK_DESCRIPTION if action == "ask" else None)
-        _ = subcommand.add_argument("--production", type=str, required=action not in ("ask", "questions-table"))
+        _ = subcommand.add_argument("--production", type=str,
+                                    required=action not in ("ask", "answer", "withdraw", "questions-table"))
         if action == "register":
             # Accepted and unused: a showrunner started before its name was looked up still passes it.
             _ = subcommand.add_argument("--session")
@@ -2637,15 +2638,17 @@ def main() -> int:
         name = cast(str | None, args.production)
         if name is None:
             assert identities is not None
-            if action == "ask":
-                unit = cast(str, args.unit)
+            if action in ("ask", "answer", "withdraw"):
+                unit = cast(str, args.unit) if action == "ask" else ""
                 caller = identities.record.by_current_session(staff.caller_identity())
                 if not unit and caller is not None and caller.kind == "producer":
                     name = str(caller.id)
                 elif unit:
                     name = unit_lookup.unit_parent(unit, session_staff.StoredReference(unit), record=identities.record).name
-                else:
+                elif action == "ask":
                     raise RegistrationFailure(action, "pass --unit <staff id> or --production <name>")
+                else:
+                    commands.choices[action].error("the following arguments are required: --production")
             else:
                 name = identities.production_of(staff.caller_identity())
                 if name is None:

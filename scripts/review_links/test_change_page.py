@@ -27,7 +27,7 @@ from io import StringIO
 from functools import cache
 from pathlib import Path
 from types import ModuleType
-from typing import Literal, cast, override
+from typing import Literal, TextIO, cast, override
 from collections.abc import Callable, Generator
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
@@ -1296,15 +1296,18 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn(change_page.reply_command(native.key, native.reply_token), first.message)
         with patch.object(change_page, 'send_with_retries', return_value=[
             change_page.DeliveryFailure(recipient.id, 'The fixture sender is unavailable.')
-        ]), patch.object(change_page, 'alert_delivery_failures'):
+        ]), patch.object(change_page, 'send_to_staff') as alert:
             change_page.deliver(first, status)
+        alert.assert_called_once()
+        self.assertIn('The fixture sender is unavailable.', cast(str, alert.call_args.args[2]))
         retried = review_actions.prepare_submission_delivery(native, request.words, status)
         assert isinstance(retried, change_page.MessageDelivery)
         self.assertEqual(retried.attempt, first.attempt)
         restarted = change_page.DeliveryStatus(self.root)
         with patch.object(change_page, 'send_to_staff') as send:
-            change_page.recover_review_messages(restarted)
-            change_page.recover_review_messages(restarted)
+            with patch.object(restarted, 'write_slots', side_effect=OSError('Cannot write the delivery receipt.')):
+                change_page.recover_review_messages(restarted)
+            change_page.recover_review_messages(change_page.DeliveryStatus(self.root))
             send.assert_called_once_with(recipient.id, change_page.SENDER, first.message)
         self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, restarted),
                               change_page.NoMessageDelivery)
@@ -2126,6 +2129,96 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(len(self.messages), count + 1)
             self.assertIn("First answer", self.messages[-1][2])
             self.assertNotIn("Second answer", self.messages[-1][2])
+
+    def test_open_question_answer_recovers_for_the_asker_when_the_saved_mark_fails(self) -> None:
+        key = self.file_user_question("Keep the saved answer")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        write_slots = status.write_slots
+
+        def write(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            if (isinstance(page, change_page.UserQuestionPage) and page.saved["saved"]
+                    and isinstance(slots.verdict, change_page.DeliveryIntent)):
+                raise OSError("fixture saved mark failed")
+            write_slots(page, row, slots)
+
+        with patch.object(status, "write_slots", new=write):
+            delivery, answer = change_browser.submit_question(question, "answer", "Keep it", status)
+        self.assertEqual(answer, "Keep it")
+        self.assertEqual(delivery.recipients, (self.unit.id,))
+        self.assertTrue(status.review_save_receipt(delivery.page, delivery.row).exists())
+        self.assertEqual(self.messages, [])
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn("Keep it", self.messages[0][2])
+        self.assertFalse(status.review_save_receipt(delivery.page, delivery.row).exists())
+
+    def test_a_failed_question_log_write_preserves_the_answer_delivery(self) -> None:
+        key = self.file_user_question("Keep the answer if its log fails")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        with patch.object(update_registration, "record_review_log", side_effect=OSError("fixture log write failed")):
+            delivery, answer = change_browser.submit_question(question, "answer", "Keep this answer", status)
+        self.assertEqual(answer, "Keep this answer")
+        self.assertIsInstance(status.slots(delivery.page, delivery.row).verdict, change_page.DeliveryIntent)
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn(answer, self.messages[0][2])
+
+    def test_question_recovery_ignores_read_errors_on_other_questions(self) -> None:
+        key = self.file_user_question("Recover this answer")
+        unrelated_key = self.file_user_question("Leave this question alone")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        questions = {item.key: item for item in change_browser.prepare(browser, status).questions}
+        unrelated = questions[unrelated_key].record.path
+        _ = change_browser.submit_question(questions[key], "answer", "Use this answer", status)
+        open_path = Path.open
+
+        def read(path: Path, mode: Literal["r"] = "r", buffering: int = -1,
+                 encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> TextIO:
+            if path == unrelated:
+                raise OSError("fixture unrelated question read failed")
+            return open_path(path, mode, buffering, encoding, errors, newline)
+
+        with patch.object(Path, "open", new=read):
+            change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn("Use this answer", self.messages[0][2])
+
+    def test_question_recovery_keeps_the_receipt_when_the_source_read_fails(self) -> None:
+        key = self.file_user_question("Read the saved answer again")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        delivery, _ = change_browser.submit_question(question, "answer", "Use the saved answer", status)
+        page = delivery.page
+        assert isinstance(page, change_page.UserQuestionPage)
+        slots = status.slots(page, delivery.row)
+        status.write_slots(replace(page, saved={**page.saved, "saved": False}), delivery.row, slots)
+        receipt = status.review_save_receipt(page, delivery.row)
+        _ = receipt.write_text(delivery.attempt + "\n")
+        open_path = Path.open
+
+        def read(path: Path, mode: Literal["r"] = "r", buffering: int = -1,
+                 encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> TextIO:
+            if path == question.record.path:
+                raise OSError("fixture question read failed")
+            return open_path(path, mode, buffering, encoding, errors, newline)
+
+        with patch.object(Path, "open", new=read):
+            change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual(status.slots(page, delivery.row), slots)
+        self.assertTrue(receipt.exists())
+        self.assertEqual(self.messages, [])
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn("Use the saved answer", self.messages[0][2])
+        self.assertFalse(receipt.exists())
 
     def test_followup_waits_for_the_reply_and_skip_moves_a_question_to_the_end(self) -> None:
         texts = {self.file_user_question("Choose first"): "Choose first",
@@ -4289,6 +4382,23 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.review_list.read_bytes(), before)
         self.assertEqual(self.messages, [])
         self.assertNotIn("Saved:", reply.body)
+
+    def test_a_git_launch_failure_keeps_the_saved_verdict_and_delivers_it(self) -> None:
+        run = cast(Callable[..., object], subprocess.run)
+
+        def fail_commit_probe(args: list[str], **kwargs: object) -> object:
+            if args[3:] == ["--literal-pathspecs", "rev-parse", "--is-inside-work-tree"]:
+                self.assertIn("works: keep the verdict", self.review_list.read_text())
+                raise FileNotFoundError("fixture Git launch failed")
+            return run(args, **kwargs)
+
+        with patch.object(subprocess, "run", new=fail_commit_probe):
+            reply = self.request(self.page_path, self.answer(feedback="keep the verdict"))
+        self.assertEqual(reply.status, 303)
+        self.assertIn("Saved: works: keep the verdict", self.request(self.page_path, {}).body)
+        self.assertCountEqual([recipient for recipient, _, message in self.messages if "works: keep the verdict" in message],
+                              ["builder-unit", "page-owner"])
+        self.assert_record_cleared()
 
     def test_a_failed_or_interrupted_owner_verdict_preserves_validation_ownership_and_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)

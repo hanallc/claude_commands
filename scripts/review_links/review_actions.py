@@ -5,6 +5,7 @@ import re
 import secrets
 import shlex
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -46,12 +47,13 @@ def record_action(item: review_items.ReviewItem, words: str, *, root: Path | Non
     elif isinstance(source, review_items.ChangeSource):
         production = source.assignment.production
         assert isinstance(production, Path)
-        if check is None:
-            change_review.record_review_log(source.path, source.row['#'], words, production)
-        else:
-            assert root is not None
+        if check is not None and root is not None:
             with change_review.checked_review_write(source.path, root, check):
                 change_review.record_review_log(source.path, source.row['#'], words, production)
+        else:
+            if check is not None:
+                _ = check()
+            change_review.record_review_log(source.path, source.row['#'], words, production)
     elif isinstance(source, review_items.ProposalSource):
         _ = proposal_issue.record_review(source.record.path, words, KeepMark(), datetime.now(user_zone()).date(), check=check)
     elif isinstance(source, review_items.EfficiencySource):
@@ -112,13 +114,12 @@ def track_question(delivery: change_page.MessageDelivery, key: str, words: str,
         assert isinstance(question, change_page.OpenQuestion)
         identity = question.question_id
         message = delivery.message.replace(change_page.reply_command(key), change_page.reply_command(key, identity))
-        page = delivery.page
-        if isinstance(page, change_page.UserQuestionPage):
-            page = replace(page, saved={**page.saved, 'message': message})
-        else:
-            assert isinstance(page, change_page.ReviewMessagePage)
-            page = replace(page, saved={**page.saved, 'message': message})
-        status.write_slots(page, delivery.row, replace(slots, question=replace(question, text=words)))
+        original = delivery.page
+        assert isinstance(original, (change_page.UserQuestionPage, change_page.ReviewMessagePage))
+        page = replace(original, saved={**original.saved, 'message': message})
+        updated = replace(slots, question=replace(question, text=words))
+        if page != original or updated != slots:
+            status.write_slots(page, delivery.row, updated)
         return replace(delivery, page=page, message=message)
 
 
@@ -212,7 +213,19 @@ def later(item: review_items.ReviewItem, value: str, words: str, *,
     until = datetime.fromisoformat(value)
     until = until.replace(tzinfo=user_zone()) if until.tzinfo is None else until.astimezone(user_zone())
     event = 'Later until '+until.isoformat()+(': '+words if words else '')
-    review_later.save(item.key, until, check=lambda: record_action(item, event, root=root, check=verify_revision))
+
+    def record_later(publish_deadline: Callable[[], None]) -> None:
+        def check_and_publish() -> None:
+            if verify_revision is not None:
+                _ = verify_revision()
+            publish_deadline()
+
+        record_action(item, event, root=root, check=check_and_publish)
+
+    # Use the same lock order as the Changes form.
+    with (change_review.review_delivery_lock(root) if root is not None and isinstance(item.source, review_items.ChangeSource)
+          else nullcontext()):
+        review_later.save(item.key, until, record_log=record_later)
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
 
@@ -273,7 +286,8 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
         previous_slots = status.slots(page, row)
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt,'verdict',recipients=(owner,))
-        status.write_slots(page,row,change_page.DeliverySlots(change_page.NoDelivery(),intent,question))
+        slots = change_page.DeliverySlots(change_page.NoDelivery(),intent,question)
+        status.write_slots(page,row,slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page,row),'claimed')
         try:
             _ = save()
@@ -281,9 +295,8 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
             status.write_slots(previous_page, row, previous_slots)
             raise
         page = replace(page,saved={**page.saved,'saved':True})
-        with review_items.after_store_write(page.saved["source"]):
-            status.write_slots(page,row,status.slots(page,row))
-    return change_page.MessageDelivery(page,row,(owner,),page.saved["message"],attempt,(owner,))
+        status.mark_review_saved(page, row, slots, intent)
+    return change_page.MessageDelivery(page,row,(owner,),page.saved['message'],attempt,(owner,))
 
 
 def message_text(item: review_items.ReviewItem, action: str, words: str) -> str:

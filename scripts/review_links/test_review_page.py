@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, tzinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import conf, urgency
+from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -32,6 +32,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from scripts.agents.remote import local_machine
+from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
@@ -40,7 +41,7 @@ from scripts.production import change_review, change_routing, footer_counts, inv
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
-from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later
+from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -2825,9 +2826,23 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         decisions = self.decisions()
         question = self.question()
         ready = self.investigation()
-        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions)
+        failed = investigation.file(ready.owner, 'Why did the report stop?', 'Read the report.',
+                                    waiting_why='The owner must complete the investigation.')
+        failed = investigation.answer(failed.owner, failed.id, 'The report is ready.')
+        failed_key = f'investigation/{failed.owner}/{failed.id}'
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions,failed_key)
+        write = atomic_file.write_bytes_atomic
+
+        def write_delivery(path: Path, content: bytes, *, mode: int | None = None) -> None:
+            if path.name.startswith(change_page.DELIVERY_PREFIX):
+                fields = cast(change_page.StoredDeliverySlots, json.loads(content))
+                saved = fields.get('review_message')
+                if saved is not None and saved.get('row') == failed.id and saved['saved'] and 'verdict' in fields:
+                    raise OSError('fixture delivery save mark failed')
+            write(path, content, mode=mode)
+
         for key in keys:
-            with self.subTest(key=key):
+            with self.subTest(key=key), patch.object(atomic_file, 'write_bytes_atomic', new=write_delivery):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
                 delivery,result = review_page.submit(self.root,self.body(key,'feedback','Use the second layout.'),self.status)
                 self.assertEqual(result,'feedback sent')
@@ -2836,12 +2851,181 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 expected = review_items.ReviewState.VALIDATING if item.type == review_items.ReviewType.CHANGE else review_items.ReviewState.DONE
                 self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),expected)
         restarted = change_page.DeliveryStatus(self.root)
-        change_page.recover_pending(restarted)
-        self.assertEqual(sum('Use the second layout.' in message for _,_,message in self.fixture.messages),5,
-                         'Each type sends one feedback message to its owner.')
+        with patch.object(atomic_file, 'write_bytes_atomic', new=write_delivery):
+            change_page.recover_pending(restarted)
+        self.assertEqual(sum('Use the second layout.' in message for _,_,message in self.fixture.messages),6,
+                         'Each request sends one feedback message to its owner.')
         before = len(self.fixture.messages)
         change_page.recover_pending(change_page.DeliveryStatus(self.root))
         self.assertEqual(len(self.fixture.messages),before)
+
+    def file_sent_question(self) -> str:
+        document = self.fixture.production
+        _ = document.write_text(document.read_text().replace(
+            '# Demo\n', '# Demo\n\n> **Status: PRODUCTION — running.**\n', 1))
+        owner = next(row.id for row in staff.snapshot().rows if row.name == 'page-owner')
+        kind = review_submissions.SubmissionKind.QUESTION
+        request_id = f'r1-{"a" * 32}-{kind}-{owner}'
+        filed = review_submissions.submit(review_submissions.NewItemRequest(
+            request_id, kind, owner, 'Which layout should the page use?', review_submissions.NoEvidence()))
+        return f'question/{owner}/{filed.path.name}'
+
+    def test_sent_question_feedback_recovers_when_the_saved_mark_write_fails(self) -> None:
+        key = self.file_sent_question()
+        words = 'Use the wide layout for the next review.'
+        write = atomic_file.write_bytes_atomic
+
+        def write_delivery(path: Path, content: bytes, *, mode: int | None = None) -> None:
+            if path.name.startswith(change_page.DELIVERY_PREFIX):
+                fields = cast(change_page.StoredDeliverySlots, json.loads(content))
+                saved = fields.get('user_answer')
+                if saved is not None and saved['saved'] and 'verdict' in fields:
+                    raise OSError('fixture delivery save mark failed')
+            write(path, content, mode=mode)
+
+        with patch.object(atomic_file, 'write_bytes_atomic', new=write_delivery):
+            delivery, result = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+        self.assertEqual(result, 'feedback sent')
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertIsInstance(delivery.page, change_page.UserQuestionPage)
+        self.assertEqual(self.fixture.messages, [])
+        closed = next(item for item in review_items.read(self.root) if item.key == key)
+        self.assertEqual(closed.state, review_items.ReviewState.DONE)
+
+        restarted = change_page.DeliveryStatus(self.root)
+        change_page.recover_pending(restarted)
+        change_page.recover_pending(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, message in self.fixture.messages if words in message], ['page-owner'])
+        self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
+        self.assertFalse(restarted.review_save_receipt(delivery.page, delivery.row).exists())
+
+    def test_recovery_does_not_send_again_when_the_completion_write_fails(self) -> None:
+        question = self.file_sent_question()
+        record = self.investigation()
+        for key in (question, f'investigation/{record.owner}/{record.id}'):
+            with self.subTest(key=key):
+                status = change_page.DeliveryStatus(self.root)
+                write_slots = status.write_slots
+
+                def fail_saved_mark(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+                    if isinstance(page, (change_page.UserQuestionPage, change_page.ReviewMessagePage)) and page.saved['saved']:
+                        raise OSError('fixture delivery save mark failed')
+                    write_slots(page, row, slots)
+
+                words = f'Use the wider layout for {key}.'
+                with patch.object(status, 'write_slots', new=fail_saved_mark):
+                    delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                receipt = status.review_save_receipt(delivery.page, delivery.row)
+                self.assertTrue(receipt.exists())
+                path = status.path(delivery.page, delivery.row)
+                restarted = change_page.DeliveryStatus(self.root)
+                write = atomic_file.write_bytes_atomic
+
+                def fail_completion(target: Path, content: bytes, *, mode: int | None = None) -> None:
+                    if target == path and 'verdict' not in json.loads(content):
+                        raise OSError('fixture delivery completion failed')
+                    write(target, content, mode=mode)
+
+                self.fixture.messages.clear()
+                with patch.object(atomic_file, 'write_bytes_atomic', new=fail_completion):
+                    change_page.recover_pending(restarted)
+                self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.DeliveryIntent)
+                self.assertTrue(receipt.exists())
+                self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+                self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
+                self.assertFalse(receipt.exists())
+
+    def test_recovery_sends_after_the_dispatch_marker_sync_fails(self) -> None:
+        question = self.file_sent_question()
+        record = self.investigation()
+        for key in (question, f'investigation/{record.owner}/{record.id}'):
+            with self.subTest(key=key):
+                words = f'Recover the send for {key}.'
+                delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                mark = self.status.closeout_path(delivery.page, delivery.row)
+                sync = atomic_file.sync_folder
+                failed = False
+
+                def fail_sync(folder: Path) -> None:
+                    nonlocal failed
+                    if folder == mark.parent and mark.exists() and not failed:
+                        failed = True
+                        raise OSError('fixture dispatch directory sync failed')
+                    sync(folder)
+
+                with patch.object(atomic_file, 'sync_folder', new=fail_sync):
+                    change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertTrue(failed)
+                self.assertFalse(any(words in message for _, _, message in self.fixture.messages))
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+
+    def test_recovery_alerts_the_owner_after_a_failed_send_and_completion_write(self) -> None:
+        question = self.file_sent_question()
+        record = self.investigation()
+        for key in (question, f'investigation/{record.owner}/{record.id}'):
+            with self.subTest(key=key):
+                words = f'Keep the feedback for {key}.'
+                delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                path = self.status.path(delivery.page, delivery.row)
+                original_message = delivery.message
+                write = atomic_file.write_bytes_atomic
+                send = change_page.send_to_staff
+                original_sends = 0
+
+                def fail_completion(target: Path, content: bytes, *, mode: int | None = None) -> None:
+                    if target == path and 'verdict' not in json.loads(content):
+                        raise OSError('fixture delivery completion failed')
+                    write(target, content, mode=mode)
+
+                def reject_feedback(recipient: staff.StaffId, sender: str, message: str) -> None:
+                    nonlocal original_sends
+                    if message == original_message:
+                        original_sends += 1
+                        raise RuntimeError('fixture recipient offline')
+                    send(recipient, sender, message)
+
+                with patch.object(change_page, 'send_to_staff', new=reject_feedback):
+                    with patch.object(atomic_file, 'write_bytes_atomic', new=fail_completion):
+                        change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                    sends_before_recovery = original_sends
+                    self.assertGreater(sends_before_recovery, 0)
+                    self.assertFalse(any(words in message for _, _, message in self.fixture.messages))
+                    change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                    change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(original_sends, sends_before_recovery)
+                alerts = [message for _, _, message in self.fixture.messages if words in message]
+                self.assertEqual(len(alerts), 1)
+                self.assertIn('Last error: fixture recipient offline', alerts[0])
+                self.assertIsInstance(self.status.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
+
+    def test_recovery_keeps_the_message_when_the_send_result_write_fails(self) -> None:
+        record = self.investigation()
+        key = f'investigation/{record.owner}/{record.id}'
+        words = 'Keep the saved layout.'
+        delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        path = self.status.closeout_path(delivery.page, delivery.row)
+        write = atomic_file.write_bytes_atomic
+
+        def fail_result(target: Path, content: bytes, *, mode: int | None = None) -> None:
+            if target == path and self.fixture.messages:
+                raise OSError('fixture send result failed')
+            write(target, content, mode=mode)
+
+        with patch.object(atomic_file, 'write_bytes_atomic', new=fail_result):
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+        change_page.recover_pending(change_page.DeliveryStatus(self.root))
+        self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+        verdict = self.status.slots(delivery.page, delivery.row).verdict
+        assert isinstance(verdict, change_page.DeliveryIntent)
+        self.assertEqual(verdict.attempt, delivery.attempt)
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
@@ -2857,6 +3041,13 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             with self.subTest(key=key):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
                 body = self.body(key,'later','Read this tomorrow.')+'&'+urlencode({'later':until.isoformat()})
+                if key == question:
+                    with (patch.object(review_later, 'write_text_atomic', side_effect=OSError('fixture deadline write failed')),
+                          self.assertRaisesRegex(OSError, 'fixture deadline write failed')):
+                        _ = review_page.submit(self.root, body, self.status)
+                    current = next(current for current in review_items.read(self.root) if current.key == key)
+                    self.assertEqual(current.log, item.log)
+                    self.assertNotIn(key, review_later.times())
                 _,result = review_page.submit(self.root,body,self.status)
                 self.assertIn('later until',result)
                 hidden = next(item for item in review_items.read(self.root) if item.key == key)
@@ -2972,6 +3163,24 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             stored = efficiency_reviews.path(ledger).read_text()
             self.assertEqual(set(efficiency_reviews.read(ledger)), {'E1', 'E2'}, 'The review file is keyed by the E<n> id.')
             self.assertNotIn('Slower checks', stored, 'The review file never copies the ledger line.')
+
+        with self.subTest(action='decline', kind='efficiency', summary='settings unavailable'):
+            nightly_ledger = ledger.with_name('ledger.md')
+            _ = nightly_ledger.write_text('- 2026-11-03 tests: Slow checks — proposed\n'
+                                          +'- 2026-11-04 tests: Faster checks — proposed\n')
+            doc = self.fixture.production
+            _ = doc.write_text(doc.read_text().replace(str(ledger), str(nightly_ledger)))
+            item = next(item for item in review_items.read(self.root) if item.id == 'page-owner/E1')
+            with (patch.object(candidates, 'state_root', return_value=nightly_ledger.parent),
+                  patch.object(candidates, 'table', side_effect=conf.Unusable('fixture title_characters unavailable')) as summary):
+                delivery, result = review_page.submit(self.root, self.body(item.key, 'decline', 'Too slow.'), self.status)
+            summary.assert_called_once()
+            self.assertEqual(result, 'declined')
+            self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+            self.assertTrue(nightly_ledger.read_text().splitlines()[0].endswith(' — declined'))
+            declined = next(record for record in review_items.read(self.root) if record.key == item.key)
+            self.assertEqual(declined.state, review_items.ReviewState.DONE)
+            self.assertEqual(declined.log[-1].words, 'Decline: Too slow.')
 
     def test_question_answer_words_remain_after_the_answer_archive_expires(self) -> None:
         key = self.question()
