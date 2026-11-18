@@ -883,8 +883,10 @@ The test server joins its request handlers before fixture cleanup and gives each
 1. One dark desktop shot of an Images card's answer buttons, before and after, clipped to the buttons.
 2. The Images and Review page suites pass. basedpyright: 0 errors, 0 warnings.
 
-### Phase 63 — A command in a question shows in a code block with a copy button  · status: todo
+### Phase 63 — A command in a question shows in a code block with a copy button  · status: done
 **Depends on:** none
+
+**Result:** `page_frame.render_code_blocks` splits text into code blocks and text for answers, review text and every question paragraph (ask, context, trailing, choices). A backticked command alone on its line shows in a code block with a copy button.
 
 #### Work Order
 

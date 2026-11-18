@@ -825,7 +825,14 @@ def inline_html(text: str) -> str:
 
 
 def review_text_html(text: str, *, inline: bool = False) -> str:
-    """Render escaped text blocks and lists; `inline` adds Markdown headings and inline formatting."""
+    """Render text blocks and lists. Enable Markdown when inline formatting is on."""
+    if inline:
+        return page_frame.render_code_blocks(text, lambda part: review_prose_html(part, inline=True))
+    return review_prose_html(text)
+
+
+def review_prose_html(text: str, *, inline: bool = False) -> str:
+    """Render text blocks and lists between code blocks."""
     escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) or inline and HEADING.match(line.lstrip()) for line in lines):
@@ -869,20 +876,7 @@ BLANK_EDGES = re.compile(r"\A(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+\Z")
 
 def review_html(text: str) -> str:
     """Render review text as paragraphs, lists, and code blocks with copy controls."""
-    content: list[str] = []
-    start = 0
-    for block in page_frame.CODE_BLOCK.finditer(text):
-        before = BLANK_EDGES.sub("", text[start:block.start()])
-        if before.strip():
-            content.append(review_text_html(before))
-        content.append(page_frame.code_block_html(block))
-        start = block.end()
-    if not content:
-        return review_text_html(BLANK_EDGES.sub("", text))
-    after = BLANK_EDGES.sub("", text[start:])
-    if after.strip():
-        content.append(review_text_html(after))
-    return "".join(content)
+    return page_frame.render_code_blocks(text, lambda part: review_prose_html(BLANK_EDGES.sub("", part)))
 
 
 def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
