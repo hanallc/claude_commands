@@ -1179,7 +1179,8 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
                       "MERGE_CHECKPOINT_REVIEW_REGIME")
         review_command = [PYTHON, script]
         command = [*review_command, "add", "--unit", request.unit.name, "--plan", checkpoint_plan(request).as_posix(),
-                   "--phase", request.phase, "--regime", request.regime, "--started", request.started, "--merged", merged,
+                   "--phase", request.phase, "--checkpoint", request.commit,
+                   "--regime", request.regime, "--started", request.started, "--merged", merged,
                    "--holds", str(request.holds), "--merge-defects", str(request.merge_defects),
                    "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,
                    "--review-minutes", numbers.review_minutes, "--ux-check-minutes", numbers.ux_check_minutes,
