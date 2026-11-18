@@ -2970,7 +2970,7 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
                 and not self._placement_owner_live(saved.assignment.owner))
 
-    def _start_pending(self, saved: records.SavedPlacementAssignment, *, check_hana_evidence: bool = True) -> bool:
+    def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state, offload
 
         provider = saved.provider
@@ -2981,12 +2981,8 @@ done
                 target = target_config.configured_ssh_target(destination.target)
                 transport = _provider_configuration().transport(target)
                 if isinstance(transport, hana_placement.HanaControlTransport):
-                    if not check_hana_evidence:
-                        return True
                     from scripts.aws_target.hana_execution import claim_dispatch_pending
-                    reference = placement.ProviderClaimReference('ssh', destination.target, destination.scope,
-                        placement.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt),
-                        saved.assignment.episode, saved.assignment.attempt)
+                    reference = placement.assigned_claim_reference(saved.assignment)
                     def read_dispatch() -> bool:
                         controller = hana_placement.controller_for(transport, read_only=True)
                         return (controller.execution_bound(reference.claim_id)
@@ -3550,12 +3546,44 @@ done
         self.persist()
         self.next_pass = self.clock.monotonic()
 
+    def _settle_hana_refusal(self, saved: records.SavedPlacementAssignment,
+                             report: placement.TerminalAttemptReport) -> bool:
+        """Close a Hana refusal from a settled journal for an exact unlaunched attempt."""
+        assignment = saved.assignment
+        if (assignment.destination.provider != "ssh" or not isinstance(report.outcome, placement.PrelaunchRefused)
+                or not isinstance(saved.permission, placement.PermissionAvailable)):
+            return False
+        from scripts.aws_target import hana_placement
+        from scripts.aws_target.hana_execution import claim_dispatch_pending, read_claim_execution
+
+        try:
+            target = target_config.configured_ssh_target(assignment.destination.target)
+            transport = _provider_configuration().transport(target)
+            if not isinstance(transport, hana_placement.HanaControlTransport):
+                return False
+            directory = hana_placement.controller_for(transport, read_only=True).directory
+        except (OSError, ValueError):
+            return False
+        reference = placement.assigned_claim_reference(assignment)
+        # The atomic journal proves settlement without a controller lock or a provider probe.
+        if (claim_dispatch_pending(directory, reference)
+                or not isinstance(read_claim_execution(directory, reference), placement.ExecutionNotStarted)):
+            return False
+        settled = replace(report, path=placement.DispatchPathSettled())
+        reason = report.outcome.reason
+        self._close_placement(replace(saved, terminal_report=settled), reason, placement.DoNotRetry(reason))
+        return True
+
     def _settle_attempt_reports(self, keys: PlacementEvidenceKeys) -> None:
         for key, saved in tuple(self.assignments.items()):
             assignment = saved.assignment
             if self.current_assignments.get(assignment.episode) != key:
                 continue
             report = saved.terminal_report
+            if (isinstance(report, placement.TerminalAttemptReport)
+                    and isinstance(report.path, placement.DispatchPathPending)
+                    and self._settle_hana_refusal(saved, report)):
+                continue
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
                     and isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled))
@@ -3594,7 +3622,7 @@ done
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
             self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
-        else:
+        elif not self._settle_hana_refusal(saved, report):
             self._close_placement(saved, outcome.reason,
                 saved.retry if isinstance(saved.retry, placement.RetryAt) else
                 placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at))
@@ -3706,20 +3734,20 @@ done
                             or not scopes_overlap(request.claim.scope, destination.scope)):
                         return [self._placement_status(assignment, "retained claim does not match the assigned provider scope",
                             check_lifetime=False)]
-                pending = self._start_pending(saved, check_hana_evidence=False)
-                path = (placement.DispatchPathPending('provider settlement remains pending')
-                    if pending else placement.DispatchPathSettled())
-                terminal = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason), path, self.clock.now())
+                terminal = placement.TerminalAttemptReport(placement.PrelaunchRefused(request.reason),
+                    placement.DispatchPathPending('provider settlement remains pending'), self.clock.now())
                 retained = request.claim if isinstance(request.claim, placement.ProviderClaimReference) else saved.provider
-                saved = replace(saved, terminal_report=terminal, provider=retained,
-                                refusal_settings=request.refusal_settings)
-                retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
-                if pending:
-                    self.assignments[key] = replace(saved, retry=retry)
-                    self.persist()
-                    self.next_pass = self.clock.monotonic()
-                else:
-                    self._close_placement(saved, request.reason, retry)
+                refused = replace(saved, terminal_report=terminal, provider=retained,
+                                  refusal_settings=request.refusal_settings)
+                if not self._settle_hana_refusal(refused, terminal):
+                    retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
+                    if self._start_pending(saved):
+                        self.assignments[key] = replace(refused, retry=retry)
+                        self.persist()
+                        self.next_pass = self.clock.monotonic()
+                    else:
+                        terminal = replace(terminal, path=placement.DispatchPathSettled())
+                        self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
         elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
                 or isinstance(saved.permission, placement.PermissionAvailable)
                 and (isinstance(request.outcome, placement.PrelaunchRefused)

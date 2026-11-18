@@ -573,6 +573,13 @@ def assigned_claim_id(episode: str, attempt: str) -> str:
     return uuid.uuid5(uuid.NAMESPACE_URL, attempt_key(episode, attempt)).hex
 
 
+def assigned_claim_reference(assignment: PlacementAssignment) -> ProviderClaimReference:
+    """Identify the provider claim whose key derives from the assignment."""
+    destination = assignment.destination
+    return ProviderClaimReference(destination.provider, destination.target, destination.scope,
+        assigned_claim_id(assignment.episode, assignment.attempt), assignment.episode, assignment.attempt)
+
+
 def retry_decision(destination: PlacementDestination, reason: str, now: float) -> RetryDecision:
     """Keep the existing remote decline delays separate from evidence age."""
     if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
