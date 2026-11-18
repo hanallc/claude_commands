@@ -1579,7 +1579,8 @@ send.deliver_worker_text = fake_sender
         def save_reason() -> None:
             try:
                 self.assertTrue(detached_runs.stop_with_reason(
-                    path, reason, still_current=lambda: True, signal_run=lambda: None))
+                    path, reason, verify_group=lambda: detached_runs.CommandGroup(10, "2000"),
+                    signal_group=lambda _group, _signum: None))
             finally:
                 writer_finished.set()
                 writer_progress.set()
@@ -1612,15 +1613,16 @@ send.deliver_worker_text = fake_sender
                 if timing == "before publication":
                     if previous:
                         self.assertTrue(detached_runs.stop_with_reason(
-                            path, previous, still_current=lambda: True, signal_run=lambda: None))
+                            path, previous, verify_group=lambda: detached_runs.CommandGroup(10, "2000"),
+                            signal_group=lambda _group, _signum: None))
 
                     @contextlib.contextmanager
                     def cancel_before_save(path: Path) -> Generator[None]:
                         if not cancelled.is_set():
                             cancelled.set()
                             self.assertFalse(detached_runs.stop_with_reason(
-                                path, reason, still_current=lambda: False,
-                                signal_run=lambda: self.fail("a cancelled stop must not signal")))
+                                path, reason, verify_group=detached_runs.CommandGroupUnverified,
+                                signal_group=lambda _group, _signum: self.fail("a cancelled stop must not signal")))
                         with record_lock(path):
                             yield
 

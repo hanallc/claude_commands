@@ -228,21 +228,23 @@ def _read_record(path: Path) -> RunRecord:
 
 
 def stop_with_reason(
-    path: Path, reason: str, *, still_current: Callable[[], bool], signal_run: Callable[[], None],
+    path: Path, reason: str, *, verify_group: Callable[[], CommandGroup | CommandGroupUnverified],
+    signal_group: Callable[[int, int], None],
 ) -> bool:
-    """Save the reason and complete the stop decision under one record lock."""
+    """Save the reason and signal the verified group under one record lock."""
     with record_lock(path):
         record = worker_lifecycle.read_json_object(path)
         if not _is_run_record(record) or path.name != f"{record['run_id']}.json":
             return False
-        if not still_current():
+        if isinstance(verify_group(), CommandGroupUnverified):
             return False
         stopping = {**record, "stop_reason": reason}
         stopped = False
         try:
             write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
-            if still_current():
-                signal_run()
+            command = verify_group()
+            if isinstance(command, CommandGroup):
+                signal_group(command.group, signal.SIGTERM)
                 stopped = True
         finally:
             if not stopped:
@@ -255,6 +257,11 @@ class CommandGroup:
     """The recorded process group of a running command and the start identity of its leader."""
     group: int
     started: str
+
+
+@dataclass(frozen=True)
+class CommandGroupUnverified:
+    """The current command group could not be confirmed."""
 
 
 def command_group(path: Path) -> CommandGroup | None:
@@ -271,23 +278,16 @@ def stop_command(path: Path, reason: str) -> bool:
     """Save the reason and TERM the command group while the supervisor and command leader are current."""
     record = worker_lifecycle.read_json_object(path)
     supervisor = _integer(record.get("pid"))
-    verified_group: CommandGroup | None = None
 
-    def still_current() -> bool:
-        nonlocal verified_group
+    def verify_group() -> CommandGroup | CommandGroupUnverified:
         command = command_group(path)
         if (command is None or detached_run_process.supervisor_match(supervisor, path) is not True
                 or process_start.process_start(command.group) != process_start.Started(command.started)):
-            return False
-        verified_group = command
-        return True
-
-    def signal_run() -> None:
-        assert verified_group is not None
-        process_group.send_process_group(verified_group.group, signal.SIGTERM)
+            return CommandGroupUnverified()
+        return command
 
     try:
-        return stop_with_reason(path, reason, still_current=still_current, signal_run=signal_run)
+        return stop_with_reason(path, reason, verify_group=verify_group, signal_group=process_group.send_process_group)
     except ProcessLookupError:
         return False
 

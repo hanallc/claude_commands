@@ -901,10 +901,13 @@ class HoldEnforcerTests(unittest.TestCase):
         assert isinstance(run, hold_enforcer.WaitingRun)
         holder, = build_hold.natedev_holds(self.holders).in_force
         read_supervisor_args = hold_enforcer.supervisor_args
-        for argument, current, prefix in ((str(record), False, ("python3",)), (str(record), True, ("python3",)),
-                                           (record.name, True, ("python3",)),
-                                           (str(record), False, ("python3", "unrelated.py"))):
-            with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix):
+        for argument, current, prefix, changes in ((str(record), False, ("python3",), False),
+                                                   (str(record), True, ("python3",), False),
+                                                   (record.name, True, ("python3",), False),
+                                                   (str(record), False, ("python3", "unrelated.py"), False),
+                                                   (str(record), True, ("python3",), True)):
+            with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix,
+                              group_changes_after_check=changes):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", argument))
                 table = self.table()
@@ -926,11 +929,15 @@ class HoldEnforcerTests(unittest.TestCase):
                     self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                     signals.append((pid, signum))
 
-                result = hold_enforcer.stop_waiting_run(
-                    run, holder, table, self.proc, supervisor_args=supervisor_args,
-                    signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
-                    signal_group=signal_group,
-                )
+                with mock.patch.object(detached_runs, "command_group", wraps=detached_runs.command_group) as read_group:
+                    if changes:
+                        group = detached_runs.CommandGroup(10, "11000")
+                        read_group.side_effect = [group, group, detached_runs.CommandGroup(20, "12000")]
+                    result = hold_enforcer.stop_waiting_run(
+                        run, holder, table, self.proc, supervisor_args=supervisor_args,
+                        signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                        signal_group=signal_group,
+                    )
                 self.assertIn(100, inspected)
                 if current:
                     self.assertIsInstance(result, hold_enforcer.StoppedRun)
