@@ -243,17 +243,25 @@ def stop_with_reason(
             return False
         pending = path.with_suffix(".stop-pending")
         stopping = {**record, "stop_reason": reason}
+        signaled = False
         try:
-            write_text_atomic(pending, json.dumps(stopping, indent=2, sort_keys=True),
-                              new_file_mode=path.stat().st_mode & 0o777)
-            command = verify_group()
-            if isinstance(command, CommandGroupUnverified):
-                return False
-            signal_group(command.group, signal.SIGTERM)
-            _ = pending.replace(path)
-            atomic_file.sync_folder(path.parent)
-        finally:
-            pending.unlink(missing_ok=True)
+            try:
+                write_text_atomic(pending, json.dumps(stopping, indent=2, sort_keys=True),
+                                  new_file_mode=path.stat().st_mode & 0o777)
+                command = verify_group()
+                if isinstance(command, CommandGroupUnverified):
+                    return False
+                signal_group(command.group, signal.SIGTERM)
+                signaled = True
+                _ = pending.replace(path)
+                atomic_file.sync_folder(path.parent)
+            finally:
+                pending.unlink(missing_ok=True)
+        except OSError as error:
+            if not signaled:
+                raise
+            print(f"detached_runs: {path}: sent SIGTERM but could not publish the stop reason: {error}",
+                  file=sys.stderr)
         return True
 
 
@@ -329,7 +337,9 @@ def _group_is_live(group: int) -> bool:
     try:
         result = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
                                 capture_output=True, text=True, check=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return True
+    if result.stderr or not result.stdout.strip():
         return True
     for line in result.stdout.splitlines():
         fields = line.split()
@@ -415,7 +425,8 @@ class OrphanReapResult:
                     continue
                 try:
                     current = _read_record(path)
-                except SystemExit:
+                except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
+                    print(" ".join(str(error).splitlines()), file=sys.stderr)
                     continue
                 if current.get("completion_pending") is True:
                     _finish_record(path, current)

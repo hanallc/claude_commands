@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import subprocess
 
 from scripts.lib import conf
@@ -16,7 +17,7 @@ class ProcessCommandText:
 
 @dataclass(frozen=True)
 class ProcessArgumentsUnavailable:
-    """The ps process check failed."""
+    """The process arguments are unavailable."""
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ def process_args(pid: int) -> list[str] | ProcessCommandText | ProcessArgumentsU
     command = shown.stdout.strip()
     if shown.returncode == 1 and not command and not shown.stderr.strip():
         return ProcessAbsent()
-    if shown.returncode or not command:
+    if shown.returncode or not command or re.fullmatch(r"\([^()]+\)", command):
         return ProcessArgumentsUnavailable()
     return ProcessCommandText(command)
 
