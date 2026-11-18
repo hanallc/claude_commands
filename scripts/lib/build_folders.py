@@ -372,9 +372,11 @@ def _open_lock(path: Path, directory: int, *, create: bool) -> int:
 
 def _take_lock(descriptor: int, mode: int, *, wait: bool = True) -> bool:
     """Try the lock until the configured probe wait ends, or once when wait is False."""
-    settings = _settings()
-    deadline = time.monotonic() + (settings.number("locks.probe_wait_seconds") if wait else 0.0)
-    retry = settings.number("locks.probe_retry_seconds")
+    deadline = retry = 0.0
+    if wait:
+        settings = _settings()
+        deadline = time.monotonic() + settings.number("locks.probe_wait_seconds")
+        retry = settings.number("locks.probe_retry_seconds")
     while True:
         try:
             fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
@@ -394,24 +396,28 @@ def _lock_current(path: Path, directory: int, descriptor: int) -> bool:
         return False
 
 
-def build_folder_state(path: Path) -> Literal["held", "free"]:
-    """Check the lock without using the lease record or session state."""
+def build_folder_state(path: Path, *, wait: bool = True) -> Literal["held", "free"]:
+    """Check whether a lock or a populated scope holds the folder."""
     try:
         with _folder_parent(path, path.parent, create=False) as directory:
             while True:
-                descriptor = _open_lock(path, directory, create=False)
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_EX):
-                        if _lock_current(path, directory, descriptor):
-                            return "held"
-                        continue
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                    if _lock_current(path, directory, descriptor):
-                        return "free"
+                    descriptor = _open_lock(path, directory, create=False)
+                except FileNotFoundError:
+                    _ = claim_free_build_folder(path, directory, MissingFolderLock.ABSENT, wait=wait)
+                    return "free"
+                try:
+                    _ = claim_free_build_folder(path, directory, descriptor, wait=wait)
+                    return "free"
+                except BuildFolderLockChanged:
+                    if not wait:
+                        return "held"
                 finally:
                     os.close(descriptor)
     except FileNotFoundError:
         return "free"
+    except (OSError, ValueError):
+        return "held"
 
 
 def build_folder_lock_fd(path: Path) -> int:
@@ -445,23 +451,35 @@ class CheckoutScopeBinding:
     lease_owner: int
 
 
-class LeaseReadPurpose(Enum):
-    ACQUIRE = auto()
-    UPDATE_HELD = auto()
+class MissingFolderLock(Enum):
+    ABSENT = auto()
 
 
-def _read_lease(path: Path, directory: int, purpose: LeaseReadPurpose) -> dict[str, object]:
-    """Read the lease. Refuse acquisition while its recorded scope is busy."""
-    try:
-        descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-    except FileNotFoundError:
-        if purpose is LeaseReadPurpose.UPDATE_HELD:
-            raise
-        return {}
+class BuildFolderLockChanged(BlockingIOError):
+    """The lock file changed before acquisition."""
+
+
+@dataclass(frozen=True)
+class MalformedLeaseRecord:
+    """A free lock has metadata that cannot supply lease attribution."""
+
+    error: ValueError
+
+
+def _read_lease(path: Path, directory: int) -> dict[str, object]:
+    descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(descriptor) as source:
-        lease = cast(dict[str, object], json.load(source))
-    if purpose is LeaseReadPurpose.UPDATE_HELD or "scope" not in lease:
-        return lease
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "a build folder lease must be a regular file", str(path))
+        record = cast(object, json.load(source))
+    if not isinstance(record, dict):
+        raise ValueError("a build folder lease must be an object")
+    return cast(dict[str, object], record)
+
+
+def _require_empty_checkout_scope(path: Path, lease: dict[str, object]) -> None:
+    if "scope" not in lease:
+        return
     scope_name = lease["scope"]
     try:
         if not isinstance(scope_name, str) or not Path(scope_name).is_absolute():
@@ -473,11 +491,11 @@ def _read_lease(path: Path, directory: int, purpose: LeaseReadPurpose) -> dict[s
             try:
                 _ = scope.stat()
             except FileNotFoundError:
-                return lease
+                return
             raise
         if "populated 1" not in fields:
             if "populated 0" in fields:
-                return lease
+                return
             raise ValueError("cgroup.events has no populated state")
     except (OSError, ValueError) as error:
         print(f"{path}: cannot check checkout scope {scope_name!r}: {error}", file=sys.stderr)
@@ -485,14 +503,34 @@ def _read_lease(path: Path, directory: int, purpose: LeaseReadPurpose) -> dict[s
     raise BlockingIOError(errno.EWOULDBLOCK, "the checkout scope is populated", str(path))
 
 
+def claim_free_build_folder(path: Path, directory: int, descriptor: int | MissingFolderLock, *,
+                            mode: int = fcntl.LOCK_EX, wait: bool = True) -> dict[str, object] | MalformedLeaseRecord:
+    """Take the current lock and require an empty scope. The caller closes the lock."""
+    if isinstance(descriptor, int):
+        acquired = _take_lock(descriptor, mode, wait=wait)
+        if not _lock_current(path, directory, descriptor):
+            raise BuildFolderLockChanged(errno.EWOULDBLOCK, "build folder lock changed", str(path))
+        if not acquired:
+            raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
+    try:
+        lease = _read_lease(path, directory)
+    except FileNotFoundError:
+        return {}
+    except ValueError as error:
+        return MalformedLeaseRecord(error)
+    _require_empty_checkout_scope(path, lease)
+    return lease
+
+
 def _write_lease(path: Path, directory: int, spec: BuildFolderSpec | CheckoutScopeBinding, *, released: bool = False,
                  ready: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
     record: dict[str, object]
     if isinstance(spec, CheckoutScopeBinding):
-        record = _read_lease(path, directory, LeaseReadPurpose.UPDATE_HELD)
+        record = _read_lease(path, directory)
         if record.get("pid") != spec.lease_owner or record.get("ready") is not True:
             raise ValueError(f"{path}: the checkout lease owner changed before scope publication")
+        _require_empty_checkout_scope(path, record)
         record["scope"] = str(spec.scope)
     else:
         record = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
@@ -500,7 +538,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec | CheckoutSco
                   "start_time": now}
         if spec.kind == "slot" and isinstance(spec.slot_checkout, SlotCheckout):
             if released:
-                record = _read_lease(path, directory, LeaseReadPurpose.UPDATE_HELD)
+                record = _read_lease(path, directory)
             record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
                           commit=spec.slot_checkout.commit, last_use=now, ready=ready)
     name = path.name + ".lease.json"
@@ -529,7 +567,13 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec | CheckoutSco
             pass
 
 
-write_checkout_lease = _write_lease
+def write_checkout_lease(path: Path, binding: CheckoutScopeBinding, descriptor: int) -> None:
+    """Bind the scope under the copy owner's pipe or the inherited slot lock."""
+    with _folder_parent(path, path.parent, create=False) as directory:
+        if not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
+            if not _lock_current(path, directory, descriptor) or not _take_lock(descriptor, fcntl.LOCK_EX, wait=False):
+                raise ValueError(f"{path}: the prepared checkout lock is missing")
+        _write_lease(path, directory, binding)
 
 
 @dataclass(frozen=True)
@@ -611,13 +655,15 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 new_folder = False
                 new_branch_start = ""
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "slot" and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind != "slot"):
+                    mode = fcntl.LOCK_SH if stable and spec.kind != "slot" and not editable_repository else fcntl.LOCK_EX
+                    try:
+                        lease = claim_free_build_folder(path, directory, descriptor, mode=mode, wait=spec.kind != "slot")
+                    except BuildFolderLockChanged:
+                        continue
+                    except BlockingIOError:
                         if renamed:
                             continue
-                        raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
-                    if not _lock_current(path, directory, descriptor):
-                        continue
+                        raise
                     try:
                         existing = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
@@ -634,7 +680,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     if isinstance(spec.slot_checkout, SlotCheckout):
                         import subprocess
 
-                        lease = _read_lease(path, directory, LeaseReadPurpose.ACQUIRE)
+                        if isinstance(lease, MalformedLeaseRecord):
+                            raise lease.error
                         if existing is None or lease.get("ready") is not True:
                             try:
                                 source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
@@ -876,12 +923,17 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     try:
         descriptor = _open_lock(path, directory, create=False)
     except FileNotFoundError:
-        _ = _read_lease(path, directory, LeaseReadPurpose.ACQUIRE)
-        return UnreservedRemovalFolder()
-    _ = stack.callback(os.close, descriptor)
-    if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) or not _lock_current(path, directory, descriptor):
+        descriptor = MissingFolderLock.ABSENT
+    if isinstance(descriptor, int):
+        _ = stack.callback(os.close, descriptor)
+    try:
+        lease = claim_free_build_folder(path, directory, descriptor, wait=wait)
+    except BlockingIOError:
         return RefusedRemovalLease()
-    _ = _read_lease(path, directory, LeaseReadPurpose.ACQUIRE)
+    if isinstance(lease, MalformedLeaseRecord):
+        return RefusedRemovalLease()
+    if isinstance(descriptor, MissingFolderLock):
+        return UnreservedRemovalFolder()
     _ = stack.callback(_locks.pop, descriptor, None)
     _locks[descriptor] = path
     return HeldFolderRemovalLease(path, directory, descriptor)
@@ -894,11 +946,12 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bo
             raise error
 
     for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
-        for name in files:
-            stem = name.removesuffix(".lock")
-            if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if isinstance(_hold_free_lease(Path(top) / stem, directory, stack, wait=wait), RefusedRemovalLease):
-                    return False
+        filenames = set(files)
+        names = {match[1] for name in files if (match := _METADATA.fullmatch(name)) is not None
+                 and (match[1] in folders or (match[1] + ".lock" in filenames and match[1] + ".lease.json" in filenames))}
+        for name in sorted(names):
+            if isinstance(_hold_free_lease(Path(top) / name, directory, stack, wait=wait), RefusedRemovalLease):
+                return False
     return True
 
 
@@ -929,7 +982,7 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
 def collector_lease(path: Path, *, children: bool = False, wait: bool = True) -> Generator[bool]:
     """Hold a managed folder's lease lock while a collector judges and removes it.
 
-    Yield False when an owner holds the lease. A folder without a lock file has no lease.
+    Yield False when a lock or a populated scope holds the folder.
     Use build_folder_lock_fd while the collector holds the lock.
     A lock file or lease record is judged by its folder's lease. With children, also hold every lease below the folder; a held one, or an unreadable
     folder, is busy.
@@ -974,9 +1027,9 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
             return cleanup() is not False
         descriptor = _open_lock(path, directory, create=True)
         try:
-            if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
-                return False
-            if not _lock_current(path, directory, descriptor):
+            try:
+                _ = claim_free_build_folder(path, directory, descriptor, wait=wait)
+            except BlockingIOError:
                 return False
             if cleanup() is False:
                 return False
@@ -1068,15 +1121,10 @@ def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[Build
 def _lease_owner_ended(path: Path, directory: int) -> bool:
     """True when the lease names a process that no longer runs. An unreadable lease is not proof."""
     try:
-        descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-    except OSError:
+        record = _read_lease(path, directory)
+    except (OSError, ValueError):
         return False
-    with os.fdopen(descriptor) as lease:
-        try:
-            record = cast(object, json.load(lease))
-        except ValueError:
-            return False
-    pid = cast(dict[str, object], record).get("pid") if isinstance(record, dict) else None
+    pid = record.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return False
     try:

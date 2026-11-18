@@ -10,12 +10,13 @@ import os
 from pathlib import Path
 import select
 import subprocess
+import sys
 from threading import Event
 from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, placement
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
@@ -26,19 +27,21 @@ from scripts.lib import build_folders, build_slots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_admit import scope_members
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
 DOC_COMMAND = ("bash", str(VERIFY), "doc")
 
 
 class VerifyDocCheckoutTests(VerifyDocFixture):
-    def start_doc(self, *, command: tuple[str, ...] = DOC_COMMAND) -> tuple[subprocess.Popen[bytes], Path, str]:
+    def start_doc(self, *, command: tuple[str, ...] = DOC_COMMAND,
+                  pass_fds: tuple[int, ...] = ()) -> tuple[subprocess.Popen[bytes], Path, str]:
         log = self.root / "verify.log"
         marker = f"TEST_DOC_CHECKOUT={self.root}"
         with log.open("wb") as output:
             process = subprocess.Popen(
                 command, cwd=self.repo, stdout=output, stderr=output,
-                env={**self.environment, "TEST_DOC_CHECKOUT": str(self.root)}, start_new_session=True,
+                env={**self.environment, "TEST_DOC_CHECKOUT": str(self.root)}, start_new_session=True, pass_fds=pass_fds,
             )
         self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
         self.addCleanup(reap, marker)
@@ -94,7 +97,8 @@ if not script.endswith("/verify_scoped_step.py"):
             self.assertEqual(len(self.pass_records()), 1)
 
     def assert_doc_retains_checkout_until_scope_empties(self, *, interrupt: bool,
-                                                       sweep_scope_sidecar: bool = False) -> None:
+                                                       sweep_scope_sidecar: bool = False,
+                                                       command: tuple[str, ...] = DOC_COMMAND) -> None:
         admission = self.use_real_scope()
         scope_file = self.root / "doc-scope"
         child_pid = self.root / "doc-descendant"
@@ -118,7 +122,7 @@ if not script.endswith("/verify_scoped_step.py"):
     wait_for_file(Path({str(release)!r}))
     raise SystemExit(0)
 '''))
-        process, log, marker = self.start_doc()
+        process, log, marker = self.start_doc(command=command)
         wait_until(lambda: child_pid.is_file() or process.poll() is not None, self.root, processes=(process,))
         self.assertTrue(child_pid.is_file(), log.read_text())
         descendant = int(child_pid.read_text())
@@ -170,6 +174,56 @@ if not script.endswith("/verify_scoped_step.py"):
 
     def test_doc_scope_stop_failure_retains_checkout_and_reservation_after_sidecar_sweep(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(interrupt=False, sweep_scope_sidecar=True)
+
+    def test_copies_run_binds_the_prepared_doc_checkout_before_cargo(self) -> None:
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            caller = fixture_member("showrunner", name="doc-copy")
+            self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
+            copies = VERIFY.parents[1] / "copies/copies.py"
+            self.assert_doc_retains_checkout_until_scope_empties(interrupt=False, command=(
+                sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--", *DOC_COMMAND,
+            ))
+
+    def test_doc_refuses_launch_when_the_scope_publication_is_lost(self) -> None:
+        config = Path(self.environment["CONF_DIR"]) / "direct.conf"
+        _ = write_config_fixture(config, "# range: 5e-324..\nVERIFY_SCOPE_PUBLICATION_SECONDS=1\n")
+        waiting = self.root / "scope-awaiting-permission"
+        self.environment["TEST_SCOPE_WAITING"] = str(waiting)
+        launcher = self.root / "bin/systemd-run"
+        self.executable(launcher, launcher.read_text().replace('exec "$@" 2>&1', '''
+rm -- "$peak.cgroup"
+: > "$TEST_SCOPE_WAITING"
+IFS= read -r permission || exit 125
+exit 99
+'''))
+        self.install_scope_interpreter(f'''
+from pathlib import Path
+import runpy
+sys.path.insert(0, {str(VERIFY.parents[2])!r})
+from scripts.direct.wait_for_test_state import wait_for_file
+from unittest.mock import patch
+from scripts.direct import verify_scoped_step
+
+start = verify_scoped_step.subprocess.Popen
+
+def start_after_publication_is_lost(*args, **kwargs):
+    process = start(*args, **kwargs)
+    wait_for_file(Path({str(waiting)!r}))
+    return process
+
+with patch.object(verify_scoped_step.subprocess, "Popen", start_after_publication_is_lost):
+    sys.argv = script_arguments
+    runpy.run_path(script, run_name="__main__")
+''')
+        process, log, _ = self.start_doc()
+        wait_until(lambda: waiting.is_file() or process.poll() is not None, self.root, processes=(process,))
+        self.assertTrue(waiting.is_file(), log.read_text())
+        self.assertEqual(process.wait(timeout=8), 125, log.read_text())
+        output = log.read_text()
+        self.assertIn("the checkout scope publication timed out", output)
+        self.assertIn("keeping the reservation", output)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.pass_records())
 
     def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
         recorded_failure = self.root / "recorded-scope-failure"
@@ -430,9 +484,12 @@ else:
                 original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
             self.repo: Path = slot.path
             self.environment["BUILDLOG_PREPARED_COPY"] = str(slot.path)
+            descriptor = build_folders.build_folder_lock_fd(slot.path)
+            self.environment["BUILDLOG_PREPARED_COPY_LOCK_FD"] = str(descriptor)
+            self.environment["BUILDLOG_RUN"] = f"{os.getpid()}:{admission_records.process_start_time(os.getpid())}"
             self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(slot.path))
-            result = self.verify()
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            process, log, _ = self.start_doc(pass_fds=(descriptor,))
+            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
             self.assertEqual(self.cargo_calls()[0]["cwd"], str(slot.path))
             self.assertEqual(build_folders.build_folder_state(slot.path), "held")
             self.assertEqual(list((self.root / "slots").glob("*-slot*.lease.json")),

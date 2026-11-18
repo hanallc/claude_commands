@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 import errno
 import fcntl
+import math
 import os
 from pathlib import Path
 import select
@@ -20,7 +21,7 @@ except FileNotFoundError:
     pass
 
 from scripts.build_queue.admission_records import process_start_time
-from scripts.lib import build_folders, inotify
+from scripts.lib import build_folders, conf, inotify
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
@@ -134,18 +135,23 @@ def drain_scope(scope: Path) -> None:
 
 def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit: str) -> Path:
     """Read the published scope while Cargo waits for its checkout lease."""
+    deadline = time.monotonic() + conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
     owners.register(watch, select.POLLIN)
     try:
+        scope = published_scope(sidecar, unit)
         while True:
-            if any(descriptor != watch for descriptor, _ in owners.poll()):
+            if isinstance(scope, Path):
+                return scope
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("the checkout scope publication timed out")
+            if any(descriptor != watch for descriptor, _ in owners.poll(math.ceil(remaining * 1000))):
                 raise ValueError("the checkout scope owner exited before launch")
-            for event in inotify.events(watch):
-                if event.mask & inotify.WATCH_REMOVED:
-                    raise ValueError("the checkout scope publication folder disappeared")
-                if event.name == sidecar.name or event.mask & inotify.IN_Q_OVERFLOW:
-                    scope = published_scope(sidecar, unit)
-                    if isinstance(scope, Path):
-                        return scope
+            events = inotify.read_events(watch)
+            if any(event.mask & inotify.WATCH_REMOVED for event in events):
+                raise ValueError("the checkout scope publication folder disappeared")
+            if any(event.name == sidecar.name or event.mask & inotify.IN_Q_OVERFLOW for event in events):
+                scope = published_scope(sidecar, unit)
     finally:
         owners.unregister(watch)
 
@@ -154,12 +160,7 @@ def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path) -> None:
     owner_start = process_start_time(checkout.lease_owner)
     if owner_start is None:
         raise ValueError("the checkout lease owner exited before scope publication")
-    directory = os.open(checkout.path.parent, os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        build_folders.write_checkout_lease(checkout.path, directory,
-                                           build_folders.CheckoutScopeBinding(scope, checkout.lease_owner))
-    finally:
-        os.close(directory)
+    build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner), 9)
     if process_start_time(checkout.lease_owner) != owner_start:
         raise ValueError("the checkout lease owner exited during scope publication")
 

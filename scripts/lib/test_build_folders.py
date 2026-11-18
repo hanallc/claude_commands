@@ -1072,6 +1072,23 @@ print('signals')
         scope.rmdir()
         self.assert_scope_allows_slot_and_collector(spec, checkout)
 
+    def test_checkout_scope_blocks_direct_removal_until_empty(self) -> None:
+        _, checkout, scope = self.slot_with_recorded_scope()
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        cleanup = mock.Mock(side_effect=lambda: shutil.rmtree(checkout))
+        self.assertFalse(folders.remove_build_folder(checkout, cleanup))
+        cleanup.assert_not_called()
+        self.assertEqual(folders.build_folder_state(checkout), "held")
+        checkout.with_name(checkout.name + ".lock").unlink()
+        self.assertEqual(folders.build_folder_state(checkout), "held")
+        with folders.collector_lease(checkout.parent, children=True) as free:
+            self.assertFalse(free)
+        _ = events.write_text("populated 0\n")
+        self.assertEqual(folders.build_folder_state(checkout), "free")
+        self.assertTrue(folders.remove_build_folder(checkout, cleanup))
+        cleanup.assert_called_once_with()
+
     def test_checkout_scope_read_error_reports_and_blocks_reuse_and_collection(self) -> None:
         spec, checkout, scope = self.slot_with_recorded_scope()
         (scope / "cgroup.events").mkdir()

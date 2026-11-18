@@ -78,6 +78,27 @@ class RepositorySlotWaitTests(unittest.TestCase):
         self.assertEqual(retry_peer.replies()[-1], wire.RepositorySlotReady())
         self.assertIn(second.episode, fixture.server.repository_slot_waiters)
 
+    def test_capacity_waits_for_a_populated_scope_after_its_lock_closes(self) -> None:
+        fixture, settings = self.pool()
+        slot = settings.slots / "widget-slot1"
+        slot.mkdir()
+        slot.with_suffix(".lock").touch()
+        scope = fixture.root / "checkout.scope"
+        scope.mkdir()
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        _ = slot.with_suffix(".lease.json").write_text(json.dumps({"scope": str(scope)}))
+        request = self.request(fixture, settings)
+        peer = fixture.connect(request)
+        reply = peer.replies()[-1]
+        self.assertIsInstance(reply, wire.RepositorySlotWaiting)
+        assert isinstance(reply, wire.RepositorySlotWaiting)
+        self.assertEqual(reply.held, (1,))
+        _ = events.write_text("populated 0\n")
+        _ = fixture.server.run_pass()
+        self.assertEqual(peer.replies()[-1], wire.RepositorySlotReady())
+        self.assertFalse(fixture.server.reservations)
+
     def test_finite_wait_names_the_repository_held_slots_and_maximum_key(self) -> None:
         fixture, settings = self.pool()
         _ = self.hold(settings)

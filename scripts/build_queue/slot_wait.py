@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from scripts.lib import conf
+from scripts.lib import build_folders, conf
 from scripts.build_queue import admission_wire as wire
 
 
@@ -12,27 +12,14 @@ class SlotWaitExpired(RuntimeError):
     """The repository pool has no capacity before the wait ends."""
 
 
-def read_pool(repository: str, machine: str, root: Path, locks: str) -> wire.RepositorySlotWaiting:
-    """Read lock holders without taking a slot lock or changing a slot."""
+def read_pool(repository: str, machine: str, root: Path, _locks: str) -> wire.RepositorySlotWaiting:
+    """Check each slot without waiting for its lease."""
     settings = conf.read_or_repository("build_folders")
     key = f"slots.{machine}.{repository}.max"
     maximum = settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
-    holders: set[tuple[int, int, int]] = set()
-    for line in locks.splitlines():
-        fields = line.split()
-        if len(fields) < 6 or fields[1] != "FLOCK" or fields[3] != "WRITE":
-            continue
-        major, minor, inode = fields[5].split(":")
-        holders.add((int(major, 16), int(minor, 16), int(inode)))
-    held: list[int] = []
-    for number in range(1, maximum + 1):
-        try:
-            info = (root / f"{repository}-slot{number}.lock").stat()
-        except FileNotFoundError:
-            continue
-        if (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino) in holders:
-            held.append(number)
-    return wire.RepositorySlotWaiting(repository, tuple(held), maximum, key)
+    held = tuple(number for number in range(1, maximum + 1)
+                 if build_folders.build_folder_state(root / f"{repository}-slot{number}", wait=False) == "held")
+    return wire.RepositorySlotWaiting(repository, held, maximum, key)
 
 
 def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, episode: str,

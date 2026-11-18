@@ -2754,20 +2754,35 @@ run_placed_scope() {
     printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
         "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
     export BUILDLOG_RESERVED_STEP
-    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_pipe=/dev/null checkout_owner=""
-    # Keep the copy owner alive while the supervisor binds the scope.
+    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_fd=- checkout_pipe="" checkout_owner=""
+    # Keep the checkout lease while the supervisor binds the scope.
     if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
         checkout_pipe="/dev/fd/$DOC_COPY_LEASE_FD"
         checkout_owner=$DOC_COPY_OWNER_PID
+    elif [[ "$CMD" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
+        checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
+        checkout_owner=${BUILDLOG_RUN:-}
+        checkout_owner=${checkout_owner%%:*}
+        if [[ ! "$checkout_fd" =~ ^[0-9]+$ || ! -e "/dev/fd/$checkout_fd" || -z "$checkout_owner" ]]; then
+            printf 'the prepared checkout has no inherited lease\n' > "$PLACEMENT_SCOPE_STATE"
+            return 125
+        fi
     fi
     # The scope writes to a file. Only the reader can write to the log pipeline.
     if ! : > "$output"; then
         printf 'cannot create the scope output file\n' > "$PLACEMENT_SCOPE_STATE"
         return 125
     fi
-    VERIFY_DOC_CHECKOUT_OWNER="$checkout_owner" \
-        "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
-        "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@" 9>"$checkout_pipe" > "$output" 2>&1 &
+    (
+        if [[ -n "$checkout_pipe" ]]; then
+            exec 9>"$checkout_pipe" || exit 125
+        else
+            exec 9>&"$checkout_fd" || exit 125
+        fi
+        export VERIFY_DOC_CHECKOUT_OWNER="$checkout_owner"
+        exec "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
+            "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@"
+    ) > "$output" 2>&1 &
     supervisor=$!
     tail -n +1 --follow --pid="$supervisor" --sleep-interval=0.1 "$output" &
     reader=$!

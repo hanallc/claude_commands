@@ -1171,6 +1171,12 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                 tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label,
                     queue_position=admitted.queue_position))
                 admitted.handoff(tree)
+                key = "BUILDLOG_PREPARED_COPY_LOCK_FD"
+                if key in os.environ:
+                    _ = scope.callback(os.environ.__setitem__, key, os.environ[key])
+                else:
+                    _ = scope.callback(os.environ.pop, key, None)
+                os.environ[key] = str(build_folders.build_folder_lock_fd(tree))
             else:
                 # OtherCommand has no first queue step to admit.
                 tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label))
