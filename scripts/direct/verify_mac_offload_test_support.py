@@ -47,6 +47,8 @@ from scripts.lib.shell_test_support import shell_functions
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
+_REACHABLE_SSH_STUB = '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
+
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run the real claim CLI; its copy signals still cross the process boundary."""
@@ -812,15 +814,20 @@ if __name__ == "__main__":
 SLEEP_STUB = r'''#!/bin/sh
 # Record the requested interval; only explicit routing gates block this fixture.
 root=$TEST_RUNNER_STATE
+count_events() {
+    count=0
+    if [ -s "$1" ]; then
+        while IFS= read -r line; do count=$((count + 1)); done < "$1"
+    fi
+}
 if [ "${TEST_PROVIDER_ROUTE_POLL_GATES:-0}" = 1 ]; then
     if [ "$1" != "${BUILD_TARGETS_POLL_S:-15}" ]; then
         exec "$TEST_REAL_SLEEP" "$@"
     fi
-    attempts=0
-    previous=0
-    if [ -s "$root/runner-events.jsonl" ]; then attempts=$(wc -l < "$root/runner-events.jsonl"); fi
-    if [ -s "$root/sleep-events" ]; then previous=$(wc -l < "$root/sleep-events"); fi
-    if [ "$attempts" -le "$previous" ]; then exit 0; fi
+    count_events "$root/runner-events.jsonl"
+    attempts=$count
+    count_events "$root/sleep-events"
+    if [ "$attempts" -le "$count" ]; then exit 0; fi
 fi
 if [ "${TEST_ROUTE_SLEEP_AFTER_RUNNER:-0}" = 1 ] && [ ! -s "$root/runner-events.jsonl" ]; then
     exit 0
@@ -828,8 +835,8 @@ fi
 printf '%s\n' "$1" >> "$root/sleep-events"
 gate=""
 if [ "${TEST_STEP_ROUTING_SLEEP:-0}" = 1 ]; then
-    step=$(wc -l < "$root/sleep-events")
-    step=$((step + 0))
+    count_events "$root/sleep-events"
+    step=$count
     printf 'sleeping\n' > "$root/routing-sleep"
     printf 'sleeping\n' > "$root/routing-sleep-$step"
     gate="$root/continue-sleep-$step"
@@ -1002,7 +1009,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
         admission = caller_admission(self, self.root, self.environment)
-        admission.configure(waiting_pass_seconds=0.05)
+        admission.configure(waiting_pass_seconds=0.25)
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             self.provider_observations.append(key)
@@ -1070,17 +1077,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     reason = (reason_file.read_text().strip() if reason_file.exists()
                               else self.placement_policy.get("TEST_RUNNER_BUSY_REASON", "busy"))
                     eligibility = placement.TemporaryExclusion(reason)
-                else:
-                    try:
-                        probe = subprocess.run(
-                            [str(self.bin_directory / "ssh"), values.get("host", destination.host), "true"],
-                            env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
-                            check=False, timeout=1)
-                        unreachable = probe.returncode != 0
-                    except (OSError, subprocess.TimeoutExpired):
-                        unreachable = True
-                    if unreachable:
-                        eligibility = placement.TemporaryExclusion("unreachable")
+                elif not self.ssh_probe_reaches(values.get("host", destination.host)):
+                    eligibility = placement.TemporaryExclusion("unreachable")
             directory = (Path(self.environment["MAC_TEST_STATE_DIR"]) if destination.target == "mac" else
                          self.home / ".local/state/build-targets" / destination.target)
             controller = directory / "controller.json"
@@ -1094,6 +1092,20 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         admission.server.host_probe = provider
         _ = caller_provider_controls(self, admission)
+
+    def ssh_probe_reaches(self, host: str) -> bool:
+        ssh = self.bin_directory / "ssh"
+        try:
+            if ssh.read_text() == _REACHABLE_SSH_STUB and os.access(ssh, os.X_OK):
+                return True
+        except (OSError, UnicodeError):
+            pass
+        try:
+            probe = subprocess.run([str(ssh), host, "true"], env=self.environment,
+                                   stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return probe.returncode == 0
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
@@ -1129,7 +1141,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
-        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
+        self.write_executable(self.bin_directory / "ssh", _REACHABLE_SSH_STUB)
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -1241,7 +1253,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
             "MAC_TEST_CONFIG": str(settings),
             "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
-            "BUILD_TARGETS_POLL_S": "0.05",
+            "BUILD_TARGETS_POLL_S": "0.25",
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader), "CONF_DIR": str(Path(reader).parent),
             "UNIT_RUN_DIR": str(self.board),
