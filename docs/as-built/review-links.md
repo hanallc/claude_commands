@@ -939,8 +939,9 @@ That request keeps the item in Morty answering and shows its confirmation next t
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening an individual row with an unread answer uses the same signed read operation.
-The List waits until the tab and console frame are visible before it sends this request.
-The row must still be open and visible when the request starts.
+The List sends this request after the text of each unread answer enters the viewport while the row is open.
+The tab and console frame must also be visible.
+Expand all leaves answers unread.
 A newer update stays unread if it arrives before the read saves.
 With Unread only on, an item can stay visible after this read until the user closes its row or changes Show.
 Changing the Unread only switch ends this exception.

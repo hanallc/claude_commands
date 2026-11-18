@@ -947,25 +947,55 @@ function syncUnread(item,form,unread,unreadSort){
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
  }
 }
-const pendingOpenReads=new Set(),deferredOpenReads=new Set(),keepOpenAfterRead=new Set();
+const pendingOpenReads=new Set(),keepOpenAfterRead=new Set();
+/** @type {Map<string, {unseen: Set<Element>, seen: Set<string>}>} */
+const watchedAnswers=new Map();
 let unreadShow='',unreadFilterVersion=0;
+// The second threshold reports a positive intersection after contact at the viewport edge.
+const answerVisibility=new IntersectionObserver(entries=>{
+ if(listIsHidden()) return;
+ for(const entry of entries){
+  if(!entry.isIntersecting || !entry.intersectionRect.width || !entry.intersectionRect.height) continue;
+  const item=entry.target.closest('[data-list-item]');
+  if(!item?.isConnected || item.hidden) continue;
+  const watch=watchedAnswers.get(item.dataset.key);
+  if(!watch?.unseen.delete(entry.target)) continue;
+  watch.seen.add(entry.target.parentElement.dataset.question);
+  answerVisibility.unobserve(entry.target);
+  if(!watch.unseen.size) void markOpenedAnswerRead(item);
+ }
+},{threshold:[0,Number.EPSILON]});
 function listIsHidden(){
  return document.visibilityState!=='visible' || window.frameElement?.hidden===true;
 }
+function stopWatchingOpenedAnswer(key){
+ for(const answer of watchedAnswers.get(key)?.unseen ?? []) answerVisibility.unobserve(answer);
+ watchedAnswers.delete(key);
+}
+function watchOpenedAnswer(item,seen=new Set()){
+ const key=item.dataset.key;
+ if(!tableView.opened.has(key) || pendingOpenReads.has(key) || watchedAnswers.has(key)) return;
+ const unseen=new Set([...item.querySelectorAll(
+  '.list-panel[data-open-read-request] .page-question:has(.question-unread) > p:last-child')]
+  .filter(answer=>!seen.has(answer.parentElement.dataset.question)));
+ if(!unseen.size) return;
+ watchedAnswers.set(key,{unseen,seen});
+ if(!listIsHidden()) for(const answer of unseen) answerVisibility.observe(answer);
+}
 function resumeOpenedAnswerReads(){
- if(listIsHidden() || !deferredOpenReads.size) return;
- for(const item of content.querySelectorAll('[data-list-item]:not([hidden])')){
-  if(deferredOpenReads.delete(item.dataset.key)) void markOpenedAnswerRead(item);
+ if(listIsHidden()) return;
+ for(const {unseen} of watchedAnswers.values()) for(const answer of unseen){
+  answerVisibility.unobserve(answer);
+  answerVisibility.observe(answer);
  }
- deferredOpenReads.clear();
 }
 async function markOpenedAnswerRead(item){
  const key=item.dataset.key;
- if(item.hidden || !tableView.opened.has(key)) return;
+ if(item.hidden || !tableView.opened.has(key) || listIsHidden()) return;
  const panel=item.querySelector('[data-detail]:not([hidden]) .list-panel');
  const request=panel?.dataset.openReadRequest;
  if(!request || pendingOpenReads.has(key)) return;
- if(listIsHidden()){deferredOpenReads.add(key);return;}
+ stopWatchingOpenedAnswer(key);
  const token=panel.dataset.openReadToken;
  const filterVersion=unreadFilterVersion;
  const [keeper,id]=key.split('/');
@@ -1008,11 +1038,11 @@ const tableView=createRecordTable({content:()=>content,
   if(nextUnreadShow!==unreadShow){
    unreadShow=nextUnreadShow;unreadFilterVersion++;keepOpenAfterRead.clear();
   }
-  for(const key of deferredOpenReads) if(!tableView.opened.has(key)) deferredOpenReads.delete(key);
+  for(const key of watchedAnswers.keys()) if(!tableView.opened.has(key)) stopWatchingOpenedAnswer(key);
   for(const key of keepOpenAfterRead) if(!tableView.opened.has(key)) keepOpenAfterRead.delete(key);
   restoreLogPositions();
  },
- itemOpened:markOpenedAnswerRead,
+ itemOpened:watchOpenedAnswer,
  expandedSelection:(data,selection)=>selection.filters.unread && selection.show===unreadShow &&
   keepOpenAfterRead.has(data.key) ? {...selection,filters:{...selection.filters,unread:''}} : undefined,
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
@@ -1258,8 +1288,14 @@ async function refresh(_supersede=false,current=()=>true){
  rememberLogPositions();
  const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
  for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
+ const priorWatches=new Map(watchedAnswers);
+ for(const key of priorWatches.keys()) stopWatchingOpenedAnswer(key);
  content.replaceWith(fresh);content=fresh;
  bindListControls();tableView.replace();
+ if(priorWatches.size) for(const item of content.querySelectorAll('[data-list-item]')){
+  const watch=priorWatches.get(item.dataset.key);
+  if(watch) watchOpenedAnswer(item,watch.seen);
+ }
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
  if(focusedRow){
@@ -1361,14 +1397,19 @@ addEventListener('pageshow',event=>{
  restoreListScroll(record.top);
 });
 addEventListener('popstate',tableView.restorePlace);
-addEventListener('hashchange',tableView.restorePlace);
+addEventListener('hashchange',event=>{
+ tableView.restorePlace(event);
+ watchLinkedAnswer();
+});
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 document.addEventListener('visibilitychange',resumeOpenedAnswerReads);
 window.addEventListener('message',event=>{
  if(event.source===parent && event.origin===location.origin && event.data==='console-shown') resumeOpenedAnswerReads();
 });
-if(tableView.linkedItem && !listReturn){
+function watchLinkedAnswer(){
+ if(!tableView.linkedItem) return;
  const row=[...content.querySelectorAll('[data-list-item]:not([hidden])')].find(item=>item.dataset.key===tableView.linkedItem);
- if(row) void markOpenedAnswerRead(row);
+ if(row) watchOpenedAnswer(row);
 }
+if(!listReturn) watchLinkedAnswer();
 })();''')

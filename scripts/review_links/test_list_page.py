@@ -3634,17 +3634,28 @@ observer.observe(original.parentNode,{childList:true});
  check(parent.document.activeElement===nav,'The response preserves the console focus');
 """, add_item=False, reduced_motion=True, in_frame=True)
 
-    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_direct_answer_link_waits_for_visibility(self) -> None:
+    def render_unread_answer(self, *, latest_status: str = "",
+                             questions_and_answers: tuple[tuple[str, str], ...] = (
+                                 ("Which check passed?", "The gate passed."),)) -> tuple[the_list.ListItem, str]:
         root = self.root / "reviews"
         item = self.add("Read the answer after opening the tab")
+        if latest_status:
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": latest_status}, source="morty")
         with (patch.object(change_page, "send_question", return_value=question_outcome()),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
-            fields = self.fields(item, "question", words="Which check passed?")
-            list_page.deliver(list_page.submit(root, urlencode(fields)))
-            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."]), 0)
+            for question, _answer in questions_and_answers:
+                current = the_list.load(MORTY.id, item.id)
+                fields = self.fields(current, "question", words=question)
+                list_page.deliver(list_page.submit(root, urlencode(fields)))
+            for number, (_question, answer) in enumerate(questions_and_answers, start=1):
+                self.assertEqual(the_list.main(["answer", item.id, "--question", f"Q{number}", "--text", answer]), 0)
         markup = list_page.render(root, include_counts=False).decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
+        return item, markup
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_direct_answer_link_waits_for_visibility(self) -> None:
+        item, markup = self.render_unread_answer()
         fragment = urlencode({"show": "unread", "item": f"{MORTY.id}/{item.id}"})
         setup = """<script>
 let visibility='hidden';
@@ -3669,6 +3680,7 @@ window.fetch=async(_url,options)=>{
   window.frameElement.hidden=false;
   window.dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  };
+ const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
  try{
   check(!row.hidden && !detail.hidden,'The direct link opens the unread row');
   check(!reads.length && unread(),'A hidden tab keeps the answer unread');
@@ -3677,15 +3689,16 @@ window.fetch=async(_url,options)=>{
    document.getElementById('list-expand-all').click();
   }
   REVEAL_FIRST();
+  await paint();
   check(!reads.length && unread(),'The answer stays unread while the tab or frame is hidden');
   REVEAL_SECOND();
+  await paint();
   if(CLOSE_ROW) check(!reads.length && unread(),'Closing the row cancels its deferred read');
   else check(reads.length===1 && reads[0].get('action')==='read' &&
    reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
    'The visible row sends its signed read once');
  }catch(error){failures.push(String(error));}
- const result=parent.document.createElement('p');result.id='probe-results';
- result.textContent=JSON.stringify(failures);parent.document.body.append(result);
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
         for first, second, close_row in (('showTab', 'showFrame', False), ('showFrame', 'showTab', False),
@@ -3693,7 +3706,149 @@ window.fetch=async(_url,options)=>{
             with self.subTest(first=first, close_row=close_row):
                 case = (probe.replace('REVEAL_FIRST', first).replace('REVEAL_SECOND', second)
                         .replace('CLOSE_ROW', str(close_row).lower()))
-                self.browser_actions(markup, setup, case, in_frame=True)
+                self.browser_answer_visibility(markup, setup, case)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_direct_answer_link_waits_until_the_answer_scrolls_into_view(self) -> None:
+        item, markup = self.render_unread_answer(latest_status="\n\n".join(f"Check {n} passed." for n in range(55)))
+        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
+        setup = """<script>
+history.replaceState(null,'','#FRAGMENT');
+const reads=[];
+window.fetch=async(_url,options)=>{
+ if(options?.method!=='POST') return new Response('',{status:503});
+ reads.push(new URLSearchParams(options.body));
+ return new Response(JSON.stringify({unread:'true'}));
+};
+</script>""".replace('FRAGMENT', fragment)
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
+  const panel=detail.querySelector('.list-panel');
+  const answer=[...panel.querySelectorAll('[data-question="Q1"] p')].find(p=>p.textContent==='The gate passed.');
+  const sample=()=>new Promise(resolve=>{
+   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
+   observer.observe(answer);
+  });
+  check(!row.hidden && !detail.hidden && row.querySelector('.list-row').getBoundingClientRect().bottom<innerHeight,
+   'The direct link opens a row within the viewport');
+  check(!(await sample()).isIntersecting && answer.getBoundingClientRect().top>innerHeight,
+   'The answer starts below the viewport');
+  check(!reads.length && panel.querySelector('.question-unread'),'The answer below the viewport stays unread');
+  answer.scrollIntoView({block:'center',behavior:'instant'});
+  check((await sample()).isIntersecting,'Scrolling brings the answer into the viewport');
+  check(reads.length===1 && reads[0].get('action')==='read' &&
+   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
+   'The answer sends one signed read when it enters the viewport');
+ }catch(error){failures.push(String(error));}
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        self.browser_answer_visibility(markup, setup, probe)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_item_link_waits_for_every_unread_answer(self) -> None:
+        item, markup = self.render_unread_answer(questions_and_answers=(
+            ("Which checks passed?", "\n".join(f"Check {number} passed." for number in range(65))),
+            ("Did the final check pass?", "The final check passed.")))
+        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
+        setup = """<script>
+const fragment='#FRAGMENT',reads=[];
+if(LINK_ON_LOAD) history.replaceState(null,'',fragment);
+window.fetch=async(_url,options)=>{
+ if(options?.method!=='POST') return new Response('',{status:503});
+ reads.push(new URLSearchParams(options.body));
+ return new Response(JSON.stringify({unread:'true'}));
+};
+</script>""".replace('FRAGMENT', fragment)
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
+  if(!LINK_ON_LOAD){
+   check(detail.hidden && !reads.length,'The loaded List starts with a closed and unread row');
+   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   const link=document.createElement('a');
+   link.href=fragment;document.body.append(link);link.click();
+   await changed;
+  }
+  const panel=detail.querySelector('.list-panel');
+  const first=panel.querySelector('[data-question="Q1"] p:last-child');
+  const second=panel.querySelector('[data-question="Q2"] p:last-child');
+  const sample=target=>new Promise(resolve=>{
+   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
+   observer.observe(target);
+  });
+  check(!row.hidden && !detail.hidden,'The item link opens the row');
+  check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
+  check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
+   'The second answer starts below the viewport');
+  check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
+   'The first answer alone leaves both answers unread');
+  document.body.style.paddingBottom='100vh';
+  second.scrollIntoView({block:'start',behavior:'instant'});
+  check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
+   'The second answer enters the viewport after the first leaves it');
+  check(reads.length===1 && reads[0].get('action')==='read' &&
+   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
+   'The last answer to enter the viewport sends one signed read');
+ }catch(error){failures.push(String(error));}
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for link_on_load in (True, False):
+            with self.subTest(link_on_load=link_on_load):
+                enabled = str(link_on_load).lower()
+                self.browser_answer_visibility(markup, setup.replace('LINK_ON_LOAD', enabled),
+                                               probe.replace('LINK_ON_LOAD', enabled))
+
+    def browser_answer_visibility(self, markup: str, setup: str, probe: str) -> None:
+        page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
+        console_page = (b'<!doctype html><style>iframe{border:0;width:100%;height:calc(100vh - 24px)}'
+                        b'iframe[hidden]{display:block;visibility:hidden}</style>'
+                        b'<iframe src="/page"></iframe><img hidden src="/complete">')
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == '/complete':
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                    self.json_response(200, {})
+                else:
+                    self.html_response(200, page if self.path == '/page' else console_page)
+                return None
+
+            @override
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                self.json_response(200, {})
+                complete.set()
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
+              patch.object(change_page, "recover_pending"),
+              patch.object(list_page, "recover_pending"),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              serve.ReviewLinksServer(("127.0.0.1", 0), self.root / "reviews") as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.root / "answer-profile"
+                profile.mkdir(exist_ok=True)
+                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                    '--window-size', '1280,900', '--screenshot', str(self.root / 'answer.png'),
+                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join()
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
@@ -3701,7 +3856,9 @@ window.fetch=async(_url,options)=>{
         root = self.root / "reviews"
         results: list[list[str]] = []
         complete = threading.Event()
-        probe = """<!doctype html><meta charset="utf-8"><iframe></iframe><img hidden src="/complete"><script>
+        probe = """<!doctype html><meta charset="utf-8">
+<style>iframe{width:100%;height:calc(100vh - 24px);border:0}</style>
+<iframe></iframe><img hidden src="/complete"><script>
 const frame=document.querySelector('iframe'), errors=[];
 const check=(ok,message)=>{if(!ok) errors.push(message);};
 const open=(show,key='',unread='')=>new Promise(resolve=>{
@@ -3793,6 +3950,8 @@ const change=async path=>{
   await change('/second-answer');
   await open('working','','1');
   const original=row(), doc=frame.contentDocument;
+  const panelQuestion=original.querySelector('[data-question="Q2"]');
+  const [askedAt,answeredAt]=[...panelQuestion.querySelectorAll('time')].map(time=>Date.parse(time.dateTime));
   check(hasDot() && original.querySelector('[data-question="Q2"] .question-unread'),
    'the second answer stays unread before the row opens');
   const refreshed=new Promise(resolve=>{
@@ -3809,6 +3968,11 @@ const change=async path=>{
    'opening the row marks the answer read and keeps the row open in Unread');
   check(row().querySelector('[data-log-index="Q2-answered"]').textContent.includes('The next check passed.'),
    'opening the row moves the answer to the log');
+  const asked=row().querySelector('[data-log-index="Q2-asked"]');
+  const answered=row().querySelector('[data-log-index="Q2-answered"]');
+  check(asked?.textContent.includes('Which check is next?') && Date.parse(asked.querySelector('time').dateTime)===askedAt &&
+   Date.parse(answered.querySelector('time').dateTime)===answeredAt && !row().querySelector('[data-question="Q2"]'),
+   'The log shows the question and answer with their recorded times after the panel clears.');
   row().querySelector('.list-toggle').click();
   check(row().hidden,'closing the read row removes it from Unread');
  }catch(error){errors.push(String(error));}
