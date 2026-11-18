@@ -455,7 +455,7 @@ class HanaController:
         except (OSError, ValueError, KeyError, TypeError) as error:
             return HanaLifecycleUnavailable(type(error).__name__, int(self.clock()))
 
-    def _spending(self) -> hana_spend.HanaSpending:
+    def _spending(self) -> hana_spend.HanaSpending[hana_spend.PermitSettings]:
         return hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
             hana_spend.read_settings(conf.read(self.workload_path)))
 
