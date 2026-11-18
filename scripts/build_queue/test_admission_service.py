@@ -373,6 +373,129 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
                 self.assertEqual(fixture.server.assignments[key].terminal_report, report)
 
+    def test_hana_claim_failure_uses_the_exact_dispatch_journal(self) -> None:
+        from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_result, hana_source
+        from scripts.aws_target.test_hana_execution import FakeExecutionObjects
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, coordinator_holder, hana_policy_request, local_candidate,
+            publish_candidate,
+        )
+        from scripts.mac_test import claim_state
+
+        cases = (("settled command path", "The Hana attempt already has a settled command path"),
+                 ("failed start", "The Hana start deadline expired"),
+                 ("fenced start refusal", "The Hana start deadline expired"),
+                 ("command published", ""),
+                 ("restored startup refusal", "The Hana start deadline expired"),
+                 ("restored claim failure", "The Hana attempt already has a settled command path"))
+        for case, reason in cases:
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                target_state = fixture.root / "targets"
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(target_state)}):
+                    request, transport = hana_policy_request(fixture)
+                    local = local_candidate(fixture)
+                    request = replace(request, constraints=replace(request.constraints,
+                        candidates=(*request.constraints.candidates, local)))
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    destination = assignment.destination
+                    self.assertEqual(destination, request.constraints.candidates[0].destination)
+                    key = placement.attempt_key(assignment.episode, assignment.attempt)
+                    claim = placement.ProviderClaimReference("ssh", destination.target, destination.scope,
+                        placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                        assignment.episode, assignment.attempt)
+                    controller = hana_placement.controller_for(transport, read_only=True)
+                    controller.bind_execution(claim.claim_id)
+                    if case == "command published":
+                        generation = hana_placement.HanaHostGeneration("deployment", "start", "boot")
+                        identity = hana_result.HanaAttemptKey(claim.episode, claim.attempt, claim.claim_id, generation)
+                        manifest = hana_source.SourceManifest(1, "hana-source", "a" * 40, "b" * 64,
+                            "https://bucket.s3.us-east-2.amazonaws.com/source", (), ("cargo", "check"), (), (), "c" * 64)
+                        source_key = assignment.source_key
+                        assert isinstance(source_key, placement.SourceKeyKnown)
+                        dispatch = hana_execution.HanaExecutionRequest(identity, manifest, 1, source_key,
+                            manifest.argv, hana_result.LogicalStepLink("call", claim.episode))
+                        holder = coordinator_holder(assignment)
+                        adopted_claim = placement.AdoptedProviderClaim(claim, holder, assignment.session,
+                            destination.host, "host-generation-a")
+                        _ = publish_candidate(fixture, request, claims=(adopted_claim,))
+                        adopted = hana_placement.HanaClaimAdopted(placement.ReservedHost(assignment, adopted_claim), generation)
+                        objects = FakeExecutionObjects(dispatch)
+
+                        def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
+                            authorized, = fixture.server.handle_request(message)
+                            assert isinstance(authorized, wire.FirstAuthorization), authorized
+                            return authorized
+
+                        state = hana_execution.dispatch_execution(controller.directory, dispatch, adopted,
+                            objects, consume=consume, current_permission=lambda: hana_box.CommandPermission(
+                                claim.claim_id, hana_box.VerifiedBoot("boot", "start"), 1, int(fixture.clock.now()) + 60),
+                            current_source_key=lambda: assignment.source_key)
+                        self.assertIsInstance(state, hana_execution.DispatchSent)
+                        self.assertEqual(len(objects.envelopes), 1)
+                        self.assertIsInstance(objects.envelopes[0], hana_execution.HanaCommandEnvelope)
+                        self.assertIsInstance(hana_execution.observe_execution(controller.directory, dispatch, objects),
+                            placement.ObservedExecution)
+                        self.assertTrue(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                        refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
+                        assert isinstance(refusal, wire.DispatchStatus)
+                        self.assertEqual(refusal.state, placement.CurrentAssignment())
+                        self.assertIsInstance(refusal.permission, placement.PermissionConsumed)
+                        waiting, = fixture.server.handle_request(request)
+                        self.assertIsInstance(waiting, wire.PlacementWait)
+                        self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                        continue
+                    if case == "fenced start refusal":
+                        def release() -> bool:
+                            return hana_placement.release_assigned(assignment, coordinator_holder(assignment), controller)
+
+                        fenced = hana_execution.settle_unpublished_claim(controller.directory, claim,
+                            release_claim=release, reason=reason)
+                        self.assertIsInstance(fenced, hana_execution.HanaSettlementPending)
+                        self.assertTrue(hana_execution.execution_command_settled(controller.directory, claim.claim_id))
+                        self.assertTrue(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                        self.assertEqual(claim_state.read_claims(claim_state.state_paths(destination.target)), ())
+                        refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
+                        assert isinstance(refusal, wire.DispatchStatus)
+                        self.assertEqual(refusal.state, placement.CurrentAssignment())
+                        controller.register(hana_box.DeploymentIdentity("deployment", "instance", "spot", "us-east-2"))
+                        retry, = fixture.server.handle_request(request)
+                        self.assertEqual(retry, wire.Assignment(assignment))
+                        settlement = hana_execution.settle_unpublished_claim(controller.directory, claim,
+                            release_claim=release, reason=reason)
+                    else:
+                        settlement = hana_execution.settle_unpublished_claim(controller.directory, claim,
+                            release_claim=lambda: True, reason=reason)
+                    self.assertIsInstance(settlement, hana_execution.HanaSettled)
+                    self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                    if case == "fenced start refusal":
+                        _ = fixture.run_pass()
+                        self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("state"))
+                    elif case.startswith("restored"):
+                        startup = case == "restored startup refusal"
+                        refused_reason = reason if startup else "state"
+                        report = placement.TerminalAttemptReport(placement.PrelaunchRefused(refused_reason),
+                            placement.DispatchPathPending("The Hana claim remains retained" if startup
+                                else "provider settlement remains pending"), fixture.clock.now())
+                        fixture.server.assignments[key] = replace(fixture.server.assignments[key], terminal_report=report,
+                            provider=claim if startup else placement.NoProviderClaim(), retry=placement.RetryAt(report.received_at))
+                        fixture.server.persist()
+                        fixture.restart()
+                        local_key = fixture.server.current_assignments[assignment.episode]
+                        self.assertEqual(fixture.server.assignments[local_key].assignment.destination, local.destination)
+                        self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment(refused_reason))
+                    else:
+                        # The adapter reports the reason code and prints the detailed provider reason.
+                        refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
+                        assert isinstance(refusal, wire.DispatchStatus)
+                        self.assertEqual(refusal.state, placement.ClosedAssignment("state"))
+                    reply, = fixture.server.handle_request(request)
+                    self.assertIsInstance(reply, wire.LocalPlacementGranted)
+                    assert isinstance(reply, wire.LocalPlacementGranted)
+                    self.assertEqual(reply.assignment.destination, local.destination)
+                    self.assertEqual((reply.assignment.episode, reply.assignment.since), (assignment.episode, assignment.since))
+                    self.assertNotEqual(reply.assignment.attempt, assignment.attempt)
+
     def test_a_settled_decline_waits_for_evidence_at_or_after_its_report(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
