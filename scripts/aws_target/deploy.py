@@ -2205,6 +2205,14 @@ class Deployment:
         path = self.directory / 'regional-images.json'
         saved = remote.read_record(path) if path.exists() else {}
         identity = region + ':' + settings.ami_id
+        if isinstance(self.mode, plan_run.PlanRun):
+            if identity not in saved:
+                raise plan_run.unsupported('the regional gate image needs an EC2 copy')
+            image = ledger.text(ledger.mapping(saved[identity]), 'image')
+            matches = ledger.rows(target.call('describe-images', '--image-ids', image), 'Images')
+            if len(matches) != 1 or matches[0].get('ImageId') != image or matches[0].get('State') != 'available':
+                raise plan_run.unsupported('the saved regional gate image is unavailable')
+            return image
         if identity not in saved:
             copied = target.call('copy-image', '--source-region', settings.region, '--source-image-id', settings.ami_id,
                 '--name', ledger.text(source, 'Name'), '--client-token', sha256(identity.encode()).hexdigest())
@@ -2228,16 +2236,20 @@ class Deployment:
             raise DeploymentRefused(region + ': ' + str(error)) from error
         return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region))
 
+    def _regional_gate_values(self, settings: DeploymentSettings, parameters: dict[str, str],
+                              network: RegionalNetwork, deployment: str, profile: str) -> dict[str, str]:
+        return {**parameters, 'GateImage': network.image, 'VpcId': network.vpc,
+            'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
+            'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
+            'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': profile}
+
     def regional_gate_stack(self, api: AwsCli, settings: DeploymentSettings, home: dict[str, str],
                             parameters: dict[str, str], network: RegionalNetwork) -> dict[str, object]:
         """Deploy only gate resources in the target region; the home stack's scaler policies cover every gate region."""
         region = network.region
         target = api.in_region(region)
         deployment = ledger.text(deployment_record(self.directory), 'deployment_id')
-        values = {**parameters, 'GateImage': network.image, 'VpcId': network.vpc,
-            'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
-            'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
-            'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': home['GateProfileArn']}
+        values = self._regional_gate_values(settings, parameters, network, deployment, home['GateProfileArn'])
         template = self.output / ('region-gates-' + region + '.json')
         write_text_atomic(template, json.dumps(region_gate_template(), sort_keys=True) + '\n')
         definitions = ledger.mapping(region_gate_template()['Parameters'])
@@ -2390,6 +2402,144 @@ class Deployment:
         return gpu_size_trial.start_service(folder, self.directory.resolve(),
                                             self.settings_path.resolve(), execute) == 0
 
+    def gate_plan(self) -> None:
+        """Preview the approved gate update in configured region order."""
+        from scripts.aws_target import cloud_gate, gpu_size_trial
+
+        if not isinstance(self.mode, plan_run.PlanRun):
+            raise DeploymentRefused('The gate plan requires the plan identity.')
+        plan = self.mode
+        settings = read_deployment_settings(self.settings_path)
+        values = cloud_gate.settings()
+        regions = gate_regions(settings.region, values)
+        api = plan.api(settings.region, settings.timeout_s)
+        failures: dict[str, str] = {}
+        results: dict[str, str] = {}
+        networks: dict[str, RegionalNetwork] = {}
+        try:
+            self._check_credentials()
+            plan.confirm_account(api.region, api.timeout_s)
+            owner = plan.credential.owner
+            saved = deployment_record(self.directory)
+            stack = plan.gate_stack(api, settings.stack_name)
+            status = ledger.text(stack, 'StackStatus')
+            if status == 'REVIEW_IN_PROGRESS':
+                raise plan_run.unsupported('the home gate stack is in REVIEW_IN_PROGRESS')
+            stack_id = ledger.text(stack, 'StackId')
+            if (saved.get('stack') != settings.stack_name or saved.get('region') != settings.region
+                    or saved.get('account_id') != owner.account or saved.get('stack_id') != stack_id):
+                raise DeploymentRefused('The home gate stack differs from the saved deployment identity.')
+            outputs = self._stack_outputs(stack, require_outputs=False)
+            deployment = ledger.text(saved, 'deployment_id')
+            live_parameters = {ledger.text(row, 'ParameterKey'): str(row.get('ParameterValue', ''))
+                               for row in ledger.rows(stack, 'Parameters')}
+            if (not re.fullmatch(r'[a-f0-9]{32}', deployment)
+                    or live_parameters.get('DeploymentId') != deployment
+                    or live_parameters.get('VpcId') != settings.vpc_id
+                    or live_parameters.get('ScalerUserName') != settings.scaler_user_name
+                    or outputs.get('ScalerUserName') != settings.scaler_user_name):
+                raise DeploymentRefused('The home gate deployment parameters differ from the saved identity.')
+            scaler_api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
+            _ = gpu_size_trial.gpu_signing_key(scaler_api)
+            scaler = scaler_api.call('get-caller-identity', service='sts')
+            principal = owner.iam('user/' + settings.scaler_user_name)
+            local_scaler = ledger.mapping(saved.get('scaler_user', {}))
+            if (scaler.get('Account') != owner.account or scaler.get('Arn') != principal
+                    or local_scaler.get('name') != settings.scaler_user_name or local_scaler.get('arn') != principal
+                    or local_scaler.get('user_id') != ledger.text(scaler, 'UserId')):
+                raise DeploymentRefused('STS did not confirm the saved gate scaler user.')
+            reply = api.call('get-template', '--stack-name', stack_id, '--template-stage', 'Original',
+                             service='cloudformation')
+            body = reply['TemplateBody']
+            live = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
+            source = TEMPLATE.read_bytes()
+            template = ledger.mapping(cast(object, json.loads(source)))
+            definitions = ledger.mapping(template['Parameters'])
+            spending = read_settings(self.settings_path)
+            gpu_types = sorted(gpu_size_trial.settings().spot_max_usd_per_hour.keys()
+                               | set(values.words('hana_gpu_instance_types')))
+            wait_s = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+            print('plan guard: home gate stack and scaler credentials passed', flush=True)
+        except plan_run.PLAN_ERRORS as error:
+            for region in regions:
+                print(f'plan gate: {region}: refused: {plan_run.safe_reason(error)}', flush=True)
+            raise DeploymentRefused('one or more gate regions failed') from None
+
+        for region in regions:
+            try:
+                if region == settings.region:
+                    networks[region] = RegionalNetwork(region, settings.vpc_id, gate_subnets(api, settings.vpc_id),
+                                                       settings.ami_id)
+                else:
+                    networks[region] = self.regional_network(api, settings, region)
+            except plan_run.PLAN_ERRORS as error:
+                failures[region] = plan_run.safe_reason(error)
+
+        try:
+            parameters = gate_parameters(settings, values, owner.partition, owner.account,
+                                         [networks[region] for region in regions[1:] if region in networks], gpu_types)
+            proposed = live_parameters | parameters
+            regional_template = region_gate_template()
+            regional_source = json.dumps(regional_template, sort_keys=True).encode()
+            regional_definitions = ledger.mapping(regional_template['Parameters'])
+            if failures and settings.region not in failures:
+                failures[settings.region] = 'the home gate policy needs the image and VPC of every gate region'
+            policy, shared = plan.gate_scaler_policy(api, stack_id, settings.scaler_user_name, template, live, proposed,
+                                                     gates_enabled=live_parameters.get('EnableGates') == 'true')
+            for key, value in (('GateBucket', shared.bucket), ('GateProfileArn', shared.profile), ('GateRoleArn', shared.role)):
+                if key in outputs and outputs[key] != value:
+                    raise DeploymentRefused('The home gate outputs differ from the proposed resource identities.')
+
+        except plan_run.PLAN_ERRORS as error:
+            for region in regions:
+                reason = failures.get(region, plan_run.safe_reason(error))
+                print(f'plan gate: {region}: refused: {reason}', flush=True)
+            raise DeploymentRefused('one or more gate regions failed') from None
+
+        for region in regions:
+            if region in failures:
+                continue
+            try:
+                target = api.in_region(region)
+                network = networks[region]
+                if region == settings.region:
+                    changes = gate_update_values(stack, parameters, definitions)
+                    change_kind = plan.gate_update(target, stack_id, source, changes, wait_s)
+                    regional_outputs = outputs
+                else:
+                    name = settings.stack_name + '-gates-' + region
+                    regional = plan.gate_stack(target, name)
+                    if regional.get('StackStatus') == 'ROLLBACK_COMPLETE':
+                        change_kind = 'permissions passed; approved setup must recreate the rolled-back stack'
+                        regional_outputs = {}
+                    else:
+                        regional_outputs = self._stack_outputs(regional, require_outputs=False)
+                        if regional.get('StackStatus') == 'REVIEW_IN_PROGRESS':
+                            raise plan_run.unsupported('the regional gate stack is in REVIEW_IN_PROGRESS')
+                        regional_parameters = self._regional_gate_values(settings, parameters, network, deployment,
+                                                                         shared.profile)
+                        changes = gate_update_values(regional, {key: value for key, value in regional_parameters.items()
+                                                                if key in regional_definitions}, regional_definitions)
+                        change_kind = plan.gate_update(target, ledger.text(regional, 'StackId'), regional_source,
+                                                           changes, wait_s)
+
+                launch = plan_run.GateLaunchProbe(deployment, network.image, network.vpc,
+                    ledger.text(network.subnets[0], 'id'), regional_outputs.get('GateLaunchTemplate', 'lt-00000000000000000'),
+                    regional_outputs.get('GateSecurityGroup', 'sg-00000000000000000'), tuple(gpu_types),
+                    {'GateAttempt': 'setup-probe', 'GpuSizeTrial': 'setup-probe', 'ExpiresAt': '0',
+                     spending.cost_explorer_tag_key: spending.cost_explorer_tag_value},
+                    gpu_size_trial.GPU_TRIAL_ARTIFACT_PREFIX + 'setup-probe.json',
+                    gpu_size_trial.GPU_TRIAL_REQUEST_PREFIX + 'setup-probe.json')
+                plan.probe_gate_scaler(target, principal, policy, shared, launch, home=region == settings.region)
+                results[region] = change_kind
+            except plan_run.PLAN_ERRORS as error:
+                failures[region] = plan_run.safe_reason(error)
+        for region in regions:
+            result = f'refused: {failures[region]}' if region in failures else f'pass ({results[region]})'
+            print(f'plan gate: {region}: {result}', flush=True)
+        if failures:
+            raise DeploymentRefused('one or more gate regions failed')
+
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
@@ -2407,7 +2557,6 @@ class Deployment:
             revision = aws_trial.host_nixpkgs_revision()
             account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
             partition = stack_id.split(':')[1]
-            prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
             values = cloud_gate.settings()
             # The home scaler policies cover every gate region, so the scaler user's policy count stays fixed.
             timings = GateRegionTimings.read(self.directory)
@@ -2420,33 +2569,15 @@ class Deployment:
             comparison_caps = gpu_size_trial.settings().spot_max_usd_per_hour
             gpu_types = sorted(comparison_caps.keys() | set(values.words('hana_gpu_instance_types')))
             gpu_caps = comparison_caps | gpu_size_trial.price_caps(values.text('hana_gpu_spot_max_usd_per_hour'))
-            parameters = {
-                'EnableGates': 'true', 'GateImage': settings.ami_id,
-                'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
-                                      *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
-                'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
-                'GateInstanceTypes': ','.join(values.words('instance_types')),
-                'GateGpuInstanceTypes': ','.join(gpu_types),
-                'GateRootGiB': str(values.whole('root_gib')),
-                'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
-                'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
-                'GateExpiryMinutes': str(values.whole('expiry_schedule_minutes')),
-                'GateExpiryTimeout': str(values.whole('expiry_timeout_s')),
-                'GateExpiryMemory': str(values.whole('expiry_memory_mib')),
-            }
+            parameters = gate_parameters(settings, values, partition, account, networks, gpu_types)
             book = ledger.CostLedger(self.directory)
             inventory = book.read_snapshot().inventories
             resources = tuple(resource for resource in inventory[-1].resources if resource.name != 'gate-shared') if inventory else ()
             book.record_inventory(ledger.ResourceInventory(int(self.clock()), resources + (
                 ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment',
                 builder_removed=bool(inventory and inventory[-1].builder_removed)))
-            # A parameter that the template no longer has must not be passed again.
             known = ledger.mapping(ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))['Parameters'])
-            changes: list[dict[str, object]] = [
-                {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
-                for row in ledger.rows(stack, 'Parameters')
-                if ledger.text(row, 'ParameterKey') not in parameters and ledger.text(row, 'ParameterKey') in known]
-            changes.extend({'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items())
+            changes = gate_update_values(stack, parameters, known)
             self.output.mkdir(parents=True, exist_ok=True)
             template = self.output / 'gate-template.json'
             write_bytes_atomic(template, TEMPLATE.read_bytes())
@@ -2478,11 +2609,7 @@ class Deployment:
             return self._probe_gate_gpu(settings, values, manifest, gpu_caps, admin_api=api,
                                         scaler_arn=scaler_arn, partition=partition, account_id=account)
 
-    def _probe_gate_gpu(self, settings: DeploymentSettings, values: conf.ConfigRead, manifest: dict[str, object],
-                        caps: dict[str, Decimal], *, admin_api: AwsCli, scaler_arn: str,
-                        partition: str, account_id: str) -> bool:
-        from scripts.aws_target import gpu_size_trial
-
+    def _gate_scaler_api(self, settings: DeploymentSettings, timeout: float) -> AwsCli:
         # Use the GPU worker's profile and credential file without inherited admin credentials.
         environment = {key: value for key, value in os.environ.items() if not key.startswith('AWS_')}
         environment.update(AWS_SHARED_CREDENTIALS_FILE=str(admin_secrets.credentials_file()),
@@ -2495,7 +2622,14 @@ class Deployment:
                                 env=environment)
 
         account = conf.read(self.settings_path)
-        api = AwsCli(account.text('credentials_profile'), settings.region, values.number('api_timeout_s'), scaler)
+        return AwsCli(account.text('credentials_profile'), settings.region, timeout, scaler)
+
+    def _probe_gate_gpu(self, settings: DeploymentSettings, values: conf.ConfigRead, manifest: dict[str, object],
+                        caps: dict[str, Decimal], *, admin_api: AwsCli, scaler_arn: str,
+                        partition: str, account_id: str) -> bool:
+        from scripts.aws_target import gpu_size_trial
+
+        api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
         regions = ledger.rows(manifest, 'regions')
         home = regions[0]
         candidates = set(values.words('spot_candidate_regions'))
@@ -2686,6 +2820,36 @@ class Deployment:
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
 
+def gate_parameters(settings: DeploymentSettings, values: conf.ConfigRead, partition: str, account: str,
+                    networks: list[RegionalNetwork], gpu_types: list[str]) -> dict[str, str]:
+    return {
+        'EnableGates': 'true', 'GateImage': settings.ami_id,
+        'GateVpcs': ','.join([f'arn:{partition}:ec2:{settings.region}:{account}:vpc/{settings.vpc_id}',
+                              *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
+        'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
+        'GateInstanceTypes': ','.join(values.words('instance_types')),
+        'GateGpuInstanceTypes': ','.join(gpu_types),
+        'GateRootGiB': str(values.whole('root_gib')),
+        'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
+        'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
+        'GateExpiryMinutes': str(values.whole('expiry_schedule_minutes')),
+        'GateExpiryTimeout': str(values.whole('expiry_timeout_s')),
+        'GateExpiryMemory': str(values.whole('expiry_memory_mib')),
+    }
+
+
+def gate_update_values(stack: dict[str, object], parameters: dict[str, str],
+                       definitions: dict[str, object]) -> list[dict[str, object]]:
+    # Preserve the values of parameters that the template still uses.
+    changes: list[dict[str, object]] = [
+        {'ParameterKey': key, 'UsePreviousValue': True}
+        for row in ledger.rows(stack, 'Parameters')
+        if (key := ledger.text(row, 'ParameterKey')) not in parameters and key in definitions
+    ]
+    changes.extend({'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items())
+    return changes
+
+
 def region_gate_template() -> dict[str, object]:
     """Reuse the home gate bodies without regional copies of global resources."""
     source = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
@@ -2808,13 +2972,14 @@ def run_setup_plan(args: DeploymentArguments) -> int:
     try:
         if (args.command not in ('up', 'hana-setup')
                 or args.workload not in ('rust', 'merge-gates')
+                or args.command == 'up' and args.workload != 'merge-gates'
                 or args.trial_action or args.approve_resources or args.approve_destroy):
             raise DeploymentRefused('Use --plan with hana-setup or up --workload merge-gates without approval flags.')
-        if args.command == 'up':
-            raise plan_run.unsupported('merge gate setup')
         plan = plan_run.PlanRun(plan_identity.plan_credentials, execute_command, time.sleep)
         subject = Deployment(args.settings, args.directory, args.output, execute=execute_command, mode=plan)
-        if not subject.hana_setup():
+        if args.command == 'up':
+            subject.gate_plan()
+        elif not subject.hana_setup():
             raise DeploymentRefused('Setup did not pass every check.')
     except KeyboardInterrupt:
         print('plan run: refused: interrupted', flush=True)

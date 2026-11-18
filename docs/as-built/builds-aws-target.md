@@ -100,7 +100,7 @@ deploy.py hana-setup --plan
 ```
 
 The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
-It refuses first-time setup, pending instance or volume work, direct-owned boxes, and merge gate setup.
+It refuses first-time Hana setup, pending instance or volume work, and direct-owned boxes.
 
 The plan checks the local credential file and reads the scaler identity with STS.
 It uses the same stack, instance, disk, and parameter checks as approved setup.
@@ -114,6 +114,28 @@ The S3 simulation uses the control bucket policy from the stack template.
 If the template has no policy or the plan cannot resolve it, the plan prints a note.
 The plan then simulates S3 without a bucket policy.
 Bucket policies added outside the stack are out of scope.
+
+To plan a merge gate update, run this command in a terminal on natedev.
+
+```sh
+deploy.py up --workload merge-gates --plan
+```
+
+The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
+It builds the same template and parameter values as approved gate setup.
+The plan previews updates in the home region and in each configured gate region.
+It removes each change set and confirms removal before it checks scaler permissions.
+An absent stack refuses because a CREATE change set can leave a stack in `REVIEW_IN_PROGRESS`.
+The plan identity has no permission to delete a stack.
+An existing stack in `REVIEW_IN_PROGRESS` also refuses.
+In a region with a rolled-back first create, the plan checks scaler permissions.
+Approved setup must delete and recreate that regional stack.
+
+The simulations exclude the active gate scaler policies that the update replaces.
+They include the proposed gate policies and the proposed S3 bucket policy.
+The simulations use the regional VPC, image, and Spot request conditions.
+The plan reports each region in configuration order.
+It passes when every region passes.
 
 ## Hana guest safety files
 

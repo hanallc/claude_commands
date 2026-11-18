@@ -1,4 +1,4 @@
-"""Preview a policy update for a stopped, stack-owned Hana box."""
+"""Preview setup changes with the AWS plan identity."""
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -48,6 +48,7 @@ PLAN_READS: frozenset[str] = frozenset((*plan_identity.READ_ACTIONS, *plan_ident
                        *plan_identity.BUCKET_READS))
 INLINE_TEMPLATE_LIMIT = 51_200
 CHANGE_SET_ABSENT = ('ChangeSetNotFound', 'ChangeSetNotFoundException')
+PLAN_ERRORS = (KeyError, OSError, TypeError, ValueError, AwsUnavailable, subprocess.SubprocessError)
 CHANGE_SET_FINISHED = ('CREATE_COMPLETE', 'FAILED', 'DELETE_COMPLETE', 'DELETE_FAILED')
 
 # The installed CLI model predates PolicyExclusionList. Add its documented ARN variant.
@@ -59,9 +60,9 @@ IAM_POLICY_EXCLUSION_MODEL = {'merge': {'shapes': {
 
 
 @dataclass(frozen=True)
-class ScalerPolicyReplacement:
-    live_arn: str
-    proposed_document: str
+class ScalerPolicyPlan:
+    live_arns: tuple[str, ...]
+    proposed_documents: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -74,15 +75,26 @@ class BucketPolicyNotSimulated:
     pass
 
 
-def resolve_template(value: object, refs: Mapping[str, str], attributes: Mapping[str, str]) -> object:
+NO_TEMPLATE_VALUE = object()
+
+
+def resolve_template(value: object, refs: Mapping[str, object], attributes: Mapping[str, str],
+                     conditions: Mapping[str, bool] | None = None) -> object:
     """Resolve policy values from the existing stack evidence."""
     if isinstance(value, list):
-        return [resolve_template(item, refs, attributes) for item in cast(list[object], value)]
+        return [item for child in cast(list[object], value)
+                if (item := resolve_template(child, refs, attributes, conditions)) is not NO_TEMPLATE_VALUE]
     if not isinstance(value, dict):
         return value
     row = ledger.mapping(cast(object, value))
     if row.keys() == {'Ref'}:
-        return refs[ledger.text(row, 'Ref')]
+        name = ledger.text(row, 'Ref')
+        return NO_TEMPLATE_VALUE if name == 'AWS::NoValue' else refs[name]
+    if row.keys() == {'Fn::If'} and conditions is not None:
+        condition, yes, no = cast(list[object], row['Fn::If'])
+        if not isinstance(condition, str):
+            raise ValueError('The template has an invalid Fn::If.')
+        return resolve_template(yes if conditions[condition] else no, refs, attributes, conditions)
     if row.keys() == {'Fn::GetAtt'}:
         field = row['Fn::GetAtt']
         if isinstance(field, list) and len(cast(list[object], field)) == 2:
@@ -98,16 +110,44 @@ def resolve_template(value: object, refs: Mapping[str, str], attributes: Mapping
         if isinstance(field, list) and len(cast(list[object], field)) == 2:
             field, bindings = cast(list[object], field)
             for name, binding in ledger.mapping(bindings).items():
-                resolved = resolve_template(binding, refs, attributes)
+                resolved = resolve_template(binding, refs, attributes, conditions)
                 if not isinstance(resolved, str):
                     raise ValueError('The template has a non-text Fn::Sub value.')
                 values[name] = resolved
         if not isinstance(field, str):
             raise ValueError('The template has an invalid Fn::Sub.')
-        return re.sub(r'\$\{([^}]+)\}', lambda match: values[match[1]], field)
+        def substitute(match: re.Match[str]) -> str:
+            resolved = values[match[1]]
+            if not isinstance(resolved, str):
+                raise ValueError('The template has a non-text Fn::Sub value.')
+            return resolved
+
+        return re.sub(r'\$\{([^}]+)\}', substitute, field)
     if any(key.startswith('Fn::') or key == 'Ref' for key in row):
         raise ValueError('The policy uses an unsupported template expression.')
-    return {key: resolve_template(item, refs, attributes) for key, item in row.items()}
+    return {key: resolve_template(item, refs, attributes, conditions) for key, item in row.items()}
+
+
+@dataclass(frozen=True)
+class GatePolicyResources:
+    bucket: str
+    profile: str
+    role: str
+    bucket_policy: str
+
+
+@dataclass(frozen=True)
+class GateLaunchProbe:
+    deployment: str
+    image: str
+    vpc: str
+    subnet: str
+    template: str
+    security_group: str
+    instance_types: tuple[str, ...]
+    request_tags: Mapping[str, str]
+    artifact_key: str
+    input_key: str
 
 
 @final
@@ -149,6 +189,10 @@ class PlanRun:
             if code:
                 api_name = action_name(service, operation).split(':')[1]
                 message = f'An error occurred ({code}) when calling the {api_name} operation'
+                if (code, service, operation) == ('ValidationError', 'cloudformation', 'describe-stacks'):
+                    target = arguments[arguments.index('--stack-name') + 1]
+                    if re.search(r': Stack with id ' + re.escape(target) + r' does not exist\s*$', result.stderr):
+                        message += ': Stack does not exist'
             else:
                 message = f'AWS did not confirm {operation}.'
             return subprocess.CompletedProcess(command, result.returncode, '', message)
@@ -182,25 +226,30 @@ class PlanRun:
         return arn
 
     def scaler_policy(self, api: AwsCli, stack: str, proposed: object, parameters: dict[str, str],
-                      bucket: str) -> ScalerPolicyReplacement:
-        reply = api.call('describe-stack-resource', '--stack-name', stack, '--logical-resource-id', 'ScalerPolicy',
+                      bucket: str) -> ScalerPolicyPlan:
+        arn = self.managed_policy_arn(api, stack, 'ScalerPolicy')
+        properties = ledger.mapping(ledger.mapping(proposed)['Properties'])
+        if properties.get('Users') != [{'Ref': 'ScalerUser'}]:
+            raise PlanRefused('The proposed Hana scaler policy targets a different user.')
+        document = resolve_template(properties['PolicyDocument'], self.template_refs(api.region, parameters),
+                                    {'ControlBucket.Arn': self.s3(bucket)})
+        return ScalerPolicyPlan((arn,), (json.dumps(document, separators=(',', ':')),))
+
+    def managed_policy_arn(self, api: AwsCli, stack: str, logical_id: str) -> str:
+        reply = api.call('describe-stack-resource', '--stack-name', stack, '--logical-resource-id', logical_id,
                          service='cloudformation')
         resource = ledger.mapping(reply['StackResourceDetail'])
         arn = ledger.text(resource, 'PhysicalResourceId')
         owner = self.credential.owner
         if (resource.get('ResourceType') != 'AWS::IAM::ManagedPolicy'
-                or resource.get('LogicalResourceId') != 'ScalerPolicy'
+                or resource.get('LogicalResourceId') != logical_id
                 or not arn.startswith(owner.iam('policy/'))
                 or not re.fullmatch(r'[\w+=,.@/-]+', arn.removeprefix(owner.iam('policy/')), re.ASCII)):
-            raise PlanRefused('CloudFormation did not identify the live Hana scaler policy.')
-        properties = ledger.mapping(ledger.mapping(proposed)['Properties'])
-        if properties.get('Users') != [{'Ref': 'ScalerUser'}]:
-            raise PlanRefused('The proposed Hana scaler policy targets a different user.')
-        document = resolve_template(properties['PolicyDocument'], self._template_refs(api.region, parameters),
-                                    {'ControlBucket.Arn': self.s3(bucket)})
-        return ScalerPolicyReplacement(arn, json.dumps(document, separators=(',', ':')))
+            raise PlanRefused(f'CloudFormation did not identify the live {logical_id} policy.')
+        return arn
 
-    def _template_refs(self, region: str, parameters: dict[str, str]) -> dict[str, str]:
+
+    def template_refs(self, region: str, parameters: dict[str, str]) -> dict[str, str]:
         owner = self.credential.owner
         return parameters | {'AWS::Partition': owner.partition, 'AWS::AccountId': owner.account, 'AWS::Region': region}
 
@@ -212,7 +261,7 @@ class PlanRun:
         resources = ledger.mapping(template['Resources'])
         outputs = ledger.mapping(template['Outputs'])
         bucket_value = ledger.mapping(outputs.get('ControlBucket', {})).get('Value')
-        refs = self._template_refs(region, parameters)
+        refs = self.template_refs(region, parameters)
         attributes: dict[str, str] = {}
         if isinstance(bucket_value, dict):
             logical_id = ledger.mapping(cast(object, bucket_value)).get('Ref')
@@ -240,7 +289,7 @@ class PlanRun:
             print('plan note: no bucket policy in the stack template', flush=True)
         return BucketPolicyNotSimulated()
 
-    def probe_scaler(self, api: AwsCli, principal: str, replacement: ScalerPolicyReplacement, instance: str,
+    def probe_scaler(self, api: AwsCli, principal: str, replacement: ScalerPolicyPlan, instance: str,
                      deployment: str, bucket: str, bucket_policy: BucketPolicyKnown | BucketPolicyNotSimulated) -> None:
         def simulate(action: str, resource: str = '*', *, context: Mapping[str, str] | None = None,
                      policy: str = '') -> None:
@@ -271,18 +320,19 @@ class PlanRun:
             simulate(action, self.s3(f'{bucket}/{key}'), policy=policy)
 
     @staticmethod
-    def _simulate(api: AwsCli, principal: str, replacement: ScalerPolicyReplacement, action: str, resource: str,
-                  context: Mapping[str, str], policy: str) -> None:
+    def _simulate(api: AwsCli, principal: str, replacement: ScalerPolicyPlan, action: str, resource: str,
+                  context: Mapping[str, str], policy: str, *, label: str = 'Hana', show: bool = True) -> None:
         entries = {'aws:RequestedRegion': api.region, 'aws:PrincipalArn': principal, **context}
         request: dict[str, object] = {
             'PolicySourceArn': principal,
-            'PolicyExclusionList': [{'PolicyArn': replacement.live_arn}],
-            'PolicyInputList': [replacement.proposed_document],
+            'PolicyInputList': list(replacement.proposed_documents),
             'ActionNames': [action],
             'ResourceArns': [resource],
             'ContextEntries': [{'ContextKeyName': key, 'ContextKeyType': 'string', 'ContextKeyValues': [value]}
                                for key, value in entries.items()],
         }
+        if replacement.live_arns:
+            request['PolicyExclusionList'] = [{'PolicyArn': arn} for arn in replacement.live_arns]
         if action.startswith('s3:'):
             request['ContextEntries'] = [
                 *cast(list[dict[str, object]], request['ContextEntries']),
@@ -293,20 +343,148 @@ class PlanRun:
         reply = api.call('simulate-principal-policy', '--cli-input-json', json.dumps(request), '--no-paginate', service='iam')
         results = ledger.rows(reply, 'EvaluationResults')
         if reply.get('IsTruncated') or len(results) != 1:
-            raise PlanRefused(f'Hana scaler {action} simulation is incomplete.')
+            raise PlanRefused(f'{label} scaler {action} simulation is incomplete.')
         result = results[0]
         if result.get('EvalActionName') != action or result.get('MissingContextValues'):
-            raise PlanRefused(f'Hana scaler {action} simulation is incomplete.')
+            raise PlanRefused(f'{label} scaler {action} simulation is incomplete.')
         rows = ledger.rows(result, 'ResourceSpecificResults') if 'ResourceSpecificResults' in result else (result,)
         field = 'EvalResourceDecision' if 'ResourceSpecificResults' in result else 'EvalDecision'
         if len(rows) != 1 or rows[0].get('EvalResourceName') != resource or rows[0].get('MissingContextValues'):
-            raise PlanRefused(f'Hana scaler {action} simulation is incomplete.')
+            raise PlanRefused(f'{label} scaler {action} simulation is incomplete.')
         decision = rows[0].get(field)
         if decision not in ('allowed', 'explicitDeny', 'implicitDeny'):
-            raise PlanRefused(f'Hana scaler {action} simulation is incomplete.')
-        print(f'plan Hana scaler: {action} {"allowed" if decision == "allowed" else "denied"}', flush=True)
+            raise PlanRefused(f'{label} scaler {action} simulation is incomplete.')
+        if show:
+            print(f'plan {label} scaler: {action} {"allowed" if decision == "allowed" else "denied"}', flush=True)
         if decision != 'allowed':
-            raise PlanRefused(f'Hana scaler {action} denied.')
+            raise PlanRefused(f'{label} scaler {action} denied.')
+
+    def gate_scaler_policy(self, api: AwsCli, stack: str, principal_name: str, template: dict[str, object],
+                           live: dict[str, object], parameters: dict[str, str], *, gates_enabled: bool
+                           ) -> tuple[ScalerPolicyPlan, GatePolicyResources]:
+        owner = self.credential.owner
+        policies = ledger.mapping(template['Resources'])
+        refs: dict[str, object] = {**self.template_refs(api.region, parameters), 'ScalerUser': principal_name}
+
+        def resource_name(logical_id: str, property_name: str) -> str:
+            properties = ledger.mapping(ledger.mapping(policies[logical_id])['Properties'])
+            value = resolve_template(properties[property_name], refs, {})
+            if not isinstance(value, str) or not value:
+                raise PlanRefused(f'The proposed {logical_id} has no fixed name.')
+            return value
+
+        bucket = resource_name('GateBucket', 'BucketName')
+        profile = owner.iam('instance-profile/' + resource_name('GateProfile', 'InstanceProfileName'))
+        role = owner.iam('role/' + resource_name('GateRole', 'RoleName'))
+        refs['GateBucket'] = bucket
+        for key, definition in ledger.mapping(template['Parameters']).items():
+            if ledger.mapping(definition).get('Type') == 'CommaDelimitedList':
+                refs[key] = [item.strip() for item in parameters.get(key, '').split(',') if item.strip()]
+        attributes = {'GateBucket.Arn': self.s3(bucket), 'GateProfile.Arn': profile, 'GateRole.Arn': role}
+        conditions = {'GateHasRegionImages': bool(refs['GateRegionImages'])}
+        live_resources = ledger.mapping(live['Resources'])
+        exclusions: list[str] = []
+        documents: list[str] = []
+        for logical_id in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy'):
+            row = ledger.mapping(policies[logical_id])
+            properties = ledger.mapping(row['Properties'])
+            if (row.get('Type') != 'AWS::IAM::ManagedPolicy' or row.get('Condition') != 'Gates'
+                    or properties.get('Users') != [{'Ref': 'ScalerUser'}]):
+                raise PlanRefused('The proposed gate policies do not match the gate scaler.')
+            if gates_enabled and logical_id in live_resources:
+                exclusions.append(self.managed_policy_arn(api, stack, logical_id))
+            document = ledger.mapping(resolve_template(properties['PolicyDocument'], refs, attributes, conditions))
+            documents.append(json.dumps(document, separators=(',', ':')))
+        policy = ledger.mapping(policies['GateBucketPolicy'])
+        properties = ledger.mapping(policy['Properties'])
+        if resolve_template(properties['Bucket'], refs, attributes) != bucket:
+            raise PlanRefused('The proposed gate bucket policy targets a different bucket.')
+        document = ledger.mapping(resolve_template(properties['PolicyDocument'], refs, attributes, conditions))
+        return (ScalerPolicyPlan(tuple(exclusions), tuple(documents)),
+                GatePolicyResources(bucket, profile, role,
+                                    json.dumps(document, separators=(',', ':'))))
+
+    def probe_gate_scaler(self, api: AwsCli, principal: str, policy: ScalerPolicyPlan, shared: GatePolicyResources,
+                          launch: GateLaunchProbe, *, home: bool) -> None:
+        owner = self.credential.owner
+
+        def simulate(action: str, resource: str = '*', *, context: Mapping[str, str] | None = None) -> None:
+            self._simulate(api, principal, policy, action, resource, context or {},
+                           shared.bucket_policy if action.startswith('s3:') else '', label='Gate', show=False)
+
+        def ec2(resource: str) -> str:
+            return f'arn:{owner.partition}:ec2:{api.region}:{owner.account}:{resource}'
+
+        if home:
+            for action in ('ec2:DescribeInstances', 'ec2:DescribeInstanceTypeOfferings', 'ec2:DescribeSpotPriceHistory',
+                           'servicequotas:GetServiceQuota', 'ce:GetCostAndUsage'):
+                simulate(action)
+        instance = ec2('instance/i-00000000000000000')
+        volume = ec2('volume/vol-00000000000000000')
+        resource_tags = {'GateDeployment': launch.deployment, 'Workload': 'cloud-claude-gate'}
+        template = ec2('launch-template/' + launch.template)
+        group = ec2('security-group/' + launch.security_group)
+        subnet = ec2('subnet/' + launch.subnet)
+        image = f'arn:{owner.partition}:ec2:{api.region}::image/{launch.image}'
+        request_tags = {'aws:RequestTag/' + key: value for key, value in
+                        {**resource_tags, **launch.request_tags}.items()}
+        for size in launch.instance_types:
+            launch_context = {'ec2:InstanceType': size, 'ec2:InstanceMarketType': 'spot',
+                              'ec2:LaunchTemplate': template, 'ec2:InstanceProfile': shared.profile}
+            simulate('ec2:RunInstances', image, context=launch_context)
+            tagged = {'aws:ResourceTag/' + key: value for key, value in resource_tags.items()}
+            for resource in (template, group):
+                simulate('ec2:RunInstances', resource, context=launch_context | tagged)
+            simulate('ec2:RunInstances', subnet, context=launch_context | {'ec2:Vpc': ec2('vpc/' + launch.vpc)})
+            simulate('ec2:RunInstances', ec2('network-interface/eni-00000000000000000'), context=launch_context)
+            for resource in (instance, volume):
+                simulate('ec2:RunInstances', resource, context=launch_context | request_tags)
+                simulate('ec2:CreateTags', resource, context=request_tags | {'ec2:CreateAction': 'RunInstances'})
+        simulate('iam:PassRole', shared.role, context={'iam:PassedToService': 'ec2.amazonaws.com'})
+        simulate('ec2:TerminateInstances', instance, context={
+            'ec2:ResourceTag/' + key: value for key, value in resource_tags.items()})
+        if home:
+            for key in (launch.artifact_key, launch.input_key):
+                for action in ('s3:PutObject', 's3:GetObject'):
+                    simulate(action, self.s3(f'{shared.bucket}/{key}'))
+            simulate('s3:ListBucket', self.s3(shared.bucket), context={'s3:prefix': launch.artifact_key})
+            simulate('s3:AbortMultipartUpload', self.s3(f'{shared.bucket}/{launch.input_key}'))
+
+    def gate_stack(self, api: AwsCli, name: str) -> dict[str, object]:
+        try:
+            reply = api.call('describe-stacks', '--stack-name', name, service='cloudformation')
+        except AwsUnavailable as error:
+            if aws_error_code(error) == 'ValidationError' and str(error).endswith(': Stack does not exist'):
+                raise unsupported('the gate stack is absent; its CREATE preview can leave a review stack') from None
+            raise
+        stacks = ledger.rows(reply, 'Stacks')
+        owner = self.credential.owner
+        prefix = f'arn:{owner.partition}:cloudformation:{api.region}:{owner.account}:stack/{name}/'
+        if (len(stacks) != 1 or stacks[0].get('StackName') != name
+                or not ledger.text(stacks[0], 'StackId').startswith(prefix)):
+            raise PlanRefused('CloudFormation did not confirm the gate stack identity.')
+        return stacks[0]
+
+    def gate_update(self, api: AwsCli, stack: str, template: bytes, values: list[dict[str, object]],
+                    timeout: int) -> str:
+        with self.change(api, stack, template, values, timeout) as change:
+            reason = str(change.get('StatusReason', '')).lower()
+            empty = change.get('Status') == 'FAILED' and any(text in reason for text in (
+                "didn't contain changes", 'no updates are to be performed', 'no changes'))
+            if change.get('NextToken'):
+                raise PlanRefused('The gate change set has more than one page.')
+            changes = ledger.rows({'Changes': change.get('Changes', [])}, 'Changes')
+            if empty and not changes:
+                return 'UPDATE has no changes; scaler permissions passed'
+            if change.get('Status') != 'CREATE_COMPLETE' or change.get('ExecutionStatus') != 'AVAILABLE':
+                raise PlanRefused('CloudFormation did not provide an available gate change set.')
+            if not changes:
+                raise PlanRefused('CloudFormation returned an empty successful gate change set.')
+            for item in changes:
+                resource = ledger.mapping(item['ResourceChange'])
+                if not ledger.text(resource, 'LogicalResourceId').startswith('Gate'):
+                    raise PlanRefused('The gate change set changes a non-gate resource.')
+            return 'UPDATE preview and scaler permissions passed'
 
     @contextmanager
     def change(self, api: AwsCli, stack: str, template: bytes, values: list[dict[str, object]],
@@ -326,10 +504,12 @@ class PlanRun:
             return self._execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check)
 
         writer = AwsCli('plan', api.region, api.timeout_s, execute)
+        created = False
         try:
             _ = writer.call('create-change-set', *target, '--change-set-type', 'UPDATE', '--template-body', content,
                             '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(values),
                             service='cloudformation')
+            created = True
             deadline = time.monotonic() + timeout
             while True:
                 change = api.call('describe-change-set', *target, '--no-paginate', service='cloudformation')
@@ -344,24 +524,34 @@ class PlanRun:
             print(f'plan stack: UPDATE in {api.region}', flush=True)
             yield change
         finally:
-            self._remove_change_set(api, writer, stack, name)
+            try:
+                self._remove_change_set(api, writer, name, target, created=created)
+            except (PlanRefused, KeyboardInterrupt):
+                print(f'plan stack: change set may remain: {name}', flush=True)
+                raise
 
-    def _remove_change_set(self, api: AwsCli, writer: AwsCli, stack: str, name: str) -> None:
-        target = ('--stack-name', stack, '--change-set-name', name)
-        try:
-            _ = writer.call('delete-change-set', *target, service='cloudformation')
-        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
-            print(f'plan stack: delete call did not confirm removal of {name}', flush=True)
+    def _remove_change_set(self, api: AwsCli, writer: AwsCli, name: str, target: tuple[str, ...],
+                           *, created: bool) -> None:
+        def delete() -> None:
+            try:
+                _ = writer.call('delete-change-set', *target, service='cloudformation')
+            except PLAN_ERRORS:
+                print(f'plan stack: delete call did not confirm removal of {name}', flush=True)
+
+        delete()
         for delay in plan_identity.PROOF_RETRY_DELAYS:
             if delay:
                 self.pause(delay)
             try:
                 _ = api.call('describe-change-set', *target, '--no-paginate', service='cloudformation')
             except AwsUnavailable as error:
-                if aws_error_code(error) in CHANGE_SET_ABSENT:
+                if created and aws_error_code(error) in CHANGE_SET_ABSENT:
                     print('plan stack: change set removal confirmed', flush=True)
                     return
-            except (OSError, ValueError, subprocess.SubprocessError):
+            except PLAN_ERRORS:
                 continue
-        print(f'plan stack: change set may remain: {name}', flush=True)
+            else:
+                if not created:
+                    created = True
+                    delete()
         raise PlanRefused('change set not removed') from None
