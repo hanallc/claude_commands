@@ -33,7 +33,7 @@ from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, aws_test_identity, box, hana_box, hana_image, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
@@ -2815,6 +2815,7 @@ class DeploymentArguments(argparse.Namespace):
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
         self.plan: bool = False
+        self.check: bool = False
         self.trial_action: str | None = None
         self.trial_folder: Path = Path()
         self.image: Path | None = None
@@ -2850,8 +2851,8 @@ def main() -> int:
         settings_path = conf.path('aws_target')
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
-    parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity'))
+    parser = argparse.ArgumentParser(description=__doc__, epilog=aws_test_identity.CONSOLE_SETUP)
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity', 'test-identity'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--image', type=Path)
@@ -2862,7 +2863,16 @@ def main() -> int:
     _ = parser.add_argument('--approve-resources', action='store_true')
     _ = parser.add_argument('--approve-destroy', action='store_true')
     _ = parser.add_argument('--plan', action='store_true', help='Check setup with the AWS plan identity.')
+    _ = parser.add_argument('--check', action='store_true', help='Verify the saved plan or test identity without a prompt.')
     args = parser.parse_args(namespace=DeploymentArguments())
+    if args.command == 'test-identity':
+        if args.plan:
+            parser.error('Use test-identity without --plan.')
+        return aws_test_identity.command(args.settings, check=args.check)
+    if args.check:
+        if args.command != 'plan-identity' or args.plan:
+            parser.error('Use --check with plan-identity or test-identity.')
+        return plan_identity.command_check(args.settings)
     if args.plan:
         return run_setup_plan(args)
     deploy = Deployment(args.settings, args.directory, args.output)
