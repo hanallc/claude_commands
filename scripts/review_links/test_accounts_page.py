@@ -47,14 +47,19 @@ def sort_reading() -> accounts.StatusReading:
     """Include shared accounts, tied values, zero values, and missing values."""
     return accounts.StatusReading((
         replace(status_row("claude2"), roles=("producers", "showrunners"), weekly_left_percent=10,
-                role_counts=(accounts.RoleSessionCounts(2, 0, 0, 0),) * 2),
+                role_counts=(accounts.RoleSessionCounts(2, 2, 0, 1), accounts.RoleSessionCounts(2, 2, 1, 10)),
+                resets_at=AT + timedelta(days=9), credits=1200.2, selected_roles=("showrunners",)),
         replace(status_row("claude1"), roles=("workers", "units"), weekly_left_percent=10,
-                role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0), accounts.RoleSessionCounts(2, 0, 0, 0))),
-        replace(status_row("claude3"), roles=(), role_counts=(), weekly_left_percent=accounts.StatusUnavailable("fixture")),
+                role_counts=(accounts.RoleSessionCounts(1, 10, 0, 5), accounts.RoleSessionCounts(2, 1, 12, 0)),
+                resets_at=AT + timedelta(days=9, hours=1), credits=1200.1, selected_roles=("units",)),
+        replace(status_row("claude3"), roles=(), role_counts=(), weekly_left_percent=accounts.StatusUnavailable("fixture"),
+                resets_at=accounts.StatusUnavailable(), credits=accounts.StatusUnavailable()),
         replace(status_row("codex1"), tool="codex", roles=("producers",), weekly_left_percent=0,
                 role_counts=(accounts.RoleSessionCounts(0, 1, 0, 0),)),
         replace(status_row("codex2"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),),
-                weekly_left_percent=accounts.StatusUnavailable("fixture"))), (), (), timezone.utc, AT)
+                weekly_left_percent=accounts.StatusUnavailable("fixture"), resets_at=AT + timedelta(days=2),
+                credits="unlimited", use_credits=True)), (), (), timezone.utc, AT,
+        first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3", "showrunners": "claude1"}))
 
 
 class ProducerRoleColorTests(unittest.TestCase):
@@ -233,15 +238,18 @@ class AccountsPageTests(unittest.TestCase):
         table = accounts.status_board(reading)
         self.assertEqual([column["key"] for column in table["columns"]][1:4], ["label", "left", "roles"])
         self.assertIn('<thead><tr><th class="left"></th>'
-                      + '<th class="left" data-account-sort="account" tabindex="0" aria-sort="ascending">account'
-                      + '<span class="sort-arrow" aria-hidden="true">▲</span></th><th class="left"></th>'
+                      + '<th class="left" data-account-sort="account" tabindex="0" aria-sort="ascending">'
+                      + '<span class="sort-label">account<span class="sort-arrow" aria-hidden="true">▲</span></span></th>'
+                      + '<th class="left"></th>'
                       + '<th class="right" data-account-sort="left" tabindex="0" aria-sort="none">'
-                      + '<span class="sort-arrow" aria-hidden="true">▲</span>left</th>'
-                      + '<th class="left" data-account-sort="role" tabindex="0" aria-sort="none">role'
-                      + '<span class="sort-arrow" aria-hidden="true">▲</span></th><th class="left"></th>'
-                      + '<th class="left">next</th>'
-                      + '<th class="right" data-account-sort="busy" tabindex="0" aria-sort="none">'
-                      + '<span class="sort-arrow" aria-hidden="true">▲</span>busy</th>', markup)
+                      + '<span class="sort-label"><span class="sort-arrow" aria-hidden="true">▲</span>left</span></th>'
+                      + '<th class="left" data-account-sort="role" tabindex="0" aria-sort="none">'
+                      + '<span class="sort-label">role<span class="sort-arrow" aria-hidden="true">▲</span></span></th>'
+                      + '<th class="left"></th>'
+                      + '<th class="left" data-account-sort="next" tabindex="0" aria-sort="none">'
+                      + '<span class="sort-label">next<span class="sort-arrow" aria-hidden="true">▲</span></span></th>'
+                      + '<th class="right" data-account-sort="busy" tabindex="0" aria-sort="none" data-sort-descending>'
+                      + '<span class="sort-label"><span class="sort-arrow" aria-hidden="true">▲</span>busy</span></th>', markup)
         self.assertNotIn(">Color<", markup)
         self.assertEqual(markup.count('<tr class="account">'), 2)
         self.assertEqual(markup.count("<tr>"), 1)
@@ -277,7 +285,11 @@ class AccountsPageTests(unittest.TestCase):
         table = accounts.status_board(reading)
         orders = accounts.account_board_sort_orders(reading, table)
         expected = {"account": [0, 1, 2, 3, 4, 5, 6], "left": [5, 0, 1, 2, 3, 4, 6],
-                    "role": [3, 5, 2, 6, 0, 1, 4], "busy": [0, 2, 3, 1, 5, 4, 6]}
+                    "role": [3, 5, 2, 6, 0, 1, 4], "busy": [0, 2, 3, 1, 5, 4, 6],
+                    "next": [2, 0, 1, 3, 4, 5, 6], "idle": [1, 2, 3, 0, 5, 4, 6],
+                    "paused": [0, 2, 1, 3, 5, 4, 6], "exited": [2, 1, 3, 0, 5, 4, 6],
+                    "total": [1, 0, 2, 3, 5, 4, 6], "resets": [5, 6, 2, 3, 0, 1, 4],
+                    "credits": [6, 2, 3, 0, 1, 5, 4], "enabled": [6, 0, 1, 2, 3, 4, 5]}
         for column, indices in expected.items():
             with self.subTest(column=column):
                 self.assertEqual([place["index"] for place in orders[column]], indices)
@@ -285,12 +297,18 @@ class AccountsPageTests(unittest.TestCase):
                           if row.label in ("claude1", "claude2") else row for row in reading.rows))
         self.assertEqual([place["index"] for place in accounts.account_board_sort_orders(precise, accounts.status_board(precise))["left"]],
                          [5, 2, 3, 0, 1, 4, 6])
+        table["rows"][4]["cells"]["roles"] = []
+        self.assertEqual(accounts.account_board_sort_orders(reading, table)["role"], orders["role"])
 
     def test_reversed_account_sort_orders_keep_missing_values_last(self) -> None:
         reading = sort_reading()
         orders = accounts.account_board_sort_orders(reading, accounts.status_board(reading))
         expected = {"account-reverse": [6, 5, 4, 3, 2, 1, 0], "left-reverse": [3, 2, 1, 0, 5, 6, 4],
-                    "role-reverse": [1, 0, 6, 2, 5, 3, 4], "busy-reverse": [5, 1, 2, 3, 0, 6, 4]}
+                    "role-reverse": [1, 0, 6, 2, 5, 3, 4], "busy-reverse": [5, 1, 2, 3, 0, 6, 4],
+                    "next-reverse": [0, 2, 6, 5, 4, 3, 1], "idle-reverse": [5, 0, 2, 3, 1, 6, 4],
+                    "paused-reverse": [5, 3, 1, 2, 0, 6, 4], "exited-reverse": [5, 0, 3, 1, 2, 6, 4],
+                    "total-reverse": [5, 3, 2, 0, 1, 6, 4], "resets-reverse": [0, 1, 2, 3, 6, 5, 4],
+                    "credits-reverse": [5, 0, 1, 2, 3, 6, 4], "enabled-reverse": [6, 5, 4, 2, 3, 0, 1]}
         for column, indices in expected.items():
             with self.subTest(column=column):
                 self.assertEqual([place["index"] for place in orders[column]], indices)
@@ -306,15 +324,17 @@ class AccountsPageTests(unittest.TestCase):
         self.assertEqual(json.dumps(table), before)
         self.assertEqual(table["rows"][-1]["cells"]["label"][0]["text"], "total")
 
-    def test_default_account_sort_uses_the_role_order_and_four_focusable_headers(self) -> None:
+    def test_default_account_sort_uses_the_role_order_and_named_headers_are_focusable(self) -> None:
         reading = sort_reading()
         table = accounts.status_board(reading)
         self.assertEqual([row["cells"]["roles"][0]["text"] for row in table["rows"][:-1]],
                          ["units", "workers", "showrunners", "producers", "", "producers", "spare"])
         markup = accounts_page.board(reading)
-        self.assertEqual(markup.count('data-account-sort="'), 4)
-        self.assertEqual(markup.count('tabindex="0"'), 4)
-        self.assertEqual(markup.count('class="sort-arrow"'), 4)
+        self.assertEqual(re.findall(r'data-account-sort="([^"]+)"', markup),
+                         ["account", "left", "role", "next", "busy", "idle", "paused", "exited",
+                          "total", "resets", "credits", "enabled"])
+        self.assertEqual(markup.count('tabindex="0"'), 12)
+        self.assertEqual(markup.count('class="sort-arrow"'), 12)
         self.assertIn('data-account-sort="account" tabindex="0" aria-sort="ascending"', markup)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
@@ -337,56 +357,78 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   range.selectNodeContents(node);
   return range.getBoundingClientRect();
  };
+ const labelText=span=>[...span.childNodes].find(node=>node.nodeType===Node.TEXT_NODE);
  const checkAlignment=(key,direction)=>{
   const cell=header(key),arrow=cell.querySelector('.sort-arrow');
-  const label=[...cell.childNodes].find(node=>node.nodeType===Node.TEXT_NODE);
+  const label=labelText(cell.querySelector('.sort-label'));
   const value=[...document.querySelector('tbody').rows].slice(0,-1)
    .map(row=>row.cells[cell.cellIndex]).find(candidate=>candidate.textContent.trim());
-  const name=key+' '+direction;
-  const text=bounds(label);
-  check(Math.abs(text.right-bounds(value).right)<=1,name+': the header and value end at the same edge');
+  const name=key+' '+direction+' at '+getComputedStyle(document.documentElement).fontSize;
+  const text=bounds(label),right=cell.classList.contains('right'),edge=right ? 'right' : 'left';
+  check(Math.abs(text[edge]-bounds(value)[edge])<=1,name+': the header and value align');
   check(cell.getAttribute('aria-sort')===direction,name+': the header has the expected sort state');
   check(getComputedStyle(arrow).visibility===(direction==='none' ? 'hidden' : 'visible'),name+': the arrow visibility matches the sort state');
   if(direction!=='none'){
    const icon=arrow.getBoundingClientRect();
-   check(icon.left>=cell.getBoundingClientRect().left && icon.right<text.left,name+': the arrow fits before the text');
+   check(right ? icon.right<text.left : icon.left>text.right,name+': the arrow fits beside the text');
+   const labels=[...document.querySelectorAll('.sort-label')].map(labelText);
+   check(labels.every(other=>{
+    const box=bounds(other);
+    return icon.right<=box.left || icon.left>=box.right;
+   }),name+': the arrow does not overlap any header label');
   }
+ };
+ const checkTableFits=label=>{
+  const scroll=document.querySelector('.card .scroll');
+  check(scroll.scrollWidth===scroll.clientWidth,label+': the table fits the card without horizontal scrolling');
  };
  const keys=()=>{let account='';return [...document.querySelector('tbody').rows].slice(0,-1).map(row=>{
   account=row.cells[1].textContent || account;return account+':'+row.cells[4].textContent.replace(' ✓','');
  });};
  const click=key=>header(key).click();
  try{
-  frameElement.style.width='1280px';frameElement.style.height='700px';await flush();
+  frameElement.style.width='1280px';frameElement.style.height='520px';await flush();
   const original=keys(),total=document.querySelector('tbody').lastElementChild.outerHTML;
   const geometry=()=>[...document.querySelectorAll('th')].map(node=>[node.getBoundingClientRect().x,node.getBoundingClientRect().width]);
   const initialGeometry=geometry();
+  const sameGeometry=()=>geometry().every((box,index)=>box.every((value,side)=>Math.abs(value-initialGeometry[index][side])<.5));
   const same=(indices,label)=>{
    check(JSON.stringify(keys())===JSON.stringify(indices.map(index=>original[index])),label);
    check(document.querySelector('tbody').lastElementChild.outerHTML===total,'the total stays last and unchanged: '+label);
-   check(geometry().every((box,index)=>box.every((value,side)=>Math.abs(value-initialGeometry[index][side])<.5)),
-    'columns keep their positions: '+label);
+   check(sameGeometry(),'columns keep their positions: '+label);
   };
+  checkTableFits('the default sort at 1280px');
+  const arrows=[...document.querySelectorAll('.sort-arrow')];
+  arrows.forEach(arrow=>{arrow.style.display='none';});
+  check(sameGeometry(),'arrows add no width to the table');
+  arrows.forEach(arrow=>arrow.style.removeProperty('display'));
   check(original[0]==='claude1:units' && original[1]==='claude1:workers','the default account order');
-  for(const key of ['left','busy']) checkAlignment(key,'none');
-  check(document.querySelectorAll('[data-account-sort]').length===4,'only four headers sort');
+  const added=[['next','ascending'],['idle','descending'],['paused','descending'],['exited','descending'],
+   ['total','descending'],['resets','ascending'],['credits','descending'],['enabled','descending']];
+  for(const key of ['left','role','busy',...added.map(([key])=>key)]) checkAlignment(key,'none');
+  checkAlignment('account','ascending');
+  check(document.querySelectorAll('[data-account-sort]').length===12,'every named header sorts');
   check([...document.querySelectorAll('[data-account-sort]')].every(node=>node.tabIndex===0 && getComputedStyle(node).cursor==='pointer'),
    'the sort headers support focus and show a pointer');
   click('account');same([6,5,4,3,2,1,0],'a second account choice reverses');
   check(header('account').getAttribute('aria-sort')==='descending','the account arrow reverses');
+  checkAlignment('account','descending');
   click('account');same([0,1,2,3,4,5,6],'account ascending');
   click('left');same([5,0,1,2,3,4,6],'left ascending');
+  checkTableFits('left sorted at 1280px');
   checkAlignment('left','ascending');
   click('left');same([3,2,1,0,5,6,4],'left descending');
   checkAlignment('left','descending');
   header('role').focus();header('role').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
   same([3,5,2,6,0,1,4],'Enter selects role ascending');
+  checkAlignment('role','ascending');
   const roleRows=[...document.querySelector('tbody').rows];
   check(roleRows[0].cells[1].textContent==='claude2' && roleRows[2].cells[1].textContent==='claude2',
    'split accounts repeat details');
   check(roleRows[4].cells[1].textContent==='claude1' && roleRows[5].cells[1].textContent==='',
    'a consecutive account run shows details once');
   click('role');same([1,0,6,2,5,3,4],'role descending');
+  checkAlignment('role','descending');
   click('busy');same([0,2,3,1,5,4,6],'busy descending');
   checkAlignment('busy','descending');
   check(header('busy').getAttribute('aria-sort')==='descending' && header('busy').querySelector('.sort-arrow').textContent==='▼',
@@ -398,6 +440,18 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
   check(reads>0 && document.querySelector('table')!==oldTable,'a live refresh replaces the table');
   same([5,1,2,3,0,6,4],'a live refresh keeps the sort');
+  const orders=JSON.parse(document.querySelector('[data-sort-orders]').dataset.sortOrders);
+  for(const [key,direction] of added){
+   click(key);checkAlignment(key,direction);
+   checkTableFits(key+' sorted at 1280px');
+   same(orders[key].map(place=>place.index),key+' first click');
+   click(key);checkAlignment(key,direction==='ascending' ? 'descending' : 'ascending');
+   same(orders[key+'-reverse'].map(place=>place.index),key+' second click');
+  }
+  document.documentElement.style.fontSize='24px';
+  checkAlignment('paused','none');
+  click('paused');checkAlignment('paused','descending');
+  click('paused');checkAlignment('paused','ascending');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
@@ -409,7 +463,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
         reading = sort_reading()
         rows = tuple(replace(row, roles=("showrunners", "units"), selected_roles=("units", "showrunners"),
                              credits=123, use_credits=True)
-                     if row.label == "claude1" else row for row in reading.rows)
+                     if row.label == "claude1" else replace(row, selected_roles=()) for row in reading.rows)
         reading = replace(reading, rows=rows,
                           first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2", "showrunners": "claude3"}))
         with patch.object(accounts, "read_status", return_value=reading):
@@ -429,7 +483,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
  const next=row=>row.querySelector('.next-cell');
  const target=row=>next(row).textContent.trim();
  const details=row=>[...row.cells].slice(-3).map(cell=>cell.textContent);
- const group=name=>document.querySelector('tr[data-move-group="'+name+'"]');
+ const group=name=>document.querySelector('tr[data-move-account="claude1"][data-move-group="'+name+'"]');
  const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  try{
   const original=rows(), cells=new Map(original.map(row=>[row,next(row)]));
@@ -438,12 +492,22 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
   check(target(units)==='claude2' && target(showrunners)==='claude3','the two role rows have distinct next targets');
   check(!showrunners.cells[1].textContent,'the second role keeps its next target with hidden account details');
   check(accountDetails[1]==='123' && accountDetails[2]==='yes','the first row has credits and their setting');
-  const nextHeader=[...document.querySelectorAll('th')].find(header=>header.textContent==='next');
+  const nextHeader=document.querySelector('[data-account-sort="next"]');
   const sameRows=()=>rows().every((row,index)=>row===original[index]);
+  const button=next(units).querySelector('[data-next-button]');
+  button.click();
+  const menu=document.querySelector('[data-move-menu]');
+  check(!menu.hidden && nextHeader.getAttribute('aria-sort')==='none' && sameRows(),
+   'the next cell button opens the menu and preserves the sort');
+  menu.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   nextHeader.click();
-  check(nextHeader.tabIndex===-1 && sameRows(),'the next header does not sort');
+  check(nextHeader.tabIndex===0 && nextHeader.getAttribute('aria-sort')==='ascending'
+   && rows()[0]===units && rows()[1]===showrunners,'the next header sorts targets ascending');
+  nextHeader.click();
+  check(nextHeader.getAttribute('aria-sort')==='descending' && rows()[0]===showrunners && rows()[1]===units,
+   'the next header reverses the target order');
   const markup=new Map(original.map(row=>[row,next(row).innerHTML]));
-  for(const column of ['account','left','role','busy']){
+  for(const column of ['account','left','role','next','idle','paused','exited','total','resets','credits','enabled','busy']){
    const header=document.querySelector('[data-account-sort="'+column+'"]');
    for(let direction=0;direction<2;direction++){
     header.click();
@@ -472,24 +536,24 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
     def test_sort_reads_saved_choices_and_handles_unavailable_storage(self) -> None:
         with patch.object(accounts, "read_status", return_value=sort_reading()):
             content = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
-        for saved, denied in ((True, False), (False, True)):
+        for saved, denied in (("role", False), ("unknown", False), ("role", True)):
             with self.subTest(saved=saved, denied=denied):
                 setup = '''<script>
 Date.now=()=>200000;const realFetch=fetch;
-localStorage.setItem('accounts-sort',JSON.stringify({column:'role',reverse:false}));
+localStorage.setItem('accounts-sort',JSON.stringify({column:SAVED_COLUMN,reverse:false}));
 if(DENIED) Object.defineProperty(window,'localStorage',{get:()=>{throw new Error('Storage denied');}});
-</script>'''.replace("DENIED", str(denied).lower())
+</script>'''.replace("SAVED_COLUMN", json.dumps(saved)).replace("DENIED", str(denied).lower())
                 probe = '''<script>
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
 try{
  const selected=document.querySelector('th[aria-sort="ascending"]');
- check(selected?.dataset.accountSort===(SAVED ? 'role' : 'account'),'the stored choice or default renders');
+ check(selected?.dataset.accountSort===EXPECTED_COLUMN,'the stored choice or default renders');
  document.querySelector('[data-account-sort="busy"]').click();
  check(document.querySelector('[data-account-sort="busy"]').getAttribute('aria-sort')==='descending',
   'sorting works when the storage write fails');
 }catch(error){failures.push(String(error));}
 realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
-</script>'''.replace("SAVED", str(saved).lower())
+</script>'''.replace("EXPECTED_COLUMN", json.dumps("role" if saved == "role" and not denied else "account"))
                 page = content.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
                 self.assertEqual(firefox_probe_results(page.encode()), [[]])
 

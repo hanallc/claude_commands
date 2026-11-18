@@ -539,7 +539,13 @@ A cached Accounts response carries its render failure to the status line.
 
 The table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
-The role swatch column is between **role** and **busy**.
+The role swatch column is between **role** and **next**.
+All named headers sort on click or Enter.
+The dot and swatch headers have no sort control.
+The arrow sits before a right-aligned label and after a left-aligned label.
+The arrow uses the column gap without adding to the table width.
+The column gap and arrow scale with the root font size.
+The viewer's sort choice stays through refreshes.
 A swatch shows for each board span with a `color_key`.
 An account has one when `config/statusline.conf` has a valid `account.<label>` color.
 The units, showrunners and workers roles use `role.unit-director`, `role.showrunner` and `role.worker`.
@@ -563,6 +569,7 @@ The `next` column follows the role color swatch.
 A selected Claude group (`units ✓` or `showrunners ✓`) shows its first target in that account's color and bold text.
 An empty group shows gray `none`.
 Its arrow button opens the move menu with a click, Enter, or Space.
+The move button leaves the sort order as it was.
 The button exposes its menu state through ARIA attributes.
 A selected Codex workers line shows its first target, or gray `auto`, without a button.
 The `auto` title explains that Codex workers move between Codex accounts by themselves.
