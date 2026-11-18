@@ -485,7 +485,8 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
                done_ids: tuple[str, ...] = (), phase_titles: tuple[tuple[str, str], ...] = (),
                production: str = "", merged_ids: Collection[str] = (), dropped_ids: Collection[str] = (),
                repository_available: bool = True,
-               destination_lands: Mapping[str, RecordedDestinationLand] = NO_RECORDED_DESTINATION_LANDS) -> UnitMergeNotes:
+               destination_lands: Mapping[str, RecordedDestinationLand] = NO_RECORDED_DESTINATION_LANDS,
+               checkpoint_merged: Callable[[str, str], bool] | None = None) -> UnitMergeNotes:
     """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
     hidden = set(merged_ids) | set(dropped_ids)
@@ -514,6 +515,9 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     def phase_production(phase: str) -> str:
         destination = destination_lands.get(phase)
         return destination.production if destination is not None else production
+
+    def merged(phase: str, commit: str) -> bool:
+        return on_main(commit) if checkpoint_merged is None else checkpoint_merged(phase, commit)
 
     open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase) and phase not in hidden}
     merging: list[str] = []
@@ -560,7 +564,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         if isinstance(sent, SentCommit) and not isinstance(pending_checkpoint_land(phase_land(wait.target), sent.commit),
                                                           land_queue.NotInLine | land_queue.LineUnused):
             continue
-        if isinstance(sent, SentCommit) and on_main(sent.commit):
+        if isinstance(sent, SentCommit) and merged(wait.target, sent.commit):
             continue
         holds[wait.target] = wait
     parts: list[WorkItem] = []
@@ -616,7 +620,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
             pending = True
     for phase, result in newest_results.items():
         if (not result["landed"] and phase not in open_sent and phase not in queued and phase not in merging
-                and not on_main(result["commit"])):
+                and not merged(phase, result["commit"])):
             parts.append(WorkItem(named(phase), merge_state_text(land_queue.LandEnded(result), production)))
             pending = True
     return UnitMergeNotes(frozenset(grouped), tuple(parts), pending, frozenset(wait_targets))
@@ -752,7 +756,7 @@ class CheckpointRepositoryUnavailable(NamedTuple):
 
 
 class DependencyHistoryUnavailable(NamedTuple):
-    """The dependency run has a recorded start but its events are unavailable."""
+    """The dependency history cannot prove which attempt is current."""
 
 
 DependencyState = waits_on.WaitState | CheckpointRepositoryUnavailable | DependencyHistoryUnavailable
@@ -1490,8 +1494,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     results = {checkpoint_result_key(row): row for row in recorded_land.results.values()}
     landed_checkpoints = {(row["unit"], row["phase"]): row["commit"] for row in results.values() if row["landed"]}
     pending_results = {commit: row for commit, row in recorded_land.results.items() if not row["landed"]}
-    recorded_destinations = {(row["unit"], row["phase"]) for row in pending_results.values() if row.get("production")}
-    events: dict[Path, list[dict[str, object]]] = {}
+    run_histories: dict[Path, plan_history.CompleteRunHistory | plan_history.IncompleteRunHistory] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
     plan_failures: dict[Path, OSError | UnicodeError] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
@@ -1514,10 +1517,13 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             return CheckpointRepositoryUnavailable()
         return common_directories.setdefault(checkout.common_dir, checkout.toplevel)
 
+    def read_history(path: Path) -> plan_history.CompleteRunHistory | plan_history.IncompleteRunHistory:
+        if path not in run_histories:
+            run_histories[path] = plan_history.read_run_history(path)
+        return run_histories[path]
+
     def read_run(path: Path) -> list[dict[str, object]]:
-        if path not in events:
-            events[path] = plan_history.read_run_events(path)
-        return events[path]
+        return read_history(path).events
 
     def read_plan(path: Path) -> list[plan_history.PlanPhase]:
         if path not in plans:
@@ -1569,12 +1575,24 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     newest = {unit_id: starts[0] for unit_id, starts in history.items()}
     runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
 
-    def read_attempt(run: UnitRunStart, phase: str) -> (
+    def latest_attempt(member: staff.StaffRow, phase: str) -> (
             waits_on.PhaseSent | waits_on.PhaseOpen | waits_on.PhaseNotStarted | DependencyHistoryUnavailable):
-        run_events = read_run(run.path)
-        if not run_events or run_events[0].get("event_type") != "run_started":
+        starts = history.get(member.id, ())
+        if not starts:
+            return DependencyHistoryUnavailable() if isinstance(member.run, staff.OpenRun) else waits_on.PhaseNotStarted()
+        current = starts[0]
+        if isinstance(member.run, staff.OpenRun) and current.path != plan_history.run_events_path(member.run.path):
             return DependencyHistoryUnavailable()
-        return phase_dependency(run_events, phase)
+        for run in starts:
+            if run.started > current.started:
+                continue
+            run_history = read_history(run.path)
+            if isinstance(run_history, plan_history.IncompleteRunHistory):
+                return DependencyHistoryUnavailable()
+            attempt = phase_dependency(run_history.events, phase)
+            if not isinstance(attempt, waits_on.PhaseNotStarted):
+                return attempt
+        return waits_on.PhaseNotStarted()
 
     def dependency(after: str, source: Path | CheckpointRepositoryUnavailable) -> tuple[DependencyState, land_queue.LandView]:
         unit_name, slash, phase = after.partition("/")
@@ -1586,8 +1604,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             land = recorded_land
             found: DependencyState = source if isinstance(source, CheckpointRepositoryUnavailable) else waits_on.NotFound()
             if member is not None:
-                run = newest.get(member.id)
-                observed = read_attempt(run, phase) if run is not None else waits_on.PhaseNotStarted()
+                observed = latest_attempt(member, phase)
                 found = observed
                 if isinstance(observed, waits_on.PhaseSent):
                     commit = observed.commit
@@ -1602,25 +1619,13 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                                 and isinstance(land_queue.land_state(land, commit), land_queue.NotInLine | land_queue.LineUnused)):
                             found = target
                 elif isinstance(observed, waits_on.PhaseNotStarted):
-                    if landed := landed_checkpoints.get((unit_name, phase)):
-                        found = waits_on.OnMain(landed)
-                    elif isinstance(source, Path):
+                    commit = landed_checkpoints.get((unit_name, phase), "")
+                    if not commit and isinstance(source, Path):
                         named = repository_evidence(source).phase_merges.get((unit_name, phase))
                         if named is not None:
-                            found = waits_on.OnMain(named.commit)
-                    elif (unit_name, phase) in recorded_destinations:
-                        for previous in history.get(member.id, ())[1:]:
-                            prior = read_attempt(previous, phase)
-                            if isinstance(prior, waits_on.PhaseNotStarted):
-                                continue
-                            if isinstance(prior, DependencyHistoryUnavailable):
-                                found = prior
-                            elif isinstance(prior, waits_on.PhaseSent):
-                                result = results.get((unit_name, phase, prior.commit.lower()))
-                                if result is not None and result.get("production") and checkpoint_merged(
-                                        unit_name, phase, prior.commit, source):
-                                    found = waits_on.OnMain(prior.commit)
-                            break
+                            commit = named.checkpoint_commit
+                    if commit and checkpoint_merged(unit_name, phase, commit, source):
+                        found = waits_on.OnMain(commit)
             elif isinstance(source, Path):
                 target = repository_evidence(source)
                 land = target.land
@@ -1718,7 +1723,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main,
                            unit_waits=waits, done_ids=tuple(done), phase_titles=tuple(titles.items()),
                            production=production_name, merged_ids=frozenset(merged_phases), dropped_ids=dropped,
-                           repository_available=repository_available, destination_lands=destination_lands)
+                           repository_available=repository_available, destination_lands=destination_lands,
+                           checkpoint_merged=lambda phase, commit: checkpoint_merged(unit.unit, phase, commit, source))
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan,

@@ -286,7 +286,7 @@ class UnitPhasesTests(unittest.TestCase):
         for status in ("busy", "idle"):
             for record, expected in cases:
                 with self.subTest(status=status, record=record):
-                    with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                    with (patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads,
                           patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queues):
                         rendered = self.blocks([member], {member.name: record}, statuses=[status])
                     self.assertIn("**empty** — idle", rendered)
@@ -676,7 +676,7 @@ class UnitPhasesTests(unittest.TestCase):
             {"phase": "8", "title": "Repair delivery", "status": "running"},
             {"phase": "10", "title": "Verify delivery", "status": "running"},
             {"phase": "12", "title": "Later delivery", "status": "todo"}]}
-        with patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads:
+        with patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads:
             rendered = self.blocks([member], {"parallel": record},
                 workers=[census_worker("tester", member.id), census_worker("repair", member.id)])
         self.assertEqual(reads.call_count, 1)
@@ -868,7 +868,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.phase_event("checkpoint", "acctload", checkpoint_commit="a" * 40, timestamp_epoch=at - 86400),
                     self.phase_event("checkpoint", "acctload", checkpoint_commit=commit, timestamp_epoch=recorded)])
                 with (patch.object(land_queue, "land_view", return_value=view),
-                      patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                      patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads):
                     rendered = unit_phases.table([unit(member.name, live(member.name))], {}, repository=self.root, now=now,
                         zone=ZoneInfo(zone), columns=1000, census_read=tiles(sessions=[session_of(member, "idle")]))
                 self.assertIn(("Now", "Load the account (acctload)",
@@ -918,7 +918,7 @@ class UnitPhasesTests(unittest.TestCase):
                             "wait_kind": "WaitingForUser", "wait_started_epoch": at + 120})
                     path = self.write_run(member, "finished", [("delivery", "Completed delivery")], tail)
                     with (patch.object(land_queue, "land_view", return_value=view),
-                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                          patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads):
                         rendered = self.blocks([member, dependent], {})
                     rows = detail_rows(rendered, member.name)
                     if expected:
@@ -975,7 +975,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(waits_on, "main_commit_identities", wraps=waits_on.main_commit_identities) as main_reads,
               patch.object(waits_on, "copied_on_main", wraps=waits_on.copied_on_main) as checks,
               patch.object(waits_on, "git", wraps=waits_on.git) as git_reads,
-              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as run_reads):
+              patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as run_reads):
             rendered = self.blocks([member, other], {})
         work = [row.work for row in detail_rows(rendered, member.name)]
         for phase in ("copied", "repeated", "subject", "result", "ancestry", "open-subject", "open-result"):
@@ -1111,7 +1111,7 @@ class UnitPhasesTests(unittest.TestCase):
                       patch.object(waits_on, "copied_on_main", wraps=waits_on.copied_on_main) as copies,
                       patch.object(unit_phases, "phase_dependency", wraps=unit_phases.phase_dependency) as dependencies,
                       patch.object(unit_phases, "read_production", wraps=read_production) as sources,
-                      patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as run_reads,
+                      patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as run_reads,
                       contextlib.redirect_stdout(output)):
                     self.assertEqual(unit_phases.main(["--production", owner.name], columns=1000), 0)
                 for member in members:
@@ -1189,6 +1189,25 @@ class UnitPhasesTests(unittest.TestCase):
                           if row.work == "Review other (other)"]
                 self.assertEqual(states, ["Ready"])
 
+    def test_remote_dependency_keeps_merge_subject_evidence_after_the_next_run(self) -> None:
+        dependent = self.member("dependent")
+        _ = self.repository()
+        remote_member = fixture_member("unit", name="remote-delivery", parent=dependent.parent,
+                                       worktree=staff.PresentWorktree("fixture-remote", self.root / "remote"))
+        checkpoint = "a" * 40
+        _ = self.write_run(remote_member, "remote-delivery", [("delivery", "Delivery")], [
+            self.phase_event("checkpoint", "delivery", checkpoint_commit=checkpoint)])
+        _ = self.queue(dependent, unit_queue.QueuedItem("Review delivery", "remote-delivery/delivery"))
+        subjects = {(remote_member.name, "delivery"): waits_on.PhaseMerge("b" * 40, 200, checkpoint[:9])}
+        with patch.object(waits_on, "landed_phases", return_value=subjects):
+            for run in ("delivery", "later"):
+                with self.subTest(run=run):
+                    if run == "later":
+                        _ = self.write_run(remote_member, "remote-next-run", [("later", "Later work")], started=300)
+                    rendered = self.blocks([dependent, remote_member], {})
+                    self.assertIn(("Next", "Review delivery", "Ready"), detail_rows(rendered, dependent.name))
+                    self.assertNotIn("Delivery (delivery)", [row.work for row in detail_rows(rendered, remote_member.name)])
+
     def test_finished_phases_stay_visible_when_merge_records_name_other_hashes(self) -> None:
         member = self.member("finished")
         _ = self.repository()
@@ -1224,7 +1243,7 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as subjects,
               patch.object(waits_on, "landed_phase", wraps=waits_on.landed_phase) as individual,
               patch.object(waits_on, "on_main", wraps=waits_on.on_main) as ancestry,
-              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+              patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads):
             rendered = self.blocks([member, other], {})
         work = [row.work for row in detail_rows(rendered, member.name)]
         for phase, title in phases:
@@ -1276,7 +1295,7 @@ class UnitPhasesTests(unittest.TestCase):
                         self.phase_event("phase_finished", evidence, phase_instance_id="new-attempt", status="completed")])
                     with (patch.object(land_queue, "land_view", return_value=view),
                           patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as subjects,
-                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                          patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads):
                         rendered = self.blocks([member, dependent], {})
                     rows = detail_rows(rendered, member.name)
                     current = ("Now", f"Delivery ({evidence})", "2nd in sdlc's merge line")
@@ -1293,19 +1312,32 @@ class UnitPhasesTests(unittest.TestCase):
                 view = land_queue.LandView({}, {}, results, frozenset(), {})
                 with patch.object(land_queue, "land_view", return_value=view):
                     rendered = self.blocks([member, dependent], {})
+                    self.assertIn(("Now", "Review delivery", f"After finished phase {evidence}; not in the merge line"),
+                                  detail_rows(rendered, dependent.name))
+                    _ = self.write_run(member, "latest-attempt", [(evidence, "Delivery")], [
+                        self.phase_event("checkpoint", evidence, checkpoint_commit=published),
+                        self.phase_event("phase_finished", evidence, status="completed")])
+                    _ = staff.set_run(member.id, staff.OpenRun(self.root / "runs/next-run"))
+                    rendered = self.blocks([member, dependent], {})
                 self.assertIn(("Next", "Review delivery", "Ready"), detail_rows(rendered, dependent.name))
 
-        with self.subTest(evidence="result", attempt="unreadable retry"):
-            path = self.write_run(member, "unreadable-retry", [("result", "Retry delivery")], [
-                self.phase_event("checkpoint", "result", checkpoint_commit=checkpoint)], started=merge_at + 1200)
-            starts = plan_history.run_starts()
-            path.unlink()
-            view = land_queue.LandView({}, {}, {published: landed}, frozenset(), {})
-            with (patch.object(plan_history, "run_starts", return_value=starts),
-                  patch.object(land_queue, "land_view", return_value=view)):
-                rendered = self.blocks([dependent], {})
-            self.assertIn(("Next", "Review delivery", "After finished phase result; merge evidence unavailable"),
-                          detail_rows(rendered, dependent.name))
+        for fault in ("read after discovery", "unreadable at discovery", "malformed phase start"):
+            with self.subTest(evidence="result", fault=fault):
+                path = self.write_run(member, "unreadable-retry", [("result", "Retry delivery")], [
+                    self.phase_event("checkpoint", "result", checkpoint_commit=checkpoint)], started=merge_at + 1200)
+                starts = plan_history.run_starts()
+                if fault == "malformed phase start":
+                    header, _, checkpoint_row = path.read_text().splitlines()
+                    _ = path.write_text(header + '\n{"event_type":"phase_started"\n' + checkpoint_row + "\n")
+                else:
+                    path.unlink()
+                view = land_queue.LandView({}, {}, {published: landed}, frozenset(), {})
+                discovery = (patch.object(plan_history, "run_starts", return_value=starts)
+                             if fault == "read after discovery" else contextlib.nullcontext())
+                with discovery, patch.object(land_queue, "land_view", return_value=view):
+                    rendered = self.blocks([dependent], {})
+                self.assertIn(("Next", "Review delivery", "After finished phase result; merge evidence unavailable"),
+                              detail_rows(rendered, dependent.name))
 
     def test_undated_checkpoints_require_the_merged_checkpoint_hash(self) -> None:
         member = self.member("finished")
@@ -1412,7 +1444,7 @@ class UnitPhasesTests(unittest.TestCase):
         _ = self.write_run(other, "foreign", [("ad-hoc", "Foreign task")], started=400)
         _ = staff.set_run(member.id, staff.OpenRun(self.root / "runs/selected"))
         _ = self.queue(member, unit_queue.QueuedItem("Review delivery"), unit_queue.QueuedItem("Clean records"))
-        with patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads:
+        with patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads:
             rendered = self.blocks([member], {})
         self.assertIn(("Now", "Other work (ad-hoc)", "Director's current step not recorded"),
                       detail_rows(rendered, "selection"))
@@ -1543,7 +1575,7 @@ class UnitPhasesTests(unittest.TestCase):
         member_path = self.write_run(member, "next", [])
         _ = self.queue(member, unit_queue.QueuedItem("Merge delivery", "dependency/22"),
                        unit_queue.QueuedItem("Read delivery", "dependency/22"))
-        with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+        with (patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads,
               patch.object(unit_phases, "phase_dependency", wraps=unit_phases.phase_dependency) as dependencies):
             rendered = self.blocks([dependency, member], {})
         self.assertIn("**next** — waiting on other work", rendered)
@@ -1587,7 +1619,7 @@ class UnitPhasesTests(unittest.TestCase):
              "depends_on": ("41", "next/acctcolor", "handler/23")},
             {"id": "43", "title": "Publish the report", "done": False, "depends_on": ("handler/23",)}]
         with (patch.object(plan_history, "plan_phases", return_value=details) as plans,
-              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+              patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads,
               patch.object(unit_phases, "phase_dependency", wraps=unit_phases.phase_dependency) as dependencies):
             rendered = self.blocks([member], {"next": record})
         rows = detail_rows(rendered, "next")
@@ -1663,7 +1695,7 @@ class UnitPhasesTests(unittest.TestCase):
                         {"id": "2", "title": "Publish delivery", "done": False, "depends_on": (reference,)}]
                     with (patch.object(plan_history, "plan_phases", return_value=details),
                           patch.object(land_queue, "land_view", return_value=land_queue.LandView({}, {}, {}, frozenset(), {})),
-                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                          patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads,
                           patch.object(unit_phases, "phase_dependency", wraps=unit_phases.phase_dependency) as dependencies):
                         rendered = self.blocks([member], {"local": record})
                     rows = detail_rows(rendered, "local")
@@ -1756,7 +1788,7 @@ class UnitPhasesTests(unittest.TestCase):
                     queued_items.append(unit_queue.QueuedItem("Review acctcolor: Add account colors"))
                 _ = self.queue(member, *queued_items)
                 workers = [census_worker("writer", member.id)] if target_state == "working" else []
-                with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                with (patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads,
                       patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queues):
                     rendered = self.blocks([member], {}, workers=workers)
                 self.assertIn(f"**reasons** — {bucket}", rendered)
@@ -1956,7 +1988,7 @@ class UnitPhasesTests(unittest.TestCase):
         }
         merge = land_queue.LandView({}, {}, {"c" * 40: failed}, frozenset(), {})
         with (patch.object(land_queue, "land_view", return_value=merge),
-              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+              patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads,
               patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queues):
             rendered = self.blocks([member], {})
         rows = detail_rows(rendered, member.name)
@@ -2041,7 +2073,7 @@ class UnitPhasesTests(unittest.TestCase):
         for dropped_view in dropped_views:
             with (self.subTest(land=dropped_view),
                   patch.object(land_queue, "land_view", return_value=dropped_view),
-                  patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                  patch.object(plan_history, "read_run_history", wraps=plan_history.read_run_history) as reads):
                 rendered = self.blocks([member], {})
             self.assertNotIn(answer[1] + " (answer-copy)", [row.work for row in detail_rows(rendered, member.name)])
             self.assertNotIn("old approval", rendered)
