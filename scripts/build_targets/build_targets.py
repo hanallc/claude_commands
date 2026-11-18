@@ -32,6 +32,7 @@ from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
+from scripts.build_targets.execution_transport import HanaGpuNextestTransport
 from scripts.build_queue.placement import CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
 
 CONFIGURED_PROVIDER_SETTINGS = ConfiguredProviderSettings()
@@ -79,6 +80,8 @@ class CliArguments(argparse.Namespace):
         self.episode: str = ""
         self.attempt: str = ""
         self.assignment_file: str = ""
+        self.result_file: str = ""
+        self.argv: list[str] = []
 
 
 def positive_pid(value: str) -> int:
@@ -102,6 +105,14 @@ def parser() -> argparse.ArgumentParser:
     _ = reserve.add_argument("--target", default="")
     _ = reserve.add_argument("--recover-only", action="store_true")
     _ = reserve.add_argument("--new-step", action="store_true")
+    gpu = commands.add_parser("run-hana-gpu")
+    _ = gpu.add_argument("--assignment-file", required=True)
+    _ = gpu.add_argument("--repo-root", required=True)
+    _ = gpu.add_argument("--package", required=True)
+    _ = gpu.add_argument("--result-file", required=True)
+    _ = gpu.add_argument("argv", nargs=argparse.REMAINDER)
+    stop_gpu = commands.add_parser("stop-hana-gpu")
+    _ = stop_gpu.add_argument("--assignment-file", required=True)
     info = commands.add_parser("assigned-info")
     _ = info.add_argument("--assignment-file", required=True)
     recovery = commands.add_parser("recover-probe", help=argparse.SUPPRESS)
@@ -183,6 +194,12 @@ def target_state(target: LocalTarget | SshTarget) -> TargetState:
     if isinstance(target, SshTarget):
         from scripts.aws_target import hana_placement
         transport = hana_placement.read_execution_transport(target)
+        if isinstance(transport, HanaGpuNextestTransport):
+            from scripts.build_targets.targets import Unreachable
+
+            setup = hana_placement.gpu_setup(transport)
+            if isinstance(setup, hana_placement.HanaStepRefused):
+                return Unreachable(setup.reason)
         if isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.build_targets.targets import Free, StateUnreadable, Unreachable
             from scripts.aws_target import hana_box
@@ -264,7 +281,7 @@ def probe_target(target: SshTarget) -> TargetState:
     from scripts.mac_test import eligibility, offload
 
     from scripts.aws_target import hana_placement
-    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+    if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return target_state(target)
     config = eligibility.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
@@ -381,7 +398,8 @@ def fixed_placement_constraints(
         selection = ROUTED
     repository = eligibility.repository_identity(repo_root)
     candidates: list[placement.PlacementCandidate] = []
-    for target in read_targets():
+    selected_name = selection.target if isinstance(selection, Pinned) and isinstance(rule, AnyTarget) else ""
+    for target in read_targets(target_name=selected_name):
         host_eligibility: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
         if isinstance(target, LocalTarget):
             destination = placement.PlacementDestination("local", target.name, store.host_name(), claim_state.WHOLE_MAC)
@@ -393,6 +411,19 @@ def fixed_placement_constraints(
             selected_settings = provider_settings
         from scripts.aws_target import hana_placement
         transport = target_config.read_execution_transport(target)
+        if isinstance(transport, HanaGpuNextestTransport):
+            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
+            if isinstance(rule, NatedevOnly):
+                host_eligibility = placement.FixedExclusion(rule.reason)
+            elif not isinstance(selection, Pinned) or selection.target != target.name:
+                host_eligibility = placement.FixedExclusion('This target requires --target hana-gpu')
+            else:
+                host_eligibility = hana_placement.gpu_step(transport,
+                    repository.key if isinstance(repository, eligibility.KnownRepository) else '', package, kind, command)
+            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            candidates.append(placement.PlacementCandidate(destination, host_eligibility))
+            continue
         if isinstance(transport, hana_placement.HanaControlTransport):
             scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
                      if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
@@ -460,13 +491,15 @@ def command_constraints(args: CliArguments) -> int:
     constraints = fixed_placement_constraints(Path(args.repo_root).resolve(), args.package,
         cast(StepKind, args.kind), (), session, placement.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
     print("any_target" if isinstance(rule, AnyTarget) else f"natedev_only {rule.reason}")
+    selected_name = selection.target if isinstance(selection, Pinned) and isinstance(rule, AnyTarget) else ""
     shown: set[str] = set()
     for candidate in constraints.candidates:
         destination = candidate.destination
         if destination.target in shown:
             continue
         shown.add(destination.target)
-        target = next(target for target in read_targets() if target.name == destination.target)
+        target = next(target for target in read_targets(target_name=selected_name)
+                      if target.name == destination.target)
         if args.mac_only and (not isinstance(target, SshTarget) or target.platform != "macos"):
             continue
         reason = (candidate.eligibility.reason if isinstance(candidate.eligibility, placement.FixedExclusion)
@@ -693,6 +726,17 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     session = claim_state.submitting_session(session)
     from scripts.aws_target import hana_placement
     transport = hana_placement.read_execution_transport(target)
+    if isinstance(transport, HanaGpuNextestTransport):
+        from scripts.build_queue.placement import FixedExclusion
+
+        if isinstance(routing, LocalRequired):
+            return ExcludedTarget(target, routing.reason)
+        if not isinstance(selection, Pinned) or selection.target != target.name:
+            return ExcludedTarget(target, 'This target requires --target hana-gpu')
+        identity = eligibility.repository_identity(repo_root)
+        policy = hana_placement.gpu_step(transport, identity.key if isinstance(identity, eligibility.KnownRepository) else '',
+                          package, kind, ())
+        return ExcludedTarget(target, policy.reason) if isinstance(policy, FixedExclusion) else EligibleTarget(target)
     if isinstance(transport, hana_placement.HanaControlTransport):
         if isinstance(routing, LocalRequired):
             return ExcludedTarget(target, routing.reason)
@@ -745,7 +789,7 @@ def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | Excluded
     from scripts.mac_test import eligibility
     from scripts.aws_target import hana_placement
 
-    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+    if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return ExcludedTarget(target, 'Hana requires an exact queue assignment')
 
     return eligibility.read_config(target.settings)
@@ -1478,6 +1522,25 @@ def main() -> int:
         if args.command == "submitting-session":
             print(claim_state.session_id(claim_state.submitting_session(args.session)))
             return 0
+        if args.command == "stop-hana-gpu":
+            from importlib import import_module
+            from scripts.build_queue import admission_wire as wire, placement
+
+            saved = wire.read_assignment(Path(args.assignment_file))
+            if not isinstance(saved, wire.Assignment) or saved.assignment.destination.target != "hana-gpu":
+                raise ValueError("A Hana GPU assignment is required to stop its service")
+            stop_service = cast(Callable[[str], int], getattr(
+                import_module("scripts.aws_target.gpu_size_trial"), "stop_assigned_gpu_service"))
+            return stop_service(placement.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt))
+        if args.command == "run-hana-gpu":
+            from scripts.aws_target import hana_placement
+            from scripts.build_queue import admission_wire as wire
+
+            saved = wire.read_assignment(Path(args.assignment_file))
+            if not isinstance(saved, wire.Assignment) or args.argv[:1] != ["--"]:
+                raise ValueError("The Hana GPU runner requires a remote assignment and a command")
+            return hana_placement.run_gpu_assignment(saved.assignment, Path(args.repo_root), args.package,
+                                      tuple(args.argv[1:]), Path(args.result_file))
         if args.command == "assigned-info":
             from scripts.build_queue import admission_protocol as wire
 

@@ -459,10 +459,10 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
         paths.add(settings.path)
     for target in targets:
         if isinstance(target, target_config.SshTarget) and target.name == target_name:
-            from scripts.aws_target import hana_placement
+            from scripts.build_targets.execution_transport import HanaControlTransport
 
             paths.add(target.settings)
-            if isinstance(transport_for(target), hana_placement.HanaControlTransport):
+            if isinstance(transport_for(target), HanaControlTransport):
                 paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
     for path in sorted(paths):

@@ -95,4 +95,18 @@ The worker lists the exact S3 result key before it downloads the object. It uses
 
 The guest arms shutdown before downloading its inputs. The Hana expiry tag and guest timer use the same deadline. The expiry job provides cleanup if the guest timer and host cleanup fail. The reservation adds 60 minutes for the schedule and one minute for EventBridge delivery. It also includes three one-minute function attempts and retry delays of one and two minutes. [Lambda function error retries](https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-error-handling.html)
 
-The worker selects only types listed in the saved deployment record. Gate setup must refresh older records that lack the list. Work order B adds the setup proof. The build queue and `verify.sh` route follow the pinned live proof.
+The worker selects only types listed in the saved deployment record. Gate setup must refresh older records that lack the list.
+
+## 8. Work order B2 implementation
+
+The queue and `verify.sh` support one pinned `hana-gpu` slot. The configured pilot is `hana_mimesis_tools:shader_variants`.
+The executor captures the assigned source and delegates the nextest run to Work Order A.
+A completed test returns its original status and both output streams.
+A claim remains pending after the GPU service starts until it confirms cleanup.
+Cancellation stops the assigned service and runs its cleanup.
+A settled infrastructure refusal releases the slot.
+The pinned caller sees the cause and exits with status 2.
+
+The route starts disabled. Set `hana_gpu_route_enabled=on` after the gate setup GPU probe succeeds.
+The route also checks the gate deployment record for the configured GPU types.
+The live pinned run remains the proof for target order changes.

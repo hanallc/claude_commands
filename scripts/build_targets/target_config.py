@@ -114,7 +114,8 @@ class LiveConfiguration(Enum):
 class CommandConfiguration:
     """Configuration reads retained only during one short command."""
 
-    targets: dict[Path, tuple[Target, ...]] = field(default_factory=dict)
+    targets: dict[tuple[Path, str], tuple[Target, ...]] = field(default_factory=dict)
+    values: dict[Path, dict[str, str]] = field(default_factory=dict)
 
 
 COMMAND_CONFIGURATION: ContextVar[LiveConfiguration | CommandConfiguration] = ContextVar(
@@ -168,17 +169,29 @@ def uses_legacy_mac_layout(platform: Platform) -> bool:
     return platform == "macos"
 
 
-def read_targets(path: Path | None = None) -> tuple[Target, ...]:
+def read_targets(path: Path | None = None, *, target_name: str = "") -> tuple[Target, ...]:
     config = conf.path("build_targets") if path is None else path
     current = COMMAND_CONFIGURATION.get()
-    if isinstance(current, CommandConfiguration) and config in current.targets:
-        return current.targets[config]
-    values = conf.read(config).values()
+    cache_key = config, target_name
+    if isinstance(current, CommandConfiguration) and cache_key in current.targets:
+        return current.targets[cache_key]
+    if isinstance(current, CommandConfiguration):
+        if config not in current.values:
+            current.values[config] = conf.read(config).values()
+        values = current.values[config]
+    else:
+        values = conf.read(config).values()
     names = tuple(name.strip() for name in values.get("targets", "").split(","))
     if not all(names) or len(set(names)) != len(names):
         raise ConfigError(f"targets: expected distinct target names in {config}")
+    if target_name and target_name not in names:
+        pinned = values.get("pinned_targets", "").split(",")
+        if any(name.strip() == target_name for name in pinned):
+            names = (target_name,)
     targets: list[Target] = []
     for name in names:
+        if target_name and name != target_name:
+            continue
         kind = values.get(f"kind.{name}", "")
         if kind not in ("local", "ssh"):
             raise ConfigError(f"kind.{name}: expected local or ssh, got {kind!r}")
@@ -200,13 +213,13 @@ def read_targets(path: Path | None = None) -> tuple[Target, ...]:
         targets.append(SshTarget(name, platform, settings))
     result = tuple(targets)
     if isinstance(current, CommandConfiguration):
-        current.targets[config] = result
+        current.targets[cache_key] = result
     return result
 
 
 def configured_ssh_target(target: str) -> SshTarget:
     """Resolve an SSH target before access to its coordination state."""
-    for configured in read_targets():
+    for configured in read_targets(target_name=target):
         if configured.name == target and isinstance(configured, SshTarget):
             require_target_name(target)
             return configured
@@ -224,10 +237,10 @@ def read_execution_transport(target: SshTarget) -> ExecutionTransport:
 def command_target_name(given: str | None) -> str:
     """Resolve a positional target for clear, drain, or release."""
     configuration = conf.read_or_repository("build_targets")
-    configured = read_targets(configuration.source)
     selected = given if given is not None else configuration.text("default_target")
+    configured = read_targets(configuration.source, target_name="" if selected == "all" else selected)
     names = {target.name for target in configured}
     names.update(key.removeprefix("sync.hosts.") for key in configuration.values() if key.startswith("sync.hosts."))
     if selected != "all" and selected not in names:
-        raise ConfigError(f"unknown target {selected}; configured targets: {', '.join(target.name for target in configured)}")
+        raise ConfigError(f"unknown target {selected}")
     return selected

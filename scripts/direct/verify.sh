@@ -1926,6 +1926,12 @@ find_mac_runner_pid() {
     fi
 }
 
+stop_assigned_gpu_unit() {
+    if [[ -n "${PLACEMENT_ASSIGNMENT_FILE:-}" ]]; then
+        verify_helper "$BUILD_TARGETS_SCRIPT" stop-hana-gpu --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" || true
+    fi
+}
+
 cancel_tree_run() {
     after_tree_change || return 0
     local runner_pid
@@ -1937,6 +1943,7 @@ cancel_tree_run() {
         collect_child "$runner_pid" TERM
         MAC_RUNNER_PID=""
     fi
+    if [[ "${STEP_ASSIGNED_TARGET:-}" == hana-gpu ]]; then stop_assigned_gpu_unit; fi
     # Board release also stops a step's separately owned process group.
     if declare -F release_token >/dev/null; then release_token || true; fi
     if [[ -n "${RUN_STEP_PID:-}" ]]; then
@@ -2180,6 +2187,7 @@ forward_mac_runner_signal() {
     if [[ -n "$runner_pid" ]]; then
         collect_child "$runner_pid" "$signal_name"
     fi
+    if [[ "${STEP_ASSIGNED_TARGET:-}" == hana-gpu ]]; then stop_assigned_gpu_unit; fi
     if [[ -n "$MAC_RESULT_FILE" ]]; then
         if [[ -d "$MAC_RESULT_FILE" ]]; then
             rmdir "$MAC_RESULT_FILE" 2>/dev/null || true
@@ -2294,13 +2302,20 @@ with open(3, "rb") as handoff:
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
+    local runner="$MAC_RUNNER"
+    if [[ "$selected_target" == hana-gpu ]]; then
+        runner="$BUILD_TARGETS_SCRIPT"
+        runner_args=(run-hana-gpu --assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
+            --repo-root "${MAC_SOURCE_ROOT:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+            --result-file "$MAC_RESULT_FILE" -- "${PLACEMENT_COMMAND[@]}")
+    fi
     MAC_RUNNER_PRIOR_JOB=${!:-}
     MAC_RUNNER_LAUNCHING=1
     (
         if [[ -z ${VERIFY_MAC_ENVIRONMENT[0]+set} ]]; then
-            exec "$PY" "$MAC_RUNNER" "${runner_args[@]}"
+            exec "$PY" "$runner" "${runner_args[@]}"
         fi
-        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$MAC_RUNNER" "${runner_args[@]}" \
+        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$runner" "${runner_args[@]}" \
             3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
     ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
     MAC_RUNNER_PID=$!
@@ -2645,7 +2660,7 @@ release_wait_claim() {
 try_reserved_target() {
     [[ -n "${PLACEMENT_ASSIGNMENT_FILE:-}" && -s "$PLACEMENT_ASSIGNMENT_FILE" ]] || return 2
     [[ "${PLACEMENT_PROVIDER:-local}" != local ]] || return 2
-    if [[ ! -f "$MAC_RUNNER" ]]; then
+    if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu && ! -f "$MAC_RUNNER" ]]; then
         release_wait_claim
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" claim-failed --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
             --reason runner >/dev/null || return $?
@@ -2982,7 +2997,8 @@ route_test() {
             continue
         fi
         (( placement_status == 0 )) || return "$placement_status"
-        if [[ "${PLACEMENT_COMMAND[0]:-}" == cargo && "${PLACEMENT_COMMAND[1]:-}" == nextest ]]; then
+        if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu && "${PLACEMENT_COMMAND[0]:-}" == cargo
+                && "${PLACEMENT_COMMAND[1]:-}" == nextest ]]; then
             require_nextest
         fi
         collect_routing_wait
@@ -3013,39 +3029,41 @@ route_test() {
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" report-prerequisite --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
                 --token after-grant >/dev/null || return $?
         fi
-        local claim_status=0
-        # reserve and recover-reservation take the same words.
-        local -a reservation_words=(--assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
-            --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
-            --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation"
-            --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity")
-        verify_helper "$BUILD_TARGETS_SCRIPT" reserve "${reservation_words[@]}" || claim_status=$?
-        if (( claim_status != 0 && claim_status != 13 )); then
-            local recovered=78
-            while (( recovered == 78 )); do
-                recovered=0
-                verify_helper "$BUILD_TARGETS_SCRIPT" recover-reservation "${reservation_words[@]}" || recovered=$?
-                if (( recovered == 78 )); then wait_for_claim_recovery; fi
-            done
-            if (( recovered == 0 || recovered == 13 )); then
-                claim_status=$recovered
-            elif (( recovered != 1 )); then
-                return "$recovered"
-            fi
-        fi
-        if (( claim_status != 0 && claim_status != 13 )); then
-            local claim_reason=state
-            if (( claim_status == 11 )); then claim_reason=busy; fi
-            if (( claim_status == 10 )); then claim_reason=blocked; fi
-            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" claim-failed --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
-                --reason "$claim_reason" || return $?
-            if [[ -n "$PINNED_TARGET" && "$claim_reason" != busy ]]; then
-                if (( claim_status == 1 )) && [[ "$STEP_ASSIGNED_PLATFORM" == linux ]]; then
-                    pinned_target_refuse 'admission changed'
+        if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu ]]; then
+            local claim_status=0
+            # reserve and recover-reservation take the same words.
+            local -a reservation_words=(--assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
+                --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+                --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation"
+                --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity")
+            verify_helper "$BUILD_TARGETS_SCRIPT" reserve "${reservation_words[@]}" || claim_status=$?
+            if (( claim_status != 0 && claim_status != 13 )); then
+                local recovered=78
+                while (( recovered == 78 )); do
+                    recovered=0
+                    verify_helper "$BUILD_TARGETS_SCRIPT" recover-reservation "${reservation_words[@]}" || recovered=$?
+                    if (( recovered == 78 )); then wait_for_claim_recovery; fi
+                done
+                if (( recovered == 0 || recovered == 13 )); then
+                    claim_status=$recovered
+                elif (( recovered != 1 )); then
+                    return "$recovered"
                 fi
-                pinned_target_refuse "$claim_reason"
             fi
-            continue
+            if (( claim_status != 0 && claim_status != 13 )); then
+                local claim_reason=state
+                if (( claim_status == 11 )); then claim_reason=busy; fi
+                if (( claim_status == 10 )); then claim_reason=blocked; fi
+                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" claim-failed --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
+                    --reason "$claim_reason" || return $?
+                if [[ -n "$PINNED_TARGET" && "$claim_reason" != busy ]]; then
+                    if (( claim_status == 1 )) && [[ "$STEP_ASSIGNED_PLATFORM" == linux ]]; then
+                        pinned_target_refuse 'admission changed'
+                    fi
+                    pinned_target_refuse "$claim_reason"
+                fi
+                continue
+            fi
         fi
         try_reserved_target "$last_decline" || return $?
         [[ "$MAC_PASSED" != 1 ]] || return 0
@@ -3175,7 +3193,13 @@ finish_copy_win() {
 run_local_test() {
     local status=0
     export BUILDLOG_TARGET=natedev
-    run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+    if [[ "$PINNED_TARGET" == hana-gpu ]]; then
+        local -a profile=()
+        if [[ -n "${NEXTEST_PROFILE:-}" ]]; then profile=(--profile "$NEXTEST_PROFILE"); fi
+        run cargo nextest run "${profile[@]}" "${NEXTEST_ARGS[@]}" || status=$?
+    else
+        run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+    fi
     if [[ -n "${COPY_WATCH_PID:-}" ]]; then
         stop_copy_watch
         if [[ "$COPY_WORD" == won && "$COPY_STOPPED" == 1 && "$status" != 0 \

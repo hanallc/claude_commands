@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
+from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+
 from scripts.aws_target.hana_placement import (
     ExecutionTransport, SshCommandTransport, HanaControlTransport, HanaHostGeneration,
     DisabledHanaRoute, EnabledHanaRoute, HanaRouteSettings, HanaCheck, HanaClippyJudgment,
@@ -27,6 +29,8 @@ def read_execution_transport(target: SshTarget) -> ExecutionTransport:
     transport = values.get('execution_transport', 'ssh')
     if transport == 'ssh':
         return SshCommandTransport(target.settings)
+    if transport == 'hana-gpu' and target.platform == 'linux' and target.name == 'hana-gpu':
+        return HanaGpuNextestTransport(target.settings, target.name)
     if transport != 'hana-control' or target.platform != 'linux':
         raise conf.Unusable('execution_transport: expected ssh or Linux hana-control')
     host = values.get('host', '')
@@ -379,3 +383,272 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,
         tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+
+
+GPU_SETUP_REQUIRED = 'Hana GPU setup is required. On natedev, run deploy.py up --workload merge-gates --approve-resources'
+GPU_SELECTION_REQUIRED = 'This target requires a configured Hana package and integration test'
+
+
+def gpu_setup(transport: HanaGpuNextestTransport) -> tuple[str, ...] | HanaStepRefused:
+    """Read the enabled route and the saved gate grants without calling AWS."""
+    from scripts.build_targets.target_config import ssh_target_state_directory
+    from scripts.mac_test import claim_state
+    from scripts.lib import conf
+
+    try:
+        settings = conf.read(transport.settings)
+        if settings.text('hana_gpu_route_enabled') != 'on':
+            return HanaStepRefused(GPU_SETUP_REQUIRED)
+        sizes = tuple(settings.words('hana_gpu_instance_types'))
+        record = claim_state.read_json_object(ssh_target_state_directory('aws') / 'gate-deployment.json')
+        granted = record.get('gpu_instance_types') if record else None
+        if sizes and isinstance(granted, list) and all(size in granted for size in sizes):
+            return sizes
+    except (OSError, ValueError):
+        pass
+    return HanaStepRefused(GPU_SETUP_REQUIRED)
+
+
+def gpu_step(transport: HanaGpuNextestTransport, repository: str, package: str, kind: str,
+             command: tuple[str, ...]) -> placement.AllowedHost | placement.FixedExclusion:
+    """Allow the configured repository and exact nextest selection."""
+    from scripts.build_queue import placement
+    from scripts.lib import conf
+
+    settings = conf.read(transport.settings)
+    if repository != settings.text('hana_gpu_repository'):
+        return placement.FixedExclusion('This target requires the Hana repository')
+    selections = tuple(item.partition(':') for item in settings.words('hana_gpu_selections'))
+    targets = tuple(test for member, separator, test in selections if separator and member == package and test)
+    if kind != 'test' or not targets or (command and not any(
+            gpu_command_matches(command, package, test) for test in targets)):
+        return placement.FixedExclusion(GPU_SELECTION_REQUIRED)
+    setup = gpu_setup(transport)
+    return placement.FixedExclusion(setup.reason) if isinstance(setup, HanaStepRefused) else placement.AllowedHost()
+
+
+def gpu_command_matches(command: tuple[str, ...], package: str, test: str) -> bool:
+    """Accept the verify.sh command with an optional explicit nextest profile."""
+    if command[:3] != ('cargo', 'nextest', 'run'):
+        return False
+    arguments = command[3:]
+    if arguments[:1] == ('--profile',) and len(arguments) >= 2 and re.fullmatch(r'[A-Za-z0-9_-]+', arguments[1]):
+        arguments = arguments[2:]
+    return arguments == ('--no-fail-fast', '--workspace', '--test', test, '-E', 'package(' + package + ')')
+
+
+def gpu_claim_pending(target: str, claim_id: str) -> bool:
+    """Keep ownership while the matching claim remains on disk."""
+    from scripts.mac_test import claim_state
+
+    return any(held.record['claim_id'] == claim_id for held in claim_state.read_claims(claim_state.state_paths(target)))
+
+
+def read_gpu_evidence(transport: HanaGpuNextestTransport, key: placement.HostEvidenceKey,
+                      request: wire.PlacementRequest) -> placement.FreshHostEvidence:
+    """Publish exact adopted claims and retain any unconfirmed GPU cleanup."""
+    import time
+    from scripts.aws_target import gpu_size_trial
+    from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+    from scripts.build_queue import placement
+    from scripts.buildlog import store
+    from scripts.lib import process_start
+    from scripts.mac_test import claim_state, eligibility, mac_test
+
+    destination = key.destination
+    repo = eligibility.repository_identity(Path(request.constraints.repository))
+    policy = gpu_step(transport, repo.key if isinstance(repo, eligibility.KnownRepository) else '',
+                      key.package, key.command_kind if isinstance(key.command_kind, str) else '', key.command)
+    if not key.command:
+        policy = placement.FixedExclusion(GPU_SELECTION_REQUIRED)
+    if (not isinstance(request.constraints.selection, placement.PinnedHost)
+            or request.constraints.selection.target != destination.target):
+        policy = placement.FixedExclusion('This target requires --target hana-gpu')
+    generation = gpu_command_generation(key.command)
+    paths = claim_state.state_paths(destination.target)
+    adopted: list[placement.AdoptedProviderClaim] = []
+    cleanup: list[placement.RetainedCleanupClaim] = []
+    with claim_state.locked(paths.lock):
+        for held in claim_state.read_claims(paths):
+            record = held.record
+            running = process_start.process_start(record['pid'])
+            if (not isinstance(running, process_start.Unreadable)
+                    and running != process_start.Started(record['proc_start'])
+                    and (not record.get('cleanup_pending') or gpu_size_trial.assigned_gpu_cleanup_confirmed(record['claim_id']))):
+                held.path.unlink()
+                continue
+            reference = placement.ProviderClaimReference('ssh', destination.target, held.scope,
+                record['claim_id'], record['episode'], record['attempt'])
+            if record.get('cleanup_pending'):
+                cleanup.append(placement.RetainedCleanupClaim(reference, 'Hana GPU cleanup is pending'))
+            elif 'remote_host' in record:
+                sid = record['submitting_session']
+                adopted.append(placement.AdoptedProviderClaim(reference,
+                    placement.ClaimHolderIdentity(store.host_name(), record['pid'], record['proc_start']),
+                    OwningSession(sid) if sid else NoOwningSession(), record['remote_host'],
+                    record.get('instance_generation', '')))
+    if isinstance(policy, placement.AllowedHost):
+        if not isinstance(mac_test.blocking_claim_block(paths, request.constraints.session), mac_test.NoMacBlock):
+            policy = placement.TemporaryExclusion('blocked')
+        elif cleanup or any(claim.reference.episode != request.episode for claim in adopted):
+            policy = placement.TemporaryExclusion('busy')
+    return placement.FreshHostEvidence(key, time.time(), generation, policy, tuple(adopted), tuple(cleanup))
+
+
+def gpu_command_generation(command: tuple[str, ...]) -> str:
+    """Bind the adopted claim to the queued command."""
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps(command).encode()).hexdigest()
+
+
+def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, package: str,
+                       command: tuple[str, ...], result_file: Path) -> int:
+    """Run the exact queued step and publish its caller-facing result."""
+    from datetime import UTC, datetime
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+
+    from scripts.aws_target import gpu_size_trial
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.build_targets import target_config
+    from scripts.buildlog import store, treekey
+    from scripts.copies import copies
+    from scripts.lib import conf, process_start
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.mac_test import claim_state, eligibility, mac_test
+    from scripts.production.gate_modules import GateRefused
+
+    started = time.monotonic()
+    destination = assignment.destination
+    identity = eligibility.repository_identity(repo)
+    scope = destination.scope
+    if (destination.target != 'hana-gpu' or destination.provider != 'ssh'
+            or destination.slot != 1 or not isinstance(scope, claim_state.RepositoryScope) or scope.slot != 1
+            or not isinstance(identity, eligibility.KnownRepository) or scope.key != identity.key or scope.name != identity.name
+            or not isinstance(assignment.source_key, placement.SourceKeyKnown) or not command):
+        raise ValueError('The assignment does not identify the Hana GPU step')
+    target = target_config.configured_ssh_target(destination.target)
+    transport = read_execution_transport(target)
+    if not isinstance(transport, HanaGpuNextestTransport) or transport.host != destination.host:
+        raise ValueError('The assigned target does not use the Hana GPU transport')
+
+    claim_id = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+    reference = placement.ProviderClaimReference('ssh', target.name, scope, claim_id,
+                                                  assignment.episode, assignment.attempt)
+    paths = claim_state.state_paths(target.name)
+    path = mac_test.claim_path(paths, scope)
+    pid = os.getpid()
+    process = process_start.process_start(pid)
+    if not isinstance(process, process_start.Started):
+        raise ValueError('The Hana GPU claim holder is unavailable')
+    holder = placement.ClaimHolderIdentity(store.host_name(), pid, process.start)
+    record: claim_state.RemoteJobClaim = {
+        'claim_id': claim_id, 'episode': assignment.episode, 'attempt': assignment.attempt,
+        'submitting_session': claim_state.session_id(assignment.session), 'pid': holder.pid,
+        'proc_start': holder.start_time, 'what': 'Hana GPU nextest', 'worktree': str(repo),
+        'since': datetime.now(UTC).isoformat(), 'repo_name': scope.name, 'repo_key': scope.key,
+        'slot': 1, 'remote_host': transport.host, 'instance_generation': gpu_command_generation(command),
+    }
+
+    def check_step() -> tuple[str, ...]:
+        policy = gpu_step(transport, identity.key, package, 'test', command)
+        if isinstance(policy, placement.FixedExclusion):
+            raise ValueError(policy.reason)
+        setup = gpu_setup(transport)
+        if isinstance(setup, HanaStepRefused):
+            raise ValueError(setup.reason)
+        if not isinstance(mac_test.blocking_claim_block(paths, assignment.session), mac_test.NoMacBlock):
+            raise ValueError('The Hana GPU target is held')
+        return setup
+
+    def before_service() -> None:
+        with claim_state.locked(paths.lock):
+            _ = check_step()
+            current = claim_state.read_run(path)
+            if isinstance(current, claim_state.NoRun) or current != record:
+                raise ValueError('The assigned Hana GPU claim changed')
+
+    result: gpu_size_trial.HanaGpuNextestResult | HanaStepRefused
+    claimed = False
+    source_changed = False
+    try:
+        sizes = check_step()
+        if treekey.tree_key(str(repo)) != assignment.source_key.key:
+            source_changed = True
+            raise ValueError('The caller source changed before capture')
+        commit = copies.capture_source(repo)
+        if treekey.tree_key(str(repo)) != assignment.source_key.key:
+            source_changed = True
+            raise ValueError('The caller source changed during capture')
+        with claim_state.locked(paths.lock):
+            if claim_state.read_claims(paths):
+                raise ValueError('The Hana GPU slot is busy')
+            write_text_atomic(path, json.dumps(record) + '\n')
+            claimed = True
+        deadline = time.monotonic() + conf.read(transport.settings).number('api_timeout_s')
+        consume = wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder)
+        permission = admission_client.consume_permission(consume)
+        while (isinstance(permission, wire.DispatchStatus)
+                and isinstance(permission.permission, placement.PermissionAvailable)
+                and permission.reason in ('adoption evidence is unavailable or stale', 'the exact claim is not adopted',
+                    'claim holder is not a live coordinator descendant')
+                and time.monotonic() < deadline):
+            time.sleep(0.25)
+            permission = admission_client.consume_permission(consume)
+        if not isinstance(permission, wire.FirstAuthorization):
+            raise ValueError('The queue did not authorize the Hana GPU step')
+        result = gpu_size_trial.run_nextest(repo, commit, gpu_size_trial.HanaGpuNextestRequest(command[3:], sizes),
+            launch=gpu_size_trial.AssignedHanaGpuLaunch(claim_id, before_service))
+    except (OSError, ValueError, KeyError, wire.AdmissionUnavailable, subprocess.SubprocessError, copies.CopyError,
+            GateRefused) as error:
+        source_changed |= isinstance(error, copies.PreparationError) and str(error).startswith('SourceChanged:')
+        result = HanaStepRefused(str(error))
+    service_started = False
+    settled = True
+    if claimed:
+        with claim_state.locked(paths.lock):
+            current = claim_state.read_run(path)
+            service_started = current == dict(record, cleanup_pending=True)
+            if current == record or service_started:
+                settled = not service_started or gpu_size_trial.assigned_gpu_cleanup_confirmed(claim_id)
+                if settled:
+                    path.unlink()
+    if isinstance(result, HanaStepRefused):
+        print('Hana GPU infrastructure failure: ' + result.reason, file=sys.stderr)
+        evidence: placement.ExecutionEvidence
+        outcome: placement.AttemptOutcome
+        if service_started:
+            evidence = placement.ExecutionEvidenceUnavailable(result.reason, time.time())
+            outcome = (placement.AttemptDeclined(result.reason) if settled
+                       else placement.AttemptOutcomeUnavailable(result.reason))
+        else:
+            evidence = placement.ExecutionNotStarted()
+            outcome = placement.PrelaunchRefused(result.reason)
+        detail = ' '.join(result.reason.splitlines())
+        reason = 'source_changed' if source_changed else detail
+        write_text_atomic(result_file, f'outcome=declined\nreason={reason}\n')
+        report = wire.ExecutionReport(admission_client.request_id(), assignment, reference,
+            evidence, outcome, placement.DispatchPathSettled() if settled else placement.DispatchPathPending(result.reason))
+        status = gpu_size_trial.NEXTEST_INFRASTRUCTURE_EXIT
+    else:
+        print(result.stdout, end='', flush=True)
+        print(result.stderr, end='', file=sys.stderr, flush=True)
+        word = 'passed' if result.exit_code == 0 else 'failed'
+        write_text_atomic(result_file, f'outcome={word}\nseconds={time.monotonic() - started:.3f}\n')
+        report = wire.ExecutionReport(admission_client.request_id(), assignment, reference,
+            placement.ExecutionEvidenceUnavailable('The GPU box has terminated', time.time()),
+            placement.AttemptCompleted(result.exit_code), placement.DispatchPathSettled())
+        status = result.exit_code
+    try:
+        response = admission_client.report_execution(report)
+        if response.assignment != assignment or (isinstance(report.outcome, placement.AttemptCompleted)
+                and response.state != placement.ClosedAssignment('completed')):
+            raise wire.AdmissionUnavailable('The queue did not confirm the Hana GPU result')
+    except (OSError, wire.AdmissionUnavailable) as error:
+        print('Hana GPU queue report failed: ' + str(error), file=sys.stderr)
+    return status
