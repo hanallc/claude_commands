@@ -2838,12 +2838,13 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 153 — A gate uses the cheapest region again as soon as it has quota room  · status: done
 
-`cloud_gate.rank_variants` (cloud_gate.py:548) cools a whole region for `capacity_cooldown_seconds` after one Spot quota refusal. Gates then use dearer regions while the cheap region has room again.
+#### As-built
 
-1. A quota refusal does not cool the region. Zone refusals keep their cooldown.
-2. A region counts as full only when our live gate boxes there, plus one, exceed its Spot quota snapshot (`ledger.read_spot_quotas`).
-3. A quota refusal at launch still moves to the next variant.
-4. Proof: the cheapest region refused 5 min ago, a box there ended, and the next gate picks that region.
+- A Spot quota refusal no longer cools the whole region. Zone refusals keep their `capacity_cooldown_seconds` cooldown.
+- `cloud_gate.rank_variants` counts a region as full when our live gate vCPUs plus the variant exceed the quota snapshot for the variant's class. `ledger.spot_quota_class` takes the class from the instance family: Standard, G and VT, or P.
+- A quota refusal saves `GateQuotaRefusal` with our live vCPU count and the time. `GateQuotaRefusal.is_active` is the one rule: the region ranks last until our count drops or the cooldown ends. A saved mark without a time reads as expired.
+- `InvalidInstanceID.NotFound` closes a reserved box record. Ranking ignores expired boxes.
+- Checkpoint `a39bda2c4`; row `b763ff7f7` on main `62aca78ee`.
 
 **Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_ledger.py`.
 
