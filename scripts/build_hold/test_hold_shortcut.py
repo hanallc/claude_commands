@@ -50,6 +50,7 @@ class HoldShortcutTests(test_build_hold.IsolatedBuildHoldTest):
             "XDG_CACHE_HOME": str(cache), "CLAUDE_PYTHON": "",
             "BUILDLOG_CALL_ID": "c1", "BUILDLOG_CALLER": "verify",
             "BUILDLOG_HOLD_PID": "12345", "BUILDLOG_HOLD_WAIT_FILE": str(self.wait_file),
+            "BUILD_TARGETS_SCRIPT": str(MEMORY_GATE.parent.parent / "build_targets" / "build_targets.py"),
             "TEST_STARTS": str(self.starts), "TEST_STATUS": "0", "GLOBIGNORE": "",
         }
         _ = self.environment.pop("CLAUDE_PYTHON", None)

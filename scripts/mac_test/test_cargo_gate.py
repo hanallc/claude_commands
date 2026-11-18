@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from typing import cast
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -103,6 +105,28 @@ class CargoGateTests(unittest.TestCase):
     def run_gate(self, environment: dict[str, str], *arguments: str, name: str = "cargo") -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(GATE / name), *arguments], env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS)
+
+    def test_copied_gate_links_find_the_copied_configuration_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            copied = copy_helpers(root, "scripts/mac_test")
+            gate_bin = copied / "mac_test/cargo_gate/bin"
+            _ = write_config_fixture(root / "config/mac_gate.conf", "refusal_exit_code=83\n")
+            environment.update(CLAUDECODE="1", GATE_TEST_BIN=str(gate_bin),
+                               PATH=os.pathsep.join((str(gate_bin), str(root / "fake"), str(root / "real"),
+                                                    "/usr/bin", "/bin")))
+            self.assertFalse((copied / "mac_test/test_cargo_gate.py").exists())
+            for name in ("cargo", "cargo-nextest", "rustc"):
+                with self.subTest(program=name):
+                    command = gate_bin / name
+                    self.assertTrue(command.is_symlink())
+                    self.assertEqual(os.readlink(command), "../gate.zsh")
+                    self.assertTrue(command.resolve().is_relative_to(root))
+                    result = subprocess.run([str(command)], env=environment, capture_output=True, text=True,
+                                            timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 83, result.stdout + result.stderr)
+                    self.assertIn("mac cargo gate refused: no placement", result.stderr)
 
     def test_terminal_and_placed_calls_keep_arguments_status_and_root_records(self) -> None:
         for placement, readable in ((False, True), (False, False), (True, True)):
