@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 from scripts.aws_target import hana_guest, hana_spend, ledger
 from scripts.aws_target.controller_lock import control_lock
+from scripts.build_queue.placement import HANA_IMAGE_STALE as HANA_IMAGE_STALE
 from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -433,6 +435,12 @@ class HanaController:
         return hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
             hana_spend.read_settings(conf.read(self.workload_path)))
 
+    def image_is_current(self, identity: DeploymentIdentity) -> bool:
+        """Check the digest setup recorded for this instance."""
+        check = cast(Callable[[Path, str, str, Path], bool],
+            import_module('scripts.aws_target.hana_image').deployed_image_is_current)
+        return check(self.directory, identity.deployment, identity.instance, self.workload_path)
+
     def register(self, identity: DeploymentIdentity, *, state: Lifecycle = Lifecycle.IDLE_STOPPED) -> None:
         """Register D2's approved identities without provisioning or enabling placement."""
         with control_lock(self.directory):
@@ -455,6 +463,8 @@ class HanaController:
                 return ClaimRefused('Hana is unprovisioned')
             if not self._spending().settings.enabled:
                 return ClaimRefused('Hana is disabled')
+            if not self.image_is_current(row.identity):
+                return ClaimRefused(HANA_IMAGE_STALE)
             if row.state not in (Lifecycle.IDLE_STOPPED, Lifecycle.STARTING, Lifecycle.READY):
                 return ClaimRefused('Hana recovery must settle before another claim')
             if isinstance(row.operation, PendingOperation) and row.operation.action == Action.STOP:
@@ -476,6 +486,8 @@ class HanaController:
             if isinstance(row, NoDeployment) or not row.claims or row.claims[0].execution != execution:
                 return ClaimRefused(row.reason if isinstance(row, BoxRecord) and row.reason else 'No current claim owns this execution')
             claim = row.claims[0]
+            if not self.image_is_current(row.identity):
+                return ClaimRefused(HANA_IMAGE_STALE)
             if row.state in (Lifecycle.STARTING, Lifecycle.READY):
                 settings = read_settings(conf.read(self.workload_path))
                 reason = _start_refusal(row, int(self.clock()), settings)
@@ -551,6 +563,8 @@ class HanaController:
                     or not isinstance(row.delivered, DeliveredPermit) or row.delivered.execution != execution
                     or row.delivered.generation != generation or row.generation != generation or now >= row.delivered.expires):
                 return ClaimRefused('The claim, boot identity, or delivered permit is stale')
+            if not self.image_is_current(row.identity):
+                return ClaimRefused(HANA_IMAGE_STALE)
             spending = self._spending().bind_start(now, generation, boot_id)
             if isinstance(spending, hana_spend.PermitRefused):
                 return ClaimRefused(spending.reason)
@@ -577,9 +591,10 @@ class HanaController:
                 self._save(row)
             settings = read_settings(conf.read(self.workload_path))
             spending = self._spending()
+            stale_start = bool(row.claims and not row.claims[0].active and not self.image_is_current(row.identity))
             if isinstance(row.operation, NoOperation):
                 if row.state == Lifecycle.IDLE_STOPPED and row.claims and spending.settings.enabled:
-                    refusal = _start_deadline_refusal(row, now, settings)
+                    refusal = HANA_IMAGE_STALE if stale_start else _start_deadline_refusal(row, now, settings)
                     if refusal:
                         row.reason, row.claims = refusal, []
                         self._save(row)
@@ -600,7 +615,8 @@ class HanaController:
             assert isinstance(operation, PendingOperation)
             abandonment = ''
             if row.state == Lifecycle.STARTING or (row.state == Lifecycle.READY and row.claims):
-                abandonment = _start_deadline_refusal(row, now, settings) or owner_refusal
+                abandonment = (HANA_IMAGE_STALE if stale_start else _start_deadline_refusal(row, now, settings)
+                               or owner_refusal)
             if abandonment and operation.action not in (Action.BOOTSTRAP, Action.START):
                 self._stop_abandoned(row, now, abandonment)
                 return row.state
