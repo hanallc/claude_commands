@@ -667,13 +667,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                           CodexResumeTranscript(transcript, since))
                 if isinstance(reader, CodexResumeTranscript):
                     reader.skip_existing_turns()
-                check = DirectorResumeCheck(row.name, opening.text, reader)
+                progress = DirectorResumeCheck(row.name, opening.text, reader)
+                check = progress
                 if isinstance(reader, herdr.TranscriptCursor):
                     cursor = reader
                     before_prompt = opening.before_prompt
 
                     def native_transcript(actual: herdr.SessionTranscript) -> object:
-                        cursor.bind_transcript(actual)
+                        if cursor.transcript != actual:
+                            progress.reader = herdr.TranscriptCursor(actual, cursor.since)
                         return before_prompt(actual)
 
                     opening = replace(opening, before_prompt=native_transcript)
@@ -691,7 +693,10 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT, client=client)
         if isinstance(result.outcome, herdr.ClaudeTrustNotWritten):
             raise ClaudeTrustWriteFailed(result.outcome.reason)
-        if isinstance(result.outcome, herdr.PromptNotSubmitted):
+        if not isinstance(result.outcome, herdr.PromptSubmissionNotRequired) and result.outcome.publication_error is not None:
+            raise OSError(f"staff publication failed: {result.outcome.publication_error}")
+        if (not isinstance(result.outcome, herdr.PromptSubmissionNotRequired)
+                and result.outcome.state != "confirmed"):
             if isinstance(target, herdr.ExistingPane) and not target.terminal:
                 return result.pane
             raise OSError(result.outcome.reason)

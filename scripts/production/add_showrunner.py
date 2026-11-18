@@ -354,9 +354,9 @@ def _main(argv: list[str]) -> int:
             transcript = herdr.SessionTranscript(identity.config_dir, identity.session_id)
             outcome = herdr.submitted_prompt(transcript, prompt, identity.started_at)
             published(transcript)
-            if not isinstance(outcome, herdr.PromptSubmitted):
+            if outcome.state != "confirmed":
                 outcome = herdr.Herdr(place.session).submit_opening_prompt(
-                    place.pane, herdr.OpeningPrompt(prompt, transcript), identity.started_at, 90_000)
+                    place.pane, herdr.OpeningPrompt(prompt, transcript, may_type=False), identity.started_at, 90_000)
         else:
             outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected,
                              identity=identity, before_prompt=published)
@@ -370,7 +370,10 @@ def _main(argv: list[str]) -> int:
         return 2
     if isinstance(outcome, herdr.ClaudeTrustNotWritten):
         return SESSION_NOT_READY
-    if isinstance(outcome, herdr.PromptNotSubmitted):
+    if outcome.publication_error is not None:
+        print(f"add_showrunner: {child.name}: staff publication failed: {outcome.publication_error}", file=sys.stderr)
+        return 1 if outcome.state == "confirmed" else SESSION_NOT_READY
+    if outcome.state != "confirmed":
         print(f"add_showrunner: {child.name}: opening prompt not submitted: {outcome.reason}", file=sys.stderr)
         return SESSION_NOT_READY
     attach = herdr.attach_hint(child.name, child.name)

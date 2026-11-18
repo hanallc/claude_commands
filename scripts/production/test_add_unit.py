@@ -17,11 +17,12 @@ import shlex
 import socket
 import shutil
 import subprocess
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import cast, final, override
+from typing import Callable, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -62,6 +63,125 @@ class NativeClaudeUnitTests(StaffTestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
         })))
+
+    def pending_opening_fixture(self) -> tuple[add_unit.UnitLaunch, add_unit.LabeledSessionFound, Path, str, str]:
+        native = fixture_runtime_id("pending-opening-rerun")
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        production = read_production("demo")
+        request = add_unit.UnitLaunch(production=production, branch="demo-alpha", worktree=self.root,
+            plan=add_unit.PlanGiven(Path("plan.md")), port=add_unit.OmittedCell(),
+            session=add_unit.NewSession(), timeout=5, identity=add_unit.UnitIdentity("alpha", "alpha"))
+        place = HerdrPlace("agents", "w1:p1")
+        marked = add_unit.LabeledSessionFound(unit_lookup.LabeledSession("alpha",
+            unit_lookup.LiveClaude("alpha", native, str(self.root), 101), place,
+            identity=unit_lookup.LiveSession(native)))
+        pending = add_unit.opening_record(production, "alpha")
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        text = "/unit:direct plan.md"
+        write_text_atomic(pending, json.dumps({"session_id": native, "prompt": text,
+            "config_dir": str(self.root), "launched_at": LAUNCHED_AT.isoformat()}))
+        return request, marked, pending, native, text
+
+    def test_pending_unit_with_empty_composer_reports_manual_recovery(self) -> None:
+        request, marked, pending, _native, _text = self.pending_opening_fixture()
+        saved = pending.read_bytes()
+        with (patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}),
+              patch.object(add_unit, "ensure_staff_unit"),
+              patch.object(herdr.Herdr, "panes", return_value=[]),
+              patch.object(herdr.Herdr, "run", return_value="────────\n❯ \n────────"),
+              patch.object(herdr.Herdr, "_wait_for_submit", return_value=None),
+              patch.object(herdr.Herdr, "_prompt") as typed,
+              patch.object(herdr.Herdr, "_send_keys") as keys):
+            outcome = add_unit.finish_opening(request, marked)
+        assert isinstance(outcome, herdr.PromptNotSubmitted)
+        self.assertIn("sent once, not confirmed", outcome.reason)
+        self.assertIn("Check the retained pane and send the prompt by hand if absent.", outcome.reason)
+        self.assertEqual(outcome.state, "unknown")
+        self.assertEqual(pending.read_bytes(), saved)
+        typed.assert_not_called()
+        keys.assert_not_called()
+        with patch.object(herdr, "close_agent") as close:
+            self.assertEqual(add_unit.close_unsent_session(request, outcome), "")
+        close.assert_not_called()
+
+    def test_pending_opening_rerun_sends_enter_without_typing_again(self) -> None:
+        request, marked, pending, native, text = self.pending_opening_fixture()
+        place = marked.unit.place
+        screen = f"────────\n❯ {text}\n────────"
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            client = herdr.Herdr("agents")
+
+        def enter(_pane: str, *_keys: str) -> None:
+            path = self.root / "projects/fixture" / f"{native}.jsonl"
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(LAUNCHED_AT.tzinfo).isoformat(),
+                "message": {"role": "user", "content": text}}) + "\n")
+
+        def check_transcript(receipt: Callable[[], object], _deadline: float) -> herdr.PromptSubmitted | None:
+            result = receipt()
+            return result if isinstance(result, herdr.PromptSubmitted) else None
+
+        def visible(*_args: str) -> str:
+            return screen
+
+        with (patch.object(add_unit, "ensure_staff_unit"),
+              patch.object(herdr, "Herdr", return_value=client),
+              patch.object(herdr, "check_target", return_value=True),
+              patch.object(herdr, "prompt_recipient_process", return_value=herdr.PromptRecipientProcess(101, "fixture")),
+              patch.object(client, "pane_row", return_value={"pane_id": place.pane, "terminal_id": "fixture"}),
+              patch.object(client, "readiness", return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+              patch.object(client, "run", side_effect=visible),
+              patch.object(client, "_wait_for_submit", side_effect=check_transcript),
+              patch.object(client, "_prompt") as transport,
+              patch.object(client, "_send_keys", side_effect=enter) as keys):
+            self.assertIsInstance(add_unit.finish_opening(request, marked), herdr.PromptSubmitted)
+            transport.assert_not_called()
+            keys.assert_called_once_with(place.pane, "Enter")
+        self.assertFalse(pending.exists())
+
+    def test_add_unit_keeps_the_session_when_a_started_transport_records_its_turn_late(self) -> None:
+        request, marked, pending, native, text = self.pending_opening_fixture()
+        place = marked.unit.place
+        transcript = herdr.SessionTranscript(self.root, native)
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            client = herdr.Herdr(place.session)
+        screen = "────────\n❯ \n────────"
+        now = time.monotonic()
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with (patch.object(time, "monotonic", side_effect=lambda: now),
+              patch.object(time, "sleep", side_effect=advance),
+              patch.object(client, "wait_for_prompt_input", return_value=herdr.PromptInputReady(screen, True)),
+              patch.object(client, "pane_row", return_value={"pane_id": place.pane, "terminal_id": "fixture"}),
+              patch.object(client, "run", return_value=screen),
+              patch.object(herdr, "prompt_recipient_process", return_value=herdr.PromptRecipientProcess(101, "fixture")),
+              patch.object(herdr, "check_target", return_value=True),
+              patch.object(client, "_prompt") as transport,
+              patch.object(client, "_send_keys") as keys,
+              patch.object(herdr, "close_agent") as close):
+            outcome = client.submit_opening_prompt(place.pane, herdr.OpeningPrompt(text, transcript), LAUNCHED_AT, 1000)
+            self.assertEqual(outcome.state, "unknown")
+            self.assertEqual(add_unit.close_unsent_session(request, outcome), "")
+            self.assertTrue(pending.exists())
+
+            path = self.root / "projects/fixture" / f"{native}.jsonl"
+            at = LAUNCHED_AT + timedelta(seconds=1)
+            write_text_atomic(path, json.dumps({"type": "user", "timestamp": at.isoformat(),
+                "message": {"role": "user", "content": text}}) + "\n")
+            with patch.object(add_unit, "ensure_staff_unit"):
+                recovered = add_unit.finish_opening(request, marked)
+            assert not isinstance(recovered, add_unit.NoPendingOpening)
+            self.assertEqual(recovered.state, "confirmed")
+            self.assertEqual(add_unit.close_unsent_session(request, recovered), "")
+            self.assertFalse(pending.exists())
+        transport.assert_called_once_with(place.pane, text)
+        keys.assert_not_called()
+        close.assert_not_called()
 
     def test_saved_transcript_model_uses_the_newest_file(self) -> None:
         native = fixture_runtime_id("saved-model")
@@ -621,8 +741,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 found = add_unit.LabeledSessionFound(unit_lookup.LabeledSession(f"{unit}-unit",
                     unit_lookup.ClaudeNotRunning(), place,
                     identity=unit_lookup.LiveSession(fixture_runtime_id("unsubmitted:" + unit))))
+                state = "unknown" if typed else "not_sent"
                 outcome = herdr.PromptNotSubmitted("destination never became ready for input"
-                                                   + ("; prompt typed 1 times" if typed else ""), never_typed=not typed)
+                                                   + ("; prompt typed 1 times" if typed else ""), state=state)
                 with (patch.object(herdr, "start_agent", return_value=outcome),
                       patch.object(add_unit, "launched_unit", side_effect=[add_unit.NoLabeledSession(), found]),
                       patch.object(herdr, "close_agent") as closed):
