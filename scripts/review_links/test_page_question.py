@@ -138,6 +138,30 @@ class PageQuestionTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.store.questions('image-1')), 1)
 
+    def test_retry_sends_the_saved_question_after_the_intent_update_fails(self) -> None:
+        write = self.status.write_slots
+        failed = False
+
+        def fail_after_question_save(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            nonlocal failed
+            if not failed and self.store.questions('image-1'):
+                failed = True
+                raise OSError('Cannot update the delivery intent.')
+            write(page, row, slots)
+
+        with patch.object(self.status, 'write_slots', side_effect=fail_after_question_save):
+            with self.assertRaisesRegex(OSError, 'Cannot update the delivery intent'):
+                _ = self.ask()
+        self.status = change_page.DeliveryStatus(self.status.root)
+        change_page.recover_review_messages(self.status)
+        self.assertEqual(self.sent, [])
+
+        change_page.deliver(self.ask(), self.status)
+        change_page.deliver(self.ask(), self.status)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('--question Q1', self.sent[0][2])
+        self.assertEqual([question.question_id for question in self.store.questions('image-1')], ['Q1'])
+
     def test_an_empty_question_does_not_write_or_claim(self) -> None:
         with self.assertRaisesRegex(question_record.AnswerRefused, 'Enter a question first'):
             _ = self.ask(words='  ')

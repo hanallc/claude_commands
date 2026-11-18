@@ -1,5 +1,8 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
+
+from scripts.production.change_review_test_support import pictured_changes
 
 import shutil
 import html
@@ -33,6 +36,7 @@ from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
 
@@ -68,8 +72,16 @@ class ReviewPageTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         config = self.fixture.temporary / 'config'
-        _ = (config/'production.conf').write_text('# whole: 20..\nquestion_title_max_chars=100\n')
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/console.conf',config/'console.conf')
+        _ = write_config_fixture(config / "production.conf", "question_title_max_chars=100\n")
+        _ = write_config_fixture(config / "console.conf",
+            "page.review.url=python:scripts.review_links.review_page:page_url\n"
+            + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
+            + "page.review.icon=inbox\npage.review.title=Review\n"
+            + "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
+            + "status.reading_delay_seconds=1\nstatus.review.age_limit_seconds=45\n")
+        _ = write_config_fixture(config / "review_links.conf",
+            "review_words_rows=4\nlater_soon_minutes=60\nlater_evening=18:00\n"
+            + "later_evening_until=17:00\nlater_morning=09:00\nlater_week_day=Monday\nlater_week_time=09:00\n")
         self.root = self.fixture.root
         self.status = change_page.DeliveryStatus(self.root)
         document = self.fixture.production.read_text()
@@ -1285,8 +1297,8 @@ window.fetch=async url=>{
                     else:
                         proposal, efficiency = case.decisions()
                         key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
-                        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
-                                            case.fixture.temporary/'config/nightly_review.conf')
+                        _ = write_config_fixture(case.fixture.temporary / 'config/nightly_review.conf',
+                            'state_folder=nightly-review\n')
                     old_id = ''
                     if wait in ('question', 'validate'):
                         delivery, _ = review_page.submit(case.root, case.body(key, wait, 'Check the old case.'), case.status)
@@ -1380,7 +1392,7 @@ window.fetch=async url=>{
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
-            [change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')],
+            pictured_changes([change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')]),
             datetime.now(user_zone()).date(), '', self.fixture.production,
             producers=[staff.StaffId('missing-producer')], record=staff.snapshot())
         decisions = self.decisions()
@@ -1462,8 +1474,7 @@ window.fetch=async url=>{
             self.assertEqual(review_later.times()[key], until)
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
-                            self.fixture.temporary/'config/nightly_review.conf')
+        _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
         proposal, efficiency = self.decisions()
         folder = self.fixture.temporary / 'decision-proposals'
         ledger = self.fixture.temporary / 'decision-efficiency.md'
@@ -1747,6 +1758,15 @@ window.fetch=async(url)=>{
         self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_clears_the_review_save_notice(self) -> None:
+        fixture = self.fixture
+        _ = change_review.append_rows(fixture.review_list, pictured_changes([
+            change_review.Visible(f'Change {number}', 'Read the diff', 'Check the result')
+            for number in range(4, 9)
+        ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
+        self.assertEqual(save_notice_failures(review_page.render(self.root), 'works'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
         question_key = self.question()
         question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
@@ -1773,8 +1793,13 @@ refreshedForm.elements.token.value+='-refreshed';refreshedForm.elements.row.valu
 window.refreshMarkup=refreshed.documentElement.outerHTML;
 window.refreshRequests=[];
 window.posts=[];
+let nextPost;
 window.fetch=async(_url,options={})=>{
- if(options.method==='POST'){window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'works'})};}
+ if(options.method==='POST'){
+  window.posts.push(new URLSearchParams(options.body));
+  if(nextPost){const response=nextPost;nextPost=null;return response;}
+  return {ok:true,json:async()=>({answer:'works'})};
+ }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>new URL(_url,location.href).searchParams.get('show')==='Waiting' ? window.waitingMarkup : window.refreshMarkup};
 };
 </script>""".replace('WAITING_MARKUP',json.dumps(review_page.render(self.root, show='Waiting').decode()).replace('</','<\\/')).replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
@@ -1784,6 +1809,27 @@ window.fetch=async(_url,options={})=>{
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
  const rows=()=>[...document.querySelectorAll('[data-list-item]')];
  const shown=()=>rows().filter(row=>!row.hidden);
+ const holdPost=()=>{
+  let resolve,reject;
+  nextPost=new Promise((resolvePost,rejectPost)=>{resolve=resolvePost;reject=rejectPost;});
+  return {
+   save:()=>resolve({ok:true,json:async()=>({answer:'works'})}),
+   fail:reason=>reject(new Error(reason))
+  };
+ };
+ const submitPending=row=>{
+  const response=holdPost();
+  const form=row.querySelector('form');
+  form.requestSubmit(form.querySelector('[value="works"]'));
+  return response.fail;
+ };
+ const expanded=row=>!row.querySelector('[data-detail]').hidden;
+ const leavingNow=row=>row.hidden && row.nextElementSibling?.matches('[data-record-motion]') &&
+  row.nextElementSibling.getAnimations({subtree:true}).length>0;
+ const visibleStatus=text=>{
+  const status=document.querySelector('[data-hidden-action-status]');
+  return status.getClientRects().length>0 && status.textContent.includes(text);
+ };
  const choose=(id,value,event='change')=>{
   if(id==='list-show'){document.querySelector('[data-show-chip="'+value+'"]').click();return;}
   if(id==='list-owner'){document.querySelector('[data-owner-chip="'+value+'"]').click();return;}
@@ -1826,16 +1872,58 @@ window.fetch=async(_url,options={})=>{
   check(fresh.querySelector('input[name=choice]:checked')?.value===picked.value,'F018: refresh keeps the selected choice');
   check(fresh.querySelector('form').elements.row.value===fresh.dataset.key+'-refreshed' &&
     fresh.querySelector('form').elements.token.value.endsWith('-refreshed'),'F018: refresh supplies the row and token');
-  const target=rows().find(row=>row.dataset.type==='change');target.querySelector('.list-toggle').click();
-  const form=target.querySelector('form');form.requestSubmit(form.querySelector('[value="works"]'));
+  const [target,other]=rows().filter(row=>row.dataset.type==='change');
+  target.querySelector('.list-toggle').click();
+  const rejectFirst=submitPending(target);
+  other.querySelector('.list-toggle').click();
+  rejectFirst('Fixture first refusal');await flush();
+  check(!target.hidden && !expanded(target) && expanded(other),'F003: a late failure keeps the newer card open');
+  check(visibleStatus('Not saved: Fixture first refusal'),'F003: the closed card has a visible reason');
+
+  target.querySelector('.list-toggle').click();
+  const rejectTarget=submitPending(target);
+  other.querySelector('.list-toggle').click();
+  const rejectOther=submitPending(other);
+  rejectTarget('Fixture overlapping refusal');rejectOther('Fixture newer refusal');await flush();
+  const targetMotion=target.nextElementSibling;
+  check(targetMotion?.matches('[data-record-motion]') &&
+    !targetMotion.querySelector('[data-detail]:not([hidden])'),
+    'F003: overlapping failures keep the returning copy of the older card closed');
+  check(!expanded(target) && expanded(other),'F003: overlapping failures keep the newer card open');
+
+  target.querySelector('.list-toggle').click();
+  const form=target.querySelector('form'),works=form.querySelector('[value="works"]');
+  const losePost=submitPending(target);
+  const leaving=target.nextElementSibling;
+  check(target.hidden && leaving?.getAnimations({subtree:true}).length,'Review starts the shared animation before the response');
+  check(leaving?.querySelector('[data-detail]:not([hidden])'),'Review fades the open details with the row');
+  losePost('Fixture lost Review response');await flush();
+  const returning=target.nextElementSibling;
+  check(!target.hidden && returning && returning!==leaving,'a lost Review response slides the card back');
+  check(!target.querySelector('[data-detail]').hidden && !works.disabled &&
+    form.querySelector('[data-send-status]').textContent==='Not saved: Fixture lost Review response',
+    'the restored Review card shows its reason and enables a retry');
+  other.querySelector('.list-toggle').click();
+  check(!expanded(target) && !target.nextElementSibling.querySelector('[data-detail]:not([hidden])'),
+    'F003: opening a card updates the copy of the returning card');
+  target.querySelector('.list-toggle').click();
+  form.requestSubmit(works);
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
+  check(!visibleStatus('Saved: works'),'a successful save adds no notice above the table');
+  check(!visibleStatus('Not saved: Fixture newer refusal'),'saving another card clears the failure notice');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
+  check(!visibleStatus('Saved: works'),'no save notice appears after the animation');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='4','the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();
-  const allForm=allTarget.querySelector('form');allForm.requestSubmit(allForm.querySelector('[value="works"]'));
+  const allForm=allTarget.querySelector('form');allForm.elements.feedback.value='Use this change.';
+  const feedbackResponse=holdPost();
+  allForm.requestSubmit(allForm.querySelector('[value="feedback"]'));
+  check(window.posts.at(-1).get('outcome')==='feedback' && leavingNow(allTarget),
+    'Send feedback starts the departure before the response');
+  feedbackResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
@@ -1928,7 +2016,12 @@ window.fetch=async(_url,options={})=>{
     'Escape closes the menu and returns focus to Later');
   Date.now=chooserNow;
   laterToggle.click();const week=laterMenu.querySelector('[data-later-preset="week"]'),weekAt=Number(week.dataset.at);
+  const laterResponse=holdPost();
   week.click();
+  check(leavingNow(fresh),'Later starts the departure before the response');
+  check(document.querySelector('[data-show-chip="open"] b').textContent==='0' &&
+    selectedOwner().dataset.ownerChip===retained.owner,'Later updates the count and keeps the owner while the request runs');
+  laterResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')===new Date(weekAt).toISOString(),
     'a preset sends its time at once');
@@ -1975,7 +2068,12 @@ window.fetch=async(_url,options={})=>{
   pending.querySelector('.list-toggle').click();
   const pendingForm=pending.querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
   const initialCount=Number(document.querySelector('[data-show-chip="open"] b').textContent);
+  const questionResponse=holdPost();
   pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));
+  check(window.posts.at(-1).get('outcome')==='question' && leavingNow(pending) &&
+    Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-1,
+    'Ask question starts the departure and updates the count before the response');
+  questionResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   const revision=pending.dataset.updated;
   for(const [state,updated,revealed] of [
@@ -2049,6 +2147,38 @@ window.fetch=async(_url,options={})=>{
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results,[[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = review_page.render(self.root).decode()
+        setup = r"""<script>
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  const row=document.querySelector('[data-type="question"]');
+  row.querySelector('.list-toggle').click();
+  const form=row.querySelector('form');
+  form.querySelector('[data-later-toggle]').click();
+  form.querySelector('[data-later-choose]').click();
+  const previous=form.querySelector('[data-later-month-step="-1"]');
+  const grid=form.querySelector('[data-later-grid]');
+  previous.focus();
+  check(document.activeElement===previous,'Previous month has focus in December');
+  previous.click();
+  const day=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+  check(previous.disabled && day?.dataset.date==='2026-11-30','November has an enabled day');
+  check(document.activeElement===day,'Focus moves from Previous month to the enabled day');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_time_displays_and_saves_24_hour_time(self) -> None:

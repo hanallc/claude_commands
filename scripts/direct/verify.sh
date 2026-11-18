@@ -551,6 +551,7 @@ BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
+BUILD_HELPER_ROOT="$(build_helper_root "${BASH_SOURCE[0]}")" || exit 2
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
@@ -671,8 +672,8 @@ FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../mac_test/fix
 # on, in addition to the tree. A change to one of them makes the record stale.
 # fix_return.py places the lint copy, and that place can decide whether lint passes.
 lint_code_files() {
-    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh"
-        "$HOME/.claude/scripts/lint/prebuild.py" "$HOME/.claude/scripts/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
+    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$BUILD_HELPER_ROOT/lint/invoke.sh"
+        "$BUILD_HELPER_ROOT/lint/prebuild.py" "$BUILD_HELPER_ROOT/lib/dev_shell.py" "${FIX_RETURN_SCRIPT:-}"
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
 }
 
@@ -701,15 +702,15 @@ LINT_LOADED_CODE_KEY="$(lint_code_key)"
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
 # shellcheck source=/dev/null
-source "$HOME/.claude/scripts/lint/invoke.sh" || {
+source "$BUILD_HELPER_ROOT/lint/invoke.sh" || {
     printf 'verify.sh: cannot load admission and hold checks; step refused\n' >&2
     exit 2
 }
 # The queue selects the host before the local hold check.
 LINT_QUEUE_PLACEMENT=1
-BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
-LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
-STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
+BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$BUILD_HELPER_ROOT/build_targets/build_targets.py}"
+LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$BUILD_HELPER_ROOT/direct/local_release_wait.py}"
+STEP_RECORD_SCRIPT="$BUILD_HELPER_ROOT/direct/step_record.py"
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
 VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
 FINAL_PASS_START=""
@@ -829,12 +830,25 @@ run() {
 }
 
 run_step() {
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        if buildlog_step_compiles "$@"; then
+            local STEP_WRITES_TREE=0
+            if step_writes_tree "$@"; then STEP_WRITES_TREE=1; fi
+            route_compiling_step "$@"
+            exit $?
+        fi
+        return 0
+    fi
     # A reservation for this call must not cover the next step's local waits.
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         release_wait_claim
     fi
-    local attempt status started ended step_log monitor=0
+    local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
     local STEP_WRITES_TREE=0
+    if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
+        build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
+        return 2
+    fi
     if step_writes_tree "$@"; then
         STEP_WRITES_TREE=1
         # Keep the call's decision for the next step.
@@ -859,6 +873,7 @@ run_step() {
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
     for attempt in 1 2; do
+        LINT_REPAIR_REUSED_GRANT=0
         if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
         if buildlog_step_compiles "$@"; then
             route_compiling_step "$@" || { status=$?; rm -f "$step_log"; return "$status"; }
@@ -866,6 +881,9 @@ run_step() {
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then rm -f "$step_log"; return "$LINT_LEFT_QUEUE_STATUS"; fi
         fi
         if buildlog_step_compiles "$@"; then
+            if [[ "$CMD" == doc ]]; then
+                BUILDLOG_TREE="${DOC_SOURCE_KEY:-$BUILDLOG_TREE}"
+            fi
             step_state on_natedev
         else
             acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
@@ -881,6 +899,9 @@ run_step() {
             set +m
             if (
                 step_token_before=${TOKEN_HELD:-0}
+                if (( LINT_REPAIR_REUSED_GRANT )) || [[ "${LINT_MEND_WAIT:-0}" == 1 ]]; then
+                    BUILDLOG_PRELAUNCH_OUTCOME=abandon
+                fi
                 # The pipeline shell owns tokens taken during memory admission.
                 trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
                 run_once "$@"
@@ -903,12 +924,18 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
+        if [[ "$CMD" == doc ]]; then doc_close_checkout || status=$?; fi
+        if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
             RUN_LAST_ATTEMPT_KILLED=0
             rm -f "$step_log"
             return 0
+        fi
+        if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]]; then
+            rm -f "$step_log"
+            return "$status"
         fi
         # A repairable tool failure may continue a lint pass. A failed check
         # must end the call even when that tool's caller handles failures.
@@ -928,9 +955,11 @@ run_step() {
             return "$status"
         fi
         if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]] || step_stopped_by_hold; }; then
-            if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
-                PLACEMENT_RETRY=1
-            else
+            if [[ "$CMD" == doc ]]; then
+                rm -f "$step_log"
+                return "$status"
+            fi
+            if [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 echo 'verify.sh: natedev hold stopped this step; choosing its target again.' >&2
             fi
             status=0
@@ -1418,7 +1447,7 @@ esac
 # Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
 # A build call with --attached does not detach: its caller reads the binary line inline.
-DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/detached_runs.py}"
+DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$BUILD_HELPER_ROOT/agents/detached_runs.py}"
 verify_helper --start
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != *" --attached "* ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -1933,6 +1962,7 @@ cancel_tree_run() {
 }
 
 start_tree_watch() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
@@ -1954,23 +1984,69 @@ finish_tree_watch() {
 
 # Read the staged tree through the copy owner's private index.
 doc_tree() {
-    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" "$DOC_REPO_TOP" "${1:-}" <<'PYDOC'
 from pathlib import Path
 import sys
 with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.buildlog.treekey import committed_tree_key
 from scripts.copies import copies
-print(copies.staged_tree(Path.cwd()))
+
+tree = copies.staged_tree(Path(sys.argv[2]))
+if sys.argv[3] == "with-key":
+    print(tree, committed_tree_key(tree.encode("ascii")))
+else:
+    print(tree)
 PYDOC
 }
 
-# The copy owner holds the lease until this shell closes descriptor 8.
+# The copy owner holds the lease until the last writer closes the pipe.
 doc_checkout() {
-    local copy_script
-    copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
-    coproc DOC_COPY { "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
-    exec 8>&"${DOC_COPY[1]}"
-    IFS= read -r DOC_TREE <&"${DOC_COPY[0]}" || return 1
-    IFS= read -r DOC_CHECKOUT <&"${DOC_COPY[0]}" || return 1
+    local checkout="$DOC_REPO_TOP"
+    if [[ "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
+        local copy_script writer checkout_tree current_tree status lease_fd=74
+        copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
+        coproc DOC_COPY { exec "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
+        DOC_COPY_OWNER_PID=$DOC_COPY_PID
+        writer=${DOC_COPY[1]}
+        # Start above verify's fixed descriptors.
+        while [[ -e "/dev/fd/$lease_fd" || -L "/dev/fd/$lease_fd" ]]; do
+            lease_fd=$((lease_fd + 1))
+        done
+        eval "exec $lease_fd>&$writer" || return $?
+        DOC_COPY_LEASE_FD=$lease_fd
+        eval "exec $writer>&-"
+        if ! IFS= read -r checkout_tree <&"${DOC_COPY[0]}" ||
+           ! IFS= read -r checkout <&"${DOC_COPY[0]}"; then
+            doc_close_checkout
+            return 1
+        fi
+        current_tree="$(doc_tree)" || { status=$?; doc_close_checkout; return "$status"; }
+        if [[ "$checkout_tree" != "$DOC_TREE" || "$current_tree" != "$DOC_TREE" ]]; then
+            doc_close_checkout
+            echo 'verify.sh: the staged tree changed before doc ran; no doc pass record was written.' >&2
+            return "$TREE_CHANGED_STATUS"
+        fi
+    fi
+    cd "$checkout" || { doc_close_checkout; return 1; }
+    MAC_SOURCE_ROOT=$checkout
+}
+
+doc_close_checkout() {
+    local owner=${DOC_COPY_OWNER_PID:-${DOC_COPY_PID:-}}
+    if [[ -n "$owner" ]]; then
+        if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
+            eval "exec $DOC_COPY_LEASE_FD>&-"
+            DOC_COPY_LEASE_FD=""
+        fi
+        if [[ "${1:-}" == stop ]]; then
+            collect_child "$owner" TERM
+        else
+            wait "$owner" || true
+        fi
+        DOC_COPY_OWNER_PID=""
+    fi
+    MAC_SOURCE_ROOT=""
+    cd "$DOC_CALLER_DIR"
 }
 
 doc_record() {
@@ -2028,6 +2104,7 @@ PYDOC
 # record.py adds the repo, worktree, branch and commit. A record that cannot be
 # written is lost, never the result.
 note_event() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
     [[ "${CALL_NOTED}" -eq 0 ]] || return 0
     CALL_NOTED=1
     collect_hold_wait
@@ -2058,8 +2135,8 @@ note_event() {
         </dev/null >/dev/null 2>&1 || true
 }
 
-MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
-MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$HOME/.claude/scripts/mac_test/mac_test.py}"
+MAC_RUNNER="${VERIFY_MAC_RUNNER:-$BUILD_HELPER_ROOT/mac_test/offload.py}"
+MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$BUILD_HELPER_ROOT/mac_test/mac_test.py}"
 export BUILDLOG_MAC_IDLE_HOOK=""
 MAC_COPY_WATCH="${VERIFY_MAC_COPY_WATCH:-$(dirname "$MAC_RUNNER")/copy_watch.py}"
 COPY_WATCH_PID=""
@@ -2456,23 +2533,39 @@ initialize_step_record() {
 route_compiling_step() {
     local command=$1
     STEP_RAN_ON_MAC=0 MAC_PASSED=0
-    if [[ "${PLACEMENT_RETRY:-0}" != 1 ]]; then
-        PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
-        PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
-        PLACEMENT_SINCE="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}"
-        PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+    if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
+        local token_status=0 reason
+        take_local_placement || token_status=$?
+        LINT_REPAIR_PENDING_GRANT=0
+        if (( token_status == 0 )); then
+            if reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
+                    "$PLACEMENT_ASSIGNMENT_FILE" "$PLACEMENT_GRANT_FILE" "$PLACEMENT_EPISODE" "$$" "${LINT_COPY_TREE:-}" "$@"); then
+                # Keep the sidecar that the grant uses to find its build scope.
+                local grant_peak=$BUILDLOG_PEAK
+                buildlog_begin "$@" || true
+                BUILDLOG_PEAK=$grant_peak
+                BUILDLOG_PLACEMENT_PREPARED=1
+                LINT_REPAIR_REUSED_GRANT=1
+                return 0
+            fi
+            echo "verify.sh: cannot reuse the judgment grant: ${reason:-grant check failed}. Requesting placement again." >&2
+            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+                --pid "$PLACEMENT_OWNER_PID" --reason "the judgment grant cannot cover the lint repair" >/dev/null || return $?
+        elif (( token_status != 10 )); then
+            return "$token_status"
+        fi
+        unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
     fi
-    PLACEMENT_RETRY=0
-    export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+    if [[ "${PLACEMENT_OUTCOME:-}" != retry ]]; then PLACEMENT_EPISODE=""; fi
     PLACEMENT_COMMAND=("$@")
-    PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
-    PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
-    if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
-        mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
-        LINT_MEMORY_WAIT_FILE=""
-    fi
     PLACEMENT_SESSION=$(verify_helper "$BUILD_TARGETS_SCRIPT" submitting-session) || return $?
     export PLACEMENT_SESSION
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        local request_status=0
+        placement_once || request_status=$?
+        PLACEMENT_EPISODE=""
+        exit "$request_status"
+    fi
     buildlog_begin "$@" || true
     BUILDLOG_PLACEMENT_PREPARED=1
     if [[ "${STEP_WRITES_TREE:-0}" == 0 ]]; then
@@ -2562,6 +2655,13 @@ try_reserved_target() {
         LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=runner
         return 0
     fi
+    if [[ "$CMD" == doc ]]; then
+        doc_checkout || return $?
+        local status=0
+        try_mac_test "$STEP_ASSIGNED_SETTINGS" "${1:-}" || status=$?
+        doc_close_checkout || return $?
+        return "$status"
+    fi
     try_mac_test "$STEP_ASSIGNED_SETTINGS" "${1:-}" || return $?
 }
 
@@ -2607,12 +2707,35 @@ mac_only_refuse() {
 
 PLACEMENT_STEP_NUMBER=0
 PLACEMENT_EPISODE=""
+PLACEMENT_OWNER_PID=$$
 PLACEMENT_EVIDENCE_EPISODE=""
 PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
+PLACEMENT_OUTCOME=""
 MAC_BACKOFF_PROBED=0
+
+apply_placement_outcome() {
+    [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]] || return 0
+    local episode="" outcome=""
+    IFS=$'\t' read -r episode outcome < "$PLACEMENT_GRANT_FILE.outcome" || true
+    rm -f -- "$PLACEMENT_GRANT_FILE.outcome" || true
+    unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
+    if [[ "$episode" != "$PLACEMENT_EPISODE" ]]; then outcome=unresolved; fi
+    case "$outcome" in
+        done|abandon)
+            PLACEMENT_EPISODE="" BUILDLOG_PLACEMENT_EPISODE=""
+            ;;
+        retry) ;;
+        *)
+            outcome=unresolved
+            PLACEMENT_CLEANUP_ERROR="could not cancel placement episode $PLACEMENT_EPISODE during step cleanup"
+            printf 'verify.sh: %s\n' "$PLACEMENT_CLEANUP_ERROR" >&2
+            ;;
+    esac
+    PLACEMENT_OUTCOME=$outcome
+}
 
 # A placement that fails before its step starts leaves the run without a
 # verdict. 78 (wait) and the left-queue status are not failures. A refusal (2)
@@ -2629,11 +2752,30 @@ placement_failed() {
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
+    if [[ -z "$PLACEMENT_EPISODE" ]]; then
+        PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
+        PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER}"
+        PLACEMENT_OWNER_PID=$$
+        PLACEMENT_SINCE="${BUILDLOG_FIRST_STEP_SINCE:-${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}}"
+        if [[ -n "${DOC_SOURCE_KEY:-}" ]]; then
+            PLACEMENT_SOURCE_KEY=$DOC_SOURCE_KEY
+        else
+            PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+        fi
+        PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
+        PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
+        if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
+            mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
+            LINT_MEMORY_WAIT_FILE=""
+        fi
+        export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+    fi
+    PLACEMENT_OUTCOME=""
     # route_test released any token before placement; a local grant takes it.
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
-        --pid $$ --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
@@ -2646,6 +2788,24 @@ placement_once() {
     [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
     [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
+    if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" \
+            --token none --request-file "$BUILDLOG_FIRST_STEP_REQUEST" -- "${PLACEMENT_COMMAND[@]}"
+        return $?
+    fi
+    if [[ -n "${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" ]]; then
+        PLACEMENT_ASSIGNMENT_FILE="$BUILDLOG_FIRST_STEP_ASSIGNMENT"
+        IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
+            PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$BUILDLOG_FIRST_STEP_ROUTE"
+        PLACEMENT_OWNER_PID="${BUILDLOG_RUN%%:*}"
+        PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
+        export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+        unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
+        local metadata
+        metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || return $?
+        IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
+        return 0
+    fi
     # A builtin wait lets the parent handle TERM during a service outage.
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
@@ -2740,6 +2900,43 @@ wait_for_claim_recovery() {
     HOLD_WAITER_PID=""
 }
 
+take_local_placement() {
+    # The grant keeps its reservation while the call takes its unit's cargo token.
+    local token_status=0
+    TOKEN_WAIT_HOLD_CHECK=build_hold_check_local
+    acquire_token local || token_status=$?
+    TOKEN_WAIT_HOLD_CHECK=""
+    if (( token_status == 10 )); then
+        # A natedev hold started before the token came: give back the grant and place again.
+        record_token_wait
+        export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
+        export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
+        BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+        if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
+            buildlog_release_memory 10 abandon
+        else
+            source "$PLACEMENT_GRANT_FILE" || return $?
+            buildlog_release_memory 10
+        fi
+        apply_placement_outcome
+        if [[ "$PLACEMENT_OUTCOME" == unresolved ]]; then
+            build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
+            return 2
+        fi
+        echo 'verify.sh: natedev hold started during the cargo token wait; choosing its target again.' >&2
+        return 10
+    fi
+    if (( token_status != 0 )); then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+            --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the cargo token wait ended" >/dev/null || true
+        return "$token_status"
+    fi
+    record_token_wait
+    if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
+    export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
+    export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
+}
+
 route_test() {
     local last_decline="" wait_reason="" name eligibility reason settings platform
     while IFS=$'\t' read -r name eligibility reason settings platform; do
@@ -2763,7 +2960,7 @@ route_test() {
                     && "$PLACEMENT_WAIT_MEMORY" == 1 && -n "$MAC_LEAVE_SETTINGS" ]] \
                     && STEP_WRITES_TREE=0 step_can_retry; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "judge lint before local repair" >/dev/null || return $?
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "judge lint before local repair" >/dev/null || return $?
                 LINT_MEMORY_WAIT_FILE="$PLACEMENT_ASSIGNMENT_FILE.wait"
                 LINT_MEMORY_JUDGMENT=1
                 BUILDLOG_PLACEMENT_PREPARED=0
@@ -2795,40 +2992,22 @@ route_test() {
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "the Mac fix pass runs only on the Mac" >/dev/null || return $?
+                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the Mac fix pass runs only on the Mac" >/dev/null || return $?
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
             if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 ]]; then
-                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "local memory permits lint repair" >/dev/null || return $?
+                LINT_REPAIR_PENDING_GRANT=1
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
-            # The grant keeps its reservation while the call takes its unit's cargo token.
+            # Doc takes its copy slot before it takes the cargo token.
+            if [[ "$CMD" == doc ]]; then doc_checkout || return $?; fi
             local token_status=0
-            TOKEN_WAIT_HOLD_CHECK=build_hold_check_local
-            acquire_token local || token_status=$?
-            TOKEN_WAIT_HOLD_CHECK=""
-            if (( token_status == 10 )); then
-                # A natedev hold started before the token came: give back the grant and place again.
-                record_token_wait
-                export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
-                export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-                source "$PLACEMENT_GRANT_FILE" || return $?
-                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
-                buildlog_release_memory 10
-                echo 'verify.sh: natedev hold started during the cargo token wait; choosing its target again.' >&2
-                continue
+            take_local_placement || token_status=$?
+            if (( token_status != 0 )) && [[ "$CMD" == doc ]]; then
+                doc_close_checkout || return $?
             fi
-            if (( token_status != 0 )); then
-                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "the cargo token wait ended" >/dev/null || true
-                return "$token_status"
-            fi
-            record_token_wait
-            if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
-            export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
-            export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-            return 0
+            if (( token_status == 10 )); then continue; fi
+            return "$token_status"
         fi
         if [[ "${TOKEN_USED:-0}" == 1 ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" report-prerequisite --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
@@ -2872,7 +3051,7 @@ route_test() {
         [[ "$MAC_PASSED" != 1 ]] || return 0
         if [[ "${LINT_MAC_FIX:-0}" == 1 && "${LAST_TARGET_REASON:-}" != busy && "${LAST_TARGET_REASON:-}" != blocked ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid $$ --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
+                --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
             return "$LINT_LEFT_QUEUE_STATUS"
         fi
         last_decline=${LAST_TARGET_REASON:-}
@@ -2890,9 +3069,14 @@ route_test() {
         fi
         if [[ "${LAST_TARGET_REASON:-}" == source_changed ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid $$ --reason "source changed before dispatch" >/dev/null || return $?
+                --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "source changed before dispatch" >/dev/null || return $?
+            if [[ "$CMD" == doc ]]; then
+                echo 'verify.sh: the doc checkout changed before dispatch.' >&2
+                return "$TREE_CHANGED_STATUS"
+            fi
             PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
             PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
+            PLACEMENT_OWNER_PID=$$
             export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
             PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key \
                 --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
@@ -3006,6 +3190,7 @@ run_local_test() {
 # tree, or (lint) already failed on it; LOOKUP_STATUS is the status to exit
 # with. Sets LOOKUP_KEY either way, --no-cache included.
 cache_lookup() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 1
     local record outcome="" word
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
@@ -3217,7 +3402,7 @@ trap - INT TERM HUP
 # while it runs verification itself: an activity, not a pass, so findings.py
 # never counts it toward convergence. The launcher-owns-its-own-pass
 # rule applies here too — the thing that runs the work opens the window.
-PROGRESS_HISTORY="${HOME}/.claude/scripts/direct/progress_history.py"
+PROGRESS_HISTORY="${BUILD_HELPER_ROOT}/direct/progress_history.py"
 ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
 
 # A phase runs two workers against one target/ directory and one Cargo lock,
@@ -3229,7 +3414,7 @@ ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
 # UNIT_RUN_DIR is deliberately not UNIT_SESSION_DIR: that
 # variable also opens a progress activity window, and concurrent windows
 # would collide in a recorder that keeps one.
-BOARD_HELPER="${HOME}/.claude/scripts/direct/board.sh"
+BOARD_HELPER="${BUILD_HELPER_ROOT}/direct/board.sh"
 BOARD_DIR="${UNIT_RUN_DIR:-}"
 BOARD_SLOT="${UNIT_TEAM_ROLE:-}"
 # The unit director's own run (a session dir, no board, no team role) takes the
@@ -3896,6 +4081,7 @@ fi
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
     if [[ "$EXIT_STATUS" == "$TREE_CHANGED_STATUS" ]]; then status=cancelled; fi
+    if [[ -n "${DOC_COPY_OWNER_PID:-${DOC_COPY_PID:-}}" ]]; then doc_close_checkout stop; fi
     stop_tree_watch
     [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
@@ -3914,6 +4100,7 @@ verify_cleanup() {
         interrupted) outcome=interrupted ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    apply_placement_outcome
     finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "${MEM_KILL_FILE}.stopped"
@@ -3925,8 +4112,8 @@ verify_cleanup() {
     fi
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "$TOKEN_WAIT_FILE" "${TOKEN_WAIT_FILE}.given_back"
     release_wait_claim
-    if [[ -n "${PLACEMENT_EPISODE:-}" ]]; then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid $$ \
+    if [[ -n "${PLACEMENT_EPISODE:-}" && "$PLACEMENT_OUTCOME" != unresolved ]]; then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid "${PLACEMENT_OWNER_PID:-$$}" \
             --reason "verify ended" >/dev/null 2>&1 || true
     fi
     remove_step_record
@@ -4226,7 +4413,7 @@ run_lint_sequence() {
         MEND_LOG="$(mktemp)"
         # run_step() records diagnostics through its tee.
         # Keep this call in the parent so cleanup can stop the step.
-        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE=""
+        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE="" LINT_REPAIR_PENDING_GRANT=0
         lint_copy_begin
         while true; do
             if lint_rewrite invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
@@ -4386,16 +4573,21 @@ case "$CMD" in
         fi
         CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
-        doc_checkout
+        DOC_CALLER_DIR=$PWD
+        DOC_COPY_LEASE_FD=""
+        DOC_SOURCE_KEY=""
+        if [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+            if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
+                DOC_TREE=$(doc_tree)
+            else
+                DOC_SOURCE=$(doc_tree with-key)
+                read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
+            fi
+        fi
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
-        DOC_CALLER_DIR=$PWD
-        cd "$DOC_CHECKOUT"
-        # Keep the signal handlers and the active step PID in the caller shell.
-        MAC_SOURCE_ROOT="$DOC_CHECKOUT"
         LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
-        cd "$DOC_CALLER_DIR"
         doc_record
         ;;
     example)

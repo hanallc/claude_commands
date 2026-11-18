@@ -367,7 +367,8 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf,
              codex: herdr.CodexConversations | None = None) -> bool:
-    with operation_deadline.within(deadline):
+    # One row's stop reads each pane once; each identity check forgets its pane before it reads again.
+    with operation_deadline.within(deadline), herdr.observation_snapshot():
         try:
             record = staff.initial_snapshot()
             if record.by_id(row.id) is None:

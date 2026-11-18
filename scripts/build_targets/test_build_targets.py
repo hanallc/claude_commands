@@ -26,7 +26,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
-from scripts.build_hold import build_hold
+from scripts.build_hold import build_hold, override_guard
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
@@ -38,11 +38,11 @@ from scripts.message import session_send
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.buildlog import record, store
-from scripts.build_targets.test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
+from scripts.build_targets.test_targets import END, NOW, SINCE, IsolatedTargetTest
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
-SHIPPED_STATUS = "\n".join((
+FIXTURE_STATUS = "\n".join((
     "mac: free",
     "natedev: free",
     "",
@@ -311,6 +311,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_stale_mac_reading_prints_before_target_status(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp(), written_age=301)
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        _ = write_config_fixture(config.parent / "mac_test.conf", "stale_seconds=300\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(time, "time", return_value=NOW.timestamp()):
             code, output, errors = self.capture_status()
@@ -577,10 +578,10 @@ class StatusTests(IsolatedBuildTargetTest):
         instant = datetime(2026, 12, 11, 21, 5, tzinfo=timezone.utc)
         self.assertEqual(build_targets.local_time(instant), "13:05 PST")
 
-    def test_shipped_config_prints_one_line_per_target_without_probe(self) -> None:
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
+    def test_fixture_config_prints_one_line_per_target_without_probe(self) -> None:
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
-                self.assertEqual(self.capture_status(), (0, SHIPPED_STATUS, ""))
+                self.assertEqual(self.capture_status(), (0, FIXTURE_STATUS, ""))
 
     def test_command_uses_config_order_and_recorded_hold(self) -> None:
         config = self.write_config(
@@ -605,7 +606,7 @@ class StatusTests(IsolatedBuildTargetTest):
         self.write_holder()
         output = io.StringIO()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=unavailable):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status", "--probe"]):
                     with redirect_stdout(output), redirect_stderr(errors):
@@ -616,17 +617,17 @@ class StatusTests(IsolatedBuildTargetTest):
             "natedev: held by hana since 13:05 PDT — render checks\n"
         ))
         self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(probed, [targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf"))])
+        self.assertEqual(probed, [targets.SshTarget("mac", "macos", self.settings)])
 
     def test_status_argument_defaults_to_recorded_state(self) -> None:
         output = io.StringIO()
         errors = io.StringIO()
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(SHIPPED_CONFIG).parent)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
             with mock.patch.object(build_targets, "probe_target", side_effect=AssertionError("Probe not requested")):
                 with mock.patch.object(sys, "argv", ["build_targets.py", "status"]):
                     with redirect_stdout(output), redirect_stderr(errors):
                         code = build_targets.main()
-        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, SHIPPED_STATUS, ""))
+        self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, FIXTURE_STATUS, ""))
 
     def test_failed_mac_probe_becomes_unreachable_status(self) -> None:
         calls: list[str] = []
@@ -927,6 +928,8 @@ class WaitLocalTests(IsolatedBuildTargetTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(self.root / "build_targets.conf", "hold_sender_timeout_seconds=30\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
         self.sleeps = 0
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
@@ -1031,7 +1034,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                     output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, 0, output + errors)
                 cycle = build_hold.read_cycle()
-                assert cycle is not None
+                assert not isinstance(cycle, build_hold.NoCycle)
                 self.assertEqual(cycle["entries"], [])
             finally:
                 for process in processes:
@@ -1125,7 +1128,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.assertEqual(self.sleeps, 1)
         self.assertIn("verify.sh: the Mac is free: leaving natedev's hold wait to run there.", errors)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual(cycle["entries"], [])
         self.assertTrue((self.root / "wait-seconds").read_text().strip())
 
@@ -1192,7 +1195,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
     def test_damaged_cycle_waits_for_unlink_then_passes_without_a_holder(self) -> None:
         self.begin_hold()
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         path = self.root / "release" / cycle["id"] / "cycle.json"
         _ = path.write_text("{broken")
 
@@ -1244,8 +1247,22 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(build_targets.command_check_local(), 10)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual(cycle["entries"], [])
+
+        home = self.root / "guard-home"
+        shared = home / ".local/state/build-hold"
+        shared.parent.mkdir(parents=True)
+        shared.symlink_to(self.holders, target_is_directory=True)
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(override_guard, "user_home", return_value=home), \
+             mock.patch.object(sys, "argv", [build_targets.__file__, "check-local", "--session", "waiting-session"]), \
+             redirect_stdout(output), redirect_stderr(errors):
+            code = build_targets.main()
+        self.assertEqual(code, 2)
+        self.assertIn(str(home / ".claude/scripts/build_hold/build_hold.py"), output.getvalue() + errors.getvalue())
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
 
     def check_launch(self, session_id: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -1258,7 +1275,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
                                   "render checks", build_hold.NoReleaseEta(), NOW)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         cycle_file = self.root / "release" / cycle["id"] / "cycle.json"
         current = self.root / "release" / "current"
         holder_file = build_hold.holder_path(self.holders, "holder-session")
@@ -1507,7 +1524,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             for _ in range(2):
                 self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         self.assertEqual(cycle["entries"], [])
         self.assertFalse((self.root / "registration").exists())
 

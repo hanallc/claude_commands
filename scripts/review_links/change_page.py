@@ -49,6 +49,7 @@ CONSOLE_FOLDER = "console"
 SEND_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 SENDER = Path(__file__).stem
 DELIVERY_PREFIX = ".review-link-delivery-"
+IMAGE_QUESTION_ROW_PREFIX = "Images "
 
 
 class BrowserManifest(TypedDict):
@@ -136,6 +137,19 @@ class StoredDeliverySlots(TypedDict, total=False):
     review_message: StoredReviewMessage
 
 
+ImageQuestionDispatchState = Literal["started", "started_after_unconfirmed", "accepted"]
+
+
+class ImageQuestionDispatch(TypedDict):
+    attempt: str
+    state: ImageQuestionDispatchState
+
+
+@dataclass(frozen=True)
+class NoImageQuestionDispatch:
+    """The record has no send mark for this image question."""
+
+
 class StoredReviewMessage(TypedDict):
     saved: bool
     source: str
@@ -143,6 +157,7 @@ class StoredReviewMessage(TypedDict):
     message: str
     # A record saved before efficiencies has no row; its row is the source's stem.
     row: NotRequired[str]
+    image_question_dispatch: NotRequired[ImageQuestionDispatch]
 
 
 class SentCloseoutAlerts(TypedDict):
@@ -301,6 +316,7 @@ class DeliveryStatus:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.request_attempts: dict[str, AttemptOwnership] = {}
+        self.startup_recovery_pending: threading.Event = threading.Event()
 
     def read_view(self) -> DeliveryReadView:
         return DeliveryReadView(self, frozenset(self.root.glob(DELIVERY_PREFIX + "*")))
@@ -316,21 +332,54 @@ class DeliveryStatus:
 
     def owns_live_attempt(self, page: ReviewPage, row: str, intent: DeliveryIntent) -> bool:
         """Check the sender while the caller holds the delivery lock."""
-        owner = self.request_attempts.get(intent.attempt)
+        return self.owns_live_claim(page, row, intent.attempt)
+
+    def owns_live_claim(self, page: ReviewPage, row: str, attempt: str) -> bool:
+        owner = self.request_attempts.get(attempt)
         return owner is not None and owner.row_file == self.path(page, row) and owner.request_thread.is_alive()
+
+    def _image_question_message(self, page: ReviewPage, row: str) -> dict[str, object]:
+        try:
+            value = cast(object, json.loads(self.path(page, row).read_text(encoding="utf-8")))
+        except (FileNotFoundError, ValueError):
+            return {}
+        if isinstance(value, dict):
+            saved = cast(dict[str, object], value).get("review_message")
+            if isinstance(saved, dict):
+                return cast(dict[str, object], saved)
+        return {}
+
+    def image_question_intent_was_not_saved(self, page: ReviewPage, row: str) -> bool:
+        """Read an explicit unsaved mark from the image question's delivery record."""
+        saved = self._image_question_message(page, row)
+        return (saved.get("saved") is False
+                and all(isinstance(saved.get(field), str) for field in ("source", "owner", "message")))
+
+    def image_question_dispatch(self, page: ReviewPage, row: str) -> ImageQuestionDispatch | NoImageQuestionDispatch:
+        dispatch = self._image_question_message(page, row).get("image_question_dispatch")
+        if isinstance(dispatch, dict):
+            fields = cast(dict[str, object], dispatch)
+            attempt, state = fields.get("attempt"), fields.get("state")
+            if isinstance(attempt, str) and state in ("started", "started_after_unconfirmed", "accepted"):
+                return {"attempt": attempt, "state": state}
+        return NoImageQuestionDispatch()
 
     def closeout_path(self, page: ReviewPage, row: str) -> Path:
         name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
         return self.root / (".review-link-closeout-alert-" + name + ".json")
 
     def failed_delivery(self, page: ReviewPage, row: str) -> FailedDelivery | NoFailedDelivery:
-        """Read the failure from the existing closeout record, including after a server restart."""
+        """Read a failure unless an earlier send may have reached the owner."""
         try:
             fields = cast(SentCloseoutAlerts, json.loads(self.closeout_path(page, row).read_text(encoding="utf-8")))
         except FileNotFoundError:
             return NoFailedDelivery()
         failed = fields.get("failed_delivery")
         if failed is None:
+            return NoFailedDelivery()
+        dispatch = self.image_question_dispatch(page, row)
+        if not isinstance(dispatch, NoImageQuestionDispatch) and (
+                dispatch["state"] != "started" or dispatch["attempt"] != failed["attempt"]):
             return NoFailedDelivery()
         return FailedDelivery(failed["attempt"], Path(failed["review_list"]), failed["row"], failed["last_error"])
 
@@ -467,7 +516,18 @@ class DeliveryStatus:
     def record(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery = NO_FAILED_DELIVERY) -> None:
         with self.locked():
             _ = self.request_attempts.pop(delivery.attempt, None)
-            slots = self.slots(delivery.page, delivery.row)
+            page, row = delivery.page, delivery.row
+            slots = self.slots(page, row)
+            if isinstance(page, ReviewMessagePage) and row.startswith(IMAGE_QUESTION_ROW_PREFIX):
+                dispatch = self.image_question_dispatch(page, row)
+                if (not isinstance(dispatch, NoImageQuestionDispatch) and dispatch["state"] != "accepted"
+                        and dispatch["attempt"] == delivery.attempt):
+                    if isinstance(result, NoFailedDelivery):
+                        accepted = replace(page, saved={**page.saved, "image_question_dispatch": {
+                            "attempt": delivery.attempt, "state": "accepted"}})
+                        self.write_slots(accepted, row, slots)
+                    self.record_result_locked(delivery, result)
+                    return
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
                     self.record_result_locked(delivery, result)
@@ -743,7 +803,14 @@ def inline_html(text: str) -> str:
 
 
 def review_text_html(text: str, *, inline: bool = False) -> str:
-    """Render escaped text blocks and lists; `inline` adds Markdown headings and inline formatting."""
+    """Render text blocks and lists. Enable Markdown when inline formatting is on."""
+    if inline:
+        return page_frame.render_code_blocks(text, lambda part: review_prose_html(part, inline=True))
+    return review_prose_html(text)
+
+
+def review_prose_html(text: str, *, inline: bool = False) -> str:
+    """Render text blocks and lists between code blocks."""
     escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) or inline and HEADING.match(line.lstrip()) for line in lines):
@@ -787,20 +854,7 @@ BLANK_EDGES = re.compile(r"\A(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+\Z")
 
 def review_html(text: str) -> str:
     """Render review text as paragraphs, lists, and code blocks with copy controls."""
-    content: list[str] = []
-    start = 0
-    for block in page_frame.CODE_BLOCK.finditer(text):
-        before = BLANK_EDGES.sub("", text[start:block.start()])
-        if before.strip():
-            content.append(review_text_html(before))
-        content.append(page_frame.code_block_html(block))
-        start = block.end()
-    if not content:
-        return review_text_html(BLANK_EDGES.sub("", text))
-    after = BLANK_EDGES.sub("", text[start:])
-    if after.strip():
-        content.append(review_text_html(after))
-    return "".join(content)
+    return page_frame.render_code_blocks(text, lambda part: review_prose_html(BLANK_EDGES.sub("", part)))
 
 
 def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
@@ -1222,6 +1276,15 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
         if not any(intent.attempt == delivery.attempt for intent in slots.intents()):
             _ = status.request_attempts.pop(delivery.attempt, None)
             return
+        page = delivery.page
+        if isinstance(page, ReviewMessagePage) and delivery.row.startswith(IMAGE_QUESTION_ROW_PREFIX):
+            previous = status.image_question_dispatch(page, delivery.row)
+            unconfirmed = (not isinstance(previous, NoImageQuestionDispatch) and previous["state"] != "accepted"
+                           and isinstance(status.failed_delivery(page, delivery.row), NoFailedDelivery))
+            started = replace(page, saved={**page.saved, "image_question_dispatch": {
+                "attempt": delivery.attempt, "state": "started_after_unconfirmed" if unconfirmed else "started"}})
+            # Save the send mark before the sender can accept the message.
+            status.write_slots(started, delivery.row, slots.updated("verdict", NoDelivery()))
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])

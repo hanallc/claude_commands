@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
 from scripts.accounts import accounts
+from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
@@ -831,8 +832,6 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 
 DETACHED_RUNS = "detached_runs"
 
-BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
-
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 
 class RetirementRefused(Exception):
@@ -1532,7 +1531,8 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     row = unit.staff_member
     owned = retirement_members(unit, record)
     for key in retirement_holds({member.id for member in owned}):
-        result = retirement_run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
+        hold_script = override_guard.helper_root(Path(__file__)) / "build_hold/build_hold.py"
+        result = retirement_run([sys.executable, str(hold_script), "release", "--holder", key], settings=settings)
         if result.returncode:
             print(f"anomaly: {retirement_failure(result)}")
     retirement_release_reservations(unit, settings=settings)
@@ -2153,7 +2153,8 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                 except staff.StaffRefused as error:
                     print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
     if unchanged:
-        print(f"{unchanged} worker names unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
+        worker_names = "worker name" if unchanged == 1 else "worker names"
+        print(f"{unchanged} {worker_names} unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
     return changed
 
 

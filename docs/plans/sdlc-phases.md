@@ -516,149 +516,79 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - A threaded Python walker: the GIL holds it near 130k entries/s (/ 58–68 s).
 
 ### Phase 45 — A refresh button on the Disks page measures the drives at once  · status: done
-**Depends on:** Phase 44
 
-#### Work Order
+#### As-built
 
-**Goal:** the user (change review C1825, 2026-11-17): "a refresh icon (lucide) that when pressed, would cause it to remeasure". The Disks page has a Lucide `refresh-cw` button. A press starts a measure at once, also when the sizes are current, and the status line shows Measuring. A press while a measure runs starts no second measure (showrunner, 2026-11-17).
-
-**Spec:**
-- `scripts/disks/disks_page.py` — `start_measure(now, launch=launch_measure, *, force=False)`: with `force`, skip the `cache_seconds` check. The lock rule stays: a running measure gives `MeasureStart.RUNNING` and no launch.
-- `scripts/review_links/serve.py` — `disks_measure_post` reads the posted form. `force=1` passes `force=True`; an empty body keeps today's behavior. The answer keeps its form (`state`, `slots`, `sessions`).
-- `scripts/disks/disks.html`:
-  - A `<button type="button">` with the vendored Lucide `refresh-cw` icon (`scripts/review_links/lucide/refresh-cw.svg`, put in by `disks_page.publish` through `page_frame.icon_svg`; no hand-copied path), `aria-label="Measure now"` and a tooltip "Measure now". It sits at the end of the page status line, in the same row.
-  - A press posts `force=1` to the measure name, sets the page's `measuring` state as `askMeasure` does, and runs a page refresh, so the status line shows `Paused · Measuring…` at once (the existing busy path).
-  - While `measuring` is set, the button is disabled. It is enabled again when new data arrives or the wait ends (`settings.wait_seconds`).
-  - A failed press shows its reason through the existing `failure` path; the button is enabled again.
-  - Style: the icon is 16 px, `currentColor`, with the page's muted text color and the accent color on hover and focus; a visible focus ring. Use console theme tokens only; no new color.
+**Measure now** uses the Lucide `refresh-cw` icon and posts `force=1`. The page shows `Paused · Measuring…` and disables the button until the data reaches its target, the wait expires, or the request fails.
+`start_measure(now, launch=launch_measure, *, force=False) -> MeasureRequest` skips the cache when forced and returns the active target if a measure holds the lock.
+`disks.coord` protects reservation and publication, and `disks.active` records the active generation. The launcher passes the locked descriptor to the child, which holds it through publication. The child sets `measured_at` at publication and removes `disks.active` before it releases the lock.
 
 **Files:**
-- `scripts/disks/disks_page.py` — `start_measure` force
-- `scripts/disks/disks.html` — the button and its press
-- `scripts/review_links/serve.py` — `force=1` in `disks_measure_post`
-- `scripts/disks/test_disks_page.py` — tests
-- `scripts/review_links/test_serve.py` — tests
+- `scripts/disks/disks_page.py` and `scripts/disks/disks.html` — measure reservation, button rendering, and generation checks.
+- `scripts/disks/measure.py` and `scripts/lib/file_lock.py` — child reservation and `ExclusiveLock` ownership.
+- `scripts/review_links/serve.py` and `scripts/review_links/page_frame.py` — the POST returns `state`, `target`, `slots`, and `sessions`. `createPageRefresh()` exposes `setStatus()`.
+- `scripts/disks/test_disks_page.py`, `scripts/disks/test_measure.py`, `scripts/lib/test_file_lock.py`, `scripts/review_links/test_page_frame.py`, and `scripts/review_links/test_serve.py` — generation, lock handoff, and browser or route tests.
+- `docs/plans/builds-report.md` — the Disks generation completion rule.
 
-**Workers:** 1 writer — `impl` writes all five files.
+**Gotchas:** `ExclusiveLock.close()` closes one handle. `release()` unlocks the inherited lock for both processes. Legacy data has generation zero.
 
-**State:** none
-
-**Constraints from prior phases:** a measure takes about 55–60 s on natedev (dust, both drives at once). `start_measure` never waits for the measure. `disks_page.publish` writes the page only when it changes. Tests write a fixture config; no test reads a tunable value. Every tunable goes in a config file.
-
-**Acceptance gate:**
-1. `scripts.disks.test_disks_page` passes, with tests for: `start_measure(force=True)` launches when the data is current; `force=True` with the lock held gives `RUNNING` and no launch; the published page holds the `refresh-cw` button with its label.
-2. `scripts.review_links.test_serve` passes, with a test that `force=1` reaches `start_measure` and an empty body does not force.
-3. basedpyright reports 0 errors and 0 warnings on the changed Python files.
-4. Live on natedev (director): press the button on the Disks page in a browser. The status line shows `Paused · Measuring…` at once, the button is disabled, and a second press does nothing. About a minute later the sizes update and the button is enabled again. One dark desktop screenshot, clipped to the status line and button, for the Change-Review line with `| after restart`.
+**Ruled out:** Retrying a measure request with an unknown target.
 
 ### Phase 46 — A question title is one short line, and the Review page never shows a long one  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the user (2026-11-17, via builds and the showrunner): "the item description is ridiculously long and unreadable - we need to have that be an impossible thing to happen". spacetime/Q461 and Q462 filed the whole question (context, values, choices, recommendation) as the item title, and the Review page shows 15+ lines in the Item column. The writer refuses a long title, and the Review page cuts an old long title to one short line.
-
-**Spec:**
-- `config/production.conf` — new key `question_title_max_chars=100` with a comment and a `# whole: 20..` line, as the other keys carry.
-- `scripts/production/update_registration.py`:
-  - `ask` refuses `--text` and `--ask` when either is longer than `question_title_max_chars` characters (the existing one-line check stays). The refusal names the limit and the length, and says to put the rest in `--context` and `--item`. It runs before the question review, so a refused question costs no review.
-  - The `questions --state` path (the replacement table from a showrunner's `open_for_user`) refuses a new or changed item whose text is longer than the limit or longer than one line. This is the path that filed spacetime/Q461 and Q462. A stored item that is already longer is only named, as `plumbing` problems are (`report("questions", "reword", …)`).
-  - Every other path that writes a question title: search for writers of `OutstandingItem` `text` and `parts["ask"]`, and apply the same rule through one helper, so the limit lives in one place.
-  - The `--text` and `--ask` help text names the limit.
-- `scripts/review_links/review_page.py`: the row title of every review item shows only its first line, cut at `question_title_max_chars` characters with "…" when longer. The search attribute keeps the full text. When the title is cut, the details show the full text (a question whose `ask` equals its `text` shows the full `ask` as its lead). Keep this change small: admin-console also changes this file now.
-- `commands/showrunner/produce.md`, **Open-questions list**: today it says "Keep each item complete enough to stand alone when the user asks for the list: what is asked, where, why and the choices". That text made spacetime put the whole question in the item. Replace it: an `open_for_user` item is the short one-line title (at most `question_title_max_chars`); file a new question with `update_registration.py ask` and its parts (`--ask`, `--context`, `--item`, `--choice`, `--recommend`), so the page and `/next` show the rest.
-- `docs/question_template.md` — the `--ask` line (line 12) names the title limit and says the rest goes in `--context` and `--item`. Both question commands import this file, so the rule lives in one place; `commands/showrunner/question.md`, `commands/unit/question.md` and the producer docs need no change.
+`check_question_title(text) -> ValidQuestionTitle | RefusedQuestionTitle` requires one nonempty line within `question_title_max_chars`, which is 100 by default. `ask` checks `--text` and `--ask` before review, and `write_question_record()` checks new or changed titles.
+`questions --state` refuses invalid new titles and reports `reword` for stored titles that it keeps.
+The Review table clips the first line by character count and available width. Search and the tooltip retain the full title. The details panel shows its hidden Item fallback when the rendered body lacks the full title.
 
 **Files:**
-- `config/production.conf` — the limit
-- `scripts/production/update_registration.py` — the refusal
-- `scripts/production/test_update_registration_questions.py` — tests
-- `scripts/review_links/review_page.py` — the cut title
-- `scripts/review_links/test_review_page.py` — tests
-- `docs/question_template.md` — the limit line
-- `commands/showrunner/produce.md` — the filing rule
+- `config/production.conf` and `scripts/production/update_registration.py` — the limit and title validation.
+- `scripts/review_links/review_page.py` — one-line rows and the full-title fallback.
+- `docs/question_template.md` and `commands/showrunner/produce.md` — the title rule and the use of `--context` and `--item`.
+- `scripts/production/test_update_registration_questions.py` and `scripts/review_links/test_review_page.py` — filing and rendering tests.
 
-**Workers:** 1 writer — `impl` writes all files.
-
-**State:** none
-
-**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. A changed config key needs the showrunner's go; this key is new. `review_page.py` is shared with admin-console: keep the hunk small and touch no other part of the file.
-
-**Acceptance gate:**
-1. `scripts.production.test_update_registration_questions` passes, with tests for: `ask` refuses a `--text` and an `--ask` one character over the limit and names the limit; a title at the limit files; the `questions --state` path refuses a new long or multi-line item and only names a stored one.
-2. `scripts.review_links.test_review_page` passes, with a test that a long title shows one line cut with "…", the search attribute keeps the full text, and the details show the full text.
-3. basedpyright reports 0 errors and 0 warnings on the changed Python files.
-4. Live on natedev (director): the Review page shows spacetime/Q461 and Q462 (or a fixture copy when they are closed) as one line each. One dark desktop screenshot of those rows for the Change-Review line with `| after restart`.
+**Gotchas:** CLI help names the setting. The CLI reads its value when it checks a title. The details check preserves block boundaries in the text.
 
 ### Phase 47 — A rename of a unit to its own name keeps bare worker names quiet  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the showrunner (2026-11-17, renamequiet). `agents rename OWNER OWNER` migrates old qualified worker names. For cargo-liner-style, whose worker rows already have bare names (`review`, `review2`, `style-ticket-1493`, `held-check-N`), it printed about 110 lines `kept; prefix does not end with cargo-liner-style`, each with a wrong hint such as `rename <id> 1493`. A row with no qualified prefix for this owner is already correct. The command prints no per-row line for it and never prints a hint that cuts a name. Second case (hana's widget): 14 rows carry the unit's former name as prefix (`widget-enhancements-impl`). Accept a prefix that equals or ends with a recorded former name of the owner; use only recorded former names, never a former name inferred from the shape of a worker name.
-
-**Spec:**
-- `scripts/agents/shutdown.py` `rename_qualified_workers(owner)`:
-  1. The owner's qualified prefixes are its name and each recorded former name. A prefix qualifies when it equals one of them or ends with `-<one of them>`.
-  2. A row whose name has no qualifying prefix is left as it is, with no per-row output. At the end, when one or more rows were left, print one line: `<N> worker names unchanged: no qualified prefix for <owner>`. No hint.
-  3. Former names: find where a durable record of the owner's former names exists (the staff row, or the session record `formerNames` that `rename` writes, shutdown.py ~2181). Use a record only if it survives a session restart. If no durable record exists, accept only the owner's current name, and say so in the report.
-  4. Qualified rows migrate as now.
-- Live defect (showrunner, 2026-11-17): hana's organon and startup were renamed to `organon-unit` and `startup-unit`. `rename_member` resolves `<name>-unit` to the unit `<name>`, and the rename then treated `<name>-unit` as a new name. For startup it wrote a pending folder and branch move that no command can clear. The STOP on renames lifts only when this defect is gone.
-  5. In `rename_plan` for a unit row, a new name equal to the row's name plus `-unit` is the row's own name: a same-name rename (worker migration and display repair only).
-  6. A new rename replaces an unstarted pending rename: staff path and checkout at the record's `source`, branch at `source_branch`, `destination` absent, move lock free. The test lives in `scripts/production/unit_move.py`; the removal runs under the row lock in `rename_apply_unit`. A started move keeps today's refusal.
-  7. On startup's state, `agents rename 556caf6e-713d-47c0-a8fc-5dd5e8c26ce4 startup` removes the record, renames the row back to `startup`, moves no folder or branch, and restarts no session.
+`rename_qualified_workers(owner)` matches a prefix equal to the current owner name or ending in `-<owner>`. It keeps other names without per-row output or rename hints.
+`rename_plan()` treats the current unit name plus `-unit` as a same-name rename. `rename_apply_unit()` can remove an unstarted pending rename under the staff row lock.
+`rename_unstarted(record, row, pending) -> bool` requires the staff path and checkout at the original source, the original branch, and an absent destination. Any native Git worktree lock makes that test fail.
 
 **Files:**
-- `scripts/agents/shutdown.py` — `rename_qualified_workers`
-- `scripts/agents/test_shutdown_cli.py` — tests (the `UNDECIDED` scenarios at ~2234 pin the old kept line and hint; the director approves replacing them with the new behavior)
-- `scripts/production/unit_move.py`, `scripts/production/test_unit_move.py` — the unstarted pending-rename test (items 6–7)
+- `scripts/agents/shutdown.py` — name matching, summary output, and pending rename replacement.
+- `scripts/production/unit_move.py` — the unstarted move check.
+- `scripts/agents/test_shutdown_cli.py` and `scripts/production/test_unit_move.py` — rename and move fixtures.
 
-**Workers:** 1 writer.
+**Binds later work:** `rename_qualified_workers()` in `scripts/agents/shutdown.py` prints `<N> worker names unchanged: no qualified prefix for <owner>` once on stderr after the scan when the count is positive. **A rename summary for one worker says "1 worker name unchanged"** uses this summary.
 
-**State:** none
-
-**Constraints from prior phases:** test with fixture staff rows only; no run on live units. No new check or gate (showrunner).
-
-**Acceptance gate:**
-1. `scripts.agents.test_shutdown_cli` passes, with tests for: bare rows (`review`, `review2`, `style-ticket-1493`, `held-check-3`) print no per-row line and one summary line; a row with a recorded former-name prefix migrates; a row with an unrecorded foreign prefix stays and prints no hint.
-   `scripts.production.test_unit_move` passes, with tests for items 5–7 and for a started move that still refuses.
-2. basedpyright reports 0 errors and 0 warnings on the changed files.
+**Gotchas:** Staff rows store no former names. The session record’s `formerNames` is process-specific, so qualification uses the current owner name.
 
 ### Phase 48 — An image can carry a question, and its answer comes back to the user  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the user (2026-11-17, via the showrunner, imageask): "images should have an ask question so that the image comes back with an answer - just like other things - if i say approved or not approved or send feedback those might not come back to me although they might - but ask a question must come back to me with an answer". unit-board's listask builds the same question flow into the List; the two pages share one module (agreed with unit-board 2026-11-17), with no second copy.
+**Ask question** uses the image card’s feedback field and sends the image owner the question and an answer command. The card stays visible while any question is open, and the image leaves the console’s waiting set.
+`images.py answer --id <image> --question Q<n> --text "<answer>"` saves the answer and clears `feedback_at` in one write. The console marks the image new after the last answer.
+Each item assigns its own `Q<n>` IDs. The store refuses unknown or already answered IDs and reads older records without a `questions` field.
+Images refreshes after each action and polls during question delivery. Images and Review restore focus, caret, and selection after a refresh.
 
-**Spec:**
-- New `scripts/review_links/page_question.py`, the shared piece (form agreed with unit-board):
-  1. Typed records `Question(question_id, asked_at, words, answer: Answer | None)` and `Answer(text, answered_at)`. `question_id` is `Q<n>`, numbered per item. Each page stores the questions on the item's own record.
-  2. A `QuestionStore` protocol that each page implements on its own record under that record's lock: `questions(item)`, `add(item, Question)`, `set_answer(item, question_id, Answer)`.
-  3. `ask(store, item, owner, source_path, row, title, words, answer_command, status) -> MessageDelivery`. It takes the next id, saves the question under one delivery claim, and sends `<Page> <item>: Ask question` / title / words / `Answer with this command: <command with item and Q id>`. It reuses the Review page delivery (`change_page.DeliveryStatus` claim, `MessageDelivery`, retry), as `review_actions.send` does.
-  4. `answer(store, item, question_id, text) -> Answered | AnswerRefused`. It refuses an unknown or already-answered id, then writes the answer. Each page runs its own return step after it.
-  5. `open_question_html(question)` and `answered_question_html(question)` render the open line and the question-and-answer pair.
-- `scripts/review_links/images.py` and `image_store.py`:
-  1. Each card gets an **Ask question** button beside Send feedback. It uses the feedback text field; an empty field gives "Enter a question first."
-  2. The question goes to the image owner with the image id and the question id. The image is not deleted. The card stays on the page and shows the open question. While a question is open, the image does not count as waiting for the user (console new mark).
-  3. `images.py answer --id <image> --question Q<n> --text "<answer>"` calls `page_question.answer`. The card then shows the question and the answer, and the image counts as waiting for the user again (the return step: it clears `feedback_at` if set and marks the card new).
-  4. The image record type gains the questions field as `NotRequired`, so older records still read.
-- `commands/show_image.md` (or the command that tells owners about Images answers): one line naming the answer command.
+**Files:**
+- `scripts/review_links/page_question.py` — `QuestionStore` defines `questions(item)`, `add(item, question)`, and `set_answer(item, question_id, answer)`. `ask(store, item, owner, source_path, row, title, words, answer_command, status) -> MessageDelivery` saves and claims delivery. `answer(store, item, question_id, text) -> Answered | AnswerRefused` records a reply for the page renderers.
+- `scripts/review_links/question_record.py` and `scripts/review_links/image_store.py` — typed question records, optional image questions, and locked image writes.
+- `scripts/review_links/images.py`, `scripts/review_links/serve.py`, and `scripts/review_links/change_page.py` — image actions and the delivery claim. The POST responds before delivery.
+- `scripts/review_links/page_frame.py` and `scripts/review_links/review_page.py` — shared focus restoration.
+- `commands/show_image.md` — the answer command.
+- `scripts/review_links/test_page_question.py`, `scripts/review_links/test_images.py`, `scripts/review_links/test_review_page.py`, `scripts/review_links/test_change_page.py`, and `scripts/review_links/test_serve.py` — storage, delivery, route, and refresh fixtures.
 
-**Files:** `scripts/review_links/page_question.py` and `test_page_question.py` (new); `scripts/review_links/images.py`, `image_store.py`, `test_images.py`; the show_image command doc.
+**Gotchas:** An answer that arrives during an earlier feedback send takes priority. An open question keeps the card visible even when an older feedback mark exists.
 
-**Workers:** 1 writer (`design`); the `test` worker takes the live shot.
+### Phase 49 — The fast-track recovery reads each Git object once, in one batch  · status: dropped
+**Result (2026-11-17):** dropped with no code change. test_fast_track makes 7,185 Git starts, and only 112 are cat-file. The batch saved no CPU (61.934 s to 61.910 s). No single call shape dominates.
 
-**State:** image records gain an optional questions field; no migration.
-
-**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. No mockup (showrunner). `page_question.py` is shared with unit-board's listask: keep its public surface to the form above; send unit-board its path as soon as its tests pass.
-
-**Acceptance gate:**
-1. `scripts.review_links.test_page_question` and `scripts.review_links.test_images` pass, with tests for: next id per item; ask saves and sends once under the claim; a failed send keeps the question with its delivery state; answer refuses an unknown and an answered id; the image card shows the open line, then the answered pair; the image leaves and re-enters the waiting set; an older record without questions reads.
-2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
-3. Live on natedev (director, by the `test` worker on a copy): ask a question on a fixture image, answer it with the command, and the card shows the question and the answer. One dark desktop screenshot for the Change-Review line with `| after restart`.
-
-### Phase 49 — The fast-track recovery reads each Git object once, in one batch  · status: todo
 **Depends on:** none
 
 #### Work Order
@@ -687,117 +617,269 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 3. `python3 ~/.claude/scripts/test_times/module_cost.py --tree <worktree> production/test_fast_track.py --commands 10` before and after the change: CPU seconds and Git process starts. Both go in the checkpoint.
 
 ### Phase 50 — A new change row fills an empty cell for each optional column  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the showrunner (2026-11-17, reviewlogcol, urgent): since about 10:25 EST no change row can be added to the natedev change list, for every production. Every merge prints "change review: failed — change-review - natedev.md: no value for the `Review log` column". A review event adds the `Review log` column to the To review table (`_add_column`), and the new-row code builds its values with no `Review log` key, so `_row` refuses the row.
-
-**Spec:**
-1. In `scripts/production/change_review.py`, a new To review row gets an empty cell for each table column it has no value for, as the Reviewed insert already does (`dict.fromkeys`). One rule for every optional column, not a special case for `Review log`.
-2. Keep `_row` as it is: it refuses a table column with no value and ignores a value with no column. Keep every value the new-row code writes today.
-3. Branch from origin/main 9d7badf17. No edit of the real change list.
+On `origin/main`, `append_rows()` seeds each `To review` column with an empty string before it applies the new row’s values.
+The rule covers `add`, `list-ready`, and `live`, including tables with `Review log` or other optional columns.
+`_row(path, columns, values)` rejects a missing table value and writes only columns present in the table.
 
 **Files:**
-- `scripts/production/change_review.py`
-- `scripts/production/test_change_review.py` — a test with a fixture list whose To review table has a `Review log` column
+- `scripts/production/change_review.py` — row defaults and strict column formatting.
+- `scripts/production/test_change_review.py` — insertion with extra columns and without an Image column.
 
-**Workers:** 1 writer (`design`).
+**Gotchas:** The phases checkout lacks the `To review` defaults present on `origin/main`.
 
-**State:** none.
+### Phase 51 — An image question never reads as unsent when it was sent  · status: done
 
-**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value.
+#### As-built
 
-**Acceptance gate:**
-1. `scripts.production.test_change_review` passes, with a test that `add`, `list-ready` and `live` add a row to a fixture list whose To review table has a `Review log` column; the test fails on origin/main.
-2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
-3. `git merge-tree` of the checkpoint against devtools reviewscan d0db535e2 and admin-console waitbuttons-2 cca12f3a3 reports the result.
-
-### Phase 51 — An image question never reads as unsent when it was sent  · status: todo
-**Depends on:** Phase 48
-
-#### Work Order
-
-**Goal:** the showrunner (2026-11-17) took both phase 48 add-ons as next work. Two edges of the image question delivery show a false `Not sent`.
-
-**Spec:**
-1. A page opened during server startup, before startup recovery claims a saved delivery intent, shows the question as sending, not `Not sent`, and keeps polling until recovery ends.
-2. A send that succeeds and then fails to write its result is not shown as `Not sent`, and a retry never sends the same question twice. Record the send before the result write, or check that record before a retry; pick the simplest rule that is always correct.
+`ReviewLinksServer` sets the startup recovery flag before recovery starts and clears it when the delivery scan finishes. Images shows that a pending question is sending and polls before recovery claims it.
+The sender replaces the intent with a `started` mark before sending. It saves `accepted` before it writes the delivery result.
+An unknown result offers a deliberate resend with the same words and question ID. If the intent update fails after the question saves, cleanup clears the intent and leaves the question eligible for retry.
 
 **Files:**
-- `scripts/review_links/change_page.py`
-- `scripts/review_links/images.py`
-- `scripts/review_links/serve.py`
-- `scripts/review_links/test_images.py`
-- `scripts/review_links/test_change_page.py`
-- `scripts/review_links/test_serve.py`
+- `scripts/review_links/change_page.py` — dispatch marks and the live attempt check.
+- `scripts/review_links/serve.py` and `scripts/review_links/images.py` — the recovery flag, delivery notices, and polling.
+- `scripts/review_links/page_question.py` — retry claims and cleanup after an intent write failure.
+- `scripts/review_links/test_images.py` and `scripts/review_links/test_page_question.py` — startup, write failure, and resend fixtures.
 
-**Workers:** 1 writer (`design`).
-
-**State:** none.
-
-**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. Keep phase 48 behavior (F001–F011) unchanged.
-
-**Acceptance gate:**
-1. The review_links suites pass, with a test for each edge that fails on phase 48.
-2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+**Gotchas:** Legacy intents without a send mark still use startup recovery. An intent from an older sender can be ambiguous after a failed result write.
 
 ### Phase 52 — A rename to a name the folder and branch already carry prints no anomaly  · status: done
-**Depends on:** none
+
+#### As-built
+
+`_unit_rename_target(value, old_name, new_name) -> str | None` uses `unit_names.swap_stem()` to replace a trailing old-name suffix first.
+If only the new-name suffix matches, the folder or branch keeps its value without an anomaly. Any value with neither suffix still produces its own anomaly.
+
+**Files:**
+- `scripts/agents/shutdown.py` — the shared target rule for implicit folder and branch names.
+- `scripts/agents/test_shutdown_cli.py` and `scripts/production/test_unit_move.py` — already-matching targets and anomaly tests.
+
+### Phase 53 — The image question code has no import cycle, and page_question has its staff accessor row  · status: done
+
+#### As-built
+
+`question_record.py` defines `Question(question_id, asked_at, words, answer=None)`, `Answer(text, answered_at)`, their stored JSON forms, and the `AnswerRefused` exception. `stored(question) -> StoredQuestion` encodes the record. `read(value) -> Question` validates the ID, timestamp, words, and optional answer.
+`image_store.py` imports those types from the page-independent module. `page_question.py` retains the store protocol, delivery API, renderers, and answer result types.
+The staff accessor table records `page_question.py` as a read accessor for the recipient’s `StaffId`.
+`change_review.py` checks question exchanges through `delivery_state.py`, which keeps delivery checks below the page layer.
+
+**Files:**
+- `scripts/review_links/question_record.py` — the shared record types, exception, and JSON conversion.
+- `scripts/review_links/image_store.py` and `scripts/review_links/page_question.py` — the store and page operations.
+- `scripts/review_links/change_page.py`, `scripts/review_links/change_browser.py`, `scripts/review_links/images.py`, `scripts/review_links/investigations_page.py`, `scripts/review_links/list_page.py`, `scripts/review_links/review_actions.py`, `scripts/review_links/review_page.py`, and `scripts/review_links/serve.py` — direct exception or record imports.
+- `scripts/production/change_review.py` and `scripts/production/delivery_state.py` — question exchange checks and their shared location.
+- `docs/as-built/staff-accessors.md` — the `StaffId` accessor entry.
+
+### Phase 54 — One fast-track call finds each path and ref once  · status: dropped
+**Result (2026-11-17):** dropped with no code change. One fetch under the landing lock and a reused worktree root cut Git starts by 2.62 percent (7,185 to 6,997); CPU rose from 56.4 s to 60.2 s. Below the 20 percent rule.
+
+**Depends on:** phase 53, phase 51 (order only); natest phase 323 (a0463a3b9) merged to main if test_fast_track.py changes
 
 #### Work Order
 
-**Goal:** the showrunner (2026-11-17). hana ran `agents rename 556caf6e-713d-47c0-a8fc-5dd5e8c26ce4 startup` on the row named `startup-unit`. The rename was right: the row name is `startup`, and the folder `hana_catalyst-startup` and branch `tool-based-ui-startup` stay. But it printed two false anomaly lines: "folder … does not end with -startup-unit" and "branch … does not end with -startup-unit". The folder and branch already end with the new name, so nothing needs a move.
+**Goal:** the showrunner with builds (2026-11-17 14:40 EST): "remove repeated path and ref discovery inside one fast-track call (the gain counts for each real fast-track call too)." test_fast_track makes 7,185 Git starts on bab921f45. The top shapes are `rev-parse --path-format=absolute` 476, `fetch origin` 383, `rev-parse --show-toplevel` 350, `rev-parse HEAD` 303, `remote get-url` 156.
 
 **Spec:**
-1. In `rename_apply_unit` (`scripts/agents/shutdown.py` ~2276), a folder or branch that already ends with `-<new name>` needs no move and prints no anomaly.
-2. A folder or branch that ends with neither the old nor the new name still prints its anomaly line.
-3. Use the name rule from `unit_names` that phase 47 added (a name and that name plus `-unit` are the same name); do not write a second copy.
+1. Measure first with a PATH `git` shim that logs argv: Git starts by shape, CPU and wall time of `production/test_fast_track.py`, on the base.
+2. In one fast-track call, find the top-level folder, the common Git folder and the `origin` URL once, and pass them down. Fetch `origin` once for each step that needs a fresh ref.
+3. Keep each read of a mutable ref where its value can change inside the call. Keep every write as it is.
+4. The behavior of `reconcile`, `push_patch`, `restore_prepared` and `land_main.land` does not change.
+5. Out of scope: which tests need the full merge flow.
+6. natest owns `test_fast_track.py`. Change no line of it unless the base is main after natest phase 323 merges.
 
 **Files:**
-- `scripts/agents/shutdown.py`
-- `scripts/agents/test_shutdown_cli.py`
+- `scripts/production/fast_track.py`
+- `scripts/lib/land_main.py` and the copy and slot helpers only where they repeat the same discovery inside one call
 
 **Workers:** 1 writer.
 
 **State:** none.
 
-**Constraints from prior phases:** tests write a fixture config and fixture staff rows; no test runs a live rename.
-
 **Acceptance gate:**
-1. `scripts.agents.test_shutdown_cli` passes, with a test for the `startup-unit` to `startup` case (no anomaly lines, folder and branch unchanged) and one for a folder that ends with neither name (anomaly kept).
-2. basedpyright reports 0 errors and 0 warnings on the changed Python files.
+1. `scripts.production.test_fast_track` passes.
+2. basedpyright reports 0 errors and 0 warnings on `scripts/production` and `scripts/lib`.
+3. The shim measure before and after shows 20 percent or more fewer Git starts and a CPU gain. If not, close with no change.
+4. The checkpoint carries the measured numbers in one line for builds.
 
-### Phase 53 — The image question code has no import cycle, and page_question has its staff accessor row  · status: done
-**Depends on:** Phase 48
+### Phase 55 — An image question card always says when a resend is needed  · status: done
+
+#### As-built
+
+`ImageQuestionDispatchState` records `started`, `started_after_unconfirmed`, or `accepted`. A refused resend after an unknown result keeps the earlier result unknown. Acceptance clears the notice.
+An explicit `saved: false` on a valid delivery record supplies the retry notice when the question has no active intent. An invalid saved-message record gives no resend notice and leaves the Images page available.
+
+**Files:**
+- `scripts/review_links/change_page.py` — dispatch state, failure selection, and validated reads of image question metadata.
+- `scripts/review_links/images.py` — the resend notice for an explicit unsaved intent.
+- `scripts/review_links/test_images.py` — refused resends, intent write failure, and invalid metadata fixtures.
+
+### Phase 56 — The timed-refresh browser tests pass under load  · status: done
+
+#### As-built
+
+The Images browser probes run the refresh callback scheduled by the page and wait for a named DOM condition through `MutationObserver`. `controlRefresh()` captures only the delivery refresh interval and advances the probe clock by its configured period.
+A tick that meets an active refresh tries again on the next animation frame.
+The test server joins its request handlers before fixture cleanup and gives each handler socket a five-second timeout.
+
+**Files:**
+- `scripts/review_links/test_images.py` — `question_probe()` and `run_question_browser()` cover focus, selection, and recovery after a failed refresh.
+
+**Gotchas:** The fixture uses a five-second refresh period and a 12-second limit per condition. A delayed refresh timer reproduces the timeout. CPU load alone does not establish the cause. Shared worktrees can cause separate fixture config and socket errors.
+
+### Phase 57 — A rename summary for one worker says "1 worker name unchanged"  · status: done
+
+#### As-built
+
+`rename_qualified_workers(owner)` in `scripts/agents/shutdown.py` prints `<N> worker name unchanged: no qualified prefix for <owner>` on stderr for a count of one, and `worker names` for any other positive count.
+
+**Files:**
+- `scripts/agents/shutdown.py` — the summary line.
+- `scripts/agents/test_shutdown_cli.py`, `scripts/production/test_unit_move.py` — the singular and plural summary assertions.
+
+### Phase 58 — Every validate message carries its validation id and command  · status: done
+**Result (2026-11-17):** the C368–C370 validate messages came at 10:55 EST from a server that ran code from before de367d2b2, whose formatter had no id line. C368 and C369 saved before the id check shipped; C370's verdict came after it. de367d2b2 already sends the id and the full command on the first send and on recovery. This phase adds the test assertions for both, which fail on the old formatter, and the Validate section of `commands/change_review.md` points to the command in the message.
+
+**Depends on:** Phase 57 (order only)
 
 #### Work Order
 
-**Goal:** the showrunner (2026-11-17, urgent): phase 48 cca97ba30 is red. (1) basedpyright reportImportCycles, 4 errors: `image_store.py` imports `change_page` and `page_question`; `change_page` imports `change_review`; `change_review` imports `image_store` (plus 3 longer chains through `update_registration`, `merge_checkpoint`, `merge_gate` and `next_item`). (2) `test_staff_accessors.test_document_lists_every_tracked_accessor` fails with rolenames 9ba1885e155f: `page_question.py` imports `staff` and has no row in `docs/as-built/staff-accessors.md`.
+**Goal:** the sdlc showrunner (2026-11-17), from the cargo-liner showrunner: the C370 verdict was refused with "this question id does not match the current question". It needed `--validation <attempt>`, but its "the user asks you to validate this" message did not carry the id. C368 and C369, from the same minute, saved without `--validation`. The sdlc validate messages C1839 and C1844 did carry "Validation id:" and the command.
 
 **Spec:**
-1. Break the cycle at its cause: `image_store.py` is a low-level store that `change_review` uses, so it must not import `change_page`, `page_question` or any module that imports `change_review`. Move the image question store and its page-level types up, or move the shared record types down into a module with no page imports. No lazy import, no `TYPE_CHECKING` workaround.
-2. The `page_question` public surface stays as phase 48 shipped it (unit-board's listask uses it).
-3. Merge rolenames 9ba1885e155f and add the `page_question.py` row to `docs/as-built/staff-accessors.md`.
+1. Find the code path that sent C370's validate message without "Validation id:" and the command (`scripts/review_links/change_page.py:1216-1218` builds the id line).
+2. Find why C368 and C369 saved without `--validation`, and state whether that is right.
+3. Every validate message carries the validation id and the full verdict command with `--validation`.
+4. The existing validate message test covers the case.
+5. `commands/change_review.md` (Validate) names `--validation <id>` and says the id is in the validate message.
 
 **Files:**
-- `scripts/review_links/image_store.py`
-- `scripts/review_links/images.py`
-- `scripts/review_links/page_question.py`
 - `scripts/review_links/change_page.py`
-- `scripts/review_links/test_images.py`
-- `scripts/review_links/test_page_question.py`
-- `docs/as-built/staff-accessors.md`
+- `scripts/review_links/test_change_page.py`
+- `scripts/production/change_review.py`, `scripts/production/test_change_review.py` if the cause is there
+- `commands/change_review.md`
 
-**Workers:** 1 writer (`test`).
+**Workers:** 1 writer (`design`).
 
-**State:** none.
-
-**Constraints from prior phases:** tests write a fixture config; no test reads a tunable value. Keep phase 48 behavior unchanged.
+**State:** the delivery slots and validation records the change writes.
 
 **Acceptance gate:**
-1. basedpyright on `scripts/production` and `scripts/review_links` reports 0 errors and 0 warnings (reportImportCycles included).
-2. The full `scripts.production` suite and the review_links suites pass.
+1. basedpyright on every changed Python file: 0 errors, 0 warnings.
+2. The changed modules' suites pass.
+3. The new check fails without the fix.
+
+### Phase 59 — A short-lived vault index lock retries and asks no question  · status: done
+**Depends on:** none
+
+**Result:** a held vault index lock retries each hour and files the vault_locked question only after the same lock stays past `vault.lock_question_age_s` (new key, 7200 s). The Mac `stat` gives device, inode and birth time; a new lock starts a new age, and a lock with no identity ages from its first stop. 47 vault tests pass; basedpyright clean.
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-17), from a natedev finding: `scripts/buildlog/vault_pull.py` on the Mac hit "index.lock: File exists" on 11-16 16:11 EST and 11-17 16:17 EST and filed a user question each time. The lock was transient: another Git process in the vault held it. When the index lock is held, wait and retry. File the vault_locked question only when the same lock stays past a set age.
+
+**Spec:**
+1. Find why both runs filed a question: the in-script retry (`vault.lock_retries`, `vault.lock_retry_delay_s`) and the second-stop rule in `_vault_locked`. Use the vault state and the message log; read only.
+2. A held index lock gives a retry, not a question. The run reports the lock and the next run tries again.
+3. File the vault_locked question only when the same lock (the same index.lock file, by its modification time or another stable identity the remote script can print) stays past a set age. A new lock starts a new age.
+4. The age is a new key in `config/build_targets.conf`, with a range comment like its neighbours. The retry pause uses the existing `vault.lock_retry_delay_s`, or a new key if its meaning changes; do not change an existing key's meaning or range.
+5. Tests write a fixture config; no test reads the live value. Add the cases to the existing vault lock tests.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py`
+- `scripts/buildlog/test_vault_pull.py`
+- `config/build_targets.conf`
+
+**Workers:** 1 writer (`design`).
+
+**State:** the vault state file and its outage record.
+
+**Acceptance gate:**
+1. basedpyright on the changed Python files: 0 errors, 0 warnings.
+2. `scripts.buildlog.test_vault_pull` passes.
+3. The new checks fail without the fix.
+
+### Phase 60 — A failed write or Git launch keeps saved review work  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-17), from the admin-console reviewscroll reviews: four failure paths on main lose or misstate saved work when a disk write or a Git launch fails. Each failure must leave saved state true and the user told the truth.
+
+**Spec:**
+1. Change review verdict: `scripts/production/change_review.py` `_edit` (about line 566) writes the verdict, then `_commit` launches Git. An `OSError` from the Git launch escapes, and `scripts/review_links/change_page.py` (about line 1054) clears the delivery claim and returns 400. The saved verdict must stand, and the claim must not clear.
+2. Delivery metadata: `scripts/review_links/review_actions.py` (about line 202) leaves the delivery file at `saved: false` when the write after the save fails. Startup recovery in `change_page.py` (about line 1277) then drops the saved message. The message must not be lost.
+3. Later: `review_actions.py` `later()` writes the source log before `review_later.save` writes the deadline. A deadline write failure leaves a false log entry, and the request takes the 503 path (`serve.py` about line 671). Order the writes so that a failure leaves no false log entry.
+4. Nightly ledger: the nightly CLI efficiency ledger writer does not take the Review store write lock that Review saves use (`scripts/review_links/efficiency_reviews.py`). Make it share that one lock.
+
+**Files:**
+- `scripts/production/change_review.py`, `scripts/production/test_change_review.py`
+- `scripts/review_links/change_page.py`, `review_actions.py`, `review_later.py`, `serve.py`, `efficiency_reviews.py`
+- their tests: `test_change_page.py`, `test_review_actions.py`, `test_serve.py`, `test_review_page.py`
+- the nightly ledger writer under `scripts/nightly_review/` and its test
+
+**Workers:** 1 writer (`design`).
+
+**Order:** admin-console reviewscroll edits the same files and merges first. Build on main 121a03c90; merge the reviewscroll hash (about 22:00 EST) before this phase commits.
+
+**Acceptance gate:**
+1. A fault-injection test for each item fails without the fix.
+2. basedpyright on the changed Python files: 0 errors, 0 warnings.
+3. The suites of the changed modules pass.
+
+### Phase 61 — The Disks page refresh button shows on the live page  · status: done
+**Depends on:** none
+
+**Result:** the live natedev page held the button as a faint 20 px icon at the far right, easy to miss. The button now shows the words Measure now in a bordered box. The Mac console publishes the page on each full console load; no code defect there. A browser check covers the button in every status state.
+
+#### Work Order
+
+**Goal:** the user (2026-11-17 19:47, change review C1850) on the Disks page refresh button from phase 45: "not works: it's not here". The live published page `~/.local/share/review-links/ysbjmg/disks.html` holds `<button id="measure-now">` inside the status line, and live main 121a03c90 has the phase 45 code. The user still sees no button.
+
+**Spec:**
+1. Open the live Disks page in headless Firefox at desktop width, dark mode, from the console server (http://100.103.14.30:8765, the console's Disks link). Take a screenshot of the status line. Read only; do not press the button.
+2. Find why the button does not show: for example, status code that rewrites `.page-status-state`, a style that hides or clips it, or a page the console links that is not the published one.
+3. Fix it where the cause is. The button shows at the right of the status line in every status state, and it stays after each refresh.
+4. Add a check that fails without the fix: a browser check if the cause is in the page script, or a table row in the existing Disks page test.
+
+**Files:**
+- `scripts/disks/disks.html`, `scripts/disks/disks_page.py`, `scripts/disks/test_disks_page.py`
+- `scripts/review_links/page_frame.py`, `scripts/review_links/test_page_frame.py`
+
+**Workers:** 1 writer (`design`).
+
+**Acceptance gate:**
+1. A dark desktop screenshot of the fixed page, clipped to the status line, shows the button. A screenshot of the live page shows the cause.
+2. The new check fails without the fix.
+3. basedpyright on the changed Python files: 0 errors, 0 warnings. The Disks and page frame suites pass.
+
+### Phase 62 — Image answer buttons use the Review page groups  · status: done
+**Depends on:** none
+
+**Result:** `page_frame.review_action_groups` and one shared style render the labeled button groups on the Review and Images pages. Images: Approved, Not Approved and Send Feedback under Closes the item; Ask question under The item returns to you, after a separator bar. Phones stack the groups with no bar.
+
+#### Work Order
+
+**Goal:** the user (2026-11-17 19:56, change review C1854) on the Images page answer buttons: "it is there but i think that ou should use the same affordance you do here in the review - the text above that says "CLOSES THIS ITEM" a separator bar and a "THE ITEM RETURNS TO YOU" - i do see the button".
+
+**Spec:**
+1. The Images card groups its answer buttons as the Review page does (`review_page.py` `form`, the `review-action-group` markup and style): a small upper-case label above each group, and a separator bar between groups.
+2. Buttons that close the image item go under "Closes the item". Ask question goes under "The item returns to you". Read the Images code to place each button by what it does.
+3. One shared helper and one shared style make the groups for both pages. No copied markup or style.
+4. The phone layout keeps the Review page rule: groups stack with no bar.
+
+**Files:**
+- `scripts/review_links/images.py`, `scripts/review_links/review_page.py`, the shared module for the helper (for example `scripts/review_links/change_browser.py` or `page_frame.py`)
+- `scripts/review_links/test_images.py`, `scripts/review_links/test_review_page.py`
+
+**Workers:** 1 writer (`review4`).
+
+**Order:** admin-console reviewscroll edits `review_page.py` and `change_browser.py` and merges first. Keep the `review_page.py` edit to the call of the shared helper.
+
+**Acceptance gate:**
+1. One dark desktop shot of an Images card's answer buttons, before and after, clipped to the buttons.
+2. The Images and Review page suites pass. basedpyright: 0 errors, 0 warnings.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3

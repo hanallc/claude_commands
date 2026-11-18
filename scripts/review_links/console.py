@@ -9,13 +9,13 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import cast
+from typing import Literal, TypedDict, cast
 from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import change_page, page_frame, review_link, review_legacy
+from scripts.review_links import change_page, for_you, page_frame, review_link, review_legacy
 
 PAGE_NAME = "console.html"
 # The console posts the open page here and reads which other pages hold new items.
@@ -179,11 +179,67 @@ def icon_svg(name: str) -> str:
     return page_frame.icon_svg(name)
 
 
-def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | UnavailablePage) -> bytes:
-    """Render navigation, the rebuild link and a frame without external fonts, scripts, or styles.
+class ForYouEntry(TypedDict):
+    """One short action entry with a console card link."""
 
-    The rebuild link opens the Rebuilds page in the frame, as a navigation entry opens its page.
-    """
+    key: str
+    kind: str
+    title: str
+    command: str
+    machine: str
+    requested_by: str
+    href: str
+
+
+class CompleteForYouCount(TypedDict):
+    """The complete count of open actions."""
+
+    available: Literal[True]
+    count: int
+
+
+class CompleteForYouPayload(CompleteForYouCount):
+    """The complete count and at most two short entries."""
+
+    entries: list[ForYouEntry]
+
+
+class UnavailableForYouPayload(TypedDict):
+    """The console cannot give a complete action count."""
+
+    available: Literal[False]
+
+
+type ForYouCountPayload = CompleteForYouCount | UnavailableForYouPayload
+type ForYouPayload = CompleteForYouPayload | UnavailableForYouPayload
+
+
+def for_you_count(snapshot: for_you.ForYouSnapshot) -> ForYouCountPayload:
+    """Encode the count without command text."""
+    count = snapshot.open_count
+    if isinstance(count, for_you.UnavailableOpenCount):
+        return {"available": False}
+    return {"available": True, "count": count.value}
+
+
+def for_you_payload() -> ForYouPayload:
+    """Read the shared action sources without changing their stores."""
+    snapshot = for_you.read()
+    count = for_you_count(snapshot)
+    if count["available"] is False:
+        return count
+    entries: list[ForYouEntry] = []
+    for row in (row for row in snapshot.rows if row.status == "open"):
+        if len(entries) == 2:
+            break
+        place = "/console/review.html?" + urlencode({"type": "for-you", "show": "open", "item": row.key})
+        entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
+                        "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
+    return {**count, "entries": entries}
+
+
+def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | UnavailablePage) -> bytes:
+    """Render navigation, the action notifier, and the page frames."""
     entries: list[str] = []
     new_mark = icon_svg("sparkle")
     for page in pages:
@@ -207,12 +263,175 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
                               + f'data-frame-retry-seconds="{settings.number("frame_retry_seconds")}" '
                               + f'data-news="/{change_page.CONSOLE_FOLDER}/{NEWS_NAME}"')
     content = content.replace("<!-- REBUILD -->", icon_svg("refresh-cw"))
+    button = ('<button type="button" class="for-you-button" data-for-you-toggle data-state="unavailable" '
+              + 'aria-controls="action-popover" aria-expanded="false" aria-label="For you: Unavailable">'
+              + icon_svg("inbox") + '<span class="for-you-label">For you</span><b data-for-you-count>?</b>'
+              + '<span class="for-you-state" data-for-you-state>Unavailable</span></button>')
+    content = content.replace("<!-- FOR YOU BUTTON -->", button)
+    content = content.replace("<!-- FOR YOU STYLE -->", page_frame.COPY_STYLE + FOR_YOU_STYLE)
+    content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + FOR_YOU_SCRIPT)
+    content = content.replace("<!-- FOR YOU COPY -->", page_frame.COPY_BUTTON)
+    content = content.replace("<!-- FOR YOU REBUILD -->", icon_svg("refresh-cw"))
+    content = content.replace("<!-- FOR YOU ACTION -->", icon_svg("list-checks"))
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
     content = content.replace('<script>', '<script>'+review_legacy.SCRIPT, 1)
     return content.encode("utf-8")
 
+
+FOR_YOU_STYLE = r'''
+.rebuild-slot{display:none!important}
+.for-you-slot{position:fixed;left:0;bottom:0;width:244px;padding:12px;z-index:8}
+.collapsed .for-you-slot{width:72px}
+.for-you-button{position:relative;display:flex;align-items:center;gap:12px;min-height:48px;width:100%;padding:12px 14px;
+border:1px solid var(--notice-hover);border-radius:9px;background:var(--notice);color:var(--notice-text);font-weight:600;text-align:left;cursor:pointer}
+.for-you-button:hover{background:var(--notice-hover)}
+.for-you-button b{margin-left:auto;background:var(--notice-text);color:var(--notice);border-radius:999px;min-width:24px;line-height:24px;text-align:center;font-size:13px}
+.for-you-button[data-state=quiet]{background:var(--hover);border-color:var(--border);color:var(--muted)}
+.for-you-button[data-state=quiet] b{background:var(--border);color:var(--muted)}
+.for-you-button[data-state=unavailable]{background:var(--hover);border-color:var(--border);color:var(--muted)}
+.for-you-state{position:absolute;bottom:0;left:46px;font-size:10px;line-height:12px}
+.collapsed .for-you-label,.collapsed .for-you-state{display:none}
+.collapsed .for-you-button b{position:absolute;top:3px;right:2px;min-width:17px;line-height:17px;font-size:11px;padding:0 3px}
+.collapsed .for-you-button[data-state=stale] b{outline:2px dotted var(--notice-text);outline-offset:2px}
+#action-popover{--popover-left:256px;position:fixed;left:var(--popover-left);bottom:24px;
+ width:min(460px,calc(100vw - var(--popover-left) - 12px));max-height:calc(100dvh - 48px);overflow:auto;z-index:10;
+border:1px solid var(--border);border-radius:12px;background:var(--nav);color:var(--text);box-shadow:0 16px 54px #0008}
+.collapsed~#action-popover{--popover-left:84px}
+#action-popover header{display:flex;align-items:center;justify-content:space-between;padding:17px 20px 0;font-size:17px}
+#action-popover header span{margin-left:5px;color:var(--notice-text)}
+#action-popover header button{background:none;border:0;border-radius:6px;color:var(--muted);font-size:24px;line-height:28px;width:28px;padding:0;cursor:pointer}
+#action-popover .panel-note{margin:5px 20px 14px;font-size:13px;color:var(--muted)}
+#action-popover article{padding:18px 20px;border-top:1px solid var(--border)}
+.short-head{display:flex;align-items:center;gap:9px;font-size:14px}.short-head svg{width:17px;height:17px;color:var(--notice-text)}
+.short-head strong{overflow-wrap:anywhere}
+#action-popover article p{margin:5px 0 12px 26px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+#action-popover .code-block{margin:0 0 10px}
+#action-popover pre{border:1px solid var(--border);background:var(--page);border-radius:6px;margin:0;padding:12px 48px 12px 13px;
+font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+#action-popover [data-copy-code]{opacity:1;color:var(--muted)}
+#action-popover a{color:var(--accent);font-size:13px;text-decoration:none}
+#action-popover footer{padding:14px 20px;border-top:1px solid var(--border);background:var(--hover)}
+.mobile-header .for-you-button{display:none}
+@media(max-width:680px){.for-you-slot{display:none}.mobile-header .for-you-button{display:flex;width:auto;gap:6px;min-height:36px;padding:5px 8px;font-size:12px}
+.mobile-header .for-you-button svg{width:16px;height:16px}.mobile-header .for-you-label{display:inline}
+.mobile-header .for-you-state{display:none}.mobile-header .for-you-button b{position:static;min-width:20px;line-height:20px}
+.mobile-header .for-you-button[data-state=stale] b{outline:2px dotted var(--notice-text);outline-offset:2px}
+#action-popover,body:has(.shell.collapsed) #action-popover{left:12px;right:12px;top:68px;bottom:auto;width:auto;max-height:calc(100dvh - 80px)}}
+'''
+
+FOR_YOU_SCRIPT = r'''
+function createForYouNotifier(openCard){
+ const triggers=[...document.querySelectorAll('[data-for-you-toggle]')],panel=document.getElementById('action-popover');
+ const entries=panel.querySelector('[data-for-you-entries]'),note=panel.querySelector('[data-for-you-note]');
+ let last=null,stale=false,reading=false,completionPending=false,opener=null,displayed='';
+ function selectionIntersects(node){
+  const selection=getSelection();
+  if(!selection || selection.isCollapsed) return false;
+  for(let i=0;i<selection.rangeCount;i++){
+   if(selection.getRangeAt(i).intersectsNode(node)) return true;
+  }
+  return false;
+ }
+ function actionURL(href){
+  const url=new URL(location.href);
+  const destination=new URL(href,url);
+  url.searchParams.set('page','review');
+  url.searchParams.set('at.review',destination.searchParams.get('at.review'));
+  return url;
+ }
+ function syncLinks(){
+  for(const link of panel.querySelectorAll('[data-for-you-card]')){
+   link.href=actionURL(link.href).href;
+  }
+ }
+ function showEntries(items){
+  const value=JSON.stringify(items);
+  if(value===displayed || entries.contains(document.activeElement)) return;
+  const nodes=items.map(item=>{
+   const article=document.getElementById('for-you-entry').content.firstElementChild.cloneNode(true);
+   article.dataset.key=item.key;
+   article.querySelector('strong').textContent=item.title;
+   article.querySelector('[data-entry-rebuild]').hidden=item.kind!=='rebuild';
+   article.querySelector('[data-entry-action]').hidden=item.kind==='rebuild';
+   article.querySelector('[data-entry-machine]').textContent=item.machine+' · '+item.requested_by;
+   article.querySelector('code').textContent=item.command;
+   article.querySelector('a').href=actionURL(item.href).href;
+   return article;
+  });
+  entries.replaceChildren(...nodes);displayed=value;
+ }
+ function drawPanel(count){
+  if(selectionIntersects(panel)) return;
+  const heading=panel.querySelector('[data-panel-count]');
+  if(heading.textContent!==count) heading.textContent=count;
+  const message=!last ? 'The action count is unavailable.' : stale ? 'Stale. The action read failed.' : last.count===0 ? 'No actions required.' : 'These actions require you now.';
+  if(note.textContent!==message) note.textContent=message;
+  showEntries(last?.entries ?? []);
+ }
+ function draw(){
+  const state=last ? stale ? 'stale' : last.count===0 ? 'quiet' : 'ready' : 'unavailable';
+  const count=last ? String(last.count) : '?';
+  for(const button of triggers){
+   button.dataset.state=state;
+   const badge=button.querySelector('[data-for-you-count]');
+   if(badge.textContent!==count) badge.textContent=count;
+   const label=button.querySelector('[data-for-you-state]');
+   const message=state==='stale' ? 'Stale' : state==='unavailable' ? 'Unavailable' : '';
+   if(label.textContent!==message) label.textContent=message;
+   button.setAttribute('aria-label','For you: '+(last ? count+(stale ? ', stale' : '') : 'Unavailable'));
+  }
+  drawPanel(count);
+ }
+ async function refresh(){
+  if(reading || document.visibilityState!=='visible') return;
+  reading=true;completionPending=false;
+  try{
+   const response=await fetch('/console/for-you.json',{cache:'no-store'});
+   const value=await response.json();
+   if(value?.available===false){last=null;stale=false;return;}
+   if(!response.ok || value?.available!==true || !Number.isInteger(value.count) || value.count<0 || !Array.isArray(value.entries)) throw Error('Invalid action count.');
+   last=value;stale=false;
+  }catch(error){stale=true;}
+  finally{
+   reading=false;draw();
+   if(completionPending) refresh();
+  }
+ }
+ function close(){
+  if(panel.hidden) return;
+  panel.hidden=true;triggers.forEach(button=>button.setAttribute('aria-expanded','false'));
+  const visibleButton=opener?.getClientRects().length ? opener : triggers.find(button=>button.getClientRects().length);
+  visibleButton?.focus({preventScroll:true});
+ }
+ triggers.forEach(button=>button.addEventListener('click',()=>{
+  if(!panel.hidden){close();return;}
+  opener=button;syncLinks();panel.hidden=false;triggers.forEach(item=>item.setAttribute('aria-expanded','true'));refresh();
+ }));
+ document.getElementById('close-actions').addEventListener('click',close);
+ function escape(event){
+  if(event.key!=='Escape' || panel.hidden) return;
+  event.preventDefault();event.stopPropagation();close();
+ }
+ addEventListener('keydown',escape,true);
+ panel.addEventListener('click',event=>{
+  const link=event.target.closest?.('[data-for-you-card]');
+  if(!link || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();close();openCard(actionURL(link.href));
+ });
+ const release=()=>drawPanel(last ? String(last.count) : '?');
+ entries.addEventListener('focusout',()=>queueMicrotask(release));
+ document.addEventListener('selectionchange',release);
+ addEventListener('message',event=>{
+  if(event.origin===location.origin && [...document.querySelectorAll('iframe')].some(frame=>frame.contentWindow===event.source) && event.data==='for-you-completed'){
+   completionPending=true;refresh();
+  }
+ });
+ draw();
+ return {refresh,escape,syncLinks};
+}
+'''
 
 DOCUMENT = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -281,14 +500,16 @@ background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .rebuild-slot:has(>[hidden]){display:none}
 .rebuild-link,.collapsed .rebuild-link{width:auto;max-width:none;margin:12px}
 .collapsed .rebuild-link .entry-label{display:inline}.collapsed .rebuild-count,.collapsed .rebuild-link .tooltip{display:none!important}}
+<!-- FOR YOU STYLE -->
 </style></head><body>
 <div class="shell" id="console-shell" <!-- SHELL -->>
 <header class="mobile-header"><button class="toggle" id="mobile-nav-toggle" type="button"
-aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><!-- MENU --></button><h1>Hana console</h1></header>
+aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><!-- MENU --></button><h1>Hana console</h1><!-- FOR YOU BUTTON --></header>
 <aside class="sidebar"><div class="brand"><h1>Hana console</h1>
 <button class="toggle" id="nav-toggle" type="button" aria-controls="console-nav" aria-expanded="true" aria-label="Collapse navigation">
 <span class="close-icon"><!-- CLOSE --></span><span class="open-icon"><!-- OPEN --></span></button></div>
 <nav id="console-nav" aria-label="Console pages"><!-- ENTRIES --></nav></aside>
+<div class="for-you-slot"><!-- FOR YOU BUTTON --></div>
 <div class="rebuild-slot"><a class="rebuild-link" id="rebuild-link" href="?page=rebuilds" data-page="rebuilds"
 <!-- REBUILDS --> data-title="Rebuilds needed" hidden><!-- REBUILD --><span class="entry-label" id="rebuild-label"></span>
 <span class="rebuild-count" id="rebuild-count" aria-hidden="true"></span><span class="tooltip" id="rebuild-tooltip" aria-hidden="true"></span></a></div>
@@ -297,7 +518,18 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <div class="frame-area">
 <section class="empty" id="page-unavailable" hidden><h3>Not available</h3><p>This page is not available. Try another page or open a new console link.</p></section></div></main>
 </div>
+<section id="action-popover" aria-label="For you actions" hidden>
+<header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
+<p class="panel-note" role="status" data-for-you-note>The action count is unavailable.</p>
+<div data-for-you-entries></div>
+<footer><a data-for-you-card href="?page=review&amp;at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen">Open For you →</a></footer>
+</section>
+<template id="for-you-entry"><article>
+<div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
+<p data-entry-machine></p><div class="code-block"><pre><code></code></pre><!-- FOR YOU COPY --></div>
+<a data-for-you-card>Open card →</a></article></template>
 <script>
+<!-- FOR YOU SCRIPT -->
 (() => {
   const shell = document.getElementById('console-shell');
   const toggle = document.getElementById('nav-toggle');
@@ -351,6 +583,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     if (place === entry.dataset.url) url.searchParams.delete(placeKey(entry.dataset.page));
     else url.searchParams.set(placeKey(entry.dataset.page), place);
     history.replaceState(null, '', url);
+    actions.syncLinks();
   }
   function frameFor(entry) {
     let frame = frames.get(entry.dataset.page);
@@ -369,7 +602,8 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       }
       place = frame.contentWindow.location.href;
       record(entry);
-      try { frame.contentWindow.addEventListener('hashchange', () => record(entry)); } catch (_) {}
+      frame.contentWindow.addEventListener('hashchange', () => record(entry));
+      frame.contentWindow.addEventListener('keydown', actions.escape, true);
     });
     frames.set(entry.dataset.page, frame);
     frameArea.prepend(frame);
@@ -428,6 +662,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     const url = new URL(location.href);
     url.searchParams.set('page', selected.dataset.page);
     history.replaceState(null, '', url);
+    actions.syncLinks();
     const path = selected.dataset.url;
     frames.forEach((frame, page) => { if (page !== selected.dataset.page) frame.hidden = true; });
     document.getElementById('page-unavailable').hidden = Boolean(path);
@@ -468,10 +703,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     event.preventDefault();
     frame.contentWindow.postMessage('console-space', location.origin);
   });
-  select(new URL(location.href).searchParams.get('page'));
   let rebuildTimer;
   async function loadRebuilds() {
-    if (!rebuildLink.dataset.url || document.visibilityState !== 'visible') return;
+    if (!rebuildLink.dataset.url || !frames.get('rebuilds') || frames.get('rebuilds').hidden || document.visibilityState !== 'visible') return;
     try {
       const response = await fetch(rebuildLink.dataset.url, {cache: 'no-store'});
       if (!response.ok) return;
@@ -488,13 +722,21 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       if (shown) shown.replaceWith(shown.ownerDocument.importNode(parsed, true));
     } catch (_) {}
   }
-  function refresh() { loadRebuilds(); loadNews(); }
+  const actions = createForYouNotifier(url => {
+    history.replaceState(null, '', url);
+    const place = url.searchParams.get('at.review');
+    if (frames.has('review') && place) frames.get('review').src = place;
+    select('review', true);
+  });
+  select(new URL(location.href).searchParams.get('page'));
+  function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }
   function scheduleRebuilds() {
     clearInterval(rebuildTimer);
     if (document.visibilityState === 'visible') rebuildTimer = setInterval(refresh, Number(shell.dataset.refreshSeconds) * 1000);
   }
   document.addEventListener('visibilitychange', () => { scheduleRebuilds(); refresh(); });
-  loadRebuilds();
+  addEventListener('focus', refresh);
+  refresh();
   scheduleRebuilds();
 })();
 </script></body></html>

@@ -201,6 +201,7 @@ class SharedUsageReadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True))
+        _ = self.enterContext(scratch_accounts_config())
         self.now = datetime(2026, 10, 19, 12, 11, tzinfo=timezone.utc)
         _ = self.enterContext(patch.object(agent_accounts, "command_json", return_value={
             "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai"}))

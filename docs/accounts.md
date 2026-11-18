@@ -57,12 +57,13 @@ Clone removal deletes the complete project entry for its exact recorded folder k
 
 Open Hana console, Accounts to see the accounts board.
 The page refreshes every 15 seconds.
-The board and terminal table show upcoming moves under the table and before the problems.
-Both use the exact group text from `accounts.py next list`.
+The board's `next` column shows the first queued account for each group.
+The terminal table shows upcoming moves under the table and before the problems.
+It uses the exact group text from `accounts.py next list`.
 An empty queue shows `Upcoming moves: none`.
 On the Mac, the role-map reply supplies the list and saves it in the role-map cache.
 Stored and offline reads use the saved list without another SSH call.
-Without a saved list, the board shows `Upcoming moves: unavailable; natedev unreachable`.
+Without a saved list, the terminal shows `Upcoming moves: unavailable; natedev unreachable`, and the `next` column shows unavailable.
 Run account operations in a terminal with `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py`.
 The terminal status table lists the numbered Claude and Codex accounts.
 The table includes accounts without a login.
@@ -137,6 +138,10 @@ Codex `use_credits` is true only when `codex_credit_accounts` in `config/account
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
 The accounts board orders its columns as account, left, role, busy, idle, paused, exited, total, resets, credits, enabled.
+The Models card below the accounts board counts the same sessions by full model ID, effort and role.
+The `unknown` row counts sessions with missing model or effort evidence.
+Select a Models header to sort its rows.
+Use a model swatch to add or change its `model.<id>` color in `config/statusline.conf`.
 Each role has a separate row with its own counts from natedev and the Mac.
 The first role row includes all account values.
 Later rows show only the role and its counts.
@@ -352,9 +357,11 @@ For `codexN` or `workers`, normal launches pass arguments to `codex` and set `CO
 
 When the first argument is `update`, the launcher uses the shared `~/.codex` install without account checks. The local update uses the terminal and receives the remaining arguments. It then updates the other machine through SSH with a 600-second limit. Each machine gets one version or failure summary line. An unreachable machine shows `unreachable; run codex update there`. The command returns zero only when both updates and version reads succeed.
 
-Configured groups select accounts for new unit and showrunner launches.
+Configured groups select accounts for Claude unit, showrunner, and producer launches.
+Until the producers group has a selection, Claude producers use the showrunners account.
+Codex producers use the workers account.
 Nightly reviews use the units account.
-Set a group with `agents move units|showrunners claudeN`.
+Set a group with `agents move units|showrunners|producers claudeN`.
 An unconfigured group refuses with that command.
 Explicit launch overrides must name the configured account.
 New launches retain the selected account and model in herdr pane launch records.
@@ -404,7 +411,7 @@ In this terminal:
 
 ```sh
 agents move <session-id-or-exact-name> <claudeN> [--dry-run] [--why "<text>"]
-agents move units|showrunners <claudeN> [--dry-run] [--why "<text>"]
+agents move units|showrunners|producers <claudeN> [--dry-run] [--why "<text>"]
 ```
 
 A move stops the selected session and resumes its conversation in its herdr pane on the target account.
@@ -421,6 +428,7 @@ A move outside the group account prints that the member returns to the group acc
 Ambiguous or unknown sessions return an error.
 A session already on the target returns success.
 A group move selects its account for future launches, then moves each live member on another account once.
+The `producers` move also resumes eligible stopped Claude producers.
 An empty group still selects its account.
 Missing showrunner registrations are named with their repair command.
 
@@ -635,13 +643,20 @@ accounts.py next add units 1 claude2 --hold half-point
 accounts.py next hold units 1 half-point --expect 1 claude4
 ```
 
-The list has showrunners, units and workers sections in that order, numbered from 1 within each group: “units 1: at 1% → claude4, hold 30 min”. Position 1 runs next; an empty log prints “nothing set up”. `move GROUP N M` moves position N to M, `remove GROUP N` removes it, and `add … --at N` inserts at positions 1 through the group’s size plus 1 (omission appends). Edits preserve other groups’ order and internal entry identities; ids are never shown or accepted in these commands. The Mac forwards group positions to natedev, which resolves and edits them under the watch and log locks; install both machines together. A head change immediately clears the displaced head’s hold and notice keys, so the new head starts its own hold on a later pass; an unchanged head keeps its hold.
+The list shows showrunners, units, producers, and workers in that order. Positions start at 1 within each group. Position 1 runs next; an empty log prints “nothing set up”. `move GROUP N M` moves position N to M, `remove GROUP N` removes it, and `add … --at N` inserts at positions 1 through the group’s size plus 1 (omission appends). Edits preserve other groups’ order and internal entry identities; ids are never shown or accepted in these commands. The Mac forwards group positions to natedev, which resolves and edits them under the watch and log locks; install both machines together. A head change immediately clears the displaced head’s hold and notice keys, so the new head starts its own hold on a later pass; an unchanged head keeps its hold.
 
-On the console Accounts page, right-click the `units ✓` or `showrunners ✓` line of a Claude account and choose another Claude account.
+The console Accounts page has a `next` column after the role color swatch.
+Selected Claude groups show their first target, or `none` when the group has no entry.
+Press the arrow button on a selected Claude group line to choose its next account.
+The menu marks the current target.
+Choose **No next move** to remove the first entry and show the next queued target, or `none`.
 The choice replaces the group's first entry, or adds one, at `next_move_percent` from `config/accounts.conf` (1%) with no hold.
-Codex workers have no menu.
+Selected Codex workers show their first target, or `auto` when no entry exists.
+Codex workers have no button; edit their moves from the command line.
+Other lines show a gray minus icon.
+Selected lines show `unavailable` when the next moves cannot be read.
 
-For units, showrunners and workers, agent-notes considers only the first entry per group.
+`agent-notes` considers only the first entry per group.
 Later entries wait until it records and removes the first entry.
 A later pass can then process the next entry.
 Later Claude entries keep no hold during that wait.
@@ -736,7 +751,7 @@ Historical jobs remain keyed by session id in `~/.local/state/accounts/unit_watc
 
 Watcher inventories read live sessions and `staff.json` membership. They neither collect nor read a desktop snapshot. Maintenance now runs through the separate agent-notes job; a `--dry-run` still writes nothing.
 
-The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
+The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused Claude session can move its group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
 
 The board and group moves share one staff member list. Each live member uses its process account. Timer registrations do not decide membership. Absent registration targets are checked separately.
 

@@ -5365,6 +5365,7 @@ class QueueLeaveTests(unittest.TestCase):
     calls: Path = Path()
     ran: Path = Path()
     recorded: Path = Path()
+    invoke: Path = Path()
     environment: dict[str, str] = {}
 
     @override
@@ -5374,9 +5375,17 @@ class QueueLeaveTests(unittest.TestCase):
         self.calls = self.root / "hook-calls"
         self.ran = self.root / "ran"
         self.recorded = self.root / "recorded"
-        scripts = self.root / ".claude/scripts"
+        scripts = self.root / "helpers"
         (scripts / "lib").mkdir(parents=True)
         (scripts / "buildlog").mkdir()
+        (scripts / "lint").mkdir()
+        self.invoke = scripts / "lint/invoke.sh"
+        _ = self.invoke.write_text(INVOKE.read_text())
+        _ = (scripts / "lint/memory_gate.sh").write_text(INVOKE.with_name("memory_gate.sh").read_text())
+        for name in ("nextest_budget.py", "nextest_tokens.py"):
+            (scripts / "lint" / name).symlink_to(INVOKE.with_name(name))
+        for name in ("build_hold", "build_queue", "build_targets"):
+            (scripts / name).symlink_to(Path(__file__).resolve().parents[1] / name, target_is_directory=True)
         py = scripts / "lib/py"
         _ = py.write_text((Path(__file__).resolve().parents[1] / "lib/py").read_text())
         py.chmod(0o755)
@@ -5438,7 +5447,7 @@ class QueueLeaveTests(unittest.TestCase):
                    + '"$TEST_PY" "$TEST_QUEUE_CLIENT" "$@"; else "$TEST_PY" "$@"; fi; }; '
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
-        result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
+        result = subprocess.run(["bash", "-c", command, "test", str(self.invoke), str(self.ran)],
             capture_output=True, text=True, timeout=30,
             check=False, env=environment)
         self.admission.server.reply_filter = lambda reply: reply

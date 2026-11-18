@@ -39,7 +39,8 @@ def ask(store: QuestionStore, item: str, owner: staff.StaffId, source_path: Path
     """Save and claim without sending. The caller delivers after it answers the browser.
 
     Row names the page and item. The command has {item} and {question_id} fields.
-    Equal words retry an open question. Different words create another question.
+    Equal words retry an open question if its send failed or remains unconfirmed.
+    Different words create another question.
     """
     words = words.strip()
     if not words:
@@ -64,29 +65,37 @@ def ask(store: QuestionStore, item: str, owner: staff.StaffId, source_path: Path
             return change_page.MessageDelivery(page, delivery_row, (owner,), message, intent.attempt, (owner,))
         attempt = secrets.token_hex()
         delivery = change_page.MessageDelivery(page, delivery_row, (owner,), message, attempt, (owner,))
-        # A failure or an abandoned intent permits a new attempt for the same question.
-        if not new_question and not isinstance(intent, change_page.DeliveryIntent):
-            previous: change_page.StoredDeliverySlots
-            try:
-                previous = cast(change_page.StoredDeliverySlots, json.loads(status.path(page, delivery_row).read_text()))
-            except FileNotFoundError:
-                previous = {}
-            prior_message = previous.get('review_message')
-            if (prior_message is not None and prior_message['saved']
-                    and isinstance(status.failed_delivery(page, delivery_row), change_page.NoFailedDelivery)):
-                return delivery
+        if not new_question:
+            dispatch = status.image_question_dispatch(page, delivery_row)
+            if not isinstance(dispatch, change_page.NoImageQuestionDispatch):
+                if dispatch['state'] == 'accepted' or status.owns_live_claim(page, delivery_row, dispatch['attempt']):
+                    return delivery
+                # Keep the earlier send mark until the new attempt starts.
+                saved['image_question_dispatch'] = dispatch
+            elif not isinstance(intent, change_page.DeliveryIntent):
+                previous: change_page.StoredDeliverySlots
+                try:
+                    previous = cast(change_page.StoredDeliverySlots, json.loads(status.path(page, delivery_row).read_text()))
+                except FileNotFoundError:
+                    previous = {}
+                prior_message = previous.get('review_message')
+                if (prior_message is not None and prior_message['saved']
+                        and isinstance(status.failed_delivery(page, delivery_row), change_page.NoFailedDelivery)):
+                    return delivery
         intent = change_page.DeliveryIntent(attempt, 'verdict', recipients=(owner,))
         status.write_slots(page, delivery_row, change_page.DeliverySlots(change_page.NoDelivery(), intent))
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, delivery_row), 'claimed')
-        try:
-            if new_question:
+        if new_question:
+            try:
                 store.add(item, question)
-            saved['saved'] = True
-            status.write_slots(page, delivery_row, status.slots(page, delivery_row))
-        except BaseException:
-            _ = status.request_attempts.pop(attempt, None)
-            status.clear_locked(page, delivery_row, status.slots(page, delivery_row), 'verdict')
-            raise
+                saved['saved'] = True
+                status.write_slots(page, delivery_row, status.slots(page, delivery_row))
+            except BaseException:
+                _ = status.request_attempts.pop(attempt, None)
+                # Keep the question eligible for a retry after cleanup removes its intent.
+                saved['saved'] = False
+                status.clear_locked(page, delivery_row, status.slots(page, delivery_row), 'verdict')
+                raise
     return delivery
 
 
