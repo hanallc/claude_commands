@@ -569,15 +569,22 @@ class ReviewLinksServerTests(unittest.TestCase):
                     status, content = self.post(accounts_page.PAGE_PATH, "group=units&to=claude2")
                     self.assertEqual((status, json.loads(content)), (expected, body))
                     move.assert_called_once_with("units", "claude2")
+                with self.subTest(clear=result), patch.object(accounts_page, "clear_next_move", return_value=result) as clear:
+                    status, content = self.post(accounts_page.PAGE_PATH, "group=showrunners&clear=first")
+                    self.assertEqual((status, json.loads(content)), (expected, body))
+                    clear.assert_called_once_with("showrunners")
             for form in ("", "key=account.claude1", "label=claude1&value=x", "key=account.claude1&value=x&value=y",
                          "key=account.claude1&value=x&extra=y", "group=units", "group=units&to=claude2&value=x",
-                         "key=account.claude1&to=claude2"):
+                         "key=account.claude1&to=claude2", "group=units&clear=all", "group=units&clear=",
+                         "group=units&clear=first&to=claude2", "group=units&clear=first&clear=first"):
                 with (self.subTest(form=form), patch.object(accounts_page, "save_color") as save,
-                      patch.object(accounts_page, "save_next_move") as move):
+                      patch.object(accounts_page, "save_next_move") as move,
+                      patch.object(accounts_page, "clear_next_move") as clear):
                     status, _ = self.post(accounts_page.PAGE_PATH, form)
                     self.assertEqual(status, 400)
                     save.assert_not_called()
                     move.assert_not_called()
+                    clear.assert_not_called()
         with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new color", .5, 101)):
             self.assertEqual(self.request(accounts_page.PAGE_PATH).body, b"new color")
 

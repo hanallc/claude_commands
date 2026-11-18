@@ -298,8 +298,9 @@ At phone width the menu button shows the icon while any page holds new items.
 Each poll reads the change lists once, about 0.1 seconds of server time.
 The Changes and Questions items functions share that read through `NewsRequest.shared`.
 
-The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+The console vendors SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
 They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
+The Accounts page also uses `chevron-down` and `minus` from the same set.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
@@ -542,15 +543,32 @@ A refused request returns 400 with its reason.
 A failed publication returns 503 with tune's last stderr line.
 A failed save restores the prior color and shows `<name>: <reason>` in the status line.
 
-A right click on the line of a selected Claude group (`units ✓` or `showrunners ✓`) opens a menu, not the browser menu.
+The `next` column follows the role color swatch.
+A selected Claude group (`units ✓` or `showrunners ✓`) shows its first target in that account's color and bold text.
+An empty group shows gray `none`.
+Its arrow button opens the move menu with a click, Enter, or Space.
+The button exposes its menu state through ARIA attributes.
+A selected Codex workers line shows its first target, or gray `auto`, without a button.
+The `auto` title explains that Codex workers move between Codex accounts by themselves.
+Other lines show a gray Lucide minus icon; the total cell stays empty.
+An unavailable queue shows gray `unavailable`; selected Claude groups retain their buttons.
+One status read supplies both the first targets and the upcoming list.
 The menu title is **When <account> reaches <percent>%, move <group> to**.
 `next_move_percent` in `config/accounts.conf` sets the percent.
 The menu lists the other Claude accounts in board order, each with its weekly percent left when known.
-Arrow keys, Home and End move between the items. Escape, Tab, a click outside, a scroll or a resize close the menu.
+The current target has a highlight and `aria-checked="true"` with `role="menuitemradio"`.
+Arrow keys, Home and End move between the items.
+Escape, Tab, a click outside, a scroll, or a resize closes the menu.
+Focus returns to the arrow button.
+The menu stays inside the viewport.
 The page pauses refresh while the menu is open and while a move save is pending.
 A choice posts `group` and `to` to `/console/accounts.html` as form data.
 The server checks the group and the account note, then calls `next_moves.set_first_next_move()`.
 The new entry replaces the group's first next move, or becomes its only one, with no hold.
+When the group has an entry, **No next move** posts `group` and `clear=first`.
+The server calls `next_moves.remove_next_move()` at `FIRST_GROUP_POSITION`.
+It refuses a clear for an empty group.
+The cell then shows the next queued target, or `none`.
 Success clears the kept page and refreshes the board, so the upcoming moves show the new entry.
 A refused request returns 400 and a failed write returns 503, each with its reason.
 A failed move shows `<group>: <reason>` in the status line.
