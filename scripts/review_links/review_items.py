@@ -37,7 +37,7 @@ class ReviewType(StrEnum):
 
 
 class ReviewState(StrEnum):
-    FOR_YOU = 'For you'
+    OPEN = 'Open'
     WAITING = 'Waiting'
     DONE = 'Done'
 
@@ -54,8 +54,8 @@ def selected_states(show: str) -> tuple[ReviewState, ...]:
     """Select the states before a store loads complete records."""
     if show == 'all':
         return REVIEW_STATES
-    if show == 'open':
-        return (ReviewState.FOR_YOU, ReviewState.WAITING)
+    if show in ('open', 'For you', 'for-you', 'for you'):
+        return (ReviewState.OPEN,)
     return (ReviewState(show),)
 
 
@@ -139,9 +139,11 @@ class ReviewItem:
     queue_after: str = ''
     value: tuple[float, ...] = ()
     text: str = ''
+    waiting_why: str = ''
 
     def for_you(self, now: datetime) -> bool:
-        return self.state == ReviewState.FOR_YOU and not self.hidden_until(now)
+        """Count Open records whose next action belongs to the user."""
+        return self.state == ReviewState.OPEN and not self.hidden_until(now)
 
     def hidden_until(self, now: datetime) -> bool:
         return not isinstance(self.times.later, NoLaterTime) and self.times.later > now
@@ -171,18 +173,18 @@ def name(identity: staff.StaffId, members: staff.StaffSnapshot) -> str:
 def change_state(row: dict[str, str], slots: delivery_state.DeliverySlots) -> ReviewState:
     if row.get('Verdict'):
         return ReviewState.DONE
-    return ReviewState.FOR_YOU if slots.waits_for_user(False) else ReviewState.WAITING
+    return ReviewState.OPEN if slots.waits_for_user(False) else ReviewState.WAITING
 
 
 def question_state(record: update_registration.QuestionRecord) -> ReviewState:
     if record.status == 'closed':
         return ReviewState.DONE
-    return ReviewState.WAITING if 'followup' in record.item else ReviewState.FOR_YOU
+    return ReviewState.WAITING if 'followup' in record.item else ReviewState.OPEN
 
 
 def investigation_state(item: investigation.Investigation) -> ReviewState:
     return {investigation.InvestigationState.OPEN: ReviewState.WAITING,
-            investigation.InvestigationState.ANSWER_READY: ReviewState.FOR_YOU,
+            investigation.InvestigationState.ANSWER_READY: ReviewState.OPEN,
             investigation.InvestigationState.READ: ReviewState.DONE}[item.state]
 
 
@@ -225,7 +227,8 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         ('works', 'not works', 'validate', 'feedback', 'question') if state != ReviewState.DONE else (),
         ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
-        entry.value, change_review.describe(row | {'#':shown},record=members))
+        entry.value, change_review.describe(row | {'#':shown},record=members),
+        review_events.waiting_why(slots.waiting_why))
 
 
 def change_queue_name(doc: Path, members: staff.StaffSnapshot, current: Path, below: bool = False) -> str:
@@ -247,7 +250,7 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                   change_review.routed_review_entries(current,document,record=members,sources=sources) if sources is not None else
                   change_review.routed_review_entries(current,document,record=members))
         return [change_item(listing.path, row, change_routing.ChangeAssignment(owner, document), members, root, queue, current)
-                for listing, owner, row in routed if ReviewState.FOR_YOU in states]
+                for listing, owner, row in routed if ReviewState.OPEN in states]
     snapshots = {path: change_review.review_snapshot(path, include_reviewed=ReviewState.DONE in states,
                                                     collect_owners=owner_options is not None)
                  for path in sorted(change_review.lists_directory().glob(change_review.PREFIX + '*.md'))}
@@ -318,7 +321,8 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
         ('answer', 'feedback', 'question') if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
-        update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line())
+        update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
+        review_events.waiting_why(fields.get('waiting_why', '')))
 
 
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
@@ -378,7 +382,7 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
     found: list[ReviewItem] = []
     investigation_states = tuple(state for state,review_state in (
         (investigation.InvestigationState.OPEN, ReviewState.WAITING),
-        (investigation.InvestigationState.ANSWER_READY, ReviewState.FOR_YOU),
+        (investigation.InvestigationState.ANSWER_READY, ReviewState.OPEN),
         (investigation.InvestigationState.READ, ReviewState.DONE)) if review_state in states)
     for identity in selected:
         if owner_options is not None and any(investigation.folder(identity).glob('I*.md')):
@@ -400,7 +404,8 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                 ReviewTimes(filed, logs[-1].time), tuple(logs),
                 ('read', 'feedback', 'question') if state != ReviewState.DONE else (), InvestigationSource(record),
                 queue='investigation-'+owner, queue_key=key,
-                text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer))
+                text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer,
+                waiting_why=review_events.waiting_why(record.waiting_why)))
     return found
 
 
@@ -410,7 +415,7 @@ def proposal_state(issue: Issue) -> ReviewState:
     if (issue.value('status') != 'open' or isinstance(proposal_progress(issue), InProgress)
             or isinstance(decision_answer(issue), DeclinedDecision) or mark == ReviewMark.DONE):
         return ReviewState.DONE
-    return ReviewState.WAITING if mark == ReviewMark.WAITING else ReviewState.FOR_YOU
+    return ReviewState.WAITING if mark == ReviewMark.WAITING else ReviewState.OPEN
 
 
 def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.StaffId, title: str, filed: datetime,
@@ -423,10 +428,11 @@ def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.Staff
     actions = DECISION_ACTIONS if state != ReviewState.DONE else ()
     if entry is None:
         return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
-                          actions,ProposalSource(issue))
+                          actions,ProposalSource(issue),waiting_why=review_events.waiting_why(issue.value('waiting_why')))
     return ReviewItem(key,identity,ReviewType.PROPOSAL,owner,who,title,state,ReviewTimes(filed,logs[-1].time),logs,
                       actions,ProposalSource(issue),entry.urgency,'proposal/'+entry.after if entry.after else '',queue,
-                      entry.key,entry.after,entry.value,proposals_table.proposal_text(entry))
+                      entry.key,entry.after,entry.value,proposals_table.proposal_text(entry),
+                      review_events.waiting_why(issue.value('waiting_why')))
 
 
 def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
@@ -493,7 +499,7 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                 # A plan backlog line has no issue to hold a page answer; the user answers it in chat.
                 path = Path(entry.key.removeprefix(proposals_table.BACKLOG_KEY).split(': ',1)[0])
                 item = ReviewItem(key,entry.item.proposal,ReviewType.PROPOSAL,owner,owner,entry.item.proposal,
-                    ReviewState.FOR_YOU,ReviewTimes(filed,filed),(ReviewLog(filed,name(owner,members),'Proposed'),),(),
+                    ReviewState.OPEN,ReviewTimes(filed,filed),(ReviewLog(filed,name(owner,members),'Proposed'),),(),
                     ProposalLedgerSource(path),entry.urgency,'proposal/'+entry.after if entry.after else '',queue,
                     entry.key,entry.after,entry.value,proposals_table.proposal_text(entry))
             if item.state not in states:
@@ -531,7 +537,7 @@ def efficiency_state(result: str, review: efficiency_reviews.EfficiencyReview) -
         return ReviewState.DONE
     if result.startswith('deferred') or review.mark == ReviewMark.WAITING:
         return ReviewState.WAITING
-    return ReviewState.DONE if review.mark == ReviewMark.DONE else ReviewState.FOR_YOU
+    return ReviewState.DONE if review.mark == ReviewMark.DONE else ReviewState.OPEN
 
 
 def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
@@ -575,7 +581,7 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
                 head[13:],state,ReviewTimes(filed,logs[-1].time),logs,
                 DECISION_ACTIONS if state != ReviewState.DONE else (),
                 EfficiencySource(path,line),entry.urgency,queue=candidates.QUEUE,queue_key=entry.key,
-                value=entry.value,text=line))
+                value=entry.value,text=line,waiting_why=review_events.waiting_why(review.waiting_why)))
     return found
 
 
@@ -615,7 +621,7 @@ def ordered(items: list[ReviewItem]) -> list[ReviewItem]:
 
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
-         owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
+         owner_options: dict[staff.StaffId, str] | None = None, assign_ids: bool = True) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
     documents = tuple(dict.fromkeys(member.doc.path for member in members.rows
@@ -623,7 +629,7 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None,
     states = selected_states(show)
     items: list[ReviewItem] = []
     if ReviewType.QUESTION in kinds:
-        items.extend(question_items(members,documents,assign_ids=True,states=states,owner_options=owner_options))
+        items.extend(question_items(members,documents,assign_ids=assign_ids,states=states,owner_options=owner_options))
     if ReviewType.CHANGE in kinds:
         items.extend(change_items(root,members,states=states,owner_options=owner_options))
     if ReviewType.INVESTIGATION in kinds:
@@ -687,7 +693,7 @@ def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.St
 def change_counts(doc: Path, record: staff.StaffSnapshot, *, source: str = '',
                   sources: list[Path] | None = None) -> tuple[int,int]:
     try:
-        items = read_kind(ReviewType.CHANGE,doc,record,sources=sources,show='For you')
+        items = read_kind(ReviewType.CHANGE,doc,record,sources=sources,show='open')
         now = datetime.now(user_zone())
         return (sum(item.for_you(now) and not isinstance(item.source.assignment.owner,change_routing.UnroutedChange)
                     and (not source or item.source_unit == source) for item in items if isinstance(item.source,ChangeSource)),
@@ -709,7 +715,7 @@ def proposals(doc: Path, *, source: str = '', sources: list[Path] | None = None,
               record: staff.StaffSnapshot | None = None) -> int:
     record = staff.snapshot() if record is None else record
     return sum(item.for_you(datetime.now(user_zone())) and (not source or item.source_unit == source)
-               for item in read_kind(ReviewType.PROPOSAL,doc,record,sources=sources,own=own,show='For you'))
+               for item in read_kind(ReviewType.PROPOSAL,doc,record,sources=sources,own=own,show=ReviewState.OPEN))
 
 
 def open_efficiency(line: str, *, source: str = '') -> bool:
@@ -724,7 +730,7 @@ def efficiency(doc: Path, *, source: str = '', sources: list[Path] | None = None
     record = staff.snapshot() if record is None else record
     try:
         return sum(item.for_you(datetime.now(user_zone())) and (not source or item.source_unit == source)
-                   for item in read_kind(ReviewType.EFFICIENCY,doc,record,sources=sources,show='For you'))
+                   for item in read_kind(ReviewType.EFFICIENCY,doc,record,sources=sources,show=ReviewState.OPEN))
     except (OSError,UnicodeError):
         if sources is not None:
             raise
@@ -733,7 +739,7 @@ def efficiency(doc: Path, *, source: str = '', sources: list[Path] | None = None
 
 def investigations(doc: Path, record: staff.StaffSnapshot, *, source: str = '', sources: list[Path] | None = None) -> int:
     try:
-        items = read_kind(ReviewType.INVESTIGATION,doc,record,sources=sources,show='For you')
+        items = read_kind(ReviewType.INVESTIGATION,doc,record,sources=sources,show='open')
     except staff.StaffUnreadable:
         return 0
     return count_items(items,datetime.now(user_zone()),source)
@@ -749,12 +755,12 @@ def question_counts(owner: staff.StaffRow, zone: ZoneInfo, identities: QuestionS
 
 
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:
-    items = with_later(investigation_items(staff.snapshot(),owners=(owner,),sources=sources,states=(ReviewState.FOR_YOU,)),sources)
+    items = with_later(investigation_items(staff.snapshot(),owners=(owner,),sources=sources,states=(ReviewState.OPEN,)),sources)
     return sum(item.for_you(datetime.now(user_zone())) for item in items)
 
 
 def next_queue(kind: str, scope: Path | staff.StaffRow, below: bool, members: staff.StaffSnapshot) -> tuple[str,list[urgency.Entry[str]]]:
-    items = read_kind(ReviewType(kind),scope,members,below=below,show='For you')
+    items = read_kind(ReviewType(kind),scope,members,below=below,show='open')
     now = datetime.now(user_zone())
     selected = [item for item in items if item.for_you(now) and not
                 (isinstance(item.source,ChangeSource) and isinstance(item.source.assignment.owner,change_routing.UnroutedChange))]

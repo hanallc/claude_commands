@@ -29,6 +29,18 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 __STEP_TIP_STYLE__
+:where(.page-status) { position: relative; }
+.page-status { --measure-width: 7.75rem; padding-inline-end: calc(var(--measure-width) + 8px); }
+.page-status > span[data-status-reason] { white-space: normal; overflow-wrap: anywhere; }
+#measure-now { position: absolute; inset-inline-end: 0; top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  inline-size: var(--measure-width); padding: 1px 6px; white-space: nowrap;
+  font: inherit; line-height: 1; font-weight: 600;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--card); color: var(--ink); cursor: pointer; }
+#measure-now svg { width: 16px; height: 16px; }
+#measure-now:hover:enabled, #measure-now:focus-visible { color: var(--accent); }
+#measure-now:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#measure-now:disabled { color: var(--ink-3); cursor: default; }
 h2 { font-size: 1.05rem; margin: 0; }
 h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 /* A card title with a definition: the info mark shows that a hover tells what the card holds. */
@@ -136,7 +148,7 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  return {field, tooltipHtml, tipRowsHtml, hoverTips};
+  return {field, staffField, staffTitle, tooltipHtml, tipRowsHtml, hoverTips, roleName, nameParts};
 })();
 
 function size(bytes) {
@@ -316,9 +328,11 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
   const usedBy = row => {
     if (row.used_by) {
       // The name of the Builds step in the slot, else the lease's work with the Builds names; then the showrunner.
-      const name = step(row)?.name || row.used_by.name;
-      return (name ? `<span class="tag run">${esc(name)}</span>` : "")
-        + (row.used_by.showrunner ? `<span class="dim">${esc(row.used_by.showrunner)}</span>` : "");
+      const current = step(row);
+      const name = current?.name || row.used_by.name;
+      const parts = current?.name ? current.name_parts : row.used_by.name_parts;
+      return (name ? `<span class="tag run">${parts ? stepTip.nameParts(parts) : esc(name)}</span>` : "")
+        + (row.used_by.showrunner ? `<span class="dim">${stepTip.roleName(row.used_by.showrunner)}</span>` : "");
     }
     return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
   };
@@ -351,7 +365,7 @@ function sessionRows(report, keepBytes, limit) {
     + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ") : '<span class="dim">—</span>';
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
-  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${esc(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
   const {shown, smaller} = sessionsAtLeast(report, limit);
@@ -390,6 +404,7 @@ let sessionReport = null;
 let sessionLimit = 0;
 let builds = null;
 let measuring = null;
+let measureTimer;
 
 // A walk bar: the parent's span as a band, and this row's part of it at its running offset, on one scale for the drive.
 function walk(row, scale) {
@@ -616,9 +631,9 @@ function slotStep(slot) {
   if (!slot.used_by || !(age <= settings.builds_max_age_seconds)) return null;
   const here = row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine;
   const run = builds.walk?.find(here);
-  if (run) return {tip: "row:" + run.key, name: run.name};
+  if (run) return {tip: "row:" + run.key, name: run.name, name_parts:run.name_parts};
   const wait = builds.waiters?.find(here);
-  return wait ? {tip: "wait:" + wait.key, name: wait.name} : null;
+  return wait ? {tip: "wait:" + wait.key, name: wait.name, name_parts:wait.name_parts} : null;
 }
 
 // The tooltip of each Disks row and card title. A slot that a Builds page step runs or waits in shows that step's tooltip.
@@ -674,14 +689,15 @@ function slotTip(slot, group, keepBytes, now, unusedDays) {
   const field = stepTip.field;
   const rows = [field(slot.name, slot.used_by ? "in use" : slot.deleted_tonight ? "deleted tonight" : "free", "title"),
     field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
-  if (slot.used_by) rows.push(field("Used by", slot.used_by.name || "—"), field("Showrunner", slot.used_by.showrunner || "—"));
+  if (slot.used_by) rows.push({...field("Used by", slot.used_by.name || "—"), valueParts:slot.used_by.name_parts},
+    stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"]));
   if (slot.deleted_tonight) rows.push(field("", `No run used it for ${unusedDays} days, so the nightly sweep deletes it.`, "long", true));
   return rows;
 }
 
 function sessionTip(row, keepBytes) {
   const field = stepTip.field;
-  const rows = [field(row.name, row.state === "unknown" ? "state unknown" : row.state, "title"), field("Size", measuredSize(row.size, keepBytes))];
+  const rows = [stepTip.staffTitle(row.name, row.state === "unknown" ? "state unknown" : row.state), field("Size", measuredSize(row.size, keepBytes))];
   if (!row.held.length) return [...rows, field("Held folders", "none")];
   return [...rows, ...row.held.flatMap((folder, index) =>
     [field(folder.name, folder.ended ? "unsaved work" : "held", "field", index === 0), field("", "Task " + folder.task, "long")])];
@@ -706,14 +722,20 @@ async function readBuilds(current) {
   }
   if (!current()) return;
   builds = next;
+  if (builds?.staff_names) globalThis.staffNames?.set(builds.staff_names);
   renderSlots();
 }
 
-async function readData() {
+async function readData(current) {
   const response = await fetch(DATA_FILE + "?" + Date.now(), {cache: "no-store"});
   if (response.status === 404 && !data) return null;
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
+  const next=await response.json();
+  if(current()){
+    if(!data || next.measured_at!==data.measured_at || next.generation!==data.generation) show(next);
+    finishMeasure(next);
+  }
+  return next;
 }
 
 function show(next) {
@@ -721,38 +743,44 @@ function show(next) {
   if (data) render(); else { renderCards(); }
 }
 
-// Ask the server for a measure and the slots and sessions in use now. The server starts a measure only when the sizes
-// are old. The page keeps the old sizes and reads the data file again until it changes.
-async function askMeasure(current) {
-  const response=await fetch(MEASURE,{method:"POST",body:"",
+function setMeasuring(value,failure='') {
+  clearTimeout(measureTimer);
+  measuring=value;
+  document.getElementById("measure-now").disabled=Boolean(measuring);
+  pageRefresh.setStatus(measuring ? 'Measuring…' : '',failure);
+  if(measuring) measureTimer=setTimeout(()=>{
+    pageRefresh.abandon();
+    setMeasuring(null,"The measure did not finish.");
+  },settings.wait_seconds*1000);
+}
+
+function finishMeasure(next) {
+  if(measuring && measuring.target!==null && next && (next.generation ?? 0)>=measuring.target) setMeasuring(null);
+}
+
+// Ask for a measure and the current slots and sessions. Keep the old sizes until the data file changes.
+async function askMeasure(current,force=false) {
+  const response=await fetch(MEASURE,{method:"POST",body:force ? "force=1" : "",
     headers:{"Content-Type":"application/x-www-form-urlencoded"}});
   const answer=await response.json();
   if(!current()) return;
   if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
   slotReport=answer.slots || null;sessionReport=answer.sessions || null;renderCards();
-  if(answer.state!=="current" && !measuring)
-    measuring={since:Date.now()/1000,before:data ? data.measured_at : null};
+  if(force) measuring.target=answer.target;
+  else if(answer.state!=="current" && !measuring)
+    setMeasuring({since:Date.now()/1000,target:answer.target});
+  finishMeasure(data);
 }
 async function loadDisks(supersede=false,current=()=>true){
- // The page reads the Builds data on its own refresh, so the page has one timer.
- let next;
- try{[next]=await Promise.all([readData(),readBuilds(current)]);}
- catch(error){
-  if(current() && measuring && Date.now()/1000-measuring.since>settings.wait_seconds) measuring=null;
-  throw error;
- }
- if(!current()) return;
- if(next && (!data || next.measured_at!==data.measured_at)){measuring=null;show(next);}
- let failure='';
- try{if(!measuring) await askMeasure(current);}
- catch(error){if(!data) throw error;failure=error.message;}
- if(!current()) return;
- if(measuring && Date.now()/1000-measuring.since>settings.wait_seconds){
-  measuring=null;failure="The measure did not finish.";
-  if(!data) throw new Error("The measure did not finish.");
- }
- if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,
-  busy:measuring ? 'Measuring…' : '',failure};
+  // The page reads the Builds data on each page refresh.
+  await Promise.all([readData(current),readBuilds(current)]);
+  if(!current()) return;
+  let failure='';
+  try{if(!measuring) await askMeasure(current);}
+  catch(error){if(!data) throw error;failure=error.message;}
+  if(!current()) return;
+  if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,
+   busy:measuring ? 'Measuring…' : '',failure};
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
 stepTip.hoverTips(document.getElementById("tip"), tipFor);
@@ -762,6 +790,18 @@ onToggle(document.getElementById("slots"), "tr[data-group]", row => {
 });
 __PAGE_REFRESH_SCRIPT__
 const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
+document.getElementById("measure-now").addEventListener("click",async()=>{
+ if(measuring) return;
+ pageRefresh.abandon();
+ const press={since:Date.now()/1000,target:null};
+ setMeasuring(press);
+ try{
+  await askMeasure(()=>measuring===press,true);
+  if(measuring===press) await pageRefresh.refresh(true);
+ }catch(error){
+  if(measuring===press){pageRefresh.abandon();setMeasuring(null,error.message);}
+ }
+});
 void pageRefresh.refresh();
 </script>
 </body>

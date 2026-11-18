@@ -371,10 +371,24 @@ Each local Promote checkout must exist before the command pushes.
   It scans first-parent merges on the production's merge branch from 2026-11-06.
   Older merges add no rows.
   It excludes foreign history through origin merge refs and `_publication_exclusions`.
+  A descendant with a separate review list has its own scan scope.
+  An unreadable descendant document remains in scope and shares the parent's list.
+  The scan reads staff parents to identify descendants, including grandchildren.
+  It excludes a descendant's first-parent merges only when the scanning branch does not share them.
+  For other outside productions, it excludes their complete first-parent merge chains.
+  The parent scan retains its merges before a descendant's fork.
+  The child scan excludes its parent's merges and its siblings' merges.
   A local gate branch remains eligible when its name differs from the production merge branch.
   `review_commits` keeps every checkpoint and other commits without a descendant checkpoint in that merge range.
   The count includes only selected commits with review lines that parse.
   The row writer uses the same selection and reads its visible lines.
+  `list-ready` reports each commit with an invalid supplied `Change-Review` line on stderr.
+  Each message names the short merge hash, short commit hash, subject, and reason from `problem()`.
+  Invalid lines include malformed forms and missing required images.
+  A passing commit's `Change-Review-Covers` line silences the covered commit, as in `missing()`.
+  A commit without a review line prints no message here.
+  Invalid commits add no rows and do not change the exit code.
+  Valid lines on non-checkpoint subjects remain eligible.
   `checkpoint_producers` reads recorded owners through `progress_history.load_events`, using the held staff snapshot.
   Legacy records use `StaffSnapshot.unit_by_worktree`.
   Merge writers record the known producer when they make the merge.
@@ -437,7 +451,23 @@ Each local Promote checkout must exist before the command pushes.
   A failed commit prints `written but not committed`; the next write commits the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
-  `add` records ready changes that have no checkpoint line.
+  Every new or edited visible row requires a registered image.
+  Metadata changes and verdicts can update existing imageless rows; the image rule applies only to new rows and visible content edits.
+  This write rule has no date exception; `problem()` retains its date rule for commit checks.
+  `add` requires `--image` or `--output` and records ready changes that have no checkpoint line.
+  `--image` accepts a PNG path or a registered image id.
+  `batch` checks all edits before any list write and names every row without an image.
+  `edit` keeps an existing image and requires an image when the row has none.
+  Edit and verdict cleanup remove an image only when no row in any known review list names it.
+  An image reference lock protects the reference scan and image removal.
+  Row writers hold the same lock from the image check through the list write.
+  Writers take the directory lock before the image reference lock.
+  Image rendering and Git commits run outside the image reference lock.
+  Unknown image ids produce refusals and never produce empty image cells.
+  `list-ready` and `live` report imageless visible lines and add no rows, including for historical commits.
+  Register an image with `change_review.py image --image <png>` or `--output <text file>`.
+  Then pass the returned id with `--image`.
+  Invisible `Change-Review: none — <reason>` lines need no image.
   `edit` retains the row id, merge, other cells and position.
   `show` displays the next row only when the user asks.
   `verdict` moves a row to Reviewed; `works` or `fine` accepts it.
@@ -551,7 +581,11 @@ Closed records remain on disk with their time and closing words.
 Automatic numbering includes invalid records and Closed records.
 An explicit number must name an unused path.
 Exact repeated operations change nothing.
-Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
+An update appends a log line and marks the item unread if it is not Closed.
+Closing clears the unread time.
+Loading a Closed record clears its unread time in memory.
+Reopening creates a new unread update.
+Mark-read clears the unread time without sending a message.
 Update and park refuse Closed items until reopen restores them.
 The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
@@ -598,7 +632,7 @@ The answer returns the record to For you.
 An exact repeat of an answer-ready or read operation changes nothing.
 Other state changes receive one refusal line.
 
-1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>"`.
+1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>" --waiting-why "<reason>"`.
 2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
 3. Mark its answer read with `investigation.py read --id I<n>`.
 4. List waiting investigations with `investigation.py list`.
@@ -677,6 +711,7 @@ A missing folder uses its nearest existing parent until the folder appears.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  The Python `followup` API requires `waiting_why`; the Review action uses the user's question text automatically.
   It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.

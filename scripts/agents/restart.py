@@ -367,7 +367,8 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf,
              codex: herdr.CodexConversations | None = None) -> bool:
-    with operation_deadline.within(deadline):
+    # One row's stop reads each pane once; each identity check forgets its pane before it reads again.
+    with operation_deadline.within(deadline), herdr.observation_snapshot():
         try:
             record = staff.initial_snapshot()
             if record.by_id(row.id) is None:
@@ -1024,11 +1025,18 @@ def stop_all(*, dry_run: bool = False, only: tuple[str, ...] = (),
     return restart(stop_all=True, dry_run=dry_run, only=only, account=account, after_stop=AfterStop.KEEP_STOPPED)
 
 
-@herdr.pane_evidence_run()
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = (),
             account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
             after_stop: AfterStop = AfterStop.RESTART,
             why: str = DEFAULT_RESTART_CAUSE) -> int:
+    with ExitStack() as pane_evidence:
+        _ = pane_evidence.enter_context(herdr.pane_evidence_run())
+        return _restart(pane_evidence, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
+                        after_stop=after_stop, why=why)
+
+
+def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: tuple[str, ...],
+             account: AllRestartAccounts | accounts.AccountSelection, after_stop: AfterStop, why: str) -> int:
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -1209,6 +1217,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             present = isinstance(server, herdr.WindowServerCreated)
         except errors as error:
             print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+        if stop_all:
+            # A stop read can still show a worker that has exited. Read pane evidence again for restore.
+            pane_evidence.close()
+            _ = pane_evidence.enter_context(herdr.pane_evidence_run())
     resume_checks = DirectorResumeChecks()
 
     def start_holder(holder: staff.StaffRow, focus: bool,

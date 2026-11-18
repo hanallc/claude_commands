@@ -14,6 +14,8 @@ import signal
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.direct import worker_state
 from scripts.lib import models_registry
 from scripts.direct import claude_worker
@@ -143,9 +145,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
         _, unit, _ = self.tree()
         identity = fixture_runtime_id("background-Claude-native")
         home = Path.home()
-        shim = home / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True)
-        shim.symlink_to(CHECKOUT / "scripts/lib/py")
+        _ = copy_helpers(home)
         self.write_json(home / ".claude.json", {"oauthAccount": {"emailAddress": "fixture@example.invalid"}})
         work = self.root / "project"
         work.mkdir()

@@ -71,6 +71,14 @@ def write_config_fixture(path: Path, overrides: str = "", *, template: str | Non
     return path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def copy_config_fixture(source: Path, destination: Path) -> Path:
+    """Copy a configuration folder into a private fixture."""
+    import shutil
+
+    _ = shutil.copytree(source, destination)
+    return destination
+
+
 def write_config_fault(path: Path, source: str) -> int:
     """Keep revision limits when a test supplies a partial or damaged config."""
     template = _template(path.name)
@@ -135,7 +143,7 @@ def config_environment(root: Path) -> dict[str, str]:
                 _ = write_config_fixture(destination)
             else:
                 _ = destination.write_bytes(_template(name).read_bytes())
-    return {"CONF_DIR": str(folder)}
+    return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 
 def gate_isolation_environment(root: Path) -> dict[str, str]:

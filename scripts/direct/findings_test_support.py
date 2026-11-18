@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 # Only the fsync test calls a function directly; never initialize it from live config.
 with patch.dict(os.environ, {"CONF_DIR": str(Path(Path(__file__).resolve().parents[2] / "config/direct.conf").parent)}):
@@ -38,10 +39,19 @@ def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path
     return invoke_cli(module, main, arguments, environment, cwd)
 
 
-# findings.py has no compiled limits, so every run needs a complete config.
-# These are the machine's shipped values; a test that cares about one limit
-# overrides just that key on top of them.
-STANDARD_CONFIG = (SCRIPT.parents[2] / "config/direct.conf").read_text(encoding="utf-8")
+def standard_configuration() -> str:
+    """Copy the config and set the limits that these ledger tests assert."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "direct.conf"
+        _ = write_config_fixture(path,
+            "MIN_REPAIR_BUDGET=3\nREPAIR_ROUNDS_PER_FINDING=0.5\nRUNAWAY_ROUNDS=5\n"
+            + "MAX_FIX_ATTEMPTS=2\nMAX_REOPENS=2\nSTALLED_ROUNDS=2\n"
+            + "MAX_CONSECUTIVE_SAME_KIND_PASSES=3\nMAX_REVIEW_CANCELLATIONS=1\n"
+            + "ROUTING_FROM_ROUND=4\nASTRA_AFTER_FAILED_FIXES=2\n")
+        return path.read_text(encoding="utf-8")
+
+
+STANDARD_CONFIG = standard_configuration()
 
 
 class FindingsLedgerFixture(unittest.TestCase):

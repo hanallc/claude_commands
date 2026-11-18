@@ -807,6 +807,50 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assertEqual(self.logged_arguments("gh"), [])
         self.assertEqual(self.logged_arguments("send"), [])
         self.assertFalse((self.state_directory / "run.json").exists())
+        from scripts.build_queue import admission_wire as wire, placement
+        from scripts.build_hold.owning_session import NoOwningSession
+
+        assignment = placement.PlacementAssignment("import-episode", "import-attempt",
+            placement.PlacementDestination("mac", "mac", "fixture-host", mac_test.WHOLE_MAC),
+            placement.SourceKeyUnavailable("the import test has no source tree"),
+            placement.SubmittingOwner("fixture-host", first.pid, run["proc_start"]), NoOwningSession(), 1.0)
+        saved_assignment = self.root / "assignment.json"
+        _ = saved_assignment.write_text(wire.encode_reply(wire.Assignment(assignment)))
+        for action, flags in (("claim", ()), ("release", ()),
+                              ("claim", ("--assignment", saved_assignment.read_text())), ("release", ()),
+                              ("claim", ("--assignment-file", str(saved_assignment))), ("release", ())):
+            with self.subTest(action=action, flags=flags, imports="local"):
+                arguments = [action, "--pid", str(first.pid), *flags]
+                if action == "claim":
+                    arguments += ["--what", "import check", "--worktree", str(worktree)]
+                else:
+                    if not (self.state_directory / "run.json").exists():
+                        self.assert_command(self.command("claim", "--pid", str(first.pid), "--what", "import release"), 0, "claimed\n")
+                    current = self.run_state()
+                    arguments += ["--claim-id", current["claim_id"], "--episode", current["episode"],
+                                  "--attempt", current["attempt"]]
+                program = '''
+import importlib.abc
+import runpy
+import sys
+
+blocked = {"scripts.build_queue.admission_protocol", "scripts.build_queue.admission_records",
+           "scripts.buildlog.sync", "scripts.buildlog.health", "scripts.buildlog.record"}
+class LocalCommandImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in blocked:
+            raise AssertionError("unused command import: " + fullname)
+sys.meta_path.insert(0, LocalCommandImports())
+sys.argv = sys.argv[1:]
+try:
+    runpy.run_path(sys.argv[0], run_name="__main__")
+finally:
+    assert not blocked.intersection(sys.modules), "unused command modules remain loaded"
+'''
+                result = subprocess.run([sys.executable, "-c", program, str(SCRIPT), *arguments],
+                    cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
+                    text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, pass_fds=(self.writer_write_fd,))
+                self.assert_command(result, 0, "claimed\n" if action == "claim" else "")
 
     def kept_claim(self, host: str = "previous-mac") -> RunState:
         owner = self.start_child()
@@ -2985,6 +3029,14 @@ subprocess.run = expire_gh
 
 
 class MacActivityScriptTests(NotificationGuardedTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = config_environment(folder)
+        _ = write_config_fixture(folder / "build_targets.conf", "platform.mac=macos\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+
     def test_app_is_active_without_work_but_deps_and_compilers_are_work(self) -> None:
         for executable, work in (("/mirror/target/debug/hana", 0),
                                  ("/mirror/target/debug/deps/hana-abc", 1),
@@ -3016,6 +3068,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.paths = mac_test.StatePaths(self.root / "state")
         self.paths.directory.mkdir()
         config = self.root / "mac_test.conf"
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
         _ = write_config_fixture(config, "host=config-mac\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "MAC_TEST_STATE_DIR": str(self.paths.directory),
@@ -3039,7 +3092,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def test_complete_idle_config_is_read_once_by_mac_test(self) -> None:
         selected = Path(os.environ["MAC_TEST_CONFIG"])
-        _ = selected.write_text((SCRIPT.parents[1].parent / "config/mac_test.conf").read_text())
+        _ = write_config_fixture(selected)
         with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as opened:
             _ = mac_test.read_config()
         self.assertEqual([call.args[0] for call in opened.call_args_list], [selected])

@@ -3370,6 +3370,7 @@ class BuildFinalizerTests(BuildPromiseFixture):
                 fixture.scoped_peak(grant, int(15.76 * GIB))
                 owner = fixture.fixture_owner(400, "warmup")
                 fixture.free(0)
+                fixture.hold_starts()
                 replies: list[wire.Wait] = []
                 reads_at_expiry = 0
                 history_reader = step_estimator.anonymous_history_rows
@@ -3394,6 +3395,9 @@ class BuildFinalizerTests(BuildPromiseFixture):
                                 fixture.restart()
                             fixture.clock.advance(1)
                             fixture.free(18 * GIB)
+                            # An idle host can admit the head after start spacing ends.
+                            fixture.hold_starts()
+                            fixture.allow_next_start()
                             reads_at_expiry = history_scans
                         else:
                             self.assertEqual(len(replies), 3)
@@ -5330,13 +5334,14 @@ def queue_leave_client_main(argv: list[str]) -> int:
 
     class HeldWaitClock:
         def __init__(self) -> None:
-            self.offset: float = 0.0
+            self.epoch: float = time.time()
+            self.elapsed: float = 0.0
 
         def now(self) -> float:
-            return time.time() + self.offset
+            return self.epoch + self.elapsed
 
         def monotonic(self) -> float:
-            return time.monotonic() + self.offset
+            return self.elapsed
 
         def sleep(self, seconds: float) -> None:
             time.sleep(seconds)
@@ -5349,7 +5354,7 @@ def queue_leave_client_main(argv: list[str]) -> int:
         nonlocal advanced
         report(output, reply)
         if not advanced:
-            clock.offset += admission_records.read_memory_config().running_pass_seconds
+            clock.elapsed += admission_records.read_memory_config().running_pass_seconds
             advanced = True
 
     with patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held):
@@ -5365,6 +5370,7 @@ class QueueLeaveTests(unittest.TestCase):
     calls: Path = Path()
     ran: Path = Path()
     recorded: Path = Path()
+    invoke: Path = Path()
     environment: dict[str, str] = {}
 
     @override
@@ -5374,9 +5380,17 @@ class QueueLeaveTests(unittest.TestCase):
         self.calls = self.root / "hook-calls"
         self.ran = self.root / "ran"
         self.recorded = self.root / "recorded"
-        scripts = self.root / ".claude/scripts"
+        scripts = self.root / "helpers"
         (scripts / "lib").mkdir(parents=True)
         (scripts / "buildlog").mkdir()
+        (scripts / "lint").mkdir()
+        self.invoke = scripts / "lint/invoke.sh"
+        _ = self.invoke.write_text(INVOKE.read_text())
+        _ = (scripts / "lint/memory_gate.sh").write_text(INVOKE.with_name("memory_gate.sh").read_text())
+        for name in ("nextest_budget.py", "nextest_tokens.py"):
+            (scripts / "lint" / name).symlink_to(INVOKE.with_name(name))
+        for name in ("build_hold", "build_queue", "build_targets"):
+            (scripts / name).symlink_to(Path(__file__).resolve().parents[1] / name, target_is_directory=True)
         py = scripts / "lib/py"
         _ = py.write_text((Path(__file__).resolve().parents[1] / "lib/py").read_text())
         py.chmod(0o755)
@@ -5438,7 +5452,7 @@ class QueueLeaveTests(unittest.TestCase):
                    + '"$TEST_PY" "$TEST_QUEUE_CLIENT" "$@"; else "$TEST_PY" "$@"; fi; }; '
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
-        result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
+        result = subprocess.run(["bash", "-c", command, "test", str(self.invoke), str(self.ran)],
             capture_output=True, text=True, timeout=30,
             check=False, env=environment)
         self.admission.server.reply_filter = lambda reply: reply
