@@ -53,7 +53,7 @@ class LaunchEnvironmentTests(unittest.TestCase):
                         record, client, {"w1:p1": entry}, evidence=evidence, strict_retained_reads=True)
                 self.assertEqual(decoded.call_count, 2)
         with (patch.object(client, "result", return_value={"process_info": {}}),
-              self.assertRaisesRegex(pane_launch.PaneProcessUnreadable, "expected a shell pid")):
+              self.assertRaisesRegex(pane_launch.PaneProcessUnreadable, "expected positive pane process ids")):
             _ = pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
                 record, client, {"w1:p1": entry}, evidence=evidence, strict_retained_reads=True)
 

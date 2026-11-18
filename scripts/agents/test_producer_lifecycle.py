@@ -27,6 +27,9 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 
 SUBMIT_OPENING = herdr.Herdr.submit_opening_prompt
 OPENING_TEXT = script_prompt("Read ~/rust/hanadocs/dwight/README.md, then run /producer:produce.")
+ZERO_PANE_PROCESS_IDS: dict[str, object] = {
+    "process_info": {"shell_pid": 0, "foreground_process_group_id": 0, "foreground_processes": []},
+}
 
 
 @contextmanager
@@ -337,11 +340,16 @@ class ProducerLifecycleTests(unittest.TestCase):
         with (patch.object(sessions, "running_sessions", return_value=[]),
               patch.object(herdr, "shared_session", return_value="fixture"),
               patch.object(herdr.Herdr, "panes", return_value=[pane]),
-              patch.object(herdr.Herdr, "scan_row_panes", return_value=herdr.RowPaneScan({}, [])),
-              patch.object(herdr.Herdr, "result", side_effect=OSError("fixture process read failed"))):
-            errors = command("rename", source.name, "beta")[2]
-            self.assertIn("cannot read producer panes: producer-pane: fixture process read failed", errors)
-            self.assertTrue(producer_lifecycle.pending_rename(source.name))
+              patch.object(herdr.Herdr, "scan_row_panes", return_value=herdr.RowPaneScan({}, []))):
+            with patch.object(herdr.Herdr, "result", side_effect=OSError("fixture process read failed")):
+                errors = command("rename", source.name, "beta")[2]
+                self.assertIn("cannot read producer panes: producer-pane: fixture process read failed", errors)
+                self.assertTrue(producer_lifecycle.pending_rename(source.name))
+            with patch.object(herdr.Herdr, "result", return_value=ZERO_PANE_PROCESS_IDS):
+                code, _, errors = command("rename", source.name, "beta")
+                self.assertEqual(code, 2)
+                self.assertIn("cannot read producer panes: producer-pane: expected positive pane process ids", errors)
+                self.assertTrue(producer_lifecycle.pending_rename(source.name))
         with patch.object(shutdown, "rename_repair_displays", return_value=True):
             self.assertEqual(command("rename", replacement.name, source.name)[0], 0)
             code, output, errors = command("rename", source.name, "beta")
@@ -439,6 +447,10 @@ class ProducerLifecycleTests(unittest.TestCase):
             with patch.object(herdr.Herdr, "result", side_effect=OSError("fixture process read failed")):
                 self.assertIn("cannot read producer panes: producer-pane: fixture process read failed",
                               command("retire", row.name, "--to", destination.name)[2])
+            with patch.object(herdr.Herdr, "result", return_value=ZERO_PANE_PROCESS_IDS):
+                code, _, errors = command("retire", row.name, "--to", destination.name)
+                self.assertEqual(code, 2)
+                self.assertIn("cannot read producer panes: producer-pane: expected positive pane process ids", errors)
             stop.assert_called_once()
             close_tab.assert_not_called()
             self.assertEqual(self.profile(row.name), "claude:sonnet:high")

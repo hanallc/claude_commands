@@ -832,6 +832,20 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
         raise store.invalid(identity, error) from None
 
 
+def _require_active_open_producers(items: Sequence[ListItem]) -> None:
+    producers = dict.fromkeys(item.producer for item in items if item.state != ItemState.CLOSED)
+    if not producers:
+        return
+    try:
+        record = staff.authority_snapshot()
+    except staff.StaffAbsent:
+        return
+    for identity in producers:
+        producer = record.by_id(identity)
+        if producer is not None and isinstance(producer.retirement, staff.RetiredProducer):
+            raise ListError(f"{producer.name}: retired producer. Choose an active producer.")
+
+
 def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
@@ -933,6 +947,7 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
             if store.path(item.id).exists():
                 raise ListError(f"{item.id}: the item already exists")
             _check_links(read, item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to})
+        _require_active_open_producers(items)
         for item in items:
             _save(store, item)
 
@@ -960,6 +975,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
         _validate(item)
         _check_links(lambda number: load(keeper, f"L{number}"), item.number, changes)
+        _require_active_open_producers((item,))
         _save(store, item)
         return item
 
@@ -996,6 +1012,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             return item
         changed = replace(changed, log=(*item.log, *entries))
         _validate(changed)
+        if item.state == ItemState.CLOSED or changed.producer != item.producer:
+            _require_active_open_producers((changed,))
         if isinstance(request, PageRequest):
             return _save_page_request(store, keeper, changed, request)
         _save(store, changed)

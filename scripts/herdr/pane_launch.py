@@ -301,8 +301,9 @@ def _process_info(client: NativePaneServer, pane: Mapping[str, object]) -> dict[
     if not isinstance(info, dict):
         raise ValueError("expected pane process information")
     process = cast(dict[str, object], info)
-    if type(process.get("shell_pid")) is not int or type(process.get("foreground_process_group_id")) is not int:
-        raise ValueError("expected a shell pid and a foreground process group id")
+    pids = (process.get("shell_pid"), process.get("foreground_process_group_id"))
+    if any(isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids):
+        raise ValueError("expected positive pane process ids")
     return process
 
 
@@ -315,8 +316,7 @@ def _native_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set
 def _retained_shell(client: NativePaneServer, pane: Mapping[str, object], *, strict: bool) -> bool:
     """Refresh a retained unknown pane once after its agent can exit."""
     info = _process_info(client, pane)
-    shell = info.get("shell_pid")
-    at_shell = isinstance(shell, int) and shell > 0 and info.get("foreground_process_group_id") == shell
+    at_shell = info["foreground_process_group_id"] == info["shell_pid"]
     if strict or at_shell:
         return not _native_sessions(info, pane) and at_shell
     return False

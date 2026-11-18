@@ -1293,6 +1293,11 @@ def snapshot() -> StaffSnapshot:
     supplied = _command_snapshot.get()
     if isinstance(supplied, StaffSnapshot):
         return supplied
+    return authority_snapshot()
+
+
+def authority_snapshot() -> StaffSnapshot:
+    """Read the current staff record from its authority."""
     if is_owner():
         return replace(_load(), production=not _file_override())
     value = _remote(["show", "--snapshot"])
