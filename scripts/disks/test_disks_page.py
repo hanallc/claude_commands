@@ -673,6 +673,19 @@ const localStorage={getItem:()=>null};
         self.assertEqual(result, {"writes": 1, "sameSlider": True, "all": [5, "any size"], "top": [2, "28 GiB"],
                                   "after": [2, "7.0 GiB"], "small": [2, "any size", True], "empty": True})
 
+    def test_a_slot_shows_the_builds_tooltip_without_a_title_field(self) -> None:
+        row = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": NOW - 60,
+               "key": "run", "used": 2.0, "slot": 1, "slot_folder": "hana-slot1", "slot_machine": "natedev",
+               "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
+        builds = {"read_at": NOW, "walk": [row], "waiters": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE}
+        body = cast(str, self.run_drive("""
+            Date.now = () => input.now * 1000;
+            slotReport = input.slots;
+            builds = input.builds;
+            result = tipFor("slot:hana-slot1");
+        """, extra={"slots": {**SLOTS, "machine": "natedev"}, "now": NOW, "builds": builds}))
+        self.assertIn("report · integrate", body)
+
     def test_each_row_and_card_title_has_a_tooltip_and_a_slot_in_use_shows_its_builds_step(self) -> None:
         # The user, 11-16: "every row should contain a tooltip that for slots should be the same tooltip that is shown in
         # the build queue so they share code and data".

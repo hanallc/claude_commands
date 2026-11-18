@@ -433,6 +433,7 @@ class HanaSetupFailureTests(CostFixture):
     setup_path: Path = Path()
     book: ledger.CostLedger = ledger.CostLedger(Path())
     calls: list[list[str]] = []
+    policy_calls: list[tuple[str, str]] = []
     scaler_calls: list[tuple[str, str]] = []
     instance_reads: list[list[str]] = []
     deleted_stacks: dict[str, tuple[int, list[dict[str, str]]]] = {}
@@ -445,6 +446,7 @@ class HanaSetupFailureTests(CostFixture):
         self.setup_path = self.state / 'hana/setup.json'
         self.book = ledger.CostLedger(self.state)
         self.calls = []
+        self.policy_calls = []
         self.scaler_calls = []
         self.instance_reads = []
         self.deleted_stacks = {}
@@ -910,6 +912,34 @@ class HanaSetupFailureTests(CostFixture):
             _ = subject.hana_setup(approve_resources=True)
         self.assertEqual(fake.operations, ['describe-stacks', 'describe-stack-resources'])
 
+    @staticmethod
+    def stack_owned_hana_template() -> dict[str, object]:
+        template = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_bytes())))
+        parameters = ledger.mapping(template['Parameters'])
+        parameters.update({key: {'Type': 'String'} for key in ('InstanceType', 'AvailabilityZone', 'SubnetId')})
+        parameters['DataGiB'] = {'Type': 'Number', 'MinValue': 1}
+        resources = ledger.mapping(template['Resources'])
+        tags = [{'Key': 'HanaDeployment', 'Value': {'Ref': 'DeploymentId'}}, {'Key': 'Workload', 'Value': 'hana'}]
+        resources['Instance'] = {'Type': 'AWS::EC2::Instance', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain',
+            'Properties': {'AvailabilityZone': {'Ref': 'AvailabilityZone'}, 'Tags': tags, 'LaunchTemplate': {
+                'LaunchTemplateId': {'Ref': 'LaunchTemplate'},
+                'Version': {'Fn::GetAtt': ['LaunchTemplate', 'LatestVersionNumber']}}}}
+        resources['DataVolume'] = {'Type': 'AWS::EC2::Volume', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain',
+            'Properties': {'AvailabilityZone': {'Ref': 'AvailabilityZone'}, 'Size': {'Ref': 'DataGiB'},
+                           'VolumeType': 'gp3', 'Encrypted': True, 'Tags': tags}}
+        resources['DataAttachment'] = {'Type': 'AWS::EC2::VolumeAttachment', 'Properties': {
+            'InstanceId': {'Ref': 'Instance'}, 'VolumeId': {'Ref': 'DataVolume'}, 'Device': '/dev/sdf'}}
+        launch = ledger.mapping(ledger.mapping(resources['LaunchTemplate'])['Properties'])
+        ledger.mapping(launch['LaunchTemplateData']).update(InstanceType={'Ref': 'InstanceType'},
+            NetworkInterfaces=[{'DeviceIndex': 0, 'SubnetId': {'Ref': 'SubnetId'},
+                                'AssociatePublicIpAddress': True, 'Groups': [{'Ref': 'SecurityGroup'}]}])
+        policy = ledger.mapping(ledger.mapping(resources['ScalerPolicy'])['Properties'])
+        for statement in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement'):
+            if statement.get('Action') == ['ec2:ModifyInstanceAttribute']:
+                ledger.mapping(ledger.mapping(statement['Condition'])['StringEquals'])['ec2:Attribute'] = 'userData'
+        template['Outputs'] = {key: {'Value': {'Ref': key}} for key in ('Instance', 'DataVolume', 'ControlBucket', 'LaunchTemplate')}
+        return template
+
     def policy_update_fixture(self, changes: list[dict[str, object]], *, fail_update: bool = False,
                               change_status: str = 'CREATE_COMPLETE', next_token: str = '',
                               execution: Literal['accepted', 'refused', 'timeout', 'unknown'] = 'accepted',
@@ -917,7 +947,8 @@ class HanaSetupFailureTests(CostFixture):
                               live_state: ledger.InstanceState = 'stopped', execution_error: str = '',
                               admin_spot_error: str = '',
                               scaler_faults: Mapping[tuple[str, str], str] | None = None,
-                              bad_readback: bool = False, volume_device: str = '/dev/sdf') -> tuple[deploy.Deployment, dict[str, str]]:
+                              bad_readback: bool = False, volume_device: str = '/dev/sdf',
+                              stack_owned: bool = False) -> tuple[deploy.Deployment, dict[str, str]]:
         scaler_faults = scaler_faults or {}
         credentials = self.root / '.config/aws-build/credentials'
         service_settings = self.root / 'service-aws-target.conf'
@@ -950,6 +981,7 @@ class HanaSetupFailureTests(CostFixture):
             reply: dict[str, object] = {}
             dry_run = operation in ('modify-instance-attribute', 'start-instances', 'stop-instances')
             self.assertEqual('--dry-run' in arguments, dry_run)
+            self.policy_calls.append((service, operation + (' --dry-run' if dry_run else '')))
             if operation == 'export-credentials':
                 self.assertEqual(service, 'configure')
                 reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret'}
@@ -997,21 +1029,31 @@ class HanaSetupFailureTests(CostFixture):
                      spot_request='fixture-spot-request',
                      template_sha256=sha256(b'previous fixture template').hexdigest(),
                      parameters_sha256=sha256(json.dumps(prepared.parameters, sort_keys=True).encode()).hexdigest())
+        current = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_bytes())))
+        template = self.stack_owned_hana_template() if stack_owned else current
+        live_parameters = {key: prepared.parameters[key] for key in ledger.mapping(template['Parameters'])}
+        if stack_owned:
+            outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template',
+                       'Instance': instance, 'DataVolume': volume}
+            saved.update(version=1, parameters_sha256=sha256(json.dumps(live_parameters, sort_keys=True).encode()).hexdigest())
+            for key in ('launch_template', 'security_group', 'instance_type'):
+                del saved[key]
+            shutil.rmtree(subject.output / 'hana')
+        pending_template = template
         write_text_atomic(self.setup_path, json.dumps(saved))
         hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
             clock=self.clock).register(hana_box.DeploymentIdentity(ledger.text(saved, 'deployment'), instance,
                 ledger.text(saved, 'spot_request'), ledger.text(saved, 'region')))
-        template = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_text())))
-        live_parameters = {key: prepared.parameters[key] for key in ledger.mapping(template['Parameters'])}
         stack_reads = 0
         _ = self.enterContext(mock.patch.object(subject.admin, 'environment', side_effect=lambda: dict(os.environ)))
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
                     check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            nonlocal stack_reads, updated
+            nonlocal stack_reads, updated, pending_template, template
             _ = capture_output, text, check
             offset = arguments.index('--region') + 2
             service, operation = arguments[offset:offset + 2]
+            self.policy_calls.append((service, operation + (' ' + arguments[offset + 2] if operation == 'wait' else '')))
             if service == 'ec2' and operation == 'describe-instances':
                 self.instance_reads.append(list(arguments))
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', instance])
@@ -1040,7 +1082,7 @@ class HanaSetupFailureTests(CostFixture):
             if operation == 'describe-stack-resources':
                 return subprocess.CompletedProcess(arguments, 0, '{"StackResources":[]}', '')
             self.calls.append(list(arguments))
-            reply = {}
+            reply: dict[str, object] = {}
             if operation == 'describe-stacks':
                 stack_reads += 1
                 if stack_disappears and stack_reads == 2:
@@ -1048,12 +1090,27 @@ class HanaSetupFailureTests(CostFixture):
                 reply = {'Stacks': [{'StackId': 'fixture-stack-id', 'StackStatus': 'CREATE_COMPLETE',
                     'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()],
                     'Parameters': [{'ParameterKey': key, 'ParameterValue': value} for key, value in live_parameters.items()]}]}
+            elif operation == 'get-template' and stack_owned:
+                self.assertEqual(arguments[offset + 2:offset + 6], ['--stack-name', 'fixture-stack-id', '--template-stage', 'Original'])
+                reply = {'TemplateBody': template if updated else json.dumps(template)}
+            elif operation == 'create-change-set' and stack_owned:
+                self.assertEqual(arguments[arguments.index('--change-set-type') + 1], 'UPDATE')
+                self.assertEqual(arguments[arguments.index('--stack-name') + 1], 'fixture-stack-id')
+                values = cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))
+                self.assertCountEqual(ledger.rows({'parameters': values}, 'parameters'),
+                    [{'ParameterKey': key, 'UsePreviousValue': True} for key in live_parameters])
+                body = arguments[arguments.index('--template-body') + 1]
+                pending_template = ledger.mapping(cast(object, json.loads(Path(body.removeprefix('file://')).read_bytes())))
+                self.assertEqual(pending_template, {**template, 'Resources': {
+                    **ledger.mapping(template['Resources']), 'ScalerPolicy': ledger.mapping(current['Resources'])['ScalerPolicy']}})
             elif operation == 'describe-change-set':
                 effective = dict(live_parameters)
                 if changed_scaler_user:
                     effective['ScalerUser'] = changed_scaler_user
                 reply = {'Status': change_status, 'Changes': [{'ResourceChange': change} for change in changes],
                          'Parameters': [{'ParameterKey': key, 'ParameterValue': value} for key, value in effective.items()]}
+                if stack_owned and not changed_scaler_user:
+                    reply['Parameters'] = [{'ParameterKey': key, 'UsePreviousValue': True} for key in live_parameters]
                 if change_status == 'FAILED':
                     reply['StatusReason'] = "The submitted information didn't contain changes."
                 if next_token:
@@ -1077,6 +1134,7 @@ class HanaSetupFailureTests(CostFixture):
                 self.assertEqual(self.scaler_calls, [('before', action) for action in self.PROBE_OPERATIONS])
                 if fail_update:
                     return subprocess.CompletedProcess(arguments, 1, '', 'fixture update failed')
+                template = pending_template
                 updated = True
             elif operation not in ('create-change-set', 'execute-change-set', 'delete-change-set', 'wait'):
                 raise AssertionError('Unexpected CloudFormation operation: ' + operation)
@@ -1154,6 +1212,111 @@ class HanaSetupFailureTests(CostFixture):
         self.assertEqual(remote.read_record(self.setup_path),
                          {**saved, 'template_sha256': sha256(deploy.HANA_TEMPLATE.read_bytes()).hexdigest()})
         self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_setup_updates_a_version_one_stack_owned_box_then_runs_as_a_no_op(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], stack_owned=True)
+        saved = remote.read_record(self.setup_path)
+        lifecycle = self.setup_path.with_name('lifecycle.json')
+        registration = lifecycle.read_bytes()
+        self.assertEqual(set(saved), {'bucket', 'data_volume', 'deployment', 'generation', 'instance',
+            'parameters_sha256', 'region', 'requested', 'spot_request', 'stack', 'template_sha256', 'version'})
+        self.assertEqual(saved['version'], 1)
+        self.assertIs(saved['requested'], True)
+        self.assertFalse((subject.output / 'hana').exists())
+
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+        passed = [f'hana-setup probe: {action}: pass' for action in self.PROBE_OPERATIONS]
+        self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith('hana-setup probe:')],
+                         ['hana-setup probe: before the policy update', *passed,
+                          'hana-setup probe: after the policy update', *passed])
+        checks = [('cloudformation', 'describe-stacks'), ('ec2', 'describe-instances'),
+                  ('ec2', 'describe-volumes'), ('cloudformation', 'get-template')]
+        probes = [('configure', 'export-credentials'), ('ec2', 'describe-instances'),
+                  ('ec2', 'describe-spot-instance-requests'), ('ec2', 'describe-instance-attribute'),
+                  ('ec2', 'modify-instance-attribute --dry-run'), ('ec2', 'start-instances --dry-run'),
+                  ('ec2', 'stop-instances --dry-run'), ('s3api', 'put-object'), ('s3api', 'get-object')]
+        self.assertEqual(self.policy_calls, [*checks, *probes, ('cloudformation', 'describe-stacks'),
+            ('cloudformation', 'create-change-set'), ('cloudformation', 'wait change-set-create-complete'),
+            ('cloudformation', 'describe-change-set'), ('cloudformation', 'execute-change-set'),
+            ('cloudformation', 'wait stack-update-complete'), *probes])
+        patched = self.stack_owned_hana_template()
+        current = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_bytes())))
+        ledger.mapping(patched['Resources'])['ScalerPolicy'] = ledger.mapping(current['Resources'])['ScalerPolicy']
+        expected = {**saved, 'template_sha256': sha256(json.dumps(patched, sort_keys=True).encode()).hexdigest()}
+        self.assertEqual(remote.read_record(self.setup_path), expected)
+        self.assertEqual(lifecycle.read_bytes(), registration)
+
+        self.policy_calls.clear()
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+        self.assertIn('The Hana scaler policy is current.', output.getvalue())
+        self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith('hana-setup probe:')], passed)
+        self.assertEqual(self.policy_calls, [*checks, *probes])
+        self.assertEqual(remote.read_record(self.setup_path), expected)
+        self.assertEqual(lifecycle.read_bytes(), registration)
+
+    def test_hana_setup_probes_a_version_one_box_after_a_no_change_response(self) -> None:
+        subject, _ = self.policy_update_fixture([], change_status='FAILED', stack_owned=True)
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+        self.assertIn('The Hana scaler policy is current.', output.getvalue())
+        self.assertEqual(self.scaler_calls, [('before', action) for _ in range(2) for action in self.PROBE_OPERATIONS])
+        self.assertIn(('cloudformation', 'delete-change-set'), self.policy_calls)
+        self.assertNotIn(('cloudformation', 'execute-change-set'), self.policy_calls)
+
+    def test_hana_setup_refuses_other_old_records_with_resources(self) -> None:
+        subject, _ = self.policy_update_fixture([], stack_owned=True)
+        saved = remote.read_record(self.setup_path)
+        cases: list[tuple[str, dict[str, object]]] = [
+            (f'generation={value!r}', {**saved, 'generation': value})
+            for value in (None, True, 1.0, '1', -1)
+        ]
+        cases.extend((f'extra {key}', {**saved, key: None}) for key in (
+            'pending_launch', 'pending_volume', 'launch_template', 'security_group',
+            'instance_type', 'zone', 'subnet', 'stop_pending', 'spot_max_price', 'unexpected',
+        ))
+        cases.extend((f'missing {key}', {name: value for name, value in saved.items() if name != key})
+                     for key in ('generation', 'bucket', 'parameters_sha256'))
+        cases.extend((
+            ('wrong version', {**saved, 'version': 0}),
+            ('wrong version type', {**saved, 'version': True}),
+            ('wrong instance type', {**saved, 'instance': []}),
+        ))
+        for name, record in cases:
+            with self.subTest(name=name):
+                write_text_atomic(self.setup_path, json.dumps(record))
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(
+                        deploy.DeploymentRefused, 'uses stack-owned resources'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(self.policy_calls, [])
+                self.assertEqual(remote.read_record(self.setup_path), record)
+
+    def test_hana_setup_refuses_a_stack_owned_box_with_a_different_scaler_user(self) -> None:
+        subject, parameters = self.policy_update_fixture([], stack_owned=True)
+        saved = self.setup_path.read_bytes()
+        parameters['ScalerUser'] = 'fixture-other-scaler'
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'scaler user differs'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(self.policy_calls, [('cloudformation', 'describe-stacks')])
+        self.assertEqual(self.scaler_calls, [])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_setup_refuses_to_change_a_stack_owned_disk_attachment(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'DataAttachment', 'ResourceType': 'AWS::EC2::VolumeAttachment',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], stack_owned=True)
+        saved = self.setup_path.read_bytes()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'only IAM policy modifications'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(self.policy_calls[-2:], [('cloudformation', 'describe-change-set'),
+                                                ('cloudformation', 'delete-change-set')])
+        self.assertNotIn(('cloudformation', 'execute-change-set'), self.policy_calls)
+        self.assertEqual(self.setup_path.read_bytes(), saved)
 
     def test_hana_probe_reports_all_calls_after_a_failed_user_data_read(self) -> None:
         subject, _ = self.policy_update_fixture([{
