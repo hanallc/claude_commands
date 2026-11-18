@@ -887,8 +887,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             for page in console.read_pages():
                 if page.items is review_page.waiting_items:
                     page = replace(page, items=waiting_review)
-                elif page.items is list_page.waiting_updates:
-                    page = replace(page, items=partial(list_page.waiting_updates, status=server.delivery_status))
                 elif page.items is images.waiting_images:
                     page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
                 pages.append(page)

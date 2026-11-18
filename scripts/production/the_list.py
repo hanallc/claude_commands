@@ -222,8 +222,17 @@ class ListItem:
     questions: tuple[question_record.Question, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.state == ItemState.CLOSED:
-            object.__setattr__(self, "unread_since", NoTimestamp.UNSET)
+        if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
+            return
+        # A Closed item can have an unread answer after its last close.
+        for entry in reversed(self.log):
+            if isinstance(entry.what, QuestionAnswered):
+                if entry.time == self.unread_since:
+                    return
+                break
+            if isinstance(entry.what, MarkedRead) or isinstance(entry.what, FieldChange) and entry.what.action == "Closed":
+                break
+        object.__setattr__(self, "unread_since", NoTimestamp.UNSET)
 
     @property
     def id(self) -> str:
@@ -1160,7 +1169,8 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
                 return item
             raise ListError("the item is already Closed with different closing words")
         return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words)
-    return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source, page_action=notice)
+    return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
+                   unread=False, page_action=notice)
 
 
 def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
