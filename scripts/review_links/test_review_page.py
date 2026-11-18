@@ -3317,7 +3317,7 @@ window.fetch=async(url,options={})=>{
    });
    observer.observe(recipients,{childList:true});
   });
-  review.querySelector('[data-review-new]').click();
+  document.querySelector('[data-review-new]').click();
   if(!dialog.open) throw new Error('New must open the dialog.');
   dialog.querySelector('[name="kind"][value="bug"]').click();
   (await ready).click();
@@ -3582,7 +3582,7 @@ window.fetch=async(url)=>{
         self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_new_button_stays_on_the_type_row_at_desktop_width(self) -> None:
+    def test_new_button_aligns_with_the_review_title_at_desktop_width(self) -> None:
         markup = review_page.build_snapshot(self.root).page.decode()
         probe = r'''<script>
 (async()=>{
@@ -3590,19 +3590,16 @@ window.fetch=async(url)=>{
  frameElement.style.width='1280px';
  await document.fonts.ready;
  const group=document.querySelector('[role="group"][aria-label="Type"]');
- const chips=[...group.querySelectorAll('[data-type-chip]:not([hidden])')];
- const button=group.querySelector('[data-review-new]');
- const singleLine=()=>{
-  const bounds=button.getBoundingClientRect(),right=group.getBoundingClientRect().right;
-  return innerWidth===1280 && bounds.width>0 && bounds.right<=right+1 && chips.every(chip=>{
-   const rect=chip.getBoundingClientRect();
-   return Math.abs(rect.top-bounds.top)<=1 && rect.right<=bounds.left && rect.height<=bounds.height+1;
-  });
- };
- if(!singleLine()) failures.push('The New button must fit on the Type row at 1280 px.');
- const counts=['3606','512','2709','1','219','165','0'];
- chips.forEach((chip,index)=>chip.querySelector('b').textContent=counts[index]);
- if(!singleLine()) failures.push('The Type row must fit when the counts have more digits.');
+ const button=document.querySelector('[data-review-new]');
+ const heading=document.querySelector('h1.page-title'),label=document.createRange();
+ label.selectNodeContents(heading);
+ const bounds=button.getBoundingClientRect(),title=heading.getBoundingClientRect();
+ const table=document.querySelector('.list-table').getBoundingClientRect();
+ if(innerWidth!==1280 || bounds.width===0 || bounds.left<label.getBoundingClientRect().right ||
+    Math.abs((bounds.top+bounds.bottom)-(title.top+title.bottom))>2 || Math.abs(bounds.right-table.right)>1){
+  failures.push('The New button must align with the title at the right edge at 1280 px.');
+ }
+ if(group.contains(button)) failures.push('The Type chips must exclude the New button.');
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>'''

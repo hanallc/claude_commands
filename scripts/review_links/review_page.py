@@ -726,14 +726,13 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
               'Investigations and Bugs <b></b></button>')
     chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
                      +' <b></b></button>' for kind in TYPES)
-    chips = ('<div class="review-type-options">'+chips+'</div>'
-             +'<button class="review-new" type="button" data-review-new><span aria-hidden="true">+</span>New</button>')
     shows = ''.join('<button id="review-show-'+value.lower().replace(' ', '-')+'" type="button" data-show-chip="'
                     +value+'" aria-pressed="'+str(value == show).lower()+'">'+label
                     +' <b></b></button>' for value, label in SHOWS)
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
-    content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review')
+    new_button = '<button class="review-new" type="button" data-review-new><span aria-hidden="true">+</span>New</button>'
+    content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review', action=new_button)
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
@@ -883,22 +882,17 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 STYLE = '''<style>
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.review-types .review-new{margin-inline-start:auto;display:inline-flex;align-items:center;gap:6px;color:var(--accent)}
 .review-new span{font-size:1.2em;line-height:1}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
 [data-review] .record-filter-row{margin-bottom:12px}
 .record-filter-row>.review-types{gap:8px}
 .review-types button{max-width:100%;overflow-wrap:anywhere}
-:is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
+:is(.review-types button,[data-clear-linked-reviews],.review-new){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
-.review-type-options button,.review-types .review-new{padding-inline:8px;gap:5px;font-size:13px;white-space:nowrap}
-.review-type-options .review-icon{margin-right:0}
-.review-type-options{display:contents}
-@media(min-width:961px){
-.record-filter-row>.review-types:has(>.review-type-options){display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start}
-.review-type-options{display:flex;flex-wrap:wrap;gap:inherit}
-}
+.page-heading:has(>.review-new)>.page-title{padding-inline-end:6rem}
+.page-heading>.review-new{position:absolute;inset-inline-end:0;inset-block-start:50%;transform:translateY(-50%);
+color:var(--accent);white-space:nowrap}
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
@@ -1354,7 +1348,7 @@ async function refresh(_supersede=false,current=()=>true){
 }
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
-content.querySelector('[data-review-new]').addEventListener('click',event=>{
+document.querySelector('[data-review-new]').addEventListener('click',event=>{
  window.reviewNewItem.open({trigger:event.currentTarget});
 });
 document.addEventListener('review-item-created',event=>{
