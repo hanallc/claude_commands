@@ -266,7 +266,7 @@ def locked() -> Generator[None, None, None]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _pin_file(queue: str) -> Path:
+def queue_state_path(queue: str) -> Path:
     return state_dir() / f"{_UNSAFE.sub('_', queue)}.json"
 
 
@@ -279,11 +279,17 @@ class QueueState:
     ended: Mapping[str, datetime] = field(default_factory=dict[str, datetime])
 
 
-def _read_state(queue: str) -> QueueState:
+def read_queue_state(queue: str, *, strict: bool = False) -> QueueState:
     try:
-        value = cast(object, json.loads(_pin_file(queue).read_text(encoding="utf-8")))
-    except (OSError, ValueError):
+        value = cast(object, json.loads(queue_state_path(queue).read_text(encoding="utf-8")))
+    except FileNotFoundError:
         return QueueState()
+    except (OSError, ValueError):
+        if strict:
+            raise
+        return QueueState()
+    if strict and not isinstance(value, dict):
+        raise ValueError('Expected a queue state object.')
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     current, source, stored = fields.get("current"), fields.get("source"), fields.get("ended")
     ended: dict[str, datetime] = {}
@@ -292,12 +298,14 @@ def _read_state(queue: str) -> QueueState:
             try:
                 ended[key] = datetime.fromisoformat(when)
             except ValueError:
+                if strict:
+                    raise
                 continue
     return QueueState(current if isinstance(current, str) else "", source if isinstance(source, str) else "", ended)
 
 
 def _write_state(queue: str, state: QueueState) -> None:
-    path = _pin_file(queue)
+    path = queue_state_path(queue)
     path.parent.mkdir(parents=True, exist_ok=True)
     stored: dict[str, object] = {"current": state.current}
     if state.source:
@@ -311,29 +319,29 @@ def _write_state(queue: str, state: QueueState) -> None:
 
 def pinned(queue: str) -> str:
     """The key of the item /next last showed from this queue, or the empty string."""
-    return _read_state(queue).current
+    return read_queue_state(queue).current
 
 
 def ended(queue: str) -> dict[str, datetime]:
     """The items the user moved to the end of this queue, with when."""
-    return dict(_read_state(queue).ended)
+    return dict(read_queue_state(queue).ended)
 
 
 def pin(queue: str, key: str, source: str = "") -> None:
     with locked():
-        state = _read_state(queue)
+        state = read_queue_state(queue)
         _write_state(queue, QueueState(key, source, state.ended))
 
 
 def queue_order(entries: Iterable[Entry[Item]], queue: str) -> list[Entry[Item]]:
     """The queue in the urgent order, with its pin and its moved items: the order its table shows."""
-    state = _read_state(queue)
+    state = read_queue_state(queue)
     return order(entries, state.current, URGENT, state.ended)
 
 
 def _pin_first(queue: str, ranked: Sequence[Entry[Item]], source: str = "") -> None:
     """Pin the first item and forget a moved item that left the queue; write only on a change."""
-    state = _read_state(queue)
+    state = read_queue_state(queue)
     present = {entry.key for entry in ranked}
     kept = {key: when for key, when in state.ended.items() if key in present}
     if ranked[0].key != state.current or source != state.source or kept != dict(state.ended):
@@ -344,7 +352,7 @@ def top(entries: Iterable[Entry[Item]], queue: str, by: str = URGENT) -> Entry[I
     """The item /next shows, which is then pinned: in the urgent order the pinned one while it is
     in the queue, else the first; in the oldest or newest order the first."""
     with locked():
-        state = _read_state(queue)
+        state = read_queue_state(queue)
         ranked = order(entries, state.current if _checked(by) == URGENT else "", by, state.ended)
         if not ranked:
             return None
@@ -360,7 +368,7 @@ def top_across(queues: Mapping[str, Sequence[Entry[Item]]], name: str, by: str =
     for oldest or newest, then by level, then the oldest. A value never compares across queues.
     """
     with locked():
-        state = _read_state(name)
+        state = read_queue_state(name)
         firsts: list[tuple[tuple[bool, float, tuple[bool, float], tuple[int, float], float], str, Entry[Item]]] = []
         for queue, entries in queues.items():
             ends = ended(queue)
@@ -387,7 +395,7 @@ def top_across(queues: Mapping[str, Sequence[Entry[Item]]], name: str, by: str =
 def move_to_end(queue: str, key: str, now: datetime) -> None:
     """Move the item `key` to the end of its queue; it is no longer current there."""
     with locked():
-        state = _read_state(queue)
+        state = read_queue_state(queue)
         ends = dict(state.ended)
         ends[key] = now.replace(microsecond=0)
         _write_state(queue, QueueState("" if state.current == key else state.current, state.source, ends))

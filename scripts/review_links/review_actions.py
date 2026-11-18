@@ -36,23 +36,42 @@ class NoScopedWait:
 NO_SCOPED_WAIT = NoScopedWait()
 
 
-def record_action(item: review_items.ReviewItem, words: str) -> None:
+def record_action(item: review_items.ReviewItem, words: str, *, root: Path | None = None,
+                  check: Callable[[], object] | None = None) -> None:
     source = item.source
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
-        update_registration.record_review_log(source.record,words)
+        update_registration.record_review_log(source.record, words, check=check)
     elif isinstance(source, review_items.InvestigationSource):
-        investigation.record_review_log(source.record.owner,source.record.id,words)
+        investigation.record_review_log(source.record.owner, source.record.id, words, check=check)
     elif isinstance(source, review_items.ChangeSource):
-        assert isinstance(source.assignment.production, Path)
-        change_review.record_review_log(source.path,source.row['#'],words,source.assignment.production)
-    elif isinstance(source, (review_items.ProposalSource, review_items.EfficiencySource)):
-        _ = decision_store.record(item,words,KeepMark())
+        production = source.assignment.production
+        assert isinstance(production, Path)
+        if check is None:
+            change_review.record_review_log(source.path, source.row['#'], words, production)
+        else:
+            assert root is not None
+            with change_review.checked_review_write(source.path, root, check):
+                change_review.record_review_log(source.path, source.row['#'], words, production)
+    elif isinstance(source, review_items.ProposalSource):
+        _ = proposal_issue.record_review(source.record.path, words, KeepMark(), datetime.now(user_zone()).date(), check=check)
+    elif isinstance(source, review_items.EfficiencySource):
+        _ = efficiency_reviews.record(source.path, decision_store.efficiency_identity(item), words, KeepMark(), check=check)
+    elif check is not None:
+        _ = check()
 
 
 def record_superseded(item: review_items.ReviewItem, action: str) -> None:
     """Keep the displaced wait in the record and the owner's production log."""
-    words = f'User chose {action} before the answer; superseded the previous wait.'
+    words = superseded_words(action)
     record_action(item, words)
+    log_superseded(item, words)
+
+
+def superseded_words(action: str) -> str:
+    return f'User chose {action} before the answer; superseded the previous wait.'
+
+
+def log_superseded(item: review_items.ReviewItem, words: str) -> None:
     scope = update_registration.question_scope(item.owner, staff.snapshot())
     if isinstance(scope, Production):
         update_registration.append_log(scope, f'Review {item.id}: '+words, None, False)
@@ -65,7 +84,7 @@ def delivery_page(item: review_items.ReviewItem, status: change_page.DeliverySta
         path = source.record.path
         row = path.stem
     elif isinstance(source, review_items.InvestigationSource):
-        path = investigation.folder(source.record.owner)/(source.record.id+'.md')
+        path = source.path
         row = source.record.id
     else:
         assert isinstance(source, review_items.EfficiencySource)
@@ -88,6 +107,8 @@ def track_question(delivery: change_page.MessageDelivery, key: str, words: str,
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
         question = slots.question
+        if isinstance(delivery.page, change_page.UserQuestionPage) and delivery.page.saved.get('question_id'):
+            return delivery
         assert isinstance(question, change_page.OpenQuestion)
         identity = question.question_id
         message = delivery.message.replace(change_page.reply_command(key), change_page.reply_command(key, identity))
@@ -115,7 +136,9 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
         return sent_question_action(item, source.record, scope, action, words, status)
     with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
         current = update_registration.current_open_question(source.record, 'followup')
-        pending = current.item.pop('followup')
+        pending = current.item.pop('followup', None)
+        if pending is None:
+            raise review_items.ReviewRecordChanged('No follow-up waits for a reply on this question.')
         events = review_events.decode(current.item.get('review_log', ''))
         event = review_events.ReviewLog(datetime.now(user_zone()), 'nate', 'Superseded followup: '+pending['text'])
         current.item['review_log'] = review_events.encode(review_events.append(events, event))
@@ -128,7 +151,8 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
 
 def sent_question_action(item: review_items.ReviewItem, record: update_registration.QuestionRecord,
                          scope: update_registration.QuestionScope, action: change_page.QuestionOutcome, words: str,
-                         status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
+                         status: change_page.DeliveryStatus, *,
+                         verify_revision: Callable[[], object] | None = None) -> tuple[change_page.MessageDelivery, str]:
     from scripts.review_links.change_browser import question_message
 
     if action not in ('answer', 'feedback', 'question'):
@@ -152,10 +176,13 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
     page = change_page.UserQuestionPage(record.path, document, (record.path.stem,), '', saved)
 
     def save() -> None:
-        if item.state == review_items.ReviewState.WAITING:
-            record_superseded(item, action)
-        update_registration.review_sent_question(record, scope, action, words,
-                                                scoped.token if isinstance(scoped, ScopedWait) else '')
+        with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
+            if verify_revision is not None:
+                _ = verify_revision()
+            if item.state == review_items.ReviewState.WAITING:
+                record_superseded(item, action)
+            update_registration.review_sent_question(record, scope, action, words,
+                                                    scoped.token if isinstance(scoped, ScopedWait) else '')
 
     delivery = save_delivery(page, record.owner, save, status, change_page.NoQuestion())
     return delivery, {'answer': words, 'question': 'question sent', 'feedback': 'feedback sent'}[action]
@@ -166,22 +193,26 @@ def resume_efficiency(item: review_items.ReviewItem) -> None:
     source = item.source
     assert isinstance(source, review_items.EfficiencySource)
     identity = decision_store.efficiency_identity(item)
-    lines = source.path.read_text().splitlines()
-    index = int(identity[1:])-1
-    head, separator, result = lines[index].partition(' — ')
-    lines[index] = head+separator+re.sub(r'^deferred\b', 'proposed', result, count=1)
-    atomic_file.write_text_atomic(source.path, '\n'.join(lines)+'\n')
+    with efficiency_reviews.ledger_lock(source.path):
+        lines = source.path.read_text().splitlines()
+        index = int(identity[1:])-1
+        if index >= len(lines) or lines[index] != source.line:
+            raise review_items.ReviewRecordChanged('The efficiency ledger entry changed.')
+        head, separator, result = lines[index].partition(' — ')
+        if result.startswith('deferred'):
+            lines[index] = head+separator+re.sub(r'^deferred\b', 'proposed', result, count=1)
+            atomic_file.write_text_atomic(source.path, '\n'.join(lines)+'\n')
 
 
-def later(item: review_items.ReviewItem, value: str, words: str) -> str:
+def later(item: review_items.ReviewItem, value: str, words: str, *,
+          verify_revision: Callable[[], object] | None = None, root: Path | None = None) -> str:
     if isinstance(item.source, review_items.ChangeSource) and isinstance(
             item.source.assignment.production, change_routing.UnavailableProduction):
         raise question_record.AnswerRefused("the production document is not available")
     until = datetime.fromisoformat(value)
-    # A menu preset sends UTC; the record and the answer use the user zone.
     until = until.replace(tzinfo=user_zone()) if until.tzinfo is None else until.astimezone(user_zone())
-    record_action(item,'Later until '+until.isoformat()+(': '+words if words else ''))
-    review_later.save(item.key,until)
+    event = 'Later until '+until.isoformat()+(': '+words if words else '')
+    review_later.save(item.key, until, check=lambda: record_action(item, event, root=root, check=verify_revision))
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
 
@@ -213,12 +244,13 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page,row),'claimed')
         try:
             _ = save()
-            page = replace(page,saved={**page.saved,'saved':True})
-            status.write_slots(page,row,status.slots(page,row))
         except BaseException:
             status.write_slots(previous_page, row, previous_slots)
             raise
-    return change_page.MessageDelivery(page,row,(owner,),page.saved['message'],attempt,(owner,))
+        page = replace(page,saved={**page.saved,'saved':True})
+        with review_items.after_store_write(page.saved["source"]):
+            status.write_slots(page,row,status.slots(page,row))
+    return change_page.MessageDelivery(page,row,(owner,),page.saved["message"],attempt,(owner,))
 
 
 def message_text(item: review_items.ReviewItem, action: str, words: str) -> str:
@@ -230,7 +262,9 @@ def message_text(item: review_items.ReviewItem, action: str, words: str) -> str:
 
 
 def investigation_action(item: review_items.ReviewItem, action: str, words: str,
-                         status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery,str]:
+                         status: change_page.DeliveryStatus, *,
+                         verify_revision: Callable[[], object] | None = None
+                         ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     source = item.source
     assert isinstance(source,review_items.InvestigationSource)
     record = source.record
@@ -242,61 +276,75 @@ def investigation_action(item: review_items.ReviewItem, action: str, words: str,
         raise investigation.InvestigationError('enter your words')
     def save() -> None:
         if waiting:
-            record_superseded(item, action)
-        if isinstance(scoped, ScopedWait):
-            _ = investigation.review_action(record.owner, record.id, action, words, reply_token=scoped.token)
-        elif waiting:
-            investigation.change_waiting(record, action, words)
+            if isinstance(scoped, ScopedWait):
+                _ = investigation.review_action(record.owner, record.id, action, words, reply_token=scoped.token, check=verify_revision)
+            else:
+                investigation.change_waiting(record, action, words, check=verify_revision)
+            with review_items.after_store_write(item.key):
+                record_superseded(item, action)
+        elif isinstance(scoped, ScopedWait):
+            _ = investigation.review_action(record.owner, record.id, action, words, reply_token=scoped.token, check=verify_revision)
         elif action == 'read':
-            _ = investigation.mark_read(record.owner, record.id, words)
+            _ = investigation.mark_read(record.owner, record.id, words, check=verify_revision)
         else:
-            _ = investigation.review_action(record.owner, record.id, action, words)
+            _ = investigation.review_action(record.owner, record.id, action, words, check=verify_revision)
     if action == 'read':
         save()
-        clear_wait(item, status)
+        with review_items.after_store_write(item.key):
+            clear_wait(item, status)
         return change_page.NoMessageDelivery(),'marked read'
     message = f'Review {item.id}: '+('Ask question' if action == 'question' else 'feedback sent')+'\n'+words
     if action == 'question':
         message += '\nAnswer with this command:\n'+change_page.reply_command(item.key)
-    path = investigation.folder(record.owner)/(record.id+'.md')
+    path = source.path
     delivery = send(item,path,record.id,message,save,status,question_text=words if action == 'question' else '', scoped=scoped)
     return delivery,('question sent' if action == 'question' else 'feedback sent')
 
 
 def decision_action(item: review_items.ReviewItem, action: str, words: str,
-                    status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery,str]:
+                    status: change_page.DeliveryStatus, *,
+                    verify_revision: Callable[[], object] | None = None
+                    ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     """Apply Approve, Decline, Send feedback or Ask question to a proposal or an efficiency."""
     source = item.source
     if action in ('feedback','question') and not words.strip():
         raise question_record.AnswerRefused('enter your words')
     waiting = item.state == review_items.ReviewState.WAITING
-    def supersede() -> None:
-        if waiting:
-            record_superseded(item, action)
-            if isinstance(source, review_items.EfficiencySource):
-                resume_efficiency(item)
+    answer = ('approved, sent to '+review_items.name(item.owner,staff.snapshot()) if action == 'approve' else
+              {'decline':'declined','feedback':'feedback sent','question':'question sent'}[action])
     logged = {'feedback':'feedback sent','question':'question','approve':'Approve','decline':'Decline'}[action]
     logged += ': '+words if words else ''
     mark: MarkChange = ReviewMark.WAITING if action == 'question' else ReviewMark.DONE
     message = message_text(item,action,words)
+    events = (superseded_words(action), logged) if waiting else (logged,)
     if isinstance(source, review_items.EfficiencySource):
         identity = decision_store.efficiency_identity(item)
         if action == 'decline':
-            supersede()
             try:
-                _ = candidates.record_outcome(identity,'declined','',source.path)
+                with efficiency_reviews.ledger_lock(source.path, check=verify_revision):
+                    _ = candidates.record_outcome(identity,'declined','',source.path)
             except candidates.OutcomeRefused as error:
                 raise question_record.AnswerRefused(str(error)) from error
-            _ = decision_store.record(item,logged,NoMark())
-            clear_wait(item, status)
-            return change_page.NoMessageDelivery(),'declined'
+            with review_items.after_store_write(item.key):
+                _ = efficiency_reviews.record(source.path, identity, events, NoMark())
+            if waiting:
+                with review_items.after_store_write(item.key):
+                    log_superseded(item, events[0])
+            with review_items.after_store_write(item.key):
+                clear_wait(item, status)
+            return change_page.NoMessageDelivery(),answer
         if action == 'approve':
             message += ('\n'+source.line+'\nApply the change, then record it with this command:\n'
                         +PY+f"nightly_review/candidates.py outcome {identity} accepted --applied '<repo> <sha>' "
                         +'--ledger '+shlex.quote(str(source.path)))
         def save_efficiency() -> None:
-            supersede()
-            _ = decision_store.record(item, logged, mark, waiting_why=words if action == 'question' else '')
+            _ = efficiency_reviews.record(source.path, identity, events, mark, check=verify_revision,
+                                          waiting_why=words if action == 'question' else '')
+            if waiting:
+                with review_items.after_store_write(item.key):
+                    resume_efficiency(item)
+                with review_items.after_store_write(item.key):
+                    log_superseded(item, events[0])
         delivery = send(item,efficiency_reviews.path(source.path),identity,message,save_efficiency,status,
                         question_text=words if action == 'question' else '')
     else:
@@ -313,16 +361,18 @@ def decision_action(item: review_items.ReviewItem, action: str, words: str,
             message += '\nThe page recorded the decline. Close the issue with /close_issue.'
 
         def save() -> None:
-            supersede()
+            day = datetime.now(user_zone()).date()
             if action == 'decline':
-                _ = proposal_issue.edit(issue,{'style_answer':'declined','style_answer_words':words},
-                                        datetime.now(user_zone()).date())
-            if isinstance(scoped, ScopedWait):
-                _ = proposal_issue.record_review(issue, logged, mark, datetime.now(user_zone()).date(),
-                                                 waiting_why=words, reply_token=scoped.token)
+                _ = proposal_issue.edit(issue, {'style_answer':'declined', 'style_answer_words':words},
+                                        day, check=verify_revision)
+                with review_items.after_store_write(item.key):
+                    _ = proposal_issue.record_review(issue, events, NoMark(), day)
             else:
-                _ = decision_store.record(item,logged,mark if action != 'decline' else NoMark(),
-                                          waiting_why=words if action == 'question' else '')
+                _ = proposal_issue.record_review(issue, events, mark, day, check=verify_revision,
+                                                 waiting_why=words if action == 'question' else '',
+                                                 reply_token=scoped.token if isinstance(scoped, ScopedWait) else '')
+            if waiting:
+                with review_items.after_store_write(item.key):
+                    log_superseded(item, events[0])
         delivery = send(item,issue,issue.stem,message,save,status,question_text=words if action == 'question' else '', scoped=scoped)
-    return delivery,{'approve':'approved, sent to '+review_items.name(item.owner,staff.snapshot()),'decline':'declined',
-                     'feedback':'feedback sent','question':'question sent'}[action]
+    return delivery,answer
