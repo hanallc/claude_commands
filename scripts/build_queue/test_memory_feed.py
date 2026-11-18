@@ -2537,39 +2537,63 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(gate, "builds_slice_cgroup", return_value=self.root / "builds.slice")):
             return memory_feed.build_tool_ram((), 0, waiters)
 
-    def test_detached_test_scope_counts_children_and_mixed_groups_follow_ancestry(self) -> None:
+    def test_unmarked_detached_scope_estimates_test_only_and_mixed_charges(self) -> None:
         _ = self.tool_process(101, "python3 -m unittest", 10, children=(102,))
         _ = self.tool_process(102, "python3 -c child", 20, parent=101, children=(103,))
         _ = self.tool_process(103, "sleep 10", 10, parent=102)
         _ = self.tool_process(104, "other", 50)
         builds = self.root / "builds.slice"
         scope = builds / "builds-detached.slice" / "tests.scope"
-        unit = self.tool_scope_unit(scope, "/usr/bin/python3 -m unittest")
-        for members, expected in (((101, 102, 103), 100), ((101, 102, 103, 104), 40)):
+        cases: tuple[tuple[tuple[int, ...], int], ...] = (
+            ((101, 102, 103), 100),
+            ((101, 102, 103, 104), 40),
+            ((), 0),
+        )
+        for members, expected in cases:
             with self.subTest(members=members):
                 write_scope(builds, anonymous=100 * 1024)
                 write_scope(scope.parent, anonymous=100 * 1024)
                 write_scope(scope, members=members, anonymous=100 * 1024)
                 self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, (100 - expected) * 1024,
                                                                            python_tests=expected * 1024))
-            unit.unlink(missing_ok=True)
 
     def test_detached_test_scope_keeps_its_class_after_the_runner_exits(self) -> None:
         _ = self.tool_process(102, "python3 -c child", 20)
         builds = self.root / "builds.slice"
-        scope = builds / "builds-detached.slice" / "run-test.scope"
+        run_id = "20261117T192504-3473301-5b4c"
+        scope = builds / "builds-detached.slice" / f"detached-python-tests-{run_id}.scope"
+        child_group = scope / "children"
         write_scope(builds, anonymous=100 * 1024)
         write_scope(scope.parent, anonymous=100 * 1024)
-        write_scope(scope, members=(102,), anonymous=100 * 1024)
+        write_scope(scope, anonymous=100 * 1024)
+        write_scope(child_group, members=(102,), anonymous=70 * 1024)
+        record = self.root / "detached_runs" / f"{run_id}.json"
+        record.parent.mkdir()
+        _ = record.write_text('{"status": "finished", "kind": "python-tests"}')
         expected = memory_feed.BuildToolRam(0, 0, 0, python_tests=100 * 1024)
-        for command in (
-            "/usr/bin/python3 -B -m unittest",
-            '/bin/sh -c "exec runner" /fixture/detached_runs/runner.scope ./scripts/lib/py -m unittest',
+        with (mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.root)}),
+              mock.patch.object(memory_feed.ToolProcessReader, "command", side_effect=AssertionError("live command read"))):
+            self.assertEqual(self.tool_split(), expected)
+            record.unlink()
+            self.assertEqual(self.tool_split(), expected)
+
+    def test_detached_scope_without_test_evidence_counts_as_other_tools(self) -> None:
+        builds = self.root / "builds.slice"
+        detached = builds / "builds-detached.slice"
+        for name, command in (
+            ("run-test.scope", "python3 -c child"),
+            ("detached-other-20261117T192504-3473301-5b4c.scope", "python3 -m unittest"),
         ):
-            with (self.subTest(command=command),
-                  mock.patch.object(memory_feed.ToolProcessReader, "command", side_effect=AssertionError("live command read"))):
-                _ = self.tool_scope_unit(scope, command)
-                self.assertEqual(self.tool_split(), expected)
+            with self.subTest(name=name):
+                _ = self.tool_process(102, command, 20)
+                scope = detached / name
+                unit = self.tool_scope_unit(scope, "/usr/bin/python3 -m unittest")
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(detached, anonymous=100 * 1024)
+                write_scope(scope, members=(102,), anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, 100 * 1024))
+                unit.unlink()
+                _ = scope.rename(self.root / name)
 
     def test_tool_group_split_names_both_byte_counts(self) -> None:
         builds = self.root / "builds.slice"
@@ -2664,14 +2688,14 @@ process.stdout.write(JSON.stringify({
                 detached = builds / "builds-detached.slice"
                 write_scope(builds, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
                 write_scope(detached, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
-                write_scope(detached / "python.scope", members=(python.pid,),
+                python_scope = detached / "detached-python-tests-20261117T192504-3473301-5b4c.scope"
+                write_scope(python_scope, members=(python.pid,),
                     current=python_use + cargo_use, anonymous=python_use + cargo_use)
-                _ = self.tool_scope_unit(detached / "python.scope", "/usr/bin/python3 -m unittest")
                 write_scope(detached / "verify.scope", members=(shell, waiter_pid, helper, unknown),
                             current=2 * gib, anonymous=2 * gib)
                 if cargo_use:
                     cargo = fixture.fixture_owner(700002, "200")
-                    sidecar = fixture.scope(cargo, folder="builds.slice/builds-detached.slice/python.scope/cargo.scope",
+                    sidecar = fixture.scope(cargo, folder=str((python_scope / "cargo.scope").relative_to(builds.parent)),
                         current=cargo_use, anonymous=cargo_use)
                     request = replace(fixture.request(owner=cargo, need=8 * admission_records.GIB), sidecar=str(sidecar))
                     grant = only_admitted(fixture.server.handle_request(request))

@@ -346,6 +346,7 @@ class DetachedRunsTests(unittest.TestCase):
                          ("running", 4321, WORKER, self.worker_id))
         self.assertNotIn("thread_id", record)
         self.assertEqual(record["command"], ["bash", "verify.sh", "check"])
+        self.assertEqual(record.get("kind"), "other")
         self.assertNotIn("port", record)
         self.assertIn("next message", output.getvalue())
         records[0].unlink()
@@ -897,9 +898,40 @@ sys.exit(1)
                 self.assertEqual(detached_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
         self.assertEqual(prefix[:2], ["systemd-run", "--user"])
         self.assertIn("--slice=builds-detached.slice", prefix)
+        self.assertIn("--unit=detached-other-r1.scope", prefix)
         self.assertEqual(prefix[-4:], ["/bin/sh", "-c", detached_runs.SCOPE_SCRIPT, str(marker)])
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
+
+    def test_declared_test_kind_names_the_scope_and_stays_in_the_record(self) -> None:
+        runtime = Path(self.stack.enter_context(short_socket_directory())) / "runtime"
+        (runtime / "systemd").mkdir(parents=True)
+        with self.supervisor_spawns(), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(detached_runs.main([
+                "start", "--session-dir", str(self.session), "--to", WORKER,
+                "--kind", "python-tests", "--", "env", "PYTHONPATH=.", "sh", "tests.sh",
+            ]), 0)
+        path, = (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
+
+        def run(command: list[str], _environment: dict[str, str], log: Path) -> int:
+            self.assertIn(f"--unit=detached-python-tests-{path.stem}.scope", command)
+            self.assertEqual(command[-4:], ["env", "PYTHONPATH=.", "sh", "tests.sh"])
+            log.with_suffix(".scope").touch()
+            return 0
+
+        with (socket.socket(socket.AF_UNIX) as manager,
+              patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime), "BUILDLOG_SCOPE": "1"}),
+              patch("shutil.which", return_value="/bin/systemd-run"),
+              patch("scripts.agents.detached_runs._run", side_effect=run)):
+            manager.bind(str(runtime / "systemd" / "private"))
+            record = self.supervise(path)
+        self.assertEqual(record.get("kind"), "python-tests")
+
+    def test_start_rejects_an_unknown_kind(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
+            _ = detached_runs.main(["start", "--kind", "unknown", "--", "true"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--kind", error.getvalue())
 
     # On 2026-11-17 a director sent TERM to a lint run's supervisor group. The supervisor died and its
     # verify.sh ran on for 3 hours with the cargo token. Each supervisor end now stops the command group.

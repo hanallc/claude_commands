@@ -35,6 +35,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import StrEnum
 from importlib import import_module
 from pathlib import Path
 from typing import IO, Literal, NotRequired, TypedDict, cast, override
@@ -80,6 +81,11 @@ COMMAND_GATE = ('read -r ready || exit 125; watcher_python=$1 watcher_script=$2;
 SUPERVISOR_GONE_REASON = "the supervisor ended before the command, so its watcher stopped the command"
 
 
+class DetachedRunKind(StrEnum):
+    PYTHON_TESTS = "python-tests"
+    OTHER = "other"
+
+
 class RunRecord(TypedDict):
     run_id: str
     status: Literal["running", "finished"]
@@ -88,6 +94,8 @@ class RunRecord(TypedDict):
     staff_id: str
     label: str
     command: list[str]
+    # Older records have no kind.
+    kind: NotRequired[Literal["python-tests", "other"]]
     log: str
     started_at: float
     pid: int
@@ -679,6 +687,7 @@ def command_start(args: argparse.Namespace) -> int:
         name = seat_name(session_dir, name)
     session_dir = str(Path(session_dir).resolve())
     label = str(getattr(args, "label", "") or "") or " ".join(command)
+    kind = cast(DetachedRunKind, getattr(args, "kind", DetachedRunKind.OTHER))
     done_file = str(getattr(args, "done_message_file", "") or "")
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
     runs = _runs_dir(session_dir).resolve()
@@ -714,6 +723,7 @@ def command_start(args: argparse.Namespace) -> int:
             record: RunRecord = {
                 "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
                 "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
+                "kind": kind.value,
                 "log": str(log_path), "started_at": time.time(), "pid": 0,
                 "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
             }
@@ -913,14 +923,16 @@ def deliver_in_fresh_process(record_path: Path) -> int:
         return 1
 
 
-def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
+def scope_prefix(marker: Path, environment: dict[str, str], *,
+                 kind: DetachedRunKind = DetachedRunKind.OTHER) -> list[str]:
     """Start the command in builds-detached.slice when a scope is available."""
     runtime = environment.get("XDG_RUNTIME_DIR", "")
     if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-            "--slice=builds-detached.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+            "--slice=builds-detached.slice", f"--unit=detached-{kind}-{marker.stem}.scope",
+            "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
@@ -997,7 +1009,9 @@ def command_supervise(args: argparse.Namespace) -> int:
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
-    prefix = scope_prefix(marker, environment)
+    kind = (DetachedRunKind.PYTHON_TESTS if record.get("kind") == DetachedRunKind.PYTHON_TESTS
+            else DetachedRunKind.OTHER)
+    prefix = scope_prefix(marker, environment, kind=kind)
     exit_code = _run(prefix + record["command"], environment, log)
     record = _read_record(record_path)
     if prefix and not marker.exists() and not record.get("stop_reason"):
@@ -1098,6 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--to", default="")
     _ = start.add_argument("--director-dir", default="", help="the run folder whose director hears results")
     _ = start.add_argument("--label", default="")
+    _ = start.add_argument("--kind", type=DetachedRunKind, choices=list(DetachedRunKind), default=DetachedRunKind.OTHER)
     _ = start.add_argument("--done-message-file", default="")
     _ = start.add_argument("command", nargs=argparse.REMAINDER)
     start.set_defaults(handler=command_start)

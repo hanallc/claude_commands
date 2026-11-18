@@ -12,12 +12,12 @@ import importlib
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never
 
@@ -2032,42 +2032,35 @@ def tool_group_children(path: Path) -> list[Path]:
         return []
 
 
+class ToolGroupKind(Enum):
+    PYTHON_TESTS = auto()
+    OTHER = auto()
+    UNMARKED = auto()
+
+
 @dataclass(frozen=True)
 class ToolGroup:
     members: set[int]
     children: list[Path]
-    python_test_scope: bool = False
-
-
-def scope_starts_python_tests(unit: Path) -> bool:
-    """Read the launch command from the transient scope file."""
-    prefix = "Description=[systemd-run] "
-    try:
-        description = next((line[len(prefix):] for line in unit.read_text().splitlines()
-                            if line.startswith(prefix)), "")
-        command = tuple(shlex.split(description))
-    except (OSError, ValueError):
-        return False
-    if command[:2] == ("/bin/sh", "-c") and len(command) > 4:
-        # The detached launcher gives its shell a marker, then the command.
-        marker = Path(command[3])
-        if marker.suffix == ".scope" and marker.parent.name == "detached_runs":
-            command = command[4:]
-    return python_test_command(command)
+    kind: ToolGroupKind = ToolGroupKind.OTHER
 
 
 def detached_tool_groups(detached: Path, excluded: set[Path]) -> dict[Path, ToolGroup]:
-    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
-    transient = runtime / "systemd" / "transient"
     groups: dict[Path, ToolGroup] = {}
-    pending = [(detached, False)]
+    pending = [(detached, ToolGroupKind.UNMARKED)]
     while pending:
-        path, python_scope = pending.pop()
-        if path not in excluded:
-            python_scope = python_scope or (path.suffix == ".scope" and scope_starts_python_tests(transient / path.name))
-            children = tool_group_children(path)
-            groups[path] = ToolGroup(tool_group_members(path), children, python_scope)
-            pending.extend((child, python_scope) for child in children)
+        path, kind = pending.pop()
+        if path in excluded:
+            continue
+        # The detached launcher sets the scope name before the command starts.
+        if path.suffix == ".scope":
+            if path.stem.startswith("detached-python-tests-"):
+                kind = ToolGroupKind.PYTHON_TESTS
+            elif path.stem.startswith("detached-other-"):
+                kind = ToolGroupKind.OTHER
+        children = tool_group_children(path)
+        groups[path] = ToolGroup(tool_group_members(path), children, kind)
+        pending.extend((child, kind) for child in children)
     return groups
 
 
@@ -2145,9 +2138,9 @@ def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], cha
     detached = builds / "builds-detached.slice"
     groups = detached_tool_groups(detached, excluded)
     members = {pid for group in groups.values() for pid in group.members}
-    mixed_members = {pid for group in groups.values() if not group.python_test_scope for pid in group.members}
     non_tests = waiting.queued | waiting.wrappers | charged
-    tests = detached_test_processes(mixed_members - non_tests, reader)
+    unmarked_members = {pid for group in groups.values() if group.kind is ToolGroupKind.UNMARKED for pid in group.members}
+    tests = detached_test_processes(unmarked_members - non_tests, reader)
     for pid in waiting.wrappers - charged - members:
         path = waiting_tool_group(pid, builds, outside, excluded)
         if path is not None and path not in groups:
@@ -2163,9 +2156,14 @@ def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], cha
     result: dict[Path, ToolGroupRam] = {}
     for path, group in groups.items():
         members = group.members
-        group_tests = members - non_tests if group.python_test_scope else members & tests
+        group_tests: set[int] = set()
+        if group.kind is ToolGroupKind.PYTHON_TESTS:
+            group_tests = members - non_tests
+        elif group.kind is ToolGroupKind.UNMARKED:
+            group_tests = members & tests
         group_wrappers = (members & waiting.wrappers) - charged
-        whole_test_scope = group.python_test_scope and group_tests == members
+        # For an unmarked group, estimate that all direct memory belongs to tests only if every live member qualifies.
+        whole_test_scope = group_tests == members and (bool(members) or group.kind is ToolGroupKind.PYTHON_TESTS)
         if not (whole_test_scope or group_tests or group_wrappers):
             continue
         try:
