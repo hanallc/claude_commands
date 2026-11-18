@@ -64,7 +64,7 @@ from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
 from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
-from scripts.mac_test import eligibility
+from scripts.mac_test import eligibility, nextest_log
 from scripts.mac_test.eligibility import (
     MacVerb,
     NonBusyMacDeclineReason,
@@ -80,6 +80,7 @@ from scripts.lib import build_folders
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+MAC_NEXTTEST_SETUP_FAILURE = "mac_nextest_setup=failed"
 # The Mac cargo gate's links (scripts/mac_test/cargo_gate/bin) in the installed copy.
 MAC_CARGO_GATE_BIN = "$HOME/.claude/scripts/mac_test/cargo_gate/bin"
 
@@ -763,6 +764,13 @@ class ReportedMacStatus:
 
 
 @dataclass(frozen=True)
+class MacNextestSetupFailed:
+    """The remote command reported a nextest setup failure."""
+
+    cleanup: CleanupOutcome = CleanupUnconfirmed()
+
+
+@dataclass(frozen=True)
 class ToolVersionMismatch:
     """The reason describes incompatible local and remote tool versions."""
     reason: str
@@ -785,7 +793,8 @@ class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy
+RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -1058,7 +1067,7 @@ class ProcessController:
             for raw_line in output:
                 if isinstance(raw_line, bytes):
                     received_bytes += len(raw_line)
-                    line = raw_line.decode()
+                    line = raw_line.decode("utf-8", errors="replace")
                 else:
                     received_bytes += len(raw_line.encode("utf-8"))
                     line = raw_line
@@ -1091,13 +1100,16 @@ class ProcessController:
                     cleanup = CleanupUnconfirmed()
                     continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
-                if status_match is not None:
+                if status_match is not None or marker == MAC_NEXTTEST_SETUP_FAILURE:
                     if held_status_line:
                         print(held_status_line, end="", flush=True)
-                    status_digits = status_match.group(1).lstrip("0") or "0"
-                    mac_status = int(status_digits) if len(status_digits) <= 3 else 256
-                    status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
-                    if isinstance(status, ReportedMacStatus):
+                    if status_match is None:
+                        status = MacNextestSetupFailed()
+                    else:
+                        status_digits = status_match.group(1).lstrip("0") or "0"
+                        mac_status = int(status_digits) if len(status_digits) <= 3 else 256
+                        status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
+                    if isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
                         self.pending = AcknowledgedStartOperation()
                         held_status_line = line
                     else:
@@ -1133,10 +1145,12 @@ class ProcessController:
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
-        if mismatch and not isinstance(status, (ReportedMacStatus)):
+        if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
+        if isinstance(status, MacNextestSetupFailed):
+            return MacNextestSetupFailed(cleanup)
         if mirror_refused:
             return MirrorUseBusy()
         if isinstance(status, UnresolvedSlotStartup):
@@ -1329,12 +1343,7 @@ def linux_mirror_root() -> Path:
 
 def mac_mirror_root() -> MacMirrorRoot:
     """Read the remote mirror root without expanding the local home folder."""
-    def mirror_root(value: str) -> MacMirrorRoot:
-        if not value.startswith("~/"):
-            raise ValueError("mirror_root must start with ~/")
-        return MacMirrorRoot(value[2:])
-
-    return conf.read("mac_test").value("mirror_root", mirror_root)
+    return conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
 
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -2010,9 +2019,17 @@ def remote_test_command(
         "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
         if isinstance(request.placement, AssignedOffloadRequest) else ""
     )
+    capture = ""
+    report_status = "; echo mac_exit=$?"
+    if request.verb == "nextest":
+        limits = nextest_log.output_limits(config.settings)
+        capture = nextest_log.capture_function(limits) + " && "
+        # The writer reports the child status. A failed launch takes the setup path.
+        report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
+    runner = "run_nextest_logged " if capture else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
@@ -2025,7 +2042,7 @@ def remote_test_command(
         f"{forced_config}"
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
+        f"{runner}~/.claude/scripts/lint/lint {invocation}{report_status}; {cleanup_command}"
     )
 
 
@@ -2526,6 +2543,11 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        try:
+            step_command = remote_test_command(config, request, repository, copied.tree_key)
+        except ValueError as error:
+            evidence.execution = placement.ExecutionNotStarted()
+            return DeclinedMacRun("state", elapsed_seconds(started), str(error))
         eligibility.mirror_busy_path(repository.name, request.target).unlink(missing_ok=True)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
@@ -2571,8 +2593,7 @@ def claimed_run(
             evidence.launch_authorized = True
         release_allowed = False
         identity = controller.claim_identity
-        command = copies.remote_use_command(request_mirror(config, request, repository),
-                                           remote_test_command(config, request, repository, copied.tree_key))
+        command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         remote_status = controller.stream_mac_run(
@@ -2585,7 +2606,7 @@ def claimed_run(
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        if not isinstance(remote_status, ReportedMacStatus):
+        if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
                 if isinstance(settlement, StartUnsettled):
@@ -2610,8 +2631,11 @@ def claimed_run(
             return LostMacRun(elapsed_seconds(started), detail)
         if not linux:
             eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
-        fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
-        if not linux and isinstance(request.fetch, FetchFolder):
+        setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
+                        or (linux and remote_status.status == os.EX_TEMPFAIL))
+        fetched = (fetch_folder(controller, config, request, repository)
+                   if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
+        if not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder):
             cleanup = controller.stream_mac_run([
                 *ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
@@ -2632,7 +2656,9 @@ def claimed_run(
             release_allowed = True
         sync_after_release = linux
         seconds = elapsed_seconds(started)
-        if linux and remote_status.status == 75:
+        if isinstance(remote_status, MacNextestSetupFailed) or setup_failed:
+            if not linux:
+                evidence.execution = placement.ExecutionNotStarted()
             return declined("state", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)

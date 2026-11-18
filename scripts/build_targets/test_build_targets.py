@@ -850,6 +850,25 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                 mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
                 self.assertEqual(mac.eligibility, expected)
 
+    def test_claude_doc_exclusion_applies_only_to_the_default_route(self) -> None:
+        cases: tuple[tuple[str, build_targets.StepKind, TargetSelection, placement.HostEligibility], ...] = (
+            (".claude", "doc", ROUTED, placement.FixedExclusion("offload_exclude")),
+            (".claude", "doc", Pinned("mac"), placement.AllowedHost()),
+            (".claude", "lint", ROUTED, placement.AllowedHost()),
+            ("hana", "doc", ROUTED, placement.AllowedHost()),
+            ("hana", "lint", ROUTED, placement.AllowedHost()),
+        )
+        for repo, kind, selection, expected in cases:
+            with self.subTest(repo=repo, kind=kind, selection=selection), mock.patch.object(
+                eligibility, "repository_identity", return_value=eligibility.KnownRepository(repo),
+            ):
+                constraints = build_targets.fixed_placement_constraints(
+                    self.root, "portable", kind, ("cargo", kind), NoOwningSession(), "fixed-source",
+                    selection=selection)
+                mac, = (candidate for candidate in constraints.candidates
+                        if candidate.destination.target == "mac")
+                self.assertEqual(mac.eligibility, expected)
+
     def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:
         self.assertEqual(self.kind_answer("check", free_gib=59), "any_target\n")
         offload.write_backoff(time.time() + 60)

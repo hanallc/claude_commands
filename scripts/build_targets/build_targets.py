@@ -411,7 +411,7 @@ def fixed_placement_constraints(
                 target = replace(target, settings=provider_settings.path)
                 settings = provider_settings
             candidates.extend(fixed_remote_candidates(
-                target, settings, repository, repo_root, package, kind, command, rule, selection))
+                target, settings, repository, repo_root, package, kind, command, rule, selection=selection))
     source = placement.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
     return placement.PlacementConstraints(source, command, str(repo_root), package, session, tuple(candidates),
         placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder(),
@@ -421,7 +421,7 @@ def fixed_placement_constraints(
 def fixed_remote_candidates(
     target: SshTarget, settings: ProviderSettings, repository: eligibility.RepositoryIdentity,
     repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...], rule: AnyTarget | NatedevOnly,
-    selection: TargetSelection,
+    *, selection: TargetSelection,
 ) -> tuple[placement.PlacementCandidate, ...]:
     """Read the remote keys that determine the fixed candidate set."""
     from scripts.aws_target import hana_placement, hana_placement_adapter
@@ -467,6 +467,11 @@ def fixed_remote_candidates(
         host = eligibility.SshProbeSettings(configuration).host
         if isinstance(rule, NatedevOnly):
             policy = placement.FixedExclusion(rule.reason)
+        elif (selection == ROUTED and target_config.uses_legacy_mac_layout(target.platform)
+                and isinstance(repository, eligibility.KnownRepository)
+                and kind in configuration.value(f"offload_exclude.{repository.name}",
+                                                eligibility.comma_values, default=set(), allow_blank=True)):
+            policy = placement.FixedExclusion("offload_exclude")
         else:
             answer = eligibility.configured_step_policy(configuration, target.platform, repository, repo_root, package, kind)
             if isinstance(answer, eligibility.IneligibleMacStep):
