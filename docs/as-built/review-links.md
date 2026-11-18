@@ -391,8 +391,8 @@ The fresh index supplies each item's state and revision, including items outside
 The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
 An owner answer returns to Open after a refresh from Waiting or Done.
 Stable chip IDs retain keyboard focus after a Show load or refresh.
-The shared table owns the Show state for both chip groups and selects.
-The List keeps its Show select.
+Review and The List use Show chips.
+The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 The Type, Show and Owner chip rows wrap at phone width.
 All types that wait on the user have the state Open.
@@ -579,6 +579,15 @@ The Producer cell shows the name of the record's producer.
 The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
+
+The shared filter controls show the Show, State, Owner, and Producer rows in that order.
+Show selects a view such as Open or Parked.
+State selects an item state within that view.
+The four rows and the words box must all match the item.
+The words box at the upper right matches the item number, owner, title, or state.
+Each row starts with All.
+Each chip count reflects the other rows and the words box.
+A zero-count chip stays visible and dimmed.
 
 A link under Links opens the target item in the console.
 The table changes Show to All if the target is outside the current view.

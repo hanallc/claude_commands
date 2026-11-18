@@ -11,6 +11,52 @@ from typing import cast
 from scripts.review_links import record_table, review_page
 
 
+class FilterControlTests(unittest.TestCase):
+    def test_chip_row_starts_with_all_and_renders_counts(self) -> None:
+        row = record_table.chip_row('Owner', (
+            record_table.Chip('one', '<span>One</span>', 0),
+            record_table.Chip('all', 'All', 2),
+            record_table.Chip('two', 'Two'),
+        ), 'one')
+        self.assertIn('role="group" aria-label="Owner" data-filter-row="owner"', row)
+        self.assertEqual([part.split('"', 1)[0] for part in row.split('data-filter-value="')[1:]],
+                         ['all', 'one', 'two'])
+        self.assertIn('aria-pressed="false" data-filter-count="2">All<b>2</b>', row)
+        self.assertIn('aria-pressed="true" data-filter-count="0"><span>One</span><b>0</b>', row)
+        self.assertIn('data-filter-count="">Two<b></b>', row)
+        self.assertIn('aria-label="Filter by &quot;words&quot;"',
+                      record_table.words_box('review-search', 'Filter by "words"'))
+
+    def test_control_keeps_zero_chips_and_selects_all_if_selection_is_hidden(self) -> None:
+        node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
+        result = subprocess.run([node, '-e', record_table.SCRIPT + r'''
+const assert=require('node:assert/strict'),row=new EventTarget(),changes=[];
+const buttons=['all','one','two'].map(value=>{
+ const button=new EventTarget(),attributes={},count={};
+ Object.assign(button,{dataset:{filterValue:value},hidden:false,
+  setAttribute:(name,text)=>attributes[name]=text,getAttribute:name=>attributes[name],
+  querySelector:()=>count});
+ return button;
+});
+Object.assign(row,{querySelectorAll:()=>buttons,hasAttribute:()=>false});
+filterControl.bind(row,value=>changes.push(value));
+filterControl.setCounts(row,{all:2,one:2});
+assert.equal(buttons[2].dataset.filterCount,'0');
+assert.equal(buttons[2].querySelector('b').textContent,'0');
+assert.equal(buttons[2].hidden,false);
+buttons[2].dispatchEvent(new Event('click'));
+assert.deepEqual(changes,['two']);
+assert.equal(buttons[2].getAttribute('aria-pressed'),'true');
+assert.equal(filterControl.setVisible(row,['one']),'all');
+assert.equal(buttons[0].hidden,false);
+assert.equal(buttons[0].getAttribute('aria-pressed'),'true');
+assert.equal(buttons[2].hidden,true);
+assert.equal(filterControl.select(row,'two'),'all');
+assert.deepEqual(changes,['two']);
+'''], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str, *, closed_item: str = '') -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))

@@ -5,6 +5,7 @@ import html
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -254,6 +255,10 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
         listing = listing.replace(b'</body>', b'''<script>
 addEventListener('message',event=>{
  if(event.source!==parent || event.origin!==location.origin || !event.data.clickListLink) return;
+ if(event.data.pendingWords){
+  const search=document.querySelector('#list-search');
+  search.value=event.data.pendingWords;search.dispatchEvent(new Event('input'));
+ }
  const links=document.querySelectorAll('[data-number="1"] [data-detail] a');
  [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
 });
@@ -272,35 +277,57 @@ frame.addEventListener('load',async()=>{
  try{
   const doc=frame.contentDocument,win=frame.contentWindow;
   const row=id=>doc.querySelector('[data-number="'+id+'"]');
-  const source=row(1),target=row(number),show=doc.querySelector('#list-show');
-  const owner=doc.querySelector('#list-owner'),producer=doc.querySelector('#list-producer'),search=doc.querySelector('#list-search');
-  const originalFilters=[owner.value,producer.value,search.value];
+  const source=row(1),target=row(number),search=doc.querySelector('#list-search');
+  const chip=(name,value)=>doc.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
+  const selected=name=>doc.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
+  const filters=()=>[selected('owner'),selected('producer'),search.value,selected('state')];
+  const pendingWords=scenario==='pending-words' ? 'item' : '';
+  const originalFilters=filters();
+  if(pendingWords) originalFilters[2]=pendingWords;
   const link=[...source.querySelectorAll('a')].find(a=>a.textContent==='#'+number);
   const expanded=item=>item.querySelector('.list-toggle').getAttribute('aria-expanded')==='true';
   const inView=element=>{
    const rect=element.getBoundingClientRect();
    return rect.top>=0 && rect.bottom<=win.innerHeight;
   };
-  check(!source.hidden && expanded(source) && show.value==='open','the source starts open in the Open view');
+  check(!source.hidden && expanded(source) && selected('show')==='open','the source starts open in the Open view');
   check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator is visible');
   link.scrollIntoView({block:'center'});
   if(scenario==='history') win.scrollTo(0,120);
+  const unavailableProducer=scenario==='unavailable-producer';
+  if(unavailableProducer){
+   const saved=new URL(win.location.href),params=new URLSearchParams(saved.hash.slice(1));
+   params.set('producer','unavailable');
+   saved.hash=String(params);
+   win.history.replaceState(win.history.state,'',saved);
+   win.history.scrollRestoration='manual';
+   win.scrollTo(0,270);
+   check(win.scrollY===270,'the previous page can scroll to 270');
+  }
   const banner=doc.querySelector('[data-page-status]');
   if(scenario==='banner') banner.style.minHeight='60px';
-  const originalTop=win.scrollY,originalPlace=win.location.href;
+  const originalTop=win.scrollY,beforeJump=win.location.href;
+  const original=new URL(beforeJump),params=new URLSearchParams(original.hash.slice(1));
+  if(pendingWords){params.set('q',pendingWords);original.hash=String(params);}
+  const originalPlace=original.href;
+  const debounced=pendingWords ? new Promise(done=>search.addEventListener('filterchange',done,{once:true})) : null;
   const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.list'),location.href).href;
   const updated=new Promise(resolve=>{
    const done=()=>{
     clearTimeout(timeout);removeEventListener('message',record);resolve();
    };
    const record=event=>{
-    if(event.source===win && event.data==='console-place' && win.location.href!==originalPlace &&
+    if(event.source===win && event.data==='console-place' && win.location.href!==beforeJump &&
        consolePlace()===win.location.href) done();
    };
    addEventListener('message',record);
    const timeout=setTimeout(done,1500);
   });
-  win.postMessage({clickListLink:number},location.origin);await updated;await frames(win);
+  win.postMessage({clickListLink:number,pendingWords},location.origin);await updated;await frames(win);
+  if(debounced){
+   await debounced;
+   check(!target.hidden && expanded(target) && search.value==='','the target stays open after the pending input settles');
+  }
   const missing=doc.querySelector('[data-missing-item]');
   check(doc===frame.contentDocument,'the click stays inside the same console frame');
   check(consolePlace()===win.location.href,'the console recorded '+consolePlace()+' instead of '+win.location.href);
@@ -308,7 +335,7 @@ frame.addEventListener('load',async()=>{
    check(!missing.hidden && missing.textContent==='Item #99 is not on the List' && inView(missing),'the missing message is in view');
   }else{
    const title=target.querySelector('.list-row');
-   check(show.value===(number==='29' ? 'all' : 'open'),'the view after the click is '+show.value);
+   check(selected('show')===(number==='29' ? 'all' : 'open'),'the view after the click is '+selected('show'));
    check(!target.hidden && expanded(target),'the target is visible and open');
    check(inView(title),'the target row is outside the viewport at '+title.getBoundingClientRect().top);
    check(title.getAnimations().some(animation=>animation.playState==='running'),'the target row has a short highlight');
@@ -318,9 +345,11 @@ frame.addEventListener('load',async()=>{
     check(top>=bottom+15,'the target top '+top+' leaves a gap below the banner bottom '+bottom);
    }
   }
-  const filters=[owner.value,producer.value,search.value];
-  const expected=originalFilters.map((value,index)=>index===['closed','producer','open'].indexOf(scenario) ? '' : value);
-  check(filters.every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters));
+  const expected=originalFilters.slice();
+  if(scenario==='closed'){expected[0]='all';expected[3]='all';}
+  if(scenario==='producer') expected[1]='all';
+  if(scenario==='open' || pendingWords) expected[2]='';
+  check(filters().every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters()));
   if(scenario==='repeat'){
    const jumpPlace=win.location.href,jumpHistoryLength=win.history.length;
    link.click();await frames(win);
@@ -334,28 +363,40 @@ frame.addEventListener('load',async()=>{
   if(!proof){
    const back=scenario==='history' ? new Promise(done=>win.addEventListener('popstate',done,{once:true})) : changed(win);
    history.back();await back;await frames(win);
-   check(win.location.href===originalPlace,'Back restores the frame address');
-   check(show.value==='open' && !source.hidden && expanded(source),'Back restores the open source');
+   if(unavailableProducer){
+    const restored=new URLSearchParams(win.location.hash.slice(1));
+    check(!restored.has('producer'),'Back removes the unavailable Producer from the frame address');
+    check(win.history.state.recordTable.top===270,'the corrected history state keeps top: 270');
+    check(win.scrollY===270,'Back restores scroll to 270, got '+win.scrollY);
+   }else{
+    check(win.location.href===originalPlace,'Back restores the frame address');
+    check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
+   }
+   check(selected('show')==='open' && !source.hidden && expanded(source),'Back restores the open source');
+   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the former chip selections');
    check(!target || !expanded(target),'Back collapses the target row');
    if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
-   check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
   }
   if(scenario==='missing'){
    const missingKey=new URLSearchParams(link.hash.slice(1)).get('item');
    const saved=new URLSearchParams(new URL(originalPlace).hash.slice(1));
    saved.set('key',source.dataset.key);saved.set('item',missingKey);
-   const change=(field,value,event)=>()=>{field.value=value;field.dispatchEvent(new win.Event(event));};
+   const clearSearch=()=>new Promise(done=>{
+    search.addEventListener('filterchange',done,{once:true});
+    search.value='';search.dispatchEvent(new win.Event('input'));
+   });
    const changes=[
-    ['Show',change(show,'all','change')],
-    ['Owner',change(owner,'','change')],
-    ['Producer',change(producer,'','change')],
-    ['Search',change(search,'','input')],
+    ['Show',()=>chip('show','all').click()],
+    ['State',()=>chip('state','all').click()],
+    ['Owner',()=>chip('owner','all').click()],
+    ['Producer',()=>chip('producer','all').click()],
+    ['Search',clearSearch],
     ['sort',()=>doc.querySelector('[data-sort]').click()],
    ];
    for(const [label,select] of changes){
     const restored=changed(win);win.location.hash=String(saved);await restored;
     check(!missing.hidden && doc.querySelector('[data-missing-keys]').hidden,'the restored missing item shows one notice');
-    select();
+    await select();
     const after=new URLSearchParams(win.location.hash.slice(1));
     check(missing.hidden && !doc.querySelector('[data-missing-keys]').textContent,label+' clears the missing item notice');
     check(after.get('item')!==missingKey && after.getAll('key').join()===source.dataset.key,label+' omits the missing item from the address');
@@ -400,7 +441,7 @@ frame.addEventListener('load',async()=>{
             try:
                 proof = os.environ.get("LIST_JUMP_PROOF")
                 cases = [(30, "open"), (29, "closed"), (31, "producer"), (99, "missing"), (29, "repeat"),
-                         (2, "history"), (2, "banner")]
+                         (2, "history"), (2, "banner"), (30, "pending-words"), (30, "unavailable-producer")]
                 if proof:
                     cases.append((29, "proof"))
                 for number, case in cases:
@@ -412,7 +453,7 @@ frame.addEventListener('load',async()=>{
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
                         filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
                         if case in ("open", "closed", "producer", "missing"):
-                            filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
+                            filters.update(owner=OWNER.id, producer=MORTY.id, state="Working", q="linked item")
                         place = list_page.PAGE_PATH + "?show=open#" + urlencode(filters)
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
@@ -623,17 +664,29 @@ frame.addEventListener('load',async()=>{
         items = self.fixture_items()
         _ = the_list.update(MORTY.id, items[0].id, {"related_to": (106,),
             "blocked_by": (the_list.ItemDependency(105, "The status page reaches main"),)}, source="morty")
-        body = without_role_colors(list_page.render(self.root / "reviews").decode())
+        markup = list_page.render(self.root / "reviews").decode()
+        body = without_role_colors(markup)
         self.assertEqual(body.count('<tbody data-list-item'), 6)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
+        controls = body.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
+        self.assertNotIn('<select', controls)
+        self.assertEqual(controls.count('type="search"'), 1)
+        self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
+                         ['show', 'state', 'owner', 'producer'])
         for value, label in list_page.SHOWS:
-            self.assertIn(f'<option value="{value}">{label}</option>', body)
-        self.assertIn('<option value="' + OWNER.id + '">sdlc</option>', body)
-        self.assertIn('<option value="' + OTHER.id + '">builds</option>', body)
-        producers = body.split('<select id="list-producer">', 1)[1].split('</select>', 1)[0]
-        self.assertEqual(producers, '<option value="">All</option><option value="' + DWIGHT.id + '">dwight</option>'
-                         + '<option value="' + MORTY.id + '">morty</option>')
+            self.assertRegex(controls, f'data-filter-value="{value}"[^>]*>{label}<b>')
+        self.assertRegex(controls, f'data-filter-value="{OWNER.id}"[^>]*>sdlc<b>')
+        self.assertRegex(controls, f'data-filter-value="{OTHER.id}"[^>]*>builds<b>')
+        producers = markup.split('data-filter-row="producer"', 1)[1].split('<span data-list-count', 1)[0]
+        choices: list[tuple[str, str]] = []
+        for match in re.finditer(r'<button\b[^>]*>.*?</button>', producers, re.DOTALL):
+            button = ElementTree.fromstring(match.group())
+            count = button[-1]
+            self.assertEqual(count.tag, 'b')
+            button.remove(count)
+            choices.append((button.attrib["data-filter-value"], ''.join(button.itertext())))
+        self.assertEqual(choices, [('all', 'All'), (DWIGHT.id, 'dwight'), (MORTY.id, 'morty')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 1)
         self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 5)
         self.assertIn(f'data-producer="{DWIGHT.id}"', body)
@@ -777,8 +830,9 @@ frame.addEventListener('load',async()=>{
         for owner in (missing, the_list.UnassignedOwner.NATE, the_list.UnassignedOwner.NOT_RECORDED):
             _ = self.add("Work for " + owner, owner=owner)
         body = list_page.render(self.root / "reviews").decode()
+        owners = body.split('data-filter-row="owner"', 1)[1].split('data-filter-row="producer"', 1)[0]
         for label in (str(missing), "nate", "Not recorded"):
-            self.assertIn('>' + label + '</option>', body)
+            self.assertIn('>' + label + '<b></b></button>', owners)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
 
@@ -1056,25 +1110,28 @@ window.fetch=async(_path,options={})=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  const row=number=>document.querySelector('[data-number="'+number+'"]');
- const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event));};
  const visible=()=>[...document.querySelectorAll('[data-list-item]')].filter(item=>!item.hidden).map(item=>item.dataset.number).sort().join(',');
- const choose=(show,query)=>{change('list-show',show);change('list-search',query,'input');};
+ const choose=(show,query)=>new Promise(done=>{
+  document.querySelector('[data-filter-row="show"] [data-filter-value="'+show+'"]').click();
+  const field=document.getElementById('list-search');
+  field.addEventListener('filterchange',done,{once:true});field.value=query;field.dispatchEvent(new Event('input'));
+ });
  const submit=(number,action)=>{const form=row(number).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
  try{
   for(const [query,expected] of [['105','105'],['L105','105'],['#105','105'],['BUILDS','105'],
     ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','54']]){
-   choose('all',query);check(visible()===expected,'words filter: '+query);
+   await choose('all',query);check(visible()===expected,'words filter: '+query);
   }
-  choose('open','106');row('106').querySelector('.list-toggle').click();
+  await choose('open','106');row('106').querySelector('.list-toggle').click();
   const removed=submit('106','remove');
   check(row('106').hidden,'Remove hides the row before the response');
   check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
   check(row('106').hidden,'Remove stays outside Open after success');
-  choose('closed','106');check(visible()==='106','Remove updates the Closed view');
+  await choose('closed','106');check(visible()==='106','Remove updates the Closed view');
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
-  choose('open','105');row('105').querySelector('.list-toggle').click();
+  await choose('open','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
   finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
@@ -1087,9 +1144,9 @@ window.fetch=async(_path,options={})=>{
   submit('105','park');check(requests.length===3,'a second Park press sends nothing');
   finishPost({item_state:'Working',parked:'true'});await flush();await flush();
   check(row('105').hidden,'Park stays outside Open after success');
-  choose('parked','105');check(visible()==='105','Park updates the Parked view');
+  await choose('parked','105');check(visible()==='105','Park updates the Parked view');
   check(parked.querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
-  choose('all','58');row('58').querySelector('.list-toggle').click();
+  await choose('all','58');row('58').querySelector('.list-toggle').click();
   const form=row('58').querySelector('form');
   check(row('58').dataset.unread==='false' && !form.querySelector('[value="read"]'),'the unread sync case starts read');
   form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
@@ -1097,7 +1154,7 @@ window.fetch=async(_path,options={})=>{
   check(row('58').dataset.unread==='true' && row('58').querySelector('.list-dot'),'an unread response restores the dot');
   check(Boolean(form.querySelector('[value="read"]')),'an unread response restores Mark read');
   if(form.querySelector('[value="read"]')){
-   choose('unread','58');
+   await choose('unread','58');
    submit('58','read');finishPost({item_state:'Waiting for nate',parked:'false',unread:'false'});await flush();await flush();
    check(!row('58').querySelector('.list-dot') && !form.querySelector('[value="read"]'),'the restored Mark read button works');
    check(row('58').hidden && document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
@@ -1107,7 +1164,7 @@ window.fetch=async(_path,options={})=>{
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe)
+        self.browser_actions(markup, setup, probe, virtual_time_ms=3000)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reserves_a_lost_park_id_and_updates_the_saved_date_label(self) -> None:
@@ -1427,10 +1484,7 @@ window.fetch=async(_path,options={})=>{
   const request=requests.at(-1);
   return {id:request.get('request'),token:request.get('token')};
  };
- const show=value=>{
-  const filter=document.getElementById('list-show');
-  filter.value=value;filter.dispatchEvent(new Event('change'));
- };
+ const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  try{
   row.querySelector('.list-toggle').click();
@@ -1441,12 +1495,13 @@ window.fetch=async(_path,options={})=>{
 </script>'''
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion)
 
-    def browser_actions(self, markup: str, setup: str, probe: str, *, reduced_motion: bool = False) -> None:
+    def browser_actions(self, markup: str, setup: str, probe: str, *,
+                        reduced_motion: bool = False, virtual_time_ms: int = 1500) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
         result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
             *(['--force-prefers-reduced-motion'] if reduced_motion else []),
-            '--user-data-dir=' + str(self.root / 'chrome-actions'), '--virtual-time-budget=1500',
+            '--user-data-dir=' + str(self.root / 'chrome-actions'), f'--virtual-time-budget={virtual_time_ms}',
             '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = '<p id="probe-results">'
@@ -1637,7 +1692,7 @@ window.fetch=async(_path,options={})=>{
         probe = '''<script>
 (async()=>{
  const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
- const show=document.getElementById('list-show');show.value='unread';show.dispatchEvent(new Event('change'));
+ document.querySelector('[data-filter-row="show"] [data-filter-value="unread"]').click();
  const before=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
  form.requestSubmit(form.querySelector('[value="ACTION"]'));
@@ -1841,7 +1896,14 @@ const submitted=(form,button)=>new Promise((resolve,reject)=>{
 });
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
-const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
+const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
+const select=(name,value)=>chip(name,value).click();
+const selectedChip=name=>document.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
+const count=(name,value)=>Number(chip(name,value).querySelector('b').textContent);
+const search=value=>new Promise(done=>{
+ const field=document.getElementById('list-search');
+ field.addEventListener('filterchange',done,{once:true});field.value=value;field.dispatchEvent(new Event('input'));
+});
 try{
  await flush();
  if(innerWidth>=960){
@@ -1860,27 +1922,84 @@ try{
   document.querySelector('[data-sort="'+column+'"]').click();
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
  }
- change('list-show','needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
- change('list-show','unread');check(visible().length===5,'Unread includes the saved unread updates');
- change('list-show','done');check(visible().length===1 && visible()[0].dataset.number==='63','Done');
- change('list-show','parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
- change('list-show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');
- change('list-show','all');check(visible().length===6,'All');
- change('list-owner',OWNER);check(visible().length===5,'Owner');
- change('list-owner','');
- change('list-producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
+ select('show','needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
+ select('show','unread');check(visible().length===5,'Unread includes the saved unread updates');
+ select('show','done');check(visible().length===1 && visible()[0].dataset.number==='63','Done');
+ select('show','parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
+ select('show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');
+ select('show','all');check(visible().length===6,'All');
+ select('show','open');
+ const showRow=chip('show','open').closest('[data-filter-row]');
+ const showValues=filterControl.buttons(showRow).map(button=>button.dataset.filterValue);
+ filterControl.setVisible(showRow,showValues.filter(value=>value!=='open'));
+ dispatchEvent(new PopStateEvent('popstate'));
+ check(selectedChip('show')==='all' && visible().length===6,'hiding Open selects All and shows all six items');
+ check(new URLSearchParams(location.hash.slice(1)).get('show')==='all','the address records the fallback to All');
+ filterControl.setVisible(showRow,showValues);
+ const theme=document.documentElement.dataset.theme;
+ const pixel=document.createElement('canvas').getContext('2d',{willReadFrequently:true});
+ const luminance=color=>{
+  pixel.fillStyle=color;pixel.fillRect(0,0,1,1);
+  const [r,g,b]=[...pixel.getImageData(0,0,1,1).data].slice(0,3).map(byte=>{
+   const value=byte/255;
+   return value<=.04045 ? value/12.92 : ((value+.055)/1.055)**2.4;
+  });
+  return .2126*r+.7152*g+.0722*b;
+ };
+ select('show','open');select('owner',OWNER);select('producer',MORTY);
+ check(Boolean(chip('owner',OWNER).querySelector('.staff-name')) &&
+  Boolean(chip('producer',MORTY).querySelector('.staff-name')),'the contrast case includes staff labels');
+ for(const themeName of ['light','dark']){
+  document.documentElement.dataset.theme=themeName;
+  for(const state of ['Working','Done']){
+   select('state',state);
+   for(const button of document.querySelectorAll('[data-filter-row] button[aria-pressed="true"]')){
+    const background=luminance(getComputedStyle(button).backgroundColor);
+    for(const element of [button,...button.querySelectorAll('b,.staff-name')]){
+     const ink=luminance(getComputedStyle(element).color);
+     const contrast=(Math.max(ink,background)+.05)/(Math.min(ink,background)+.05);
+     check(getComputedStyle(button).opacity==='1' && contrast>=4.5,
+      themeName+' contrast for '+button.textContent+': '+contrast);
+    }
+   }
+  }
+ }
+ if(theme===undefined) delete document.documentElement.dataset.theme;
+ else document.documentElement.dataset.theme=theme;
+ select('state','all');select('producer','all');select('owner','all');select('show','all');
+ select('owner',OWNER);check(visible().length===5,'Owner');
+ select('owner','all');
+ select('producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
  check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'the address keeps the producer');
- change('list-producer','');
+ select('producer','all');
  check(visible().length===6 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
- change('list-search','#106','input');
+ for(const name of ['show','state','owner','producer'])
+  check(document.querySelector('[data-filter-row="'+name+'"] button').dataset.filterValue==='all',name+' starts with All');
+ select('show','open');select('state','Working');
+ check(visible().length===2 && count('state','Waiting for nate')===1 && count('state','Done')===0,
+  'State filters within Open, and each State count follows Show');
+ const zero=chip('state','Done'),zeroPosition=zero.getBoundingClientRect();
+ check(!zero.hidden && !zero.disabled && Number(getComputedStyle(zero).opacity)<1 && zeroPosition.width>0,
+  'a zero chip stays in the row, dimmed and enabled');
+ select('state','Done');check(visible().length===0 && count('show','done')===1,'a zero chip can select an empty view');
+ select('show','done');check(visible().map(row=>row.dataset.number).join(',')==='63','Done Show and Done State match together');
+ select('show','all');select('state','Working');select('owner',OWNER);select('producer',DWIGHT);
+ check(visible().length===0 && count('owner','all')===1 && count('producer','all')===1 && count('state','all')===0,
+  'each count ignores only its own row');
+ select('producer','all');await search('console');
+ check(visible().map(row=>row.dataset.number).join(',')==='106' && count('show','open')===1 &&
+  count('producer',DWIGHT)===0 && count('owner','all')===2,'the words box and all four rows combine');
+ check(zero.getBoundingClientRect().left===zeroPosition.left,'a zero chip retains its place');
+ await search('');select('state','all');select('owner','all');
+ await search('#106');
  check(visible().length===1 && visible()[0].dataset.number==='106','number search');
- change('list-search','console','input');check(visible().length===2,'title search');
+ await search('console');check(visible().length===2,'title search');
  check(new URLSearchParams(location.hash.slice(1)).get('q')==='console','the address keeps the query');
  for(const title of ['Straße','STRAẞE']){
-  change('list-search',title,'input');
+  await search(title);
   check(visible().length===1 && visible()[0].dataset.number==='106','Unicode title search: '+title);
  }
- change('list-search','console','input');
+ await search('console');
  const selected=visible().find(row=>row.dataset.number==='106');selected.querySelector('.list-toggle').click();
  check(!selected.querySelector('[data-detail]').hidden,'a row opens');
  const words=selected.querySelector('textarea'),tell=selected.querySelector('[value="tell"]');
@@ -1955,20 +2074,23 @@ try{
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
  location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
- check(document.getElementById('list-producer').value===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
+ check(selectedChip('producer')===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
- check(document.getElementById('list-producer').value==='' && visible().length===6,'an unknown producer shows all items');
+ check(selectedChip('producer')==='all' && visible().length===6,'an unknown producer shows all items');
+ location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
+ check(selectedChip('state')==='Working' && selectedChip('owner')===OWNER && selectedChip('show')==='unread' &&
+  visible().map(row=>row.dataset.number).join(',')==='106','an address restores Show, State, Owner and words together');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
-  check(document.getElementById('list-show').value==='all' && document.getElementById('list-owner').value==='' &&
-    document.getElementById('list-producer').value==='' && document.getElementById('list-search').value==='','an item link clears filters');
+  check(selectedChip('show')==='all' && selectedChip('owner')==='all' &&
+    selectedChip('producer')==='all' && document.getElementById('list-search').value==='','an item link clears filters');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
  location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'open',q:'106',sort:'#',dir:'desc'});await flush();
- check(document.getElementById('list-owner').value===retained.dataset.owner && document.getElementById('list-show').value==='open' &&
+ check(selectedChip('owner')===retained.dataset.owner && selectedChip('show')==='open' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
@@ -1983,7 +2105,9 @@ try{
  }
 }catch(error){failed.push(String(error));}
 await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...errors])});
-})();</script>'''.replace('OWNER', json.dumps(OWNER.id)).replace('DWIGHT', json.dumps(DWIGHT.id))
+})();</script>'''
+        for name, identity in (("OWNER", OWNER.id), ("DWIGHT", DWIGHT.id), ("MORTY", MORTY.id)):
+            probe = probe.replace(name, json.dumps(identity))
         for width in (1440, 390):
             with self.subTest(width=width):
                 for identity in ("L105", "L106"):
@@ -2039,12 +2163,12 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                             done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                                 '--window-size', f'{width},900', '--screenshot', str(self.root / f'page-{width}.png'),
                                 f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                            self.assertEqual(done.returncode, 0, done.stderr)
+                            self.assertEqual(results, [[]])
                             sends.assert_called_once()
-                        self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         server.shutdown()
                         thread.join(5)
-                self.assertEqual(results, [[]])
 
 
 if __name__ == '__main__':

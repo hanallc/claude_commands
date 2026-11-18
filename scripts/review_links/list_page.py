@@ -481,10 +481,10 @@ def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) ->
             + ''.join(chips) + '</aside>') if chips else ''
 
 
-def filter_options(names: Mapping[str, str], colors: staff_names.StaffNames) -> str:
-    """Write one menu option for each staff ID, sorted by its shown name."""
-    return ''.join(f'<option value="{html.escape(value, quote=True)}"{colors.style(value)}>{html.escape(name)}</option>'
-                   for value, name in sorted(names.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
+def staff_chips(labels: Mapping[str, str], names: staff_names.StaffNames) -> list[record_table.Chip]:
+    """Build one chip for each staff ID, in name order."""
+    return [record_table.Chip(value, names.html(value, label))
+            for value, label in sorted(labels.items(), key=lambda pair: (pair[1].casefold(), pair[0]))]
 
 
 def render(root: Path) -> bytes:
@@ -496,20 +496,20 @@ def render(root: Path) -> bytes:
                if any(entry.item.reviews for entry in items) else {})
     today = datetime.fromtimestamp(read_at, user_zone())
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
-    owners = filter_options({str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}, names)
-    producers = filter_options({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items}, names)
-    shows = ''.join(f'<option value="{value}">{label}</option>' for value, label in SHOWS)
+    owners = staff_chips({str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}, names)
+    producers = staff_chips({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items}, names)
+    states = [record_table.Chip(state.value, state.value) for state in the_list.ItemState]
+    shows = [record_table.Chip(value, label) for value, label in SHOWS if value != 'all']
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     seconds = conf.read("review_links").number("page_refresh_seconds")
     content = (STYLE + page_frame.title("The List", "list")
-               + f'<div data-list data-refresh-seconds="{seconds}"><div class="list-filters">'
-               + '<label for="list-owner">Owner</label><select id="list-owner"><option value="">All</option>' + owners + '</select>'
-               + '<label for="list-producer">Producer</label><select id="list-producer"><option value="">All</option>'
-               + producers + '</select>'
-               + '<label for="list-show">Show</label><select id="list-show">' + shows + '</select>'
-               + '<label class="list-search-label" for="list-search">Search</label>'
-               + '<input type="search" id="list-search" placeholder="Filter by number, owner, item or state">'
+               + f'<div data-list data-refresh-seconds="{seconds}"><div data-record-filters>'
+               + record_table.words_box('list-search', 'Filter by number, owner, item or state')
+               + record_table.chip_row('Show', shows, 'open')
+               + record_table.chip_row('State', states, 'all')
+               + record_table.chip_row('Owner', owners, 'all')
+               + record_table.chip_row('Producer', producers, 'all')
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<p data-missing-item role="status" hidden></p>'
                + '<p data-hidden-action-status role="status" hidden></p>'
@@ -570,24 +570,21 @@ function syncUnread(item,form,unread){
 }
 const tableView=createRecordTable({content:()=>content,
  shows:['open','needs-me','unread','done','parked','closed','all'],
- filters:['producer'],
+ filters:['state','producer'],
  missingItem:key=>{
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
   return number ? 'Item #'+number+' is not on the List' : '';
  },
- visible:(data,{owner,show,query:search,filters})=>{
-  if(owner && data.owner!==owner) return false;
-  if(filters.producer && data.producer!==filters.producer) return false;
-  if(!matchesWords(data,search)) return false;
-  switch(show){
-   case 'open':return !['Done','Closed'].includes(data.state) && data.parked!=='true';
-   case 'needs-me':return data.state==='Waiting for nate' && data.parked!=='true';
-   case 'unread':return data.unread==='true';
-   case 'done':return data.state==='Done';
-   case 'parked':return data.parked==='true';
-   case 'closed':return data.state==='Closed';
-   default:return true;
-  }
+ filterValues:(data,search)=>{
+  if(!matchesWords(data,search)) return null;
+  const show=[],parked=data.parked==='true';
+  if(!parked && !['Done','Closed'].includes(data.state)) show.push('open');
+  if(!parked && data.state==='Waiting for nate') show.push('needs-me');
+  if(data.unread==='true') show.push('unread');
+  if(data.state==='Done') show.push('done');
+  if(parked) show.push('parked');
+  if(data.state==='Closed') show.push('closed');
+  return {show,state:[data.state],owner:[data.owner],producer:[data.producer]};
  },
  counts:(items,count)=>count+' of '+items.length+' items shown · '+
   items.filter(item=>item.dataset.state==='Waiting for nate' && item.dataset.parked!=='true').length+' need you · '+
