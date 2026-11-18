@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import atomic_file
 from scripts.production import investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import change_page, question_record, review_items
+from scripts.review_links import change_page, list_page, question_record, review_items
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -518,6 +518,25 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(answer.text, words)
         self.assertEqual(saved.questions, (replace(closed.questions[0], answer=answer),))
         self.assertEqual(replace(saved, updated=closed.updated, log=closed.log, questions=closed.questions), closed)
+
+    def test_list_command_keeps_an_item_while_its_question_waits(self) -> None:
+        item = self.add("Check the List")
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        shown = list_page.render(status.root, include_counts=False).decode()
+        self.assertRegex(shown, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+        request = the_list.PageRequest("ask", "question", "Which check passed?")
+        _ = the_list.ask_question(MORTY.id, item.id, request, status)
+        waiting = list_page.render(status.root, include_counts=False, status=status).decode()
+        self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]* hidden>')
+        result, output, errors = self.command("list")
+        self.assertEqual((result, errors), (0, ""))
+        self.assertIn(item.title, output)
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "The browser check."),
+                         (0, f"answered {item.id} Q1\n", ""))
+        answered = the_list.load(MORTY.id, item.id)
+        returned = list_page.render(status.root, include_counts=False).decode()
+        self.assertRegex(returned, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+        self.assertEqual(answered.unread_since, START)
 
     def test_typed_log_refuses_invalid_fields(self) -> None:
         item = self.add()

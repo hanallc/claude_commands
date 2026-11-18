@@ -367,7 +367,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == list_page.PAGE_PATH:
             try:
                 with server.list_store_access():
-                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE)
+                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE,
+                                               status=server.delivery_status)
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
@@ -805,7 +806,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             with server.list_store_access():
                 submission = list_page.submit(server.root, body, server.delivery_status)
                 fixture_reply = ({"state": "saved",
-                    **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
+                    **list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)}
                     if server.mode is ServerMode.LIST_FIXTURE else None)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
@@ -817,8 +818,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(200, fixture_reply)
             return
         try:
-            state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
-            current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0])
+            action = fields["action"][0]
+            state = "saved" if action.startswith("resend-") else {"read": "read", "question": "saved"}.get(action, "sent")
+            current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)
             reply = {"state": state, **current}
             if isinstance(submission, list_page.ListUnparkSubmission):
                 reply["unpark_outcome"] = submission.response_outcome(current).value
@@ -881,17 +883,19 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             opened = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True).get("open", [])
-            pages = console.read_pages()
+            pages: list[console.ConsolePage] = []
+            for page in console.read_pages():
+                if page.items is review_page.waiting_items:
+                    page = replace(page, items=waiting_review)
+                elif page.items is list_page.waiting_updates:
+                    page = replace(page, items=partial(list_page.waiting_updates, status=server.delivery_status))
+                elif page.items is images.waiting_images:
+                    page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
+                pages.append(page)
             # An empty name means the open page is not a navigation entry, such as the Rebuilds page.
             if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
                 raise ValueError("name one console page or none")
-            pages = tuple(
-                replace(page, items=waiting_review) if page.items is review_page.waiting_items
-                else replace(page, items=partial(images.waiting_images, status=server.delivery_status))
-                if page.items is images.waiting_images else page
-                for page in pages
-            )
-            fresh = console.news(server.root, pages, opened[0])
+            fresh = console.news(server.root, tuple(pages), opened[0])
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return
@@ -983,6 +987,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
         self.delivery_status.startup_recovery_pending.set()
+
         def recover_pending() -> None:
             try:
                 recover_changes(self.delivery_status)
@@ -1059,7 +1064,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 if (stamp is ModuleStampUnavailable.UNREADABLE or stamp[0] >= STARTED_NS
                         or (path in self.module_stamps and self.module_stamps[path] != stamp)):
                     with self.delivery_status.locked():
-                        if self.delivery_status.request_attempts:
+                        if self.delivery_status.request_attempts or self.delivery_status.question_jobs:
                             return
                     with self.branch_deletions_lock:
                         if self.branch_deletions:
