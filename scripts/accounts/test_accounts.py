@@ -305,6 +305,7 @@ class AccountsTests(unittest.TestCase):
         _ = self.main_dir.mkdir(mode=0o700)
         notes = self.root / "notes"
         _ = notes.mkdir()
+        (self.home / "sessions").mkdir()
         environment = {
             "AGENT_NOTES_DIR": str(notes),
             "STAFF_FILE": str(self.root / "staff.json"),
@@ -882,7 +883,7 @@ class AccountsTests(unittest.TestCase):
                 if denied_machine == "peer":
                     peer_counts["claude_registry_unreadable"] = True
                 atomic_file.write_text_atomic(session_counts_cache(), json.dumps(peer_counts))
-                directory = registry_path if denied_machine == "local" else self.root / "absent-sessions"
+                directory = registry_path if denied_machine == "local" else sessions.sessions_dir()
                 with (patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(directory)}),
                       patch.object(Path, "iterdir", new=list_folder),
                       patch.object(session_state, "running_detached_work", return_value=session_state.NO_DETACHED_WORK)):
@@ -9971,6 +9972,7 @@ class StatusProblemCauseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        (self.home / "sessions").mkdir()
         _ = cast(object, self.enterContext(scratch_account_home(self.home, {
             "AGENT_NOTES_DIR": str(self.home / "notes"),
             "CODEX_HOME": str(self.home / ".codex"), "USER_ZONE": "UTC",

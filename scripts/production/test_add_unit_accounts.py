@@ -116,6 +116,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         home = self.root / "home with 'quotes' $()"
         _ = Path(self.env["HOME"]).rename(home)
         self.env["HOME"] = str(home)
+        self.env["NOTIFIER_SESSIONS_DIR"] = str(home / ".claude/sessions")
         self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caller account")
         directory = self.prepare_unit_account("claude3")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")

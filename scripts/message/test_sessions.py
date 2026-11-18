@@ -440,11 +440,11 @@ class SessionLookupTests(ShutdownTestCase):
             (result.returncode, result.stdout, result.stderr), (1, "", "sessions: no live session for 'session:missing'\n")
         )
 
-    def test_missing_registry_returns_absent(self) -> None:
+    def test_missing_registry_returns_unknown(self) -> None:
         self.sessions.rmdir()
         result = self.run_cli("socket", "session:missing")
         self.assertEqual((result.returncode, result.stdout, result.stderr),
-                         (1, "", "sessions: no live session for 'session:missing'\n"))
+                         (3, "", "sessions: one or more registry files could not be read\n"))
 
     def test_registry_that_cannot_be_listed_returns_unknown(self) -> None:
         with (mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),

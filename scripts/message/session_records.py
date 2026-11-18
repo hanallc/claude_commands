@@ -94,12 +94,10 @@ class RegistryRecordGone:
 
 
 def read_registry(*, dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
-    """Treat an absent directory as empty and report unreadable evidence."""
+    """Report a directory that cannot be listed and any unreadable session records."""
     directory = sessions_dir()
     try:
         paths = [path for path in directory.iterdir() if path.suffix == ".json"]
-    except FileNotFoundError:
-        return RegistryRead((), ())
     except OSError:
         return RegistryRead((), (directory,))
     entries: list[RegistryObservation] = []

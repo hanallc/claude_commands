@@ -431,11 +431,11 @@ class SessionPaneTests(unittest.TestCase):
                 self.assertIn(("pane", "close", place.pane), commands)
 
 
-    def test_missing_registry_folder_returns_no_such_target(self) -> None:
+    def test_missing_registry_folder_returns_an_error(self) -> None:
         with mock.patch.dict(self.environment, {"NOTIFIER_SESSIONS_DIR": str(self.root / "absent")}):
             result = self.run_cli("where", "session", "missing")
         self.assertEqual((result.returncode, result.stdout, result.stderr),
-                         (1, "", "session missing: no such target\n"))
+                         (3, "", "session missing: one or more session records could not be read\n"))
 
     def test_denied_registry_folder_returns_an_error(self) -> None:
         with mock.patch.object(Path, "iterdir", side_effect=PermissionError(self.records)):

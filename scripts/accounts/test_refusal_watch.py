@@ -187,8 +187,6 @@ class RefusalWatchTests(unittest.TestCase):
         directory = status_sessions.sessions_dir()
         try:
             _ = tuple(directory.iterdir())
-        except FileNotFoundError:
-            return status_sessions.RegistryRead((), ())
         except OSError:
             return status_sessions.RegistryRead((), (directory,))
         records = self.live if observe is None else observe()
@@ -209,13 +207,13 @@ class RefusalWatchTests(unittest.TestCase):
         observed = status_sessions.read_registry() if isinstance(registry, session_records.ReadCurrentRegistry) else registry
         return self.running_registry_records(observed)
 
-    def test_absent_registry_supplies_no_running_sessions(self) -> None:
+    def test_absent_registry_keeps_the_running_session_list_incomplete(self) -> None:
         _ = self.owner("fixture")
         directory = status_sessions.sessions_dir()
         self.assertEqual(len(status_sessions.running_sessions()), 1)
         directory.rmdir()
         registry = status_sessions.read_registry()
-        self.assertEqual(registry.unreadable, ())
+        self.assertEqual(registry.unreadable, (directory,))
         self.assertEqual(status_sessions.running_records(registry), [])
         self.assertEqual(status_sessions.running_sessions(), [])
         self.assertEqual(status_sessions.live_sessions(), [])
