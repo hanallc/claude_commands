@@ -3061,16 +3061,26 @@ window.fetch=(url,options={})=>{
    check(row.hidden,'The save hides '+key+'.');
   }
 
-  const link=document.createElement('a');
-  link.href='#'+new URLSearchParams({show:'all',item:'page-owner/C1'});
-  link.textContent='Open Change C1';
-  document.body.append(link);
-  const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-  link.click();
-  await navigated;
-  const linked=change('page-owner/C1');
-  check(linked?.dataset.state==='Done' && !linked.hidden && !linked.querySelector('[data-detail]').hidden,
-   'The same-tab link shows the closed Change C1.');
+  const follow=async show=>{
+   const link=document.createElement('a');
+   link.href='#'+new URLSearchParams({show,item:'page-owner/C1'});
+   link.textContent='Open Change C1';
+   document.body.append(link);
+   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   link.click();
+   await navigated;
+   link.remove();
+   return change('page-owner/C1');
+  };
+  const openDone=row=>row?.dataset.state==='Done' && !row.hidden && !row.querySelector('[data-detail]').hidden;
+  const linked=await follow('all');
+  check(openDone(linked),'The same-tab link shows the closed Change C1.');
+  check(linked?.querySelector('[data-review-body]'),'The reopened card keeps its cached details.');
+  check(!linked?.querySelector('[data-review-form]'),'The reopened card hides stale actions until the snapshot arrives.');
+  document.querySelector('[data-show-chip="open"]').click();
+  check(document.querySelector('[data-review]').dataset.show==='open','Open is selected before the link.');
+  check(openDone(await follow('open')) && document.querySelector('[data-review]').dataset.show==='all',
+   'A link from Open selects All and shows the closed Change C1.');
   check(!change('page-owner/C2'),'The unlinked Change C2 stays hidden.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});

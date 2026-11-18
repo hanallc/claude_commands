@@ -981,6 +981,9 @@ function loadBodies(){
    const current=mountedRow(key);
    if(!current || current.dataset.bodyLoaded) return;
    current.dataset.bodyLoaded='true';current.querySelector('[data-detail]>td').innerHTML=text;
+   const departure=saved.get(key);
+   if(departure?.closes && departure.awaitingSnapshot && current.dataset.type==='change')
+    current.querySelector('[data-review-form]')?.remove();
    const panel=current.querySelector('.review-panel');if(panel) updateTitleFallback(panel);
    bindForm(current);restoreFocus(key);view.drawWindow();
   };
@@ -1068,7 +1071,7 @@ function bindForm(row){
      handed,state:result.state ?? (handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:data.get('outcome')==='question',
-     closes:!handed && !['question','later'].includes(outcome)});
+     closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true});
     savedEntry(key,saved.get(key));
     pendingSaves.delete(key);
     view.closeCard(key);
@@ -1191,9 +1194,8 @@ async function refresh(_supersede=false,current=()=>true){
   // The index supplies the state and update time for each row.
   const submitted=entry.state===result.previousState && entry.updated===result.updated;
   if(!submitted && (result.handed || entry.state!==result.state)){saved.delete(key);continue;}
-  if(!result.closes && !result.question && !result.later && !submitted){
-   saved.delete(key);
-  }
+  if(!result.closes && !result.question && !result.later && !submitted) saved.delete(key);
+  else result.awaitingSnapshot=submitted;
  }
  for(const [key,result] of saved) savedEntry(key,result);
  const revealed=revealConflict();bind();view.apply(false);
@@ -1222,7 +1224,9 @@ else if(start>=0){
 function restorePlace(event){
  const fragment=new URLSearchParams(location.hash.slice(1)),jump=fragment.get('jump'),item=jump || fragment.get('item');
  if(item && !saved.get(item)?.closes && !saved.get(item)?.question) saved.delete(item);
- if(jump){view.place();view.jump(jump,{pushPlace:false});}
+ const entry=index.get(item);
+ const closedLink=event.type==='hashchange' && !history.state?.recordTable && entry?.type==='change' && entry.state==='Done';
+ if(jump || closedLink){view.place();view.jump(item,{pushPlace:false});}
  else view.restorePlace(event);
 }
 addEventListener('popstate',restorePlace);
