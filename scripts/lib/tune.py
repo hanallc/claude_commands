@@ -62,6 +62,11 @@ def change(args: RequestedValueChange) -> int:
         print(f"already {args.key}={args.value}")
     else:
         print(f"live now: {args.key}={args.value}")
+        if args.file == "hana_aws":
+            from scripts.aws_target import hana_render
+
+            if hana_render.affects_guest_config(args.key, source):
+                print("The Hana image is now stale. Build and register a current Hana image.")
         for line in live_settings.start_readers(args.file):
             print(line)
         print(live_settings.write_mac(args.file, args.key, args.value, order=saved.order))

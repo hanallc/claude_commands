@@ -12,7 +12,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -20,7 +20,7 @@ from scripts.lib import atomic_file, conf
 from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
-from scripts.review_links import image_store, review_link
+from scripts.review_links import image_store, new_item_dialog, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
@@ -59,14 +59,25 @@ class NativeSubmissionDestination:
     def address(self) -> SubmissionAddress:
         return SubmissionAddress(self.kind, self.recipient_id, self.request_id)
 
-    def saved(self) -> SavedSubmission:
-        return SavedSubmission(self.id, self.kind, self.recipient_id, self.request_id, self.payload_hash, self.path,
-                               self.original_path, self.owner)
+
+type NativeSubmittedRecord = update_registration.QuestionRecord | Issue | investigation.Investigation
+
+
+def native_origin(record: NativeSubmittedRecord) -> new_item_dialog.SubmissionOrigin:
+    """Read the typed origin from a native record."""
+    if isinstance(record, update_registration.QuestionRecord):
+        details = record.item.get("review_submission")
+        return read_submission(details) if details is not None else new_item_dialog.NoReviewSubmission()
+    if isinstance(record, Issue):
+        return proposal_issue.review_submission(record)
+    return record.submission
 
 
 @dataclass(frozen=True)
 class SavedSubmission(NativeSubmissionDestination):
     """The receipt for a completed native write."""
+
+    record: NativeSubmittedRecord = field(compare=False)
 
     @property
     def key(self) -> str:
@@ -74,12 +85,10 @@ class SavedSubmission(NativeSubmissionDestination):
 
     @property
     def details(self) -> ReviewSubmission:
-        """Read the submission details from the native record."""
-        with _locked_request(self.address, fallback=self) as lookup:
-            located = lookup.native
-        if isinstance(located, LocatedSubmission):
-            return located.details
-        raise OSError(f"Cannot find the native record for request {self.request_id}.")
+        details = native_origin(self.record)
+        if not isinstance(details, ReviewSubmission):
+            raise OSError(f"Cannot read the native Review origin for {self.id}.")
+        return details
 
     @property
     def reply_token(self) -> str:
@@ -145,7 +154,7 @@ def _request_folder(request_id: str) -> Path:
     return root / read_request_id(request_id)
 
 
-def image_folder(item: SavedSubmission) -> Path:
+def image_folder(item: SavedSubmission | ReviewSubmission) -> Path:
     """Return the private folder for the image IDs on the native record."""
     return _request_folder(item.request_id) / "images"
 
@@ -284,6 +293,7 @@ class LocatedSubmission:
     """The matching request metadata read from a native record."""
     destination: NativeSubmissionDestination
     details: ReviewSubmission
+    record: NativeSubmittedRecord
 
 
 @dataclass(frozen=True)
@@ -302,13 +312,11 @@ class SubmissionLookup:
 
 @contextmanager
 def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | None = None, *,
-                    fallback: RequestFile = _NO_REQUEST_FILE, for_send: bool = False) -> Generator[SubmissionLookup]:
+                    for_send: bool = False) -> Generator[SubmissionLookup]:
     owners = {address.recipient_id}
     while True:
         with investigation.recipient_locks(*owners):
             hint = _request_hint(address)
-            if isinstance(hint, (NoRequestFile, UnreadableRequestFile)) and isinstance(fallback, NativeSubmissionDestination):
-                hint = fallback
             if isinstance(hint, NativeSubmissionDestination) and hint.address == address and hint.owner not in owners:
                 owners.add(hint.owner)
                 continue
@@ -334,14 +342,15 @@ def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | N
 
 
 def _located(address: SubmissionAddress, path: Path, owner: staff.StaffId, identity: str,
-             details: ReviewSubmission) -> LocatedSubmission | NoNativeSubmission:
-    if details.request_id != address.request_id:
+             record: NativeSubmittedRecord) -> LocatedSubmission | NoNativeSubmission:
+    details = native_origin(record)
+    if not isinstance(details, ReviewSubmission) or details.request_id != address.request_id:
         return NoNativeSubmission()
     if not re.fullmatch(NATIVE_ID_PREFIX[address.kind] + r"[1-9][0-9]*", identity):
         raise OSError(f"The native Review record at {path} has an invalid item ID.")
     path = path.resolve()
     return LocatedSubmission(NativeSubmissionDestination(identity, address.kind, address.recipient_id,
-                             address.request_id, details.request_digest, path, path, owner), details)
+                             address.request_id, details.request_digest, path, path, owner), details, record)
 
 
 def _read_native_submission(address: SubmissionAddress, path: Path,
@@ -353,18 +362,16 @@ def _read_native_submission(address: SubmissionAddress, path: Path,
                 records = update_registration.selected_question_records([path], (), None, sources=[], owner=owner)
                 if records and "review_submission" in records[0].item:
                     item = records[0].item
-                    return _located(address, path, owner, item.get("review_id", ""), read_submission(item.get("review_submission")))
+                    return _located(address, path, owner, item.get("review_id", ""), records[0])
             case SubmissionKind.PROPOSAL:
                 issue = Issue(path, record_store.read_header(path, strict=True))
                 if proposal_issue.proposal_owner(issue, issue.value("proposed_by")) == owner and "proposal" in issue.fields.get("tags", []):
-                    origin = proposal_issue.review_submission(issue)
-                    if isinstance(origin, ReviewSubmission):
-                        return _located(address, path, owner, issue.value("proposal_id"), origin)
+                    return _located(address, path, owner, issue.value("proposal_id"), issue)
             case SubmissionKind.INVESTIGATION | SubmissionKind.BUG:
                 report = investigation.read_review_record(path)
                 if (report.owner == owner and report.kind.value == address.kind.value
                         and isinstance(report.submission, ReviewSubmission)):
-                    return _located(address, path, owner, report.id, report.submission)
+                    return _located(address, path, owner, report.id, report)
     except FileNotFoundError:
         return NoNativeSubmission()
     except (OSError, ValueError, update_registration.RegistrationFailure) as error:
@@ -379,23 +386,20 @@ def _search_owner_store(address: SubmissionAddress, owner: staff.StaffId, folder
         case SubmissionKind.PROPOSAL:
             issue = proposal_issue.find_review_proposal(folders, owner, lookup, document=document)
             if issue is not None:
-                origin = proposal_issue.review_submission(issue)
-                assert isinstance(origin, ReviewSubmission)
-                return _located(address, issue.path, owner, issue.value("proposal_id"), origin)
+                return _read_native_submission(address, issue.path, owner)
         case SubmissionKind.QUESTION:
             record = update_registration.find_review_question_in_folder(
                 update_registration.QuestionFolder(record_store.default_question_folder(owner), owner), lookup,
                 other_folders=folders, document=document)
             if record is not None:
                 item = record.item
-                return _located(address, record.path, owner, item.get("review_id", ""), read_submission(item.get("review_submission")))
+                return _located(address, record.path, owner, item.get("review_id", ""), record)
         case SubmissionKind.INVESTIGATION | SubmissionKind.BUG:
             found = investigation.find_review_submission(
                 owner, investigation.InvestigationKind(address.kind.value), address.request_id)
             if found is not None:
                 path, report = found
-                assert isinstance(report.submission, ReviewSubmission)
-                return _located(address, path, owner, report.id, report.submission)
+                return _located(address, path, owner, report.id, report)
     return NoNativeSubmission()
 
 
@@ -481,7 +485,7 @@ def _has_receipt_for(saved: NativeSubmissionDestination) -> bool:
 
 
 def _complete_receipt(folder: Path, saved: NativeSubmissionDestination,
-                      hint: RequestFile, *, first_send: bool = False) -> SavedSubmission:
+                      hint: RequestFile, record: NativeSubmittedRecord, *, first_send: bool = False) -> SavedSubmission:
     """Complete the receipt before a retry can return the native result."""
     try:
         if (folder / "receipt.json").is_file():
@@ -499,7 +503,8 @@ def _complete_receipt(folder: Path, saved: NativeSubmissionDestination,
             raise
         words = " ".join(str(error).splitlines())
         print(f"Review receipt for {saved.id}: {words}", file=sys.stderr)
-    return saved.saved()
+    return SavedSubmission(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
+                           saved.path, saved.original_path, saved.owner, record)
 
 
 def _recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
@@ -547,7 +552,7 @@ class RecipientOption(TypedDict):
     proposal: bool
 
 
-def _proposal_folder(recipient: staff.StaffRow) -> Path | NoNativeFolder:
+def proposal_folder(recipient: staff.StaffRow) -> Path | NoNativeFolder:
     from scripts.production import proposals_folder
 
     if isinstance(recipient.doc, (staff.LiveDoc, staff.WrappedDoc)):
@@ -568,7 +573,7 @@ def recipient_options(members: staff.StaffSnapshot) -> list[RecipientOption]:
         if not active:
             continue
         try:
-            can_receive_proposals = isinstance(_proposal_folder(row), Path)
+            can_receive_proposals = isinstance(proposal_folder(row), Path)
         except OSError:
             can_receive_proposals = False
         options.append(RecipientOption(id=row.id, name=row.name, proposal=can_receive_proposals))
@@ -576,25 +581,25 @@ def recipient_options(members: staff.StaffSnapshot) -> list[RecipientOption]:
 
 
 def _file(kind: SubmissionKind, recipient: staff.StaffRow, title: str, words: str, details: ReviewSubmission,
-          members: staff.StaffSnapshot, proposal_folder: Path | NoNativeFolder,
-          before_write: Callable[[str, Path], None]) -> None:
+          members: staff.StaffSnapshot, folder: Path | NoNativeFolder,
+          before_write: Callable[[str, Path], None]) -> NativeSubmittedRecord:
     why = f"{recipient.name} answers this"
     match kind:
         case SubmissionKind.QUESTION:
             identities = update_registration.QuestionStaff.for_record(members)
             scope = update_registration.question_scope(recipient, members)
             parts = update_registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
-            _ = update_registration.ask(
+            return update_registration.ask(
                 scope, title, parts, "", update_registration.Ranking(), identities=identities,
                 outgoing=update_registration.QuestionFromReview(words, why, details, before_write))
         case SubmissionKind.PROPOSAL:
-            assert isinstance(proposal_folder, Path)
-            _ = proposal_issue.file_review_proposal(proposal_folder, recipient.id, title, words, why, details,
-                                                   before_write=before_write)
+            assert isinstance(folder, Path)
+            return proposal_issue.file_review_proposal(folder, recipient.id, title, words, why, details,
+                                                       before_write=before_write)
         case SubmissionKind.BUG | SubmissionKind.INVESTIGATION:
-            _ = investigation.file(recipient.id, title, words, waiting_why=why,
-                                   kind=investigation.InvestigationKind(kind.value), submission=details,
-                                   before_write=before_write)
+            return investigation.file(recipient.id, title, words, waiting_why=why,
+                                      kind=investigation.InvestigationKind(kind.value), submission=details,
+                                      before_write=before_write)
 
 
 def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = None) -> SavedSubmission:
@@ -629,13 +634,13 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
             if isinstance(receipt, NativeSubmissionDestination) and isinstance(found, LocatedSubmission):
                 _check_same_request(receipt, request, payload_hash)
                 _check_same_request(found.destination, request, payload_hash)
-                return _complete_receipt(folder, found.destination, receipt)
+                return _complete_receipt(folder, found.destination, receipt, found.record)
         with _locked_request(address, members, for_send=True) as lookup:
             hint, located, current = lookup.hint, lookup.native, lookup.members
             if isinstance(located, LocatedSubmission):
                 saved = located.destination
                 _check_same_request(saved, request, payload_hash)
-                return _complete_receipt(folder, saved, hint)
+                return _complete_receipt(folder, saved, hint, located.record)
             if receipt_file.is_file():
                 raise OSError(f"Cannot find the native record for request {request_id}.")
             if isinstance(hint, UnreadableRequestFile):
@@ -646,7 +651,7 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
             assert current is not None
             members = current
             recipient = _active_recipient(request.recipient_id, members)
-            destination = _proposal_folder(recipient) if kind == SubmissionKind.PROPOSAL else NoNativeFolder(kind)
+            destination = proposal_folder(recipient) if kind == SubmissionKind.PROPOSAL else NoNativeFolder(kind)
             if kind == SubmissionKind.PROPOSAL and isinstance(destination, NoNativeFolder):
                 raise SubmissionError("Select a recipient with a native proposal folder.")
             if isinstance(hint, NoRequestFile):
@@ -665,9 +670,10 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
                 _write_location(pending_file, saved)
                 destinations[:] = [saved]
 
-            _file(kind, recipient, title, words, details, members, destination, before_write)
+            record = _file(kind, recipient, title, words, details, members, destination, before_write)
             saved, = destinations
-            return _complete_receipt(folder, saved, saved, first_send=not request_exists and isinstance(hint, NoRequestFile))
+            return _complete_receipt(folder, saved, saved, record,
+                                     first_send=not request_exists and isinstance(hint, NoRequestFile))
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure,
             update_registration.InputError, Refusal) as error:
         raise SubmissionError(str(error)) from error
