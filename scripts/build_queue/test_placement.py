@@ -1789,8 +1789,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         from decimal import Decimal
         from scripts.aws_target import hana_box, hana_spend
 
-        with (PlacementFixture() as fixture,
-              mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True)):
+        with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
             good = settings.read_text()
             self.commit_settings(settings)
@@ -1800,17 +1799,27 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 return hana_spend.StartAffordable(expires)
 
             with mock.patch.object(hana_spend.HanaSpending, "preview_start", autospec=True, side_effect=preview) as start:
-                edits = (
-                    ("daily_budget_usd", good.replace("# range: 0.01..\ndaily_budget_usd=6", "daily_budget_usd=broken"), 1),
-                    ("guard_grace_seconds", good.replace("guard_grace_seconds=60", "guard_grace_seconds=broken"), 0),
-                )
-                for key, contents, count in edits:
-                    with self.subTest(key=key), redirect_stderr(io.StringIO()) as warnings:
-                        _ = settings.write_text(contents)
-                        evidence = self.read_target(fixture, request)
-                        assert isinstance(evidence, placement.FreshHostEvidence), evidence
-                        self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-                        self.assertEqual(warnings.getvalue().count(f"{key}='broken'"), count)
+                _ = settings.write_text(good.replace("daily_budget_usd=6", "daily_budget_usd=broken"))
+                with redirect_stderr(io.StringIO()) as warnings:
+                    budget = self.read_target(fixture, request)
+                assert isinstance(budget, placement.FreshHostEvidence), budget
+                self.assertEqual(budget.eligibility, ALLOWED_HOST)
+                self.assertEqual(warnings.getvalue().count("daily_budget_usd='broken'"), 1)
+                start.assert_called_once()
+
+                _ = settings.write_text(good.replace("guard_grace_seconds=60", "guard_grace_seconds=broken"))
+                with redirect_stderr(io.StringIO()):
+                    stale = self.read_target(fixture, request)
+                assert isinstance(stale, placement.FreshHostEvidence), stale
+                self.assertEqual(stale.eligibility, placement.FixedExclusion(placement.HANA_IMAGE_STALE))
+                start.assert_called_once()
+
+                with (mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True),
+                      redirect_stderr(io.StringIO()) as warnings):
+                    guest = self.read_target(fixture, request)
+                assert isinstance(guest, placement.FreshHostEvidence), guest
+                self.assertEqual(guest.eligibility, ALLOWED_HOST)
+                self.assertNotIn("guard_grace_seconds='broken'", warnings.getvalue())
                 self.assertEqual(start.call_count, 2)
 
     def test_hana_client_and_service_recover_the_same_route_limit(self) -> None:
