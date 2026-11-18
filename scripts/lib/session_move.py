@@ -9,9 +9,10 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 from collections.abc import Callable, Generator, Iterator, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import astuple, dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -73,19 +74,31 @@ class SessionDestination:
 def transcript_cwd(session_id: str) -> str:
     paths = session_records.transcript_locations(session_id)
     for path in sorted(paths, key=lambda path: path.stat().st_mtime_ns, reverse=True):
+        source = transcripts.transcript_source(path)
+        compressed = source.suffix == ".zst"
+        cwd = ""
         try:
-            with transcripts.stream_transcript(path) as stream:
-                for line in stream:
+            with (closing(transcripts.compressed_transcript_lines(source)) if compressed else source.open("rb")) as lines:
+                for line in lines:
+                    # Read to the end of the archive to check the decoder status.
+                    if cwd:
+                        continue
                     try:
                         row = cast(object, json.loads(line))
                     except ValueError:
                         continue
                     if isinstance(row, dict):
-                        cwd = cast(dict[str, object], row).get("cwd")
-                        if isinstance(cwd, str) and Path(cwd).is_absolute():
-                            return cwd
+                        candidate = cast(dict[str, object], row).get("cwd")
+                        if isinstance(candidate, str) and Path(candidate).is_absolute():
+                            cwd = candidate
+                            if not compressed:
+                                break
         except FileNotFoundError:
             continue
+        except subprocess.CalledProcessError as error:
+            raise MoveRefused(f"{source}: zstd decompression failed with status {error.returncode}") from error
+        if cwd:
+            return cwd
     raise MoveRefused(f"{session_id}: no working folder in a transcript")
 
 

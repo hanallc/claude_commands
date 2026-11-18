@@ -81,6 +81,10 @@ class VerifyNixShellTests(NixFixture):
         lint = self.home / ".claude/scripts/lint"
         lint.mkdir(parents=True)
         _ = (lint / "invoke.sh").write_text(TOOL_SETUP, encoding="utf-8")
+        prepare = ('if [[ ${1:-} == --prepare-temp ]]; then\n'
+                   + f'    source "{SCRIPTS / "lint/invoke.sh"}" --prepare-temp\n'
+                   + '    return $?\nfi\n')
+        _ = (scripts / "lint/invoke.sh").write_text(prepare + TOOL_SETUP, encoding="utf-8")
         self.setup_log = self.root / "verification.json"
         self.python_log = self.root / "python.jsonl"
         self.env.update({"CLAUDE_PYTHON": sys.executable,

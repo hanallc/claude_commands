@@ -454,6 +454,71 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(answer.text, text)
         self.assertEqual(saved.unread_since, START)
 
+    def test_close_clears_unread_and_reopen_marks_a_new_update(self) -> None:
+        item = self.add()
+        self.assertIsInstance(the_list.unread_update(item), the_list.UnreadUpdate)
+        closed = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        self.assertIs(closed.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertIs(the_list.unread_update(closed), the_list.NoUnreadUpdate.ABSENT)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        self.assertIn('unread_since: ""\n', path.read_text())
+
+        reopened_at = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=reopened_at):
+            reopened = the_list.reopen(MORTY.id, item.id, source="nate")
+        self.assertEqual(reopened.unread_since, reopened_at)
+        self.assertIsInstance(the_list.unread_update(reopened), the_list.UnreadUpdate)
+
+    def test_answer_updates_a_closed_item_without_marking_it_unread(self) -> None:
+        item = self.add()
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        answered_at = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=answered_at):
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "The page check passed."),
+                             (0, f"answered {item.id} Q1\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.CLOSED)
+        self.assertEqual(saved.updated, answered_at)
+        self.assertIsInstance(saved.questions[0].answer, question_record.Answer)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        self.assertIn('unread_since: ""\n', path.read_text())
+
+    def test_load_reads_a_legacy_closed_record_without_an_unread_update(self) -> None:
+        item = self.add(changes={"latest_status": "The report is ready.", "next_step": "Review the report.",
+                                 "evidence": "The page check passed.", "done_when": "The report closes."})
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id,
+                                  the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        field = f'unread_since: {json.dumps(START.isoformat())}\n'
+        stored = path.read_text().replace('unread_since: ""\n', field, 1)
+        self.assertIn(field, stored)
+        _ = path.write_text(stored)
+        closed = the_list.load(MORTY.id, item.id)
+        self.assertIs(closed.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertIs(the_list.unread_update(closed), the_list.NoUnreadUpdate.ABSENT)
+        self.assertEqual(path.read_text(), stored)
+        answered_at = START + timedelta(minutes=1)
+        words = "The page check passed."
+        with patch.object(the_list, "now", return_value=answered_at):
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", words),
+                             (0, f"answered {item.id} Q1\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIn('unread_since: ""\n', path.read_text())
+        self.assertEqual(saved.log, (*closed.log, the_list.ItemChange(answered_at, the_list.QuestionAnswered("Q1"), "morty")))
+        self.assertEqual(saved.updated, answered_at)
+        answer = saved.questions[0].answer
+        assert isinstance(answer, question_record.Answer)
+        self.assertEqual(answer.text, words)
+        self.assertEqual(saved.questions, (replace(closed.questions[0], answer=answer),))
+        self.assertEqual(replace(saved, updated=closed.updated, log=closed.log, questions=closed.questions), closed)
+
     def test_typed_log_refuses_invalid_fields(self) -> None:
         item = self.add()
         path = the_list.folder(MORTY.id) / f"{item.id}.md"

@@ -1,4 +1,4 @@
-"""Read plain and zstd transcripts."""
+"""Find transcript folders and open plain and compressed transcripts."""
 from __future__ import annotations
 
 from collections.abc import Generator, Iterable
@@ -8,11 +8,20 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import BinaryIO, cast
+from typing import BinaryIO
 
 
 def uncompressed_path(path: Path) -> Path:
     return path.with_suffix("") if path.suffix == ".zst" else path
+
+
+def config_dirs() -> list[Path]:
+    """List Claude config folders, including the configured override."""
+    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        directories.add(Path(override).expanduser())
+    return sorted(directories)
 
 
 def codex_transcript_homes(extra_homes: Iterable[Path] = ()) -> list[Path]:
@@ -63,26 +72,6 @@ def transcript_source(path: Path) -> Path:
 
 
 @contextmanager
-def stream_transcript(path: Path) -> Generator[BinaryIO]:
-    """Read the transcript in order without a temporary file."""
-    source = transcript_source(path)
-    with source.open("rb") as stream:
-        if source.suffix != ".zst":
-            yield stream
-            return
-        with subprocess.Popen(["zstd", "-q", "-d", "-c"], stdin=stream, stdout=subprocess.PIPE) as decoder:
-            assert decoder.stdout is not None
-            output = cast(BinaryIO, decoder.stdout)
-            yield output
-            # Check the complete archive even when the caller uses only the first lines.
-            while output.read(65536):
-                pass
-            status = decoder.wait()
-            if status:
-                raise OSError(f"{source}: zstd decompression failed with status {status}")
-
-
-@contextmanager
 def open_transcript(path: Path) -> Generator[BinaryIO]:
     """Keep decompression outside memory and permit existing readers to seek."""
     source = transcript_source(path)
@@ -100,6 +89,19 @@ def open_transcript(path: Path) -> Generator[BinaryIO]:
             raise
         _ = stream.seek(0)
         yield stream
+
+
+def compressed_transcript_lines(path: Path) -> Generator[bytes]:
+    """Read compressed transcript lines in order through a pipe."""
+    command = ["zstd", "-q", "-d", "-c"]
+    with path.open("rb") as source, subprocess.Popen(
+        command, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    ) as decoder:
+        assert decoder.stdout is not None
+        with decoder.stdout:
+            yield from decoder.stdout
+        if status := decoder.wait():
+            raise subprocess.CalledProcessError(status, command)
 
 
 def compress_transcript(path: Path, output: BinaryIO) -> int:

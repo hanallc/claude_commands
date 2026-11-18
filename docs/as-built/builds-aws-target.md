@@ -250,10 +250,26 @@ Setup reads the events of each matching stack by ID to find retained disks and b
 It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
 If it cannot verify cleanup, setup keeps the record and asks the user to run `down --workload hana --approve-destroy`.
 It registers the deployment only after the Spot request and stopped state match.
+Setup then probes the scaler path with the same credential file and profile as `aws-target.service`.
+It checks credential export and reads the instance, Spot request, and user data.
+It uses EC2 `--dry-run` for the user data change, start, and stop commands.
+AWS confirms permission for these commands with `DryRunOperation`. [AWS CLI dry-run reference](https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html#options)
+The user data dry run uses the value from the user data read, or an empty value if the read fails.
+Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` and compares the bytes it reads back.
+It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
+When AWS supplies an error code, the failure line includes it in parentheses.
+For a pending policy update, setup labels the probe runs `before the policy update` and `after the policy update`.
+Setup requires an idle-stopped lifecycle with no claims or pending start.
+It confirms that EC2 reports the instance as stopped.
+Setup compares the effective change set parameters with the approved parameters before execution.
+The second run starts after CloudFormation confirms the update.
+Setup continues the update if the first probe run fails.
+Setup returns exit status 1 if any operation in the last probe run fails.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
 It refuses changes that replace or remove an instance, volume, or volume attachment.
-When a create or update fails, setup reads failed stack events from the current change before cleanup.
+When a policy update fails, setup prints the failed progress step and the update error.
+When an ordinary setup change fails, setup reads failed stack events from the current change before cleanup.
 The error gives the name, type, status, and AWS reason for each failed resource.
 If setup cannot read the events, it reports that they are unavailable and continues cleanup.
 Setup ends the Spot boxes other than the box in `hana/setup.json`.
@@ -263,7 +279,7 @@ It deletes these resources before it closes the spending reservation and removes
 If the rollback or cleanup is incomplete, setup keeps the record and reservation for `down`.
 For an incomplete setup, `down` also checks deleted stack history for retained resources.
 If that history has no match, `down` reports it and continues with any disk or bucket in the saved record.
-After a failed update, setup deletes resources retained during rollback and keeps the stack and record.
+After a failed ordinary setup update, setup deletes resources retained during rollback and keeps the stack and record.
 Run `prepare --workload hana` again before retrying with changed inputs.
 The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 
@@ -1099,7 +1115,13 @@ The command policy rejects repairs, builds, nextest, final steps, path overrides
 The active target order remains unchanged, and `enabled=off` still prevents placement.
 
 Provider evidence reads lifecycle and execution records through the existing background worker.
-Spending previews use the account ledger lock without saving a reservation or changing the ledger.
+The stopped Hana target shares one spending preview across placement probes in the admission process.
+The preview expires after `preview_max_age_s` seconds, which defaults to two.
+Changes to the ledger, launch history, lifecycle journal, bills, or spending configuration invalidate the preview.
+The cache skips previews that use configuration recovered from Git.
+A full preview uses the account ledger lock and reads the launch history once.
+The preview gives placement evidence only.
+The controller still performs its full reservation and start checks.
 The controller alone owns demand starts, spending reservations, and idle-stop serialization.
 One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.

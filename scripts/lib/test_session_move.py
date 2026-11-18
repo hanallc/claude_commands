@@ -122,12 +122,16 @@ class SessionMoveTests(unittest.TestCase):
         self.assertEqual((target / "nested" / "note").read_bytes(), b"hold contents")
         self.assertEqual((former_scratch / "note").read_bytes(), b"hold contents")
 
-    def test_dry_run_reads_a_compressed_transcript_without_a_temporary_file(self) -> None:
+    def test_compressed_transcript_checks_the_decoder_before_using_the_first_absolute_cwd(self) -> None:
         source = self.leaf("compressed")
         transcript = self.base / "claude-home" / "projects" / self.project / "compressed.jsonl"
         transcript.parent.mkdir(parents=True)
-        _ = transcript.write_text(json.dumps({"cwd": str(self.base / "archive")}) + "\n", encoding="utf-8")
-        _ = compressed_copy(transcript)
+        _ = transcript.write_text(
+            "".join(json.dumps({"cwd": str(cwd)}) + "\n"
+                    for cwd in ("relative", self.base / "archive", self.base / "later")),
+            encoding="utf-8",
+        )
+        archive = compressed_copy(transcript)
 
         with (mock.patch.object(tempfile, "tempdir", str(self.base)),
               mock.patch.object(tempfile, "TemporaryFile", wraps=tempfile.TemporaryFile) as temporary):
@@ -138,6 +142,17 @@ class SessionMoveTests(unittest.TestCase):
         temporary.assert_not_called()
         self.assertTrue(source.is_dir())
         self.assertEqual(list(self.root.iterdir()), [])
+
+        with archive.open("ab") as output:
+            _ = output.write(b"invalid trailing frame")
+        for args in (("--dry-run",), ()):
+            with self.subTest(args=args):
+                status, output, errors = self.invoke(*args)
+                self.assertEqual(status, 1)
+                self.assertEqual(output, "")
+                self.assertIn(f"{archive}: zstd decompression failed", errors)
+                self.assertTrue(source.is_dir())
+                self.assertFalse((self.root / "archive").exists())
 
     def test_copy_checks_and_deletes_the_source(self) -> None:
         source = self.leaf("old")

@@ -268,6 +268,20 @@ class TmpSweepCase(unittest.TestCase):
 
 
 class CopyTests(TmpSweepCase):
+    def test_expired_lock_removal_leaves_the_fresh_lease_without_a_folder(self) -> None:
+        folder = self.tmp / "scratch" / "report"
+        lock = write(folder.with_name(folder.name + ".lock"))
+        lease = write(folder.with_name(folder.name + ".lease.json"), "fresh lease")
+        os.utime(lock, (self.now - 10 * DAY, self.now - 10 * DAY))
+        self.recent(lease)
+
+        result = self.sweep()
+
+        self.assertEqual([entry["path"] for entry in result.deleted], [str(lock)])
+        self.assertFalse(folder.exists())
+        self.assertFalse(lock.exists())
+        self.assertEqual(lease.read_text(), "fresh lease")
+
     def test_busy_absent_copy_does_not_block_later_recovery_or_the_sweep(self) -> None:
         pair = self.tmp / "copies/pair"
         pair.mkdir(parents=True)
