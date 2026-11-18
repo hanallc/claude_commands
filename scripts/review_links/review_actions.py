@@ -244,6 +244,39 @@ def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save
     return save_delivery(page, item.owner, save, status, question)
 
 
+def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
+                                status: change_page.DeliveryStatus
+                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Claim the first message for a published native request."""
+    row = saved.request_id
+    path = saved.original_path
+    message = (f'New {saved.kind} {saved.id} from Review.\n\n{words}\n\n'
+               + change_page.reply_command(saved.key, saved.reply_token))
+    record: change_page.StoredReviewMessage = {
+        'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,
+        'message': message, 'submission_request': row,
+    }
+    page = change_page.ReviewMessagePage(path, path.parent, (row,), '', record)
+    with status.locked():
+        stored = status.metadata_page(page)
+        slots = status.slots(page, row)
+        if isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row:
+            page = stored
+            if page.saved.get('submission_delivered'):
+                return change_page.NoMessageDelivery()
+        intent = slots.verdict
+        if isinstance(intent, change_page.DeliveryIntent):
+            if status.owns_live_claim(page, row, intent.attempt):
+                return change_page.NoMessageDelivery()
+        else:
+            recipient = staff.StaffId(page.saved['owner'])
+            intent = change_page.DeliveryIntent(secrets.token_hex(), 'verdict', recipients=(recipient,))
+            status.write_slots(page, row, slots.updated('verdict', intent))
+        status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
+    return change_page.MessageDelivery(page, row, intent.recipients, page.saved['message'], intent.attempt,
+                                       (staff.StaffId(page.saved['owner']),))
+
+
 def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestionPage, owner: staff.StaffId,
                   save: Callable[[], object], status: change_page.DeliveryStatus,
                   question: change_page.NoQuestion | change_page.OpenQuestion) -> change_page.MessageDelivery:

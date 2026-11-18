@@ -31,6 +31,7 @@ from typing import Literal, TextIO, cast, override
 from collections.abc import Callable, Generator
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+from uuid import uuid4
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
@@ -43,7 +44,7 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary, process
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_events, review_link
-from scripts.review_links import question_record, review_items
+from scripts.review_links import new_item_dialog, question_record, review_actions, review_items, review_submissions
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -1282,6 +1283,36 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(forms.counts["page-owner"], 2)
         self.assertEqual(footer_counts.changes(self.production), forms.counts["page-owner"])
         self.assert_no_delivery_controls(content)
+
+    def test_submission_message_recovery_reuses_the_claim_and_receipt(self) -> None:
+        recipient = fixture_member('producer', name='producer')
+        kind = new_item_dialog.SubmissionKind.BUG
+        request = new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-{kind}-{recipient.id}', kind,
+                                                recipient.id, 'Check the build.', new_item_dialog.NoEvidence())
+        native = review_submissions.submit(request)
+        status = change_page.DeliveryStatus(self.root)
+        first = review_actions.prepare_submission_delivery(native, request.words, status)
+        assert isinstance(first, change_page.MessageDelivery)
+        self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, status),
+                              change_page.NoMessageDelivery)
+        self.assertIn(change_page.reply_command(native.key, native.reply_token), first.message)
+        with patch.object(change_page, 'send_with_retries', return_value=[
+            change_page.DeliveryFailure(recipient.id, 'The fixture sender is unavailable.')
+        ]), patch.object(change_page, 'send_to_staff') as alert:
+            change_page.deliver(first, status)
+        alert.assert_called_once()
+        self.assertIn('The fixture sender is unavailable.', cast(str, alert.call_args.args[2]))
+        retried = review_actions.prepare_submission_delivery(native, request.words, status)
+        assert isinstance(retried, change_page.MessageDelivery)
+        self.assertEqual(retried.attempt, first.attempt)
+        restarted = change_page.DeliveryStatus(self.root)
+        with patch.object(change_page, 'send_to_staff') as send:
+            with patch.object(restarted, 'write_slots', side_effect=OSError('Cannot write the delivery receipt.')):
+                change_page.recover_review_messages(restarted)
+            change_page.recover_review_messages(change_page.DeliveryStatus(self.root))
+            send.assert_called_once_with(recipient.id, change_page.SENDER, first.message)
+        self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, restarted),
+                              change_page.NoMessageDelivery)
 
     def test_delivery_failure_survives_restart_until_the_same_row_succeeds(self) -> None:
         status = change_page.DeliveryStatus(self.root)
