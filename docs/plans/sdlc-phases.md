@@ -1146,7 +1146,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `change_review.py` withdraws an open or reviewed row and keeps the user's words and the time in the row history. The `list-ready` revert scan is gone. On main 716ca5f73 (hash 03a78d761).
 
-### Phase 74 — A unit's worktree repo selects its merge repo  · status: todo
+### Phase 74 — A unit's worktree repo selects its merge repo  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1167,6 +1167,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** `merge_checkpoint.py --production P` names the merge destination; P's checkout, branch, tests, push, promotion and lock apply. A unit whose staff parent is another production is accepted only when its worktree uses P's main checkout; the parent keeps its log and ledger. produce.md groups merge notices by destination production. On main 62aca78ee (hash c5980b520).
 
 ### Phase 75 — Review page follow-ups  · status: todo
 **Depends on:** none
