@@ -9,6 +9,7 @@
 // Add --identity as the fourth argument for the row hover identity block images.
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
+// Use --headcount to compare the Running and Queued headers.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
@@ -42,6 +43,7 @@ try {
   const identityComparison = process.argv[4] === '--identity';
   const waitTipComparison = process.argv[4] === '--wait-tip';
   const macrouteComparison = process.argv[4] === '--macroute';
+  const headcountComparison = process.argv[4] === '--headcount';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -221,6 +223,91 @@ try {
           fitLabels();
           })()`);
         };
+        await checkHeadcounts(navigate, evaluate, call);
+        if (headcountComparison) console.log(JSON.stringify({pass:true,comparison:'headcount'}));
+        else {
+          servedReading = base;
+          await checkPage(navigate, evaluate, call);
+        }
+      } finally {
+        if(ws) ws.close();
+        chrome.kill('SIGTERM');
+        await exited;
+      }
+
+      async function checkHeadcounts(navigate, evaluate, call) {
+        const headingReading = structuredClone(readings.queued_none);
+        const toolsBytes = 6 * 1024 ** 3;
+        Object.assign(headingReading.ram, {build_tools_bytes:toolsBytes,rust_analyzer_bytes:toolsBytes,
+          sccache_bytes:0,other_build_tools_bytes:0});
+        const local = base.walk.find(row => row.queued && !row.ci);
+        const aws = readings.cloud.walk.find(row => row.kind === 'cloud');
+        const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build');
+        const macStatus = readings.mac_failed.walk.find(row => row.kind === 'mac-unavailable');
+        assert.ok(local && aws && mac && macStatus);
+        headingReading.walk = [local, aws, mac, {...local, queued:false, key:'untracked-step'}];
+        const headerState = `({
+          running:document.querySelector('[data-tip="walkhead"]').textContent,
+          queued:document.querySelector('#walk .queue-title')?.textContent ?? '',
+          tools:document.querySelector('#walk .wrow.tools .name')?.textContent,
+          free:document.querySelector('#walk .wrow.room .name')?.textContent
+        })`;
+        const captureHeadings = async name => {
+          await evaluate("document.querySelector('[data-tip=walkhead]').scrollIntoView({block:'center'})");
+          const clip = await evaluate(`(() => {
+            const section = document.querySelector('[data-tip="walkhead"]').closest('section').getBoundingClientRect();
+            const queue = document.querySelector('#walk .queue-title').getBoundingClientRect();
+            return {x:section.left,y:section.top+scrollY,width:section.width,height:queue.bottom-section.top+8,scale:1};
+          })()`);
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder,`${name}-dark.png`),Buffer.from(shot.data,'base64'));
+        };
+        await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+        await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+        servedReading = headingReading;
+        if (headcountComparison) {
+          assert.ok(beforePage, 'The header comparison needs the previous page.');
+          await navigate('before.html');
+          assert.deepEqual(await evaluate(headerState), {running:'Running, in start order',
+            queued:'Queued, in order of submission',tools:'Build tools',free:'Free'});
+          await captureHeadings('before');
+        }
+        await navigate('memory_live.html');
+        assert.deepEqual(await evaluate(headerState), {running:'Running, in start order (3)',
+          queued:'Queued, in order of submission (4)',tools:'Build tools',free:'Free'});
+        if (headcountComparison) await captureHeadings('after');
+        await evaluate('window.render = window.renderReading');
+        const longUnit = 'research-with-a-long-unit-name'.repeat(8);
+        for (const [units, walk, count, queued] of [
+          [['research'], [local, aws, macStatus], 2, 'Queued, research first, then in submission order (2)'],
+          [[longUnit], [local, aws, macStatus], 2, `Queued, ${longUnit} first, then in submission order (2)`],
+          [['research', 'cables'], [local], 1, 'Queued, research followed by cables and then in submission order (1)'],
+          [['research'], [macStatus], 0, 'Queued, in order of submission (0)'],
+        ]) {
+          servedReading = {...headingReading, walk, waiters:headingReading.waiters.slice(0,count), queued_priority_units:units};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual(await evaluate(headerState), {
+            running:`Running, in start order (${walk.filter(row=>row.kind!=='mac-unavailable').length})`,
+            queued,tools:'Build tools',free:'Free'});
+          assert.deepEqual(await evaluate(`[
+            document.querySelectorAll('#walk .wrow.wait').length,
+            document.querySelectorAll('#walk tr.wait').length
+          ]`), [count, count]);
+          if (units.includes(longUnit)) {
+            assert.deepEqual(await evaluate(`(() => {
+              const heading = document.querySelector('#walk .queue-title');
+              const [label, count] = heading.children;
+              return {
+                truncated: label.scrollWidth > label.clientWidth && getComputedStyle(label).textOverflow === 'ellipsis',
+                count: count.textContent.trim(),
+                countFits: count.getBoundingClientRect().right <= heading.parentElement.getBoundingClientRect().right + 1
+              };
+            })()`), {truncated:true, count:'(2)', countFits:true});
+          }
+        }
+      }
+
+      async function checkPage(navigate, evaluate, call) {
         await navigate('memory_live.html');
         // The user, 11-16: space pauses every update, a tooltip still opens, and space again resumes.
         const pressSpace = async () => {
@@ -1263,6 +1350,7 @@ try {
             const absent=structuredClone(base);
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
+            delete absentRun.caller;
             await show(absent);
             const absentCells=await evaluate(`({unit:document.querySelector('.walk-table td.unit').textContent,
               owner:document.querySelector('.wrow[data-run] .owner').textContent,
@@ -1398,7 +1486,9 @@ try {
               }
             }
             await show(readings.shrink);
-            assert.equal(await evaluate("document.querySelectorAll('.queue-head').length"),0);
+            assert.equal(await evaluate("document.querySelector('#walk .queue-title').textContent"),
+              'Queued, in order of submission (0)');
+            assert.equal(await evaluate("document.querySelectorAll('#walk .wrow.wait, #walk tr.wait').length"),0);
             // The tooltip shows 'second nextest', a step that the smaller reading no longer has.
             await evaluate(`showTip('${proofTip('row',0,readings.shrink)}',200,200)`);
             const smaller=structuredClone(base);
@@ -1716,8 +1806,8 @@ try {
                     return range.getBoundingClientRect().bottom;
                   };
                   return {title:heading.textContent,font:getComputedStyle(heading).font,
-                    hover:heading.title,truncated:heading.scrollWidth>heading.clientWidth,
-                    clipped:getComputedStyle(heading).textOverflow==='ellipsis' && getComputedStyle(heading).overflow==='hidden',
+                    hover:heading.title,truncated:heading.firstElementChild.scrollWidth>heading.firstElementChild.clientWidth,
+                    clipped:getComputedStyle(heading.firstElementChild).textOverflow==='ellipsis' && getComputedStyle(heading.firstElementChild).overflow==='hidden',
                     withinChart:heading.getBoundingClientRect().right<=header.getBoundingClientRect().right+1,
                     headerHeight:header.getBoundingClientRect().height,
                     headerOffset:header.getBoundingClientRect().top-columns.getBoundingClientRect().top,
@@ -1736,7 +1826,7 @@ try {
                       return Math.abs(row.getBoundingClientRect().top-chart.getBoundingClientRect().top)<=1;
                     }),beside:walk.classList.contains('beside')};
                 })()`);
-                assert.equal(state.title,title);
+                assert.equal(state.title,`${title} (${readings[name].waiters.length})`);
                 assert.ok(state.hover.startsWith(title+'\n'));
                 assert.match(state.hover,/Showrunner:/);
                 assert.match(state.hover,/Unit:/);
@@ -1780,7 +1870,7 @@ try {
                 assert.equal(state.title,cases[2][1]);
               } else {
                 assert.ok(Math.abs(state.roomTop-beforeRoomTop)<=1,'The room row moved.');
-                assert.equal(state.title,cases[2][1]);
+                assert.equal(state.title,`${cases[2][1]} (${readings.queued_two.waiters.length})`);
                 assert.ok(state.waitTop<beforeWaitTop,'The separate title row remains.');
               }
               await capture(`${version}-${theme}-queued`,'#walk');
@@ -2423,10 +2513,13 @@ try {
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
         const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
-        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'sdlc branch',
-          showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,started_at:gateReading.read_at-600});
+        const gateRow=gateReading.walk[gateIndex];
+        Object.assign(gateRow,{name:'natemerge integrate',unit:'natemerge',title:{unit:'natemerge',step:'integrate'},
+          about:gateAbout,changes:'sdlc branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
+          started_at:gateReading.read_at-600});
+        delete gateRow.caller;
         // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
-        delete gateReading.walk[gateIndex].parts;
+        delete gateRow.parts;
         await show(gateReading);
         await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
         const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
@@ -2447,13 +2540,10 @@ try {
         })()`);
         const endShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:endClip});
         await writeFile(join(folder,'after-dark-desktop.png'),Buffer.from(endShot.data,'base64'));
+
         await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
-      } finally {
-        if(ws) ws.close();
-        chrome.kill('SIGTERM');
-        await exited;
       }
     } finally {
       await rm(profile,{recursive:true,force:true,maxRetries:3});
