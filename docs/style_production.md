@@ -598,7 +598,7 @@ The parent merges each ticket checkpoint with the normal unit checkpoint command
 `merge_checkpoint.py --production <parent showrunner name> <unit> <phase> <hash> --started <time>`.
 Then run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`.
 Apply the `not built` and reservation recovery rules below.
-Send the owning director `From the showrunner of <parent showrunner name>: ticket <id> merged; refill.`
+Send the owning director `ticket <id> merged; refill.`
 This route needs no style hand-off.
 
 ### Style showrunner route
@@ -615,7 +615,7 @@ If a retained record still needs release, repeat the coordinator command before 
 `ticket merge` and `reconcile` also recover any retained reservation record.
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
 to recover any retained reservation and wake units waiting for sync. Send the owning director
-`From the showrunner of <style showrunner name>: ticket <id> merged; refill.`
+`ticket <id> merged; refill.`
 For each `has no applied check` line that merge prints, check the change in the
 code, and run the printed `held built` command when the change is there. A rerun
 of `ticket merge` on a merged ticket prints these lines again. A finding whose
@@ -630,9 +630,8 @@ merge after the release is confirmed releases nothing more.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --production <style showrunner name> --checkpoint <style branch tip>`.
-It adds the hand-off, sends
-`From the showrunner of <style showrunner name>: hand-off <hash>` to the current parent's
-`showrunners.py address <parent>`, then records `handoff send`.
+It adds the hand-off and gets the current parent's address with `showrunners.py address <parent>`.
+It sends `hand-off <checkpoint>` to that address, then records `handoff send`.
 A send that send.py queued (`QUEUED:`, exit 1) is sent too: send.py delivers
 it later. The command prints `hand-off <hash7>: queued for <parent>`.
 Style work never waits for a sync to go home.
@@ -645,7 +644,7 @@ from its last merged hand-off. The subject is
 `Merge <style showrunner name> hand-off (<hash7>) into <branch point>`.
 After pushing, notifying sync and promoting, the attached receiver records the
 hand-off as merged in the style ledger with its merge commit, then sends
-`From the showrunner of <parent showrunner name>: hand-off <hash7> merged as <merge7>.`
+`hand-off <c7> merged as <m7>.`
 The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
 ancestry on the branch point is the evidence, so it also takes a pending row.
@@ -682,9 +681,9 @@ Run `reconcile` afterward: a root's unsent row stays pending until ancestry
 marks it merged.
 This also clears hand-offs a departing parent had not merged.
 
-On `From <unit>: ticket <id> closed with no code change; <n> held.`, merge
-nothing and send neither a hand-off nor a refill message: the unit refills
-itself; its `ticket merge` already woke units waiting for sync.
+When you receive `ticket <id> closed with no code change; <n> held.`, skip the merge.
+Omit the hand-off and refill messages.
+The unit refills itself, and its `ticket merge` already notified units that wait for sync.
 When `<n>` is positive, run `style_proposals.py file`.
 
 ## Yielding

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import os
 import shutil
@@ -15,7 +16,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import override
 
-from scripts.lib import main_sync
+from scripts.lib import live_settings, main_sync, waiting_rows
 from scripts.message import session_send
 
 
@@ -45,7 +46,8 @@ class MainSyncTests(unittest.TestCase):
         _ = warm_status.write_text("#!/bin/sh\nexit 1\n")
         warm_status.chmod(0o755)
         self.enterContext(unittest.mock.patch.dict(os.environ, {
-            "CONF_DIR": str(config), "PATH": str(binaries) + os.pathsep + os.environ["PATH"]}))
+            "CONF_DIR": str(config), "XDG_STATE_HOME": str(self.root / "xdg"),
+            "PATH": str(binaries) + os.pathsep + os.environ["PATH"]}))
         self.origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.origin)], check=True)
         self.writer = self.root / "writer"
@@ -116,6 +118,34 @@ class MainSyncTests(unittest.TestCase):
             self.assertEqual(git(self.checkout, "status", "--porcelain", "--untracked-files=no"), "")
             self.assertEqual((self.checkout / "d").read_text(), "d")
             self.assertEqual((self.checkout / "session-state.json").read_text(), "{}")
+
+    def test_an_advanced_checkout_cannot_move_back_during_claude_sync(self) -> None:
+        older = self.commit("b")
+        newer = self.commit("c")
+        _ = git(self.checkout, "fetch", "-q", "origin")
+        _ = git(self.writer, "push", "-q", "--force", "origin", f"{older}:main")
+        flock = fcntl.flock
+
+        def finish_newer_pull(descriptor: int, operation: int) -> None:
+            _ = git(self.checkout, "merge", "--ff-only", newer)
+            flock(descriptor, operation)
+
+        with unittest.mock.patch.object(fcntl, "flock", finish_newer_pull):
+            self.assertEqual(main_sync.sync(self.checkout).state, "diverged")
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), newer)
+
+    def test_claude_sync_restores_the_accepted_save_when_head_is_current(self) -> None:
+        (self.writer / "config").mkdir()
+        _ = (self.writer / "config/example.conf").write_text("# whole: 1..\namount=2\n")
+        _ = git(self.writer, "add", "config/example.conf")
+        _ = self.commit("setting")
+        self.assertEqual(main_sync.sync(self.checkout).state, main_sync.ADVANCED)
+        path = self.checkout / "config/example.conf"
+        with unittest.mock.patch.dict(os.environ, {"CONF_DIR": str(path.parent), "LIVE_SETTINGS_SAVE_ORDER": "1"}):
+            self.assertEqual(live_settings.main(["example", "amount", "3"]), 0)
+            _ = path.write_text("# whole: 1..\namount=2\n")
+            self.assertEqual(main_sync.sync(self.checkout).state, main_sync.CURRENT)
+        self.assertEqual(path.read_text(), "# whole: 1..\namount=3\n")
 
     def test_each_blocked_case_leaves_the_checkout_alone(self) -> None:
         _ = self.commit("b")
@@ -256,6 +286,7 @@ class MainSyncTests(unittest.TestCase):
                    subprocess.CompletedProcess(["git"], 0, str(self.checkout / ".git"), ""),
                    subprocess.CompletedProcess(["git"], 1, "", "fetch refused")]
         with (unittest.mock.patch.object(main_sync, "_git", side_effect=results),
+              unittest.mock.patch.object(waiting_rows, "restore_live"),
               unittest.mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(
                   ["github-warm-status"], 5)) as probe):
             outcome = main_sync.sync(self.checkout)

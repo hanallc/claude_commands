@@ -378,9 +378,11 @@ Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the ow
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
-When the user submits a Review action, the row and its open details fade and collapse together in 200 ms.
-The rows below slide into place as the row collapses.
+When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
+The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
+If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
 A successful save adds no notice above the table.
 The status region above the table shows a failure only for the most recent submission.
@@ -729,13 +731,19 @@ The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
-The shared filter controls show the Show, State, Owner, and Producer rows in that order.
-Show selects a view such as Open or Parked.
-State selects an item state within that view.
-The four rows and the words box must all match the item.
-The words box at the upper right matches the item number, owner, title, or state.
-Each row starts with All.
-Each chip count reflects the other rows and the words box.
+The List starts with All selected in its single row of status chips.
+The chip order is All, Needs me, Morty answering, Working, Blocked, Parked, and Closed.
+Morty answering includes all items with an open question, including parked items and items that need Resend.
+The other status chips contain items with no open question.
+Needs me includes unparked items in Waiting for nate or Delivered.
+Working includes unparked items in New or Working.
+Blocked includes unparked items in Blocked or Paused.
+Parked includes items with a future parking time in states other than Done and Closed.
+Closed includes items in Done or Closed, even when they have a future parking time.
+Each item belongs to one status category. The six counts add up to All.
+The Unread only switch limits the visible items and chip counts to unread items.
+The Owner and Producer menus and the words box also limit the chip counts.
+The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
 
 The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
@@ -774,6 +782,8 @@ Each List record stores a `producer`: the fixed staff ID of a staff row with the
 The option refuses a name or ID that does not resolve to exactly one current producer row.
 A new item without the option, and an old record without the field, belong to the record keeper, morty.
 The terminal list shows a Producer column after Owner.
+The CLI shows producers only their assigned items. Morty can see every item.
+See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
 
 When List records have review links, the page reads review items once per render and indexes them by key.
 It stores no review states on the List record.
@@ -814,15 +824,15 @@ The List number column and the Review ID column use the shared no-wrap rule.
 The Owner menu includes record owners without a current staff row.
 The Producer menu beside it lists each producer that a record names.
 An address with a producer that no record names shows all producers.
-The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
-Open excludes Done, Closed, and items with a future parking time.
-Unread excludes Closed items from the view and the counts.
-Closed items have no unread dot or Mark read button.
+The State column shows the saved state of each item.
+Closing an item clears its unread mark. A later answer can mark it unread again.
+An older address with `show=done` opens the Closed view.
+An older address with `show=unread` turns on Unread only.
 The search field matches the item number, owner name, title, or state words.
 Numbers can include `L` or `#`.
 One match function ignores case for every field.
 Parked items also match the word `Parked`.
-The address retains the owner, producer, view, search, column, and direction.
+The address retains the owner, producer, status chip, unread switch, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
 The record keeps Evidence, and the open row has no separate Evidence section.
@@ -884,18 +894,19 @@ It restores both controls when the response reports a new unread update.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
 Tell morty shows “sent to morty; update remains unread” in both cases.
-Tell morty applies the current filter again, so a read item leaves Unread at once.
+Tell morty applies the current filters. A read item leaves the view when Unread only is on.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
 The page uses the question and delivery code shared with Images.
 The server replies to the browser before it sends morty the item number, title, question, and answer command.
 Equal words select the open question. Different words create a new question.
 An exact request retry uses the same question ID, even after morty answers it.
-The row leaves every Show view while every unanswered question has a live sender or confirmed acceptance.
+The row moves to Morty answering when the question saves.
+The row shows a waiting note when each unanswered question has a live sender or confirmed acceptance.
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
 The console updates its unread indicator on its own news refresh.
-The next List refresh shows the row if any unanswered question has an uncertain send, failed send, or no sender.
+The next List refresh shows the delivery notice and Resend when a question needs another send.
 An unknown result shows “Question Qn may not have reached morty.”
 The List shows why Resend is unavailable if the previous sender is active or cannot be checked.
 Images shows the same reason when it cannot retry the question.
@@ -913,11 +924,16 @@ After a successful Ask keeps the row visible, the row toggle receives lost focus
 Focus stays on the user's selection if they move it during the request, including to the parent console.
 On refresh, the List restores focus to an available action button with the same item key and action.
 Column sort buttons keep focus through refresh.
-A direct or related-item link opens a waiting row with “The producer will answer” and no action buttons.
-A related-item link keeps the current filters.
+A waiting row shows “The producer will answer” and no action buttons.
+A link opens a filtered-out question or read item in a separate section and preserves the current filters.
+The section does not change the results count.
+An open question adds a Morty answering note below the saved state.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one log entry. It marks the item unread if the item is not Closed.
-After the last answer, the next refresh returns the row to the applicable views.
+The answer adds one log entry and marks the item unread, including when the item is Closed.
+After the last answer, the next refresh returns the row to its status chip.
+Parked shows the item after the last answer if its parking time is still active.
+A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
+That request keeps the item in Morty answering and shows its confirmation next to Show.
 The log shows each answered question with its answer.
 The command refuses an unknown ID, a second answer, and empty text.
 
@@ -932,7 +948,12 @@ Recovery claims unsent work only after the shared question reader verifies the d
 Recovery leaves uncertain outcomes for the user.
 An older pending attempt with no live sender appears as uncertain.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
+Remove sits at the left edge of the row above the four-line text box.
+**Unpark** and **Park until** sit at the right edge of the row.
+An expanded parked item shows its parking time above the buttons.
+**Unpark** appears in the form when the parking time is in the future and the item is in a state other than Closed.
 **Park until** opens the shared calendar and 24-hour time field directly.
+The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
 Park writes the time through `the_list.park` with the same source.
@@ -943,22 +964,37 @@ The writer requires the instant in the receipt or in a parking change with the s
 The picker can resend the original request and instant after the parking time passes.
 When the saved date has passed, the picker gives focus to an enabled day.
 The page keeps the words for Tell morty.
-Morty does not perform these two button actions.
+**Unpark** clears the parking time through `the_list.unpark` and keeps the item state.
+It records one Unparked event and saves one notice for morty.
+If the item has no active parking time, the writer saves only a hidden request receipt.
+The receipt records whether the time expired or was absent.
+A replay of that request preserves any newer parking time.
+The response reports the saved request outcome and the current parking state.
+The page shows “Parking time already expired” for an expired time.
+It shows “No active parking time to clear” when the time is absent.
+Both results preserve the parking draft.
+A replay of a successful Unpark reports the original result and any newer active parking time.
+When Unpark clears parking and removes the row from Parked, the page shows “Item #N unparked.”
+The page shows confirmations for hidden rows next to the Show filter.
+It keeps one confirmation per hidden row after overlapping Unpark requests.
+Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
+In All, the row stays expanded and focus moves from **Unpark** to its item number.
+After Unpark, the item's saved state sets its status chip.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
-Remove leaves Open at once when the user presses the button.
-Park leaves Open and enters Parked at once.
-The row leaves Unread when the user presses Mark read, Ask question, Tell morty, or Remove.
-The row returns to Unread if the server reports an unread update and the row is visible in The List.
+Remove moves the item to Closed at once.
+Park moves an item to Parked at once when its state is outside Closed.
+With Unread only on, the row leaves the view when the user presses Mark read, Ask question, Tell morty, or Remove.
+The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved time to update one parking label.
+The page uses the saved time to update the parking labels for the expanded and collapsed row.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
 If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
@@ -979,7 +1015,7 @@ The row block requires the record's own number, a List state line, and field bul
 Only field bullets and their continuation lines belong to the block.
 A continuation line starts with at least two spaces or a tab.
 A second run changes nothing.
-The page can mark an item read, close it, park it, or append feedback and delivery states.
+The page can mark an item read, close it, park it, unpark it, or append feedback and delivery states.
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, action, and words with each change in one locked write.
 The same write saves a pending notice for actions that send one.
