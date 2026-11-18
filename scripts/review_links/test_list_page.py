@@ -818,10 +818,10 @@ frame.addEventListener('load',async()=>{
         _ = the_list.park(MORTY.id, item.id, the_list.time_value("2026-11-18T02:00:00+00:00"), source="nate")
         with self.subTest(view="table"):
             body = list_page.render(root).decode()
-            self.assertIn("Parked until 2026-11-17</small>", body)
-            self.assertIn("Parked until</dt><dd>2026-11-17</dd>", body)
+            self.assertIn("Parked until 2026-11-17 21:00 EST</small>", body)
+            self.assertIn("Parked until</dt><dd>2026-11-17 21:00 EST</dd>", body)
         with self.subTest(view="response"):
-            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-11-17")
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-11-17 21:00 EST")
 
     def test_old_closed_log_uses_the_closing_words_renderer(self) -> None:
         log = self.legacy_log("- 2026-11-16 18:10:00+00:00 Closed: The **check** passed. — nate")
@@ -1494,6 +1494,75 @@ document.body.append(result);
             send.assert_called_once()
         self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
+    def test_park_saves_the_picked_instant_in_the_user_zone(self) -> None:
+        item = self.add("Park until a time")
+        root = self.root / "reviews"
+        until = "2026-12-04T00:30:00.000Z"
+        _ = list_page.submit(root, urlencode(self.fields(item, "park", until=until)))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.parked_until, datetime(2026, 12, 4, 0, 30, tzinfo=UTC))
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-12-03 19:30 EST")
+        body = list_page.render(root).decode()
+        self.assertIn("Parked until 2026-12-03 19:30 EST</small>", body)
+        self.assertIn("Parked until</dt><dd>2026-12-03 19:30 EST</dd>", body)
+
+    def test_park_retry_compares_the_saved_instant_to_the_second(self) -> None:
+        item = self.add("Retry the exact parking time")
+        root = self.root / "reviews"
+        fields = self.fields(item, "park", until="2026-12-04T00:30:05Z")
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            saved = the_list.load(MORTY.id, item.id)
+            with self.assertRaisesRegex(the_list.ListError, "different parking time"):
+                _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-04T00:30:55Z"}))
+            same_time = {**fields, "until": "2026-12-03T19:30:05-05:00"}
+            list_page.deliver(list_page.submit(root, urlencode(same_time)))
+            send.assert_called_once()
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_park_retry_accepts_a_legacy_date_only_record(self) -> None:
+        item = self.add("Retry a Park saved by the old page")
+        root = self.root / "reviews"
+        fields = self.fields(item, "park", until="2026-12-03")
+        request_fields = the_list._request_fields  # pyright: ignore[reportPrivateUsage]
+
+        def legacy_fields(request: the_list.PageRequest) -> dict[str, str]:
+            return {key: value for key, value in request_fields(request).items() if key != "parked_until"}
+
+        with (patch.object(the_list, "_request_fields", side_effect=legacy_fields),
+              patch.object(change_page, "send_to_staff") as send):
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            later = datetime(2026, 12, 6, 5, tzinfo=UTC)
+            saved = the_list.park(MORTY.id, item.id, later, source="morty")
+            with patch.object(the_list, "now", return_value=datetime(2026, 12, 3, 5, tzinfo=UTC)):
+                list_page.deliver(list_page.submit(root, urlencode(fields)))
+            send.assert_called_once()
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_park_retry_refuses_an_earlier_park_when_its_own_event_is_missing(self) -> None:
+        item = self.add("Retry a Park with missing evidence")
+        root = self.root / "reviews"
+        earlier = self.fields(item, "park", until="2026-12-03")
+        original = {**earlier, "request": earlier["request"] + "." + "a" * 32, "until": "2026-12-04"}
+        request_fields = the_list._request_fields  # pyright: ignore[reportPrivateUsage]
+
+        def legacy_fields(request: the_list.PageRequest) -> dict[str, str]:
+            return {key: value for key, value in request_fields(request).items() if key != "parked_until"}
+
+        with patch.object(the_list, "_request_fields", side_effect=legacy_fields):
+            _ = list_page.submit(root, urlencode(earlier))
+            _ = list_page.submit(root, urlencode(original))
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        body, marker, log = path.read_text().partition("## Log\n\n")
+        lines = log.splitlines()
+        self.assertIn('"action": "Parked"', lines[-2])
+        del lines[-2]
+        _ = path.write_text(body + marker + "\n".join(lines) + "\n")
+        saved = the_list.load(MORTY.id, item.id)
+        with self.assertRaisesRegex(the_list.ListError, "different parking time"):
+            _ = list_page.submit(root, urlencode({**original, "until": earlier["until"]}))
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
     def test_new_park_checks_the_date_at_the_locked_write(self) -> None:
         item = self.add("Refuse a Park that reaches the writer at midnight")
         root = self.root / "reviews"
@@ -1591,6 +1660,139 @@ window.fetch=async(_path,options={})=>{
         self.browser_actions(markup, setup, probe, virtual_time_ms=3000)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ const toggle=form.querySelector('[data-later-toggle]');
+ check(!form.querySelector('input[type=date]'),'Park has no native date input');
+ toggle.click();
+ const sheet=form.querySelector('[data-later-custom]');
+ check(!sheet.hidden && !sheet.closest('[data-later-menu]').hidden,'Park opens the shared sheet');
+ check(document.activeElement.dataset.date==='2026-12-03','Focus starts on the selected date');
+ sheet.querySelector('[data-date="2026-12-03"]').click();
+ const field=sheet.querySelector('[data-later-time]');
+ field.value='1930';field.dispatchEvent(new Event('input',{bubbles:true}));
+ check(sheet.querySelector('[data-later-summary]').textContent==='Parks until Thu 3 Dec 19:30',
+  'The shared sheet shows the 24-hour time in the user zone');
+ check(!requests.length,'Changing the selection does not submit the form');
+ sheet.querySelector('[value="park"]').click();
+ check(sheet.hidden && requests.length===1,'Save closes the shared sheet and submits once');
+ check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-12-04T00:30:00.000Z',
+  'Save sends the selected instant');
+ finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03 19:30 EST'});
+ await flush();
+ check(row.querySelector('[data-parked-note]').textContent==='Parked until 2026-12-03 19:30 EST',
+  'The row shows the saved time');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+ form.querySelector('[data-later-toggle]').click();
+ const previous=form.querySelector('[data-later-month-step="-1"]');
+ const grid=form.querySelector('[data-later-grid]');
+ previous.focus();
+ check(document.activeElement===previous,'Previous month has focus in December');
+ previous.click();
+ const day=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+ check(previous.disabled && day?.dataset.date==='2026-11-30','November has an enabled day');
+ check(document.activeElement===day,'Focus moves from Previous month to the enabled day');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_retries_the_same_parking_time_after_it_passes(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-12-02T13:00:00Z');
+ Date.now=()=>now;
+ show('all');
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.click();
+ const time=form.querySelector('[data-later-time]'),save=form.querySelector('[value="park"]');
+ time.value='1930';time.dispatchEvent(new Event('input',{bubbles:true}));
+ save.click();
+ const first=requests[0];
+ check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save sends the chosen instant');
+ losePost();await flush();
+ now=Date.parse('2026-12-05T13:00:00Z');
+ toggle.click();
+ check(time.value==='19:30' && !save.disabled,'The picker retains and enables the expired retry');
+ save.click();
+ check(requests.length===2 && requests[1].get('request')===first.get('request') &&
+  requests[1].get('until')===first.get('until'),'Save retries the same ID and instant');
+ if(requests.length===2){finishPost({parked:'false',parked_until:''});await flush();}
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_refusal_from_enter_restores_focus(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.click();
+ const time=form.querySelector('[data-later-time]');
+ time.focus();
+ time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+ check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Open');
+ finishPost({reason:'The fixture refuses Park'});
+ await flush();
+ for(const animation of document.getAnimations()) animation.finish();
+ await flush();
+ check(!row.hidden && !toggle.disabled && document.activeElement===toggle,
+  'The restored row returns focus to Park until');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_expired_park_retry_keeps_the_calendar_in_the_tab_order(self) -> None:
+        self.browser_action_sequence(r"""
+ let now=Date.parse('2026-12-02T13:00:00Z');
+ Date.now=()=>now;
+ show('all');
+ const toggle=form.querySelector('[data-later-toggle]'),grid=form.querySelector('[data-later-grid]');
+ const save=form.querySelector('[value="park"]');
+ toggle.click();
+ save.click();
+ const first=requests[0];
+ losePost();await flush();
+ now=Date.parse('2026-12-15T13:00:00Z');
+ toggle.click();
+ const entry=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+ check(entry?.dataset.date==='2026-12-15','The calendar has an enabled day in the Tab order');
+ check(entry===document.activeElement && !save.disabled,'The calendar has focus and Save can retry');
+ document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ now=Date.parse('2027-01-02T13:00:00Z');
+ toggle.click();
+ const nextMonth=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+ check(nextMonth?.dataset.date==='2027-01-02','The calendar opens on an enabled month');
+ if(nextMonth){
+  nextMonth.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+  check(document.activeElement.dataset.date==='2027-01-03','ArrowRight selects a new date from the focused day');
+  save.click();
+  check(requests[1]?.get('request')!==first.get('request') && requests[1]?.get('until')?.startsWith('2027-01-03'),
+   'The new date sends a new request');
+  if(requests.length===2){finishPost({parked:'true'});await flush();}
+ }
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_refusal_keeps_focus_on_search(self) -> None:
+        self.browser_action_sequence(r"""
+ Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ form.querySelector('[data-later-toggle]').click();
+ const time=form.querySelector('[data-later-time]');
+ time.focus();
+ time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+ check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Open');
+ finishPost({reason:'The fixture refuses Park'});
+ await flush();
+ const search=document.getElementById('list-search');
+ search.focus();
+ check(document.activeElement===search,'Search receives focus while the row returns');
+ for(const animation of document.getAnimations()) animation.finish();
+ await flush();
+ check(!row.hidden && document.activeElement===search,'A refused Park keeps focus on Search');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reserves_a_lost_park_id_and_updates_the_saved_date_label(self) -> None:
         item = self.add("Change the parking date")
         _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
@@ -1619,7 +1821,7 @@ window.fetch=async(_path,options={})=>{
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
  try{
-  check(labels().join() === 'Parked until 2026-11-18','starts with one saved date label');
+  check(labels().join() === 'Parked until 2026-11-18 13:00 EST','The row starts with one saved time label');
   form.elements.until.value='2026-12-03';
   const park=submit('park');losePost();await flush();
   check(submit('park')===park,'an exact Park retry keeps its request ID');
