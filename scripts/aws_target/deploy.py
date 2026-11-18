@@ -1273,8 +1273,8 @@ class Deployment:
                 + '3. Run deploy.py hana-setup --approve-resources')
         raise DeploymentRefused(f'AWS lists no Spot prices for Hana instance types in the eligible subnets of {api.region}.')
 
-    def _reserve_hana_setup(self, spending: hana_spend.HanaSpending, saved: dict[str, object],
-                            generation: int) -> ledger.HanaComputeExposure:
+    def _reserve_hana_setup(self, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+                            saved: dict[str, object], generation: int) -> ledger.HanaComputeExposure:
         now = int(self.clock())
         for row in spending.book.read_snapshot().hana_compute:
             if row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen):
@@ -1291,8 +1291,8 @@ class Deployment:
         return reservation.exposure
 
     def _launch_hana_instance(self, api: AwsCli, path: Path, saved: dict[str, object],
-                              candidates: tuple[HanaSpotCandidate, ...], spending: hana_spend.HanaSpending,
-                              deadline: int) -> None:
+                              candidates: tuple[HanaSpotCandidate, ...],
+                              spending: hana_spend.HanaSpending[hana_spend.PermitSettings], deadline: int) -> None:
         if 'pending_launch' in saved:
             pending = PendingHanaLaunch.decode(saved['pending_launch'])
             first = next((candidate for candidate in candidates if pending.matches(candidate)), None)
@@ -1414,7 +1414,8 @@ class Deployment:
                 return row.at
         raise DeploymentRefused('The saved Hana setup has no reservation time.')
 
-    def _clear_hana_setup(self, spending: hana_spend.HanaSpending, path: Path, saved: dict[str, object]) -> None:
+    def _clear_hana_setup(self, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+                          path: Path, saved: dict[str, object]) -> None:
         generation = ledger.instant(saved, 'generation')
         now = int(self.clock())
         spending.reconcile(now, 'terminated', generation=generation)

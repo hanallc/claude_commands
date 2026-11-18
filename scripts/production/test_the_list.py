@@ -16,8 +16,9 @@ from typing import cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file
-from scripts.production import investigation, record_store, staff, the_list, update_registration
+from scripts.production import change_review, investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
 
@@ -587,6 +588,38 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(self.command(command, item.id, "--review", identities[0], "--source", "morty"),
                     (1, "", f"the_list: {item.id}: reopen the Closed item before changing it\n"))
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_review_link_ignores_a_producer_directory(self) -> None:
+        folder = self.root / "producer"
+        folder.mkdir()
+        _ = (folder / "README.md").write_text("# Producer\n")
+        members = staff.snapshot()
+        rows = tuple(replace(row, doc=staff.LiveDoc(local_machine(), folder)) if row.id == MORTY.id
+                     else row for row in members.rows)
+        _ = staff.record_path().write_text(replace(members, rows=rows).encode())
+        report = investigation.file(OWNER.id, "Read the result", "Check the result.", waiting_why="Check the result.")
+        item = self.add()
+        with (patch.object(change_review, "lists_directory", return_value=self.root),
+              self.assertNoLogs(review_items.__name__, level="WARNING")):
+            self.assertEqual(self.command("link", item.id, "--review", f"{OWNER.name}/{report.id}",
+                                          "--source", "morty"), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (f"investigation/{OWNER.id}/{report.id}",))
+
+    def test_review_link_warns_and_skips_an_unreadable_change_list(self) -> None:
+        unreadable = self.root / f"{change_review.PREFIX}broken.md"
+        _ = unreadable.write_bytes(b"\xff")
+        listing = self.root / f"{change_review.PREFIX}{RUNNER.name}.md"
+        _ = listing.write_text(
+            "## To review\n\n| # | Change | How to check | Producer |\n| --- | --- | --- | --- |\n"
+            + f"| C1 | Review the result | Open the result | {RUNNER.id} |\n", encoding="utf-8")
+        item = self.add()
+        key = f"{RUNNER.name}/C1"
+        with (patch.object(change_review, "lists_directory", return_value=self.root),
+              self.assertLogs(review_items.__name__, level="WARNING") as warnings):
+            self.assertEqual(self.command("link", item.id, "--review", key, "--source", "morty"), (0, "", ""))
+        warning, = warnings.output
+        self.assertIn(f"Review source {unreadable}:", warning)
+        self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (key,))
 
     def test_old_records_without_reviews_load_without_writes(self) -> None:
         item = self.add()
