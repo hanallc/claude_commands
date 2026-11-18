@@ -700,6 +700,25 @@ class ReviewPageTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     _ = review_items.read_current(self.root, moved.records[issue], staff.snapshot())
 
+    def test_snapshot_shows_and_counts_proposals_from_a_producer_document(self) -> None:
+        doc = self.fixture.temporary / 'producer.md'
+        folder = self.fixture.temporary / 'producer-proposals'
+        folder.mkdir()
+        _ = doc.write_text(f'# Producer\n- **Proposals:** {folder}\n')
+        producer = fixture_member('producer', name='producer', doc=staff.LiveDoc(local_machine(), doc))
+        path = folder / 'P1.md'
+        _ = path.write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+            +f'proposed_by: {producer.id}\nproposal_id: P1\ndate_created: 2026-11-01\n---\n'
+            +'# Reduce the build time\n')
+
+        snapshot = review_page.build_snapshot(self.root)
+        proposals = [item for item in snapshot.records.values() if item.type == review_items.ReviewType.PROPOSAL]
+        self.assertEqual(review_items.count_items(proposals, datetime.now(snapshot.zone)), 1)
+        self.assertIn('proposal/'+str(path), {entry['key'] for entry in snapshot.entries})
+        self.assertEqual(proposals[0].owner, producer.id)
+        self.assertIn(doc, snapshot.source_stamps)
+        self.assertEqual(snapshot.notices, ())
+
     def test_snapshot_ignores_producer_documents_and_reports_missing_production(self) -> None:
         directory = self.fixture.temporary / 'brain'
         directory.mkdir()

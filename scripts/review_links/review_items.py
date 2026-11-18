@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -878,9 +878,19 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                 if selection.key == 'proposal/'+str(selection.path):
                     paths_by_scope.setdefault(selection.path, []).append(scope)
                 continue
-            doc = scope if isinstance(scope, Path) else record_store.local_document(members.by_id(owner))
+            member = members.by_id(owner)
+            doc = scope if isinstance(scope, Path) else record_store.local_document(member)
+            current: tuple[Path, ...] = ()
+            if member is not None and member.kind == 'producer' and isinstance(member.doc, staff.LiveDoc):
+                producer_doc = member.doc.path
+                with suppress(OSError):
+                    if producer_doc.is_file():
+                        if sources is not None:
+                            sources.append(producer_doc)
+                        if (configured := record_store.issues_folder(producer_doc)) is not None:
+                            current = (configured,)
             with guard_source(doc if doc is not None else state_root(), sources):
-                for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc,
+                for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, current, document=doc,
                                                          strict=sources is not None, sources=sources):
                     folders.setdefault(folder, []).append(scope)
         for folder, owners in folders.items():
