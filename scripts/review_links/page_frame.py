@@ -6,12 +6,15 @@ import html
 import json
 import re
 import time
+from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 ICONS = Path(__file__).with_name("lucide")
+QUESTION_WAITING = "The {owner_role} will answer this"
 
 
 def icon_svg(name: str) -> str:
@@ -171,6 +174,22 @@ def code_block_html(block: re.Match[str]) -> str:
             + '</code></pre>' + COPY_BUTTON + '</div>')
 
 
+def render_code_blocks(text: str, render_text: Callable[[str], str]) -> str:
+    """Render code blocks and pass the text between them to the caller's renderer."""
+    content: list[str] = []
+    start = 0
+    for block in CODE_BLOCK.finditer(text):
+        before = text[start:block.start()]
+        if before.strip():
+            content.append(render_text(before))
+        content.append(code_block_html(block))
+        start = block.end()
+    after = text[start:]
+    if after.strip() or not content:
+        content.append(render_text(after))
+    return "".join(content)
+
+
 # The title, status and content share one centered column and page background.
 # A text page keeps a 1124 px column; a page whose main has the page-wide class uses the pane width.
 # A page that measures its layout uses the desktop gutter.
@@ -197,7 +216,33 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 [data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
 @keyframes page-status-turn{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){[data-status-icon=Reading] svg{animation:none}}
+.review-actions{display:flex;align-items:flex-end;gap:26px;flex-wrap:wrap}
+.review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
+.review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}
+.review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
+@media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
+@media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''')
+
+class ReturningActionHeading(StrEnum):
+    ITEM_RETURNS = "The item returns to you"
+    SENDS_TO_SHOWRUNNER = "Sends to showrunner"
+
+
+def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,
+                         returning_heading: ReturningActionHeading = ReturningActionHeading.ITEM_RETURNS) -> str:
+    """Render the Review action groups that have controls."""
+    groups = (
+        ("Closes the item", closing_buttons, "", ""),
+        (returning_heading, returning_buttons, "", ""),
+        ("Hides it until", later_controls, " review-later", ' class="later-menu"'),
+    )
+    return '<div class="review-actions">' + "".join(
+        f'<div class="review-action-group{group_class}"><span>{label}</span>'
+        + f'<div{controls_class}>{controls}</div></div>'
+        for label, controls, group_class, controls_class in groups if controls
+    ) + '</div>'
+
 
 COPY_BUTTON = '''<button type="button" data-copy-code aria-label="Copy code" title="Copy">
 <svg data-copy-icon width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"

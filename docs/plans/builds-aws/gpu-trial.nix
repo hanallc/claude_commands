@@ -1,5 +1,5 @@
 # Build this system once on natedev, then import it into the official gate image.
-{ runtimeRoots, toolchain }:
+{ runtimeRoots, toolchain, hanaNextest ? false }:
 { config, lib, pkgs, modulesPath, ... }:
 {
   imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
@@ -17,7 +17,8 @@
     modesetting.enable = true;
     nvidiaSettings = false;
   };
-  environment.systemPackages = with pkgs; [ python3 cargo-nextest vulkan-tools git curl ] ++ [ toolchain ];
+  environment.systemPackages = with pkgs; [ python3 vulkan-tools git curl toolchain ]
+    ++ lib.optional (!hanaNextest) cargo-nextest;
   system.extraDependencies = runtimeRoots;
   users.users.gpu-trial = {
     isNormalUser = true;
@@ -40,6 +41,8 @@
       ExecStartPre = "+${pkgs.coreutils}/bin/chown -R gpu-trial:users /var/lib/gpu-size-trial";
       ExecStart = "/var/lib/gpu-size-trial/run";
       KillMode = "control-group";
+    } // lib.optionalAttrs hanaNextest {
+      MemoryMax = "28G";
     };
   };
   systemd.services.gpu-trial-expiry-arm = {
@@ -53,7 +56,7 @@
         shutdown -h now
         exit 1
       fi
-      systemd-run --unit=gpu-trial-expiry --on-calendar=@"$deadline" ${pkgs.systemd}/bin/shutdown -h now
+      systemd-run --unit=gpu-trial-expiry --on-calendar=@"$deadline" --timer-property=AccuracySec=1s ${pkgs.systemd}/bin/shutdown -h now
     '';
   };
   services.openssh.enable = lib.mkForce false;

@@ -83,6 +83,13 @@ class ProtocolTests(unittest.TestCase):
                 current.owner, current.constraints.session, current.since)
             claim = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
                 assignment.destination.scope, "older-claim", assignment.episode, assignment.attempt)
+            refusal = wire.ClaimFailure("settings-refusal", assignment, "off",
+                refusal_settings=records.RefusalSettings("disabled-settings"))
+            self.assertEqual(wire.parse_request(wire.encode_request(refusal)), refusal)
+            envelope = cast(dict[str, object], json.loads(wire.encode_request(refusal)))
+            del cast(dict[str, object], envelope["data"])["refusal_settings"]
+            self.assertEqual(wire.parse_request(json.dumps(envelope)),
+                replace(refusal, refusal_settings=records.NoRefusalSettings()))
             consume = cast(dict[str, object], json.loads(wire.encode_request(wire.ConsumePermission("older-consume", assignment, claim))))
             del cast(dict[str, object], consume["data"])["holder"]
             parsed_consume = wire.parse_request(json.dumps(consume))

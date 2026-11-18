@@ -186,9 +186,10 @@ class StyleConfigTests(unittest.TestCase):
             with self.subTest(reader=reader), mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
                 _ = config.write_text(
                     f"# one of: python, rust\nreader={reader.value}\n"
-                    + "# text:\ninstall_folder=~/.local/state/style/reader\n")
+                    + "# whole: 1..\nprotocol=7\n# text:\nminimum_version=2.3.4\n")
                 self.assertEqual(style_config.refill_reader(), reader)
-                self.assertEqual(style_config.reader_install_folder(), self.root / ".local/state/style/reader")
+                self.assertEqual(style_config.reader_protocol(), 7)
+                self.assertEqual(style_config.reader_minimum_version(), "2.3.4")
 
 
 if __name__ == "__main__":

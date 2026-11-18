@@ -2,7 +2,8 @@ Status: design only; requires agreement from AWS, resources, queue, verify, repo
 
 # One kept AWS machine for Hana
 
-Use one Ohio `m7a.2xlarge` Spot instance with 8 vCPUs, 32 GiB RAM, and retained build storage.
+Use one Ohio Spot instance with retained build storage.
+Try an `m7a.4xlarge` with 16 vCPUs and 64 GiB of memory first.
 Route only Hana clippy judgments and check to AWS.
 Keep mend, build, and clippy repairs on natedev.
 Keep nextest on natedev with its GPU and local test binaries.
@@ -217,19 +218,28 @@ Keep `start_timeout_seconds=120`, `idle_stop_seconds=600`, and `max_steps=1` as 
 | --- | --- | --- |
 | `enabled` | `off` | Require an explicit decision before routing Hana work. |
 | `region` | `us-east-2` | Use the supplied Ohio prices and one storage zone. |
-| `instance_type` | `m7a.2xlarge` | Provide 32 GiB RAM at the smaller supplied price. |
-| `spot_max_usd_per_hour` | `0.15` | Bound compute exposure; refuse higher prices. |
+| `instance_type` | `m7a.4xlarge` | Provide 64 GiB of memory. |
+| `fallback_instance_types` | `c7a.4xlarge,m7i.4xlarge,m6a.4xlarge` | Try these types when the first choice cannot launch. |
+| `spot_max_usd_per_hour` | `0.35` | Bound the compute reservation and skip higher Spot prices during setup. |
+| `spot_ceiling_margin` | `0.25` | Add this fraction of the current Spot price when setup suggests a new ceiling. |
 | `idle_stop_seconds` | `600` | Retain short bursts and stop through quiet periods. |
 | `start_timeout_seconds` | `120` | Bound a caller's startup wait. |
 | `max_steps` | `1` | Establish memory and slot behavior before concurrent execution. |
 | `step_cpu_limit` | `4` | Allow the observed work without occupying all host CPUs. |
-| `step_memory_gib` | `24` | Leave 8 GiB for the operating system and control processes. |
+| `step_memory_gib` | `24` | Reserve memory for the operating system and control processes. |
 | `root_gib` | `40` | Retain the system and Nix store without a smaller untested root. |
 | `data_gib` | `300` | Retain the shared slot pool, Rust tools, and Cargo caches. |
 | `free_floor_gib` | `30` | Prevent disk exhaustion during compilation. |
 | `daily_budget_usd` | `6` | Bound this workload within the unchanged USD 35 account limit. |
 
 Keep the step allowlist fixed to Hana clippy judgments and check.
+
+Hana setup creates the launch template, security group, control bucket, and scaler policy in CloudFormation.
+Setup tries the prepared type and subnet first if their price is within the ceiling.
+It then tries the other eligible types and subnets in order of price.
+The first successful launch determines the zone of the encrypted data disk.
+Setup saves the resource identities in `hana/setup.json`.
+Teardown ends the persistent Spot request and instance before it deletes the data disk and stack.
 Reject tree-writing flags such as `--fix` before remote execution.
 Derive the compiler revision from the requested source instead of adding a duplicate version setting.
 

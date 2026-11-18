@@ -6,8 +6,11 @@ that folder's `commondir` file names the shared Git folder.
 """
 from __future__ import annotations
 
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, overload
 
 _BRANCH_PREFIX = "ref: refs/heads/"
 
@@ -27,6 +30,10 @@ class UnreadableGitFiles(GitFilesError):
         super().__init__(f"{path}: {reason}")
         self.path: Path = path
         self.reason: str = reason
+
+
+class MissingReferencedGitDirectory(UnreadableGitFiles):
+    """The directory that a gitdir: line names is missing."""
 
 
 @dataclass(frozen=True)
@@ -51,19 +58,52 @@ class DetachedHead:
     commit: str
 
 
-def _read_line(path: Path) -> str:
+@overload
+def _read_entry(path: Path, *, allow_directory: Literal[False] = False) -> str: ...
+
+
+@overload
+def _read_entry(path: Path, *, allow_directory: Literal[True]) -> str | Path: ...
+
+
+def _read_entry(path: Path, *, allow_directory: bool = False) -> str | Path:
+    """Read a metadata line or return the directory path for a .git folder."""
     try:
-        return path.read_text(encoding="utf-8").strip()
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError as error:
+        try:
+            _ = path.lstat()
+        except FileNotFoundError:
+            raise error
+        except OSError as inspection_error:
+            raise UnreadableGitFiles(path, f"cannot inspect: {inspection_error}") from inspection_error
+        raise UnreadableGitFiles(path, f"cannot read: {error}") from error
+    except OSError as error:
+        raise UnreadableGitFiles(path, f"cannot read: {error}") from error
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if allow_directory and stat.S_ISDIR(mode):
+            return _folder(path, path)
+        if not stat.S_ISREG(mode):
+            raise UnreadableGitFiles(path, "expected a regular file")
+        with os.fdopen(descriptor, encoding="utf-8", closefd=False) as source:
+            return source.read().strip()
     except (OSError, UnicodeError) as error:
         raise UnreadableGitFiles(path, f"cannot read: {error}") from error
+    finally:
+        os.close(descriptor)
 
 
-def _folder(path: Path, named_by: Path) -> Path:
+def _folder(path: Path, named_by: Path, *,
+            missing: type[UnreadableGitFiles] = UnreadableGitFiles) -> Path:
     try:
-        found = path.resolve()
-    except (OSError, RuntimeError) as error:
+        found = path.resolve(strict=True)
+        mode = found.stat().st_mode
+    except FileNotFoundError as error:
+        raise missing(named_by, f"{path} is missing") from error
+    except (OSError, RuntimeError, ValueError) as error:
         raise UnreadableGitFiles(named_by, f"cannot resolve {path}: {error}") from error
-    if not found.is_dir():
+    if not stat.S_ISDIR(mode):
         raise UnreadableGitFiles(named_by, f"{found} is not a folder")
     return found
 
@@ -71,20 +111,22 @@ def _folder(path: Path, named_by: Path) -> Path:
 def at(toplevel: Path) -> Checkout:
     """Read the checkout whose `.git` entry is in this folder, with no search of parent folders."""
     dot_git = toplevel / ".git"
-    if dot_git.is_dir():
-        git_dir = _folder(dot_git, dot_git)
-    elif dot_git.is_file():
-        line = _read_line(dot_git)
-        location = line.removeprefix("gitdir:").strip()
-        if not line.startswith("gitdir:") or not location:
-            raise UnreadableGitFiles(dot_git, "expected a gitdir: line")
-        git_dir = _folder(toplevel / location, dot_git)
+    try:
+        entry = _read_entry(dot_git, allow_directory=True)
+    except FileNotFoundError as error:
+        raise NotACheckout(f"{toplevel}: no .git entry") from error
+    if isinstance(entry, Path):
+        git_dir = entry
     else:
-        raise NotACheckout(f"{toplevel}: no .git entry")
+        location = entry.removeprefix("gitdir:").strip()
+        if not entry.startswith("gitdir:") or not location:
+            raise UnreadableGitFiles(dot_git, "expected a gitdir: line")
+        git_dir = _folder(toplevel / location, dot_git, missing=MissingReferencedGitDirectory)
     common = git_dir / "commondir"
-    if not common.is_file():
+    try:
+        location = _read_entry(common)
+    except FileNotFoundError:
         return Checkout(toplevel.resolve(), git_dir, git_dir)
-    location = _read_line(common)
     if not location:
         raise UnreadableGitFiles(common, "empty commondir path")
     return Checkout(toplevel.resolve(), git_dir, _folder(git_dir / location, common))
@@ -96,14 +138,20 @@ def locate(folder: Path) -> Checkout:
     if not start.is_dir():
         raise NotACheckout(f"{folder}: not a folder")
     for toplevel in (start, *start.parents):
-        if (toplevel / ".git").exists():
+        try:
             return at(toplevel)
+        except NotACheckout:
+            continue
     raise NotACheckout(f"{folder}: not in a Git checkout")
 
 
 def head(checkout: Checkout) -> OnBranch | DetachedHead:
     """Read HEAD in the checkout's own Git folder."""
-    text = _read_line(checkout.git_dir / "HEAD")
+    path = checkout.git_dir / "HEAD"
+    try:
+        text = _read_entry(path)
+    except FileNotFoundError as error:
+        raise UnreadableGitFiles(path, f"cannot read: {error}") from error
     return OnBranch(text.removeprefix(_BRANCH_PREFIX)) if text.startswith(_BRANCH_PREFIX) else DetachedHead(text)
 
 

@@ -11,6 +11,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 from typing import NamedTuple, TypedDict, cast, override
 import unittest
@@ -18,8 +19,11 @@ from unittest.mock import patch
 from uuid import uuid4
 
 
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib import build_folders
+from scripts.buildlog.store import host_name
+from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
 from scripts.lint.memory_test_support import config_environment
 
 
@@ -83,9 +87,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="worktree-lifecycle-")))
         self.home = self.root / "home"
         self.home.mkdir()
-        scripts = self.home / ".claude/scripts"
-        scripts.parent.mkdir()
-        scripts.symlink_to(CHECKOUT / "scripts", target_is_directory=True)
+        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree", "config")
         self.origin = self.root / "origin.git"
         self.repository = self.root / "clone"
         self.merge_tree = self.root / "integration"
@@ -294,6 +296,126 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertEqual(results, [{"kind": "Ended", "path": str(tree), "detail": branch}])
         self.assertEqual((self.merge_tree / "code.txt").read_text(), "cherry-picked\n")
         self.assert_ended(tree, branch)
+
+    def landed_cargo_worktree(self) -> tuple[Path, Path, cargo_seed.SeedLimits]:
+        tree, branch = self.trees / "seeded", "seeded"
+        self.make(tree, branch)
+        _ = self.commit(tree, "Cargo.toml", "[workspace]\n")
+        self.publish(tree, branch)
+        self.land(branch)
+        cargo_root = self.root / "external"
+        cargo_root.mkdir()
+        build = cargo_root / tree.name
+        mirror = self.root / "mirror"
+        parent = mirror.joinpath(*tree.parent.parts[1:])
+        parent.parent.mkdir(parents=True)
+        parent.symlink_to(cargo_root, target_is_directory=True)
+        mapping = {"workspace_root": str(tree), "target_directory": str(tree / "target"),
+                   "build_directory": str(build)}
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        cargo = bin_dir / "cargo"
+        overridden = {**mapping, "build_directory": str(cargo_root / "override")}
+        _ = cargo.write_text("#!/bin/sh\ncase \"$*\" in\n"
+                             + "  *build.build-dir=*) printf '%s\\n' " + shlex.quote(json.dumps(overridden)) + " ;;\n"
+                             + "  *) printf '%s\\n' " + shlex.quote(json.dumps(mapping)) + " ;;\nesac\n")
+        cargo.chmod(0o755)
+        state = self.root / "sweep-state"
+        state.mkdir()
+        _ = (state / "cargo-output-roots.json").write_text(json.dumps([mapping]))
+        self.environment.update({"PATH": str(bin_dir) + os.pathsep + self.environment["PATH"],
+                                 "LINT_SWEEP_STATE_DIR": str(state)})
+        config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        host = host_name()
+        overrides = {f"roots.slot_cargo.{host}": str(cargo_root), f"roots.cargo_paths.{host}": str(mirror),
+                     f"seed.enabled.{host}": "1",
+                     "seed.max_gib": "1", "seed.min_free_gib": "0"}
+        lines: list[str] = []
+        for line in config.read_text().splitlines():
+            key = line.partition("=")[0]
+            lines.append(f"{key}={overrides.pop(key)}" if key in overrides else line)
+        lines.extend(f"{key}={value}" for key, value in overrides.items())
+        _ = config.write_text("\n".join(lines) + "\n")
+        limits = cargo_seed.SeedLimits(cargo_root, 1 << 30, 0)
+        self.assertEqual(cargo_seed.seed_limits(conf.read(config), host), limits)
+        return tree, build, limits
+
+    def test_landed_worktree_removes_its_external_cargo_seed(self) -> None:
+        tree, build, _limits = self.landed_cargo_worktree()
+        file = build / "debug/deps/libportable-1234567890abcdef.rlib"
+        file.parent.mkdir(parents=True)
+        _ = file.write_text("seed")
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(build.exists())
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
+        self.assert_ended(tree, "seeded")
+
+    def test_failed_worktree_removal_keeps_the_mapping_until_retry(self) -> None:
+        tree, build, _limits = self.landed_cargo_worktree()
+        build.mkdir()
+        git = self.root / "bin/git"
+        real_git = shutil.which("git")
+        assert real_git is not None
+        _ = git.write_text("#!/bin/sh\n"
+                           + 'if [ "$3" = worktree ] && [ "$4" = remove ]; then\n'
+                           + '    echo "fixture refuses worktree remove" >&2\n    exit 1\nfi\n'
+                           + f'exec {shlex.quote(real_git)} "$@"\n')
+        git.chmod(0o755)
+        self.assertEqual(self.finish_landed(), [{"kind": "Kept", "path": str(tree),
+                                                "detail": "stderr: fixture refuses worktree remove"}])
+        marker = scratch.cargo_removal_mark(tree)
+        self.assertIn(str(build), marker.read_text())
+        self.assertFalse(build.exists())
+        self.assertTrue(tree.is_dir())
+        git.unlink()
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(marker.exists())
+        self.assert_ended(tree, "seeded")
+
+    @unittest.skipUnless(sys.platform == "linux", "seeding is supported on Linux")
+    def test_worktree_removal_keeps_a_checkout_that_a_seed_holds(self) -> None:
+        tree, build, _limits = self.landed_cargo_worktree()
+        self.assertFalse(build.exists())
+        with cargo_seed.checkout_guard(tree, cargo_seed.CheckoutAccess.BUILD):
+            self.assertEqual(self.finish_landed(), [{"kind": "Kept", "path": str(tree),
+                                                    "detail": f"Cargo output kept: Cargo seed is in progress: {tree}"}])
+        self.assertTrue(tree.is_dir())
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(scratch.cargo_removal_mark(tree).exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "seeding is supported on Linux")
+    def test_cargo_override_skips_seed_and_worktree_removal_keeps_the_override(self) -> None:
+        tree, default, limits = self.landed_cargo_worktree()
+        override = limits.cargo_root / "override"
+        git_dir = git_files.at(tree).git_dir
+        before = set(git_dir.iterdir())
+        helper = self.home / ".claude/scripts/lib"
+        result = self.command(tree, [str(helper / "py"), str(helper / "cargo_seed.py"), "cargo", "+stable",
+                                     "check", "--config", "build.build-dir=" + json.dumps(str(override))])
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertFalse(override.exists())
+        self.assertEqual(set(git_dir.iterdir()), before)
+        mark = scratch.cargo_removal_mark(tree)
+        self.assertFalse(mark.exists())
+
+        outside = self.root / "downloads"
+        for directory in (default, override, outside):
+            directory.mkdir()
+            _ = (directory / "contents").write_text(directory.name)
+        no_peers: list[str] = []
+        scratch.atomic_record(mark, [
+            {"workspace_root": str(tree), "target_directory": str(tree / "target"),
+             "build_directory": str(directory), "other_checkouts": no_peers}
+            for directory in (override, outside)
+        ])
+
+        self.assertEqual(self.finish_landed(), [{"kind": "Ended", "path": str(tree), "detail": "seeded"}])
+        self.assertFalse(default.exists())
+        self.assertEqual((override / "contents").read_text(), "override")
+        self.assertEqual((outside / "contents").read_text(), "downloads")
+        self.assertFalse(mark.exists())
+        self.assert_ended(tree, "seeded")
 
     def test_unlanded_commit_is_reported_and_preserves_all_items(self) -> None:
         for branch in ("unlanded", "origin-ahead", "origin-ahead-missing-locally"):
