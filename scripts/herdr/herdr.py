@@ -1427,6 +1427,14 @@ class PaneObservations:
     bulk_placement: HerdrProcessPlacements | None = None
     pid_placements: dict[int, ProcessPlacement] = field(default_factory=dict)
 
+    def clear(self) -> None:
+        """Discard the evidence that an action can change."""
+        self.replies.clear()
+        self.process_batches.clear()
+        self.linux_process_states.clear()
+        self.bulk_placement = None
+        self.pid_placements.clear()
+
     @property
     def process_places(self) -> HerdrProcessPlacements:
         if self.bulk_placement is None:
@@ -5314,10 +5322,28 @@ _live_pane_reader: ContextVar[Callable[[str], _LivePanePlaces]] = ContextVar(
     "herdr_live_pane_reader", default=_LivePanePlaces)
 
 
+@dataclass
+class _PanePlacementSnapshot:
+    """Cache pane placement for one report."""
+
+    parent: Callable[[str], _LivePanePlaces]
+    places: dict[str, _LivePanePlaces] = field(default_factory=dict)
+
+    def __call__(self, session: str) -> _LivePanePlaces:
+        if session not in self.places:
+            self.places[session] = self.parent(session)
+        return self.places[session]
+
+    def clear(self) -> None:
+        self.places.clear()
+        if isinstance(self.parent, _PanePlacementSnapshot):
+            self.parent.clear()
+
+
 @contextmanager
 def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
     """Share live panes and retained shells; yield the pane reader for report display."""
-    reader = cache(_live_pane_reader.get())
+    reader = _PanePlacementSnapshot(_live_pane_reader.get())
     token = _live_pane_reader.set(reader)
     try:
         yield lambda session: [pane.copy() for pane in reader(session).panes.values()]
@@ -5399,7 +5425,7 @@ def herdr_places() -> HerdrProcessPlacements:
     try:
         if _platform() == "darwin":
             processes = {process.pid: process for process in _darwin_processes()}
-            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets())
+            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets(), failures=failures)
 
             def parent(pid: int) -> int:
                 return processes[pid].parent
@@ -5759,12 +5785,11 @@ def _darwin_process_cwds(pids: Sequence[int]) -> dict[int, str | UnreadableCwd]:
     return working_directories
 
 
-def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket]) -> dict[int, str]:
+def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket], *,
+                             failures: list[str] | None = None) -> dict[int, str]:
     config = _session_socket("default").parent
     holders: dict[str, set[int]] = {}
     for listener in listeners:
-        if listener.pid not in by_pid:
-            continue
         if listener.path == config / "herdr.sock":
             session = "default"
         elif listener.path.name == "herdr.sock" and listener.path.parent.parent == config / "sessions":
@@ -5772,7 +5797,11 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
         else:
             continue
         holders.setdefault(session, set()).add(listener.pid)
-    servers = {next(iter(pids)): session for session, pids in holders.items() if len(pids) == 1}
+    if failures is not None:
+        failures.extend(f"cannot establish a socket owner for herdr session {session}"
+                        for session, pids in holders.items() if len(pids) > 1)
+    servers = {pid: session for session, pids in holders.items() if len(pids) == 1
+               for pid in pids if pid in by_pid}
     children: dict[int, list[int]] = {}
     for process in by_pid.values():
         children.setdefault(process.parent, []).append(process.pid)
@@ -5966,12 +5995,23 @@ def process_action() -> Generator[None]:
         reader = reader.parent
     token = _process_reader.set(_read_current_processes)
     action = _process_action.set(True)
+    outer_observations = _pane_observations.get()
+    outer_panes = _live_pane_reader.get()
+    outer_evidence = _pane_evidence_run.get()
     observations = _pane_observations.set(None)
     panes = _live_pane_reader.set(_LivePanePlaces)
     evidence = _pane_evidence_run.set(_SCAN_AT_USE)
     try:
         yield
     finally:
+        if outer_observations is not None:
+            outer_observations.clear()
+        if isinstance(outer_panes, _PanePlacementSnapshot):
+            outer_panes.clear()
+        if isinstance(outer_evidence, PaneEvidenceRun):
+            with outer_evidence.lock:
+                outer_evidence.sessions.clear()
+                outer_evidence.shell_processes.clear()
         _pane_evidence_run.reset(evidence)
         _live_pane_reader.reset(panes)
         _pane_observations.reset(observations)

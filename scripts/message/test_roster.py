@@ -536,7 +536,7 @@ class RosterTests(unittest.TestCase):
             peer.assert_called_once()
             deliver.assert_called_once()
             message = cast(send.Message, deliver.call_args.args[0])
-            self.assertEqual((message.to, message.text), (f"session:{owner.current_session}", "fixture text"))
+            self.assertEqual((message.to, message.text), (f"staff:{owner.id}", "fixture text"))
             with self.assertRaises(SystemExit) as refused:
                 _ = send.send(send.parse(["--to", "bad", "--from", "fixture-reviewer", "--text", "fixture text"]))
             self.assertEqual(refused.exception.code, 2)
@@ -667,7 +667,7 @@ class RosterTests(unittest.TestCase):
         for target in targets:
             registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
-                previous = f"staff:{owner.id}" if target == owner.name else target
+                previous = f"staff:{owner.id}" if target == owner.name else f"session:{identity}"
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {previous: started.isoformat()}}}))
                 options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
                                       "--key", "notice", "--repeat-minutes", "30"])
@@ -1151,7 +1151,9 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(recipient.reach, roster.Messageable(f"session:{native}"))
                 route = send.resolve_recipient(f"session:{native}", send.LocalOnly(), observed,
                                                membership=membership)
-                self.assertEqual(route, send.PaneWorkerRecipient(child))
+                self.assertEqual(route, send.ClaudeRecipient(f"session:{native}"))
+                self.assertEqual(send.resolve_recipient(child.name, send.LocalOnly(), observed,
+                                                        membership=membership), send.PaneWorkerRecipient(child))
                 self.assertTrue(broadcast.selects(broadcast.Workers(), recipient))
                 self.assertTrue(broadcast.selects(broadcast.WorkersOfUnit(
                     "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b", unit.name, recipient.machine), recipient))
@@ -1498,7 +1500,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(deliver.call_count, 1)
         forwarded = cast(send.Message, deliver.call_args.args[0])
-        self.assertEqual(forwarded.to, 'session:peer-session')
+        self.assertEqual(forwarded.to, 'staff:peer-session')
         self.assertEqual(forwarded.text, 'owner update')
 
     def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:

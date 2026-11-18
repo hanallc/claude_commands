@@ -889,7 +889,18 @@ The scan can exclude a different PID before it reads the foreground owner's conv
 A unit report records the staff lifecycle and current owner evidence separately. A unit can have a recorded pause or exit while the current owner is unknown. The watchdog preserves the outage and any recovery result when the owner is unknown. A direct resume checks current owner evidence for a unit in a production. Demotion selects a launch mode only after a fresh owner check.
 
 The unit list takes the status and address from the checked owner. It leaves the pane address blank for a standalone owner.
-The unit report uses activity from the same registry entry as the checked owner.
+The unit report uses activity from the current record that matches the checked PID, process start, and conversation.
+The unit board uses the checked owner for presence.
+The board marks an unknown owner as unknown in the summary, Director column, and detail heading.
+Census session rows contain no PID or process start.
+The board omits command names and shell waits from these rows.
+The board shows unknown director work when shell rows indicate possible work and other records do not establish the work state.
+The board uses checked owner activity when the census is readable.
+It shows idle for explicit registry idle.
+It shows unknown director activity when the census is unreadable or the checked evidence does not show activity.
+Proved absence remains visible when the census is unreadable.
+The live unit ID collection retains unknown units and scan failures.
+The inventory reports unreadable placement as unknown.
 Worker director lookup checks the staff member's current conversation.
 It returns `UnknownUnitDirector` when it cannot establish ownership.
 A standalone Claude director needs a recorded process start and matching native identity.
