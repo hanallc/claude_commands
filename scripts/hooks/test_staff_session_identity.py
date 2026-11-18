@@ -18,7 +18,8 @@ from scripts.hooks import staff_session_identity
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
-from scripts.herdr import pane_launch
+from scripts.herdr import herdr, pane_launch
+from scripts.herdr.test_herdr import ClaudeForegroundSocket
 from scripts.agents import pane_record
 
 
@@ -74,10 +75,14 @@ class StaffSessionIdentityTests(StaffTestCase):
         hook = Path(staff_session_identity.__file__).with_name("session-start-pane-record.py")
         namespace = runpy.run_path(str(hook))
         record_start = cast(Callable[[], None], namespace["main"])
+        pid = os.getpid()
+        proof = ClaudeForegroundSocket(self.fixture.environment["HERDR_SESSION"],
+                                      self.fixture.environment["HERDR_PANE_ID"], pid)
         with (mock.patch.dict(os.environ, self.fixture.environment),
+              mock.patch.object(herdr, "session_socket_request", side_effect=proof.request),
               mock.patch("sys.stdin", io.StringIO(json.dumps(self.fixture.payload))),
-              mock.patch.object(pane_record, "claude_arguments", return_value=["claude"]),
-              mock.patch.object(os, "getppid", return_value=os.getpid()),
+              mock.patch.object(pane_record, "process_arguments", return_value=["claude"]),
+              mock.patch.object(os, "getppid", return_value=pid),
               mock.patch.object(staff, "runtime_id", return_value=self.fixture.new_id)):
             record_start()
 

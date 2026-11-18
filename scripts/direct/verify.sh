@@ -1817,6 +1817,7 @@ RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
+LINT_FIX_INCOMPLETE=0
 PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
@@ -2370,7 +2371,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
     fi
     case "$result_word" in
-        declined|lost)
+        declined|lost|hana_command_admission_refused)
             if [[ "$result_word" == declined && -n "$result_seconds" ]]; then
                 printf '%s\n' "$result_seconds" >> "$BUILDLOG_HOLD_WAIT_FILE"
             fi
@@ -3311,9 +3312,11 @@ record_mac_pass() {
 # verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
 # placement that failed before its step started. A fix pass that still changes
 # the tree at the limit can leave more fixes for the next call.
+# An incomplete fix pass can also leave fixes for the next call.
 lint_failure_is_the_tree() {
     [[ "$CMD" == lint ]] || return 1
     (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1
+    (( LINT_FIX_INCOMPLETE == 0 )) || return 1
     (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
     (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
@@ -4206,11 +4209,15 @@ lint_rewrite() {
 # A fixed path that no reservation holds fails the pass.
 lint_copy_return() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    local folder="$LINT_COPY_DIR"
+    local folder="$LINT_COPY_DIR" status
     LINT_COPY_DIR="" LINT_COPY_TREE=""
     LINT_COPY_ARGS=()
     verify_helper "$FIX_RETURN_SCRIPT" return-copy \
-        --repo-root "$(git rev-parse --show-toplevel)" --folder "$folder"
+        --repo-root "$(git rev-parse --show-toplevel)" --folder "$folder" || {
+        status=$?
+        LINT_FIX_INCOMPLETE=1
+        return "$status"
+    }
 }
 
 lint_copy_drop() {
@@ -4298,11 +4305,13 @@ run_mac_lint_fix() {
     invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" || fix_status=$?
     if [[ "$MAC_FIX_RESULT" == withheld ]]; then
         # A fix that no reservation holds is withheld on natedev too.
+        LINT_FIX_INCOMPLETE=1
         echo 'verify.sh: the Mac fix pass fixed a path that no reservation holds; see above.' >&2
         exit 1
     fi
     if (( fix_status != 0 )) || [[ "$STEP_RAN_ON_MAC" != 1 \
             || ( "$MAC_FIX_RESULT" != applied && "$MAC_FIX_RESULT" != none ) ]]; then
+        LINT_FIX_INCOMPLETE=1
         echo 'verify.sh: the Mac fix pass did not finish; natedev repairs the tree.'
         return 1
     fi

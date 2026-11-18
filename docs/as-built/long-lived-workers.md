@@ -25,9 +25,10 @@ The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
 The launcher returns when a child accepts that dispatch through `scripts.lib.detached.start_detached`.
 The child uses a separate session, so a signal to the caller's process group does not stop it.
-A compaction must write its transcript record within `WORKER_COMPACT_SECONDS`.
-The same deadline bounds `/compact --wait --timeout` and the following turn-end wait.
-Only the compaction record proves completion; a turn-start record does not.
+`WORKER_COMPACT_SECONDS` sets the deadline for `/compact --wait --timeout` and the following turn-end wait.
+Only a new compaction record in the transcript proves completion.
+If the deadline expires, the worker checks for this record before it reports a timeout.
+A complete compaction record lets the worker send the assignment.
 The child then sends the prompt and confirms its transcript receipt within `WORKER_SETTLE_SECONDS`.
 It writes its output to `compact-<dispatch id>.log` in the run folder.
 A compaction failure sends no prompt and clears only matching `/compact` composer text.
@@ -80,7 +81,9 @@ The hook reads the worker's run inside the worker lock.
 A new assign finishes the unfinished completion before it replaces the link.
 That notice names its own pass and says it is a late result. The pane stays for the new assign.
 The late step does not retire the worker, and it keeps a hold that the new assign also owns.
-If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
+If notice delivery fails, the assign returns uncertain and reports the pending notice.
+A replacement for a failed pass starts after the hook delivers the pending notice.
+The recorder gives the replacement a new pass id even when the assignment inputs match.
 
 A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
 The pass records the digest before submission.
@@ -108,18 +111,57 @@ An empty turn reply writes no reply file and adds no `; reply <path>` text.
 
 A new Codex worker has no resume argument.
 Its pane session report supplies the first native identity.
-The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
-Every other foreground process prevents the pane report from proving a sole Codex process.
+`herdr.foreground_pane_owner` proves the owner for pane actions, retained launches, and status reports.
+`_pane_sessions` reads identities from that proof.
+Resume uses pane metadata to find candidates when the process scan is incomplete.
+It requires the proved conversation before it reports an existing Codex session.
+The roster uses the proved Codex PID for the conversation, account, and folder.
+Unit reports join the proved owner to staff.
+Inherited marks and retained launches can identify which unit has an unknown pane.
+The report records an anomaly when no eligible unit can receive an unknown pane.
+The report also records failures to list panes.
+A unit without owner proof remains unknown when either anomaly leaves its pane uncertain.
+A registry entry supplies activity only for a proved pane owner or a confirmed non-pane process.
+An inherited identity on a proved shell can associate a stopped unit with its pane.
+Session commands require a matching foreground owner before they read or route to a pane.
+The unit pane selector returns exit 3 without an address when the owner is unknown.
+The Claude SessionStart hook checks the nearest Claude ancestor against the foreground PID before either write.
+A worker roster needs a proved open pane before it uses a Claude registry entry for status and routing.
+A proved Codex PID can supply its account while its conversation address stays unknown.
+`process_placement` distinguishes a verified pane, a confirmed non-pane process, and unknown placement.
+The staff thread reader uses resume arguments only for a confirmed non-pane process.
+`pane_activity` checks whether the pane runs a program or sits at its shell.
+Program names from occupancy and startup checks are diagnostics.
+The list shows `unknown` for an unproved owner, including a live Node descendant with unreadable arguments.
+A shell with an inherited thread id has no foreground agent.
+The Linux placement scan and the owner check share each process state in the report, including failed reads.
+An input check reads fresh process state.
+During an input check, the ancestry read supplies each descendant's exit state.
+The terminal check uses that state to skip zombie processes.
+Codex launch capture refreshes the process state and uses one foreground proof.
+Launch diagnostics omit argument tokens.
+The function requires one foreground Codex process with known arguments.
+All other foreground processes must descend from that Codex process.
+A Claude child cannot claim the Codex pane.
+If a foreground Codex process has no arguments, the pane owner stays unproved.
+If the identity remains unknown, the pane notice lists the foreground program names.
 After its first turn, the launcher clears the cached pane list before it checks the published worker.
 This refresh includes the pane session report and the process evidence within an observation snapshot.
 An incomplete final scan names the state, the scan reason, and membership in the parent's tabs.
 Every worker operation takes the name lock before the fixed-id lock.
 The launcher holds both locks from publication through dispatch recording and submission.
 The first `ready` hook waits for these locks before it checks the dispatch.
-An ignored turn closes the pane when no dispatch holds the worker.
+An ignored turn can close the pane when no dispatch holds the worker.
+A matching DONE for an ended pass follows the late DONE rule if the hook has no completion for that reply.
+The hook saves the late reply in a file named for the pass.
+It sends one notice with the earlier pass state and reply path.
+The hook records delivery before it tries to close the pane.
+A repeat of a DONE that the hook already handled sends no second notice.
 
 `worker.dispatch_receipt` reads the transcript and detached run evidence.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
+A later assistant message preserves the matching DONE.
+A detached result after DONE requires a new matching reply.
 A pending run reply keeps the pass active without another prompt.
 Run events preserve the last worker reply while a result awaits a reply.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
@@ -131,24 +173,51 @@ The notice includes the worker's last reply and leaves the pass active.
 A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
 An empty turn without that compaction evidence stays ignored.
 Resubmit that work with `worker.py answer <name> --text "Read the assigned prompt and do the work."`.
-For an active pass, `answer` adds the saved completion id to the normal DONE instruction.
-The pass and saved delivery stay unchanged, and the normal hook handles the matching DONE reply.
+`answer` takes the same worker lock as `assign`.
+It requires an active pass, a saved delivery, and transcript proof that the worker accepted the delivery.
+If compaction holds the lock or the pass lacks proof, `answer` refuses to send input.
+A matching DONE in the transcript blocks input before the completion hook updates the pass.
+Use `assign.sh` for new work.
 A blocked Codex question receives only the supplied answer text.
-The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
-The completion rule accepts the saved DONE hook completion for the same dispatch.
-Live detached work prevents completion before pane closure.
+Other answers include the saved completion ID in the DONE instruction.
+The normal hook handles DONE for the same pass.
+If the reply ends with a different DONE ID, the no DONE notice names both IDs.
+The pass stays active and the pane stays open until the reply contains the matching DONE.
+The completion hook saves the reply and records the pending notice for the exact pass.
+Live detached work delays normal and late DONE notices.
+The hook runs saved completion actions and records delivery before it closes the pane.
+A failed delivery keeps the notice pending and the pane open.
+The hook, restore, and assignment use the same completion recovery under the worker lock.
+Recovery continues a saved completion or checks for matching DONE in the transcript.
+The restart prefilter sends each saved worker to restore, including workers with no active pass.
+Unavailable completion evidence keeps the restart entry.
+Pane closure alone keeps the restart entry.
+Completion removes the entry after it saves the final result.
+Restore reports incomplete recovery if pane closure fails.
+The next restore retries closure without sending the completion notice again.
+The hook records closure diagnostic delivery separately from the diagnostic text.
+A later recovery retries an undelivered diagnostic with the same delivery key.
 The hook ends `scratch.worker_task(row.id)` before it closes the pane.
 This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
-A failed cleanup adds one line to the director notice and permits pane closure.
+A failed cleanup adds a diagnostic to the director notice and permits pane closure.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
-A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+When DONE arrives during launcher error recovery, the hook finishes the saved actions.
+The director's notice names the earlier state.
+The recorder preserves the status of each ended pass.
+A DONE that arrives after recovery has finished sends a late notice.
+`astra_review.py --read` reads a reply when the saved completion names its file and the final DONE matches the dispatch.
+It reads the reply file once and prints the text from that read after validation.
+The check includes second-stage IDs and late reply files.
+The hook saves the completion before it sends the notice.
+The reply is ready before the hook stamps notice delivery, including when completion actions report an error.
+The check reads passes in the current recorder state.
 The review trial uses the latest completion duration for each pass.
 Named adversary and contract reviews use the same completion hook.
 Their DONE reply records `done` and sends one notice.
 The hook also saves an assigned style review result.
-A close anomaly retains the completed outcome and reaches the director in the hook message.
+A close anomaly retains the completed outcome and sends a separate diagnostic to the director.
 A held reviewer role remains held after submission. Completion ends that reviewer and releases the role.
 The close matches the pane's terminal identity and closes it without a foreground-process wait.
 Uncertain ownership or failed closure produces a retained-pane diagnostic.
@@ -605,12 +674,42 @@ The supervisor installs no signal handler.
 Each checks the supervisor and the command leader identity first, and saves a stop reason.
 The supervisor stays alive, records the exit status and delivers the result.
 A result with a stop reason reads `STOPPED (exit <n>)` and carries a `Stop reason:` line.
+New worker runs save the recorder pass ID or the reason the lookup failed.
+An unavailable pass ID prevents cancellation.
+For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
+After an explicit stop, the supervisor records the leader's exit status and waits for the entire group to end.
+The supervisor starts delivery once the group ends.
+The run stays pending for completion readers until delivery or the reaper confirms that the group ended.
+The folder reader finds pending stops by index and verifies their status in the run record.
+The stop uses the same command and group checks as the orphan reaper for other runs of the worker.
+The stop keeps the pass active if it cannot confirm ownership or the end of the commands.
+It reports the reason for keeping the pass.
+The stop holds the worker lock, then the admission lock, then the recorder lock.
+The stop checks the shared receipt for DONE before it cancels the pass.
+The recorder saves a verified DONE through normal completion.
+The recorder saves the canceled status, stopped outcome, reason, and notice in one state write.
+Assign can reuse the worker when its pane is idle.
+`worker.py answer` reports `no active pass`.
+The turn hook sends the director one stopped notice with the worker name and phase.
+The recorder retains the notice for delivery after another pass replaces the stopped pass.
+The turn hook saves a verified late DONE reply and retains the stopped outcome.
+The recorder retains the original prompt and reply path after a replacement pass starts.
+If the Stop event has no DONE marker, the hook uses each unsaved receipt to check the transcript for its DONE marker.
+A run without a pane pass uses the ordinary result delivery.
+A newer run of the same command suppresses the older orphan result.
+A repeated stop sends no additional signal or notice.
 If the supervisor dies, the orphan reaper finishes the record and delivers the result.
 The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.
 The sender submits to a proved worker pane or sends the result and cause to the current holder.
+Before Herdr sends keys to Codex, `foreground_pane_owner` checks which descendants can hold the terminal.
+The function reads the kernel process state and skips each confirmed exited child.
+It checks stdin for the other descendants before Herdr checks the composer for a draft.
+A pipe permits input to Codex.
+If a descendant uses the pane terminal or its stdin is unreadable, Herdr rejects the prompt.
+The holder receives the result with one anomaly line that names the program.
 `check_patch` checks patch paths against the binding generation and phase reservation.
 It rejects patches outside the bound paths or repository.
 The check does not cover arbitrary shell or Python writes.
@@ -841,3 +940,22 @@ Read-only reviewers and writers have separate access policies.
 Checkpointed phases provide the comparison unit for usage reports.
 Staff owns worker identity and parent relationships.
 Native evidence owns current execution state.
+
+## Incomplete owner evidence
+
+The worker scan records incomplete evidence for each backend. Staff removal refuses an unreadable scan that could include the target worker.
+The scan skips a process when the pane proves a different foreground PID or an empty shell.
+The scan can exclude a different PID before it reads the foreground owner's conversation.
+
+A unit report records the staff lifecycle and current owner evidence separately. A unit can have a recorded pause or exit while the current owner is unknown. The watchdog preserves the outage and any recovery result when the owner is unknown. A direct resume checks current owner evidence for a unit in a production. Demotion selects a launch mode only after a fresh owner check.
+
+The unit list takes the status and address from the checked owner. It leaves the pane address blank for a standalone owner.
+The unit report uses activity from the same registry entry as the checked owner.
+Worker director lookup checks the staff member's current conversation.
+It returns `UnknownUnitDirector` when it cannot establish ownership.
+A standalone Claude director needs a recorded process start and matching native identity.
+A single proved owner takes precedence over incomplete registry records.
+Conflicting owner proofs for the same conversation return `UnknownUnitDirector`.
+A missing or unavailable messaging socket does not change proved ownership.
+Stall watch checks the unit owner before it reads a pane or retires prompt state. A retained launch alone supplies a candidate.
+An empty candidate pane stays unassigned to the unit. The unit's prompt state stays in place when its pane is unassigned or unknown.
