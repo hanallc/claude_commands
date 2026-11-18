@@ -435,25 +435,32 @@ The account details include the dot, label, swatch, allowance, reset, credits, a
 A separated row shows the account details again.
 A lone producer row shows all account details.
 The helper preserves the complete input rows for later sorts.
-The Accounts page sorts through four focusable column headers:
+Each named header on the Accounts page has a sort control.
+The first selection sets the order for that column.
 
 1. Account sorts by label and then by role order.
 2. Left sorts by the full quota value, least first, then by account and role order.
 3. Role sorts by role name and then by account.
-4. Busy sorts by count, most first, then by account.
+4. Next sorts by the target account name.
+5. Busy, idle, paused, exited, and total sort by count, largest first.
+6. Resets sorts by the reset time, soonest first.
+7. Credits sorts by the full balance, largest first. An unlimited balance comes first.
+8. Enabled puts accounts with credits enabled first.
 
 The role order is units, showrunners, workers, producers, spare, and no role.
 The default sort uses account order.
 Missing values stay last in both directions.
+Next cells without a target stay last in both directions.
+Blank enabled cells also stay last in both directions.
 Clicking the selected header reverses its order.
 Enter performs the same action on a focused header.
-Each sortable header reserves space for its arrow.
+Each sort arrow uses the gap beside its label without adding column width.
 `account_board_sort_orders` prepares both directions and uses `account_details_in_row_order` for each order.
 The browser moves the existing rows and restores the account details for each consecutive account run.
 The total row stays last.
-Sorting preserves the total values and upcoming moves.
+Sorting preserves the total values.
 Browser storage keeps each viewer's choice through refreshes and page visits.
-Failed storage reads use the default sort.
+A failed storage read or an unknown saved column uses the default sort.
 Failed storage writes keep the current choice for the open page.
 The shipped value of `role.producer` is `pink`.
 `role_colors` reads the current settings for the Accounts board and the console name renderer.
@@ -474,7 +481,7 @@ A selected Claude group shows its first target, or `none`, and an arrow button o
 A selected Codex workers line shows its first target, or `auto`, without a button.
 Other lines show a minus icon; the total cell stays empty.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
-One queue read supplies both the first targets and the unchanged upcoming list.
+One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
 Off the role-map host, first targets are unavailable.
 The menu marks the current target and can remove the group's first entry.
 Its `stale_at` is the next local midnight, when its reset text changes.
