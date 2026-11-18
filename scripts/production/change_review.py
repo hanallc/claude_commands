@@ -2043,6 +2043,7 @@ class PendingVerdictCleanup:
     feature_review: str = ''
     superseded_wait: str = ''
     wait_log: WaitSupersessionDestination | NoSavedWaitLogDestination = NO_SAVED_WAIT_LOG_DESTINATION
+    require_git_commit: bool = True
 
     @classmethod
     def for_row(cls, root: Path, path: Path, row: str) -> PendingVerdictCleanup:
@@ -2058,7 +2059,8 @@ class PendingVerdictCleanup:
         cleanup = replace(cls.for_row(intent.parent, path, row),
                           verdict=_words('verdict', cast(str, fields['verdict'])),
                           feature_review=cast(str, fields.get('feature_review', '')),
-                          superseded_wait=cast(str, fields.get('superseded_wait', '')))
+                          superseded_wait=cast(str, fields.get('superseded_wait', '')),
+                          require_git_commit=fields.get('require_git_commit') is not False)
         if path.parent != lists or path.is_symlink() or not path.match(PREFIX+'*.md') or cleanup.intent != intent:
             raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         if 'wait_log' in fields:
@@ -2088,12 +2090,15 @@ class PendingVerdictCleanup:
     def confirm_durability(self) -> None:
         """Confirm the visible verdict before recovery performs its closeout."""
         self.sync()
-        _commit([self.path], f'{_owner(self.path)} verdict {self.row}', report_warning=self.commit_failed)
+        _commit([self.path], f'{_owner(self.path)} verdict {self.row}',
+                report_warning=self.commit_failed if self.require_git_commit else _print_warning)
 
     def save(self) -> None:
         fields: dict[str, object] = {
             'list':str(self.path.resolve()), 'row':self.row, 'verdict':self.verdict,
             'feature_review':self.feature_review, 'superseded_wait':self.superseded_wait}
+        if not self.require_git_commit:
+            fields['require_git_commit'] = False
         if isinstance(self.wait_log, WaitSupersessionDestination):
             fields['wait_log'] = self.wait_log.fields()
         write_text_atomic(self.intent, json.dumps(fields)+'\n', new_file_mode=0o600)
@@ -2232,7 +2237,8 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
         else:
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append,
-                                    publish=publish, superseded=superseded, commit_warning=cleanup.commit_failed)
+                                    publish=publish, superseded=superseded,
+                                    commit_warning=cleanup.commit_failed if cleanup.require_git_commit else warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings, cleanup=cleanup)
 
 

@@ -1309,7 +1309,6 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         return NoMessageDelivery()
     doc = assignment.production if defer_verdict_cleanup else row_production(page, row)
     recipients = verdict_recipients(owner, verdict)
-    cleanup: change_review.PendingVerdictCleanup | change_review.NoVerdictCleanup = change_review.NO_VERDICT_CLEANUP
     attempt = ''
     with status.locked():
         slots = status.slots(page, row_id)
@@ -1321,8 +1320,6 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         with status.locked():
             if attempt and status.slots(page, row_id).verdict != slots.verdict:
                 status.write_slots(page, row_id, slots)
-            if isinstance(cleanup, change_review.PendingVerdictCleanup):
-                cleanup.intent.unlink(missing_ok=True)
 
     if recipients and not defer_verdict_cleanup:
         attempt = status.begin(page, row_id, "verdict", recipients=recipients, user_verdict=True)
@@ -1330,25 +1327,25 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         if recipients and defer_verdict_cleanup:
             attempt = status.begin(page, row_id, "verdict", recipients=recipients, user_verdict=True)
         review = closeout_before_save(page, doc, row_id, verdict, status)
-        if defer_verdict_cleanup or review:
-            cleanup = replace(change_review.PendingVerdictCleanup.for_row(status.root, page.review_list, row_id),
-                              verdict=verdict, feature_review=review)
         production_name = unit_lookup.doc_owner(page.production, staff.snapshot()).name
         production = change_review.production_doc(production_name)
-        if isinstance(cleanup, change_review.PendingVerdictCleanup):
-            with change_review.checked_review_write(page.review_list, status.root, lambda: None):
-                recorded = answer_row(page, row_id).get('Verdict')
-                if recorded == verdict:
-                    cancel_preparation()
-                    return NoMessageDelivery()
-                if recorded:
-                    raise AnswerRefused("this row already has a different saved answer")
+        with change_review.checked_review_write(page.review_list, status.root, lambda: None):
+            recorded = answer_row(page, row_id).get('Verdict')
+            if recorded == verdict:
+                cancel_preparation()
+                return NoMessageDelivery()
+            if recorded:
+                raise AnswerRefused("this row already has a different saved answer")
+            cleanup = replace(change_review.PendingVerdictCleanup.for_row(status.root, page.review_list, row_id),
+                              verdict=verdict, feature_review=review, require_git_commit=defer_verdict_cleanup or bool(review))
+            try:
                 cleanup.save()
                 result = change_review.save_verdict(page.review_list, row_id, verdict, production, cleanup=cleanup)
-                if isinstance(result, change_review.VerdictSaved) and isinstance(result.cleanup, change_review.NoVerdictCleanup):
-                    cleanup.intent.unlink(missing_ok=True)
-        else:
-            result = change_review.save_verdict(page.review_list, row_id, verdict, production)
+            except (change_review.ChangeReviewError, OSError):
+                cleanup.intent.unlink(missing_ok=True)
+                raise
+            if isinstance(result, change_review.VerdictRefused) or isinstance(result.cleanup, change_review.NoVerdictCleanup):
+                cleanup.intent.unlink(missing_ok=True)
     except change_review.VerdictDurabilityUnconfirmed:
         with status.locked():
             _ = status.request_attempts.pop(attempt, None)
@@ -1361,11 +1358,14 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         if defer_verdict_cleanup:
             raise question_record.AnswerRefused("The answer could not be saved.") from error
         raise question_record.AnswerRefused(str(error).strip()) from error
-    if isinstance(result, change_review.VerdictRefused):
-        cancel_preparation()
-        raise question_record.AnswerRefused(result.reason)
     for warning in result.warnings:
         print(f"review-links {warning}", file=sys.stderr)
+    if isinstance(result, change_review.VerdictRefused):
+        for line in result.lines:
+            if line.startswith("scratch not removed:"):
+                print(f"review-links {line}", file=sys.stderr)
+        cancel_preparation()
+        raise question_record.AnswerRefused(result.reason)
     details = (f"Merged: {row.get('Merged', '')}", f"User feedback: {feedback if feedback.strip() else verdict}",
                "\n".join(result.lines).strip())
     try:
@@ -1422,10 +1422,11 @@ def finish_verdict_cleanup(delivery: MessageDelivery | NoMessageDelivery,
     if not isinstance(cleanup, change_review.PendingVerdictCleanup):
         return delivery
     lines = finish_saved_verdict(cleanup, status)
+    for line in lines:
+        if isinstance(delivery, NoMessageDelivery) or line.startswith("scratch not removed:"):
+            print(f"review-links {line}", file=sys.stderr)
     if isinstance(delivery, MessageDelivery):
         return replace(delivery, message='\n'.join((delivery.message, *lines)), scratch_cleanup=change_review.NO_VERDICT_CLEANUP)
-    for line in lines:
-        print(f"review-links {line}", file=sys.stderr)
     return NoMessageDelivery()
 
 
