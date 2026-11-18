@@ -238,13 +238,16 @@ def stop_with_reason(
         if not still_current():
             return False
         stopping = {**record, "stop_reason": reason}
+        stopped = False
         try:
             write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
-            signal_run()
-        except BaseException:
-            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-            raise
-        return True
+            if still_current():
+                signal_run()
+                stopped = True
+        finally:
+            if not stopped:
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+        return stopped
 
 
 @dataclass(frozen=True)

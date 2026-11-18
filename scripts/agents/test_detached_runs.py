@@ -1156,6 +1156,21 @@ sys.exit(status)
             send.assert_not_called()
             self.assertEqual(path.read_bytes(), saved_bytes)
 
+        with self.subTest(case="supervisor changes after the stop reason replaces the record"):
+            self.update_record(path, stop_reason="earlier stop")
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+
+            def same_supervisor(_pid: int, _record_path: Path) -> bool:
+                current = cast(dict[str, object], json.loads(path.read_text()))
+                return current["stop_reason"] == "earlier stop"
+
+            with (patch.object(detached_run_process, "supervisor_match", side_effect=same_supervisor) as observe,
+                  patch.object(process_group, "send_process_group") as send):
+                self.assertFalse(detached_runs.stop_command(path, "new stop"))
+            self.assertEqual(observe.call_count, 2)
+            send.assert_not_called()
+            self.assertEqual(cast(object, json.loads(path.read_text())), saved)
+
         with self.subTest(case="directory sync fails after the stop reason replaces the record"):
             self.update_record(path, stop_reason="earlier stop")
             saved = cast(dict[str, object], json.loads(path.read_text()))
