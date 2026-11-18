@@ -2740,18 +2740,18 @@ class DeploymentArguments(argparse.Namespace):
 
 
 def main() -> int:
-    os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
     if sys.argv[1:2] == ['aws-trial']:
         from scripts.aws_target import aws_trial
+        os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         settings_path = conf.path('aws_target')
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--image', type=Path)
-    _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
+    _ = parser.add_argument('--workload', choices=('merge-gates', 'hana', 'plan-identity'), default='merge-gates')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
@@ -2760,6 +2760,16 @@ def main() -> int:
     args = parser.parse_args(namespace=DeploymentArguments())
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
+        if args.workload == 'plan-identity' and args.command != 'down':
+            raise DeploymentRefused('Use --workload plan-identity only with down.')
+        if args.command == 'plan-identity' or args.workload == 'plan-identity':
+            from scripts.aws_target import plan_identity
+            if args.command == 'plan-identity':
+                plan_identity.command_create(args.settings, approve_resources=args.approve_resources)
+            else:
+                plan_identity.command_down(args.settings, approve_destroy=args.approve_destroy)
+            return 0
+        os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         if args.command == 'gpu-size-trial':
             if args.trial_action != 'run' or args.trial_folder == Path():
                 raise DeploymentRefused('Use gpu-size-trial run --trial-folder DIR --approve-resources')
