@@ -13,7 +13,6 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import conf
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -277,7 +276,13 @@ class AffectedModulesTests(unittest.TestCase):
                             self.assertEqual(result.modules, (self.repo / "scripts/checks/test_audit.py",) if selected else ())
                 self.modules.remove(self.repo / "scripts/checks/test_audit.py")
 
-        words = conf.read(Path(__file__).resolve().parents[2] / "config/merge_gate.conf").text("scan_roots").split()
+        words = (
+            "issue_score/test_experiment.py:config/issue_score.conf "
+            "issue_score/test_score_issues.py:config/issue_score.conf "
+            "maintenance/test_vault_commit.py:config/agent_notes.toml "
+            "review_links/test_review_link.py:scripts/lib/py "
+            "usage/test_collect_mac.py:scripts/lib/py"
+        ).split()
         data_inputs = (
             ("config/issue_score.conf", ("issue_score/test_experiment.py", "issue_score/test_score_issues.py")),
             ("config/agent_notes.toml", ("maintenance/test_vault_commit.py",)),

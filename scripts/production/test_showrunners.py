@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.production.staff_test_support import unit_membership, fixture_member, fixture_runtime_id
 
 import json
@@ -790,11 +792,9 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual((self.root / "herdr-responses.json").read_bytes(), before)
 
     def test_settings_read_each_file_change(self) -> None:
-        source = Path(__file__).parents[2] / "config/showrunners.conf"
-        text = source.read_text()
-        _ = self.config.write_text(text)
+        _ = write_config_fixture(self.config, "stall_minutes=5\n")
         self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 5)
-        _ = self.config.write_text(text.replace("stall_minutes=5", "stall_minutes=9"))
+        _ = write_config_fixture(self.config, "stall_minutes=9\n")
         self.assertEqual(showrunners.load_settings_from(self.config)["stall_minutes"], 9)
 
     def test_settings_read_exact_staff_recipient_ids(self) -> None:
