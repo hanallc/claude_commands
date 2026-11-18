@@ -28,7 +28,7 @@ from unittest import mock
 
 
 from scripts.production import change_review
-from scripts.lib import copy_record, file_lock
+from scripts.lib import conf, copy_record, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
@@ -288,11 +288,15 @@ class NativeVerdictTests(unittest.TestCase):
         self.assertIn('fixture record is unreadable', error)
         self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
 
-        _ = record.write_text('{', encoding='utf-8')
-        code, output, error = run(*arguments)
-        self.assertEqual((code, output), (1, ''))
-        self.assertIn('cannot read its verdict delivery record', error)
-        self.assertEqual((listing.read_bytes(), record.read_bytes()), (before[0], b'{'))
+        for damaged in (b'{', b'{"verdict":{"state":"pending"}}',
+                        b'{"kind":"verdict","state":"pending","attempt":""}'):
+            with self.subTest(damaged=damaged):
+                _ = record.write_bytes(damaged)
+                code, output, error = run(*arguments)
+                self.assertEqual((code, output), (1, ''))
+                self.assertIn('cannot read its verdict delivery record', error)
+                self.assertEqual((listing.read_bytes(), record.read_bytes()), (before[0], damaged))
+            _ = listing.write_bytes(before[0])
         _ = record.write_bytes(before[1])
         self.assertEqual(case.fixture.messages, [])
 
@@ -3057,6 +3061,12 @@ class ActionTest(unittest.TestCase):
             self.assertIn("scratch not removed: fixture cleanup failed", output)
             self.assertIn(held, scratch.holds())
             before = self.path.read_bytes()
+            with mock.patch.object(scratch, "end", side_effect=conf.Unusable("fixture scratch configuration is unavailable")):
+                code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("scratch not removed: fixture scratch configuration is unavailable", output)
+            self.assertIn(held, scratch.holds())
+            self.assertEqual(self.path.read_bytes(), before)
             code, output, error = run(*arguments)
             self.assertEqual((code, error), (0, ""))
         self.assertIn(f"removed {folder}\n", output)

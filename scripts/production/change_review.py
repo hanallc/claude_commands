@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -1984,7 +1984,7 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         result = scratch.end(f"row:{_owner(path)}-{row}")
         return ([f"removed {folder}" for folder in result]
                 + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
-    except (scratch.ScratchError, OSError) as error:
+    except (conf.Unusable, scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 
 
