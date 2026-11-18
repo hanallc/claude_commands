@@ -46,7 +46,7 @@ from typing import IO, Literal, NotRequired, TypedDict, TypeGuard, cast, overrid
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import conf, process_group, process_start, unit_runs
+from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
@@ -83,13 +83,20 @@ COMMAND_GATE = ('read -r ready || exit 125; watcher_python=$1 watcher_script=$2;
                 + '(read -r end; [ "$end" = done ] || exec "$watcher_python" "$watcher_script" supervisor-gone '
                 + '"$UNIT_DETACHED_RECORD") <&0 & exec 0</dev/null; exec "$@"')
 SUPERVISOR_GONE_REASON = "the supervisor ended before the command, so its watcher stopped the command"
+CONFIRMED_STOP_SUFFIX = ".stop-confirmed"
+STAGED_STOP_SUFFIX = ".stop-staged"
 
 
 class PaneDispatchUnavailable(TypedDict):
     unavailable: str
 
 
-class RunRecord(TypedDict):
+class StopFields(TypedDict, total=False):
+    stop_reason: str
+    stop_pass_requested: Literal[True]
+
+
+class RunRecord(StopFields):
     run_id: str
     status: Literal["running", "finished"]
     session_dir: str
@@ -116,8 +123,6 @@ class RunRecord(TypedDict):
     # Set when the run ended without its supervisor: "supervisor gone".
     completion_pending: NotRequired[bool]
     ended: NotRequired[str]
-    stop_reason: NotRequired[str]
-    stop_pass_requested: NotRequired[Literal[True]]
     # An empty id records a worker run outside a pass. Older records omit the field.
     pane_dispatch_id: NotRequired[str | PaneDispatchUnavailable]
     orphan_result_superseded: NotRequired[Literal[True]]
@@ -252,45 +257,94 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
             return False
 
 
+def _read_stop_fields(path: Path, run_id: object) -> StopFields:
+    saved = worker_lifecycle.read_json_object(path)
+    if not saved:
+        return {}
+    reason = saved.get("stop_reason")
+    if (not isinstance(run_id, str) or saved.get("run_id") != run_id or not isinstance(reason, str)
+            or ("stop_pass_requested" in saved and saved["stop_pass_requested"] is not True)):
+        raise worker_lifecycle.WorkerStateUnreadable(path, "invalid stop fields")
+    fields: StopFields = {"stop_reason": reason}
+    if saved.get("stop_pass_requested") is True:
+        fields["stop_pass_requested"] = True
+    return fields
+
+
 def _read_record(path: Path) -> RunRecord:
     raw = worker_lifecycle.read_json_object(path)
-    if not _is_run_record(raw) or path.name != f"{raw['run_id']}.json":
+    if not _is_run_record(raw):
         raise SystemExit(f"detached_runs: {path} is not a run record")
-    return raw
+    if path.name != f"{raw['run_id']}.json":
+        raise SystemExit(f"detached_runs: {path} does not match run ID {raw['run_id']}")
+    confirmed = _read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), raw["run_id"])
+    return {**raw, **confirmed} if confirmed else raw
+
+
+def _recover_staged_pane_stop(path: Path, record: RunRecord) -> RunRecord:
+    """Recover the pane request under the record lock after the command exits."""
+    if record.get("stop_pass_requested") or not path.with_suffix(PENDING_STOP_SUFFIX).exists():
+        return record
+    staged = path.with_suffix(STAGED_STOP_SUFFIX)
+    fields = _read_stop_fields(staged, record["run_id"])
+    if not fields.get("stop_pass_requested"):
+        return record
+    _ = staged.replace(path.with_suffix(CONFIRMED_STOP_SUFFIX))
+    atomic_file.sync_folder(path.parent)
+    return {**record, **fields}
 
 
 def stop_with_reason(
     path: Path, reason: str, *, verify_group: Callable[[], CommandGroup | CommandGroupUnverified],
     signal_group: Callable[[int, int], None], stop_pass: bool = False,
 ) -> bool:
-    """Save the reason and signal the verified group under one record lock."""
+    """Publish the stop reason after signaling the verified group."""
     with record_lock(path):
-        record = worker_lifecycle.read_json_object(path)
-        if not _is_run_record(record) or path.name != f"{record['run_id']}.json":
+        try:
+            record = _read_record(path)
+        except SystemExit:
             return False
         if record.get("stop_pass_requested") is True:
             return False
         if isinstance(verify_group(), CommandGroupUnverified):
             return False
+        staged = path.with_suffix(STAGED_STOP_SUFFIX)
+        confirmed = path.with_suffix(CONFIRMED_STOP_SUFFIX)
         stopping = {**record, "stop_reason": reason}
         pending_stop = path.with_suffix(PENDING_STOP_SUFFIX)
         if stop_pass:
             # Index the run before it can outlive its supervisor.
             pending_stop.touch(exist_ok=True)
             stopping["stop_pass_requested"] = True
-        stopped = False
+        signaled = False
         try:
-            write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
-            command = verify_group()
-            if isinstance(command, CommandGroup):
+            try:
+                write_text_atomic(staged, json.dumps(stopping, indent=2, sort_keys=True),
+                                  new_file_mode=path.stat().st_mode & 0o777)
+                command = verify_group()
+                if isinstance(command, CommandGroupUnverified):
+                    return False
                 signal_group(command.group, signal.SIGTERM)
-                stopped = True
-        finally:
-            if not stopped:
-                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-                if stop_pass:
+                signaled = True
+                try:
+                    _ = staged.replace(path)
+                except OSError:
+                    # Publish the staged content only after the signal succeeds.
+                    _ = staged.replace(confirmed)
+                    atomic_file.sync_folder(path.parent)
+                    raise
+                confirmed.unlink(missing_ok=True)
+                atomic_file.sync_folder(path.parent)
+            finally:
+                if stop_pass and not signaled:
                     pending_stop.unlink(missing_ok=True)
-        return stopped
+                staged.unlink(missing_ok=True)
+        except OSError as error:
+            if not signaled:
+                raise
+            print(f"detached_runs: {path}: sent SIGTERM but could not finalize the stop record: {error}",
+                  file=sys.stderr)
+        return True
 
 
 @dataclass(frozen=True)
@@ -366,7 +420,9 @@ def _group_is_live(group: int) -> bool:
     try:
         result = subprocess.run(["ps", "-A", "-o", "pgid=", "-o", "stat="],
                                 capture_output=True, text=True, check=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return True
+    if result.stderr or not result.stdout.strip():
         return True
     for line in result.stdout.splitlines():
         fields = line.split()
@@ -377,13 +433,18 @@ def _group_is_live(group: int) -> bool:
     return False
 
 
-def _saved_process(pid: object, started: object) -> process_start.ProcessStart:
-    """Read the saved process identity and reject a reused PID."""
+@dataclass(frozen=True)
+class SavedProcessIdReused:
+    """A different process now owns the saved PID."""
+
+
+def _saved_process(pid: object, started: object) -> process_start.ProcessStart | SavedProcessIdReused:
+    """Read the saved process identity and identify a reused PID."""
     if not isinstance(started, str) or not started or _integer(pid) <= 0:
         return process_start.Gone()
     observed = process_start.process_start(_integer(pid))
     if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
-        return process_start.Gone()
+        return SavedProcessIdReused()
     return observed
 
 
@@ -404,7 +465,13 @@ def _command_has_ended(raw: Mapping[str, object], pid: int) -> bool:
         return False
     group = _integer(raw.get("command_group"))
     if group > 0:
-        return not _group_is_live(group)
+        leader = group == _integer(raw.get("command_pid"))
+        if leader and isinstance(command, SavedProcessIdReused):
+            return True
+        if not _group_is_live(group):
+            return True
+        # The group ID can be reused after the last member exits.
+        return leader and isinstance(_saved_process(group, raw.get("command_started")), SavedProcessIdReused)
     supervisor = _saved_process(pid, raw.get("supervisor_started"))
     owns_group = isinstance(supervisor, (process_start.Started, process_start.Zombie))
     if not owns_group and isinstance(command, process_start.Zombie):
@@ -448,10 +515,12 @@ class OrphanReapResult:
                     fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     continue
-                current = worker_lifecycle.read_json_object(path)
-                if (_is_run_record(current) and path.name == f"{current['run_id']}.json"
-                        and current.get("completion_pending") is True):
-                    _ = _replay_completion(path, current)
+                try:
+                    current = _read_record(path)
+                    if current.get("completion_pending") is True:
+                        _ = _replay_completion(path, current)
+                except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
+                    print(" ".join(str(error).splitlines()), file=sys.stderr)
 
 
 def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
@@ -485,7 +554,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             continue
         if raw.get("status") == "finished" and raw.get("completion_pending"):
             if not detached_run_process.supervises(raw["pid"], path):
-                result.queue_completion(path, _read_record(path))
+                result.queue_completion(path, raw)
             continue
         if not _orphaned(path, raw, now):
             continue
@@ -495,9 +564,11 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
         except FileExistsError:
             continue
         try:
-            record = _read_record(path)
-            if record["status"] != "running":
-                continue
+            with record_lock(path):
+                record = _read_record(path)
+                if record["status"] != "running":
+                    continue
+                record = _recover_staged_pane_stop(path, record)
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
                         and other.get("staff_id") == record["staff_id"]
                         and _number(other.get("started_at"), 0.0) > record["started_at"]
@@ -522,6 +593,8 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             record = _write_record(path, record)
             result.queue_completion(path, record)
             result.run_ids.append(record["run_id"])
+        except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
+            print(" ".join(str(error).splitlines()), file=sys.stderr)
         finally:
             claim.unlink(missing_ok=True)
     return result
@@ -631,8 +704,9 @@ def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
 
 
 # Keep the record lock at its path until the record is gone.
-_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock",
-              "{}" + PENDING_STOP_SUFFIX, "{}.json", "{}.record.lock")
+_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-staged",
+              "{}" + CONFIRMED_STOP_SUFFIX, "{}" + PENDING_STOP_SUFFIX,
+              "{}.json", "{}.record.lock")
 
 
 def prune_finished(runs: Path) -> list[str]:
@@ -717,7 +791,7 @@ def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> Run
     for path in _run_record_paths(runs):
         raw = worker_lifecycle.read_json_object(path)
         if (raw.get("worker") == worker and raw.get("command") == command and raw.get("tree_key") == tree_key
-                and _run_is_pending(raw, lambda pid: detached_run_process.supervises(pid, path))):
+                and _run_is_pending(path, raw, lambda pid: detached_run_process.supervises(pid, path))):
             return cast(RunRecord, cast(object, raw))
     return None
 
@@ -831,15 +905,24 @@ def live_runs_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]]) -> li
         for path in sorted(paths):
             raw = worker_lifecycle.read_json_object(path)
             if (isinstance(identity := raw.get("staff_id"), str) and identity in identities
-                    and _run_is_pending(raw, lambda pid: pid in supervisors.get(path, ()))):
+                    and _run_is_pending(path, raw, lambda pid: pid in supervisors.get(path, ()))):
                 found.append(cast(RunRecord, cast(object, raw)))
     return found
 
 
-def _run_is_pending(raw: Mapping[str, object], supervisor_owns: Callable[[int], bool]) -> bool:
+def _recover_indexed_stop(path: Path, raw: dict[str, object]) -> None:
+    if raw.get("stop_pass_requested") is not True and path.with_suffix(PENDING_STOP_SUFFIX).exists():
+        raw.update(_read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), raw.get("run_id")))
+
+
+def _run_is_pending(path: Path, raw: dict[str, object], supervisor_owns: Callable[[int], bool]) -> bool:
     # A stop can outlive its supervisor. The delivery process or reaper proves that its group ended.
-    return raw.get("status") == "running" and (
-        raw.get("stop_pass_requested") is True or supervisor_owns(_integer(raw.get("pid"))))
+    if raw.get("status") != "running":
+        return False
+    if raw.get("stop_pass_requested") is True or supervisor_owns(_integer(raw.get("pid"))):
+        return True
+    _recover_indexed_stop(path, raw)
+    return raw.get("stop_pass_requested") is True
 
 
 def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRunEvidence:
@@ -853,11 +936,10 @@ def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRun
     for path in paths:
         try:
             raw = worker_lifecycle.read_json_object(path)
+            if owns(raw) and _run_is_pending(path, raw, lambda pid: detached_run_process.supervises(pid, path)):
+                found.append(cast(RunRecord, cast(object, raw)))
         except (OSError, ValueError) as error:
             errors.append(LiveRunReadError(path, error))
-            continue
-        if owns(raw) and _run_is_pending(raw, lambda pid: detached_run_process.supervises(pid, path)):
-            found.append(cast(RunRecord, cast(object, raw)))
     return LiveRunEvidence(tuple(found), tuple(errors))
 
 
@@ -1338,11 +1420,12 @@ def command_supervise(args: argparse.Namespace) -> int:
     with _completion_sources(Path(__file__).resolve().parents[1]):
         exit_code = _run(prefix + record["command"], environment, log)
         with record_lock(record_path):
-            record = _read_record(record_path)
+            record = _recover_staged_pane_stop(record_path, _read_record(record_path))
             retry_without_scope = bool(prefix) and not marker.exists() and not record.get("stop_reason")
         if retry_without_scope:
             exit_code = _run(record["command"], environment, log)
-            record = _read_record(record_path)
+            with record_lock(record_path):
+                record = _recover_staged_pane_stop(record_path, _read_record(record_path))
         marker.unlink(missing_ok=True)
         # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
         # unless the result is already held.
@@ -1434,7 +1517,9 @@ def command_stop(args: argparse.Namespace) -> int:
     if stop_command(path, str(getattr(args, "reason", ""))):
         print(f"stopped {path.stem}: its result comes from the supervisor")
         return 0
-    if worker_lifecycle.read_json_object(path).get("stop_pass_requested") is True:
+    raw = worker_lifecycle.read_json_object(path)
+    _recover_indexed_stop(path, raw)
+    if raw.get("stop_pass_requested") is True:
         print(f"{path.stem} already has a stop request", file=sys.stderr)
         return 1
     print(f"{path.stem} is not running or its process identity changed; nothing stopped", file=sys.stderr)
