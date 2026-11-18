@@ -36,7 +36,7 @@ else:
     from scripts.buildlog import health as buildlog_health
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
-from scripts.lib import conf
+from scripts.lib import conf, session_folder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -50,17 +50,42 @@ START_SUBPROCESS = subprocess.Popen
 
 class GeneratedSourceTests(unittest.TestCase):
     def test_no_envrc_source_requires_generated_source_outside_trusted_roots(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary, \
-             mock.patch.dict(os.environ, {'SCRATCH_ROOT': str(Path(temporary) / 'scratch')}):
-            folder = scratch.new('gate:offload-generated-source', 'proof')
-            self.assertIsNone(nix_env.nearest_envrc(folder))
-            self.assertFalse(offload.trusted_linux_source(folder))
-            _ = scratch.update_record(folder, lambda record: {
-                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
-            self.assertTrue(offload.trusted_linux_source(folder))
-            _ = (folder / '.envrc').write_text('use flake\n')
-            with mock.patch.object(nix_env, 'ensure', return_value=nix_env.Refused('not approved')):
-                self.assertFalse(offload.trusted_linux_source(folder))
+        for live_session in (False, True):
+            with self.subTest(live_session=live_session), tempfile.TemporaryDirectory() as session_temporary:
+                sessions = Path(session_temporary) / "sessions"
+                other_worker = sessions / "other-worker"
+                (other_worker / "proof").mkdir(parents=True)
+                sentinel = other_worker / "proof/source.txt"
+                _ = sentinel.write_text("another worker's source\n")
+                index = sessions / ".id"
+                index.mkdir()
+                (index / "offload-fixture").symlink_to(other_worker.name)
+                before = sorted(path.relative_to(sessions) for path in sessions.rglob("*"))
+                with mock.patch.dict(os.environ, {
+                    "SESSION_TEMP_ROOT": str(sessions if live_session else sessions / "absent"),
+                    "CODEX_THREAD_ID": "offload-fixture",
+                }):
+                    self.assertEqual(session_folder.caller_folder(), other_worker if live_session else None)
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        with mock.patch.dict(os.environ, {
+                            "SCRATCH_ROOT": str(root / "scratch"),
+                            "SCRATCH_HOLDS": str(root / "holds.json"),
+                            "SESSION_TEMP_ROOT": str(root / "absent-session"),
+                        }):
+                            folder = scratch.new('gate:offload-generated-source', 'proof')
+                            self.assertTrue(folder.is_relative_to(root), str(folder))
+                            self.assertIsNone(nix_env.nearest_envrc(folder))
+                            self.assertFalse(offload.trusted_linux_source(folder))
+                            _ = scratch.update_record(folder, lambda record: {
+                                **(record.fields if isinstance(record, copy_record.Registered) else {}), 'generated_source': True})
+                            self.assertTrue(offload.trusted_linux_source(folder))
+                            _ = (folder / '.envrc').write_text('use flake\n')
+                            with mock.patch.object(nix_env, 'ensure', return_value=nix_env.Refused('not approved')):
+                                self.assertFalse(offload.trusted_linux_source(folder))
+                    self.assertFalse(folder.exists())
+                self.assertEqual(sorted(path.relative_to(sessions) for path in sessions.rglob("*")), before)
+                self.assertEqual(sentinel.read_text(), "another worker's source\n")
 
 
 class LintVerbTests(unittest.TestCase):
