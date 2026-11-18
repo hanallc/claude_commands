@@ -537,9 +537,12 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
                  +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
                  +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
                  +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div>')
-    return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
-            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{words_rows}" '
-            + 'placeholder="Type your words. They go with the button that you press."></textarea>'
+    words = ''
+    if closes or returns or later:
+        field = 'words-'+html.escape(item.key, quote=True)
+        words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
+                 + 'placeholder="Type your words. They go with the button that you press."></textarea>')
+    return ('<form method="post" data-review-form>'+hidden+words
             + page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
             + '<span role="status" data-send-status></span></form>')
 
@@ -833,7 +836,7 @@ const pendingSaves=new Map();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 const kinds=['question','change','investigation','proposal','efficiency'],states=['Open','Waiting','Done','Validating'];
 let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
-let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
+let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard,deferredLink=null;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
@@ -896,7 +899,7 @@ function storeSavedVerdicts(){
 try{
  for(const [key,result] of JSON.parse(sessionStorage.getItem(savedVerdictsKey) || '[]')){
   if(!snapshotPrecedesSave(index.get(key),result)) continue;
-  saved.set(key,result);savedEntry(key,result);
+  saved.set(key,{...result,restored:true});savedEntry(key,result);
  }
 }catch{}
 storeSavedVerdicts();
@@ -1032,7 +1035,7 @@ function loadBodies(){
  });
 }
 function rememberForm(form){
- if(!form) return;
+ if(!form?.elements.feedback) return;
  const row=form.closest('[data-list-item]');
  if(pendingSaves.get(row.dataset.key)?.saved) return;
  const choices=[...row.querySelectorAll('input[name=choice]')];
@@ -1051,6 +1054,7 @@ function bindForm(row){
  form.dataset.bound='true';
  const key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
  drawSaveState(key,form);
+ if(!words) return;
  const choices=[...row.querySelectorAll('input[name=choice]')];
  if(drafts.has(key)){
   const draft=drafts.get(key);words.value=draft.feedback;if(later) later.value=draft.later;
@@ -1090,7 +1094,7 @@ function bindForm(row){
     saved.set(key,marker);savedEntry(key,marker);
     if(marker.closes) storeSavedVerdicts();
     pendingSaves.delete(key);
-    view.closeCard(key);
+    if(!isDeferredLink(key)) view.closeCard(key);
     view.showActionResult(row,submission,key,{kind:'success',message:'Saved: '+result.answer});
     if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
    }catch(error){
@@ -1099,7 +1103,13 @@ function bindForm(row){
    }
    finally{
     pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
-    followItemLink({inheritFilters:true,unappliedOnly:true});
+    if(isDeferredLink(key)){
+     deferredLink=null;
+     followItemLink({inheritFilters:true});
+    }else if(deferredLink?.href!==location.href){
+     deferredLink=null;
+     followItemLink({inheritFilters:true,unappliedOnly:true});
+    }
     if(!pendingSaves.size) void pageRefresh.refresh(true);
    }
   };
@@ -1210,7 +1220,7 @@ async function refresh(_supersede=false,current=()=>true){
   if(!entry || (result.later && Date.now()>=result.later)) {saved.delete(key);continue;}
   // The index supplies the state and update time for each row.
   const submitted=snapshotPrecedesSave(entry,result);
-  if(!submitted && (result.handed || entry.state!==result.state)){saved.delete(key);continue;}
+  if(!submitted && (result.restored || result.handed || entry.state!==result.state)){saved.delete(key);continue;}
   if(!result.closes && !result.question && !result.later && !submitted) saved.delete(key);
   else result.awaitingSnapshot=submitted;
  }
@@ -1233,12 +1243,25 @@ function followItemLink(options){
   return true;
  }});
 }
+const frame=window.frameElement;
+if(frame?.reviewPlace){
+ const {place,table}=frame.reviewPlace;
+ delete frame.reviewPlace;
+ if(!history.state?.recordTable && place===location.pathname+location.search+location.hash)
+  history.replaceState({recordTable:table},'');
+}
 if(history.state?.recordTable) view.restorePlace();
 else if(!followItemLink()){view.place();view.apply();}
+function isDeferredLink(key){return deferredLink?.key===key && deferredLink.href===location.href;}
 function restorePlace(event){
+ const params=new URLSearchParams(location.hash.slice(1));
+ const key=params.get('jump') || params.get('item') || new URLSearchParams(location.search).get('item');
+ if(pendingSaves.has(key)){
+  deferredLink={key,href:location.href};return;
+ }
+ deferredLink=null;
  if(event.type==='hashchange' && !history.state?.recordTable && followItemLink({inheritFilters:true})) return;
- const key=new URLSearchParams(location.hash.slice(1)).get('item');
- if(!pendingSaves.has(key)) view.restorePlace(event);
+ view.restorePlace(event);
 }
 addEventListener('popstate',restorePlace);
 addEventListener('hashchange',restorePlace);

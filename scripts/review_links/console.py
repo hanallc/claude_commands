@@ -574,15 +574,20 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     return base;
   }
   function record(entry) {
-    let place;
+    let place, state = history.state;
     try {
-      const at = frames.get(entry.dataset.page).contentWindow.location;
+      const child = frames.get(entry.dataset.page).contentWindow;
+      const at = child.location;
       place = placeOf(entry, at.pathname + at.search + at.hash);
+      if (entry.dataset.page === 'review') {
+        const table = child.history.state?.recordTable;
+        state = table ? {reviewPlace: {place, table}} : null;
+      }
     } catch (_) { return; }
     const url = new URL(location.href);
     if (place === entry.dataset.url) url.searchParams.delete(placeKey(entry.dataset.page));
     else url.searchParams.set(placeKey(entry.dataset.page), place);
-    history.replaceState(null, '', url);
+    history.replaceState(state, '', url);
     actions.syncLinks();
   }
   function frameFor(entry) {
@@ -590,7 +595,10 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     if (frame) return frame;
     frame = document.createElement('iframe');
     frame.hidden = true;
-    frame.src = placeOf(entry, new URL(location.href).searchParams.get(placeKey(entry.dataset.page)));
+    const target = placeOf(entry, new URL(location.href).searchParams.get(placeKey(entry.dataset.page)));
+    const restored = history.state?.reviewPlace;
+    if (entry.dataset.page === 'review' && restored?.place === target) frame.reviewPlace = restored;
+    frame.src = target;
     let place = frame.src;
     frame.addEventListener('load', () => {
       let loaded = false;
@@ -661,7 +669,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     document.title = 'Hana console · ' + title;
     const url = new URL(location.href);
     url.searchParams.set('page', selected.dataset.page);
-    history.replaceState(null, '', url);
+    history.replaceState(history.state, '', url);
     actions.syncLinks();
     const path = selected.dataset.url;
     frames.forEach((frame, page) => { if (page !== selected.dataset.page) frame.hidden = true; });

@@ -793,7 +793,8 @@ class ReviewPageTests(unittest.TestCase):
         self.assertRegex(revision, r'^[0-9a-f]{16}$')
         self.assertIn(f'name="revision" value="{revision}"', card)
         self.assertIn('How to check', done, 'A Done key loads its body directly.')
-        for hidden in ('<h3>Proof</h3>', 'data-later-toggle'):
+        self.assertIn('data-send-status', done)
+        for hidden in ('<h3>Proof</h3>', 'data-later-toggle', 'Your words', 'name="feedback"'):
             with self.subTest(hidden=hidden):
                 self.assertNotIn(hidden, done)
         with self.assertRaises(LookupError):
@@ -3274,6 +3275,20 @@ if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item
     await new Promise(resolve=>requestAnimationFrame(resolve));
    check(row()?.dataset.state==='Done' && row()?.querySelector('[data-review-body]') &&
       !row()?.querySelector('[value="works"]'),'A reload during publication retry hides the old verdict action.');
+   const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+   index.r.find(entry=>entry[0]===key)[6]=2;
+   const facts=pageRefreshFacts(),version='confirmed';
+   window.fetch=(url,options)=>{
+    const params=new URL(url,location.href).searchParams;
+    if(params.has('index')) return Promise.resolve(Response.json({index,version,facts}));
+    if(params.has('version') && !params.has('body')) return Promise.resolve(Response.json({version,facts}));
+    return fetchCard(url,options);
+   };
+   const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+   await refreshed;
+   content.querySelector('[data-show-chip="Done"]').click();
+   check(row()?.dataset.state==='Done' && !row().hidden,'The confirmed Change appears in the Done list.');
   }else{
    check(content.dataset.show==='open' && !row(),'A reload restores Open when the address names a Done Change.');
   }
@@ -3348,6 +3363,116 @@ window.fetch=(url,options={})=>{
         page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
         page = page.replace('</body>', probe+'</body>', 1)
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_back_and_forward_defer_the_link_to_its_own_pending_save(self) -> None:
+        _ = self.question()
+        setup = r"""<script>
+const sendProbe=fetch,finishSave=new Map();
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method!=='POST') return sendProbe(url,options);
+ const key=new URLSearchParams(options.body).get('row');
+ return new Promise(resolve=>finishSave.set(key,()=>resolve(Response.json({answer:'saved',state:'Done'}))));
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const content=document.querySelector('[data-review]');
+ const row=key=>content.querySelector('[data-key="'+key+'"]');
+ const fetchCard=fetch;
+ window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
+  ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
+  : fetchCard(url,options);
+ const afterHash=step=>new Promise((resolve,reject)=>{
+  const timeout=setTimeout(()=>reject(new Error('The history entry did not change during '+step+'.')),5000);
+  addEventListener('hashchange',()=>{clearTimeout(timeout);resolve();},{once:true});
+ });
+ const item=()=>new URLSearchParams(location.hash.slice(1)).get('item');
+ async function start(key,action){
+  const changed=afterHash('link to '+key);location.hash=new URLSearchParams({item:key});await changed;
+  const form=await readyReviewCard(row(key));
+  form.elements.feedback.value='The saved words.';
+  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+  return form;
+ }
+ async function settle(key,form){
+  finishSave.get(key)();
+  while(form.dataset.sending) await new Promise(resolve=>requestAnimationFrame(resolve));
+ }
+ try{
+  if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
+  const change='page-owner/C1',question=content.querySelector('[data-type="question"][data-list-item]').dataset.key;
+  const changeForm=await start(change,'works'),questionForm=await start(question,'answer');
+  const back=afterHash('Back');history.back();await back;
+  if(item()!==change) failures.push('Back restores the pending Change link.');
+  const forward=afterHash('Forward');history.forward();await forward;
+  if(item()!==question) failures.push('Forward restores the pending Question link.');
+  await settle(change,changeForm);
+  if(!questionForm.dataset.sending || item()!==question)
+   failures.push('The Change save leaves the Question link pending.');
+  await settle(question,questionForm);
+  const target=row(question);
+  if(item()!==question || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
+   failures.push('The Question save opens the Done card at the restored link.');
+ }catch(error){failures.push(String(error));}
+ await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
+        self.assertEqual(firefox_probe_results(page.replace('</body>', probe+'</body>', 1).encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_console_reload_preserves_show_and_an_explicit_link_opens_the_card(self) -> None:
+        _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
+                                         datetime.now(user_zone()).date(), self.fixture.production)
+        review = browser_markup(self.root)
+        pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
+                                     console.AvailablePage('/console/review.html')),)
+        shell = console.render(pages, console.UnavailablePage()).decode()
+        shell = shell.replace('</head>', '''<script>
+const sendProbe=fetch;
+window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
+ Promise.resolve(Response.json({available:true,count:0,entries:[],new:[]}));
+</script></head>''', 1)
+        probe = r"""<script>
+(async()=>{
+ const failures=[],stage=sessionStorage.getItem('console-reload');
+ const frame=document.querySelector('iframe'),key='page-owner/C1';
+ const explicit='/console/review.html?show=open&item='+encodeURIComponent(key);
+ const row=()=>frame.contentDocument.querySelector('[data-key="'+key+'"]');
+ const show=()=>frame.contentDocument.querySelector('[data-review]')?.dataset.show;
+ const until=async (predicate,label)=>{
+  const end=performance.now()+8000;
+  while(!predicate()){
+   if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  if(!stage){
+   sessionStorage.setItem('console-reload','linked');
+   location.search=new URLSearchParams({'page':'review','at.review':explicit});return;
+  }
+  await until(()=>frame.contentWindow.history.state?.recordTable,'Review to load');
+  if(stage==='linked'){
+   if(show()!=='all' || row()?.querySelector('[data-detail]').hidden!==false)
+    failures.push('An explicit link opens the Done Change.');
+   frame.contentDocument.querySelector('[data-show-chip="open"]').click();
+   await until(()=>new URLSearchParams(location.search).get('at.review')==='/console/review.html'+
+    frame.contentWindow.location.hash,'Console to record Open');
+   sessionStorage.setItem('console-reload','reloaded');location.reload();return;
+  }
+  if(show()!=='open' || row()) failures.push('A Console reload keeps Open and hides the Done Change. Show: '+show());
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        shell = shell.replace('</body>', probe+'</body>', 1)
+        review_html, shell_html = (json.dumps(page).replace('</', '<\\/') for page in (review, shell))
+        router = f'<script>document.write(location.pathname.endsWith("review.html") ? {review_html} : {shell_html});</script>'
+        self.assertEqual(firefox_probe_results(router.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
