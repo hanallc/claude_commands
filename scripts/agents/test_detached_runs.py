@@ -842,7 +842,17 @@ sys.exit(1)
         self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         path = self.record(["bash", "verify.sh", "test", "hana"])
         self.update_record(path, pid=DEAD_PID)
-        popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
+        legacy = path.with_name("legacy.json")
+        legacy_record = cast(dict[str, object], json.loads(path.read_text()))
+        del legacy_record["director_dir"]
+        legacy_record["run_id"] = legacy.stem
+        write_text_atomic(legacy, json.dumps(legacy_record))
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(str(legacy), lines[0])
+        self.assertEqual(cast(object, json.loads(legacy.read_text())), legacy_record)
         popen.assert_called_once()
         record = cast(detached_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
         self.assertEqual((record["status"], record.get("ended"), record.get("exit_code")),
@@ -902,12 +912,15 @@ sys.exit(1)
                       patch.object(subprocess, "run", return_value=output)):
                     self.assertTrue(detached_run_process.runs_command(4321, ["assign.py", "impl", argument]))
         record = self.root / "run folder/r1.json"
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "PROCESS_CHECK_SECONDS=7\n")
         for tail, matches in (("", True), (" backup.json", False)):
             with self.subTest(tail=tail):
                 output = subprocess.CompletedProcess(["ps"], 0, f"python detached_runs.py supervise {record}{tail}\n", "")
                 with (patch.object(Path, "exists", return_value=False),
-                      patch.object(subprocess, "run", return_value=output)):
+                      patch.object(subprocess, "run", return_value=output) as ps):
                     self.assertEqual(detached_run_process.supervises(4321, record), matches)
+                ps.assert_called_once_with(["ps", "-p", "4321", "-o", "args="],
+                                           capture_output=True, text=True, check=False, timeout=7)
 
     def test_a_live_supervisor_is_not_ended(self) -> None:
         path = self.live_run(["bash", "verify.sh", "check"])
@@ -1116,6 +1129,14 @@ sys.exit(status)
                 send.assert_not_called()
                 self.assertNotIn("stop_reason", cast(dict[str, object], json.loads(path.read_text())))
 
+        with self.subTest(case="supervisor check times out"):
+            self.update_record(path, status="running", command_group=os.getpid(), command_started=started.start)
+            with (patch.object(detached_run_process, "supervises", side_effect=subprocess.TimeoutExpired("ps", 5)),
+                  patch.object(process_group, "send_process_group") as send):
+                self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
+            send.assert_not_called()
+            self.assertNotIn("stop_reason", cast(dict[str, object], json.loads(path.read_text())))
+
     def test_updates_do_not_write_missing_or_invalid_records(self) -> None:
         with self.subTest(update="stop after prune"):
             path = self.finished_run("pruned-before-stop")
@@ -1135,6 +1156,20 @@ sys.exit(status)
             write.assert_not_called()
             send.assert_not_called()
             self.assertEqual(path.read_text(), partial)
+
+        with self.subTest(update="stop on a record named for another run"):
+            path = self.record(["true"])
+            started = process_start.process_start(os.getpid())
+            assert isinstance(started, process_start.Started)
+            self.update_record(path, run_id="other-run", command_group=os.getpid(), command_started=started.start)
+            original = path.read_text()
+            with (patch.object(detached_run_process, "supervises", return_value=True),
+                  patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
+                  patch.object(process_group, "send_process_group") as send):
+                self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
+            write.assert_not_called()
+            send.assert_not_called()
+            self.assertEqual(path.read_text(), original)
 
         with self.subTest(update="delivery after prune"):
             path = self.finished_run("pruned-before-delivery-write")
@@ -1466,14 +1501,16 @@ send.deliver_worker_text = fake_sender
     def test_cancelled_stop_reason_is_absent_from_the_delivered_result(self) -> None:
         reason = "stopped for service deploy; run again after the release"
         record_lock = detached_runs.record_lock
-        for timing in ("before publication", "during recheck"):
-            with self.subTest(cancellation=timing):
+        for timing, previous in (("before publication", ""),
+                                 ("before publication", "stopped for an earlier hold"), ("during recheck", "")):
+            with self.subTest(cancellation=timing, previous=previous):
                 session_staff.inbox_path(self.worker_id).unlink(missing_ok=True)
                 path = self.record([sys.executable, "-c", "pass"])
                 cancelled = Event()
                 if timing == "before publication":
-                    self.assertTrue(detached_runs.stop_with_reason(
-                        path, reason, still_current=lambda: True, signal_run=lambda: None))
+                    if previous:
+                        self.assertTrue(detached_runs.stop_with_reason(
+                            path, previous, still_current=lambda: True, signal_run=lambda: None))
 
                     @contextlib.contextmanager
                     def cancel_before_save(path: Path) -> Generator[None]:
@@ -1571,7 +1608,11 @@ send.deliver_worker_text = fake_sender
                 self.assertTrue(cancelled.is_set())
                 self.assertIn("Result: PASS (exit 0)", message)
                 self.assertNotIn(reason, message)
-                self.assertNotIn("stop_reason", record)
+                if previous:
+                    self.assertEqual(record.get("stop_reason"), previous)
+                    self.assertIn("Stop reason: " + previous, message)
+                else:
+                    self.assertNotIn("stop_reason", record)
                 if timing == "during recheck":
                     self.assertIn("Stage 2: go", message)
 

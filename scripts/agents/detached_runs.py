@@ -227,10 +227,10 @@ def stop_with_reason(
     """Save the reason and complete the stop decision under one record lock."""
     with record_lock(path):
         record = worker_lifecycle.read_json_object(path)
-        if not _is_run_record(record):
+        if not _is_run_record(record) or path.name != f"{record['run_id']}.json":
             return False
-        record["stop_reason"] = reason
-        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+        stopping = {**record, "stop_reason": reason}
+        write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
         sent = False
         try:
             if still_current():
@@ -239,7 +239,6 @@ def stop_with_reason(
             return sent
         finally:
             if not sent:
-                del record["stop_reason"]
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
@@ -278,7 +277,7 @@ def stop_command(path: Path, reason: str) -> bool:
 
     try:
         return stop_with_reason(path, reason, still_current=still_current, signal_run=signal_run)
-    except ProcessLookupError:
+    except (ProcessLookupError, subprocess.TimeoutExpired):
         return False
 
 
@@ -335,7 +334,7 @@ def _saved_process(pid: object, started: object) -> process_start.ProcessStart:
     return observed
 
 
-def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
+def _orphaned(path: Path, raw: Mapping[str, object], now: float) -> bool:
     """Recover a running record after its command and owned group processes end."""
     if raw.get("status") != "running":
         return False
@@ -412,8 +411,12 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
 def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
     """Reap orphan records while the caller holds the runs-folder admission lock."""
     now = time.time()
-    records = [(path, raw) for path in sorted(runs.glob("*.json"))
-               if (raw := worker_lifecycle.read_json_object(path)).get("run_id")]
+    records: list[tuple[Path, RunRecord]] = []
+    for path in sorted(runs.glob("*.json")):
+        try:
+            records.append((path, _read_record(path)))
+        except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
+            print(" ".join(str(error).splitlines()), file=sys.stderr)
     result = OrphanReapResult()
     for path, raw in records:
         if worker and raw.get("worker") != worker:

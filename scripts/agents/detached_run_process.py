@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 
+from scripts.lib import conf
+
 
 @dataclass(frozen=True)
 class ProcessCommandText:
@@ -16,7 +18,9 @@ def process_args(pid: int) -> list[str] | ProcessCommandText:
     """Read the process arguments or the complete ps command text."""
     if Path("/proc/self").exists():
         return _proc_args(Path(f"/proc/{pid}"))
-    shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, check=False)
+    timeout = conf.read("detached_runs").whole("PROCESS_CHECK_SECONDS")
+    shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                           capture_output=True, text=True, check=False, timeout=timeout)
     return ProcessCommandText(shown.stdout.strip())
 
 
