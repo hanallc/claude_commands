@@ -20,10 +20,12 @@ from urllib.parse import parse_qs, urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import staff
+from scripts.message import send_result
+from scripts.production import delivery_state, staff
+from scripts.review_links.test_page_question import question_outcome
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
 from scripts.review_links import question_record
@@ -61,6 +63,7 @@ class ImagesFixture(unittest.TestCase):
         _ = self.shot.write_bytes(PNG)
         self.sent = []
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture))
+        _ = self.enterContext(patch.object(change_page, "send_question", side_effect=self.capture_question))
 
     def submit(self, body: str) -> None:
         delivery = images.submit(self.root, body, self.status)
@@ -68,6 +71,13 @@ class ImagesFixture(unittest.TestCase):
 
     def capture(self, recipient: str, sender: str, message: str) -> None:
         self.sent.append((recipient, sender, message))
+
+    def capture_question(self, recipient: staff.StaffId, message: str, _message_id: str
+                         ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+        owner = staff.snapshot().by_id(recipient)
+        assert owner is not None
+        self.capture(f"session:{owner.current_session}", change_page.SENDER, message)
+        return question_outcome()
 
     def owner_id(self) -> staff.StaffId:
         assert self.owner is not None
@@ -716,27 +726,26 @@ class ImageQuestionTests(ImagesFixture):
 
     def test_a_failed_question_send_keeps_the_record_and_retries_the_same_question(self) -> None:
         record = self.register()
-        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
-        with patch.object(change_page, 'send_message', side_effect=RuntimeError('owner offline')) as send:
-            change_page.deliver(delivery, self.status)
-        self.assertEqual(send.call_count, 4)
+        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "owner offline")) as send,
+              patch.object(change_page, "alert_delivery_failures")):
+            self.ask(record)
+        self.assertEqual(send.call_count, 3)
         content = images.render(self.status).decode()
         self.assertIn('Not sent. Press Ask question again with the same words.', content)
         self.assertIn(f'data-image="{record["id"]}"', content)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id'],)))
         paths = list(self.root.glob(change_page.DELIVERY_PREFIX+'*'))
         self.assertEqual(len(paths), 1)
-        saved = cast(change_page.StoredDeliverySlots, json.loads(paths[0].read_text()))
-        assert 'review_message' in saved
-        self.assertTrue(saved['review_message']['saved'])
+        saved = change_page.read_question_attempt(paths[0])
+        self.assertEqual(saved.state, delivery_state.QuestionSendState.FAILED)
+        self.assertEqual(saved.error, 'owner offline')
         self.status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
-        failure = self.status.failed_delivery(delivery.page, delivery.row)
-        assert isinstance(failure, change_page.FailedDelivery)
-        self.assertEqual(failure.last_error, 'owner offline')
         pending = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
-        self.assertEqual(self.status.failed_delivery(pending.page, pending.row), failure)
+        content = images.render(self.status).decode()
+        self.assertNotIn(f'data-image="{record["id"]}"', content)
+        self.assertIn(f'data-waiting-images="{record["id"]}"', content)
         change_page.deliver(pending, self.status)
-        self.assertIsInstance(self.status.failed_delivery(pending.page, pending.row), change_page.NoFailedDelivery)
+        self.assertEqual(change_page.read_question_attempt(paths[0]).state, delivery_state.QuestionSendState.SENT)
         self.ask(record)
         self.assertEqual(len(self.sent), 1)
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
@@ -747,22 +756,22 @@ class ImageQuestionTests(ImagesFixture):
     def test_an_unconfirmed_send_requires_a_user_resend_after_a_restart(self) -> None:
         record = self.register()
         delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
-        write = self.status.write_slots
+        publish = change_page.publish_question_attempt
 
-        def interrupt_after_send(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+        def interrupt_after_send(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
             if self.sent:
                 raise OSError('Cannot write the send confirmation.')
-            write(page, row, slots)
+            publish(path, attempt)
 
-        with patch.object(self.status, 'write_slots', side_effect=interrupt_after_send):
+        with patch.object(change_page, 'publish_question_attempt', side_effect=interrupt_after_send):
             with self.assertRaisesRegex(OSError, 'Cannot write the send confirmation'):
                 change_page.deliver(delivery, self.status)
 
         self.status = change_page.DeliveryStatus(self.root)
         change_page.recover_review_messages(self.status)
-        self.assertEqual(self.status.image_question_dispatch(delivery.page, delivery.row),
-                         {'attempt': delivery.attempt, 'state': 'started'})
-        self.assertIsInstance(self.status.failed_delivery(delivery.page, delivery.row), change_page.NoFailedDelivery)
+        sending = change_page.read_question_attempt(self.status.path(delivery.page, delivery.row))
+        self.assertEqual(sending.attempt_id, delivery.attempt)
+        self.assertEqual(sending.state, delivery_state.QuestionSendState.SENDING)
         self.assertEqual(len(self.sent), 1)
         content = images.render(self.status).decode()
         self.assertIn('The send result is unknown. Enter the same words and press Ask question to send it again.', content)
@@ -775,14 +784,14 @@ class ImageQuestionTests(ImagesFixture):
     def test_refused_resends_keep_the_first_send_result_unknown(self) -> None:
         record = self.register()
         delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
-        write = self.status.write_slots
+        publish = change_page.publish_question_attempt
 
-        def fail_confirmation(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+        def fail_confirmation(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
             if self.sent:
                 raise OSError('Cannot write the send confirmation.')
-            write(page, row, slots)
+            publish(path, attempt)
 
-        with patch.object(self.status, 'write_slots', side_effect=fail_confirmation):
+        with patch.object(change_page, 'publish_question_attempt', side_effect=fail_confirmation):
             with self.assertRaisesRegex(OSError, 'Cannot write the send confirmation'):
                 change_page.deliver(delivery, self.status)
 
@@ -791,46 +800,45 @@ class ImageQuestionTests(ImagesFixture):
                 self.status = change_page.DeliveryStatus(self.root)
                 change_page.recover_review_messages(self.status)
                 self.assertEqual(len(self.sent), 1)
-                with patch.object(change_page, 'send_message', side_effect=RuntimeError('owner offline')) as send:
+                with (patch.object(change_page, "send_question",
+                                   return_value=question_outcome("refused", "owner offline")) as send,
+                      patch.object(change_page, "alert_delivery_failures")):
                     self.ask(record)
-                self.assertEqual(send.call_count, 4)
-                dispatch = self.status.image_question_dispatch(delivery.page, delivery.row)
-                assert not isinstance(dispatch, change_page.NoImageQuestionDispatch)
-                self.assertEqual(dispatch['state'], 'started_after_unconfirmed')
-                self.assertIsInstance(self.status.failed_delivery(delivery.page, delivery.row), change_page.NoFailedDelivery)
-                content = images.render(self.status).decode()
+                self.assertEqual(send.call_count, 3)
+                saved = change_page.read_question_attempt(self.status.path(delivery.page, delivery.row))
+                self.assertEqual(saved.state, delivery_state.QuestionSendState.UNKNOWN)
+                self.assertTrue(saved.earlier_unconfirmed)
+                content = images.render(change_page.DeliveryStatus(self.root)).decode()
                 self.assertIn('The send result is unknown.', content)
                 self.assertNotIn('Not sent.', content)
 
         self.ask(record)
         self.assertEqual(len(self.sent), 2)
-        dispatch = self.status.image_question_dispatch(delivery.page, delivery.row)
-        assert not isinstance(dispatch, change_page.NoImageQuestionDispatch)
-        self.assertEqual(dispatch['state'], 'accepted')
+        saved = change_page.read_question_attempt(self.status.path(delivery.page, delivery.row))
+        self.assertEqual(saved.state, delivery_state.QuestionSendState.SENT)
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
         self.assertEqual([question.question_id for question in questions], ['Q1'])
 
-    def test_a_saved_question_without_a_send_intent_shows_the_resend_notice(self) -> None:
+    def test_recovery_verifies_the_saved_question_after_the_ready_write_fails(self) -> None:
         record = self.register()
-        write = self.status.write_slots
+        publish = change_page.publish_question_attempt
 
-        def fail_intent_update(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
-            if isinstance(page, change_page.ReviewMessagePage) and page.saved['saved']:
+        def fail_intent_update(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
+            if attempt.state is delivery_state.QuestionSendState.READY:
                 raise OSError('Cannot update the send intent.')
-            write(page, row, slots)
+            publish(path, attempt)
 
-        with patch.object(self.status, 'write_slots', side_effect=fail_intent_update):
+        with patch.object(change_page, 'publish_question_attempt', side_effect=fail_intent_update):
             with self.assertRaisesRegex(OSError, 'Cannot update the send intent'):
                 self.ask(record)
 
         self.status = change_page.DeliveryStatus(self.root)
         change_page.recover_review_messages(self.status)
-        self.assertEqual(self.sent, [])
         notice = 'Not sent. Press Ask question again with the same words.'
+        self.assertEqual(len(self.sent), 1)
         content = images.render(self.status).decode()
-        self.assertIn(notice, content)
-        self.assertIn(f'data-image="{record["id"]}"', content)
-        self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id'],)))
+        self.assertNotIn(f'data-image="{record["id"]}"', content)
+        self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset())
         self.ask(record)
         self.assertEqual(len(self.sent), 1)
         self.assertIn('--question Q1', self.sent[0][2])
@@ -838,7 +846,7 @@ class ImageQuestionTests(ImagesFixture):
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
         self.assertEqual([question.question_id for question in questions], ['Q1'])
 
-    def test_malformed_question_delivery_metadata_keeps_only_the_asked_card_hidden(self) -> None:
+    def test_malformed_question_delivery_metadata_renders_as_unknown(self) -> None:
         record = self.register()
         other = self.register('An image without a question')
         delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
@@ -849,10 +857,32 @@ class ImageQuestionTests(ImagesFixture):
             with self.subTest(saved=saved):
                 _ = path.write_text(json.dumps({'review_message': saved}))
                 content = images.render(self.status).decode()
-                self.assertNotIn(f'data-image="{record["id"]}"', content)
+                self.assertIn(f'data-image="{record["id"]}"', content)
                 self.assertIn(f'data-image="{other["id"]}"', content)
                 self.assertNotIn('Not sent.', content)
-                self.assertNotIn('The send result is unknown.', content)
+                self.assertIn('The send result is unknown.', content)
+                self.assertEqual(images.waiting_images(console.NewsRequest(self.root)),
+                                 frozenset((record['id'], other['id'])))
+
+    def test_an_unreadable_sender_with_a_held_lock_shows_the_block_reason(self) -> None:
+        record = self.register()
+        words = 'Which check passed?'
+        delivery = images.ask_question(self.root, record['id'], words, self.status)
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        blocked = "Resend is unavailable until the sender can be checked."
+        with patch.object(process_start, "process_start", return_value=process_start.Unreadable("Cannot read the sender.")):
+            content = images.render(self.status).decode()
+            self.assertIn(f'<p role="status" data-resend-blocked>{blocked}</p>', content)
+            self.assertNotIn('Enter the same words and press Ask question to send it again.', content)
+            self.ask(record, words)
+            self.assertEqual(self.sent, [])
+        _ = delivery.job.release()
+        content = images.render(self.status).decode()
+        self.assertNotIn(blocked, content)
+        self.assertIn('Not sent. Press Ask question again with the same words.', content)
+        self.ask(record, words)
+        self.assertEqual(len(self.sent), 1)
 
     def test_a_failed_send_mark_sync_allows_only_a_user_resend(self) -> None:
         record = self.register()
@@ -867,9 +897,7 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(self.sent, [])
 
         retry = images.ask_question(self.root, record['id'], words, self.status)
-        intent = self.status.slots(retry.page, retry.row).verdict
-        assert isinstance(intent, change_page.DeliveryIntent)
-        self.assertTrue(self.status.owns_live_attempt(retry.page, retry.row, intent))
+        self.assertIn(f'data-waiting-images="{record["id"]}"', images.render(self.status).decode())
         change_page.deliver(retry, self.status)
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
         self.assertEqual([question.question_id for question in questions], ['Q1'])
@@ -879,8 +907,15 @@ class ImageQuestionTests(ImagesFixture):
     def test_a_failed_failure_receipt_allows_only_a_user_resend(self) -> None:
         record = self.register()
         delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
-        with (patch.object(change_page, 'send_message', side_effect=RuntimeError('owner offline')) as send,
-              patch.object(self.status, 'record_result_locked', side_effect=OSError('Cannot write the failure.'))):
+        publish = change_page.publish_question_attempt
+
+        def fail_result(path: Path, attempt: delivery_state.QuestionAttempt) -> None:
+            if attempt.state is delivery_state.QuestionSendState.FAILED:
+                raise OSError("Cannot write the failure.")
+            publish(path, attempt)
+
+        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "owner offline")) as send,
+              patch.object(change_page, "publish_question_attempt", side_effect=fail_result)):
             with self.assertRaisesRegex(OSError, 'Cannot write the failure'):
                 change_page.deliver(delivery, self.status)
         self.assertEqual(send.call_count, 3)
@@ -1005,6 +1040,8 @@ async (find, whenPageShows, check, controlRefresh) => {
                          [(['question'], ['Which check passed?']), (['question'], ['Which check failed?']),
                           (['question'], ['Which check failed?'])])
         self.assertEqual(len(self.sent), 3)
+        self.assertIn('Change review delivery needs attention', self.sent[1][2])
+        self.assertIn('--question Q2', self.sent[2][2])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
     def test_browser_removes_a_saved_question_after_an_incomplete_success_body(self) -> None:
@@ -1208,12 +1245,14 @@ async (find, whenPageShows, check, controlRefresh) => {
         first_delivery_done = threading.Event()
         second_delivery_done = threading.Event()
         resend_done = threading.Event()
-        fixture = self
 
-        def refuse_question(recipient: str, sender: str, message: str) -> None:
-            if message.startswith(f'Images {identity}: Ask question\n'):
-                raise RuntimeError('The owner is unavailable.')
-            fixture.capture(recipient, sender, message)
+        def fail_result_sync(folder: Path) -> None:
+            for path in folder.glob(change_page.DELIVERY_PREFIX + "*"):
+                if change_page.read_question_attempt(path).state is delivery_state.QuestionSendState.SENT:
+                    raise OSError("Cannot sync the delivery result.")
+            sync(folder)
+
+        sync = atomic_file.sync_folder
 
         class Probe(BaseHTTPRequestHandler):
             timeout: ClassVar[float | None] = 5
@@ -1280,15 +1319,14 @@ async (find, whenPageShows, check, controlRefresh) => {
                     if is_first_delivery:
                         if first_delivery_released.wait(TEST_HANG_GUARD_SECS):
                             if fail_result_write:
-                                with patch.object(delivery_status, 'record_result_locked',
-                                                  side_effect=OSError('Cannot write the delivery result.')):
-                                    with fixture.assertRaisesRegex(OSError, 'Cannot write the delivery result'):
-                                        change_page.deliver(delivery, delivery_status)
+                                with patch.object(atomic_file, "sync_folder", side_effect=fail_result_sync):
+                                    change_page.deliver(delivery, delivery_status)
                             else:
                                 change_page.deliver(delivery, delivery_status)
                             first_delivery_done.set()
                     elif isinstance(delivery, change_page.MessageDelivery) and delivery.row.endswith('/Q2') and not second_delivery_done.is_set():
-                        with patch.object(change_page, 'send_message', side_effect=refuse_question):
+                        with patch.object(change_page, "send_question",
+                                          return_value=question_outcome("refused", "The owner is unavailable.")):
                             change_page.deliver(delivery, delivery_status)
                         second_delivery_done.set()
                     else:
@@ -1465,7 +1503,10 @@ class ImagesServerTests(ImagesFixture):
 
     def test_a_saved_question_stays_off_the_page_before_and_after_startup_recovery(self) -> None:
         record = self.register()
-        _ = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        _ = delivery.job.release()
         started, release, completed = threading.Event(), threading.Event(), threading.Event()
         recover = change_page.recover_pending
 

@@ -27,8 +27,10 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import conf
+from scripts.lib import conf, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message import send_result
+from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
@@ -90,11 +92,13 @@ class ListPageTests(unittest.TestCase):
 
     def test_bulk_controls_show_lucide_icons_and_accessible_labels(self) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
-        header = markup.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
-        for label, icon in (("Expand all", "chevrons-up-down"), ("Collapse all", "chevrons-down-up")):
+        controls = markup.split('<div class="list-expansion">', 1)[1].split('</div>', 1)[0]
+        for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
+                                    ("collapse", "Collapse all", "chevrons-down-up")):
             with self.subTest(label=label):
-                self.assertRegex(header, rf'<button\b[^>]*aria-label="{label}"[^>]*>\s*<svg\b')
-                control = header.split(f'aria-label="{label}"', 1)[1].split('</button>', 1)[0]
+                self.assertRegex(controls, rf'<button\b[^>]*aria-label="{label}"[^>]*>\s*<svg\b')
+                self.assertIn(f'id="list-{action}-all" data-list-expansion="{action}"', controls)
+                control = controls.split(f'aria-label="{label}"', 1)[1].split('</button>', 1)[0]
                 self.assertIn(f'title="{label}"', control)
                 self.assertIn(f'class="lucide lucide-{icon}"', control)
 
@@ -365,7 +369,7 @@ async function inspect(frame){
        'the generated link keeps the Review sort selected in the controls');
     }
     if(stage===1){
-     check(selected(doc,'owner')==='','the jump resets Owner to All when words or Show hide the card');
+     check(selected(doc,'owner')===ownerId,'The jump keeps the matching Owner.');
      check(search.value==='' && selected(doc,'type')==='change','the jump clears conflicting words and keeps the matching type');
     }
     if(stage===0 && !reloaded){
@@ -1126,7 +1130,7 @@ document.body.append(result);
         config = self.root / "config"
         config.mkdir()
         _ = write_config_fixture(config / "change_review.conf")
-        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\n")
+        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\ndelivery_pause_seconds=0\n")
         _ = write_config_fixture(config / "console.conf",
             "page.list.url=python:scripts.review_links.list_page:page_url\n"
             + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n")
@@ -1171,7 +1175,7 @@ document.body.append(result);
         self.assertEqual(body.count('<tbody data-list-item'), 6)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
-        controls = body.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
+        controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
         self.assertNotIn('<select', controls)
         self.assertEqual(controls.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
@@ -1180,7 +1184,7 @@ document.body.append(result);
             self.assertRegex(controls, f'data-filter-value="{value}"[^>]*>{label}<b>')
         self.assertRegex(controls, f'data-filter-value="{OWNER.id}"[^>]*>sdlc<b>')
         self.assertRegex(controls, f'data-filter-value="{OTHER.id}"[^>]*>builds<b>')
-        producers = markup.split('data-filter-row="producer"', 1)[1].split('<span data-list-count', 1)[0]
+        producers = markup.split('data-filter-row="producer"', 1)[1].split('<p data-missing-item', 1)[0]
         choices: list[tuple[str, str]] = []
         for match in re.finditer(r'<button\b[^>]*>.*?</button>', producers, re.DOTALL):
             button = ElementTree.fromstring(match.group())
@@ -2142,25 +2146,495 @@ window.fetch=async(_path,options={})=>{
 
     def test_saved_question_and_answer_appear_on_the_item_and_the_answer_is_unread(self) -> None:
         root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
         item = self.add("Inspect the List", number=106)
         fields = self.fields(item, "question", words="What changed in <List>?")
-        _ = list_page.submit(root, urlencode(fields))
-        opened = list_page.render(root).decode()
-        self.assertIn("Question Q1 — waiting for an answer", opened)
-        self.assertIn("What changed in &lt;List&gt;?", opened)
+        delivery = list_page.submit(root, urlencode(fields), status)
+        opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
+        self.assertIn('data-waiting-for-answer="true"', opened)
+        self.assertIn('<p data-waiting-note>The producer will answer.</p>', opened)
+        self.assertNotIn('value="question"', opened)
         self.assertNotIn('aria-label="Unread update"', opened)
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            list_page.deliver(delivery)
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
               redirect_stdout(io.StringIO())):
             self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
         _ = list_page.submit(root, urlencode(fields))
-        answered = list_page.render(root).decode()
-        self.assertNotIn("<h3>Question Q1 — waiting for an answer</h3>", answered)
-        self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", answered)
+        answered = list_page.render(root).decode().split('<script>', 1)[0]
+        self.assertIn('data-waiting-for-answer="false"', answered)
+        self.assertIn('value="question"', answered)
         self.assertIn('aria-label="Unread update"', answered)
         self.assertIn('value="read">Mark read</button>', answered)
         log = answered.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
         self.assertIn("Answered question Q1 <small>", log)
         self.assertIn("Marked read <small>", log)
+        self.assertIn("What changed in &lt;List&gt;?", log)
+        self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", log)
+
+    def test_another_question_keeps_the_failed_questions_resend_available(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Keep the first question available")
+
+        def ask(words: str) -> list_page.ListQuestionDelivery:
+            current = the_list.load(MORTY.id, item.id)
+            delivery = list_page.submit(root, urlencode(self.fields(current, "question", words=words)), status)
+            assert isinstance(delivery, list_page.ListQuestionDelivery)
+            return delivery
+
+        first = ask("Which check passed?")
+        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Producer offline")),
+              patch.object(change_page, "alert_delivery_failures")):
+            list_page.deliver(first)
+        second = ask("Which check is next?")
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            for pending in (True, False):
+                with self.subTest(second_pending=pending):
+                    if not pending:
+                        list_page.deliver(second)
+                        send.assert_called_once()
+                    self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
+                    markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
+                    self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+                    self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
+                    self.assertNotIn('value="resend-Q2"', markup)
+            current = the_list.load(MORTY.id, item.id)
+            retry = list_page.submit(root, urlencode(self.fields(current, "resend-Q1")), status)
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "true")
+            list_page.deliver(retry)
+            self.assertEqual(send.call_count, 2)
+        self.assertEqual(the_list.load(MORTY.id, item.id).questions, current.questions)
+
+    def test_recorded_question_failure_takes_priority_when_the_intent_clear_fails(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Keep the failed question available")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        _ = delivery.job.release()
+        failure = change_page.FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, "Producer offline")
+        saved: change_page.StoredReviewMessage = {"saved": True, "source": str(delivery.page.review_list),
+            "owner": MORTY.id, "message": delivery.message, "row": delivery.row}
+        intent = change_page.DeliveryIntent(delivery.attempt, "verdict", recipients=(MORTY.id,))
+        page = change_page.ReviewMessagePage(delivery.page.review_list, delivery.page.production,
+                                             delivery.page.rows, "", saved)
+        with status.locked():
+            status.write_slots(page, delivery.row, change_page.DeliverySlots(change_page.NoDelivery(), intent))
+            status.record_result_locked(delivery, failure)
+        reopened = change_page.DeliveryStatus(root)
+        self.assertEqual(reopened.slots(page, delivery.row).verdict, intent)
+        self.assertEqual(reopened.failed_delivery(page, delivery.row), failure)
+        markup = list_page.render(root, include_counts=False).decode().split('<script>', 1)[0]
+        self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+        self.assertIn('Question Q1 did not reach morty', markup)
+        self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
+
+        current = the_list.load(MORTY.id, item.id)
+        retry = list_page.submit(root, urlencode(self.fields(current, "resend-Q1")), reopened)
+        assert isinstance(retry, list_page.ListQuestionDelivery)
+        assert isinstance(retry.delivery, change_page.MessageDelivery)
+        self.assertNotEqual(retry.delivery.attempt, failure.attempt)
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["waiting_for_answer"], "true")
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            list_page.deliver(retry)
+        send.assert_called_once()
+        self.assertEqual(the_list.load(MORTY.id, item.id), current)
+
+    def test_question_result_write_failure_leaves_the_saved_question_available_for_resend(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        first_jobs: dict[str, the_list.ListItem] = {}
+        for number in (1, 2):
+            item = self.add(f"Recovery question {number}", number=number)
+            asked = list_page.submit(root, urlencode(self.fields(item, "question", words=f"Which check {number}?")), status)
+            assert isinstance(asked, list_page.ListQuestionDelivery)
+            delivery = asked.delivery
+            assert isinstance(delivery, change_page.PageQuestionSend)
+            assert isinstance(delivery.job, change_page.QuestionJob)
+            self.assertEqual(item.id, delivery.job.record.source.item_id)
+            first_jobs[delivery.job.record.message_id] = item
+            _ = delivery.job.release()
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+        recovering = change_page.DeliveryStatus(root)
+        transport = FakeQuestionTransport()
+        publish = change_page.publish_question_attempt
+        lost: list[str] = []
+
+        def fail_first_result(path: Path, record: delivery_state.QuestionAttempt) -> None:
+            if record.state is delivery_state.QuestionSendState.SENT and not lost:
+                lost.append(record.message_id)
+                raise OSError("Cannot save the result")
+            publish(path, record)
+
+        def send(recipient: staff.StaffId, message: str, message_id: str
+                 ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            if lost:
+                first = first_jobs[lost[0]]
+                self.assertEqual(list_page.saved_action_state(MORTY.id, first.id, status=recovering)["waiting_for_answer"], "false")
+                second = first_jobs[message_id]
+                self.assertEqual(list_page.saved_action_state(MORTY.id, second.id, status=recovering)["waiting_for_answer"], "true")
+                markup = list_page.render(root, include_counts=False, status=recovering).decode().split('<script>', 1)[0]
+                self.assertIn('Question Q1 may not have reached morty', markup)
+                self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root), status=recovering)), 1)
+            return transport.send(recipient, message, message_id)
+
+        with (patch.object(change_page, "publish_question_attempt", side_effect=fail_first_result),
+              patch.object(change_page, "send_question", side_effect=send)):
+            change_page.recover_review_messages(recovering)
+            change_page.recover_review_messages(change_page.DeliveryStatus(root))
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(len(transport.receipts), 2)
+
+    def test_accepted_question_has_no_resend_after_job_cleanup_fails(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("The accepted question")
+        fields = self.fields(item, "question", words="Which check passed?")
+        delivery = list_page.submit(root, urlencode(fields), status)
+        transport = FakeQuestionTransport()
+
+        with patch.object(change_page, "send_question", side_effect=transport.send):
+            with (patch.object(status.question_jobs, "discard", side_effect=OSError("Cannot clear the job.")),
+                  self.assertRaisesRegex(OSError, "Cannot clear the job.")):
+                list_page.deliver(delivery)
+            restarted = change_page.DeliveryStatus(root)
+            change_page.recover_review_messages(restarted)
+            list_page.deliver(list_page.submit(root, urlencode(fields), restarted))
+            current = the_list.load(MORTY.id, item.id)
+            list_page.deliver(list_page.submit(root, urlencode(self.fields(current, "resend-Q1")), restarted))
+        markup = list_page.render(root, include_counts=False).decode().split('<script>', 1)[0]
+        self.assertIn('data-waiting-for-answer="true"', markup)
+        self.assertNotIn('value="resend-Q1"', markup)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(len(transport.receipts), 1)
+
+    def test_resend_repairs_a_mismatch_after_the_previous_sender_finishes(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Repair the delivery")
+        words = "Which check passed?"
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        path = status.path(delivery.page, delivery.row)
+        saved = delivery.job.record
+        damaged = replace(saved, source=replace(saved.source, words="A different question."), recipient_id=OTHER.id,
+                          message="A different message.", resend_requests=("earlier-request",))
+        with status.locked():
+            change_page.advance_question_attempt(path, saved, damaged)
+        damaged = change_page.read_question_attempt(path)
+        current = the_list.load(MORTY.id, item.id)
+        fields = urlencode(self.fields(current, "resend-Q1", words="Ignore these words."))
+        active = "Resend is unavailable while the previous sender is active."
+        body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+        self.assertIn('data-waiting-for-answer="false"', body)
+        self.assertIn(active, body)
+        self.assertNotIn('value="resend-Q1"', body)
+        with patch.object(change_page, "send_question") as send:
+            with self.assertRaisesRegex(question_record.AnswerRefused, re.escape(active)):
+                list_page.deliver(list_page.submit(root, fields, status))
+            send.assert_not_called()
+        self.assertEqual(change_page.read_question_attempt(path), damaged)
+
+        receipt = delivery_state.QuestionSendReceipt("sent", "Receipt for the wrong question.")
+        with status.locked():
+            change_page.advance_question_attempt(path, damaged, replace(
+                damaged, state=delivery_state.QuestionSendState.SENT,
+                owner=delivery_state.NoQuestionSendOwner(), receipt=receipt))
+        _ = delivery.job.release()
+        previous = change_page.read_question_attempt(path)
+        body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+        self.assertIn('data-waiting-for-answer="false"', body)
+        self.assertIn('value="resend-Q1">Resend question Q1</button>', body)
+        message = (f'List item {item.number}: Ask question\n{item.title}\n{words}\n'
+                   + 'Answer with this command: ~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
+                   + f'answer {item.id} --question Q1 --text "<answer>"')
+        outcome = (send_result.UnconfirmedSendOutcome(), "No reply from transport.")
+        with patch.object(change_page, "send_question", return_value=outcome) as send:
+            for _ in range(2):
+                list_page.deliver(list_page.submit(root, fields, status))
+            send.assert_called_once_with(MORTY.id, message, saved.message_id)
+        repaired = change_page.read_question_attempt(path)
+        self.assertEqual(repaired.source, saved.source)
+        self.assertEqual(repaired.recipient_id, MORTY.id)
+        self.assertEqual(repaired.message, message)
+        self.assertNotEqual(repaired.attempt_id, previous.attempt_id)
+        self.assertGreater(repaired.revision, previous.revision)
+        self.assertIsInstance(repaired.owner, delivery_state.NoQuestionSendOwner)
+        self.assertIsInstance(repaired.receipt, delivery_state.NoQuestionSendReceipt)
+        self.assertTrue(repaired.earlier_unconfirmed)
+        self.assertEqual(repaired.resend_requests, ("earlier-request", parse_qs(fields)["request"][0]))
+        self.assertEqual(repaired.state, delivery_state.QuestionSendState.UNKNOWN)
+        with status.locked(), self.assertRaisesRegex(ValueError, "stale"):
+            change_page.advance_question_attempt(path, damaged, previous)
+        self.assertEqual(change_page.read_question_attempt(path), repaired)
+        self.assertEqual(the_list.load(MORTY.id, item.id), current)
+        with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The check passed."]), 0)
+        answer = the_list.load(MORTY.id, item.id).questions[0].answer
+        assert answer is not None
+        self.assertEqual(answer.text, "The check passed.")
+
+    def test_resend_uses_a_released_lock_when_the_previous_process_is_unreadable(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Check the previous sender")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check finished?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        claimed = delivery.job.record
+        assert isinstance(claimed.owner, delivery_state.QuestionSendOwner)
+        previous_owner = replace(claimed.owner, pid=claimed.owner.pid + 1)
+        path = status.path(delivery.page, delivery.row)
+        with status.locked():
+            change_page.advance_question_attempt(path, claimed, replace(
+                claimed, owner=previous_owner, state=delivery_state.QuestionSendState.SENDING))
+        fields = urlencode(self.fields(the_list.load(MORTY.id, item.id), "resend-Q1"))
+        process_identity = process_start.process_start
+
+        def read_identity(pid: int) -> process_start.ProcessStart:
+            if pid == previous_owner.pid:
+                return process_start.Unreadable("Cannot read the previous sender.")
+            return process_identity(pid)
+
+        blocked = "Resend is unavailable until the sender can be checked."
+        with (patch.object(process_start, "process_start", side_effect=read_identity) as identity,
+              patch.object(change_page, "send_question", return_value=question_outcome()) as send):
+            markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+            self.assertIn('data-waiting-for-answer="false"', markup)
+            self.assertIn(blocked, markup)
+            self.assertNotIn('value="resend-Q1"', markup)
+            with self.assertRaisesRegex(question_record.AnswerRefused, re.escape(blocked)):
+                list_page.deliver(list_page.submit(root, fields, status))
+            send.assert_not_called()
+            _ = delivery.job.release()
+            self.assertTrue(Path(cast(str, delivery.job.lock.name)).is_file())
+            identity.reset_mock()
+            markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+            self.assertNotIn(blocked, markup)
+            self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
+            identity.assert_not_called()
+            list_page.deliver(list_page.submit(root, fields, status))
+            list_page.deliver(list_page.submit(root, fields, status))
+            send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+
+    def test_a_title_edit_preserves_ready_sent_and_queued_questions(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        state = delivery_state.QuestionSendState
+        for number, previous_state in enumerate((state.READY, state.SENT, state.QUEUED), 1):
+            with self.subTest(state=previous_state):
+                item = self.add("Original title", number=number)
+                words = "Which check passed?\nWhat did you find?"
+                asked = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                delivery = asked.delivery
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                assert isinstance(delivery.job, change_page.QuestionJob)
+                claimed = delivery.job.record
+                path = status.path(delivery.page, delivery.row)
+                if previous_state is state.READY:
+                    with status.locked():
+                        change_page.advance_question_attempt(path, claimed, replace(
+                            claimed, state=state.READY, owner=delivery_state.NoQuestionSendOwner()))
+                    _ = delivery.job.release()
+                else:
+                    outcome = "queued" if previous_state is state.QUEUED else "sent"
+                    with patch.object(change_page, "send_question", return_value=question_outcome(outcome)):
+                        list_page.deliver(asked)
+
+                edited = the_list.update(MORTY.id, item.id, {"title": "New title"}, source="morty")
+                target = change_page.list_question_target(Path(claimed.source.path), edited.id, edited.number,
+                                                          edited.title, MORTY.id)
+                with status.locked(), self.subTest(check="state after edit"):
+                    view = change_page.question_delivery_view(status, target.saved(edited.questions[0]))
+                    self.assertEqual(view.state, previous_state)
+
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                    change_page.recover_review_messages(status)
+                    if previous_state is state.READY:
+                        send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+                    else:
+                        send.assert_not_called()
+                final_state = state.SENT if previous_state is state.READY else previous_state
+                self.assertEqual(change_page.read_question_attempt(path).state, final_state)
+                self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "true")
+                body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+                self.assertNotIn('value="resend-Q1"', body)
+
+    def test_recovery_and_list_reject_a_changed_question_message(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        state = delivery_state.QuestionSendState
+        cases = ((state.READY, False), (state.SENT, False), (state.QUEUED, False), (state.READY, True))
+        for number, (previous_state, changed_command) in enumerate(cases, 1):
+            with self.subTest(state=previous_state, changed_command=changed_command):
+                item = self.add("Check the saved question", number=number)
+                words = "Which check finished?"
+                asked = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
+                assert isinstance(asked, list_page.ListQuestionDelivery)
+                delivery = asked.delivery
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                assert isinstance(delivery.job, change_page.QuestionJob)
+                claimed = delivery.job.record
+                path = status.path(delivery.page, delivery.row)
+                receipt: delivery_state.NoQuestionSendReceipt | delivery_state.QuestionSendReceipt
+                if previous_state is state.READY:
+                    receipt = delivery_state.NoQuestionSendReceipt()
+                else:
+                    receipt = delivery_state.QuestionSendReceipt("queued" if previous_state is state.QUEUED else "sent", "")
+                wrong_message = (claimed.message.replace("--question Q1", "--question Q99") if changed_command
+                                 else claimed.message.replace(words, "A different question."))
+                with status.locked():
+                    change_page.advance_question_attempt(path, claimed, replace(
+                        claimed, state=previous_state, message=wrong_message,
+                        owner=delivery_state.NoQuestionSendOwner(), receipt=receipt))
+                _ = delivery.job.release()
+
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+                    change_page.recover_review_messages(status)
+                    send.assert_not_called()
+                    self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
+                    body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+                    self.assertIn('value="resend-Q1">Resend question Q1</button>', body)
+                    current = the_list.load(MORTY.id, item.id)
+                    fields = urlencode(self.fields(current, "resend-Q1"))
+                    for _ in range(2):
+                        list_page.deliver(list_page.submit(root, fields, status))
+                    send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+                self.assertEqual(the_list.load(MORTY.id, item.id), current)
+
+    def test_a_malformed_job_id_keeps_sender_exclusion_until_the_lock_releases(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Keep the sender lock")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check finished?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        lock_path = Path(cast(str, delivery.job.lock.name))
+        path = status.path(delivery.page, delivery.row)
+        claimed = delivery.job.record
+        current = the_list.load(MORTY.id, item.id)
+        fields = urlencode(self.fields(current, "resend-Q1"))
+        reopened = change_page.DeliveryStatus(root)
+        blocked = "Resend is unavailable while the previous sender is active."
+
+        def send_with_damage(_recipient: staff.StaffId, _message: str, _message_id: str
+                             ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            with status.locked():
+                sending = change_page.read_question_attempt(path)
+                assert isinstance(sending.owner, delivery_state.QuestionSendOwner)
+                change_page.publish_question_attempt(path, replace(sending, owner=replace(sending.owner, job_id="damaged")))
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["waiting_for_answer"], "false")
+            body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+            self.assertIn(blocked, body)
+            self.assertNotIn('value="resend-Q1"', body)
+            with self.assertRaisesRegex(question_record.AnswerRefused, re.escape(blocked)):
+                _ = list_page.submit(root, fields, reopened)
+            return question_outcome()
+
+        with patch.object(change_page, "send_question", side_effect=send_with_damage) as send:
+            list_page.deliver(asked)
+            send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+        with self.assertRaisesRegex(ValueError, "Invalid delivery field job_id"):
+            _ = change_page.read_question_attempt(path)
+        body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+        self.assertIn('value="resend-Q1">Resend question Q1</button>', body)
+        outcome = (send_result.UnconfirmedSendOutcome(), "No reply from transport.")
+        with patch.object(change_page, "send_question", return_value=outcome) as send:
+            retried = list_page.submit(root, fields, reopened)
+            assert isinstance(retried, list_page.ListQuestionDelivery)
+            assert isinstance(retried.delivery, change_page.PageQuestionSend)
+            assert isinstance(retried.delivery.job, change_page.QuestionJob)
+            self.assertEqual(Path(cast(str, retried.delivery.job.lock.name)), lock_path)
+            list_page.deliver(retried)
+            list_page.deliver(list_page.submit(root, fields, reopened))
+            send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
+        self.assertEqual(the_list.load(MORTY.id, item.id), current)
+
+    def test_mixed_question_results_keep_counts_and_unread_in_agreement(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("The item with four questions")
+        cases = (("Already answered?", question_outcome()), ("Sent to the owner?", question_outcome()),
+                 ("The owner refused?", question_outcome("refused", "The owner is offline.")),
+                 ("What happened?", (send_result.UnconfirmedSendOutcome(), "The response is missing.")))
+        for words, outcome in cases:
+            current = the_list.load(MORTY.id, item.id)
+            delivery = list_page.submit(root, urlencode(self.fields(current, "question", words=words)), status)
+            with (patch.object(change_page, "send_question", return_value=outcome),
+                  patch.object(change_page, "alert_delivery_failures")):
+                list_page.deliver(delivery)
+        with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The check passed."]), 0)
+        reopened = change_page.DeliveryStatus(root)
+        body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+        self.assertIn('data-waiting-for-answer="false"', body)
+        self.assertIn('aria-label="Unread update"', body)
+        self.assertIn("Question Q3 did not reach morty", body)
+        self.assertIn("Question Q4 may not have reached morty", body)
+        for identity in ("Q1", "Q2", "Q3", "Q4"):
+            self.assertEqual(f'value="resend-{identity}"' in body, identity in ("Q3", "Q4"))
+        self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root), status=reopened)), 1)
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["unread"], "true")
+        current = the_list.load(MORTY.id, item.id)
+        fields = self.fields(current, "resend-Q4")
+        with patch.object(change_page, "send_question", return_value=cases[-1][1]) as send:
+            for _ in range(2):
+                list_page.deliver(list_page.submit(root, urlencode(fields), reopened))
+            send.assert_called_once()
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_hides_a_saved_ask_from_all_views_and_counts(self) -> None:
+        _ = self.add("Only this row matches the search", the_list.ItemState.WAITING_FOR_NATE, number=1)
+        _ = self.add("Other item", number=2, owner=OTHER.id)
+        self.browser_action_sequence(r"""
+ const input=document.getElementById('list-search');
+ const count=document.querySelector('[data-list-count]');
+ const changes=[];
+ window.fetch=new Proxy(window.fetch,{apply(fetch,receiver,args){
+  changes.push(args[1]?.method || 'GET');return Reflect.apply(fetch,receiver,args);
+ }});
+ show('all');
+ form.elements.words.value='Which check passed?';
+ submit('question');
+ check(!row.hidden,'The row stays in All until the save succeeds');
+ finishPost({unread:'false',waiting_for_answer:'true'});await flush();
+ check(row.hidden,'The saved row leaves All');
+ check(changes.join()==='POST','The row leaves without a refresh');
+ check(count.textContent==='1 of 1 items shown · 0 need you · 1 unread','All totals exclude the saved row');
+ const chip=(group,value)=>[...document.querySelectorAll('[data-filter-row="'+group+'"] button')]
+  .find(button=>button.dataset.filterValue===value);
+ for(const [group,value] of [['show','needs-me'],['state','Waiting for nate'],['owner',row.dataset.owner]])
+  check(chip(group,value).dataset.filterCount==='0',group+' excludes the saved row');
+ check(chip('producer',row.dataset.producer).dataset.filterCount==='1','Producer excludes the saved row');
+ for(const view of ['open','needs-me','unread','done','parked','closed','all']){
+  show(view);check(row.hidden,view+' hides the saved row');
+ }
+ const target=location.pathname+'#item='+encodeURIComponent(row.dataset.key);
+ location.hash=target.slice(target.indexOf('#'));
+ await flush();
+ check(!row.hidden && !row.querySelector('[data-detail]').hidden &&
+  row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
+  !row.querySelector('[value="question"]'),'A direct link opens only the waiting row without Ask');
+ check(count.textContent.startsWith('1 of 1'),'Direct links do not count the waiting row');
+ input.value='Only this row';input.dispatchEvent(new Event('input'));
+ await new Promise(resolve=>setTimeout(resolve,150));
+ check(row.hidden && count.textContent.startsWith('0 of 1'),'Search excludes the waiting row');
+""", reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_open_row_and_shows_the_refusal_after_a_lost_remove(self) -> None:
@@ -2353,12 +2827,238 @@ window.fetch=async(_path,options={})=>{
  form.elements.words.dispatchEvent(new Event('input'));
  submit('question');
  check(row.hidden,'Ask question starts the fade before the response in Unread');
- finishPost({unread:'false'});await flush();
+ finishPost({unread:'false',waiting_for_answer:'true'});await flush();
  check(row.hidden && row.dataset.unread==='false','the saved question keeps the row outside Unread');
  show('open');
- check(!row.hidden && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
-  'the same row in Open has no unread controls');
+ check(row.hidden && row.dataset.unread==='false' && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
+  'the saved question also keeps the row outside Open with unread cleared');
 """)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_moves_question_focus_only_when_the_submitted_row_had_focus(self) -> None:
+        _ = self.add("The question item", number=1)
+        _ = self.add("The next item", number=2, owner=OTHER.id)
+        for destination in ("next row", "empty view", "user selection"):
+            with self.subTest(destination=destination):
+                self.browser_action_sequence("const destination=" + json.dumps(destination) + r""";
+ const search=document.getElementById('list-search');
+ const next=document.querySelector('[data-number="2"] .list-toggle');
+ const all=document.querySelector('[data-filter-row="show"] [data-filter-value="all"]');
+ if(destination==='empty view'){
+  search.value='The question item';
+  search.dispatchEvent(new CustomEvent('filterchange',{detail:search.value}));
+ }
+ const input=form.elements.words;
+ input.value='Which check passed?';input.dispatchEvent(new Event('input'));
+ form.querySelector('[value="question"]').focus();
+ submit('question');
+ if(destination==='user selection') all.focus();
+ finishPost({unread:'false',waiting_for_answer:'true'});await flush();
+ const expected=destination==='next row' ? next : destination==='empty view' ? search : all;
+ check(document.activeElement===expected,'The browser keeps focus at '+destination);
+""", add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_related_link_reveals_waiting_item_without_changing_filters(self) -> None:
+        first = self.add("Check the current result", number=1)
+        target = self.add("Check the later result", number=2)
+        _ = the_list.update(MORTY.id, first.id, {"related_to": (target.number,)}, source="nate")
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        delivery = the_list.ask_question(MORTY.id, target.id, the_list.PageRequest("ask", "question", "What passed?"), status)
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            change_page.deliver(delivery, status)
+        self.browser_action_sequence(r"""
+ const search=document.getElementById('list-search');
+ const target=document.querySelector('[data-number="2"]');
+ const owner=[...document.querySelectorAll('[data-filter-row="owner"] button')]
+  .find(button=>button.dataset.filterValue===row.dataset.owner);
+ owner.click();
+ search.value='check';search.dispatchEvent(new CustomEvent('filterchange',{detail:search.value}));
+ check(target.hidden,'The waiting item stays out of Open');
+ row.querySelector('a[data-record-jump]').click();
+ const place=new URLSearchParams(location.hash.slice(1));
+ check(!target.hidden && !target.querySelector('[data-detail]').hidden,'The related link reveals its waiting item');
+ check(place.get('show')==='open' && place.get('owner')===row.dataset.owner && search.value==='check',
+  'The related link keeps Show, Owner and the search');
+ check(document.querySelector('[data-list-count]').textContent.startsWith('1 of 1'),
+  'The linked waiting row stays outside the totals');
+""", add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_restores_ask_focus_after_a_failed_post(self) -> None:
+        self.browser_action_sequence(r"""
+ show('unread');
+ const ask=form.querySelector('[value="question"]'),input=form.elements.words;
+ input.value='Which check passed?';input.dispatchEvent(new Event('input'));
+ ask.focus();
+ submit('question');
+ check(row.hidden,'The row leaves Unread during the request');
+ ask.blur();
+ check(document.activeElement===document.body,'The browser has no focused control while Ask is disabled');
+ losePost();await flush();
+ check(!row.hidden && !ask.disabled && document.activeElement===ask,'The restored Ask button has focus');
+ submit('question');
+ const search=document.getElementById('list-search');
+ search.focus();
+ finishPost({reason:'The POST was refused'});await flush();
+ check(document.activeElement===search,'A failed request preserves the focus the user chose');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_restores_ask_focus_after_the_unread_row_finishes_its_animation(self) -> None:
+        _ = self.add("Restore the unread row", number=1)
+        for user_selects_search in (False, True):
+            with self.subTest(user_selects_search=user_selects_search):
+                self.browser_action_sequence(r"""
+ show('unread');
+ const ask=form.querySelector('[value="question"]'),input=form.elements.words;
+ input.value='Which check passed?';input.dispatchEvent(new Event('input'));
+ ask.focus();
+ submit('question');
+ ask.blur();
+ losePost();await flush();
+ const spacer=document.querySelector('[data-record-motion]');
+ const animation=spacer?.getAnimations({subtree:true})[0];
+ check(animation && getComputedStyle(row).display==='none','The row is still hidden by the animation');
+ if(!animation) throw new Error('The restored row must animate.');
+ const search=document.getElementById('list-search');
+ if(USER_SELECTS_SEARCH) search.focus();
+ animation.finish();await flush();
+ check(!row.hidden && !ask.disabled,'The row and Ask button are available');
+ check(document.activeElement===(USER_SELECTS_SEARCH ? search : ask),'Focus returns only if the user did not move it');
+""".replace('USER_SELECTS_SEARCH', json.dumps(user_selects_search)), add_item=False)
+
+    def add_item_with_failed_question(self) -> the_list.ListItem:
+        root = self.root / "reviews"
+        item = self.add("Keep the row with a failed question", number=1)
+        delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check failed?")))
+        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Producer offline")),
+              patch.object(change_page, "alert_delivery_failures")):
+            list_page.deliver(delivery)
+        return the_list.load(MORTY.id, item.id)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_keeps_row_focus_through_refresh_when_an_older_question_needs_resend(self) -> None:
+        _ = self.add_item_with_failed_question()
+        self.browser_action_sequence(r"""
+ const ask=form.querySelector('[value="question"]'),input=form.elements.words;
+ check(Boolean(form.querySelector('[value="resend-Q1"]')),'The older question needs a resend');
+ refreshMarkup=document.documentElement.outerHTML;
+ input.value='Which check is next?';input.dispatchEvent(new Event('input'));
+ ask.focus();
+ submit('question');
+ ask.blur();
+ finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const refreshed=document.querySelector('[data-number="1"]');
+ check(refreshed!==row && !refreshed.hidden,'The refresh keeps the row visible');
+ check(document.activeElement===refreshed.querySelector('.list-toggle'),'The row toggle keeps focus through refresh');
+""", reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_moves_focus_when_a_mixed_question_save_removes_the_row_from_unread(self) -> None:
+        item = self.add_item_with_failed_question()
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+        _ = self.add("The next unread item", number=2)
+        self.browser_action_sequence(r"""
+ show('unread');
+ check(!row.hidden && form.querySelector('[value="resend-Q1"]'),'Unread shows the item with a failed question');
+ const snapshot=document.documentElement.cloneNode(true);
+ snapshot.querySelector('[data-number="1"]').dataset.unread='false';
+ refreshMarkup=snapshot.outerHTML;
+ const ask=form.querySelector('[value="question"]'),input=form.elements.words;
+ input.value='Which check is next?';input.dispatchEvent(new Event('input'));
+ ask.focus();
+ submit('question');
+ ask.blur();
+ finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const refreshed=document.querySelector('[data-number="1"]');
+ check(refreshed!==row && refreshed.hidden,'The item leaves Unread and the List refreshes');
+ check(document.activeElement===document.querySelector('[data-number="2"] .list-toggle'),
+  'Focus moves to the next unread item and stays there through refresh');
+""", reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_restores_the_selected_action_on_another_item_after_refresh(self) -> None:
+        _ = self.add_item_with_failed_question()
+        _ = self.add("The next open item", number=2)
+        self.browser_action_sequence(r"""
+ const other=document.querySelector('[data-number="2"]');
+ other.querySelector('.list-toggle').click();
+ const remove=other.querySelector('button[value="remove"]');
+ refreshMarkup=document.documentElement.outerHTML;
+ const ask=form.querySelector('[value="question"]'),input=form.elements.words;
+ input.value='Which check is next?';input.dispatchEvent(new Event('input'));
+ ask.focus();
+ submit('question');
+ remove.focus();
+ check(document.activeElement===remove,'The user selects Remove on the other item during the request');
+ finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const refreshed=document.querySelector('[data-number="2"]');
+ check(refreshed!==other && !refreshed.hidden,'The List refreshes the other item');
+ check(document.activeElement===refreshed.querySelector('button[value="remove"]'),
+  'Remove on the same item keeps focus through refresh');
+""", reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_restores_the_column_sort_focus_after_refresh(self) -> None:
+        _ = self.add_item_with_failed_question()
+        self.browser_action_sequence(r"""
+ const sort=document.querySelector('[data-sort="3"]');
+ refreshMarkup=document.documentElement.outerHTML;
+ form.elements.words.value='Which check is next?';form.elements.words.dispatchEvent(new Event('input'));
+ form.querySelector('[value="question"]').focus();
+ submit('question');
+ sort.focus();
+ finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const renewed=document.querySelector('[data-sort="3"]');
+ check(renewed!==sort,'The List replaces the sort button during refresh');
+ check(document.activeElement===renewed,'The selected column sort keeps focus');
+""", reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_skips_a_row_that_is_still_in_its_return_animation(self) -> None:
+        _ = self.add("The first unread item", number=1)
+        _ = self.add("The second unread item", number=2)
+        self.browser_action_sequence(r"""
+ show('unread');
+ const second=document.querySelector('[data-number="2"]');
+ second.querySelector('.list-toggle').click();
+ function ask(target){
+  target.elements.words.value='Which check passed?';target.elements.words.dispatchEvent(new Event('input'));
+  target.querySelector('[value="question"]').focus();
+  submit('question',target);
+ }
+ ask(form);
+ const failFirst=finishPost;
+ ask(second.querySelector('form'));
+ failFirst({reason:'The save failed'});await flush();
+ const returning=row.nextElementSibling.getAnimations({subtree:true})[0];
+ check(!row.hidden && !row.querySelector('.list-toggle').getClientRects().length,
+  'The first row returns but its animation still hides its toggle');
+ returning.pause();
+ finishPost({unread:'false',waiting_for_answer:'true'});await flush();
+ check(document.activeElement===document.getElementById('list-search'),
+  'Search receives focus because neither row has an available toggle');
+ returning.finish();
+""", add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_question_response_preserves_focus_in_the_parent_console(self) -> None:
+        _ = self.add("The question item", number=1)
+        _ = self.add("The next item", number=2, owner=OTHER.id)
+        self.browser_action_sequence(r"""
+ const ask=form.querySelector('[value="question"]'),input=form.elements.words;
+ const nav=parent.document.getElementById('console-nav');
+ input.value='Which check passed?';input.dispatchEvent(new Event('input'));
+ ask.focus();
+ check(document.hasFocus() && document.activeElement===ask,'Ask starts with focus in the List frame');
+ submit('question');
+ nav.focus();
+ check(!document.hasFocus() && parent.document.activeElement===nav,'The user focuses the console during the request');
+ finishPost({unread:'false',waiting_for_answer:'true'});await flush();
+ check(row.hidden,'The successful POST hides the row');
+ check(parent.document.activeElement===nav,'The response preserves the console focus');
+""", add_item=False, reduced_motion=True, in_frame=True)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
@@ -2369,9 +3069,9 @@ window.fetch=async(_path,options={})=>{
         probe = b"""<!doctype html><iframe></iframe><img hidden src="/complete"><script>
 const frame=document.querySelector('iframe'), errors=[];
 const check=(ok,message)=>{if(!ok) errors.push(message);};
-const open=show=>new Promise(resolve=>{
+const open=(show,key='')=>new Promise(resolve=>{
  frame.onload=resolve;
- frame.src='LIST_PATH?fixture='+show+'#show='+show;
+ frame.src='LIST_PATH?fixture='+show+'#'+new URLSearchParams({show,...(key ? {item:key} : {})});
 });
 const row=()=>frame.contentDocument.querySelector('[data-list-item]');
 const hasDot=()=>Boolean(row().querySelector('.list-dot'));
@@ -2405,16 +3105,22 @@ const change=async path=>{
   check(!row().hidden && hasDot(),'the item starts in Unread');
   check(await ask('Which check passed?')==='Question saved','the first question saves');
   check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
+  const key=row().dataset.key;
   await open('open');
-  check(row().textContent.includes('Which check passed?'),'the saved question appears in the row');
+  check(row().hidden,'a saved question stays out of Open after a page load');
+  await open('all',key);
+  check(!row().hidden && !row().querySelector('[data-detail]').hidden &&
+   row().querySelector('[data-waiting-note]')?.textContent==='The producer will answer.' &&
+   !row().querySelector('[value="question"]'),'a direct link shows the waiting line without Ask');
+  await change('/answer');
+  await open('unread');
+  check(!row().hidden && hasDot() && row().querySelector('.list-log').textContent.includes('Which check passed?') &&
+   row().querySelector('.list-log').textContent.includes('The gate passed.'),
+   'the answer returns the item to Unread with the question and answer in the log');
   await change('/newer');
   check(await ask('Which check is next?')==='Question saved; update remains unread',
    'the notice says the newer update remains unread');
-  check(hasDot() && row().querySelector('[value="read"]'),'the newer update shows both unread controls');
-  await change('/answer');
-  await open('unread');
-  check(!row().hidden && hasDot() && row().textContent.includes('The gate passed.'),
-   'the answer appears and the item returns to Unread');
+  check(hasDot() && row().hidden,'the newer update stays unread while the question hides the row');
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
@@ -2451,7 +3157,7 @@ const change=async path=>{
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session),
-              patch.object(change_page, "send_to_staff"),
+              patch.object(change_page, "send_question", return_value=question_outcome()),
               serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
@@ -2468,16 +3174,20 @@ const change=async path=>{
                 server.shutdown()
                 thread.join()
 
-    def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True) -> None:
+    def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
+                                in_frame: bool = False) -> None:
         if add_item:
             _ = self.add("Test List action retries", number=1)
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         setup = '''<script>
-const requests=[];let finishPost,losePost;
+const requests=[];let finishPost,losePost,refreshMarkup;
 window.fetch=async(_path,options={})=>{
- if(options.method!=='POST') throw new Error('Fixture refresh refused');
+ if(options.method!=='POST'){
+  if(refreshMarkup===undefined) throw new Error('Fixture refresh refused');
+  return {ok:true,text:async()=>refreshMarkup};
+ }
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
@@ -2503,19 +3213,25 @@ window.fetch=async(_path,options={})=>{
   row.querySelector('.list-toggle').click();
 ''' + steps + '''
  }catch(error){failures.push(String(error));}
- const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+ const result=parent.document.createElement('p');result.id='probe-results';
+ result.textContent=JSON.stringify(failures);parent.document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion)
+        self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion, in_frame=in_frame)
 
     def browser_actions(self, markup: str, setup: str, probe: str, *,
                         reduced_motion: bool = False, virtual_time_ms: int = 1500,
-                        window_size: tuple[int, int] | None = None) -> None:
+                        window_size: tuple[int, int] | None = None, in_frame: bool = False) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
+        if in_frame:
+            page = self.root / 'actions-console.html'
+            _ = page.write_text('<!doctype html><button id="console-nav">Console navigation</button>'
+                                + '<iframe title="The List" src="actions.html"></iframe>')
         result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
             *(['--force-prefers-reduced-motion'] if reduced_motion else []),
             *([f'--window-size={window_size[0]},{window_size[1]}'] if window_size else []),
+            *(['--allow-file-access-from-files'] if in_frame else []),
             '--user-data-dir=' + str(self.root / 'chrome-actions'), f'--virtual-time-budget={virtual_time_ms}',
             '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2943,14 +3659,42 @@ const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [d
 const select=(name,value)=>chip(name,value).click();
 const selectedChip=name=>document.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
 const count=(name,value)=>Number(chip(name,value).querySelector('b').textContent);
+const bulk=action=>document.querySelector('.list-table-tools [data-list-expansion="'+action+'"]');
 const search=value=>new Promise(done=>{
  const field=document.getElementById('list-search');
  field.addEventListener('filterchange',done,{once:true});field.value=value;field.dispatchEvent(new Event('input'));
 });
 try{
  await flush();
+ const tools=document.querySelector('.list-table-tools'),table=tools.nextElementSibling;
+ const countLine=tools.querySelector('[data-list-count]');
+ const bounds=element=>element.getBoundingClientRect();
+ const center=rect=>(rect.top+rect.bottom)/2;
+ const near=(a,b)=>Math.abs(a-b)<1;
+ const expand=bounds(bulk('expand')),collapse=bounds(bulk('collapse')),shown=bounds(countLine);
+ check(table.matches('.list-table') && bounds(tools).bottom<=bounds(table).top,
+       'The controls and count sit directly above the table.');
+ check(near(expand.left,bounds(table).left) && near(shown.right,bounds(table).right) &&
+       near(center(expand),center(collapse)) && near(center(expand),center(shown)) && expand.right<collapse.left,
+       'The two buttons and the right-aligned count share one row.');
+ check(countLine.textContent.startsWith('3 of 6 items shown') && countLine.getAttribute('role')==='status',
+       'The count in the row reports the visible items.');
+ for(const action of ['expand','collapse']){
+  const button=bulk(action),box=bounds(button),icon=bounds(button.querySelector('svg'));
+  const minimum=innerWidth<960 ? 32 : 24;
+  check(box.width>=minimum && box.height>=minimum && box.width<36 && box.height<36 &&
+        icon.width>=16 && icon.height>=16 && icon.left>box.left && icon.right<box.right &&
+        icon.top>box.top && icon.bottom<box.bottom,'The small button fits its icon and has a hit area.');
+  const hit=document.elementFromPoint(box.left+3,center(box));
+  check(button.contains(hit),'The button accepts a click near its edge.');
+ }
+ check(expand.left>=0 && shown.right<=innerWidth && collapse.right<shown.left &&
+       document.documentElement.scrollWidth<=innerWidth,'The row fits without clipping or horizontal overflow.');
  if(innerWidth>=960){
-  check(document.querySelector('main').getBoundingClientRect().width===1124,'the desktop uses the shared column width');
+  check(bounds(document.querySelector('main')).width===Math.min(1124,document.documentElement.clientWidth),
+        'The desktop uses the available width up to the shared limit.');
+  check(collapse.right<=bounds(document.querySelector('[data-sort="0"]').closest('th')).right,
+        'Both buttons sit above the number column.');
   for(const header of document.querySelectorAll('[data-sort]')){
    const label=document.createRange();label.selectNodeContents(header.firstChild);
    check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
@@ -3073,10 +3817,10 @@ try{
  check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
  check(refreshed!==selected,'refresh replaces the row');
- document.querySelector('[aria-label="Expand all"]').click();
+ bulk('expand').click();
  check(visible().length===2 && visible().every(row=>!row.querySelector('[data-detail]').hidden),
   'Expand all opens both matching rows after refresh');
- document.querySelector('[aria-label="Collapse all"]').click();
+ bulk('collapse').click();
  check(visible().length===2 && visible().every(row=>row.querySelector('[data-detail]').hidden),
   'Collapse all closes both matching rows after refresh');
  refreshed.querySelector('.list-toggle').click();
@@ -3161,7 +3905,7 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
 })();</script>'''
         for name, identity in (("OWNER", OWNER.id), ("DWIGHT", DWIGHT.id), ("MORTY", MORTY.id)):
             probe = probe.replace(name, json.dumps(identity))
-        for width in (1440, 390):
+        for width in (1440, 961, 390):
             with self.subTest(width=width):
                 for identity in ("L105", "L106"):
                     _ = the_list.update(MORTY.id, identity,

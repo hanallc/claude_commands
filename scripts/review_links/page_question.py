@@ -2,15 +2,12 @@
 from __future__ import annotations
 
 import html
-import json
 import secrets
-import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Protocol, cast
+from typing import Protocol
 
-from scripts.production import staff
+from scripts.production.delivery_state import QuestionAttempt, QuestionSendState
 from scripts.review_links import change_page, question_record
 
 
@@ -34,69 +31,66 @@ class QuestionStore(Protocol):
         ...
 
 
-def ask(store: QuestionStore, item: str, owner: staff.StaffId, source_path: Path, row: str, title: str,
-        words: str, answer_command: str, status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
-    """Save and claim without sending. The caller delivers after it answers the browser.
-
-    Row names the page and item. The command has {item} and {question_id} fields.
-    Equal words retry an open question if its send failed or remains unconfirmed.
-    Different words create another question.
-    """
-    words = words.strip()
-    if not words:
-        raise question_record.AnswerRefused('Enter a question first.')
+def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
+        words: str, status: change_page.DeliveryStatus, *,
+        resend_unknown: bool = False, resend_request: str = "") -> change_page.MessageDelivery:
+    """Save and claim the question before the server answers the browser."""
+    if not resend_request:
+        words = words.strip()
+    if not words.strip():
+        raise question_record.AnswerRefused("Enter a question first.")
     with status.locked():
+        item = target.item
         questions = store.questions(item)
         question = next((question for question in questions
                          if question.answer is None and question.words == words), None)
         new_question = question is None
         if question is None:
+            if resend_request:
+                raise question_record.AnswerRefused("This item has no open question with that id.")
             number = max((int(question.question_id[1:]) for question in questions), default=0) + 1
-            question = question_record.Question(f'Q{number}', datetime.now(UTC).isoformat(), words)
-        command = answer_command.format(item=shlex.quote(item), question_id=question.question_id)
-        message = f'{row}: Ask question\n{title}\n{words}\nAnswer with this command: {command}'
-        delivery_row = f'{row}/{question.question_id}'
-        saved: change_page.StoredReviewMessage = {'saved': not new_question, 'source': str(source_path),
-            'owner': owner, 'message': message, 'row': delivery_row}
-        page = change_page.ReviewMessagePage(source_path, source_path.parent, (delivery_row,), '', saved)
-        slots = status.slots(page, delivery_row)
-        intent = slots.verdict
-        if isinstance(intent, change_page.DeliveryIntent) and status.owns_live_attempt(page, delivery_row, intent):
-            return change_page.MessageDelivery(page, delivery_row, (owner,), message, intent.attempt, (owner,))
-        attempt = secrets.token_hex()
-        delivery = change_page.MessageDelivery(page, delivery_row, (owner,), message, attempt, (owner,))
-        if not new_question:
-            dispatch = status.image_question_dispatch(page, delivery_row)
-            if not isinstance(dispatch, change_page.NoImageQuestionDispatch):
-                if dispatch['state'] == 'accepted' or status.owns_live_claim(page, delivery_row, dispatch['attempt']):
-                    return delivery
-                # Keep the earlier send mark until the new attempt starts.
-                saved['image_question_dispatch'] = dispatch
-            elif not isinstance(intent, change_page.DeliveryIntent):
-                previous: change_page.StoredDeliverySlots
-                try:
-                    previous = cast(change_page.StoredDeliverySlots, json.loads(status.path(page, delivery_row).read_text()))
-                except FileNotFoundError:
-                    previous = {}
-                prior_message = previous.get('review_message')
-                if (prior_message is not None and prior_message['saved']
-                        and isinstance(status.failed_delivery(page, delivery_row), change_page.NoFailedDelivery)):
-                    return delivery
-        intent = change_page.DeliveryIntent(attempt, 'verdict', recipients=(owner,))
-        status.write_slots(page, delivery_row, change_page.DeliverySlots(change_page.NoDelivery(), intent))
-        status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, delivery_row), 'claimed')
+            question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words)
+        saved = target.saved(question)
+        page = saved.page()
+        path = status.path(page, saved.source.row)
+        requests = (resend_request,) if resend_request else ()
+        prepared = QuestionAttempt(saved.source, saved.recipient, saved.message, 1, QuestionSendState.PREPARED,
+                                   secrets.token_hex(32), resend_requests=requests)
+        view = change_page.question_delivery_view(status, saved)
+        previous = view.attempt
+        record = previous if isinstance(previous, QuestionAttempt) else prepared
+        repeated_resend = isinstance(previous, QuestionAttempt) and resend_request in previous.resend_requests
+        if repeated_resend and view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN):
+            return change_page.question_envelope(page, record)
+        if isinstance(view, change_page.ResendBlocked):
+            if view.state is QuestionSendState.UNKNOWN and (resend_request or new_question):
+                raise question_record.AnswerRefused(view.reason)
+            return change_page.question_envelope(page, record)
+        if isinstance(view, change_page.QuestionDeliveryAccepted):
+            return change_page.question_envelope(page, record)
+        if not new_question and view.state is QuestionSendState.UNKNOWN and not resend_unknown:
+            return change_page.question_envelope(page, record)
+        if isinstance(previous, QuestionAttempt):
+            unsaved_draft = (new_question and previous.state is QuestionSendState.PREPARED
+                             and not previous.earlier_unconfirmed and previous.message_id == prepared.message_id)
+            if new_question and not unsaved_draft and not saved.matches(previous):
+                raise question_record.AnswerRefused("The question does not match its delivery record.")
+            if unsaved_draft or view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN) or (
+                    resend_request and not repeated_resend):
+                retry = replace(prepared, revision=record.revision + 1,
+                                earlier_unconfirmed=record.earlier_unconfirmed or (
+                                    not unsaved_draft and view.state is QuestionSendState.UNKNOWN),
+                                resend_requests=(*record.resend_requests, *requests))
+                change_page.advance_question_attempt(path, record, retry)
+                record = retry
+        else:
+            record = replace(prepared, earlier_unconfirmed=not new_question and view.state is QuestionSendState.UNKNOWN)
+            change_page.publish_question_attempt(path, record)
         if new_question:
-            try:
-                store.add(item, question)
-                saved['saved'] = True
-                status.write_slots(page, delivery_row, status.slots(page, delivery_row))
-            except BaseException:
-                _ = status.request_attempts.pop(attempt, None)
-                # Keep the question eligible for a retry after cleanup removes its intent.
-                saved['saved'] = False
-                status.clear_locked(page, delivery_row, status.slots(page, delivery_row), 'verdict')
-                raise
-    return delivery
+            store.add(item, question)
+            if question not in store.questions(item):
+                raise question_record.AnswerRefused("The saved question does not match this delivery.")
+        return change_page.claim_question(status, change_page.ready_question(path, record, saved))
 
 
 def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answered | AnswerRefused:
