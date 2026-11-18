@@ -40,19 +40,17 @@ Stored references keep the staff id and resolve current staff facts when used.
 
 ## Producer rows and commands
 
-Each producer runs its own named job.
-The producer kind supplies shared management.
-Each producer keeps its own role contract.
+Each producer loads the common command and reads its job and current work from its README.
 
 | Staff name | Kind | Command | Job contract |
 |---|---|---|---|
-| `morty` | `producer` | `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
-| `brain` | `producer` | `/producer:brain` | Its command defines management only. |
-| `dwight` | `producer` | `/producer:dwight` | Strategist; its command defines management only. |
+| `morty` | `producer` | `/producer:produce`, then `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
+| `brain` | `producer` | `/producer:produce` | Manages the user's personal notes and task list. |
+| `dwight` | `producer` | `/producer:produce` | Manages its assigned productions. |
 
 The commands live in `commands/producer/`.
 Morty's operations document is `docs/producer/morty-operations.md`.
-The Codex command sync names Morty's skill `producer-morty`.
+The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
