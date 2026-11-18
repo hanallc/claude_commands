@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import hana_provider, hana_transport
-from scripts.aws_target.aws_cli import AwsCli
+from scripts.aws_target.aws_cli import AwsCli, AwsUnavailable
 from scripts.lib import conf
 from scripts.lib.build_slots_test_support import private_slot_config
 
@@ -55,7 +55,18 @@ class HanaTransportPolicyTests(unittest.TestCase):
                 self.assertEqual(objects['source/fixture-deployment/' + digest], b'fixture bundle')
                 url = transport.signed_get(digest)
                 self.assertIn('/source/fixture-deployment/' + digest, url)
-                self.assertTrue(all(timeout == configuration.whole('aws_timeout_s') for _, timeout in calls))
+                self.assertNotEqual(configuration.whole('source_upload_timeout_s'), configuration.whole('aws_timeout_s'))
+                self.assertTrue(all(timeout == configuration.whole(
+                    'source_upload_timeout_s' if operation == 'put-object' else 'aws_timeout_s')
+                    for operation, timeout in calls))
+                def stalled(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                            check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    _ = capture_output, text, check, env
+                    raise subprocess.TimeoutExpired(list(arguments), timeout)
+                provider.api.execute = stalled
+                with self.assertRaisesRegex(AwsUnavailable, 'did not upload in .* s .source_upload_timeout_s.'):
+                    transport.put_if_absent('b' * 64, payload)
+                provider.api.execute = execute
                 actions = {hana_provider.PROVIDER_OPERATIONS[operation] for operation, _ in calls
                            if operation != 'export-credentials'}
                 actions.add(hana_provider.PROVIDER_OPERATIONS['get-object'])
