@@ -1059,7 +1059,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `commands/recall.md` says park only hides the item until morty unparks it, and `/recall` never changes the work, its owner or its timing. On main 3515c9470 (hash 1d074db29).
 
-### Phase 70 — A worker with an unknown run state does not break the census  · status: todo
+### Phase 70 — A worker with an unknown run state does not break the census  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1079,6 +1079,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. The new census row fails on main. The writer has a test that fails on main.
 2. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** a worker whose run state cannot be read shows as unknown, and the census goes on. `detached_runs.py` stops a run only after it verifies the process group again; the hold enforcer and the supervisor use the same check. On main f4663d63b (hash 609e4bdca).
 
 ### Phase 71 — Producer docs name the live accounts and models  · status: done
 **Depends on:** none
@@ -1123,7 +1125,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `commands/producer/produce.md` is the one producer command; each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`. The brain and dwight skills are gone; brain has its README; dwight rewrites its own. On main 78de4e3ec (hash 3c7a8d4ad).
 
-### Phase 73 — A change row can be withdrawn  · status: todo
+### Phase 73 — A change row can be withdrawn  · status: done
 **Depends on:** phase 72 (queue order).
 
 #### Work Order
@@ -1141,6 +1143,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** `change_review.py` withdraws an open or reviewed row and keeps the user's words and the time in the row history. The `list-ready` revert scan is gone. On main 716ca5f73 (hash 03a78d761).
 
 ### Phase 74 — A unit's worktree repo selects its merge repo  · status: todo
 **Depends on:** none
