@@ -325,7 +325,7 @@ class HanaGuestEndedWithoutResult(HanaSettled):
 
 @dataclass(frozen=True)
 class HanaAdmissionRefusalSettled(HanaSettled):
-    """The guest confirmed that the command did not start."""
+    """The admission check confirmed that the command did not start."""
     outcome: placement.HanaCommandAdmissionRefused
     evidence: placement.ExecutionNotStarted
 
@@ -453,7 +453,8 @@ def _journal_attempt(row: dict[str, object]) -> tuple[str, str]:
 
 
 def settle_unpublished_claim(directory: Path, reference: placement.ProviderClaimReference, *,
-                             release_claim: Callable[[], bool], reason: str, cancelled: bool = False) -> HanaSettlement:
+                             release_claim: Callable[[], bool], reason: str | placement.HanaCommandAdmissionRefused,
+                             cancelled: bool = False) -> HanaSettlement:
     """Close a claim that never created an executable request without inventing a boot identity."""
     execution = reference.claim_id
     try:
@@ -463,11 +464,16 @@ def settle_unpublished_claim(directory: Path, reference: placement.ProviderClaim
                 if row.get('kind') != 'unpublished' or _journal_attempt(row) != (reference.episode, reference.attempt):
                     return HanaSettlementPending('The Hana attempt already has a command dispatch')
             else:
+                refusal = isinstance(reason, placement.HanaCommandAdmissionRefused) and not cancelled
+                kind = 'hana_command_admission_refused' if refusal else 'cancelled' if cancelled else 'prelaunch'
+                detail = reason if isinstance(reason, str) else reason.reason
                 row: dict[str, object] = {'version': 1, 'kind': 'unpublished', 'claim_id': execution,
-                    'episode': reference.episode, 'attempt': reference.attempt, 'phase': 'fenced',
+                    'episode': reference.episode, 'attempt': reference.attempt, 'phase': 'settled' if refusal else 'fenced',
                     'evidence': _evidence_fields(placement.ExecutionNotStarted()), 'publication_attempted': False,
-                    'command_settled': True, 'outcome': {'kind': 'cancelled' if cancelled else 'prelaunch', 'reason': reason}}
+                    'command_settled': True, 'outcome': {'kind': kind, 'reason': detail}}
                 _save_journal(directory, execution, row)
+            if row['phase'] == 'settled':
+                return _settled_dispatch(row)
         if not release_claim():
             return HanaSettlementPending('The Hana lifecycle start or claim remains unresolved')
         with _journal_lock(directory, execution):
@@ -732,7 +738,7 @@ def _terminal(row: dict[str, object]) -> placement.TerminalAttemptOutcome:
         return placement.AttemptCancelled(reason)
     if outcome.get('kind') == 'prelaunch':
         return placement.PrelaunchRefused(reason)
-    if outcome.get('kind') == placement.HANA_COMMAND_ADMISSION_REFUSED:
+    if outcome.get('kind') == 'hana_command_admission_refused':
         return placement.HanaCommandAdmissionRefused(reason)
     if outcome.get('kind') not in ('declined', 'guest-ended'):
         raise ValueError('The Hana settlement outcome is invalid')
@@ -759,6 +765,9 @@ class NoCommandAdmissionRefusal:
     """The observation does not prove a command admission refusal."""
 
 
+NO_COMMAND_ADMISSION_REFUSAL = NoCommandAdmissionRefusal()
+
+
 def command_admission_refusal(observation: HanaCommandObservation
                               ) -> placement.HanaCommandAdmissionRefused | NoCommandAdmissionRefusal:
     """Classify a command admission refusal after the guest confirms departure."""
@@ -774,7 +783,9 @@ def command_admission_refusal(observation: HanaCommandObservation
 
 
 def settle_execution(directory: Path, request: HanaExecutionRequest, objects: ExecutionObjects, *,
-                     release_claim: Callable[[], bool], reason: str, cancelled: bool = False) -> HanaSettlement:
+                     release_claim: Callable[[], bool], reason: str, cancelled: bool = False,
+                     admission_refusal: placement.HanaCommandAdmissionRefused | NoCommandAdmissionRefusal
+                     = NO_COMMAND_ADMISSION_REFUSAL) -> HanaSettlement:
     """Require exact command closure before lifecycle release."""
     import base64
 
@@ -789,7 +800,7 @@ def settle_execution(directory: Path, request: HanaExecutionRequest, objects: Ex
             published = row['publication_attempted'] is True
             command_settled = row['command_settled'] is True
         guest_ended = False
-        refusal: placement.HanaCommandAdmissionRefused | NoCommandAdmissionRefusal = NoCommandAdmissionRefusal()
+        refusal = NoCommandAdmissionRefusal() if published else admission_refusal
         if published and not command_settled:
             observation = _checked_observation(row, request)
             if (not cancelled and 'accepted_result' not in row and row.get('source_update_attempted') is not True
@@ -821,7 +832,7 @@ def settle_execution(directory: Path, request: HanaExecutionRequest, objects: Ex
                     result = hana_result.decode_result(base64.b64decode(cast(str, row['accepted_result']), validate=True))
                     outcome = {'kind': 'completed', 'status': result.status}
                 elif isinstance(refusal, placement.HanaCommandAdmissionRefused):
-                    outcome = {'kind': placement.HANA_COMMAND_ADMISSION_REFUSED, 'reason': refusal.reason}
+                    outcome = {'kind': 'hana_command_admission_refused', 'reason': refusal.reason}
                     evidence = placement.ExecutionNotStarted()
                     row['phase'] = 'settled'
                 elif guest_ended and isinstance(evidence, placement.ExecutionEvidenceUnavailable):
