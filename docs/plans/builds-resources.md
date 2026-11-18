@@ -2906,10 +2906,14 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/run_cost.py`, `scripts/buildlog/test_aws_report.py`.
 
-### Phase 158 — The Phase 151 cloud slot groups merge with main  · status: todo
+### Phase 158 — The Phase 151 cloud slot groups merge with main  · status: done
 
-**Cause:** the Phase 151 row `49dc19798` conflicts with main `f6c11ee64` in `aws_trial.py`, `cloud_gate.py`, `test_cloud_gate.py` and `admission_service.py`. Main now records the gate job in the cloud reservation request and the admission record; Phase 151 adds the cloud slot group.
+#### As-built
+- The Phase 151 row `49dc19798` conflicted with main `f6c11ee64` in four files. Main records the gate job in the cloud reservation request and the admission record. Phase 151 adds the cloud slot group.
+- The new row keeps both changes. `cloud_reservation` takes a suite mode or a step job and a group. `_prepare_admission` records `gate_job` and keeps the group grants.
+- `test_aws_trial.py`: the fake reservation function takes the job and the group. The worker named this file; the director made the fixture fix.
+- Tests on the row in both layouts, 0 failures: 8 suites, 763 tests.
+- Blind review: approved in 1 round.
+- Checkpoint `2eb06f046`; row `6160f865c` on main `f6c11ee64`, branch `builds-resources-p158`. It replaces `49dc19798`.
 
-**Fix:** a new row on main that keeps both changes. Same behavior as Phase 151.
-
-**Proof:** the cloud gate, trial, admission, memory feed and queue view suites pass on the new row.
+**Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_aws_trial.py`, `scripts/build_queue/admission_service.py`.
