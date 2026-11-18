@@ -9,7 +9,8 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import partial
 import html
 import ipaddress
 import json
@@ -765,7 +766,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def news_post(self) -> None:
         """Record the page the console shows, and name the other pages that hold new items."""
-        root = cast(ReviewLinksServer, self.server).root
+        server = cast(ReviewLinksServer, self.server)
         try:
             length = int(self.headers.get("Content-Length", "0"))
             opened = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True).get("open", [])
@@ -773,7 +774,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             # An empty name means the open page is not a navigation entry, such as the Rebuilds page.
             if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
                 raise ValueError("name one console page or none")
-            fresh = console.news(root, pages, opened[0])
+            pages = tuple(replace(page, items=partial(images.waiting_images, status=server.delivery_status))
+                          if page.items is images.waiting_images else page for page in pages)
+            fresh = console.news(server.root, pages, opened[0])
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return
