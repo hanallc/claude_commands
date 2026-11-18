@@ -4209,9 +4209,17 @@ class NativeAgentProcess:
 
 
 def _process_birth(pid: int) -> str:
-    started = (darwin_process_identity(pid).started if _platform() == "darwin"
-               else runtime_sessions.process_start(pid))
+    # A pane process can exit after herdr lists it; that process starts or exits, its pane is not unknown.
+    if _platform() == "darwin":
+        try:
+            started = darwin_process_identity(pid).started
+        except _DarwinProcessGone as error:
+            raise NativeRegistryChanging(f"pid {pid}: process exited") from error
+    else:
+        started = runtime_sessions.process_start(pid)
     if not started:
+        if _platform() != "darwin" and not Path(f"/proc/{pid}").exists():
+            raise NativeRegistryChanging(f"pid {pid}: process exited")
         raise ValueError(f"pid {pid}: process start is unavailable")
     return started
 
@@ -5094,6 +5102,9 @@ class DarwinProcessIdentity(NamedTuple):
 def darwin_process_identity(pid: int) -> DarwinProcessIdentity:
     result = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "lstart=,tty=", "-p", str(pid)],
                          timeout=5, environment={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    if result.returncode != 0 and not result.stdout.strip() and not result.stderr.strip():
+        # ps prints nothing and fails only when no process has this pid.
+        raise _DarwinProcessGone(f"process {pid}: exited")
     require_success(result, f"process {pid} identity")
     fields = result.stdout.strip().rsplit(maxsplit=1)
     if len(fields) != 2 or not re.fullmatch(

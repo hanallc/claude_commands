@@ -60,7 +60,9 @@ class ScratchBranches:
 
     def command(self, *arguments: str) -> str:
         result = subprocess.run(["git", "-C", str(self.repository), *arguments],
-                                capture_output=True, text=True, check=True)
+                                capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise AssertionError(f"git {' '.join(arguments)}: {result.stderr}")
         return result.stdout.strip()
 
     def remote_names(self) -> set[str]:
@@ -193,6 +195,16 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
 
 
 class BranchPageTests(unittest.TestCase):
+    def test_unit_names_have_role_colors_and_unknown_names_stay_plain(self) -> None:
+        member = staff.StaffRow(staff.StaffId("role-test"), "unit", "Builder", staff.StaffRoot(), current_session=staff.StaffId("role-test"))
+        row = branch_page.MergedUnitBranch("merged", member.name, "abc", "2026-11-16T12:00:00+00:00",
+            "def", "2026-11-16T13:00:00+00:00", branch_page.InactiveUnit())
+        page = branch_page.BranchPage(Path(), (row, replace(row, unit="nate")), "private", member.id, Path())
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
+            body = branch_page.render(page).decode()
+        self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>Builder</span>')
+        self.assertIn('Unit: nate — not active', body)
+
     def test_lists_only_merged_recorded_natedev_unit_branches_and_checks_each_row(self) -> None:
         for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main"):
             with self.subTest(live_directory=live_directory), scratch_branches() as fixture:
@@ -247,10 +259,10 @@ class BranchPageTests(unittest.TestCase):
                         current_branch = fixture.command("-C", str(fixture.root / "active"), "branch", "--show-current")
                         self.assertNotEqual(row.name, current_branch)
                         self.assertEqual(row.unit_status, branch_page.ActiveUnitBranch(current_branch))
-                        self.assertIn(f"Unit: {html.escape(row.unit)} — active, now on branch {html.escape(current_branch)}", content)
+                        self.assertIn(f"Unit: {html.escape(row.unit)} — active, now on branch {html.escape(current_branch)}", content_text)
                     else:
                         self.assertEqual(row.unit_status, branch_page.InactiveUnit())
-                        self.assertIn(f"Unit: {html.escape(row.unit)} — not active", content)
+                        self.assertIn(f"Unit: {html.escape(row.unit)} — not active", content_text)
                 listing = fixture.listing()
                 unowned = [row for row in listing.rows if isinstance(row, branch_page.MergedUnownedBranch)]
                 expected_unowned = [f"unowned-{number:02}" for number in range(10)]

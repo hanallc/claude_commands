@@ -1,6 +1,8 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.agents import remote
 from scripts.herdr import herdr_types
 
@@ -12,6 +14,7 @@ import signal
 import shlex
 import shutil
 import socketserver
+import subprocess
 import sys
 import tempfile
 import time
@@ -552,7 +555,7 @@ class RecordedResumeTests(RestartTestCase):
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     folder: Path = Path("/tmp/recorded-resume")
@@ -660,7 +663,7 @@ class MixedRestartTests(ShutdownTestCase):
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(root / "conf" / source.name, source.read_text())
+            _ = write_config_fixture(root / 'conf' / source.name)
         write_text_atomic(root / "conf/models.conf",
             Path(__file__).resolve().parents[1].joinpath("lib/test_models_registry.conf").read_text())
         directory = staff.PresentWorktree(remote.local_machine(), root)
@@ -750,6 +753,8 @@ class MixedRestartTests(ShutdownTestCase):
                 return world.socket_request(method, **params)
             arguments = cast(list[str], request.get("argv", []))[2:]
             action = arguments[:2]
+            if action in (["pane", "list"], ["pane", "process-info"]):
+                requests.append(" ".join(action))
             if action == ["status", "server"]:
                 return {"running": True}
             if action == ["pane", "list"]:
@@ -842,6 +847,21 @@ class MixedRestartTests(ShutdownTestCase):
             "    if sys.argv[3:5] == ['pane', 'read']:\n        response = json.loads(response)['result']['text']\n" +
             "    print('status: running' if sys.argv[-2:] == ['status', 'server'] else response, end='\\n')\n", new_file_mode=0o700)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": str(cli)})))
+        program = herdr.run_program
+
+        def run_program(argv: list[str], timeout: float = herdr.PROGRAM_TIMEOUT_SECONDS, *,
+                        environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            # The CLI script gives the same stdout; each start of it costs an interpreter.
+            if argv[:1] != [str(cli)]:
+                return program(argv, timeout, environment=environment)
+            with lock:
+                response = reply({"argv": argv[1:]})
+            if argv[3:5] == ["pane", "read"]:
+                output = str(response["text"])
+            else:
+                output = "status: running" if argv[-2:] == ["status", "server"] else json.dumps({"result": response})
+            return subprocess.CompletedProcess(argv, 0, output + "\n", "")
+        _ = self.enterContext(patch.object(herdr, "run_program", run_program))
         _ = cast(object, self.enterContext(patch.multiple(unit_runs, RUN_ROOT=root / "runs", FORMER_RUN_ROOT=root / "former", ASTRA_RUN_ROOT=root / "astra")))
         def role_account(role: str) -> accounts.AccountSelection:
             return (accounts.CodexWorkersAccount("codex1", root / ".codex1") if role == "workers" else
@@ -852,9 +872,7 @@ class MixedRestartTests(ShutdownTestCase):
         read_bytes, kill = Path.read_bytes, os.kill
         def proc_bytes(path: Path) -> bytes:
             return read_bytes(proc / path.relative_to("/proc")) if str(path).startswith("/proc/991") else read_bytes(path)
-        def signal_process(pid: int, number: int) -> None:
-            if not 990999 <= pid < 991300:
-                return kill(pid, number)
+        def exit_process(pid: int, number: int) -> None:
             if not (proc / str(pid)).exists():
                 raise ProcessLookupError(pid)
             if number:
@@ -867,6 +885,12 @@ class MixedRestartTests(ShutdownTestCase):
                 _ = panes[pane].pop("agent_session", None)
                 write_text_atomic(proc / str(shell_pids[pane]) / "task" / str(shell_pids[pane]) / "children", "")
                 shutil.rmtree(proc / str(pid))
+        def signal_process(pid: int, number: int) -> None:
+            if not 990999 <= pid < 991300:
+                return kill(pid, number)
+            # The fake server answers under this lock; an exit is one change to its world.
+            with lock:
+                exit_process(pid, number)
         _ = self.enterContext(patch.object(Path, "read_bytes", proc_bytes))
         _ = self.enterContext(patch.object(os, "kill", side_effect=signal_process))
         for command in commands:
@@ -924,6 +948,10 @@ class MixedRestartTests(ShutdownTestCase):
             self.assertEqual(len(live), 5 if command == "restart" else 0)
             self.assertGreater(seeds.call_count, 0)
             self.assertIn("pane.process_info", requests)
+            if command == "stop":
+                # Each row stop reads its panes once; five rows took 60 pane lists before the row scope.
+                self.assertLessEqual(requests.count("pane list"), 25, command)
+                self.assertLessEqual(requests.count("pane process-info"), 25, command)
             self.assertEqual(starts.call_count, 2 if command == "restart" else 0)
             self.assertEqual(bool(orders.call_count), command == "restart")
 
@@ -1090,8 +1118,9 @@ class RestartTests(RestartTestCase):
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "unit-0": "claude:opus:max", "probe-codex": "codex:gpt-test:high",
             "morty": "claude:opus:max", "TEST-agent": "claude:opus:max",
@@ -2230,7 +2259,7 @@ class RestartTests(RestartTestCase):
 
     def test_saved_tab_waits_for_its_own_shell_and_never_splits(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
-        write_text_atomic(settings, settings.read_text().replace("OWN_PANE_SHELL_SECONDS=30", "OWN_PANE_SHELL_SECONDS=0.2"))
+        _ = write_config_fixture(settings, "OWN_PANE_SHELL_SECONDS=0.2\n")
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"staff_id": "row-0", "seen": 1}]}]}
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
@@ -3788,7 +3817,7 @@ class RetainedSplitRestartTests(RestartTestCase):
         root = fixture.root
         config = root / "conf"
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(config / source.name, source.read_text())
+            _ = write_config_fixture(config / source.name)
         write_text_atomic(config / "models.conf", registry_text())
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
             "MODELS_CONFIG_FILE": str(config / "models.conf"), "MODELS_CONFIG_PUBLISH": "0",

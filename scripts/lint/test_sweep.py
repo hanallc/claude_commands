@@ -583,6 +583,7 @@ class RebuildTests(SweepCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(conf.path("lint"), "sweep_cold_crates=50\n")
         _ = self.enterContext(mock.patch.object(store, "host_name", side_effect=lambda: record.local_step_identity().hosts[0]))
 
     def test_rebuild_report_fails_when_an_enumerated_month_disappears(self) -> None:
@@ -1232,7 +1233,19 @@ def cut_stamp(seconds: float) -> str:
     return store.utc_iso(sweep.TARGET_OVERRIDE_RECORDER_CUT.timestamp() + seconds)
 
 
+FLOOR_TEST_SETTINGS = (
+    "sweep_cold_crates=50\nsweep_measurement_paths=3\nsweep_alert_interval_seconds=3600\n"
+    + "sweep_delete_stamp_grace_seconds=2\n"
+)
+
+
 class FloorTests(SweepCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = write_config_fixture(conf.path("lint"),
+            FLOOR_TEST_SETTINGS + "sweep_floor_roots=~/rust ~/.local/state ~/.cache /tmp\n")
+
     def root_row(self, workspace: str | Path, target: str | Path, build: str | Path, *,
                  cwd: str | Path = "", step: str = "build", call_id: str = "attempt", host: str = "",
                  argv: Sequence[str] = (), target_folder: str | Path = "", started_at: str | None = None) -> None:
@@ -3447,8 +3460,8 @@ class FloorTests(SweepCase):
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", return_value={}))
         _ = write_config_fixture(conf.path("lint"),
-                                 f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
-                                 + f"sweep_floor_roots={base}\n" + "sweep_phone_floor_gib=0\n")
+                                 FLOOR_TEST_SETTINGS + f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
+                                 + f"sweep_floor_roots={base}\nsweep_phone_floor_gib=0\n")
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         _ = self.enterContext(mock.patch.object(
@@ -5944,6 +5957,7 @@ raise SystemExit(int(os.environ[variable]))
         _ = write(home / ".cache" / "sccache" / "0" / "1" / "01d2c3b4a5968778")
         _ = write(home / ".cache" / "sccache" / "debug" / ".fingerprint" / "x" / "y")
         self.enterContext(mock.patch.dict(os.environ, {"HOME": str(home)}))
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "lint.conf", "sweep_floor_roots=~/.cache\n")
         self.assertIn("~/.cache", conf.read("lint").words("sweep_floor_roots"))
         found = sweep.target_dirs([root for root in conf.read("lint").words("sweep_floor_roots") if root.startswith("~/.cache")])
         self.assertEqual(found, [str(root)])
@@ -7321,6 +7335,7 @@ class MacFloorTests(SweepCase):
 
     def test_mac_missing_or_lower_floor_refuses_with_one_line(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
+        _ = write_config_fixture(config, "sweep_floor_gib=150\n")
         original = config.read_text()
         for changed in (original.replace("sweep_floor_gib=150", "sweep_floor_gib=99"),
                         original.replace("sweep_floor_gib=150", "")):
@@ -7335,7 +7350,10 @@ class MacFloorTests(SweepCase):
 
     def test_mac_entry_uses_mac_floor_and_skips_the_tmp_sweep(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
-        _ = write_config_fixture(config, "sweep_floor_gib=101")
+        _ = write_config_fixture(conf.path("build_targets"), "platform.mac=macos\n")
+        _ = write_config_fixture(config,
+            "sweep_floor_gib=101\nmirror_root=~/.local/state/mac-test/test-mirror\n"
+            + "sweep_floor_roots=/tmp ~/rust ~/.local/state/mac-test/test-mirror\n")
         claims = floor_claims.ClaimSnapshot(frozenset())
         with (mock.patch.object(floor_claims, "read_claims", return_value=claims),
               mock.patch.object(sweep, "hold_floor", return_value=0) as take,

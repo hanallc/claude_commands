@@ -17,17 +17,19 @@ from unittest import mock
 from scripts.aws_target import hana_guest as guest, hana_receiver
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class HanaGuestTests(unittest.TestCase):
+    settings: guest.SafetySettings = guest.SafetySettings(False, 1, 1, 1, 1, 1, 1)
+
     def __init__(self, methodName: str = 'runTest') -> None:
         super().__init__(methodName)
         self.root: Path = Path()
-        self.config_path: Path = ROOT / 'config/hana_aws.conf'
-        self.settings: guest.SafetySettings = guest.read_settings(conf.read(self.config_path))
+        self.config_path: Path = Path()
         self.now: float = 1000.0
         self.generation: str = 'fixture_generation'
         self.boot_id: str = 'fixture-boot'
@@ -39,7 +41,8 @@ class HanaGuestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config_path = self.root / 'hana_aws.conf'
-        _ = self.config_path.write_text((ROOT / 'config/hana_aws.conf').read_text())
+        _ = write_config_fixture(self.config_path,
+            'guard_grace_seconds=60\npermit_max_seconds=120\nwatchdog_check_seconds=10\n')
         self.settings = guest.read_settings(conf.read(self.config_path))
         self.paths = guest.GuestPaths(self.root / 'state', self.root / 'boot-id')
         self.paths.directory.mkdir()
@@ -255,12 +258,9 @@ class HanaGuestTests(unittest.TestCase):
     def test_config_values_drive_the_rendered_settings(self) -> None:
         files = self.files()
         self.assertEqual(json.loads(files['safety.json'].content), asdict(self.settings))
-        changed = self.config_path.read_text().replace(
-            f'watchdog_check_seconds={self.settings.watchdog_check_seconds}',
-            f'watchdog_check_seconds={self.settings.watchdog_check_seconds + 1}')
-        _ = self.config_path.write_text(changed)
+        _ = write_config_fixture(self.config_path, 'watchdog_check_seconds=11\n')
         settings = guest.read_settings(conf.read(self.config_path))
-        self.assertEqual(settings.watchdog_check_seconds, self.settings.watchdog_check_seconds + 1)
+        self.assertEqual(settings.watchdog_check_seconds, 11)
 
     def test_far_future_expiry_grants_no_permission(self) -> None:
         permit = replace(self.fresh(), expires_at=self.now + self.settings.permit_max_seconds

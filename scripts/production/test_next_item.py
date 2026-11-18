@@ -2,6 +2,8 @@
 """Tests for next_item.py: the one item /next shows from the four lists, and moving an item to the end."""
 from __future__ import annotations
 
+from scripts.production.change_review_test_support import pictured_changes
+
 from scripts.agents import remote
 
 import contextlib
@@ -80,7 +82,7 @@ class NextItemTests(unittest.TestCase):
         self.root = Path(folder.name)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**source_environment(self.root / "sources"),
-                "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
+                "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(self.root), "HERDR_BIN": "/nonexistent/herdr"})))
         _ = self.enterContext(isolated_source_readers())
         _ = fixture_member("showrunner", name="demo", doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
         with contextlib.ExitStack() as stack:
@@ -216,12 +218,13 @@ class NextItemTests(unittest.TestCase):
         self.assertEqual(run("show", "--kind", "efficiency", "--production", unit_lookup.doc_owner(bare, staff.snapshot()).name)[1],
                          "no efficiency is waiting for you\n")
         path = self.root / "change-review" / "change-review - natedev.md"
-        _ = change_review.append_rows(path, [Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")],
+        _ = change_review.append_rows(path, pictured_changes([Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")]),
                                       date(2026, 10, 15), "", doc, record=staff.snapshot())
         _ = doc.write_text(doc.read_text() + f"- **Change review:** `{path.with_name('change-review - demo.md')}`\n")
         self.assertEqual(run("show", "--kind", "change", "--production", "demo"), (0, "\n".join([
             "change", "demo/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
-            "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
+            "  Merged: 2026-10-15", "  Production: demo",
+            f"  Image: {change_review.pending(path)[0][change_review.IMAGE]}", ""]), ""))
 
     def test_each_kind_shows_its_own_production_and_with_all_below_each_lower_one_never_above(self) -> None:
         plans = self.root / "docs" / "plans"
@@ -243,7 +246,7 @@ class NextItemTests(unittest.TestCase):
         # The side production is a root of its own, with its own list.
         side_list = path.with_name("change-review - side.md")
         for name in (*names, "gone"):
-            _ = change_review.append_rows(side_list if name == "side" else path, [Visible(f"{name}-item change", "Run it", "It works")], date(2026, 10, 15),
+            _ = change_review.append_rows(side_list if name == "side" else path, pictured_changes([Visible(f"{name}-item change", "Run it", "It works")]), date(2026, 10, 15),
                                           "", docs.get(name, docs["top"]), record=staff.snapshot())
         # A row without a production belongs to the list's root.
         root_id = unit_lookup.doc_owner(docs["top"], staff.snapshot()).id
@@ -258,7 +261,7 @@ class NextItemTests(unittest.TestCase):
                 _ = staff.move(existing.id, staff.ReportsTo(parent) if parent is not None else staff.StaffRoot())
             owner = fixture_member("showrunner", name=name, parent=parent, doc=staff.LiveDoc(remote.local_machine(), doc))
             with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}):
-                item = investigation.file(owner.id, f"{name}-item", "Find the cause.")
+                item = investigation.file(owner.id, f"{name}-item", "Find the cause.", waiting_why='The owner must complete the investigation.')
                 _ = investigation.answer(owner.id, item.id, "The cause is known.")
             fields = {"since": "2026-10-06T09:00", "text": f"{name}-item", "question": f"{name}-item next step?",
                       "asked_by": owner.id}
@@ -320,7 +323,7 @@ class NextItemTests(unittest.TestCase):
             self.assertNotEqual(next_item.change_queue(docs["top"]).name, next_item.change_queue(docs["kid"]).name)
 
             producer = fixture_member("producer", name="planner")
-            ready = investigation.file(producer.id, "Producer investigation", "Read the producer log.")
+            ready = investigation.file(producer.id, "Producer investigation", "Read the producer log.", waiting_why='The owner must complete the investigation.')
             ready = investigation.answer(producer.id, ready.id, "The producer answer is ready.")
             with mock.patch.object(staff, "caller_identity", return_value=producer.current_session):
                 for arguments in (("show", "--kind", "investigation"), ("show",)):
@@ -348,7 +351,7 @@ class NextItemTests(unittest.TestCase):
         top, kid = self.root / "top-production.md", self.root / "kid-production.md"
         root = fixture_member("showrunner", name="top", doc=staff.LiveDoc(remote.local_machine(), top))
         _ = fixture_member("showrunner", name="kid", parent=root.id, doc=staff.LiveDoc(remote.local_machine(), kid))
-        _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
+        _ = change_review.append_rows(path, pictured_changes([Visible("kid change", "Run it", "It works")]), date(2026, 10, 15), "",
                                       kid, record=staff.snapshot())
 
         def the_list(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
@@ -419,7 +422,7 @@ class NextItemTests(unittest.TestCase):
         queue = next_item.change_queue(doc)
         self.assertEqual({entry.key for entry in queue.entries}, {"kid/C9", "kid/C10", "C9", "C434"})
         self.assertEqual(footer_counts.changes(doc), len(queue.entries))
-        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 4 changes")
+        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "Review: 4 changes")
         self.assertEqual(set(lists) & set(footer_counts.sources(doc)),
                          {change_review.list_file("top"), change_review.list_file("kid")})
         self.assertEqual({path: path.read_bytes() for path in lists}, lists)
@@ -561,7 +564,7 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(output.splitlines()[1], "kid/C9 Earlier child change")
             self.assertEqual(footer_counts.changes(doc), 2)
-            self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 2 changes")
+            self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "Review: 2 changes")
 
     def test_bad_urgency_in_earlier_list_leaves_current_rows_in_show_and_count(self) -> None:
         doc = self.attached_changes()["kid"]

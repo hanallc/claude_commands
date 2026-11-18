@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 import unittest
 from collections.abc import Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
@@ -29,7 +30,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
 from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, session_folder
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import session_send
 
 DAY = 86_400
@@ -72,6 +73,10 @@ class FolderAuditTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "build_folders.conf", "roots.system=/tmp\n")
+        _ = cast(object, self.enterContext(unittest.mock.patch.dict(os.environ, environment)))
         self.root = Path(self.enterContext(short_socket_directory()))
         self.rust = self.root / "rust"
         self.temp = self.root / "tmp"
@@ -133,6 +138,9 @@ class FolderAuditTests(unittest.TestCase):
                                                                 # test-run folder must not reach the live root.
                                                                 session_folder.ROOT_ENV: str(self.root / "session"),
                                                                 **copies_environment(self.root)}))
+        _ = write_config_fixture(self.root / "config/build_folders.conf",
+            "patterns.legacy-unique={purpose}{suffix}\nnames.suffix_length=8\n"
+            + "prefixes.verify-copy=verify-copy.{owner}.\nprefixes.verify-hold=verify-hold.{owner}.\n")
         _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=2.5\n")
         _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n")
 
@@ -825,6 +833,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual([entry.path for entry in unread], [in_scratch])
 
     def test_idle_time_counts_the_newest_mtime_inside_and_git_times_never_ctime(self) -> None:
+        _ = write_config_fixture(self.root / "config/lint.conf", "folder_idle_depth=3\n")
         repo = folder(self.rust / "hana_p34d_alone")
         deep = repo / "a" / "b"
         deep.mkdir(parents=True)
@@ -1040,6 +1049,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(folder_audit.candidates(self.rust, [self.temp], frozenset()), [ordinary])
 
     def test_the_message_lists_each_folder_and_names_scratch(self) -> None:
+        _ = write_config_fixture(self.root / "config/lint.conf", "folder_remove_after_seconds=604800\n")
         loose = [folder_audit.Loose(Path("/home/u/rust/a"), 0.0, "s"),
                  folder_audit.Loose(Path("/tmp/b"), 0.0, "s", folder_audit.REMOVED)]
         text = folder_audit.message(loose)

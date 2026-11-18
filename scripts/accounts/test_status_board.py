@@ -4,13 +4,16 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import os
+import tempfile
 from pathlib import Path
 from typing import Literal, cast, override
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts
+from scripts.accounts import accounts, next_moves, role_map
+from scripts.accounts.home_test_support import scratch_account_home
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.whoami import agent_accounts
 
 NOW = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
@@ -56,7 +59,10 @@ def text(spans: list[accounts.BoardSpan]) -> str:
 class StatusBoardTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")})))
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(configuration / "accounts.conf", "next_move_percent=1\nusage_stale_minutes=10\n")
+        _ = write_config_fixture(configuration / "statusline.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_the_table_matches_the_plugin_columns_lines_and_totals(self) -> None:
         board = accounts.status_board(fixture())
@@ -89,6 +95,38 @@ class StatusBoardTests(unittest.TestCase):
             ("units ✓", accounts.BoardGroup(account="claude1", group="units")),
             ("showrunners ✓", accounts.BoardGroup(account="claude1", group="showrunners")),
             ("workers", None), ("units", None), ("units ✓", None), ("", None)])
+
+    def test_status_uses_one_queue_read_for_the_upcoming_list_and_first_targets(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with scratch_account_home(home, {}, clear=True), patch.object(role_map, "is_role_map_host", return_value=True):
+            first = next_moves.add_next_move("units", 1, "claude2")
+            later = next_moves.add_next_move("units", 2, "claude3")
+            workers = next_moves.add_next_move("workers", 1, "codex2")
+            entries = (first, later, workers)
+            expected = next_moves.render_next_moves(entries)
+            for content in (next_moves.encode_next_moves(entries), "[]", "["):
+                with self.subTest(content=content):
+                    _ = next_moves.next_moves_file().write_text(content)
+                    with (patch.object(accounts, "_read_status", return_value=fixture()),
+                          patch.object(next_moves, "read_next_moves", wraps=next_moves.read_next_moves) as read):
+                        result = accounts.read_status(source=accounts.StoredUsageOnly())
+                    read.assert_called_once_with()
+                    if content == "[":
+                        self.assertIsInstance(result.first_next_moves, accounts.NextMovesUnavailable)
+                        self.assertIn("Upcoming moves: unavailable", result.upcoming_moves[0])
+                    elif content == "[]":
+                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveTargets())
+                        self.assertEqual(result.upcoming_moves, ("Upcoming moves: none",))
+                    else:
+                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveTargets({"units": "claude2", "workers": "codex2"}))
+                        self.assertEqual(result.upcoming_moves, ("Upcoming moves:", *expected.splitlines()))
+            with (patch.object(accounts, "_read_status", return_value=fixture()),
+                  patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "read_role_map", return_value=role_map.RoleMap({}, "codex1", upcoming_moves=("saved moves",))),
+                  patch.object(next_moves, "read_next_moves", side_effect=AssertionError("unexpected queue read"))):
+                result = accounts.read_status(source=accounts.StoredUsageOnly())
+            self.assertEqual(result.upcoming_moves, ("saved moves",))
+            self.assertIsInstance(result.first_next_moves, accounts.NextMovesUnavailable)
 
     def test_tones_mark_access_and_low_quota(self) -> None:
         rows = {text(line["cells"]["label"]): line for line in accounts.status_board(fixture())["rows"]}
