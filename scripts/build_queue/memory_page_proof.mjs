@@ -248,6 +248,11 @@ try {
                 showTip(key, x, position.top+15);
                 const tooltip = document.querySelector('#tip');
                 const tipBounds = tooltip.getBoundingClientRect();
+                const role = '[data-color-text="role.unit-director"]';
+                const titleStaff = tooltip.querySelector(role);
+                const unitStaff = waiterCell.closest('tr').querySelector('.unit ' + role);
+                const staffBounds = titleStaff?.getBoundingClientRect();
+                const staffColor = titleStaff && getComputedStyle(titleStaff).color;
                 const fields = Array.from(tooltip.querySelectorAll('dt')).map(label => {
                   const value = label.nextElementSibling;
                   const bounds = value.getBoundingClientRect();
@@ -270,6 +275,9 @@ try {
                   position.left >= 0 && position.right <= innerWidth &&
                   waiterCell.scrollWidth === waiterCell.clientWidth;
                 return {fields,visible,headers:headers.map(header => header.textContent),
+                  staff:{title:titleStaff?.textContent,unit:unitStaff?.textContent,color:staffColor,
+                    visible:staffBounds && staffBounds.width > 0 && staffBounds.left >= tipBounds.left
+                      && staffBounds.right <= tipBounds.right && staffColor !== getComputedStyle(tooltip).color},
                   verbs:[cell('row',running).textContent,cell('row',mac).textContent,
                     waiterCell.textContent,cell('wait',direct).textContent],
                   macFields:tooltipRows('row:' + mac.key, latest).map(({label,value}) => [label,value]),
@@ -278,14 +286,17 @@ try {
               assert.deepEqual(result.headers, ['Verify','Verify']);
               assert.deepEqual(result.verbs, ['final','test','final','']);
               assert.deepEqual(result.macFields.slice(1), [['Step','nextest'],['Call','verify test sample --no-cache']]);
-              const {fields, facts} = result;
+              const {fields, facts, staff} = result;
+              assert.deepEqual([staff.title, staff.unit, staff.visible], ['builder', 'builder', true]);
+              assert.equal(fields.find(field => field.label === 'Runs on').value, 'natedev only');
+              assert.equal(fields.find(field => field.label === 'Because').value, 'creates a Linux install');
               assert.equal(fields.find(field => field.label === 'Step').value, `${facts.step} (${facts.position} of ${facts.total})`);
               assert.equal(facts.call, "verify final sample --local 'creates a Linux install'");
               const last = fields.at(-1);
               assert.deepEqual([last.label,last.value,last.group], ['Call',facts.call,true]);
               assert.ok(result.visible && fields.every(field => field.fits && field.align === 'right'
                 && Math.abs(field.right-fields[0].right) < 1), JSON.stringify({theme,width,result}));
-              views.push({theme,width});
+              views.push({theme,width,staffColor:staff.color});
               if (theme === 'dark' && width === 1600) {
                 const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
                 await writeFile(join(folder,'builds-verify-column-dark.png'),Buffer.from(shot.data,'base64'));

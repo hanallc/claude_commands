@@ -288,7 +288,7 @@ class ProducerWriterTests(ProducerFixture):
                             code, _, errors = run(*arguments, '--validation', identity)
                             self.assertEqual((code, errors), (0, ''))
                         updated = next(item for item in review_items.read(case.root) if item.key == key)
-                        self.assertEqual(updated.state, review_items.ReviewState.DONE if verdict == 'works' else review_items.ReviewState.FOR_YOU)
+                        self.assertEqual(updated.state, review_items.ReviewState.DONE if verdict == 'works' else review_items.ReviewState.OPEN)
                         if verdict != 'works':
                             before = listing.read_bytes(), record.read_bytes()
                             stale = change_review.save_verdict(listing, 'C1', 'works', case.fixture.production, validation_id=identity)

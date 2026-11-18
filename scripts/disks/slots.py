@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.buildlog.store import host_name
 from scripts.disks import measure
@@ -13,6 +13,7 @@ from scripts.disks.measure import DisksData
 from scripts.lib import build_folders, build_slots, conf
 from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.message.unit_labels import OwnerRole
+from scripts.review_links import staff_names as name_rendering
 
 State = Callable[[Path], Literal["held", "free"]]
 # The shown name of a lease owner: a staff id or a role name.
@@ -38,6 +39,7 @@ class SlotUse(TypedDict):
     # "<unit> <step>", named as the Builds page names a step.
     name: str
     showrunner: str
+    name_parts: NotRequired[list[name_rendering.NamePart]]
 
 
 class SlotRow(TypedDict):
@@ -87,7 +89,10 @@ def slot_use(record: Mapping[str, object], steps: StepNames, owners: OwnerNames)
     step = text.get("work", "")
     current = " ".join(part for part in (unit, text.get("purpose", "")) if part)
     name = steps.for_owner(step, unit, OwnerRole.UNIT, current_name=current) if step else current
-    return {"name": name, "showrunner": text.get("showrunner", "")}
+    current_parts = name_rendering.text_parts(name_rendering.StaffReference(unit),
+        " " if unit and text.get("purpose") else "", text.get("purpose", ""))
+    parts = name_rendering.owned_step_parts(steps, step, unit, OwnerRole.UNIT, current=current_parts) if step else current_parts
+    return {"name": name, "showrunner": text.get("showrunner", ""), "name_parts": parts}
 
 
 def slot_row(path: Path, number: int, cargo_root: Path, settings: conf.ConfigRead, data: DisksData | None, now: float,
