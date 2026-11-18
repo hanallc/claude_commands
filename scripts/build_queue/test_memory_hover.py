@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -12,6 +13,7 @@ from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import test_memory_feed
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
@@ -81,7 +83,7 @@ class MemoryHoverTests(unittest.TestCase):
     def test_tooltip_colors_only_fields_that_name_staff(self) -> None:
         data = {"waiters": [{"name": "Compile", "unit": "builder", "showrunner": "helper",
                 "runner": "worker", "worker": "builder", "kind": "repository-slot",
-                "because": "builder", "runs_on": "builder", "why": "builder"}]}
+                "title": {"unit": "builder", "step": "Compile"}, "because": "builder", "runs_on": "builder", "why": "builder"}]}
         body = str(self.page_expression("(()=>{" + self.role_setup()
             + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))
         grid = ElementTree.fromstring(body)
@@ -291,6 +293,7 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(name=name, unit=counter["unit"]):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
                     "name": name, "unit": "fixture", "showrunner": "fixture-production", "started_at": 100,
+                    "title": {"unit": "fixture", "step": name},
                     "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": "",
                     "need": memory_feed.gib(hold.memory.need), "need_part": True, "progress": counter}]}))
                 self.assertEqual(hover[0], f"fixture · {name}  running 5 min")
@@ -339,6 +342,7 @@ class MemoryHoverTests(unittest.TestCase):
         about = "Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc."
         row = {"name": "natemerge integrate", "queued": True, "used": 1, "reserved": 0, "counted": 1,
                "showrunner": "builds", "unit": "natemerge", "runner": "unit director",
+               "title": {"unit": "natemerge", "step": "integrate"},
                "about": about, "changes": "sdlc branch"}
         data = {"read_at": 200, "walk": [row], "waiters": [{**row, "need": 2, "since": 100, "why": "its turn"}]}
         for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
@@ -510,6 +514,7 @@ class MemoryHoverTests(unittest.TestCase):
                                 ("MacTestingCounter", "testing"), ("MacStageUnavailable", "—")):
             with self.subTest(stage=stage):
                 row = {"kind": "mac-build", "name": "hana nextest", "unit": "trunk", "pid": 710001,
+                       "title": {"unit": "trunk", "step": "hana nextest"},
                        "machine": "mac", "vcpus": 12, "repository": "hana", "showrunner": "hana", "started_at": 100, "read_at": 190,
                        "used": 3.5, "stage": {"kind": stage}}
                 data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": [row], "waiters": []}
@@ -699,6 +704,25 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
 
+    def test_repository_slot_renders_the_unit_and_script_title(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        data = fixture.copies_slot_page("python3 /fixture/check.service.sh", source="/fixture/startup",
+                                       unit="startup", staff_id="staff-startup")
+        row, = data["waiters"]
+        key = row.get("key")
+        self.assertIsNotNone(key)
+        body = cast(list[str], self.page_expression(
+            f"(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:{key}',data)])",
+            cast(object, json.loads(memory_feed.page_json(data))), walk=True))
+        unit = re.search(r'<tr class="wait wait-first"[^>]*>.*?<td class="unit"><span class="cell-text">([^<]*)</span></td>',
+                         body[0])
+        self.assertIsNotNone(unit)
+        assert unit is not None
+        self.assertEqual(unit[1], "startup")
+        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · check.service.sh")
+
     def test_repository_slot_wait_has_no_memory_group(self) -> None:
         data = {"waiters": [{"kind": "repository-slot", "name": "widget build", "need": 0,
                             "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
@@ -846,6 +870,8 @@ function fitLabels() {}
         for kind, rows in (("run", payload["walk"]), ("wait", payload["waiters"])):
             for index, row in enumerate(cast(list[dict[str, object]], rows)):
                 _ = row.setdefault("key", f"fixture-{kind}-{index}")
+                _ = row.setdefault("title", {"unit": "", "step": row.get("ci_label") or row["name"]})
+                _ = row.setdefault("unit", "")
         result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload),
             text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

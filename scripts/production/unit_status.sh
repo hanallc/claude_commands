@@ -141,9 +141,9 @@ for line in $units; do
   [[ -n ${state_keys[$u]:-} ]] || { print -u2 "No staff id for $u"; exit 1; }
   target=$fields[2]
   echo "== $u"
-  if [[ -z $target ]]; then echo 'SESSION GONE'; continue; fi
   # Status columns: unit, place, state, Claude name, session id.
   claude_state=$fields[3]
+  if [[ -z $target && $claude_state != unknown ]]; then echo 'SESSION GONE'; continue; fi
   session_id=$fields[5]
   case $claude_state in
     unknown) echo 'CLAUDE STATE UNKNOWN' ;;

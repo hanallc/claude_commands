@@ -1756,16 +1756,24 @@ class NoReservation:
 
 @dataclass(frozen=True)
 class NoEndedStepSlot:
-    """The ended step has no live caller-named run."""
+    """The ended step has no live caller run."""
 
 
 def ended_step_slot(row: Reservation, ended_at: float,
                     policy: AdmissionPolicy) -> BetweenStepsSlot | NoEndedStepSlot:
     """Keep a live caller's accepted need during the gap after its step ends."""
     origin = row.get("run_origin", FoundRun(row.get("build_run", NoLiveBuildRun())))
-    if isinstance(origin, CallerRun) and isinstance(origin.run, LiveBuildRun):
-        return BetweenStepsSlot(origin.run, row.get("reservation_id", ""), row["need"], ended_at + policy.timing.slot_gap_seconds)
-    return NoEndedStepSlot()
+    if not isinstance(origin, CallerRun) or not isinstance(origin.run, LiveBuildRun):
+        return NoEndedStepSlot()
+    waiter = row.get("queue_waiter", {})
+    identity = reservation_identity(row)
+    absent = records.EndedStepFactNotRecorded()
+    facts = records.EndedStepFacts(identity["step"] or absent,
+        row.get("package") or waiter.get("package") or PackageNotRecorded(),
+        step_project(waiter.get("repository_name", ""), row["repo"]) or absent,
+        identity["folder"] or absent, row.get("slot_staff", records.NoEndedStepStaff()))
+    return BetweenStepsSlot(origin.run, row.get("reservation_id", ""), row["need"],
+                            ended_at + policy.timing.slot_gap_seconds, facts)
 
 
 def between_steps(slot: RunSlot) -> BetweenStepsSlot:

@@ -220,7 +220,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
     report("state", "ok", "; ".join(owed) if owed else "no next list")
     record = staff.snapshot()
     try:
-        marked = unit_lookup.labeled_sessions(production.name, record=record)
+        marked = unit_lookup.every_labeled_session(record=record)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
     checkpoints = {entry.unit: entry for entry in merged_checkpoints(production, record=record)} if isinstance(state, PlanLanded) else {}
@@ -229,8 +229,16 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         entry = checkpoints.get(name)
         detail = f"phase {entry.phase} ({entry.commit[:7]})" if entry is not None else "no code checkpoint"
         report("last-merged", "ok", f"{name}: {detail}")
-        found = marked.get(row.name)
-        report("session", "ok", f"{name}: " + (f"{found.place.session} live" if found is not None else "gone"))
+        match marked.checked_unit(production.name, name):
+            case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(place=place)):
+                description = f"{place.session} live"
+            case unit_lookup.ProvedLiveUnit():
+                description = "live"
+            case unit_lookup.ProvedAbsentUnit():
+                description = "gone"
+            case unit_lookup.UnknownUnit(reason=reason):
+                description = f"unknown ({reason})"
+        report("session", "ok", f"{name}: {description}")
 
 
 def doc_path_in_checkout(production: Production, path: Path) -> str:
