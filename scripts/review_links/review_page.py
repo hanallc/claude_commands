@@ -545,7 +545,7 @@ function bind(){
    const buttons=[...form.querySelectorAll('button')];
    buttons.forEach(button=>button.disabled=true);notice.textContent='';
    departures.set(key,{kind:'pending'});
-   view.startAction(row);
+   const submission=view.startAction(row);
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
@@ -555,10 +555,10 @@ function bind(){
      state:waits ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
      hiddenUntil:outcome==='later' ? Date.parse(until) : 0});
     view.closeCard(key);
-    view.showActionResult(row,form.elements.row.value,'Saved: '+result.answer);
+    view.showActionResult(row,submission,form.elements.row.value,{kind:'success',message:'Saved: '+result.answer});
    }catch(error){
     departures.delete(key);
-    view.showActionResult(row,form.elements.row.value,'Not saved: '+error.message);
+    view.showActionResult(row,submission,form.elements.row.value,{kind:'failure',message:'Not saved: '+error.message});
     buttons.forEach(button=>button.disabled=false);
    }
    finally{

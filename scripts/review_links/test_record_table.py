@@ -6,9 +6,107 @@ import shutil
 import subprocess
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from scripts.review_links import record_table, review_page
+from scripts.review_links.test_accounts_page import firefox_probe_results
+
+
+def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> list[list[str]]:
+    """Check the status region during sequential and overlapping saves."""
+    setup = b'''<script>
+const realFetch=fetch;
+let finishPost;
+window.setInterval=()=>0;
+window.fetch=(_path,options={})=>{
+ if(options.method!=='POST') return new Promise(()=>{});
+ return new Promise((resolve,reject)=>{
+  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({ok:true,json:async()=>({
+   answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
+  })});
+ });
+};
+</script>'''
+    probe = r'''<script>
+(async()=>{
+ const reloadKey='save-notice-reload';
+ const status=document.querySelector('[data-hidden-action-status]');
+ const action=ACTION;
+ let failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const clear=()=>status.hidden && !status.textContent;
+ if(sessionStorage.getItem(reloadKey)){
+  failures=JSON.parse(sessionStorage.getItem(reloadKey));
+  sessionStorage.removeItem(reloadKey);
+  check(clear(),'reload clears the failure');
+ }else try{
+  const [first,second,third,older,newer,next,reload,anchor]=document.querySelectorAll('[data-list-item]');
+  const open=row=>{
+   if(row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+  };
+  const startSave=row=>{
+   open(row);
+   const form=row.querySelector('form');
+   const settled=new Promise(resolve=>{
+    const observe=new MutationObserver(()=>{
+     if(!form.dataset.sending){observe.disconnect();resolve();}
+    });
+    observe.observe(form,{attributes:true,attributeFilter:['data-sending']});
+   });
+   finishPost=undefined;
+   form.requestSubmit(form.querySelector('button[value="'+action+'"]'));
+   if(!finishPost) throw new Error('The save did not start.');
+   check(clear(),'the next save clears the notice at submission');
+   const finish=finishPost;
+   return async reason=>{finish(reason);await settled;};
+  };
+  const save=async(row,reason='')=>{
+   const finish=startSave(row);
+   if(!reason){
+    const motion=row.nextElementSibling;
+    check(row.hidden && motion?.matches('[data-record-motion]') &&
+      motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===200),
+      'a successful save starts the 200 ms row fade');
+   }else if(action==='works') open(anchor);
+   await finish(reason);
+  };
+  const failure=(row,reason)=>{
+   const label=action==='works' ? row.querySelector('form').elements.row.value : 'Item '+row.dataset.number;
+   const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
+   check(!status.hidden && status.textContent===label+': '+prefix+reason,
+    'the table shows only '+reason);
+  };
+  for(const row of [first,second,third]){
+   await save(row);
+   check(clear(),'a successful save leaves no notice');
+  }
+  await save(older,'Fixture first failure');failure(older,'Fixture first failure');
+  await save(newer,'Fixture latest failure');failure(newer,'Fixture latest failure');
+  await save(next);
+  check(clear(),'a later success leaves no notice');
+  for(const newerReason of ['Fixture newer overlapping failure','']){
+   const finishOlder=startSave(older),finishNewer=startSave(newer);
+   if(action==='works') open(anchor);
+   await finishNewer(newerReason);
+   await finishOlder('Fixture older overlapping failure');
+   if(newerReason){
+    failure(newer,newerReason);
+    check(newer.querySelector('[data-send-status]').textContent.includes(newerReason),
+     'the newer failure stays on its row');
+   }else check(clear(),'an older failure adds no notice after a newer success');
+   check(older.querySelector('[data-send-status]').textContent.includes('Fixture older overlapping failure'),
+    'the older failure stays on its row');
+  }
+  await save(reload,'Fixture failure before reload');
+  failure(reload,'Fixture failure before reload');
+  sessionStorage.setItem(reloadKey,JSON.stringify(failures));
+  location.reload();
+  return;
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''.replace('ACTION', json.dumps(action)).encode()
+    return firefox_probe_results(page.replace(b'<head>', b'<head>'+setup, 1).replace(b'</body>', probe+b'</body>'))
 
 
 class FilterControlTests(unittest.TestCase):

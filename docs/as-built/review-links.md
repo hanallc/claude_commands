@@ -355,7 +355,10 @@ When the user submits a Review action, the row and its open details fade and col
 The rows below slide into place as the row collapses.
 If the request fails, the row slides back into view and the current card stays selected.
 The animation updates when the user opens or closes a card during the transition.
-The status region above the table shows the result when the row or its details are hidden.
+A successful save adds no notice above the table.
+The status region above the table shows a failure only for the most recent submission.
+It shows that failure when the row or its details are hidden.
+The next save attempt or reload clears this notice.
 Filter and sort changes apply at once.
 The reduced motion preference disables row animations.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
@@ -752,8 +755,8 @@ A refusal restores the last state and parking status from the server.
 A failed Mark read or Tell morty request restores the unread state.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
-The page keeps a separate failure notice for each row.
-The notice appears above the table while the row or its details hide the inline notice.
+Each row keeps its own inline failure notice.
+The List uses the same rules as Review for notices above the table.
 If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps each unconfirmed request ID for an exact retry, even after another action.

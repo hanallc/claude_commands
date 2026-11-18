@@ -35,6 +35,7 @@ from scripts.review_links import change_browser, change_page, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_record_table import save_notice_failures
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
 
@@ -1495,7 +1496,7 @@ window.fetch=async(_path,options={})=>{
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_keeps_a_separate_notice_for_each_hidden_remove(self) -> None:
+    def test_browser_shows_only_the_latest_hidden_remove_notice(self) -> None:
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
@@ -1509,16 +1510,24 @@ window.fetch=async(_path,options={})=>{
  const status=document.querySelector('[data-hidden-action-status]');
  const message=number=>'Item '+number+': Save not confirmed: Fixture lost response';
  const shows=number=>!status.hidden && status.textContent.includes(message(number));
- check(shows(1) && shows(2),'both hidden notices appear above the table');
+ check(!shows(1) && shows(2),'only the latest hidden notice appears above the table');
  row.querySelector('.list-toggle').click();
- check(!shows(1) && shows(2),'opening row one removes only its banner notice');
+ check(!shows(1) && shows(2),'opening row one preserves the latest notice');
  check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
   'row one shows its notice inline');
  second.querySelector('.list-toggle').click();
- check(status.hidden,'opening both rows hides the banner');
+ check(status.hidden,'opening the latest failed row hides the notice above the table');
  row.querySelector('.list-toggle').click();
- check(shows(1) && !shows(2),'closing row one restores only its banner notice');
+ check(status.hidden,'closing row one does not restore the older notice');
 ''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_clears_the_list_save_notice(self) -> None:
+        for number in range(1, 9):
+            _ = self.add(f"List item {number}", number=number)
+        with patch.object(list_page, "counts_strip", return_value=""):
+            page = list_page.render(self.root / "reviews")
+        self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_keeps_the_question_request_after_a_service_failure(self) -> None:
