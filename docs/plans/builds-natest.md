@@ -4838,21 +4838,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_verify_token_wait.test_no_token_records_zero` uses a warm build folder. Cargo seeding (7f9f08a71) adds a valid metadata call on a cold folder.
 - The AWS gate passed both modules: its TMPDIR holds the staff fixture, and Cargo seeding is off on AWS. Only natedev showed the red.
 
-### Phase 348 — the verify wait holder tests use less aws CPU  · status: todo
+### Phase 348 — the verify wait holder tests use less aws CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_wait_holder.py` costs at most half its AWS CPU (45.4 s median, 26 tests) with every assertion kept.
-
-**Spec:**
-1. Base: origin/main 3f0894230, worktree `~/worktrees/claude-natedev-natest-waitholder`, branch `natest-waitholder348`.
-2. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> direct/test_verify_wait_holder.py --tests 20 --commands 20`. Name the costs by test and by command.
-3. The slowest kept test is `VerifyTokenHolderTests.test_token_wait_names_the_owner_and_updates_it_on_the_next_pass` (8.0 s).
-4. Cut repeated process starts and Git calls: share one fixture build per class, call Python in process where the test checks Python output, and keep real subprocess runs only where the test proves process behavior.
-5. Tests read no value /tune can change. No signal handlers, no lazy imports, no test-count goals.
-6. If the floor stays above half, name the architecture change that would cut it.
-
-**Files:** `scripts/direct/test_verify_wait_holder.py` and its test support; production code only where a defect lives.
-
-**Acceptance gate:** the module passes; AWS pair (3 rounds) shows the saving; basedpyright clean on changed files.
+- Hash 3e0f345321472cad642e0a525dcbb6006e4aed37 on branch `natest-waitholder348`, parent origin/main 3f0894230.
+- `direct/test_verify_wait_holder.py` builds the wait fixtures once for each class and keeps the target scripts in the class seed. Six token identity cases call the holder resolver in process. The Linux reservation fixture moves into the helper; the live claim and runner checks stay.
+- The token and Mac fixture environments drop inherited `GIT_*` variables.
+- AWS pair (3 rounds, c7a.4xlarge): 43.57 -> 26.50 CPU s, a saving of 17.03 s; 26 tests pass.
+- Floor: ten live tests use 25.1 CPU s on natedev. Architecture proposal: move the placement and repair decisions in `verify.sh` into a callable Python coordinator.
