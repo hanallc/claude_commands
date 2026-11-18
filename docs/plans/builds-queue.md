@@ -2850,6 +2850,12 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 6. Cutover (condition of builds): it needs no step from the user beyond what the service reload does by itself. If it needs a restart or a wait for old runs, tell builds before the hash.
 7. Send builds a time for this phase when 44bq is sent.
 
+### Phase 44bx — A bad name template or a script path with a space does not harm a queue row  · status: todo
+**Source:** the closure review of phase 44bs, pass 4 (2026-11-18). Two findings moved out of 44bs, because neither is a regression of that phase.
+1. A name template from the config that raises (`owned.default`, `ci_label`) stops the page feed (`slot_wait.py` `_show_owner`, `memory_feed.py` `ci_step_label`). The phase base already formatted `ci_label` without a guard. Validate each name template when the config is read. A template that fails shows the verb alone and the feed continues.
+2. A script path with a space loses its script name (`QueueRowName.script()` sends the complete path to `script_file()`). `/fixture/local repo/check_rows.py` shows `check_rows.py`.
+3. Acceptance: one table test in `test_memory_feed.py` with a failing template for each template key and a script path with a space; each row is on the page with its name; the feed raises nothing. Each row fails on the 44bs checkpoint.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
