@@ -1263,6 +1263,7 @@ try {
             const absent=structuredClone(base);
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
+            delete absentRun.caller;
             await show(absent);
             const absentCells=await evaluate(`({unit:document.querySelector('.walk-table td.unit').textContent,
               owner:document.querySelector('.wrow[data-run] .owner').textContent,
@@ -2423,10 +2424,13 @@ try {
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
         const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
-        Object.assign(gateReading.walk[gateIndex],{name:'natemerge integrate',unit:'natemerge',about:gateAbout,changes:'sdlc branch',
-          showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,started_at:gateReading.read_at-600});
+        const gateRow=gateReading.walk[gateIndex];
+        Object.assign(gateRow,{name:'natemerge integrate',unit:'natemerge',title:{unit:'natemerge',step:'integrate'},
+          about:gateAbout,changes:'sdlc branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
+          started_at:gateReading.read_at-600});
+        delete gateRow.caller;
         // The user, 11-16: "Uses 0.0 GiB? ... has to be a bug". The gate row shows a real use, not memory parts.
-        delete gateReading.walk[gateIndex].parts;
+        delete gateRow.parts;
         await show(gateReading);
         await evaluate(`showTip(proofTip('row', ${gateIndex}),700,420)`);
         const gateTip=await evaluate("[...document.querySelectorAll('#tip dt, #tip dd')].map(cell=>cell.textContent)");
