@@ -325,11 +325,14 @@ def decode_question(value: object) -> NoQuestion | OpenQuestion | AnsweredQuesti
         return AnsweredQuestion(question_id, text, answer)
     return OpenQuestion(question_id, text, decode_slot(fields.get("delivery"), "question"))
 
-def decode_slot(value: object, kind: Literal["verdict", "validation", "question"]) -> DeliveryIntent | NoDelivery:
+def decode_slot(value: object, kind: Literal["verdict", "validation", "question"], *,
+                require_attempt: bool = False) -> DeliveryIntent | NoDelivery:
     if not isinstance(value, dict):
         return NoDelivery()
     fields = cast(dict[str, object], value)
     attempt, state = fields.get("attempt"), fields.get("state")
+    if require_attempt and state == "pending" and (not isinstance(attempt, str) or not attempt.strip()):
+        raise ValueError(f"pending {kind} has no attempt ID")
     feedback = fields.get("feedback", "") if kind == "validation" else ""
     if not isinstance(attempt, str) or state != "pending" or not isinstance(feedback, str):
         return NoDelivery()
@@ -349,19 +352,20 @@ def decode(content: str) -> DeliverySlots:
     return decode_value(value)
 
 
-def decode_value(value: object) -> DeliverySlots:
+def decode_value(value: object, *, require_verdict_attempt: bool = False) -> DeliverySlots:
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     reason = waiting_why(fields.get("waiting_why"))
     if "validation" in fields or "verdict" in fields or "question" in fields:
         return DeliverySlots(decode_validation(fields.get("validation")),
-                             decode_slot(fields.get("verdict"), "verdict"),
+                             decode_slot(fields.get("verdict"), "verdict", require_attempt=require_verdict_attempt),
                              decode_question(fields.get("question")), reason)
     # Older records contain one intent.
     kind = fields.get("kind")
     if kind == "validation":
         return DeliverySlots(decode_validation(fields), NoDelivery(), waiting_why=reason)
     if kind == "verdict":
-        return DeliverySlots(NoDelivery(), decode_slot(fields, "verdict"), waiting_why=reason)
+        return DeliverySlots(NoDelivery(), decode_slot(fields, "verdict", require_attempt=require_verdict_attempt),
+                             waiting_why=reason)
     feedback = fields.get("feedback")
     if isinstance(feedback, str):
         return DeliverySlots(ValidationRequested("", feedback), NoDelivery(), waiting_why=reason)

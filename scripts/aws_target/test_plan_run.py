@@ -620,6 +620,8 @@ GATE_USER_ID = 'fixture-immutable-user'
 GATE_BUCKET = f'cloud-claude-gate-{DEPLOYMENT}'
 GATE_POLICY_NAMES = ('GateScalerPolicy', 'GateGpuTrialScalerPolicy')
 MANAGED_POLICY = 'AWS::IAM::ManagedPolicy'
+GATE_TRIAL_GPU_TYPE = 'g6.xlarge'
+GATE_HANA_GPU_TYPE = 'g6.2xlarge'
 
 
 @final
@@ -681,19 +683,19 @@ class GatePlanTests(CostFixture):
 regions={' '.join(self.regions)}
 instance_types=m7a.8xlarge
 credential_file={self.credentials_path}
-hana_gpu_instance_types=g4dn.2xlarge
-hana_gpu_spot_max_usd_per_hour={{"g4dn.2xlarge": "0.5"}}
-gpu_size_trial_spot_max_usd_per_hour={{"g6.8xlarge": "0.8"}}
-gpu_size_trial_limit_usd=3
-gpu_size_trial_box_extra_usd=0.2
+hana_gpu_instance_types={GATE_HANA_GPU_TYPE}
+hana_gpu_spot_max_usd_per_hour={json.dumps({GATE_HANA_GPU_TYPE: '0.5'})}
+gpu_size_trial_spot_max_usd_per_hour={json.dumps({GATE_TRIAL_GPU_TYPE: '0.25'})}
+gpu_size_trial_limit_usd=2
+gpu_size_trial_box_extra_usd=0.05
 # whole: 1..
-gpu_size_trial_lifetime_minutes=60
-# range: 0.01..
-api_timeout_s=1
-# range: 0.01..
-spot_max_usd_per_hour=0.8
+gpu_size_trial_lifetime_minutes=10
+# range: 1..
+api_timeout_s=5
+# range: 0..
+spot_max_usd_per_hour=0.5
 # whole: 1..
-root_gib=64
+root_gib=30
 # whole: 1..
 artifact_days=7
 # whole: 1..
@@ -701,7 +703,7 @@ log_days=7
 # whole: 1..
 expiry_schedule_minutes=5
 # whole: 1..
-expiry_timeout_s=60
+expiry_timeout_s=20
 # whole: 1..
 expiry_memory_mib=128
 # range: 0..
@@ -889,7 +891,10 @@ shared_usd_per_month=1
         contexts = {ledger.text(row, 'ContextKeyName'): row
                     for row in ledger.rows({'rows': request['ContextEntries']}, 'rows')}
         self.assertEqual(contexts['aws:RequestedRegion']['ContextKeyValues'], [region])
-        if action == 'ec2:RunInstances' and ':instance/' in resource:
+        if action == 'ec2:GetSpotPlacementScores':
+            self.assertEqual(resource, '*')
+            self.assertEqual(contexts['ec2:Region']['ContextKeyValues'], [region])
+        elif action == 'ec2:RunInstances' and ':instance/' in resource:
             self.assertEqual(contexts['ec2:InstanceMarketType']['ContextKeyValues'], ['spot'])
             self.assertEqual(contexts['aws:RequestTag/GateDeployment']['ContextKeyValues'], [DEPLOYMENT])
             self.assertEqual(contexts['aws:RequestTag/GpuSizeTrial']['ContextKeyValues'], ['setup-probe'])
@@ -913,12 +918,6 @@ shared_usd_per_month=1
         decision = 'implicitDeny' if self.failure == action and self.failure_region == region else 'allowed'
         return {'EvaluationResults': [{'EvalActionName': action, 'EvalResourceName': resource, 'EvalDecision': decision}]}
 
-    @staticmethod
-    def gpu_types() -> set[str]:
-        from scripts.aws_target import cloud_gate, gpu_size_trial
-
-        return set(gpu_size_trial.settings().spot_max_usd_per_hour) | set(cloud_gate.settings().words('hana_gpu_instance_types'))
-
     def calls_in(self, region: str) -> list[tuple[str, str]]:
         return [(service, operation) for place, service, operation in self.calls if place == region]
 
@@ -938,14 +937,19 @@ shared_usd_per_month=1
                     ('ec2', 'describe-images'), ('cloudformation', 'describe-stacks')]
         reads = [('iam', action) for action in ('ec2:DescribeInstances', 'ec2:DescribeInstanceTypeOfferings',
                  'ec2:DescribeSpotPriceHistory', 'servicequotas:GetServiceQuota', 'ce:GetCostAndUsage')]
+        scores = [('iam', 'ec2:GetSpotPlacementScores')]
         launch = [('iam', action) for action in (
             *(['ec2:RunInstances'] * 6), 'ec2:CreateTags', 'ec2:RunInstances', 'ec2:CreateTags')]
         finish = [('iam', 'iam:PassRole'), ('iam', 'ec2:TerminateInstances')]
         s3 = [('iam', action) for action in ('s3:PutObject', 's3:GetObject', 's3:PutObject', 's3:GetObject',
                                            's3:ListBucket', 's3:AbortMultipartUpload')]
-        count = len(self.gpu_types())
-        self.assertEqual(self.calls_in(GATE_HOME), home + change + policies + reads + launch * count + finish + s3)
-        self.assertEqual(self.calls_in(GATE_REGION), regional + change + launch * count + finish)
+        count = len((GATE_TRIAL_GPU_TYPE, GATE_HANA_GPU_TYPE))
+        for region, calls in (
+            (GATE_HOME, home + change + policies + reads + scores + launch * count + finish + s3),
+            (GATE_REGION, regional + change + scores + launch * count + finish),
+        ):
+            with self.subTest(region=region):
+                self.assertEqual(self.calls_in(region), calls)
 
     def test_busy_account_stack_lock_refuses_the_plan_before_aws(self) -> None:
         with account_stack_lock(self.state) as access:
@@ -1278,11 +1282,14 @@ shared_usd_per_month=1
 
     def test_regional_recovery_requires_a_passing_simulation(self) -> None:
         self.statuses[GATE_REGION] = 'ROLLBACK_COMPLETE'
-        self.failure, self.failure_region = 'ec2:TerminateInstances', GATE_REGION
-        status, output = self.run_plan()
-        self.assertEqual(status, 1, output)
-        self.assertIn('us-west-2: refused: Gate scaler ec2:TerminateInstances denied.', output)
-        self.assertNotIn(('cloudformation', 'create-change-set'), self.calls_in(GATE_REGION))
+        for action in ('ec2:TerminateInstances', 'ec2:GetSpotPlacementScores'):
+            with self.subTest(action=action):
+                self.calls.clear()
+                self.failure, self.failure_region = action, GATE_REGION
+                status, output = self.run_plan()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f'{GATE_REGION}: refused: Gate scaler {action} denied.', output)
+                self.assertNotIn(('cloudformation', 'create-change-set'), self.calls_in(GATE_REGION))
 
     def test_absent_regional_stack_never_creates_a_review_stack(self) -> None:
         self.statuses[GATE_REGION] = 'absent'

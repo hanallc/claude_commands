@@ -2876,12 +2876,12 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                     continue
                 else:
                     reason = 'The captured Hana source needs a complete bundle'
-                    complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
                     source_update_sent = True
                     try:
+                        complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
                         _ = execution.publish_source_update(lifecycle.directory, prepared, complete, objects)
-                    except (OSError, ValueError, RuntimeError, ConnectionError):
-                        reason = 'The Hana source update publication is unresolved'
+                    except (OSError, ValueError, RuntimeError, ConnectionError) as error:
+                        reason = f'The Hana source update publication is unresolved: {error}'
                         break
                     time.sleep(configuration.whole('control_poll_seconds'))
                     continue

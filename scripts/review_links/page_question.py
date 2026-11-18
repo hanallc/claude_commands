@@ -110,15 +110,16 @@ def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answ
     return Answered(question_record.Question(question.question_id, question.asked_at, question.words, response))
 
 
-def open_question_html(question: question_record.Question) -> str:
+def open_question_html(question: question_record.Question, *, asked_time_html: str = "") -> str:
     return (f'<section class="page-question" data-question="{html.escape(question.question_id, quote=True)}">'
             + f'<h3>Question {html.escape(question.question_id)} — waiting for an answer</h3>'
-            + f'<p>{html.escape(question.words)}</p></section>')
+            + asked_time_html + f'<p>{html.escape(question.words)}</p></section>')
 
 
-def answered_question_html(question: question_record.Question) -> str:
-    if question.answer is None:
-        raise ValueError('This question has no answer.')
+def answered_question_html(question: question_record.Question, answer: question_record.Answer, *,
+                           asked_time_html: str = "", answer_time_html: str = "", answer_mark_html: str = "") -> str:
     return (f'<section class="page-question" data-question="{html.escape(question.question_id, quote=True)}">'
-            + f'<h3>Question {html.escape(question.question_id)}</h3><p>{html.escape(question.words)}</p>'
-            + f'<h3>Answer</h3><p>{html.escape(question.answer.text)}</p></section>')
+            + f'<h3>Question {html.escape(question.question_id)}</h3>'
+            + asked_time_html + f'<p>{html.escape(question.words)}</p>'
+            + '<h3>Answer' + answer_mark_html + '</h3>'
+            + answer_time_html + f'<p>{html.escape(answer.text)}</p></section>')

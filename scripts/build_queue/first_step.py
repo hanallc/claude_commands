@@ -17,7 +17,8 @@ from scripts.buildlog import store
 from scripts.direct.local_release_wait import local_release_waiter
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
-from scripts.lib.build_steps import VerifyCommand, verify_command, command_program
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
+from scripts.lib.build_steps import VerifyCommand, command_job, command_program, verify_command
 
 
 class FirstStepRefused(RuntimeError):
@@ -139,6 +140,8 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
                    position: SlotQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
     name = 'targeted-test' if command_program(command) == 'targeted_test.py' else 'merge-gate'
+    resolved_job = command_job(command)
+    job = resolved_job if isinstance(resolved_job, StepJob) else GATE_JOB_NOT_RECORDED
     config = records.read_memory_config()
     first = config.program_first_peaks.get(name)
     if first is None:
@@ -158,7 +161,8 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
             arguments.extend(('--type-dirs', word.partition('=')[2]))
             break
     def refresh() -> wire.AdmitRequest:
-        return client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
+        request = client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
+        return replace(request, identity=replace(request.identity, job=job))
     output = client.WaitOutput()
     answer = queue_place.request_place(queue_place.RefreshedRequest(refresh), output)
     if isinstance(answer, wire.Refused):

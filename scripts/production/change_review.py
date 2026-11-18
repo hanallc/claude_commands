@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -444,6 +444,18 @@ def row_id(row: str) -> str:
 def read(path: Path) -> str:
     """The list's text; a list not yet written reads as the skeleton's tables."""
     return path.read_text(encoding="utf-8") if path.exists() else BODY
+
+
+def review_list_source(path: Path) -> Path:
+    """Resolve a review list path and reject existing paths that are not files."""
+    source = path.resolve()
+    try:
+        mode = source.stat().st_mode
+    except FileNotFoundError:
+        return source
+    if not stat.S_ISREG(mode):
+        raise ChangeReviewError(f"{source}: the review list must be a regular file")
+    return source
 
 
 def list_file(showrunner: str, *, sources: list[Path] | None = None) -> Path:
@@ -1984,7 +1996,7 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         result = scratch.end(f"row:{_owner(path)}-{row}")
         return ([f"removed {folder}" for folder in result]
                 + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
-    except (scratch.ScratchError, OSError) as error:
+    except (conf.Unusable, scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 
 
@@ -2043,6 +2055,7 @@ class PendingVerdictCleanup:
     feature_review: str = ''
     superseded_wait: str = ''
     wait_log: WaitSupersessionDestination | NoSavedWaitLogDestination = NO_SAVED_WAIT_LOG_DESTINATION
+    require_git_commit: bool = True
 
     @classmethod
     def for_row(cls, root: Path, path: Path, row: str) -> PendingVerdictCleanup:
@@ -2050,16 +2063,23 @@ class PendingVerdictCleanup:
         return cls(path, row, root / name.replace('.review-link-delivery-', VERDICT_CLEANUP_PREFIX, 1))
 
     @classmethod
-    def load(cls, intent: Path, lists: Path) -> PendingVerdictCleanup:
-        """Read the exact list, row and verdict for restart cleanup."""
-        fields = cast(dict[str, object], json.loads(intent.read_text(encoding='utf-8')))
+    def load(cls, intent: Path, expected_directory: Path | None = None) -> PendingVerdictCleanup:
+        """Read the exact list, row and verdict from a private cleanup record."""
+        with os.fdopen(os.open(intent, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding='utf-8') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise ChangeReviewError(f"{intent}: scratch cleanup record must be private")
+            fields = cast(dict[str, object], json.load(source))
         path = Path(cast(str, fields['list']))
         row = _row_id('row', cast(str, fields['row']))
+        if path != review_list_source(path) or (expected_directory is not None and path.parent != expected_directory):
+            raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         cleanup = replace(cls.for_row(intent.parent, path, row),
                           verdict=_words('verdict', cast(str, fields['verdict'])),
                           feature_review=cast(str, fields.get('feature_review', '')),
-                          superseded_wait=cast(str, fields.get('superseded_wait', '')))
-        if path.parent != lists or path.is_symlink() or not path.match(PREFIX+'*.md') or cleanup.intent != intent:
+                          superseded_wait=cast(str, fields.get('superseded_wait', '')),
+                          require_git_commit=fields.get('require_git_commit') is not False)
+        if cleanup.intent != intent:
             raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         if 'wait_log' in fields:
             cleanup = replace(cleanup, wait_log=WaitSupersessionDestination.from_fields(
@@ -2088,12 +2108,15 @@ class PendingVerdictCleanup:
     def confirm_durability(self) -> None:
         """Confirm the visible verdict before recovery performs its closeout."""
         self.sync()
-        _commit([self.path], f'{_owner(self.path)} verdict {self.row}', report_warning=self.commit_failed)
+        _commit([self.path], f'{_owner(self.path)} verdict {self.row}',
+                report_warning=self.commit_failed if self.require_git_commit else _print_warning)
 
     def save(self) -> None:
         fields: dict[str, object] = {
             'list':str(self.path.resolve()), 'row':self.row, 'verdict':self.verdict,
             'feature_review':self.feature_review, 'superseded_wait':self.superseded_wait}
+        if not self.require_git_commit:
+            fields['require_git_commit'] = False
         if isinstance(self.wait_log, WaitSupersessionDestination):
             fields['wait_log'] = self.wait_log.fields()
         write_text_atomic(self.intent, json.dumps(fields)+'\n', new_file_mode=0o600)
@@ -2232,7 +2255,8 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
         else:
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append,
-                                    publish=publish, superseded=superseded, commit_warning=cleanup.commit_failed)
+                                    publish=publish, superseded=superseded,
+                                    commit_warning=cleanup.commit_failed if cleanup.require_git_commit else warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings, cleanup=cleanup)
 
 

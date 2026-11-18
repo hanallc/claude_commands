@@ -1439,8 +1439,9 @@ def _read_local_roster(environment: Mapping[str, str], *, membership: staff.Staf
     warnings: list[str] = []
     machine = machine_name()
     directory = sessions.sessions_dir()
-    if directory in registry.unreadable:
-        _problem(problems, "Claude session records", f"cannot list {directory}")
+    for path in registry.unreadable:
+        reason = f"cannot list {path}" if path == directory else f"cannot read {path}"
+        _problem(problems, "Claude session records", reason)
     newest: dict[str, SessionRecord] = {}
     for record in sessions.running_records(registry):
         _ = newest.setdefault(record["sessionId"], record)
