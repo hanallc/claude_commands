@@ -1,8 +1,10 @@
 """Shell stand-ins keep argument records without starting Python per command."""
 
+import shlex
 from pathlib import Path
+from typing import Literal
 
-from scripts.lib.checkout_test_support import python_tool_source
+from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
 
 
 JSON_SHELL = r'''
@@ -40,6 +42,29 @@ def write_shell(path: Path, source: str) -> None:
     """Bash builtins handle JSON escaping and timed FIFO reads on Linux and macOS."""
     _ = path.write_text("#!/bin/bash\n" + JSON_SHELL + source)
     path.chmod(0o755)
+
+
+def configure_nextest_trim(shim: Path, trim: int | Literal["run"]) -> None:
+    """Keep the log writer active for each trim outcome."""
+    original = Path(__file__).resolve().with_name("nextest_log.py")
+    interpreter, _, body = fixture_shim_source().partition("\n")
+    trim_command = f"exit {trim}" if isinstance(trim, int) else ":"
+    source = (interpreter + '\nif [ "${2##*/}" = nextest_log.py ]; then\n'
+              + f'    shift 2\n    set -- -B {shlex.quote(str(original))} "$@"\n'
+              + f'else\n    {trim_command}\nfi\n' + body)
+    _ = shim.write_text(source)
+    shim.chmod(0o755)
+
+
+def install_nextest_log_writer(home: Path) -> Path:
+    """Make the checkout's log writer available in a private home."""
+    script = home / ".claude/scripts/mac_test/nextest_log.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.symlink_to(Path(__file__).resolve().with_name("nextest_log.py"))
+    shim = home / ".claude/scripts/lib/py"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    configure_nextest_trim(shim, 0)
+    return shim
 
 
 COMMAND_STUB = r'''

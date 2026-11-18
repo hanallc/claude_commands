@@ -323,7 +323,8 @@ class ReviewPageTests(unittest.TestCase):
         archive_snapshot = archive_cache.get()
         record = archive_snapshot.records[created.key]
         self.assertEqual(record.queue_after, str(archived))
-        with (patch.object(review_items, 'proposal_store_folders', side_effect=AssertionError('The exact read scanned folders.')),
+        with (patch('scripts.production.record_store.known_folders',
+                    side_effect=AssertionError('The exact read scanned folders.')),
               patch.object(review_items, 'store_paths', side_effect=AssertionError('The exact read listed records.'))):
             self.assertEqual(review_items.read_current(self.root, record, archive_snapshot.members), record)
             retry = archive_cache.create_submission(request)
@@ -700,6 +701,40 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertTrue(any(str(proposal_path) in notice for notice in broken.notices))
                 with self.assertRaises(PermissionError):
                     _ = review_items.read_current(self.root, moved.records[issue], staff.snapshot())
+
+    def test_snapshot_shows_and_counts_proposals_from_a_producer_document(self) -> None:
+        doc = self.fixture.temporary / 'producer.md'
+        folder = self.fixture.temporary / 'producer-proposals'
+        folder.mkdir()
+        _ = doc.write_text(f'# Producer\n- **Proposals:** {folder}\n')
+        producer = fixture_member('producer', name='producer', doc=staff.LiveDoc(local_machine(), doc))
+        path = folder / 'P1.md'
+        _ = path.write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+            +f'proposed_by: {producer.id}\nproposal_id: P1\ndate_created: 2026-11-01\n---\n'
+            +'# Reduce the build time\n')
+
+        snapshot = review_page.build_snapshot(self.root)
+        proposals = [item for item in snapshot.records.values() if item.type == review_items.ReviewType.PROPOSAL]
+        self.assertEqual(review_items.count_items(proposals, datetime.now(snapshot.zone)), 1)
+        self.assertIn('proposal/'+str(path), {entry['key'] for entry in snapshot.entries})
+        self.assertEqual(proposals[0].owner, producer.id)
+        self.assertIn(doc, snapshot.source_stamps)
+        self.assertEqual(snapshot.notices, ())
+
+    def test_snapshot_ignores_producer_documents_and_reports_missing_production(self) -> None:
+        directory = self.fixture.temporary / 'brain'
+        directory.mkdir()
+        missing_producer = self.fixture.temporary / 'current.md'
+        missing_production = self.fixture.temporary / 'production-missing.md'
+        _ = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
+        _ = fixture_member('producer', name='morty', doc=staff.LiveDoc(local_machine(), missing_producer))
+        _ = fixture_member('showrunner', name='missing', doc=staff.LiveDoc(local_machine(), missing_production))
+
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertIn(f'Could not load {missing_production}.', snapshot.notices)
+        for path in (directory, missing_producer):
+            self.assertNotIn(f'Could not load {path}.', snapshot.notices)
+            self.assertNotIn(path, snapshot.source_stamps)
 
     def test_change_projection_isolates_an_unreadable_production_path(self) -> None:
         doc = self.fixture.temporary / 'unreadable.md'
@@ -3366,7 +3401,7 @@ window.fetch=async(url,options={})=>{
    });
    observer.observe(recipients,{childList:true});
   });
-  review.querySelector('[data-review-new]').click();
+  document.querySelector('[data-review-new]').click();
   if(!dialog.open) throw new Error('New must open the dialog.');
   dialog.querySelector('[name="kind"][value="bug"]').click();
   (await ready).click();
@@ -3629,6 +3664,31 @@ window.fetch=async(url)=>{
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_button_aligns_with_the_review_title_at_desktop_width(self) -> None:
+        markup = review_page.build_snapshot(self.root).page.decode()
+        probe = r'''<script>
+(async()=>{
+ const failures=[];
+ frameElement.style.width='1280px';
+ await document.fonts.ready;
+ const group=document.querySelector('[role="group"][aria-label="Type"]');
+ const button=document.querySelector('[data-review-new]');
+ const heading=document.querySelector('h1.page-title'),label=document.createRange();
+ label.selectNodeContents(heading);
+ const bounds=button.getBoundingClientRect(),title=heading.getBoundingClientRect();
+ const table=document.querySelector('.list-table').getBoundingClientRect();
+ if(innerWidth!==1280 || bounds.width===0 || bounds.left<label.getBoundingClientRect().right ||
+    Math.abs((bounds.top+bounds.bottom)-(title.top+title.bottom))>2 || Math.abs(bounds.right-table.right)>1){
+  failures.push('The New button must align with the title at the right edge at 1280 px.');
+ }
+ if(group.contains(button)) failures.push('The Type chips must exclude the New button.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        markup = markup.replace('</body>', probe + '</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:

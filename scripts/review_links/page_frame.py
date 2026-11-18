@@ -25,8 +25,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str) -> str:
-    """Build the title and its shared refresh status."""
+def title(text: str, page: str, *, action: str = "") -> str:
+    """Build the title and refresh status with an optional action beside the title."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -36,7 +36,10 @@ def title(text: str, page: str) -> str:
                     + '>' + icon_svg(icon) + '</span>' for state, icon in (
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
-    return (f'<h1 class="page-title">{html.escape(text)}</h1>'
+    heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
+    if action:
+        heading = f'<div class="page-heading">{heading}{action}</div>'
+    return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
             + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
@@ -211,6 +214,8 @@ STYLE = (BUTTON_STATES
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
          + 'main:has(>.page-status):not(.page-wide){max-width:1124px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
+         + '.page-heading{position:relative;margin-bottom:8px}'
+         + '.page-heading>.page-title{margin:0}'
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
          + r'''
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;

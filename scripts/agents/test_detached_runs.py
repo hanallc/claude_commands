@@ -572,10 +572,72 @@ class DetachedRunsTests(unittest.TestCase):
         path = self.finished_run("cancelled", pid=DEAD_PID, exit_code=143, completion_pending=True)
         collected, = self.collect_completions(1)
         path.unlink()
-        with patch.object(detached_runs, "_complete_worker_dispatch") as complete:
+        with (patch.object(detached_runs, "_complete_worker_dispatch") as complete,
+              contextlib.redirect_stderr(io.StringIO())):
             collected.complete()
             complete.assert_not_called()
         self.assertFalse(path.exists())
+
+    def test_collected_completions_skip_invalid_records_and_complete_later_records(self) -> None:
+        read = worker_lifecycle.read_json_object
+        invalid = b"{"
+        for damage in ("missing", "unreadable", "mismatched ID", "locked read"):
+            with self.subTest(damage=damage):
+                path = self.finished_run("cancelled", pid=DEAD_PID, exit_code=143, completion_pending=True)
+                later = self.finished_run("later", pid=DEAD_PID, completion_pending=True)
+                collected, = self.collect_completions(1)
+                if damage == "missing":
+                    path.unlink()
+                elif damage == "unreadable":
+                    _ = path.write_bytes(invalid)
+                elif damage == "mismatched ID":
+                    self.update_record(path, run_id="other-run")
+
+                def damage_during_locked_read(target: Path) -> dict[str, object]:
+                    if damage == "locked read" and target == path:
+                        with target.with_suffix(".completion.lock").open("r") as claim:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        _ = target.write_bytes(invalid)
+                    return read(target)
+
+                saved = invalid if damage == "locked read" else path.read_bytes() if path.exists() else b""
+                errors = io.StringIO()
+                with (patch.object(detached_runs, "_complete_worker_dispatch",
+                                   return_value=detached_runs.CompletionReplay.HANDLED) as complete,
+                      patch.object(worker_lifecycle, "read_json_object", side_effect=damage_during_locked_read),
+                      contextlib.redirect_stderr(errors)):
+                    collected.complete()
+                complete.assert_called_once()
+                self.assertEqual(complete.call_args.args[0]["run_id"], later.stem)
+                self.assertIn(str(path), errors.getvalue())
+                self.assertFalse(worker_lifecycle.read_json_object(later)["completion_pending"])
+                if damage == "missing":
+                    self.assertFalse(path.exists())
+                else:
+                    self.assertEqual(path.read_bytes(), saved)
+                    path.unlink()
+
+    def test_reap_rejects_a_run_id_that_does_not_match_its_file(self) -> None:
+        for status in ("running", "finished", "collected"):
+            with self.subTest(status=status):
+                path = self.finished_run("cancelled", pid=DEAD_PID, exit_code=143,
+                                         status="running" if status == "running" else "finished",
+                                         completion_pending=status != "running")
+                collected = self.collect_completions(1) if status == "collected" else []
+                self.update_record(path, run_id="other-run")
+                saved = path.read_bytes()
+                with (patch.object(detached_runs, "_complete_worker_dispatch") as complete,
+                      patch.object(detached_runs, "deliver", return_value="fixture delivery") as deliver,
+                      contextlib.redirect_stderr(io.StringIO())):
+                    if collected:
+                        collected[0].complete()
+                    else:
+                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                    complete.assert_not_called()
+                    deliver.assert_not_called()
+                self.assertEqual(path.read_bytes(), saved)
+                path.unlink()
 
     def test_reap_skips_a_completion_claim_that_another_holder_has(self) -> None:
         self.set_pass("active", 0)
@@ -997,6 +1059,29 @@ sys.exit(1)
         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "running")
 
+    def test_failed_ps_does_not_reap_a_run(self) -> None:
+        absent = subprocess.CompletedProcess(["ps"], 1, "", "")
+        exists = Path.exists
+
+        def exists_without_proc(file: Path) -> bool:
+            return file != Path("/proc/self") and exists(file)
+
+        failures = (subprocess.CompletedProcess(["ps"], 1, "", "ps: fixture failure"),
+                    subprocess.CompletedProcess(["ps"], 2, "", ""), OSError("ps could not start"),
+                    subprocess.CompletedProcess(["ps"], 0, "(python3.13)\n", ""),
+                    subprocess.CompletedProcess(["ps"], 0, "(py(test))\n", ""))
+        with patch.object(Path, "exists", exists_without_proc):
+            for failure in failures:
+                path = self.finished_run("active", status="running", pid=DEAD_PID,
+                                         command_pid=0, command_group=0)
+                saved = path.read_bytes()
+                with self.subTest(failure=failure):
+                    with patch.object(subprocess, "run", side_effect=[failure]):
+                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                        self.assertEqual(path.read_bytes(), saved)
+                    with patch.object(subprocess, "run", return_value=absent):
+                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+
     def test_start_exits_3_for_a_caller_without_a_registered_worker(self) -> None:
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
@@ -1233,16 +1318,20 @@ sys.exit(status)
             send.assert_not_called()
             self.assertEqual(path.read_bytes(), saved_bytes)
 
-        with self.subTest(case="supervisor changes after the stop reason replaces the record"):
+        with self.subTest(case="supervisor changes after the stop reason is staged"):
             self.update_record(path, stop_reason="earlier stop")
             saved = cast(dict[str, object], json.loads(path.read_text()))
+            staged_stop = path.with_suffix(".stop-staged")
 
             def same_supervisor(_pid: int, _record_path: Path) -> bool:
-                current = cast(dict[str, object], json.loads(path.read_text()))
-                if current["stop_reason"] == "new stop":
-                    self.assertIs(current.get("stop_pass_requested"), True)
-                    self.assertTrue(pending_stop.is_file())
-                return current["stop_reason"] == "earlier stop"
+                self.assertEqual(cast(object, json.loads(path.read_text())), saved)
+                if not staged_stop.exists():
+                    return True
+                staged = cast(dict[str, object], json.loads(staged_stop.read_text()))
+                self.assertEqual(staged["stop_reason"], "new stop")
+                self.assertIs(staged.get("stop_pass_requested"), True)
+                self.assertTrue(pending_stop.is_file())
+                return False
 
             with (patch.object(detached_run_process, "supervisor_match", side_effect=same_supervisor) as observe,
                   patch.object(process_group, "send_process_group") as send):
@@ -1251,8 +1340,9 @@ sys.exit(status)
             send.assert_not_called()
             self.assertEqual(cast(object, json.loads(path.read_text())), saved)
             self.assertFalse(pending_stop.exists())
+            self.assertFalse(staged_stop.exists())
 
-        with self.subTest(case="directory sync fails after the stop reason replaces the record"):
+        with self.subTest(case="directory sync fails after the stop reason is staged"):
             self.update_record(path, stop_reason="earlier stop")
             saved = cast(dict[str, object], json.loads(path.read_text()))
             with (patch.object(atomic_file, "sync_folder", side_effect=[OSError("fixture sync failure"), None]),
@@ -1286,6 +1376,87 @@ sys.exit(status)
             self.assertEqual(checks, 2)
             send.assert_called_once_with(os.getpid(), signal.SIGTERM)
             self.assertTrue(pending_stop.is_file())
+
+    def test_failed_stop_sync_leaves_the_original_record_when_rollback_would_fail(self) -> None:
+        path = self.record(["fixture command"])
+        saved = path.read_bytes()
+        replace = os.replace
+        sync_failed = False
+
+        def fail_sync(_folder: Path) -> None:
+            nonlocal sync_failed
+            sync_failed = True
+            raise OSError("fixture sync failure")
+
+        def fail_rollback(source: Path, target: Path) -> None:
+            if sync_failed and target == path:
+                raise OSError("fixture rollback failure")
+            replace(source, target)
+
+        with (patch.object(atomic_file, "sync_folder", side_effect=fail_sync),
+              patch.object(os, "replace", side_effect=fail_rollback),
+              patch.object(process_group, "send_process_group") as send,
+              self.assertRaises(OSError)):
+            _ = detached_runs.stop_with_reason(
+                path, "fixture stop", verify_group=lambda: detached_runs.CommandGroup(DEAD_PID, "fixture start"),
+                signal_group=process_group.send_process_group)
+        self.assertTrue(sync_failed)
+        send.assert_not_called()
+        self.assertEqual(path.read_bytes(), saved)
+
+    def test_stop_reason_becomes_visible_after_the_signal(self) -> None:
+        replace = os.replace
+        sync_folder = atomic_file.sync_folder
+        for failure in ("none", "rename", "sync"):
+            with self.subTest(failure=failure):
+                path = self.record(["fixture command"])
+                saved = path.read_bytes()
+                signaled = False
+
+                def signal_fixture(group: int, signum: int) -> None:
+                    nonlocal signaled
+                    self.assertEqual((group, signum), (DEAD_PID, signal.SIGTERM))
+                    self.assertEqual(path.read_bytes(), saved)
+                    signaled = True
+
+                def rename_fixture(source: Path, target: Path) -> None:
+                    if target == path:
+                        self.assertTrue(signaled)
+                        if failure == "rename":
+                            raise OSError("fixture rename failure")
+                    replace(source, target)
+
+                def sync_fixture(folder: Path) -> None:
+                    if signaled and failure == "sync":
+                        raise OSError("fixture sync failure")
+                    sync_folder(folder)
+
+                errors = io.StringIO()
+                with (patch.object(os, "replace", side_effect=rename_fixture),
+                      patch.object(atomic_file, "sync_folder", side_effect=sync_fixture),
+                      contextlib.redirect_stderr(errors)):
+                    self.assertTrue(detached_runs.stop_with_reason(
+                        path, "fixture stop", verify_group=lambda: detached_runs.CommandGroup(DEAD_PID, "fixture start"),
+                        signal_group=signal_fixture))
+                self.assertTrue(signaled)
+                self.assertFalse(path.with_suffix(".stop-staged").exists())
+                if failure == "none":
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertIn(str(path), errors.getvalue())
+                    self.assertIn(f"fixture {failure} failure", errors.getvalue())
+                if failure == "rename":
+                    self.assertEqual(path.read_bytes(), saved)
+                    with (patch.object(detached_runs, "scope_prefix", return_value=["fixture-scope"]),
+                          patch.object(detached_runs, "_run", return_value=143) as run):
+                        record = self.supervise(path)
+                    run.assert_called_once_with(["fixture-scope", "fixture command"], ANY, path.with_suffix(".log"))
+                    self.assertEqual(record.get("stop_reason"), "fixture stop")
+                    message, = cast(list[str], self.pending()["messages"])
+                    self.assertIn("Result: STOPPED (exit 143)", message)
+                    self.assertIn("Stop reason: fixture stop", message)
+                else:
+                    self.assertEqual(worker_lifecycle.read_json_object(path).get("stop_reason"), "fixture stop")
 
     def test_updates_do_not_write_missing_or_invalid_records(self) -> None:
         with self.subTest(update="stop after prune"):
@@ -1501,10 +1672,19 @@ exit 143
         self.update_record(path, pid=DEAD_PID, supervisor_started="fixture-start")
         _ = self.stack.enter_context(patch.object(process_start, "process_start",
                                                  return_value=process_start.Zombie("fixture-start")))
-        with patch.object(subprocess, "run", side_effect=OSError("unreadable process table")):
-            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
-        self.assertEqual(self.pending(), {})
-        self.assertEqual(json.loads(path.read_text())["status"], "running")
+        for scan in (OSError("unreadable process table"),
+                     subprocess.CalledProcessError(1, ["ps"], "", ""),
+                     UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+                     subprocess.CompletedProcess(["ps"], 0, "", ""),
+                     subprocess.CompletedProcess(["ps"], 0, "", "ps: fixture failure"),
+                     subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} Z\n", "ps: partial listing")):
+            with self.subTest(scan=scan):
+                with (patch.object(detached_run_process, "supervises", return_value=False),
+                      patch.object(subprocess, "run", side_effect=[scan]) as group_scan):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                group_scan.assert_called_once()
+                self.assertEqual(self.pending(), {})
+                self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "running")
 
         with self.subTest(case="ps times out for both running and finished records"):
             finished = self.finished_run("awaiting-completion", pid=DEAD_PID, completion_pending=True)
@@ -1573,6 +1753,20 @@ exit 143
                     group_scan.assert_not_called()
                 self.assertEqual(json.loads(path.read_text())["status"], "finished")
                 self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
+    def test_orphan_reaping_finishes_when_the_command_group_id_is_reused(self) -> None:
+        group = DEAD_PID + 2
+        reused = process_start.Started("reused-start")
+        for before_scan in (reused, process_start.Gone()):
+            with self.subTest(before_scan=type(before_scan).__name__):
+                path = self.record(["bash", "verify.sh"])
+                self.update_record(path, pid=DEAD_PID, command_pid=group, command_group=group,
+                                   command_started="original-start")
+                listing = subprocess.CompletedProcess(["ps"], 0, f"{group} S\n", "")
+                with (patch.object(process_start, "process_start", side_effect=[before_scan, reused]),
+                      patch.object(subprocess, "run", return_value=listing)):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), [path.stem])
+                self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "finished")
 
     def test_orphan_reaping_waits_for_live_members_of_the_command_group(self) -> None:
         group = DEAD_PID + 2
@@ -1761,14 +1955,12 @@ send.deliver_worker_text = fake_sender
                             flock(descriptor, operation)
 
                     def reuse_at_recheck(pid: int, proc_root: Path = build_hold.PROC_ROOT) -> str:
-                        if pid == 10:
-                            stopping = cast(dict[str, object], json.loads(path.read_text()))
-                            if stopping.get("stop_reason") == reason:
-                                rechecking.set()
-                                self.assertTrue(write_attempted.wait(timeout=guard.remaining()))
-                                self.assertTrue(supervisor_blocked.is_set(), "the drain must hold the record lock")
-                                _ = (proc / "10/stat").write_text("10 (reused) S 100 " + "0 " * 17 + "3000")
-                                cancelled.set()
+                        if pid == 10 and path.with_suffix(".stop-staged").exists():
+                            rechecking.set()
+                            self.assertTrue(write_attempted.wait(timeout=guard.remaining()))
+                            self.assertTrue(supervisor_blocked.is_set(), "the drain must hold the record lock")
+                            _ = (proc / "10/stat").write_text("10 (reused) S 100 " + "0 " * 17 + "3000")
+                            cancelled.set()
                         return read_start(pid, proc_root)
 
                     def supervise_at_recheck() -> detached_runs.RunRecord:
@@ -2517,6 +2709,101 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(reply.read_text().rstrip(), result)
         self.assertEqual(len(agent.notices), 2)
         self.assertIn("phase 40: done", agent.notices[1])
+
+    def test_supervisor_recovers_a_pane_stop_staged_by_an_interrupted_stopper(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        record = self.record(row)
+        record.update(pid=DEAD_PID, command_group=DEAD_PID, command_started="private-start",
+                      pane_dispatch_id=dispatch)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        reason = "Interrupted pane stop."
+        write_text_atomic(path.with_suffix(".stop-staged"),
+                          json.dumps({**record, "stop_pass_requested": True, "stop_reason": reason}))
+        path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).touch()
+
+        with (patch.object(detached_runs, "_run", return_value=143) as run,
+              patch.object(detached_runs, "scope_prefix", return_value=["fixture-scope"]),
+              patch.object(detached_runs, "_group_is_live", return_value=False)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(run.call_count, 1)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("stop_reason"), reason)
+        self.assertIs(saved.get("stop_pass_requested"), True)
+        self.assertFalse(path.with_suffix(".stop-staged").exists())
+        self.assertFalse(path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).exists())
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("phase 40: stopped", self.notices[0][1])
+
+    def test_a_failed_record_rename_preserves_the_latest_confirmed_pane_stop(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        path = Path(self.record(row)["log"]).with_suffix(".json")
+        replace = os.replace
+
+        def fail_record_rename(source: Path, target: Path) -> None:
+            if target == path:
+                raise OSError("fixture record rename failure")
+            replace(source, target)
+
+        def verify_group() -> detached_runs.CommandGroup:
+            return detached_runs.CommandGroup(DEAD_PID, "private-start")
+
+        with (patch.object(os, "replace", side_effect=fail_record_rename),
+              patch.object(process_group, "send_process_group") as send_group,
+              contextlib.redirect_stderr(io.StringIO())):
+            self.assertTrue(detached_runs.stop_with_reason(
+                path, "Build hold.", verify_group=verify_group, signal_group=process_group.send_process_group))
+            self.assertTrue(detached_runs.stop_with_reason(
+                path, "Pane stop.", verify_group=verify_group, signal_group=process_group.send_process_group,
+                stop_pass=True))
+        self.assertEqual(send_group.call_count, 2)
+        confirmed = worker_lifecycle.read_json_object(path.with_suffix(".stop-confirmed"))
+        self.assertEqual(confirmed.get("stop_reason"), "Pane stop.")
+        self.assertIs(confirmed.get("stop_pass_requested"), True)
+
+    def test_confirmed_stop_keeps_the_pane_request_after_a_failed_record_rename(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        record = self.record(row)
+        record.update(pid=DEAD_PID, command_group=DEAD_PID, command_started="private-start",
+                      pane_dispatch_id=dispatch, tree_key="private-tree")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        saved = path.read_bytes()
+        replace = os.replace
+
+        def fail_record_rename(source: Path, target: Path) -> None:
+            if target == path:
+                raise OSError("fixture record rename failure")
+            replace(source, target)
+
+        reason = "Private stop."
+        with (patch.object(os, "replace", side_effect=fail_record_rename),
+              patch.object(detached_run_process, "supervisor_match", return_value=True),
+              patch.object(process_start, "process_start", return_value=process_start.Started("private-start")),
+              patch.object(process_group, "send_process_group") as send_group,
+              contextlib.redirect_stderr(io.StringIO())):
+            self.assertTrue(detached_runs.stop_command(path, reason))
+        send_group.assert_called_once_with(DEAD_PID, signal.SIGTERM)
+        self.assertEqual(path.read_bytes(), saved)
+
+        identities = frozenset({row.id})
+        pending = {**record, "stop_pass_requested": True, "stop_reason": reason}
+        with (patch.object(detached_run_process, "supervises", return_value=False),
+              patch.object(detached_run_process, "supervisor_records", return_value={}),
+              patch.object(detached_runs, "_group_is_live", side_effect=[True, False, False])):
+            self.assertEqual(detached_runs.live_twin(path.parent, row.name, ["true"], "private-tree"), pending)
+            self.assertEqual(detached_runs.live_runs(path.parent, row.name), [pending])
+            self.assertEqual(detached_runs.live_runs_in_folders({self.run_dir: identities}), [pending])
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [path.stem])
+        self.assertFalse(path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).exists())
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("phase 40: stopped", self.notices[0][1])
 
     def test_stop_keeps_pass_with_another_runs_live_group(self) -> None:
         row = self.fixture.worker("impl", family="codex")
