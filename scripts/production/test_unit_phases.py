@@ -1177,6 +1177,18 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertTrue(any(row.work == "Review other (other)" and row.state.endswith(dependency_state)
                                     for row in detail_rows(rendered, members[0].name)), rendered)
 
+        with self.subTest(remote_checkpoint="landed in an earlier run"):
+            _ = subprocess.run(["git", "-C", str(foreign), "update-ref", "refs/remotes/origin/main", retry_carrier],
+                               check=True, capture_output=True)
+            self.assertTrue(waits_on.on_main(foreign, retry))
+            before = table_of(retry_units, {}, repository)
+            _ = self.write_run(remote_member, "remote-next-run", [("later", "Later work")], started=200)
+            after = table_of(retry_units, {}, repository)
+            for rendered in (before, after):
+                states = [row.state for row in detail_rows(rendered, members[0].name)
+                          if row.work == "Review other (other)"]
+                self.assertEqual(states, ["Ready"])
+
     def test_finished_phases_stay_visible_when_merge_records_name_other_hashes(self) -> None:
         member = self.member("finished")
         _ = self.repository()
@@ -1282,6 +1294,18 @@ class UnitPhasesTests(unittest.TestCase):
                 with patch.object(land_queue, "land_view", return_value=view):
                     rendered = self.blocks([member, dependent], {})
                 self.assertIn(("Next", "Review delivery", "Ready"), detail_rows(rendered, dependent.name))
+
+        with self.subTest(evidence="result", attempt="unreadable retry"):
+            path = self.write_run(member, "unreadable-retry", [("result", "Retry delivery")], [
+                self.phase_event("checkpoint", "result", checkpoint_commit=checkpoint)], started=merge_at + 1200)
+            starts = plan_history.run_starts()
+            path.unlink()
+            view = land_queue.LandView({}, {}, {published: landed}, frozenset(), {})
+            with (patch.object(plan_history, "run_starts", return_value=starts),
+                  patch.object(land_queue, "land_view", return_value=view)):
+                rendered = self.blocks([dependent], {})
+            self.assertIn(("Next", "Review delivery", "After finished phase result; merge evidence unavailable"),
+                          detail_rows(rendered, dependent.name))
 
     def test_undated_checkpoints_require_the_merged_checkpoint_hash(self) -> None:
         member = self.member("finished")

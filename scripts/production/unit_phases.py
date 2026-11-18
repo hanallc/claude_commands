@@ -656,8 +656,8 @@ class OpenUnitRun(NamedTuple):
     phases: tuple[OpenRunPhase, ...]
 
 
-class NewestUnitRun(NamedTuple):
-    """The newest run found for one unit."""
+class UnitRunStart(NamedTuple):
+    """The recorded start of a unit run."""
 
     started: float
     path: Path
@@ -675,10 +675,10 @@ class OpenPhaseHistory(NamedTuple):
     events: list[dict[str, object]]
 
 
-def newest_unit_runs(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, NewestUnitRun]:
-    """Select each unit's current staff run before newer ad hoc history."""
+def unit_run_history(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, list[UnitRunStart]]:
+    """Order each unit's runs with its current staff run first."""
     snapshot = staff.StaffSnapshot(staff.active(snapshot, "unit"))
-    newest: dict[staff.StaffId, NewestUnitRun] = {}
+    runs: dict[staff.StaffId, list[UnitRunStart]] = {}
     for path, started_event in plan_history.run_starts():
         try:
             owner = unit_runs.run_owner(started_event, snapshot)
@@ -688,12 +688,12 @@ def newest_unit_runs(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, Newes
             continue
         started = next((float(value) for value in (started_event.get("run_started_at"), started_event.get("timestamp_epoch"))
                         if isinstance(value, int | float) and not isinstance(value, bool)), 0.0)
-        previous = newest.get(owner.id)
-        current_run = owner.run.path.name if isinstance(owner.run, staff.OpenRun) else ""
-        if previous is None or (path.stem == current_run, started, path.name) > (
-                previous.path.stem == current_run, previous.started, previous.path.name):
-            newest[owner.id] = NewestUnitRun(started, path, started_event)
-    return newest
+        runs.setdefault(owner.id, []).append(UnitRunStart(started, path, started_event))
+    for owner in snapshot.rows:
+        if owner.id in runs:
+            current_run = owner.run.path.name if isinstance(owner.run, staff.OpenRun) else ""
+            runs[owner.id].sort(key=lambda run: (run.path.stem == current_run, run.started, run.path.name), reverse=True)
+    return runs
 
 
 def run_is_finished(events: list[dict[str, object]]) -> bool:
@@ -707,7 +707,7 @@ def run_is_finished(events: list[dict[str, object]]) -> bool:
 
 def open_unit_runs(snapshot: staff.StaffSnapshot, *,
                    read_run: RunEventsReader = read_work_events,
-                   newest: dict[staff.StaffId, NewestUnitRun] | None = None) -> dict[staff.StaffId, OpenUnitRun]:
+                   newest: dict[staff.StaffId, UnitRunStart] | None = None) -> dict[staff.StaffId, OpenUnitRun]:
     """Read each unit's staff pointer and retain its open phases."""
     result: dict[staff.StaffId, OpenUnitRun] = {}
     for owner in snapshot.find(kind="unit"):
@@ -751,7 +751,11 @@ class CheckpointRepositoryUnavailable(NamedTuple):
     """The unit has no readable checkout or recorded merge destination."""
 
 
-DependencyState = waits_on.WaitState | CheckpointRepositoryUnavailable
+class DependencyHistoryUnavailable(NamedTuple):
+    """The dependency run has a recorded start but its events are unavailable."""
+
+
+DependencyState = waits_on.WaitState | CheckpointRepositoryUnavailable | DependencyHistoryUnavailable
 
 
 def wait_text(found: DependencyState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
@@ -776,7 +780,7 @@ def wait_text(found: DependencyState, land: land_queue.LandView, *, now: float, 
             return "started"
         case waits_on.PhaseNotStarted():
             return "not started"
-        case CheckpointRepositoryUnavailable():
+        case CheckpointRepositoryUnavailable() | DependencyHistoryUnavailable():
             return "merge evidence unavailable"
         case _:
             return "dependency not found locally"
@@ -852,7 +856,7 @@ def local_worktree_exists(tree: staff.PresentWorktree) -> bool:
         return False
 
 
-def fallback_plan(member: staff.StaffRow, run: NewestUnitRun, opened: OpenUnitRun | NoOpenUnitRun,
+def fallback_plan(member: staff.StaffRow, run: UnitRunStart, opened: OpenUnitRun | NoOpenUnitRun,
                   record: object, *, read_plan: Callable[[Path], list[plan_history.PlanPhase]]) -> BoardPlanRecord:
     """Read unfinished plan headings against the newest run's open phases."""
     if not isinstance(member.worktree, staff.PresentWorktree):
@@ -1289,7 +1293,7 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
             if not items:
                 if target in waits:
                     first = BlockedNext(unit_wait_reason(waits[target], target), waits[target])
-                elif isinstance(found, CheckpointRepositoryUnavailable):
+                elif isinstance(found, CheckpointRepositoryUnavailable | DependencyHistoryUnavailable):
                     first = NextUnavailable()
                 elif item.after and not isinstance(found, waits_on.OnMain):
                     first = BlockedNext(entry.state_text)
@@ -1314,7 +1318,7 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
                     continue
                 reference = dependency if "/" in dependency else f"{unit}/{dependency}"
                 found = wait_state(reference)
-                unavailable_dependency |= isinstance(found, CheckpointRepositoryUnavailable)
+                unavailable_dependency |= isinstance(found, CheckpointRepositoryUnavailable | DependencyHistoryUnavailable)
                 if not isinstance(found, waits_on.OnMain):
                     dependency_lines.append(dependency_state_text(dependency, unit, found, dependency_land(reference),
                                                                   now=now, zone=zone, phase_ids=phase_ids))
@@ -1486,6 +1490,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     results = {checkpoint_result_key(row): row for row in recorded_land.results.values()}
     landed_checkpoints = {(row["unit"], row["phase"]): row["commit"] for row in results.values() if row["landed"]}
     pending_results = {commit: row for commit, row in recorded_land.results.items() if not row["landed"]}
+    recorded_destinations = {(row["unit"], row["phase"]) for row in pending_results.values() if row.get("production")}
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
     plan_failures: dict[Path, OSError | UnicodeError] = {}
@@ -1560,8 +1565,16 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         return land._replace(results=pending_results)
 
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
-    newest = newest_unit_runs(snapshot)
+    history = unit_run_history(snapshot)
+    newest = {unit_id: starts[0] for unit_id, starts in history.items()}
     runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
+
+    def read_attempt(run: UnitRunStart, phase: str) -> (
+            waits_on.PhaseSent | waits_on.PhaseOpen | waits_on.PhaseNotStarted | DependencyHistoryUnavailable):
+        run_events = read_run(run.path)
+        if not run_events or run_events[0].get("event_type") != "run_started":
+            return DependencyHistoryUnavailable()
+        return phase_dependency(run_events, phase)
 
     def dependency(after: str, source: Path | CheckpointRepositoryUnavailable) -> tuple[DependencyState, land_queue.LandView]:
         unit_name, slash, phase = after.partition("/")
@@ -1574,7 +1587,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             found: DependencyState = source if isinstance(source, CheckpointRepositoryUnavailable) else waits_on.NotFound()
             if member is not None:
                 run = newest.get(member.id)
-                observed = phase_dependency(read_run(run.path) if run is not None else [], phase)
+                observed = read_attempt(run, phase) if run is not None else waits_on.PhaseNotStarted()
                 found = observed
                 if isinstance(observed, waits_on.PhaseSent):
                     commit = observed.commit
@@ -1595,6 +1608,19 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                         named = repository_evidence(source).phase_merges.get((unit_name, phase))
                         if named is not None:
                             found = waits_on.OnMain(named.commit)
+                    elif (unit_name, phase) in recorded_destinations:
+                        for previous in history.get(member.id, ())[1:]:
+                            prior = read_attempt(previous, phase)
+                            if isinstance(prior, waits_on.PhaseNotStarted):
+                                continue
+                            if isinstance(prior, DependencyHistoryUnavailable):
+                                found = prior
+                            elif isinstance(prior, waits_on.PhaseSent):
+                                result = results.get((unit_name, phase, prior.commit.lower()))
+                                if result is not None and result.get("production") and checkpoint_merged(
+                                        unit_name, phase, prior.commit, source):
+                                    found = waits_on.OnMain(prior.commit)
+                            break
             elif isinstance(source, Path):
                 target = repository_evidence(source)
                 land = target.land
