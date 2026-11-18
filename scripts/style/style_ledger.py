@@ -308,6 +308,11 @@ FINAL_TICKET_STATES: frozenset[TicketState] = frozenset({"merged", "dropped"})
 
 
 @dataclass(frozen=True)
+class NoIssuedTicket:
+    """The unit has no issued ticket."""
+
+
+@dataclass(frozen=True)
 class Unfiled:
     """The finding has no proposal yet."""
 
@@ -3737,6 +3742,18 @@ class Ledger:
             "SELECT id FROM tickets WHERE unit=? AND state='queued' ORDER BY created_at,id", (unit,),
         ).fetchall())
         return tuple(self._ticket(row[0]) for row in rows)
+
+    def last_issued_ticket_kind(self, unit: str) -> TicketKind | NoIssuedTicket:
+        """Read the kind of the last ticket assigned to the unit."""
+        unit = str(self.unit_row(unit).id)
+        # A predecessor can merge after its successor starts. Read the predecessors in one pass.
+        rows = cast(list[tuple[TicketKind]], self._connection.execute(
+            "SELECT kind FROM tickets WHERE unit=? AND branch!='' AND id NOT IN ("
+            + "SELECT p.predecessor FROM ticket_predecessors p JOIN tickets s ON s.id=p.ticket "
+            + "WHERE s.unit=? AND s.branch!='') "
+            + "ORDER BY updated_at DESC, CAST(id AS INTEGER) DESC LIMIT 1", (unit, unit),
+        ).fetchall())
+        return rows[0][0] if rows else NoIssuedTicket()
 
     def staff_resolver(self) -> session_staff.RowResolver:
         """Share one staff snapshot across the ledger command."""

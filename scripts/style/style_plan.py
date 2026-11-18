@@ -3149,7 +3149,7 @@ def checkpoint_selection(work: WaitingCheckpoint | NoCheckpointBlock, ledger: st
     if isinstance(changes, MainChanges) and changes.paths and findings:
         edits = main_edits or EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
         if any(edits.uncertain(finding) for finding in findings):
-            raise style_ledger.LedgerError("selected footprint at main is uncertain")
+            return WaitingForMerge(work.ticket_id, work.commit, "footprint unknown: selected footprint at main is uncertain")
         files = (*files, *(path for finding in findings for path in edits.of(finding)))
     return work.check(files)
 
@@ -3242,6 +3242,19 @@ def fill_decision_batch(repo: Path, tip: str, candidates: tuple[BuildableDecisio
 def catalog_definition(definitions: Mapping[str, rules.Rule], rule: str) -> rules.Rule | None:
     """Return the catalog definition for a decision or finding rule."""
     return definitions.get(style_ledger.base_rule(rule))
+
+
+def structure_blocked_files(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, ...]) -> frozenset[str]:
+    """Find the files that pending or open structure work holds."""
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
+        rows = cast(list[tuple[str]], connection.execute(
+            "SELECT id FROM tickets WHERE kind='structure' AND state IN ('queued','assigned','checkpointed')",
+        ).fetchall())
+    paths = {str(PurePosixPath(cell.crate) / "Cargo.toml") if cell.path == cell.crate else cell.path
+             for cell in cells if cell.tier == "D" and cell.state != "current"}
+    for (ticket_id,) in rows:
+        paths.update(ledger.pipeline_footprint(ledger.ticket_get(ticket_id), frozenset()))
+    return frozenset(paths)
 
 
 def _select_phase(
@@ -3369,6 +3382,11 @@ def _select_observed_phase(
                 if selection == FamilySelection.COUNT and issue not in follow.skipped else decision_members(issue))
         for issue, findings in unbuilt.items()}
     pending_decision_files = frozenset(finding.path for findings in decision_findings.values() for finding in findings)
+    has_build_work = bool(pending_decision_files) or any(ticket["kind"] == "proposal" for ticket in queued)
+    structure_files: frozenset[str] = (structure_blocked_files(ledger, context.eligible_cells(cells, definitions))
+                                       if has_build_work else frozenset())
+    build_turn = (selection == FamilySelection.OWN and has_build_work
+                  and ledger.last_issued_ticket_kind(unit) == "structure")
     blocking_counts = blocked_cell_counts(cells, scopes)
     queued.sort(key=lambda ticket: work_order(ticket["kind"], cast(rules.Family, ticket["family"]), ticket["crate"], blocking_counts))
     coverage_families: tuple[rules.Family, ...] = tuple(
@@ -3376,7 +3394,10 @@ def _select_observed_phase(
         or (queued and queued[0]["kind"] != "structure"
             and family_rank(owned) < family_rank(cast(rules.Family, queued[0]["family"]))))
     coverage = (ranked_candidates(repo, ledger, busy, coverage_families, scope, scopes, base, first_files, definitions, cells, context=context)
-                if selection == FamilySelection.OWN and queued and coverage_families else ())
+                if selection == FamilySelection.OWN and not build_turn and queued and coverage_families else ())
+    # On a build turn, all candidates have priority over the first wait in selection order.
+    saved_waits: list[WaitingForMerge | WaitingForSync] = []
+
     def take_queued(tickets: tuple[style_ledger.TicketRecord, ...]) -> (
             PhaseWritten | WaitingForMerge | WaitingForSync | NoAvailableWork):
         for ticket in tickets:
@@ -3388,33 +3409,42 @@ def _select_observed_phase(
             skipped = any(issue in follow.skipped for issue in ledger.ticket_proposals(ticket["id"]))
             ranked = (("skipped by the declaration step",) if skipped else
                       _rank_waits(ledger, ticket, ticket_family, ranked_work.waits(ticket_family), scopes, tip)) if in_scope and not uncertain else ()
-            if (in_scope and ticket["kind"] != "proposal"
+            if (in_scope and ticket["kind"] not in ("structure", "proposal")
                     and pending_decision_files.intersection(ticket["files"])):
                 ranked = (*ranked, "approved findings await build")
+            if in_scope and ticket["kind"] == "proposal" and structure_files.intersection(edits.of_ticket(ticket)):
+                continue
             if in_scope and isinstance(predecessor, WaitingCheckpoint):
                 if uncertain:
+                    if build_turn:
+                        continue
                     raise style_ledger.LedgerError("selected footprint is uncertain")
                 origin = ledger.ticket_origin(ticket["id"])
                 findings = edits.ticket_findings(origin) if isinstance(origin, style_ledger.ApprovedProposal) else ()
                 checkpoint = checkpoint_selection(predecessor, ledger, changes, edits.of_ticket(ticket), findings)
                 if isinstance(checkpoint, WaitingForMerge):
-                    return checkpoint
+                    if not build_turn:
+                        return checkpoint
+                    saved_waits.append(checkpoint)
+                    continue
             if (in_scope and not uncertain and not ranked
                     and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
                 origin = ledger.ticket_origin(ticket["id"])
                 findings = edits.ticket_findings(origin) if isinstance(origin, style_ledger.ApprovedProposal) else ()
-                checkpoint = checkpoint_selection(predecessor, ledger, changes, edits.of_ticket(ticket), findings)
-                if isinstance(checkpoint, WaitingForMerge):
-                    return checkpoint
                 sync = ticket_sync_wait(ledger, changes, ticket["kind"], ticket["crate"], ticket["rule"],
                                         edits.of_ticket(ticket), findings)
                 if isinstance(sync, WaitingForSync):
-                    return sync
+                    if not build_turn:
+                        return sync
+                    saved_waits.append(sync)
+                    continue
                 ledger.ticket_assign(ticket["id"], branch)
                 for extra in ledger.queued_tickets(unit):
                     if extra["id"] == ticket["id"]:
                         continue
                     if extra["family"] != ticket["family"]:
+                        continue
+                    if {ticket["kind"], extra["kind"]} == {"structure", "proposal"}:
                         continue
                     if style_config.config_for_unit(unit, ledger.staff_resolver().record).assignment(ledger.unit_name(unit)).open_tickets > 1:
                         continue
@@ -3432,17 +3462,24 @@ def _select_observed_phase(
             print(f"dropped {ticket['id']}: {reason}")
         return NoAvailableWork()
 
-    priorities = [work_order(candidate.kind, candidate.family, candidate.crate, blocking_counts)
-                  for candidate in coverage if not pending_decision_files.intersection(candidate.files)]
-    priorities.extend(work_order("structure" if definition.tier == "D" else "proposal",
-                                 cast(rules.Family, definition.family),
-                                 style_proposals.crate_for(directories, findings[0].path), blocking_counts)
-                      for issue, findings in unbuilt.items() if findings
-                      and (definition := catalog_definition(definitions, frontmatter(issue).get("style_rule", [""])[0])) is not None)
-    deferred = tuple(ticket for ticket in queued
-                     if not pending_decision_files.intersection(ticket["files"])
-                     and any(priority < work_order(ticket["kind"], cast(rules.Family, ticket["family"]),
-                                                   ticket["crate"], blocking_counts) for priority in priorities))
+    if build_turn:
+        deferred = tuple(ticket for ticket in queued if ticket["kind"] != "proposal")
+    else:
+        priorities = [work_order(candidate.kind, candidate.family, candidate.crate, blocking_counts)
+                      for candidate in coverage if candidate.kind == "structure"
+                      or not pending_decision_files.intersection(candidate.files)]
+        priorities.extend(work_order("structure" if definition.tier == "D" else "proposal",
+                                     cast(rules.Family, definition.family),
+                                     style_proposals.crate_for(directories, findings[0].path), blocking_counts)
+                          for issue, findings in unbuilt.items() if queued and findings
+                          and (definition := catalog_definition(definitions, frontmatter(issue).get("style_rule", [""])[0]))
+                          is not None)
+        has_structure_candidate = any(candidate.kind == "structure" for candidate in coverage)
+        deferred = tuple(ticket for ticket in queued
+                         if (ticket["kind"] == "proposal" and has_structure_candidate)
+                         or ((ticket["kind"] == "structure" or not pending_decision_files.intersection(ticket["files"]))
+                             and any(priority < work_order(ticket["kind"], cast(rules.Family, ticket["family"]),
+                                                           ticket["crate"], blocking_counts) for priority in priorities)))
     immediate = take_queued(tuple(ticket for ticket in queued if ticket not in deferred))
     if not isinstance(immediate, NoAvailableWork):
         return immediate
@@ -3456,7 +3493,10 @@ def _select_observed_phase(
         for selected in candidates:
             checkpoint = checkpoint_selection(predecessor, ledger, changes, selected.files)
             if isinstance(checkpoint, WaitingForMerge):
-                overlap_wait = checkpoint
+                if build_turn:
+                    saved_waits.append(checkpoint)
+                else:
+                    overlap_wait = checkpoint
                 continue
             # Code-changing tickets wait for these inputs; a structure read judges the unit's current source.
             changed: list[UnsyncedChange] = ([unsynced[path] for path in selected.files if path in unsynced]
@@ -3467,7 +3507,10 @@ def _select_observed_phase(
                 continue
             sync = ticket_sync_wait(ledger, changes, selected.kind, selected.crate, selected.rule, selected.files)
             if isinstance(sync, WaitingForSync):
-                return sync
+                if not build_turn:
+                    return sync
+                saved_waits.append(sync)
+                continue
             retained = next((ticket for ticket in ledger.queued_tickets(unit)
                              if ticket["kind"] == selected.kind and ticket["family"] == selected.family
                              and ticket["crate"] == selected.crate and tuple(ticket["files"]) == selected.files
@@ -3483,14 +3526,15 @@ def _select_observed_phase(
             return PhaseWritten(ticket_id)
         return overlap_wait if isinstance(overlap_wait, WaitingForMerge) else NoAvailableWork()
 
-    if selection == FamilySelection.OWN and "modules" in families:
-        priority = tuple(ticket for ticket in ranked_candidates(
-            repo, ledger, busy, families, scope, scopes, base, first_files, definitions, cells, context=context)
-            if ticket.kind == "structure" and not pending_decision_files.intersection(ticket.files))
-        if priority:
-            result = take_reads(priority)
-            if isinstance(result, PhaseWritten):
-                return result
+    def take_structure(structure_busy: BusyFiles) -> PhaseWritten | WaitingForMerge | WaitingForSync | NoAvailableWork:
+        return take_reads(tuple(ticket for ticket in ranked_candidates(
+            repo, ledger, structure_busy, families, scope, scopes, base, first_files, definitions, cells, context=context)
+            if ticket.kind == "structure"))
+
+    if selection == FamilySelection.OWN and "modules" in families and not build_turn:
+        result = take_structure(busy)
+        if isinstance(result, PhaseWritten):
+            return result
 
     # One line for each waiting file that holds the unit's own work: a pending cell in scope or an unbuilt finding.
     own = {cell.path for cell in cells if cell.family in families and cell.state in ("open", "stale")
@@ -3556,7 +3600,7 @@ def _select_observed_phase(
         gone: dict[str, list[str]] = defaultdict(list)
         blocked = {finding.path for finding in findings
                    if not crate_in_scope(scope, style_proposals.crate_for(directories, finding.path))
-                   or busy.contains(finding.path) or finding.path in unsynced}
+                   or busy.contains(finding.path) or finding.path in structure_files or finding.path in unsynced}
         lower = {finding.finding_id for finding in findings
                  if style_proposals.ranked_below_unit(family, style_proposals.crate_for(directories, finding.path), scopes)
                  and finding.finding_id not in moved and (finding.finding_id in read or finding.path in present)}
@@ -3605,8 +3649,12 @@ def _select_observed_phase(
             previous_count = len(by_file[path])
             by_file[path] = [finding for finding in by_file[path] if exemptions.allows(finding, family)]
             refusals["waiting for rank"] += previous_count - len(by_file[path])
-        held = {path for path in by_file if path not in outside and (not by_file[path] or busy.contains(path))}
-        for path in sorted(held - set(waits)):
+        structure_held = by_file.keys() & structure_files - outside
+        for path in sorted(structure_held):
+            print(f"waiting {issue.path}: {path} has pending or open structure work")
+        refusals["waiting for structure"] += sum(len(by_file[path]) for path in structure_held)
+        held = structure_held | {path for path in by_file if path not in outside and (not by_file[path] or busy.contains(path))}
+        for path in sorted(held - structure_held - set(waits)):
             print(f"waiting {issue.path}: {path} busy")
         # A file that a commit on the unit base changed waits for the sync that reads it.
         changed = sorted(path for path in set(by_file) - outside - held if path in unsynced)
@@ -3623,6 +3671,11 @@ def _select_observed_phase(
                 if uncertain:
                     footprint_waits[(finding.path, f"{uncertain[0]} has a path attribute the rename gate cannot read")] += 1
                     continue
+                structure_path = next((path for path in edits.of(finding) if path in structure_files), None)
+                if structure_path is not None:
+                    footprint_waits[(finding.path, f"edits {structure_path}, waiting for structure")] += 1
+                    refusals["waiting for structure"] += 1
+                    continue
                 edited = next((edited for edited in edits.of(finding) if busy.contains(edited)), None)
                 if edited is None:
                     free.append(finding)
@@ -3631,7 +3684,7 @@ def _select_observed_phase(
             by_file[path] = free
         style_proposals.print_finding_waits(issue.path, footprint_waits)
         refusals["outside pilot scope"] += sum(len(by_file[path]) for path in outside)
-        refusals["busy or rank held"] += sum(len(by_file[path]) for path in held)
+        refusals["busy or rank held"] += sum(len(by_file[path]) for path in held - structure_held)
         refusals["waiting for sync"] += sum(len(by_file[path]) for path in changed)
         main_edits = edits_at_main(ledger, changes)
         if main_edits is not None:
@@ -3669,16 +3722,17 @@ def _select_observed_phase(
             cast(rules.Family, candidate.definition.family), candidate.crate, blocking_counts)))
         primary = ordered_decisions[0]
         family = next(owned for owned in families if owned == primary.definition.family)
-        earlier = take_queued(tuple(ticket for ticket in deferred
-                             if work_order(ticket["kind"], cast(rules.Family, ticket["family"]),
-                                           ticket["crate"], blocking_counts)
-                             < work_order("structure" if primary.definition.tier == "D" else "proposal",
-                                          family, primary.crate, blocking_counts)))
-        if not isinstance(earlier, NoAvailableWork):
-            return earlier
+        if not build_turn:
+            earlier = take_queued(tuple(ticket for ticket in deferred
+                                 if work_order(ticket["kind"], cast(rules.Family, ticket["family"]),
+                                               ticket["crate"], blocking_counts)
+                                 < work_order("structure" if primary.definition.tier == "D" else "proposal",
+                                              family, primary.crate, blocking_counts)))
+            if not isinstance(earlier, NoAvailableWork):
+                return earlier
         higher_families: tuple[rules.Family, ...] = (tuple(
             owned for owned in families if family_rank(owned) < family_rank(family))
-            if primary.definition.tier != "D" else ())
+            if primary.definition.tier != "D" and not build_turn else ())
         higher = (tuple(ticket for ticket in ranked_candidates(
             repo, ledger, busy, higher_families, scope, scopes, base, first_files, definitions, cells, context=context)
             if ticket.kind != "structure") if higher_families else ())
@@ -3703,18 +3757,37 @@ def _select_observed_phase(
     # As complete does, one renumber follows every decision this refill closed.
     if closed:
         style_proposals.renumber()
+    if build_turn and not isinstance(decision_wait, NoAvailableWork):
+        saved_waits.append(decision_wait)
+    coverage_busy = busy
+    if build_turn and "modules" in families:
+        queued_structure = take_queued(tuple(ticket for ticket in deferred if ticket["kind"] == "structure"))
+        if isinstance(queued_structure, PhaseWritten):
+            return queued_structure
+        deferred = tuple(ticket for ticket in deferred if ticket["kind"] != "structure")
+        queued_structure_paths = frozenset(path for ticket in ledger.queued_tickets(unit)
+                                           if ticket["kind"] == "structure"
+                                           for path in ledger.pipeline_footprint(ticket, frozenset()))
+        coverage_busy = replace(busy, paths=busy.paths | queued_structure_paths)
+        result = take_structure(coverage_busy)
+        if isinstance(result, PhaseWritten):
+            return result
     if selection == FamilySelection.OWN and deferred:
         queued_result = take_queued(deferred)
         if not isinstance(queued_result, NoAvailableWork):
             return queued_result
-    if selection != FamilySelection.COUNT and not isinstance(decision_wait, NoAvailableWork):
+    if not build_turn and selection != FamilySelection.COUNT and not isinstance(decision_wait, NoAvailableWork):
         return decision_wait
     if selection == FamilySelection.COUNT:
         reason = ", ".join(f"{reason} ({count})" for reason, count in sorted(refusals.items()) if count) or "none approved"
         return BuildableFindings(buildable, reason)
-    candidates = ranked_candidates(repo, ledger, busy, families, scope, scopes, base, first_files, definitions, cells, context=context)
+    candidates = ranked_candidates(repo, ledger, coverage_busy, families, scope, scopes, base, first_files, definitions, cells, context=context)
     if candidates:
-        return take_reads(candidates)
+        result = take_reads(candidates)
+        if isinstance(result, PhaseWritten) or not saved_waits:
+            return result
+    if saved_waits:
+        return saved_waits[0]
     blocked_crates: set[str] = set()
     for family in families:
         refill = _refill_cells(ledger, cells, base, family, scope, ranked_work.waits(family), definitions, context)
