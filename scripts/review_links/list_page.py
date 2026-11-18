@@ -744,6 +744,10 @@ background:var(--ink-2);border-radius:50%}
 .list-show-filter [data-hidden-action-status]{margin-bottom:0}
 .list-unread-switch{order:1}
 }
+@media(max-width:620px) and (max-height:260px){
+.list-show-controls .record-filter-row{grid-template-columns:minmax(0,1fr)}
+.list-show-filter [data-hidden-action-status]{margin-inline-start:0}
+}
 .list-table-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
 .list-table-tools [data-list-count]{min-width:0;color:var(--ink-2);font-size:13px;text-align:right;overflow-wrap:anywhere}
 [data-linked-item]{margin-top:16px}
