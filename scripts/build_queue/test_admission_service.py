@@ -4540,6 +4540,45 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
 class ServiceTests(unittest.TestCase):
 
+    def test_showrunner_ci_nextest_records_its_caller_on_the_running_row(self) -> None:
+        session = staff.StaffId("b6374931-fe3a-4f6d-96b7-ad20415a8346")
+        runner = staff.StaffRow(session, "showrunner", "spacetime", staff.StaffRoot(),
+                                current_session=session)
+        with AdmissionFixture() as fixture:
+            staff_file = fixture.root / "staff.json"
+            _ = staff_file.write_text(json.dumps({"schema": 2, "rows": [runner.to_json()]}))
+            request = fixture.request(need=GIB)
+            parent = 1
+            chain = (
+                ("python3", "ci_points.py", "ci", "start", "--production", "spacetime"),
+                ("bash", "validate_and_push.sh", "--validate-only"),
+                ("bash", "run_validation.sh"),
+                ("bash", "validate_ci.sh"),
+                ("lint", "nextest", "--workspace", "--all-features", "--tests"),
+            )
+            environment = {"STAFF_FILE": str(staff_file), "CODEX_THREAD_ID": "",
+                           "CLAUDE_CODE_SESSION_ID": session, "CLAUDE_SESSION_FOLDER": "spacetime",
+                           "CLAUDE_SESSION_NAME": "", "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": ""}
+            for index, argv in enumerate(chain):
+                pid = request.owner.pid if index == len(chain) - 1 else 100 + index
+                start = request.owner.start_time if pid == request.owner.pid else str(pid)
+                write_process(fixture.proc.path, pid, parent=parent, start=start)
+                process = fixture.proc.path / str(pid)
+                _ = (process / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
+                _ = (process / "environ").write_bytes(
+                    ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode())
+                parent = pid
+            with mock.patch.dict(os.environ, environment), \
+                    mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                        request.profile, step_estimator.ReusableEstimate())):
+                caller = client.step_request(["cargo", "nextest", "run", *chain[-1][2:]], request.cwd,
+                    request.owner, request.since, str(fixture.scope(request.owner)), request.episode)
+                _ = only_admitted(fixture.connect(caller).replies())
+                reply, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(reply, wire.ViewReply)
+            step, = [row for row in reply.reading.view.running if row.pid == request.owner.pid]
+            self.assertEqual((step.session_id, step.session_name, step.unit), (session, "spacetime", "spacetime"))
+
     def test_caller_admission_sets_the_child_zone(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = {"BUILDLOG_DIR": str(root / "log"), "USER_ZONE": "Pacific/Pago_Pago", "HOME": str(root / "home")}
@@ -5106,9 +5145,10 @@ class ServiceTests(unittest.TestCase):
                 notices.bind(str(notify_path))
                 notices.setblocking(False)
 
+                source = fixture.root / "loaded-source.py"
+
                 def serve(server: service.AdmissionServer) -> None:
                     server.start()
-                    source = fixture.root / "loaded-source.py"
                     _ = source.write_text("old")
                     info = source.stat()
                     server.sources = {source: (info.st_ino, info.st_mtime_ns)}
@@ -5121,8 +5161,9 @@ class ServiceTests(unittest.TestCase):
                     self.assertTrue(server.stopped)
 
                 execv = mock.Mock(side_effect=OSError("stop before replacement"))
-                with mock.patch.dict(os.environ, {"LISTEN_FDS": "1", "LISTEN_PID": str(os.getpid()),
-                                                  "NOTIFY_SOCKET": str(notify_path)}), \
+                environment = {"LISTEN_FDS": "1", "LISTEN_PID": str(os.getpid()),
+                               "NOTIFY_SOCKET": str(notify_path), service.ADMISSION_SOURCE_RELOAD: ""}
+                with mock.patch.dict(os.environ, environment), redirect_stderr(io.StringIO()) as journal, \
                      mock.patch.object(service, "LISTEN_FD", inherited), \
                      mock.patch.object(service, "SystemClock", return_value=fixture.clock), \
                      mock.patch.object(service, "SystemReadings", return_value=fixture.readings), \
@@ -5132,6 +5173,10 @@ class ServiceTests(unittest.TestCase):
                      mock.patch.object(sys, "argv", ["admission_service", "serve", "--state-dir", str(fixture.state_dir)]):
                     with self.assertRaisesRegex(OSError, "stop before replacement"):
                         _ = service.main()
+                    reload_marker = os.environ.get(service.ADMISSION_SOURCE_RELOAD, "")
+                self.assertEqual(journal.getvalue().splitlines(),
+                    [f"memory admission: reload for changed source {source}"])
+                self.assertTrue(reload_marker)
                 execv.assert_called_once_with(sys.executable, sys.orig_argv)
                 self.assertTrue(os.get_inheritable(inherited))
                 os.close(inherited)
@@ -5143,6 +5188,27 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(len(states), 2)
                 self.assertEqual(states[0], "READY=1")
                 self.assertRegex(states[1], r"^RELOADING=1\nMONOTONIC_USEC=\d+$")
+                with mock.patch.dict(os.environ, {**environment, service.ADMISSION_SOURCE_RELOAD: reload_marker}), \
+                     mock.patch.object(service, "LISTEN_FD", os.dup(listener.fileno())), \
+                     redirect_stderr(io.StringIO()) as journal:
+                    replacement = fixture.new_server(start=False)
+                    notify = cast(Callable[[str], None], getattr(service, "_notify"))
+
+                    def notify_before_journal(message: str) -> None:
+                        self.assertEqual(journal.getvalue(), "")
+                        notify(message)
+
+                    try:
+                        with mock.patch.object(service, "_notify", side_effect=notify_before_journal):
+                            replacement.start()
+                        self.assertEqual(notices.recv(4096).decode(), "READY=1")
+                        version = admission_code.admission_code_version(replacement.source_root)
+                        self.assertRegex(version, r"^[0-9a-f]{64}$")
+                        self.assertEqual(journal.getvalue().splitlines(),
+                            [f"memory admission: reload ready, source hash {version}"])
+                        self.assertNotIn(service.ADMISSION_SOURCE_RELOAD, os.environ)
+                    finally:
+                        replacement.close()
             self.assertTrue(fixture.socket_path.exists())
 
     def test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits(self) -> None:

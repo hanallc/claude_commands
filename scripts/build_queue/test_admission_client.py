@@ -830,6 +830,30 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(launch.identity.unit, unit)
                     self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
 
+    def test_step_identity_names_each_caller_kind(self) -> None:
+        with AdmissionFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="spacetime")
+            unit = fixture_member("unit", name="navigation", parent=runner.id)
+            worker = fixture_member("worker", name="impl", parent=unit.id)
+            environment = {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                           "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": ""}
+            for session, reference, folder, name, owner_unit in (
+                (runner.current_session, "", "", "spacetime", "spacetime"),
+                (unit.current_session, "", "", "navigation", "navigation"),
+                (worker.current_session, "", "", "impl", "navigation"),
+                ("", worker.id, "", "impl", "navigation"),
+                ("unlisted", worker.id, "research", "research", ""),
+                ("unlisted", "", "", "unregistered session", ""),
+                ("", "", "", "local caller", ""),
+            ):
+                with self.subTest(session=session, reference=reference, folder=folder), mock.patch.dict(os.environ, {
+                    **environment, "CLAUDE_CODE_SESSION_ID": session,
+                    "CLAUDE_SESSION_FOLDER": folder, "BUILDLOG_OWNER_STAFF_ID": reference,
+                }):
+                    identity = client.step_identity("nextest", "")
+                    self.assertEqual((identity.name, identity.unit), (name, owner_unit))
+                    self.assertEqual(identity.session_id, worker.current_session if reference and not session else session)
+
     def use_transport(self, fixture: AdmissionFixture, *exchanges: Exchange) -> ScriptedTransport:
         transport = ScriptedTransport(fixture.clock, *exchanges)
         _ = self.enterContext(mock.patch.object(client, "CLOCK", fixture.clock))

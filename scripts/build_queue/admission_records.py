@@ -1564,9 +1564,26 @@ def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     from scripts.production import staff
 
     session = staff.caller_identity()
-    identity: WaiterIdentity = {"session_id": session, "session_name": os.environ.get("CLAUDE_SESSION_NAME", ""),
-                                "step": step, "folder": os.getcwd() if worktree else ""}
-    if unit := os.environ.get(BUILDLOG_UNIT):
+    reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "") if not session else ""
+    name = os.environ.get("CLAUDE_SESSION_NAME", "").strip()
+    unit = os.environ.get(BUILDLOG_UNIT, "")
+    if session or reference:
+        try:
+            members = staff.local_snapshot()
+        except staff.StaffUnreadable:
+            members = staff.StaffSnapshot(())
+        member = members.by_current_session(session) if session else members.by_id(staff.StaffId(reference))
+        if member is not None:
+            session = member.current_session
+            name = member.name
+            owner = members.owner_of(member.id)
+            if owner is not None:
+                unit = unit or owner.name
+    name = name or Path(os.environ.get("CLAUDE_SESSION_FOLDER", "")).name
+    identity: WaiterIdentity = {"session_id": session,
+        "session_name": name or ("unregistered session" if session else "local caller"),
+        "step": step, "folder": os.getcwd() if worktree else ""}
+    if unit:
         identity["unit"] = unit
     return identity
 

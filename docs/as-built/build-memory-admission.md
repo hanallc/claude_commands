@@ -933,6 +933,10 @@ BRP launches use `launch`; launch permission creates no reservation.
 
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
+The client reads the caller name from the local staff record.
+It uses the worker's parent as the unit and respects an explicit unit override.
+For other callers, it uses the exported name or the session folder name.
+When both are absent, it uses `unregistered session` for a session and `local caller` for a direct command.
 A valid wait resets checker-failure time. Checker failures after a wait retry until `BUILDLOG_MEM_CHECK_RETRY_S`.
 A first checker failure or explicit refusal stops at once. A launch deadline applies during transport and checker retries.
 A zero launch limit refuses its first hold and accepts an immediate grant.
@@ -997,6 +1001,8 @@ A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
+The service logs the changed source paths before `execv`.
+The replacement logs the admission source hash after it sends `READY=1`.
 A failed start of the new code exits, and `Restart=always` starts the service again.
 A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 `down-alert` waits `silence_seconds` and claims `build-admission`.

@@ -1204,6 +1204,7 @@ def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
 
 # systemd passes the first inherited socket at this descriptor.
 LISTEN_FD = 3
+ADMISSION_SOURCE_RELOAD = "BUILD_ADMISSION_SOURCE_RELOAD"
 
 
 def _notify(message: str) -> None:
@@ -1445,6 +1446,7 @@ class AdmissionServer:
         self.sources: dict[Path, tuple[int, int] | SourceMissing] = {
             path: self._stamp(path) for path in self._source_paths()}
         self.source_change_at: float | SourcesUnchanged = SourcesUnchanged()
+        self.changed_sources: set[Path] = set()
         state_dir.mkdir(parents=True, exist_ok=True)
 
         self.config_path: Path = conf.path("build_admission")
@@ -4406,6 +4408,10 @@ done
         self.epoll.register(listener.fileno(), select.EPOLLIN)
         self.listener_started_at = self.clock.monotonic()
         _notify("READY=1")
+        if os.environ.pop(ADMISSION_SOURCE_RELOAD, ""):
+            version = admission_code.admission_code_version(self.source_root)
+            print(f"memory admission: reload ready, source hash {version or 'unavailable'}",
+                  file=sys.stderr, flush=True)
 
     def _drop_deferred_requests(self, connection: Connection) -> None:
         self.deferred_requests = [pending for pending in self.deferred_requests
@@ -4563,6 +4569,7 @@ done
         current = {path: self._stamp(path) for path in self.sources}
         now = self.clock.monotonic()
         if current != self.sources:
+            self.changed_sources.update(path for path, stamp in current.items() if self.sources[path] != stamp)
             self.sources = current
             self.source_change_at = now
         elif (isinstance(configuration, records.MemoryConfig)
@@ -4993,6 +5000,9 @@ def main() -> int:
         if server.replace_in_place:
             # The new code takes the same socket without the systemd restart delay; a failed start restarts as before.
             os.set_inheritable(LISTEN_FD, True)
+            os.environ[ADMISSION_SOURCE_RELOAD] = "1"
+            changed = ", ".join(str(path) for path in sorted(server.changed_sources))
+            print(f"memory admission: reload for changed source {changed}", file=sys.stderr, flush=True)
             os.execv(sys.executable, sys.orig_argv)
         return 0
     except override_guard.SharedStateWriteRefused as error:
