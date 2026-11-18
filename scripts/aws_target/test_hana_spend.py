@@ -12,7 +12,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import config, hana_spend, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, instant, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, instant, text_setting
 from scripts.lib import conf
 
 
@@ -21,25 +21,19 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 class HanaSpendTests(CostFixture):
     book: ledger.CostLedger = ledger.CostLedger(Path())
-    controller: hana_spend.HanaSpending
-    workload: hana_spend.PermitSettings
+    workload: hana_spend.PermitSettings = hana_spend.PermitSettings(
+        False, 'fixture', 'fixture', (), Decimal(1), 1, 1, Decimal(1), Decimal(1), 1, 1)
+    controller: hana_spend.HanaSpending = hana_spend.HanaSpending(book, Path(), workload)
     start: int = instant('2026-01-15T00:00:00+00:00')
-
-    def __init__(self, methodName: str = 'runTest'):
-        super().__init__(methodName)
-        self.workload = hana_spend.read_settings(conf.read(REPOSITORY / 'config/hana_aws.conf'))
-        self.controller = hana_spend.HanaSpending(self.book, Path(), self.workload)
 
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         private = self.root / 'hana_aws.conf'
-        _ = private.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        text_setting(private, 'enabled', 'on')
+        install_hana_spending_settings(private)
         self.workload = hana_spend.read_settings(conf.read(private))
-        account = conf.read(REPOSITORY / 'config/aws_target.conf')
-        self.costs({'daily_limit_usd': account.text('daily_limit_usd'), 'limit_reserve_usd': '0'})
+        self.costs({'daily_limit_usd': '35', 'limit_reserve_usd': '0'})
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'private inventory', builder_removed=True))
         self.book.observe(ledger.InstanceObservation(self.start, 'terminated', 'private account inventory'))
@@ -80,7 +74,7 @@ class HanaSpendTests(CostFixture):
 
     def test_gate_spend_and_hana_share_the_unchanged_account_limit(self) -> None:
         account = config.read_settings(self.settings)
-        self.assertEqual(account.daily_limit_usd, conf.decimal(conf.read(REPOSITORY / 'config/aws_target.conf').text('daily_limit_usd')))
+        self.assertEqual(account.daily_limit_usd, Decimal('35'))
         storage = self.workload.storage_usd_per_month / 30
         gate = ledger.GateReservation('private-gate', self.start, self.start + 3600,
             account.daily_limit_usd - storage / 2, Decimal(0), instance_type=account.instance_type, region=self.workload.region)

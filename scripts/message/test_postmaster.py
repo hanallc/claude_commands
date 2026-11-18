@@ -12,6 +12,7 @@ from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from typing import Literal, cast, override
 from unittest.mock import patch
 
@@ -63,6 +64,11 @@ class PostmasterTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "postmaster.conf",
+            "wait_seconds=3.0\nheartbeat_max_age_seconds=2.0\npoll_seconds=0.05\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         self.state = self.root / "message"
         self.directory = self.state / "postmaster"
         self.clock = FakeClock()
@@ -129,21 +135,18 @@ class PostmasterTests(unittest.TestCase):
         self.no_id_files()
 
     def test_outbox_wait_uses_the_current_configuration(self) -> None:
-        config = self.root / "config"
-        config.mkdir()
-        defaults = Path(postmaster.__file__).resolve().parents[2] / "config/postmaster.conf"
-        with patch.dict(os.environ, {"CONF_DIR": str(config)}):
-            for seconds in (0.15, 0.35):
-                _ = (config / "postmaster.conf").write_text(
-                    defaults.read_text().replace("wait_seconds=3.0", f"wait_seconds={seconds}"))
-                self.heartbeat()
-                answer = self.attempt()
-                self.assertIsInstance(answer, postmaster.RelayRequired)
-                self.assertAlmostEqual(answer.seconds, seconds, places=6)
+        settings = Path(os.environ["CONF_DIR"]) / "postmaster.conf"
+        for seconds in (0.15, 0.35):
+            _ = write_config_fixture(settings, f"wait_seconds={seconds}\n")
+            self.heartbeat()
+            answer = self.attempt()
+            self.assertIsInstance(answer, postmaster.RelayRequired)
+            self.assertAlmostEqual(answer.seconds, seconds, places=6)
 
     def test_constants_and_entry_ids(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "postmaster.conf", "claim_grace_seconds=9\n")
         self.assertEqual((postmaster.wait_seconds(), postmaster.claim_grace_seconds(),
-            postmaster.heartbeat_max_age_seconds(), postmaster.poll_seconds()), (3.0, 15.0, 2.0, 0.05))
+            postmaster.heartbeat_max_age_seconds(), postmaster.poll_seconds()), (3.0, 9.0, 2.0, 0.05))
         ids = [postmaster.new_entry_id() for _ in range(2)]
         self.assertNotEqual(ids[0], ids[1])
         for identity in ids:
@@ -257,6 +260,7 @@ class PostmasterTests(unittest.TestCase):
         self.no_id_files()
 
     def test_claim_grace_follows_late_delivery_withdrawal_or_missing_result(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "postmaster.conf", "claim_grace_seconds=9\n")
         for outcome in ("delivered", "withdrawn", "missing"):
             with self.subTest(outcome=outcome):
                 self.heartbeat()
@@ -438,7 +442,7 @@ class PostmasterTests(unittest.TestCase):
                             self.claim()
                         elif original_exists(self.path("outbox")):
                             delivered.append("mod")
-                            receipt_due = self.clock.elapsed + (5.535 if delayed else 0)
+                            receipt_due = self.clock.elapsed + (postmaster.claim_grace_seconds() / 2 if delayed else 0)
 
                             def receipt() -> None:
                                 if self.clock.elapsed >= receipt_due:

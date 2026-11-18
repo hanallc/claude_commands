@@ -1,5 +1,6 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
 from scripts.aws_target.test_spot_end import Disk, FakeEc2, TAG as HANA_TAG
@@ -434,32 +435,14 @@ class HanaSetupFailureTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         self.clock = TestClock()
-        self.workload = self.root / 'hana_aws.conf'
+        self.workload = write_hana_config()
         self.setup_path = self.state / 'hana/setup.json'
         self.book = ledger.CostLedger(self.state)
         self.calls = []
         self.deleted_stacks = {}
-        _ = self.workload.write_bytes((deploy.TEMPLATE.parents[3] / 'config/hana_aws.conf').read_bytes())
-        for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id'):
-            text_setting(self.workload, key, 'fixture-' + key)
-        text_setting(self.workload, 'availability_zone', 'us-east-2b')
-        text_setting(self.workload, 'instance_type', 'm7a.4xlarge')
-        text_setting(self.workload, 'fallback_instance_types', 'c7a.4xlarge')
-        numeric_settings(self.workload, {'intent_lookup_timeout_s': '15', 'stop_poll_seconds': '10'})
+        numeric_settings(self.workload, {'intent_lookup_timeout_s': '15'})
         self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
         self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
-        original = conf.read_or_repository
-
-        def configuration(name: str) -> conf.ConfigRead:
-            return conf.read(self.workload) if name == 'hana_aws' else original(name)
-
-        _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
-        original_path = conf.path
-
-        def config_path(name: str | Path) -> Path:
-            return self.workload if name == 'hana_aws' else original_path(name)
-
-        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=config_path))
         settings = aws_config.DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gate', 'image',
             'owner', 'fixture-release', 'us-east-2b', 'vpc', 'subnet', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
         _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=settings))
@@ -483,10 +466,11 @@ class HanaSetupFailureTests(CostFixture):
             offset = arguments.index('--region') + 2
             operation = arguments[offset + 1]
             if operation == 'describe-subnets':
-                self.assertIn('Name=vpc-id,Values=fixture-vpc_id', arguments)
+                vpc = conf.read(self.workload).text('vpc_id')
+                self.assertIn(f'Name=vpc-id,Values={vpc}', arguments)
                 return subprocess.CompletedProcess(arguments, 0, json.dumps({'Subnets': [
                     {'SubnetId': 'fixture-subnet-' + suffix, 'AvailabilityZone': 'us-east-2' + suffix,
-                     'VpcId': 'fixture-vpc_id', 'State': 'available', 'DefaultForAz': True} for suffix in ('a', 'c')]}), '')
+                     'VpcId': vpc, 'State': 'available', 'DefaultForAz': True} for suffix in ('a', 'c')]}), '')
             if operation == 'describe-spot-price-history':
                 if fake.fail == operation:
                     return subprocess.CompletedProcess(arguments, 1, '', 'fixture Spot read failed')
@@ -1106,7 +1090,7 @@ class DeploymentTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(box, 'urlopen', side_effect=AssertionError('tests require a fake tailnet transport'))))
-        _ = self.settings.write_text((deploy.TEMPLATE.parents[3] / 'config/aws_target.conf').read_text())
+        _ = write_config_fixture(self.settings)
         self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
         self.bundle.mkdir()
@@ -1156,8 +1140,8 @@ class DeploymentTests(CostFixture):
         for key, value in values.items():
             self.replace(key, value)
         gates = self.root / 'cloud_gate.conf'
-        _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
-        text_setting(gates, 'regions', 'us-east-1')
+        _ = write_config_fixture(gates,
+            "regions=us-east-1\nroot_gib=40\nspot_max_usd_per_hour=0.8\nshared_usd_per_month=1\n")
         # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
         _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
                                     re.sub(r'^(spot_quota_request_vcpus)=.*$', r'\1=128', gates.read_text(), flags=re.M), flags=re.M))
@@ -1569,9 +1553,7 @@ sys.exit(7)
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        shipped = (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_text()
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n')
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
@@ -1793,7 +1775,7 @@ sys.exit(7)
         subject = self.deployment()
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
-        _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        _ = write_config_fixture(self.root / 'cloud_gate.conf')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
         gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
@@ -2631,14 +2613,14 @@ sys.exit(7)
         return len(attached) + len(blocks) + len(regional) * (regions - 1)
 
     def test_scaler_user_keeps_two_gate_policies_and_the_budget_block_in_every_region_count(self) -> None:
-        gates = conf.read(deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf')
+        gates = conf.read(self.root / 'cloud_gate.conf')
         for key in ('regions', 'spot_candidate_regions'):
             with self.subTest(regions=len(gates.words(key))):
                 # AWS attaches at most 10 managed policies to one IAM user; the budget block needs a free slot.
                 self.assertEqual(self.scaler_policy_count(len(gates.words(key))), 3)
 
     def test_gate_scaler_policy_for_every_candidate_region_fits_the_managed_policy_size(self) -> None:
-        gates = conf.read(deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf')
+        gates = conf.read(self.root / 'cloud_gate.conf')
         regions = gates.words('spot_candidate_regions')
         partition, account = 'aws', '1' * 12
         values: dict[str, object] = {
@@ -3333,6 +3315,7 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'targets=mac,natedev\n')
         self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()

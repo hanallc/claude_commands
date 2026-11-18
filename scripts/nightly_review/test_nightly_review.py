@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
 
 from scripts.agents import remote
@@ -73,7 +75,11 @@ class NightlyReviewTests(unittest.TestCase):
         configuration = self.root / "config"
         configuration.mkdir()
         for stem in ("nightly_review", "accounts", "nix_env"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+            _ = write_config_fixture(configuration / f'{stem}.conf')
+        _ = write_config_fixture(configuration / "nightly_review.conf",
+                                 "review_modes=config rust messages\ncommand_path=~/.claude/commands/nightly_review.md\n"
+                                 + "title_characters=90\nmessage_sample_rows=20\nstate_folder=nightly-review\n"
+                                 + "sample_timeout_overhead_seconds=15\nprimary_showrunner_name=natedev\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)

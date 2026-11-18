@@ -85,7 +85,7 @@ class CargoGateTests(unittest.TestCase):
         ps.chmod(0o755)
         _ = write_config_fixture(root / "config/mac_gate.conf",
             "placement_check_command=" + shlex.join([sys.executable, str(check)])
-            + "\nplacement_check_timeout_seconds=1\nplacement_recheck_seconds=15\n")
+            + "\nplacement_check_timeout_seconds=1\nplacement_recheck_seconds=15\nrefusal_exit_code=125\n")
         ssh = fake / "ssh"
         _ = ssh.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n"
             + "root = Path(os.environ['GATE_TEST_ROOT'])\n"
@@ -113,8 +113,9 @@ class CargoGateTests(unittest.TestCase):
                     environment["REAL_STATUS"] = "23"
                     if placement:
                         _ = write_config_fixture(root / "config/mac_gate.conf",
-                            (Path(__file__).resolve().parents[2] / "config/mac_gate.conf").read_text()
-                            .replace("placement_check_timeout_seconds=10", "placement_check_timeout_seconds=1"))
+                            "placement_check_command=ssh -o BatchMode=yes -o ConnectTimeout=6 natedev "
+                            + "'~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py placement-status'\n"
+                            + "placement_check_timeout_seconds=1\n")
                         environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
                     if not readable:
                         (root / "config/mac_gate.conf").unlink()

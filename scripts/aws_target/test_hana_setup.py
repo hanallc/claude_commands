@@ -17,8 +17,8 @@ from unittest import mock
 from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
-from scripts.aws_target.ledger_test_support import CostFixture, numeric_settings, text_setting
-from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY, REPOSITORY
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config
+from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
 
 
@@ -30,26 +30,10 @@ class HanaSetupTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         self.clock = TestClock()
-        self.workload = self.root / 'hana_aws.conf'
-        _ = self.workload.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        for key, value in {'ami_id': 'fixture-image', 'ami_owner_id': '000000000000',
-                           'vpc_id': 'fixture-vpc', 'subnet_id': 'fixture-subnet', 'availability_zone': 'us-east-2b',
-                           'instance_type': 'm7a.4xlarge',
-                           'fallback_instance_types': 'c7a.4xlarge,m7i.4xlarge,m6a.4xlarge'}.items():
-            text_setting(self.workload, key, value)
-        numeric_settings(self.workload, {'intent_lookup_timeout_s': '120', 'aws_timeout_s': '10', 'stop_poll_seconds': '10',
-                                         'stop_wait_timeout_s': '600', 'spot_max_usd_per_hour': '0.35'})
+        self.workload = write_hana_config()
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private setup inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'private setup account'))
-        original = conf.read_or_repository
-        def configuration(name: str) -> conf.ConfigRead:
-            return conf.read(self.workload) if name == 'hana_aws' else original(name)
-        _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
-        original_path = conf.path
-        def config_path(name: str) -> Path:
-            return self.workload if name == 'hana_aws' else original_path(name)
-        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=config_path))
 
     def subject(self, fake: FakeAws) -> deploy.Deployment:
         return deploy.Deployment(self.settings, self.state, self.root / 'output', execute=fake, clock=self.clock, notify=lambda _event: True)
@@ -128,7 +112,7 @@ class HanaSetupTests(CostFixture):
                 self.assertTrue(any(isinstance(row.state, ledger.HanaExposureOpen) for row in evidence.hana_compute))
                 self.assertTrue(evidence.hana_storage)
                 self.assertEqual(service, 'cloudformation')
-                self.assertIn('hana-build', arguments)
+                self.assertIn(workload.text('stack_name'), arguments)
                 version += 1
                 return {}
             if operation == 'describe-change-set':
@@ -363,7 +347,8 @@ class HanaSetupTests(CostFixture):
 
     def test_setup_updates_the_launch_template_after_refusals_and_a_ceiling_change(self) -> None:
         key = 'spot_max_usd_per_hour'
-        _ = self.workload.write_text(self.workload.read_text().replace(f'{key}=0.35\n', f'{key}=0.09\n'))
+        ceiling = conf.read(self.workload).text(key)
+        _ = self.workload.write_text(self.workload.read_text().replace(f'{key}={ceiling}\n', f'{key}=0.09\n'))
         fake = FakeAws(self.clock)
         subject = self.subject(fake)
         saved_path = self.state / 'hana/setup.json'
