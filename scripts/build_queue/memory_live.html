@@ -1556,7 +1556,7 @@ function placeMemoryBars(d) {
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   // A local bar stops at the cap line; a bar that the cap cuts shows a cap-colored end.
-  const chartEdge = !hasCap(d) ? width : progressEnd;
+  const chartEdge = hasCap(d) ? width * capEnd(d) : width;
   const capBox = (left, size, className) => {
     const drawn = Math.min(size, chartEdge - left);
     return box(left, drawn, drawn < size ? `${className} over-cap` : className);
