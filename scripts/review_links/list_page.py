@@ -526,7 +526,7 @@ def staff_chips(labels: Mapping[str, str], names: staff_names.StaffNames) -> lis
             for value, label in sorted(labels.items(), key=lambda pair: (pair[1].casefold(), pair[0]))]
 
 
-def render(root: Path) -> bytes:
+def render(root: Path, *, include_counts: bool = True) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
@@ -542,6 +542,7 @@ def render(root: Path) -> bytes:
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     seconds = conf.read("review_links").number("page_refresh_seconds")
+    counts = counts_strip(members, names) if include_counts else ''
     content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}"><div data-record-filters>'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
@@ -556,7 +557,7 @@ def render(root: Path) -> bytes:
                + '<col style="width:10%"><col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
                + '<col style="width:8%"></colgroup><thead><tr>' + headers + '</tr></thead>'
                + ''.join(item_rows(entry, members, today, index, secret, reviews, names) for index, entry in enumerate(items)) + '</table>'
-               + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members, names) + '</div><script>' + SCRIPT + '</script>')
+               + '<p data-empty hidden>No items in this view.</p></div>' + counts + '</div><script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
