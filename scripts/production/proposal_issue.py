@@ -168,13 +168,15 @@ class NoProposalSubmissionReply:
 
 _NO_SUBMISSION_REPLY = NoProposalSubmissionReply()
 
-def record_review(path: Path, words: str, change: MarkChange, today: date, who: str = "nate", *,
-                  waiting_why: str = "", check_state: Callable[[], None] = lambda: None,
+def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, today: date, who: str = "nate", *,
+                  check: Callable[[], object] | None = None, waiting_why: str = "", check_state: Callable[[], None] = lambda: None,
                   reply_token: str = "",
                   submission_reply: ProposalSubmissionReply | NoProposalSubmissionReply = _NO_SUBMISSION_REPLY) -> bool:
     """Append one Review page log line and change its mark. Returns False for an exact repeat."""
     reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ""
     with issue_lock(path):
+        if check is not None:
+            _ = check()
         issue = Issue(path, frontmatter(path))
         check_state()
         before = review_log(issue)
@@ -193,9 +195,13 @@ def record_review(path: Path, words: str, change: MarkChange, today: date, who: 
                 raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
             if repeated:
                 return False
-        elif words.startswith("Answer: ") and issue.value("review_submission"):
+        lines_to_append = (words,) if isinstance(words, str) else words
+        if not isinstance(submission_reply, ProposalSubmissionReply) and issue.value("review_submission") and any(
+                line.startswith("Answer: ") for line in lines_to_append):
             raise new_item_dialog.SubmissionError("Use the scoped reply from the Review item.")
-        events = review_events.append(before, ReviewLog(datetime.now(timezone.utc), who, words))
+        events = before
+        for line in lines_to_append:
+            events = review_events.append(events, ReviewLog(datetime.now(timezone.utc), who, line))
         mark = review_events.changed_mark(review_mark(issue), change)
         new_wait: dict[str, str] = {}
         if change == ReviewMark.WAITING and issue.value("review_submission"):
@@ -550,9 +556,11 @@ def _clear_waiting_mark(text: str, path: Path) -> tuple[str, list[str]]:
     return remove_fields(text, (REVIEW_MARK_FIELD,), path)
 
 
-def edit(path: Path, fields: dict[str, str], today: date) -> list[str]:
+def edit(path: Path, fields: dict[str, str], today: date, *, check: Callable[[], object] | None = None) -> list[str]:
     """Set the fields and date_modified in the issue at path. Returns the keys whose lines changed."""
     with issue_lock(path):
+        if check is not None:
+            _ = check()
         text = read_issue(path)
         text, removed = _clear_waiting_mark(text, path) if fields.get("stage") == IN_PROGRESS_STAGE else (text, [])
         text, changed = set_fields(text, {**fields, "date_modified": _vault_date(today)}, path)

@@ -305,3 +305,30 @@ A repeated finish also attempts to clear matching pointers.
 An old run cannot clear a pointer that names a newer run.
 `direct_run.active_run` keeps its 12-hour rule for recent writes in the run folder.
 That rule controls turn continuation and does not permit deletion.
+
+### Session folder cutover
+
+Run `scripts/lib/py scripts/lib/session_move.py --dry-run` before the cutover.
+The output gives each source, destination, size, move type, and naming rule.
+Run the command without `--dry-run` to move the files.
+The dry run reads the session index and folder records without creating a preview directory.
+It reads compressed transcripts through a pipe.
+The command checks the scratchpad copy after it scans the source for deletion.
+It checks each entry's identity, contents, mode, owner, and group before deletion.
+It checks modification times for files.
+On Linux, the copy must retain each source extended attribute and its value.
+The copy can contain additional extended attributes.
+Before deletion, the command compares the source extended attributes with their verified values.
+It checks session liveness again immediately before it starts to delete each scratchpad tree.
+A session can still start between that check and the end of the deletion.
+The command refuses invalid session index entries.
+The command leaves open holds in the former scratch root and reports each path and owner.
+It compares directory identities to detect overlaps with held folders, including folders held through a bind mount.
+It skips each scratchpad tree that overlaps an open hold and returns status 1.
+Ask the owner to release a hold before you retry the cutover.
+The journal in `<session-root>/.session-move` records the pending scratchpad copy.
+Run the same command after an interruption to resume the pending copy or deletion.
+If source data changes before publication, the command saves a copy-in-progress state before it discards the stage.
+The command keeps the source and can rebuild the stage on retry.
+The command reports unrecognized entries and preserves them.
+It refuses an existing destination unless the journal identifies it as the result of the pending move.

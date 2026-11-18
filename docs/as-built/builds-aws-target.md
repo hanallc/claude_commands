@@ -39,6 +39,111 @@ Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
 
+## AWS plan identity
+
+Run this command in a terminal on natedev.
+
+```sh
+deploy.py plan-identity --approve-resources
+```
+
+For a new key, the command checks encryption to the GPG key that protects the GitHub token.
+Run `github-warmup` in a terminal on natedev if the GPG agent is cold.
+Enter the administrator passphrase when the command asks for it.
+The command creates the `aws-build-plan` IAM user and one managed policy.
+It checks the user with STS, reads EC2 availability zones, and simulates seven denied actions.
+After these checks pass, it saves one access key in `~/.config/aws-build/plan.gpg` with mode `0600`.
+The rename that publishes `plan.gpg` commits setup.
+If setup fails before the rename, it revokes any new key it finds.
+During setup, `plan.gpg` must be absent before the command revokes a key.
+If directory sync or cleanup fails after the rename, the command warns and reports that the identity is ready.
+Setup keeps the verified file and IAM key after the rename.
+If IAM lists no key after a failed creation, a key can appear later.
+Run the same approved command again to revoke the late key and create a new key.
+If `plan.gpg` is absent, the command revokes all keys that IAM lists for the plan user before it creates one key.
+The command keeps the local key when it matches the sole key that IAM lists.
+Setup refuses if the local key differs from the sole key that IAM lists.
+Setup also refuses if it cannot read or decrypt `plan.gpg`.
+This refusal preserves the local file and the IAM keys.
+Setup uses GPG without a passphrase prompt for these checks.
+If `plan.gpg` is damaged, delete the file and run the command again.
+The command compares the default policy with the current configuration and sets a new default version when they differ.
+Omit `--approve-resources` to print the plan without contacting AWS.
+
+The policy allows setup reads, IAM simulation for users in the account, and S3 object listings in account buckets.
+The policy allows reads of applied service quotas and quota request history.
+The command prints the configured names and regions of the home, regional gate, and Hana stacks.
+The policy limits CloudFormation stack details and templates to those stacks.
+It allows creation and deletion of change sets named `aws-build-plan-*` on those stacks.
+The policy blocks the `TemplateURL` request parameter.
+CloudFormation accepts an inline template body or `UsePreviousTemplate` when the stack has a template.
+A `CREATE` change set for an absent stack leaves an empty stack in `REVIEW_IN_PROGRESS`.
+The policy denies deletion of every stack.
+It denies change set execution, role passing, EC2, IAM and S3 writes, and S3 object reads.
+It denies EC2 instance attribute and Spot request reads because those calls can return user data.
+
+Sessions use `plan_credentials()` to decrypt the key without a prompt.
+If the agent is cold, run `github-warmup` in a terminal on natedev.
+The approved removal command can revoke the key while `plan.gpg` exists.
+Run this command in the same terminal to remove the key, user, and policy.
+
+```sh
+deploy.py down --workload plan-identity --approve-destroy
+```
+
+## Run a setup plan
+
+Run this command in a terminal on natedev.
+
+```sh
+deploy.py hana-setup --plan
+```
+
+The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
+It refuses first-time Hana setup, pending instance or volume work, and direct-owned boxes.
+
+The plan checks the local credential file and reads the scaler identity with STS.
+It uses the same stack, instance, disk, and parameter checks as approved setup.
+It previews one modification to `ScalerPolicy` without resource replacement.
+The plan deletes the change set and confirms its removal with CloudFormation.
+If removal stays unconfirmed, the plan prints the change set name and refuses.
+
+The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
+The plan simulates the EC2 probes without reading user data or starting the box.
+The S3 simulation uses the control bucket policy from the stack template.
+If the template has no policy or the plan cannot resolve it, the plan prints a note.
+The plan then simulates S3 without a bucket policy.
+Bucket policies added outside the stack are out of scope.
+
+To plan a merge gate update, run this command in a terminal on natedev.
+
+```sh
+deploy.py up --workload merge-gates --plan
+```
+
+The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
+It holds the same controller lock as approved gate setup and image removal.
+If the controller lock is busy, the plan refuses before it contacts AWS.
+It builds the same template and parameter values as approved gate setup.
+The plan previews updates in the home region and in each configured gate region.
+It removes each change set and confirms removal before it checks scaler permissions.
+Each removal has one deadline for all deletion and confirmation calls.
+An absent stack refuses because a CREATE change set can leave a stack in `REVIEW_IN_PROGRESS`.
+The plan identity has no permission to delete a stack.
+An existing stack in `REVIEW_IN_PROGRESS` also refuses.
+In a region with a rolled-back first create, the plan checks scaler permissions.
+Approved setup must delete and recreate that regional stack.
+
+The plan reads the change sets for managed policies that the updates remove or replace.
+If a preview fails or its removal is unconfirmed, all regions that share the scaler policies refuse.
+The simulations exclude those policies and the live versions of the proposed gate scaler policies.
+If the plan cannot identify a policy to exclude, it names the policy and refuses.
+The simulations include the proposed gate policies and the proposed S3 bucket policy.
+The simulations use the regional VPC, image, and Spot request conditions.
+The plan simulates `ec2:GetSpotPlacementScores` in each gate region.
+The plan reports each region in configuration order.
+It passes when every region passes.
+
 ## Hana guest safety files
 
 `scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
@@ -314,7 +419,12 @@ Setup continues the update if the first probe run fails.
 Setup returns exit status 1 if any operation in the last probe run fails.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
-Setup refuses a stack that owns the instance or data disk. Run approved Hana teardown first.
+For a registered version-1 box, setup reads the original stack template and replaces only `ScalerPolicy`.
+The change set uses the previous value of every live parameter.
+The instance, data disk, and attachment stay in the stack.
+Setup saves the updated template hash and keeps the version-1 record.
+If the policy is current, setup runs the probe without executing a change set.
+Setup refuses a stack-owned box if it cannot confirm the saved resource identities.
 Setup refuses a change set that replaces or removes an instance, volume, or attachment.
 When a policy update fails, setup prints the failed step and the update error.
 When an ordinary stack change fails, setup reads failed stack events from the current change before cleanup.
@@ -664,11 +774,13 @@ The AWS CLI reads all pages, and the reader selects the latest price for each ty
 The reader also reads applied Standard Spot and G and VT Spot quotas.
 It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
 It removes inherited administrator keys and profiles from the AWS process environment.
-The only API actions are `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
+The snapshot calls `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
 The CLI service name is `service-quotas`; the IAM prefix is `servicequotas`.
 See the [AWS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_service-quotas.html).
 The snapshot test derives IAM actions from every request in the real snapshot path.
 It checks the scaler policy for each action, all resources, and no regional condition.
+The scaler policy also allows `ec2:GetSpotPlacementScores` on all resources.
+The grant has no regional condition because a score request can name several target regions.
 A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
 The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.

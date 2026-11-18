@@ -146,10 +146,15 @@ class TurnEndTests(unittest.TestCase):
                     runs = self.case.run_dir / "detached_runs"
                     runs.mkdir(exist_ok=True)
                     for run_id, owner, owner_id in (("own", name, str(row.id)), ("director", "director", "")):
-                        atomic_file.write_text_atomic(runs / f"{run_id}.json", json.dumps(
-                            {"run_id": run_id, "worker": owner, "staff_id": owner_id, "status": "finished",
-                             "started_at": datetime.now().timestamp()}))
-                        atomic_file.write_text_atomic(runs / f"{run_id}.log", "output")
+                        log = runs / f"{run_id}.log"
+                        record: detached_runs.RunRecord = {
+                            "run_id": run_id, "worker": owner, "staff_id": owner_id, "status": "finished",
+                            "started_at": datetime.now().timestamp(), "pid": 0, "command": ["true"],
+                            "label": "private verification", "log": str(log), "session_dir": str(self.case.run_dir),
+                            "director_dir": str(self.case.run_dir), "done_message_file": "",
+                        }
+                        atomic_file.write_text_atomic(log.with_suffix(".json"), json.dumps(record))
+                        atomic_file.write_text_atomic(log, "output")
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)

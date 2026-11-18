@@ -644,7 +644,10 @@ class WaitHolderRulesTests(unittest.TestCase):
         continuation["build_run"] = run
         continuation["order_since"] = run.started_at
         inputs = self.inputs(self.running(1, GIB, session="other"))
-        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10)
+        absent = admission_records.EndedStepFactNotRecorded()
+        identity = admission_records.EndedStepFacts("check", admission_records.PackageNotRecorded(),
+                                                    absent, absent, admission_records.NoEndedStepStaff())
+        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10, identity)
         inputs = replace(inputs, ordered=[(Path("head"), head), (Path("continuation"), continuation)],
             slots=(admission_records.ContinuationSlot(slot, admission_records.waiter_owner(continuation)),))
         result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
@@ -2051,6 +2054,7 @@ class MemoryQueueFixture(unittest.TestCase):
         self.processes = {100: "first", 200: "second", 300: "head", 400: "warmup"}
         self.readings = {100: admission_records.MeasuredMemory(GIB, anonymous=admission_records.AnonymousRunUse(GIB)), 200: admission_records.MeasuredMemory(2 * GIB, anonymous=admission_records.AnonymousRunUse(2 * GIB))}
         _ = cast(object, self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root))))
+        (self.root / "sessions").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root), "BUILDLOG_PROC": str(self.root / "proc"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(patch.object(admission_records, "process_start_time", side_effect=self.processes.get))
         def table(_proc: Path) -> dict[int, gate.ProcessIdentity]:
@@ -3677,6 +3681,31 @@ class CurrentBlockerTests(MemoryQueueFixture):
         result = self.blocker()
         self.assertIsInstance(result, gate.ReservationBlocker)
         self.assertEqual(gate.blocker_fields(self.blocker()), {'session_id': 'owner-id', 'session_name': 'owner-name', 'pool': 'memory'})
+
+    def test_blocker_reports_an_incomplete_session_name_lookup(self) -> None:
+        _ = (self.root / "proc/100/environ").write_bytes(b"CLAUDE_CODE_SESSION_ID=owner-id\0")
+        for cause in ("missing folder", "unreadable record"):
+            registry = self.root / cause
+            unreadable = registry
+            name: str | gate.BlockerSessionNameUnknown = gate.BlockerSessionNameUnknown((unreadable,))
+            if cause == "unreadable record":
+                registry.mkdir()
+                unreadable = registry / "unfinished.json"
+                _ = unreadable.write_text("{")
+                name = "registry name"
+                _ = (registry / "good.json").write_text(json.dumps({
+                    "pid": 100, "sessionId": "owner-id", "name": name, "messagingSocketPath": "", "updatedAt": 1,
+                }))
+            with (self.subTest(cause=cause), patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                result = self.blocker()
+                self.assertEqual(result, gate.ReservationBlocker("owner-id", name))
+                self.assertIn(f"memory queue: session registry unreadable: {unreadable}", errors.getvalue())
+                fields = gate.blocker_fields(result)
+                if isinstance(name, gate.BlockerSessionNameUnknown):
+                    self.assertEqual(fields["session_name_unknown"], f"session registry unreadable: {unreadable}")
+                else:
+                    self.assertNotIn("session_name_unknown", fields)
 
     def test_check_reports_holder_changes_on_existing_poll_with_opt_in_field(self) -> None:
         for name in ("owner-name", "new-owner"):
@@ -5792,7 +5821,8 @@ class StrictTargetLineTests(unittest.TestCase):
 
     def test_continuation_switch_only_allows_a_step_within_its_claim_to_pass(self) -> None:
         run = LiveBuildRun(90, "90", NOW_EPOCH - 10)
-        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10)
+        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10,
+            identity=admission_records.HoldPredatesStepFacts())
         for bypass in (False, True):
             for need in (2, 3):
                 with self.subTest(bypass=bypass, need=need), patch.object(
@@ -6030,7 +6060,8 @@ class QueueExplanationTests(MemoryQueueFixture):
         busy = placement.CargoFolder(self.root / "busy")
         free = placement.CargoFolder(self.root / "free")
         run = LiveBuildRun(900, "900", NOW_EPOCH - 60)
-        slot = admission_records.BetweenStepsSlot(run, "previous", 4 * GIB, NOW_EPOCH + 10)
+        slot = admission_records.BetweenStepsSlot(run, "previous", 4 * GIB, NOW_EPOCH + 10,
+            identity=admission_records.HoldPredatesStepFacts())
         inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB),
             slots=(admission_records.ContinuationSlot(slot, "400-warmup"),),
             cargo_folders={"300-head": busy, "400-warmup": free}, occupied_cargo_folders=frozenset({busy}))

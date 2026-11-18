@@ -19,6 +19,7 @@ scripts/build_hold/shared_state_defaults.py
 scripts/build_queue/__init__.py
 scripts/build_queue/admission_client.py
 scripts/build_queue/admission_code.py
+scripts/build_queue/admission_jobs.py
 scripts/build_queue/admission_protocol.py
 scripts/build_queue/admission_records.py
 scripts/build_queue/admission_wire.py
@@ -71,6 +72,7 @@ scripts/lib/session_paths.py
 scripts/lib/slot_root.py
 scripts/lib/suite_runners.py
 scripts/lib/test_phase.py
+scripts/lib/time_limit.py
 scripts/lib/transcripts.py
 scripts/lib/unit_runs.py
 scripts/lib/user_zone.py
