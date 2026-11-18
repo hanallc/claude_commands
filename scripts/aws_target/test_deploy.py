@@ -1733,17 +1733,31 @@ sys.exit(7)
                 self.assertNotIn('snap-old', fake.snapshots)
                 self.assertFalse((subject.directory / 'gate-image').exists())
 
-    def gate_fixture(self, change: str = 'GateBucket') -> tuple[deploy.Deployment, list[list[str]]]:
+    def gate_fixture(self, change: str = 'GateBucket', *, probe_faults: Mapping[str, str | tuple[str, ...]] | None = None,
+                     has_gpu_target: bool = True, unoffered_gpu_type: str = '',
+                     termination_decision: str = 'allowed', denied_region: str = '',
+                     resource_specific_simulation: bool = False,
+                     scaler_arn: str = 'arn:aws:iam::fixture-account:user/fixture-scaler'
+                     ) -> tuple[deploy.Deployment, list[list[str]]]:
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
-        # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n'
+            + 'hana_gpu_instance_types=g4dn.2xlarge g6.2xlarge\n'
+            + 'spot_candidate_regions=us-east-2\n'
+            + 'gpu_setup_dry_run_retry_timeout_s=1\ngpu_setup_dry_run_retry_interval_s=1')
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         commands: list[list[str]] = []
         outputs = {'GateBucket': 'fixture-bucket', 'GateLaunchTemplate': 'fixture-template',
-                   'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role'}
+                   'GateLaunchVersion': '1', 'GateSecurityGroup': 'fixture-group', 'GateRoleId': 'fixture-role',
+                   'ScalerUserName': 'fixture-scaler'}
+        faults = probe_faults or {}
+        fault_attempts: dict[str, int] = {}
+        probe_bodies: dict[str, bytes] = {}
+        artifact_key = 'artifacts/gpu-size-trial/setup-probe.json'
+        input_key = 'requests/gpu-size-trial/setup-probe.json'
+        upload_id = 'fixture-upload'
 
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
@@ -1763,6 +1777,35 @@ sys.exit(7)
                 reply = {'Account': 'fixture-account'}
             elif operation == 'describe-change-set':
                 reply = {'Status': 'CREATE_COMPLETE', 'Changes': [{'ResourceChange': {'LogicalResourceId': change}}]}
+            elif operation == 'simulate-principal-policy':
+                self.assertEqual(args[:7], ['aws', '--profile', 'build-admin', '--region', 'us-east-1',
+                                            'iam', 'simulate-principal-policy'])
+                region = args[12].split(':')[3]
+                self.assertEqual(args[7:13], ['--policy-source-arn', 'arn:aws:iam::fixture-account:user/fixture-scaler',
+                    '--action-names', 'ec2:TerminateInstances', '--resource-arns',
+                    f'arn:aws:ec2:{region}:fixture-account:instance/i-00000000000000000'])
+                self.assertEqual(args[13], '--context-entries')
+                saved = remote.read_record(self.state / 'gate-deployment.json')
+                self.assertEqual(json.loads(args[14]), [
+                    {'ContextKeyName': 'ec2:ResourceTag/GateDeployment', 'ContextKeyType': 'string',
+                     'ContextKeyValues': [saved['deployment_id']]},
+                    {'ContextKeyName': 'ec2:ResourceTag/Workload', 'ContextKeyType': 'string',
+                     'ContextKeyValues': ['cloud-claude-gate']},
+                    {'ContextKeyName': 'aws:RequestedRegion', 'ContextKeyType': 'string',
+                     'ContextKeyValues': [region]},
+                ])
+                self.assertEqual(args[15:], ['--no-paginate', '--output', 'json'])
+                if faults.get(operation) == 'AccessDenied':
+                    return subprocess.CompletedProcess(args, 1, '',
+                        'An error occurred (AccessDenied) when calling the SimulatePrincipalPolicy operation: private diagnostic')
+                decision = 'explicitDeny' if region == denied_region else termination_decision
+                evaluation: dict[str, object] = {'EvalActionName': 'ec2:TerminateInstances',
+                    'EvalResourceName': args[12], 'EvalDecision': decision}
+                if resource_specific_simulation:
+                    evaluation['EvalResourceName'] = 'arn:${Partition}:ec2:${Region}:${Account}:instance/${InstanceId}'
+                    evaluation['ResourceSpecificResults'] = [
+                        {'EvalResourceName': args[12], 'EvalResourceDecision': decision}]
+                reply = {'EvaluationResults': [evaluation]}
             elif operation not in ('create-change-set', 'execute-change-set', 'delete-change-set', 'wait'):
                 raise AssertionError(operation)
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
@@ -1771,6 +1814,107 @@ sys.exit(7)
             'build-admin', 'us-east-1', 1, execute=execute)))
         _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
         _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+
+        def scaler(arguments: Sequence[str], *, env: dict[str, str] | None = None,
+                   **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            commands.append(args)
+            profile = conf.read(self.settings).text('credentials_profile')
+            self.assertEqual(args[:5], ['aws', '--profile', profile, '--region', 'us-east-2'])
+            self.assertEqual({key: value for key, value in (env or {}).items() if key.startswith('AWS_')}, {
+                'AWS_SHARED_CREDENTIALS_FILE': str(self.credentials), 'AWS_EC2_METADATA_DISABLED': 'true'})
+            saved = remote.read_record(self.state / 'gate-deployment.json')
+            service, operation = args[5:7]
+            dry_run = operation in ('run-instances', 'terminate-instances')
+            self.assertEqual('--dry-run' in args, dry_run)
+            reply: dict[str, object] = {}
+            name = operation
+            if operation == 'get-caller-identity':
+                self.assertEqual(service, 'sts')
+                self.assertEqual(args[7:], ['--output', 'json'])
+                reply = {'Arn': scaler_arn}
+            elif operation == 'describe-instances':
+                self.assertEqual(service, 'ec2')
+                self.assertIn('Name=instance-lifecycle,Values=spot', args)
+                tags = [{'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'GpuSizeTrial', 'Value': 'fixture-trial'}]
+                instances: list[dict[str, object]] = [{'InstanceId': 'fixture-foreign-box',
+                    'Tags': [*tags, {'Key': 'GateDeployment', 'Value': 'another-deployment'}]}]
+                if has_gpu_target:
+                    instances.append({'InstanceId': 'fixture-gpu-box',
+                        'Tags': [*tags, {'Key': 'GateDeployment', 'Value': saved['deployment_id']}]})
+                reply = {'Reservations': [{'Instances': instances}]}
+            elif operation in ('describe-instance-type-offerings', 'describe-spot-price-history'):
+                self.assertEqual(service, 'ec2')
+                if operation == 'describe-instance-type-offerings':
+                    types = args[-3].removeprefix('Name=instance-type,Values=').split(',')
+                    reply = {'InstanceTypeOfferings': [{'InstanceType': size,
+                        'Location': 'c' if size == unoffered_gpu_type else 'b' if size == 'g4dn.2xlarge' else 'a'}
+                        for size in types]}
+            elif operation == 'get-service-quota':
+                self.assertEqual(service, 'service-quotas')
+                self.assertIn('L-3819A6DF', args)
+                reply = {'Quota': {'Value': 48}}
+            elif operation == 'get-cost-and-usage':
+                self.assertEqual(service, 'ce')
+                self.assertEqual(args[9:17], ['--granularity', 'DAILY', '--metrics', 'UnblendedCost',
+                    'UsageQuantity', '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--filter'])
+                self.assertIn('--no-paginate', args)
+                reply = account_reply(args)
+            elif operation == 'export-credentials':
+                self.assertEqual(service, 'configure')
+                self.assertEqual(args[7:9], ['--format', 'process'])
+                reply = {'AccessKeyId': 'fixture-key', 'SecretAccessKey': 'fixture-secret'}
+            elif operation == 'run-instances':
+                self.assertEqual(service, 'ec2')
+                launch = ledger.mapping(cast(object, json.loads(args[args.index('--cli-input-json') + 1])))
+                name += ' ' + ledger.text(launch, 'InstanceType')
+            elif operation == 'terminate-instances':
+                self.assertEqual(service, 'ec2')
+                self.assertTrue(has_gpu_target)
+                self.assertEqual(args[7:9], ['--instance-ids', 'fixture-gpu-box'])
+            elif operation in ('put-object', 'list-objects-v2', 'get-object'):
+                self.assertEqual(service, 's3api')
+                probe_key = args[10]
+                self.assertIn(probe_key, (artifact_key, input_key))
+                if probe_key == input_key:
+                    name += ' inputs'
+                self.assertEqual(args[7:11], ['--bucket', outputs['GateBucket'],
+                    '--prefix' if operation == 'list-objects-v2' else '--key', probe_key])
+                if operation == 'put-object':
+                    probe_bodies[probe_key] = Path(args[args.index('--body') + 1]).read_bytes()
+                    self.assertTrue(probe_bodies[probe_key])
+                elif operation == 'list-objects-v2':
+                    self.assertEqual(probe_key, artifact_key)
+                    self.assertEqual(args[11:14], ['--max-keys', '1', '--no-paginate'])
+                    reply = {'Contents': [{'Key': probe_key}]} if probe_key in probe_bodies else {}
+                else:
+                    _ = Path(args[-3]).write_bytes(probe_bodies[probe_key])
+            elif operation in ('create-multipart-upload', 'abort-multipart-upload'):
+                self.assertEqual(service, 's3api')
+                self.assertEqual(args[7:11], ['--bucket', outputs['GateBucket'], '--key', input_key])
+                if operation == 'create-multipart-upload':
+                    reply = {'UploadId': upload_id}
+                else:
+                    self.assertEqual(args[11:13], ['--upload-id', upload_id])
+            else:
+                raise AssertionError(operation)
+            default_code = 'DryRunOperation' if dry_run else ''
+            scripted = faults.get(name, default_code)
+            if isinstance(scripted, tuple):
+                position = fault_attempts.get(name, 0)
+                fault_attempts[name] = position + 1
+                code = scripted[position] if position < len(scripted) else default_code
+            else:
+                code = scripted
+            if code == 'TimeoutExpired':
+                raise subprocess.TimeoutExpired(operation, 1)
+            if code:
+                action = ''.join(word.title() for word in operation.split('-'))
+                return subprocess.CompletedProcess(args, 1, '',
+                    f'An error occurred ({code}) when calling the {action} operation: private diagnostic')
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+
+        subject.execute = scaler
         # A gate deploy reads prices at its end; the fixture keeps that read local.
         _ = self.enterContext(mock.patch.object(deploy, 'read_price_snapshot', return_value=0))
         return subject, commands
@@ -2980,6 +3124,248 @@ sys.exit(7)
         expected = ['g4dn.2xlarge', 'g4dn.xlarge', 'g6.2xlarge']
         self.assertEqual(applied, ','.join(expected))
         self.assertEqual(remote.read_record(self.state / 'gate-deployment.json')['gpu_instance_types'], expected)
+
+    def test_gate_setup_proves_each_saved_gpu_type_and_the_result_transfer(self) -> None:
+        subject, commands = self.gate_fixture()
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'regions=us-east-2\nhana_gpu_instance_types=g4dn.2xlarge\n' +
+            'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.98}')
+        with (mock.patch.dict(os.environ, {'AWS_ACCESS_KEY_ID': 'fixture-admin', 'AWS_PROFILE': 'build-admin'}),
+              redirect_stdout(StringIO()) as output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+
+        reports = [line.removeprefix('gate-setup probe: ') for line in output.getvalue().splitlines()
+                   if line.startswith('gate-setup probe: ')]
+        self.assertEqual(reports, [
+            'get-caller-identity: pass (OK)', 'describe-instances: pass (OK)', 'describe-instance-type-offerings: pass (OK)',
+            'describe-spot-price-history: pass (OK)', 'get-service-quota: pass (OK)', 'get-cost-and-usage: pass (OK)',
+            'run-instances g4dn.2xlarge: pass (DryRunOperation)', 'run-instances g6.2xlarge: pass (DryRunOperation)',
+            'terminate-instances: pass (DryRunOperation)', 'termination us-east-2: pass (IAM simulation)',
+            'export-credentials: pass (OK)', 'put-object: pass (OK)',
+            'list-objects-v2: pass (OK)', 'get-object: pass (OK)', 'put-object inputs: pass (OK)',
+            'get-object inputs: pass (OK)',
+            'create/abort-multipart-upload: pass (OK)',
+        ])
+        self.assertLess(output.getvalue().index('cloud-gate: deployed'), output.getvalue().index('gate-setup probe: '))
+        saved = remote.read_record(self.state / 'gate-deployment.json')
+        launches = self.gpu_probe_launches(commands)
+        self.assertEqual([launch['InstanceType'] for launch in launches], saved['gpu_instance_types'])
+        for launch in launches:
+            self.assertEqual(launch['LaunchTemplate'], {'LaunchTemplateId': 'fixture-template', 'Version': '1'})
+            self.assertEqual(launch['ImageId'], 'ami-fixture')
+            self.assertEqual((launch['MinCount'], launch['MaxCount']), (1, 1))
+            subnet = 'fixture-b' if launch['InstanceType'] == 'g4dn.2xlarge' else 'fixture-a'
+            self.assertEqual(launch['NetworkInterfaces'], [{'DeviceIndex': 0, 'SubnetId': subnet,
+                                                           'Groups': ['fixture-group'], 'AssociatePublicIpAddress': True}])
+            market = ledger.mapping(launch['InstanceMarketOptions'])
+            self.assertEqual(market['MarketType'], 'spot')
+            options = ledger.mapping(market['SpotOptions'])
+            self.assertEqual((options['SpotInstanceType'], options['InstanceInterruptionBehavior']), ('one-time', 'terminate'))
+            specs = ledger.rows(launch, 'TagSpecifications')
+            self.assertEqual([spec['ResourceType'] for spec in specs], ['instance', 'volume'])
+            for spec in specs:
+                tags = {ledger.text(tag, 'Key'): tag['Value'] for tag in ledger.rows(spec, 'Tags')}
+                self.assertEqual(tags['GateDeployment'], saved['deployment_id'])
+                self.assertEqual(tags['Workload'], 'cloud-claude-gate')
+                self.assertEqual(tags['GateAttempt'], launch['ClientToken'])
+                self.assertEqual(tags['Project'], 'fixture-build')
+                self.assertTrue(tags['GpuSizeTrial'])
+                self.assertGreater(int(str(tags['ExpiresAt'])), self.now)
+        self.assertNotIn('create-tags', [args[6] for args in commands if args[:1] == ['aws'] and '--profile' in args])
+
+    @staticmethod
+    def gpu_probe_launches(commands: list[list[str]]) -> list[dict[str, object]]:
+        return [ledger.mapping(cast(object, json.loads(args[args.index('--cli-input-json') + 1])))
+                for args in commands if 'run-instances' in args]
+
+    def failed_gpu_probe_output(self, operation: str, code: str, *,
+                                fault: str = '', advice: str = 'Check the gate scaler permissions and repeat approved setup.') -> str:
+        subject, _commands = self.gate_fixture(probe_faults={fault or operation: code})
+        argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--approve-resources']
+        with (mock.patch.object(deploy, 'Deployment', return_value=subject), mock.patch.object(sys, 'argv', argv),
+              redirect_stdout(StringIO()) as output):
+            self.assertEqual(deploy.main(), 1)
+        result = output.getvalue()
+        self.assertIn(f'gate-setup probe: {operation}: fail ({code})', result)
+        self.assertNotIn('private diagnostic', result)
+        self.assertEqual(result.splitlines()[-1], f'gate-setup: {advice}')
+        return result
+
+    def test_gate_setup_fails_on_one_refused_gpu_type_and_finishes_the_other_probes(self) -> None:
+        output = self.failed_gpu_probe_output('run-instances g4dn.2xlarge', 'UnauthorizedOperation')
+        self.assertIn('gate-setup probe: run-instances g6.2xlarge: pass (DryRunOperation)', output)
+        self.assertIn('gate-setup probe: get-object: pass (OK)', output)
+
+    def test_gate_setup_fails_on_an_s3_403(self) -> None:
+        output = self.failed_gpu_probe_output('list-objects-v2', '403')
+        self.assertIn('gate-setup probe: get-object: pass (OK)', output)
+
+    def test_gate_setup_fails_on_cost_explorer_denial(self) -> None:
+        output = self.failed_gpu_probe_output('get-cost-and-usage', 'AccessDeniedException')
+        self.assertIn('gate-setup probe: get-object inputs: pass (OK)', output)
+
+    def test_gate_setup_fails_on_input_get_denial(self) -> None:
+        _ = self.failed_gpu_probe_output('get-object inputs', 'AccessDenied')
+
+    def test_gate_setup_fails_on_multipart_abort_denial(self) -> None:
+        _ = self.failed_gpu_probe_output('create/abort-multipart-upload', 'AccessDenied', fault='abort-multipart-upload')
+
+    def test_gate_setup_fails_when_scaler_credentials_do_not_export(self) -> None:
+        _ = self.failed_gpu_probe_output('export-credentials', 'AccessDenied')
+
+    def test_gate_setup_lists_only_the_exact_result_probe_key(self) -> None:
+        subject, commands = self.gate_fixture()
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        listed_keys = [args[args.index('--prefix') + 1] for args in commands if 'list-objects-v2' in args]
+        self.assertEqual(listed_keys, ['artifacts/gpu-size-trial/setup-probe.json'])
+        self.assertIn('list-objects-v2: pass (OK)', output.getvalue())
+        self.assertIn('get-object inputs: pass (OK)', output.getvalue())
+
+    def test_gate_setup_skips_dry_run_without_an_offered_subnet(self) -> None:
+        size = 'g4dn.2xlarge'
+        subject, commands = self.gate_fixture(unoffered_gpu_type=size)
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        self.assertIn(f'run-instances {size} unverified. No saved subnet offers this type.', output.getvalue())
+        launches = self.gpu_probe_launches(commands)
+        self.assertTrue(launches)
+        self.assertTrue(all(launch['InstanceType'] != size for launch in launches))
+
+    def test_gate_setup_retries_denied_launch_within_the_configured_deadline(self) -> None:
+        self.check_gpu_launch_retries(('UnauthorizedOperation', 'DryRunOperation'), [2], success=True)
+
+    def test_gate_setup_stops_retrying_denied_launch_at_the_configured_deadline(self) -> None:
+        self.check_gpu_launch_retries(('UnauthorizedOperation',) * 3, [2, 2], success=False)
+
+    def check_gpu_launch_retries(self, codes: tuple[str, ...], expected_waits: list[float], *, success: bool) -> None:
+        operation = 'run-instances g4dn.2xlarge'
+        subject, commands = self.gate_fixture(probe_faults={operation: codes})
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'gpu_setup_dry_run_retry_timeout_s=5\ngpu_setup_dry_run_retry_interval_s=2')
+        clock = 0.0
+        waits: list[float] = []
+
+        def pause(seconds: float) -> None:
+            nonlocal clock
+            clock += seconds
+            waits.append(seconds)
+
+        subject.pause = pause
+        with mock.patch.object(time, 'monotonic', side_effect=lambda: clock), redirect_stdout(StringIO()) as output:
+            self.assertEqual(subject.gate_up(approve_resources=True), success)
+        self.assertEqual(waits, expected_waits)
+        self.assertEqual(output.getvalue().count(f'{operation}: UnauthorizedOperation. Retry in 2 s.'), len(waits))
+        launches = self.gpu_probe_launches(commands)
+        self.assertEqual(sum(launch['InstanceType'] == 'g4dn.2xlarge' for launch in launches), len(waits) + 1)
+
+    def test_gate_setup_gives_retry_advice_for_a_timeout(self) -> None:
+        _ = self.failed_gpu_probe_output('list-objects-v2', 'TimeoutExpired', advice='Run approved setup again.')
+
+    def test_gate_setup_gives_retry_advice_for_throttling(self) -> None:
+        _ = self.failed_gpu_probe_output('list-objects-v2', 'ThrottlingException', advice='Run approved setup again.')
+
+    def test_gate_setup_gives_retry_advice_for_cost_explorer_throttling(self) -> None:
+        _ = self.failed_gpu_probe_output('get-cost-and-usage', 'LimitExceededException', advice='Run approved setup again.')
+
+    def test_gate_setup_gives_retry_advice_for_a_server_error(self) -> None:
+        _ = self.failed_gpu_probe_output('list-objects-v2', '503', advice='Run approved setup again.')
+
+    def test_gate_setup_reports_one_failure_per_probe_and_one_advice_per_kind(self) -> None:
+        subject, _commands = self.gate_fixture(probe_faults={'get-cost-and-usage': 'AccessDenied',
+            'list-objects-v2': '503', 'get-object inputs': 'AccessDenied'})
+        with redirect_stdout(StringIO()) as output:
+            self.assertFalse(subject.gate_up(approve_resources=True))
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line for line in lines if line.startswith('gate-setup probe:') and ': fail (' in line], [
+            'gate-setup probe: get-cost-and-usage: fail (AccessDenied)',
+            'gate-setup probe: list-objects-v2: fail (503)',
+            'gate-setup probe: get-object inputs: fail (AccessDenied)',
+        ])
+        self.assertEqual([line for line in lines if line.startswith('gate-setup:')], [
+            'gate-setup: Check the gate scaler permissions and repeat approved setup.',
+            'gate-setup: Run approved setup again.',
+        ])
+
+    def test_gate_setup_rejects_a_scaler_profile_for_another_principal(self) -> None:
+        subject, commands = self.gate_fixture(has_gpu_target=False, scaler_arn='fixture-other-principal')
+        argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--approve-resources']
+        with (mock.patch.object(deploy, 'Deployment', return_value=subject), mock.patch.object(sys, 'argv', argv),
+              redirect_stdout(StringIO()) as output):
+            self.assertEqual(deploy.main(), 1)
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line for line in lines if line.startswith(('gate-setup probe:', 'gate-setup:'))], [
+            'gate-setup probe: get-caller-identity: fail. The scaler profile does not match the stack user.',
+        ])
+        self.assertNotIn('fixture-other-principal', output.getvalue())
+        self.assertFalse(any('simulate-principal-policy' in args for args in commands))
+
+    def test_gate_setup_reports_simulator_access_denial_once_across_regions(self) -> None:
+        subject, commands = self.gate_fixture(has_gpu_target=False, probe_faults={'simulate-principal-policy': 'AccessDenied'})
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'regions=us-east-2 us-west-2\nspot_candidate_regions=us-east-2 us-west-2')
+        network = deploy.RegionalNetwork('us-west-2', 'fixture-vpc', [], 'ami-fixture')
+        stack = {'region': 'us-west-2', 'subnets': [{'id': 'fixture-other-subnet', 'zone': 'us-west-2a'}]}
+        with (mock.patch.object(subject, 'regional_network', return_value=network),
+              mock.patch.object(subject, 'regional_gate_stack', return_value=stack), redirect_stdout(StringIO()) as output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        self.assertFalse(any('terminate-instances' in args for args in commands))
+        self.assertEqual(sum('simulate-principal-policy' in args for args in commands), 2)
+        self.assertEqual([line for line in output.getvalue().splitlines()
+                          if line.startswith('gate-setup probe: termination ') or 'SimulatePrincipalPolicy' in line], [
+            'gate-setup probe: termination us-east-2 unverified.',
+            'gate-setup probe: termination us-west-2 unverified.',
+            'gate-setup: The administrator cannot call iam:SimulatePrincipalPolicy.',
+        ])
+
+    def test_gate_setup_simulates_the_scaler_termination_grant_without_a_box(self) -> None:
+        self.check_gpu_termination_simulation('allowed', success=True)
+
+    def test_gate_setup_fails_on_a_simulated_termination_denial(self) -> None:
+        self.check_gpu_termination_simulation('implicitDeny', success=False)
+
+    def test_gate_setup_accepts_a_resource_specific_termination_allow(self) -> None:
+        self.check_gpu_termination_simulation('allowed', success=True, resource_specific=True)
+
+    def test_gate_setup_fails_on_a_resource_specific_termination_denial(self) -> None:
+        self.check_gpu_termination_simulation('explicitDeny', success=False, resource_specific=True)
+
+    def check_gpu_termination_simulation(self, decision: str, *, success: bool, resource_specific: bool = False) -> None:
+        subject, commands = self.gate_fixture(has_gpu_target=False, termination_decision=decision,
+                                              resource_specific_simulation=resource_specific)
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(subject.gate_up(approve_resources=True), success)
+        self.assertEqual(sum('simulate-principal-policy' in args for args in commands), 1)
+        self.assertFalse(any('terminate-instances' in args for args in commands))
+        report = ('termination us-east-2: pass (IAM simulation)' if success
+                  else 'termination us-east-2: fail (TerminationGrantDenied)')
+        self.assertIn('gate-setup probe: ' + report, output.getvalue())
+
+    def test_gate_setup_simulates_each_saved_spot_candidate_and_fails_on_a_regional_denial(self) -> None:
+        subject, commands = self.gate_fixture(denied_region='us-west-2')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'regions=us-east-2 us-west-2 eu-west-1 eu-west-2\n'
+            + 'spot_candidate_regions=us-east-2 us-west-2 eu-west-2 us-east-1')
+
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'ami-fixture')
+
+        def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _outputs: dict[str, str],
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+            subnets = [] if given.region == 'eu-west-2' else [{'id': 'fixture-other-subnet', 'zone': given.region + 'a'}]
+            return {'region': given.region, 'subnets': subnets}
+
+        with (mock.patch.object(subject, 'regional_network', side_effect=network),
+              mock.patch.object(subject, 'regional_gate_stack', side_effect=stack), redirect_stdout(StringIO()) as output):
+            self.assertFalse(subject.gate_up(approve_resources=True))
+        identity = next(i for i, args in enumerate(commands) if args[6] == 'get-caller-identity' and args[2] != 'build-admin')
+        simulations = [(i, args[args.index('--resource-arns') + 1].split(':')[3])
+                       for i, args in enumerate(commands) if 'simulate-principal-policy' in args]
+        self.assertEqual([region for _, region in simulations], ['us-east-2', 'us-west-2'])
+        self.assertTrue(all(i > identity for i, _ in simulations))
+        self.assertIn('terminate-instances: pass (DryRunOperation)', output.getvalue())
+        self.assertIn('termination us-east-2: pass (IAM simulation)', output.getvalue())
+        self.assertIn('termination us-west-2: fail (TerminationGrantDenied)', output.getvalue())
 
     def test_gpu_trial_command_requires_approval_and_checks_credentials(self) -> None:
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output')

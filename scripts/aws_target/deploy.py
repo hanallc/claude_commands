@@ -7,9 +7,10 @@ except FileNotFoundError:
     pass
 
 import argparse
+import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable, Sequence, Generator
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -34,7 +35,7 @@ from uuid import uuid4
 
 from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
-from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
+from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
@@ -45,11 +46,97 @@ from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
 HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
 CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
+PROBE_DENIED_CODES = frozenset(('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation',
+                               'Client.UnauthorizedOperation', 'Forbidden', '401', '403'))
 
 
-def _hana_operation_failure(operation: str, error: Exception) -> str:
+def _operation_failure(operation: str, error: Exception) -> str:
     code = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
     return f'{operation}: fail' + (f' ({code})' if code else '')
+
+
+@dataclass(frozen=True)
+class ScalerProbe:
+    operation: str
+    call: Callable[[AwsCli], object]
+    success_code: str = 'OK'
+
+
+@dataclass(frozen=True)
+class ScalerProbeUnverified:
+    reason: str = ''
+
+
+@dataclass(frozen=True)
+class ScalerProbePassed:
+    pass
+
+
+@dataclass(frozen=True)
+class ScalerProbeFailure:
+    operation: str
+    code: str
+
+    def next_step(self) -> str:
+        if self.code in PROBE_DENIED_CODES or self.code in ('AuthFailure', 'TerminationGrantDenied'):
+            return 'Check the gate scaler permissions and repeat approved setup.'
+        if ((self.operation, self.code) == ('get-cost-and-usage', 'LimitExceededException')
+                or self.code.startswith(('Throttl', 'TooManyRequests', 'RequestTimeout'))
+                or self.code in ('TimeoutExpired', 'TimeoutError', 'RequestLimitExceeded', 'SlowDown', '429',
+                                 'InternalError', 'InternalFailure', 'ServiceUnavailable')
+                or re.fullmatch(r'5[0-9]{2}', self.code)):
+            return 'Run approved setup again.'
+        return 'Check the failed operation and repeat approved setup.'
+
+
+class TerminationGrantDenied(ValueError):
+    pass
+
+
+class ScalerIdentityMismatch(ValueError):
+    pass
+
+
+def run_scaler_probes(label: str, api: AwsCli, probes: Iterable[ScalerProbe], *,
+                      show_codes: bool = False) -> tuple[ScalerProbeFailure, ...]:
+    failed: list[ScalerProbeFailure] = []
+    for probe in probes:
+        try:
+            result = probe.call(api)
+        except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            code = aws_error_code(error, allow_status=show_codes) if isinstance(error, AwsUnavailable) else ''
+            code = code or (type(error).__name__ if show_codes else '')
+            failed.append(ScalerProbeFailure(probe.operation, code))
+            if isinstance(error, ScalerIdentityMismatch):
+                report = f'{probe.operation}: fail. The scaler profile does not match the stack user.'
+            else:
+                report = f'{probe.operation}: fail' + (f' ({code})' if code else '')
+        else:
+            if isinstance(result, ScalerProbeUnverified):
+                report = f'{probe.operation} unverified.'
+                if result.reason:
+                    report += f' {result.reason}'
+            else:
+                report = f'{probe.operation}: pass'
+                if show_codes:
+                    report += f' ({probe.success_code})'
+        print(f'{label}: {report}', flush=True)
+    return tuple(failed)
+
+
+def put_probe_object(api: AwsCli, bucket: str, key: str, content: bytes) -> None:
+    with tempfile.TemporaryDirectory(prefix='scaler-probe-') as folder:
+        body = Path(folder) / 'probe.json'
+        _ = body.write_bytes(content)
+        _ = api.call('put-object', '--bucket', bucket, '--key', key, '--body', str(body), service='s3api')
+
+
+def get_probe_object(api: AwsCli, bucket: str, key: str, content: bytes) -> None:
+    with tempfile.TemporaryDirectory(prefix='scaler-probe-') as folder:
+        body = Path(folder) / 'probe.json'
+        _ = api.call('get-object', '--bucket', bucket, '--key', key, str(body), service='s3api')
+        if body.read_bytes() != content:
+            raise ValueError('The probe object differs from the value sent')
 
 
 @contextmanager
@@ -580,7 +667,7 @@ class Deployment:
                 requests = ledger.rows(api.call('describe-spot-instance-requests', '--spot-instance-request-ids', request),
                                        'SpotInstanceRequests')
             except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                raise AwsUnavailable(_hana_operation_failure('describe-spot-instance-requests', error)) from None
+                raise AwsUnavailable(_operation_failure('describe-spot-instance-requests', error)) from None
             if (len(requests) != 1 or requests[0].get('InstanceId') != instance
                     or requests[0].get('Type') != 'persistent'
                     or requests[0].get('InstanceInterruptionBehavior') != 'stop'):
@@ -608,56 +695,38 @@ class Deployment:
 
     @staticmethod
     def _probe_hana_scaler(provider: AwsHanaProvider, identity: hana_box.DeploymentIdentity) -> bool:
-        api = provider.api.in_region(identity.region)
-        passed = True
-
-        @contextmanager
-        def report(operation: str) -> Generator[None]:
-            nonlocal passed
-            try:
-                yield
-            except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                passed = False
-                print('hana-setup probe: ' + _hana_operation_failure(operation, error))
-            else:
-                print(f'hana-setup probe: {operation}: pass')
-
-        with report('export-credentials'):
-            _ = provider.signing_key()
-        with report('describe-instances'):
-            _ = api.call('describe-instances', '--instance-ids', identity.instance)
-        with report('describe-spot-instance-requests'):
-            _ = api.call('describe-spot-instance-requests', '--spot-instance-request-ids', identity.spot_request)
         attribute = ('--instance-id', identity.instance, '--attribute', 'userData')
         user_data = ''
-        with report('describe-instance-attribute'):
+
+        def read_user_data(api: AwsCli) -> None:
+            nonlocal user_data
             reply = api.call('describe-instance-attribute', *attribute)
             value = ledger.mapping(reply.get('UserData', {})).get('Value', '')
             if not isinstance(value, str):
                 raise ValueError('Invalid user data value')
             user_data = value
-        with report('modify-instance-attribute'), tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
-            # Use an empty value for the dry run if the read failed.
-            data = Path(folder) / 'user-data'
-            _ = data.write_text(user_data)
-            api.ec2_dry_run('modify-instance-attribute', *attribute, '--value', f'file://{data}')
-        for operation in ('start-instances', 'stop-instances'):
-            with report(operation):
-                api.ec2_dry_run(operation, '--instance-ids', identity.instance)
+
+        def check_user_data_write(api: AwsCli) -> None:
+            with tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
+                # Use an empty value for the dry run if the read failed.
+                data = Path(folder) / 'user-data'
+                _ = data.write_text(user_data)
+                api.ec2_dry_run('modify-instance-attribute', *attribute, '--value', f'file://{data}')
 
         key = f'control/{identity.deployment}/setup-probe.json'
-        query = ('--bucket', provider.bucket, '--key', key)
         content = b'{"probe": "hana-setup"}'
-        with report('put-object'), tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
-            body = Path(folder) / 'probe.json'
-            _ = body.write_bytes(content)
-            _ = api.call('put-object', *query, '--body', str(body), service='s3api')
-        with report('get-object'), tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
-            body = Path(folder) / 'probe.json'
-            _ = api.call('get-object', *query, str(body), service='s3api')
-            if body.read_bytes() != content:
-                raise ValueError('The probe object differs from the value sent')
-        return passed
+        return not run_scaler_probes('hana-setup probe', provider.api.in_region(identity.region), [
+            ScalerProbe('export-credentials', lambda _api: provider.signing_key()),
+            ScalerProbe('describe-instances', lambda api: api.call('describe-instances', '--instance-ids', identity.instance)),
+            ScalerProbe('describe-spot-instance-requests', lambda api: api.call('describe-spot-instance-requests',
+                '--spot-instance-request-ids', identity.spot_request)),
+            ScalerProbe('describe-instance-attribute', read_user_data),
+            ScalerProbe('modify-instance-attribute', check_user_data_write),
+            ScalerProbe('start-instances', lambda api: api.ec2_dry_run('start-instances', '--instance-ids', identity.instance)),
+            ScalerProbe('stop-instances', lambda api: api.ec2_dry_run('stop-instances', '--instance-ids', identity.instance)),
+            ScalerProbe('put-object', lambda api: put_probe_object(api, provider.bucket, key, content)),
+            ScalerProbe('get-object', lambda api: get_probe_object(api, provider.bucket, key, content)),
+        ])
 
     @staticmethod
     def _hana_setup_started(book: ledger.CostLedger, saved: dict[str, object]) -> int:
@@ -1700,8 +1769,9 @@ class Deployment:
             for position, region in enumerate(additional, 1):
                 with timings.measure(GateRegionOperation.NETWORK, region, position, len(additional), self.settings_path):
                     networks.append(self.regional_network(api, settings, region))
-            gpu_types = sorted(gpu_size_trial.settings().spot_max_usd_per_hour.keys() |
-                               set(values.words('hana_gpu_instance_types')))
+            comparison_caps = gpu_size_trial.settings().spot_max_usd_per_hour
+            gpu_types = sorted(comparison_caps.keys() | set(values.words('hana_gpu_instance_types')))
+            gpu_caps = comparison_caps | gpu_size_trial.price_caps(values.text('hana_gpu_spot_max_usd_per_hour'))
             parameters = {
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
@@ -1735,14 +1805,16 @@ class Deployment:
             with step('up', 'updating the stack', self.settings_path, hint='can take several minutes'):
                 self._gate_change(api, stack_id, template, changes)
             outputs = self._stack(settings)
+            deployment_id = ledger.text(saved, 'deployment_id')
+            home: dict[str, object] = {'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
+                'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
+                'security_group': outputs['GateSecurityGroup']}
             manifest: dict[str, object] = {
-                'deployment_id': ledger.text(saved, 'deployment_id'), 'revision': revision,
+                'deployment_id': deployment_id, 'revision': revision,
                 'instance_types': values.words('instance_types'),
                 'gpu_instance_types': gpu_types,
                 'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
-                'regions': [{'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
-                    'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
-                    'security_group': outputs['GateSecurityGroup']}],
+                'regions': [home],
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
@@ -1753,8 +1825,186 @@ class Deployment:
                     manifest['regions'] = regional
                     cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
-        self._fill_prices()
-        return True
+            self._fill_prices()
+            scaler_arn = f"arn:{partition}:iam::{account}:user/{outputs['ScalerUserName']}"
+            return self._probe_gate_gpu(settings, values, manifest, gpu_caps, admin_api=api,
+                                        scaler_arn=scaler_arn, partition=partition, account_id=account)
+
+    def _probe_gate_gpu(self, settings: DeploymentSettings, values: conf.ConfigRead, manifest: dict[str, object],
+                        caps: dict[str, Decimal], *, admin_api: AwsCli, scaler_arn: str,
+                        partition: str, account_id: str) -> bool:
+        from scripts.aws_target import gpu_size_trial
+
+        # Use the GPU worker's profile and credential file without inherited admin credentials.
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('AWS_')}
+        environment.update(AWS_SHARED_CREDENTIALS_FILE=str(admin_secrets.credentials_file()),
+                           AWS_EC2_METADATA_DISABLED='true')
+
+        def scaler(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                   check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            _ = env
+            return self.execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check,
+                                env=environment)
+
+        account = conf.read(self.settings_path)
+        api = AwsCli(account.text('credentials_profile'), settings.region, values.number('api_timeout_s'), scaler)
+        regions = ledger.rows(manifest, 'regions')
+        home = regions[0]
+        candidates = set(values.words('spot_candidate_regions'))
+        subnets = ledger.rows(home, 'subnets')
+        types = gpu_size_trial.string_list(manifest['gpu_instance_types'])
+        bucket = ledger.text(manifest, 'bucket')
+        deployment_id = ledger.text(manifest, 'deployment_id')
+        now = int(self.clock())
+        started = datetime.fromtimestamp(now, UTC).isoformat()
+        utc_day = now - now % 86400
+        nonce = uuid4().hex
+        key = gpu_size_trial.GPU_TRIAL_ARTIFACT_PREFIX + 'setup-probe.json'
+        input_key = gpu_size_trial.GPU_TRIAL_REQUEST_PREFIX + 'setup-probe.json'
+        content = json.dumps({'probe': nonce}).encode()
+        spending = read_settings(self.settings_path)
+        termination_targets: list[str] = []
+        offered_zones: dict[str, set[str]] = {}
+        label = 'gate-setup probe'
+        retry_interval = values.whole('gpu_setup_dry_run_retry_interval_s')
+        simulation_access_denied = False
+
+        def verify_scaler_identity(api: AwsCli) -> None:
+            reply = api.call('get-caller-identity', service='sts')
+            if reply.get('Arn') != scaler_arn:
+                raise ScalerIdentityMismatch
+
+        def describe_instances(api: AwsCli) -> None:
+            reply = api.call('describe-instances', '--filters', *gpu_size_trial.GPU_SPOT_FILTERS)
+            if reply.get('NextToken'):
+                raise ValueError('The GPU Spot instance list is incomplete')
+            for reservation in ledger.rows(reply, 'Reservations'):
+                for instance in ledger.rows(reservation, 'Instances'):
+                    tags = {row['Key']: row['Value'] for row in
+                            ledger.rows({'Tags': instance.get('Tags', [])}, 'Tags')}
+                    if (tags.get('GateDeployment') == deployment_id and tags.get('Workload') == 'cloud-claude-gate'
+                            and tags.get('GpuSizeTrial')):
+                        termination_targets.append(ledger.text(instance, 'InstanceId'))
+
+        def describe_offerings(api: AwsCli) -> None:
+            reply = api.call('describe-instance-type-offerings', '--location-type', 'availability-zone',
+                             '--filters', 'Name=instance-type,Values=' + ','.join(types))
+            for row in ledger.rows(reply, 'InstanceTypeOfferings'):
+                offered_zones.setdefault(ledger.text(row, 'InstanceType'), set()).add(ledger.text(row, 'Location'))
+
+        def launch_probe(api: AwsCli, size: str, deadline: float) -> ScalerProbePassed | ScalerProbeUnverified:
+            zones = offered_zones.get(size, set())
+            subnet = next((row for row in subnets if ledger.text(row, 'zone') in zones), None)
+            if subnet is None:
+                return ScalerProbeUnverified('No saved subnet offers this type.')
+            launch = gpu_size_trial.GpuSpotLaunch(deployment_id, nonce, f'{nonce}-{size}', size, caps[size],
+                now + 60 * values.whole('hana_gpu_lifetime_minutes'), values.whole('gpu_size_trial_root_gib'),
+                base64.b64encode(b'#!/bin/sh\nexit 0\n').decode())
+            arguments = json.dumps(launch.arguments(home, subnet, settings.root_device_name, spending))
+            remaining = deadline - time.monotonic()
+            timeout = min(api.timeout_s, remaining) if remaining > 0 else api.timeout_s
+            while True:
+                try:
+                    api.ec2_dry_run('run-instances', '--cli-input-json', arguments, timeout_s=timeout)
+                    return ScalerProbePassed()
+                except AwsUnavailable as error:
+                    code = aws_error_code(error, operation='RunInstances', allow_status=True)
+                    if code not in PROBE_DENIED_CODES or deadline - time.monotonic() <= retry_interval:
+                        raise
+                    print(f'{label}: run-instances {size}: {code}. Retry in {retry_interval} s.', flush=True)
+                    self.pause(retry_interval)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    timeout = min(api.timeout_s, remaining)
+
+        def simulate_termination(region: str) -> ScalerProbePassed | ScalerProbeUnverified:
+            nonlocal simulation_access_denied
+            action = 'ec2:TerminateInstances'
+            instance_arn = f'arn:{partition}:ec2:{region}:{account_id}:instance/i-00000000000000000'
+            context = [{'ContextKeyName': key, 'ContextKeyType': 'string', 'ContextKeyValues': [value]}
+                       for key, value in (('ec2:ResourceTag/GateDeployment', deployment_id),
+                                          ('ec2:ResourceTag/Workload', 'cloud-claude-gate'),
+                                          ('aws:RequestedRegion', region))]
+            try:
+                reply = admin_api.call('simulate-principal-policy', '--policy-source-arn', scaler_arn,
+                    '--action-names', action, '--resource-arns', instance_arn,
+                    '--context-entries', json.dumps(context), '--no-paginate', service='iam')
+            except AwsUnavailable as error:
+                if aws_error_code(error, operation='SimulatePrincipalPolicy', allow_status=True) not in PROBE_DENIED_CODES:
+                    raise
+                simulation_access_denied = True
+                return ScalerProbeUnverified()
+            incomplete = 'The termination simulation result is incomplete'
+            results = ledger.rows(reply, 'EvaluationResults')
+            if reply.get('IsTruncated') or len(results) != 1 or results[0].get('EvalActionName') != action:
+                raise ValueError(incomplete)
+            result = results[0]
+            decision_key = 'EvalDecision'
+            if 'ResourceSpecificResults' in result:
+                matches = [row for row in ledger.rows(result, 'ResourceSpecificResults')
+                           if row.get('EvalResourceName') == instance_arn]
+                if len(matches) != 1:
+                    raise ValueError(incomplete)
+                result = matches[0]
+                decision_key = 'EvalResourceDecision'
+            elif result.get('EvalResourceName') != instance_arn:
+                raise ValueError(incomplete)
+            decision = result.get(decision_key)
+            if decision in ('implicitDeny', 'explicitDeny'):
+                raise TerminationGrantDenied('The simulator denied termination for the scaler')
+            if decision != 'allowed' or result.get('MissingContextValues'):
+                raise ValueError(incomplete)
+            return ScalerProbePassed()
+
+        def list_result_probe(api: AwsCli) -> None:
+            if not gpu_size_trial.gpu_object_exists(api, bucket, key):
+                raise ValueError('The probe object does not appear in the list')
+
+        def probe_multipart(api: AwsCli) -> None:
+            location = ('--bucket', bucket, '--key', input_key)
+            reply = api.call('create-multipart-upload', *location, service='s3api')
+            _ = api.call('abort-multipart-upload', *location, '--upload-id', ledger.text(reply, 'UploadId'), service='s3api')
+
+        def probes() -> Iterable[ScalerProbe]:
+            yield ScalerProbe('describe-instances', describe_instances)
+            yield ScalerProbe('describe-instance-type-offerings', describe_offerings)
+            yield ScalerProbe('describe-spot-price-history', lambda api: api.call('describe-spot-price-history',
+                '--instance-types', *types, '--product-descriptions', 'Linux/UNIX', '--start-time', started))
+            yield ScalerProbe('get-service-quota', lambda api: spot_quota(api, 'L-3819A6DF'))
+            yield ScalerProbe('get-cost-and-usage', lambda api: fetch_account_charges(
+                api, utc_day - 86400, utc_day, now, spending.cost_explorer_read_usd))
+            deadline = time.monotonic() + values.whole('gpu_setup_dry_run_retry_timeout_s')
+            for size in types:
+                yield ScalerProbe(f'run-instances {size}',
+                                  lambda api, size=size: launch_probe(api, size, deadline), 'DryRunOperation')
+            if termination_targets:
+                yield ScalerProbe('terminate-instances', lambda api: api.ec2_dry_run(
+                    'terminate-instances', '--instance-ids', termination_targets[0]), 'DryRunOperation')
+            for row in regions:
+                region = ledger.text(row, 'region')
+                if region in candidates and row.get('subnets'):
+                    yield ScalerProbe(f'termination {region}', lambda _api, region=region: simulate_termination(region),
+                                      'IAM simulation')
+            yield ScalerProbe('export-credentials', gpu_size_trial.gpu_signing_key)
+            yield ScalerProbe('put-object', lambda api: put_probe_object(api, bucket, key, content))
+            yield ScalerProbe('list-objects-v2', list_result_probe)
+            yield ScalerProbe('get-object', lambda api: get_probe_object(api, bucket, key, content))
+            yield ScalerProbe('put-object inputs', lambda api: put_probe_object(api, bucket, input_key, content))
+            yield ScalerProbe('get-object inputs', lambda api: get_probe_object(api, bucket, input_key, content))
+            yield ScalerProbe('create/abort-multipart-upload', probe_multipart)
+
+        failed = run_scaler_probes(label, api, (ScalerProbe('get-caller-identity', verify_scaler_identity),),
+                                   show_codes=True)
+        if failed and failed[0].code == ScalerIdentityMismatch.__name__:
+            return False
+        if not failed:
+            failed = run_scaler_probes(label, api, probes(), show_codes=True)
+        if simulation_access_denied:
+            print('gate-setup: The administrator cannot call iam:SimulatePrincipalPolicy.', flush=True)
+        for next_step in dict.fromkeys(failure.next_step() for failure in failed):
+            print(f'gate-setup: {next_step}', flush=True)
+        return not failed
 
     def _fill_prices(self) -> None:
         """Read Spot prices and quotas once the stack allows it; the hourly refresh continues."""

@@ -21,15 +21,38 @@ Start with one headless shader test on an 8-vCPU, 32 GiB box. Choose the lowest 
 
 ## 3. User commands
 
-**One proposed setup command on natedev.** Run it in the commands checkout after the implementation lands.
+**Setup on natedev.** Run this command in the commands checkout after the implementation lands.
 
 ```sh
-python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources --hana-gpu-nextest
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
 ```
 
-Run the proof first with the worker's scaler credentials. Use the exact one-box launch arguments and EC2 DryRun. Pass only on `DryRunOperation`. Check quota, offerings, price, instance reads, cost access, and signed S3 PUT and GET with small expiring objects. If launch is denied, check launch, tagging, and role pass separately with the same policy context. Check termination with DryRun against an existing tagged gate box when available. Otherwise check the tagged termination policy and mark live termination unverified until the pilot. Print all denied and unverified actions in one report. A live run still proves capacity and guest boot. [EC2 RunInstances API](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_RunInstances.html), [IAM simulator limits](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_testing-policies.html)
+After deployment, the command uses the worker's scaler profile to check GPU access in the home region.
+Setup requires the profile's caller ARN to match the stack's scaler user ARN.
+It reads quota, offerings, Spot prices, instances, and Cost Explorer charges.
+It checks local credential export with the same reader that the trial uses.
+It sends a `RunInstances` DryRun with the trial launch arguments when a saved subnet offers the type.
+If no saved subnet offers a type, setup reports that launch as unverified.
+Setup retries denied launch DryRuns within the deadline in `cloud_gate.conf`.
+The DryRun must return `DryRunOperation`. [EC2 RunInstances API](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_RunInstances.html)
+The request includes tags for the instance and volume. [EC2 tag permissions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html)
+It checks termination with DryRun if it finds a matching GPU Spot instance.
+The administrator simulates termination in each saved Spot candidate region with subnets.
+Each simulation includes the region in `aws:RequestedRegion` and uses the instance ARN and tag context.
+A simulated denial fails setup.
+Setup reports termination as unverified if the administrator cannot call `iam:SimulatePrincipalPolicy`. [IAM simulation API](https://docs.aws.amazon.com/IAM/latest/APIReference/API_SimulatePrincipalPolicy.html)
+Setup checks S3 put and get for one fixed object under each trial prefix.
+It lists the exact result key.
+It creates and aborts a multipart upload on the input probe key.
+A failed required probe makes setup exit with status 1.
+Setup prints one result per operation and one advice line per error kind.
+Use the pilot to verify capacity, guest boot, signed transfers, and cleanup.
 
-One approved setup command can apply a missing gate policy update through `gate_up` and repeat the proof. The local deployment record lists 19 regions and includes `us-east-2`. Reuse the gate bucket, template, profile, and NixOS AMI. Prepare the NVIDIA closure locally and upload it to that bucket. Setup creates the proof objects and the closure object. It needs no additional IAM principal or AMI. Keep the target disabled until the required checks pass. `scripts/aws_target/deploy.py:1483–1549,1720–1741`, `docs/plans/builds-aws/cloudformation.json:700–975,1170–1246`.
+One approved setup command applies the gate policy update and checks the resulting access.
+The local deployment record lists 19 regions and includes `us-east-2`.
+Reuse the gate bucket, template, profile, and NixOS AMI.
+Prepare the NVIDIA closure locally. The trial uploads the closure to the gate bucket.
+Setup creates the probe objects. Keep the target disabled until the required checks pass.
 
 **One normal test command for the pilot.** Setup and the first test take two commands in total. Run the test from the Hana checkout at the reviewed source. It creates one temporary Spot instance and root disk, plus request and result objects. `scripts/direct/verify.sh:1370–1377,2955–2961`, `scripts/aws_target/gpu_size_trial.py:1082–1140`.
 
@@ -95,4 +118,6 @@ The worker lists the exact S3 result key before it downloads the object. It uses
 
 The guest arms shutdown before downloading its inputs. The Hana expiry tag and guest timer use the same deadline. The expiry job provides cleanup if the guest timer and host cleanup fail. The reservation adds 60 minutes for the schedule and one minute for EventBridge delivery. It also includes three one-minute function attempts and retry delays of one and two minutes. [Lambda function error retries](https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-error-handling.html)
 
-The worker selects only types listed in the saved deployment record. Gate setup must refresh older records that lack the list. Work order B adds the setup proof. The build queue and `verify.sh` route follow the pinned live proof.
+The worker selects only types listed in the saved deployment record.
+Gate setup refreshes older records and checks access for every saved GPU type.
+Add the build queue and `verify.sh` route after the pinned live proof.

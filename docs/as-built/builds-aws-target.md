@@ -1016,6 +1016,29 @@ It uses the regional gate template and its NixOS image.
 A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.
 The CPU gate statement remains unchanged.
 
+After deployment, `deploy.py up --workload merge-gates --approve-resources` checks GPU access with the trial scaler profile.
+Setup compares the profile's caller ARN with the stack's scaler user ARN. A mismatch fails setup.
+It reads instances, offerings, Spot prices, and quota in the home region.
+It uses the trial's Cost Explorer reader and probes local credential export.
+It sends a tagged `RunInstances` DryRun with the trial launch template when a saved subnet offers the type.
+If no saved subnet offers a type, setup reports the launch as unverified for that type.
+Setup reports each wait before it retries a denied launch DryRun.
+The `gpu_setup_dry_run_retry_timeout_s` and `gpu_setup_dry_run_retry_interval_s` keys in `cloud_gate.conf` set the deadline and interval.
+The template supplies the instance profile.
+The launch request checks tagging at creation. [EC2 tag permissions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html)
+If a matching GPU Spot instance exists, setup checks termination with DryRun.
+The administrator simulates the scaler user's termination grant in each saved Spot candidate region with subnets.
+Each simulation uses a sample instance ARN, the required tags, and `aws:RequestedRegion`.
+A simulated denial fails setup.
+If the administrator lacks `iam:SimulatePrincipalPolicy`, setup reports termination as unverified.
+Setup writes one fixed probe object under each GPU trial prefix and checks the contents through GET.
+Setup lists the exact result key. The trial lists result keys only.
+Setup creates and aborts a multipart upload on the input probe key.
+A failed required probe makes setup exit with status 1.
+Setup prints one result per operation and one advice line per error kind.
+Setup directs the user to check the grant for authorization failures or repeat setup for transient failures.
+The probe creates no EC2 instance. The pilot still checks capacity and guest boot.
+
 Each box imports the signed closure download and reboots once.
 The prepared system enables NVIDIA Vulkan and starts the trial runner.
 The runner uploads each run's report and memory rows separately.
