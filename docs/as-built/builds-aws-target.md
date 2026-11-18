@@ -242,15 +242,30 @@ It reserves setup costs within both account and workload limits before the stack
 It does not permit demand starts or guest command admission.
 Setup resumes an existing stack through reads before another mutation.
 It refuses changed resource inputs or an expired reservation before another stack request.
+If AWS confirms that the stack is missing, setup checks the local record for resource identities.
+If the record names an instance, data disk, or bucket, setup asks the user to run `down --workload hana --approve-destroy`.
+If the record names none of these resources, setup searches the deleted stack history for the saved stack name.
+It uses stacks that AWS created at or after the saved reservation time.
+Setup reads the events of each matching stack by ID to find retained disks and buckets.
+It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
+If it cannot verify cleanup, setup keeps the record and asks the user to run `down --workload hana --approve-destroy`.
 It registers the deployment only after the Spot request and stopped state match.
 Setup adds no route, target, or slot capacity.
-Setup changes the stack through a change set, never through `cloudformation deploy`.
-It refuses an Instance, Volume or VolumeAttachment replace or remove before it executes the change set.
-A failed create or update calls `spot_end.end_boxes` before it reports the error.
-That call keeps only the box that `hana/setup.json` records.
-It then deletes, through `retained.delete`, the disks and buckets that the rollback kept (`DELETE_SKIPPED`).
-A failed create also deletes the failed stack.
-The launch template sets `DeleteOnTermination` true on the root disk, so AWS deletes each root disk with its box.
+Setup uses a change set to change the stack.
+It refuses changes that replace or remove an instance, volume, or volume attachment.
+When a create or update fails, setup reads failed stack events from the current change before cleanup.
+The error gives the name, type, status, and AWS reason for each failed resource.
+If setup cannot read the events, it reports that they are unavailable and continues cleanup.
+Setup ends the Spot boxes other than the box in `hana/setup.json`.
+After a failed create, setup requires `ROLLBACK_COMPLETE` or `ROLLBACK_FAILED` before it deletes the stack.
+It waits for stack deletion and reads events by stack ID for disks and buckets marked `DELETE_SKIPPED`.
+It deletes these resources before it closes the spending reservation and removes `hana/setup.json`.
+If the rollback or cleanup is incomplete, setup keeps the record and reservation for `down`.
+For an incomplete setup, `down` also checks deleted stack history for retained resources.
+If that history has no match, `down` reports it and continues with any disk or bucket in the saved record.
+After a failed update, setup deletes resources retained during rollback and keeps the stack and record.
+Run `prepare --workload hana` again before retrying with changed inputs.
+The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 
 ## Ending persistent Spot boxes
 
@@ -263,9 +278,11 @@ The request then launches a new box with no tags.
 4. Terminate the boxes and wait until they are terminated.
 5. Read again. `SpotEndIncomplete` names any request or box that stays live.
 A failed cancel raises before any terminate.
-`deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, and deletes the Hana stack.
-It then deletes the data disk and the control bucket, and removes the local Hana records.
-The data on those disks and in the bucket is lost; `--approve-destroy` is the approval.
+`deploy.py down --workload hana --approve-destroy` ends Hana boxes before and after it deletes the Hana stack.
+The second check ends any box that CloudFormation kept during deletion.
+The command then deletes the data disk and the control bucket.
+It closes the compute and storage charges before it removes the local Hana records.
+The `--approve-destroy` flag authorizes deletion of the disk and bucket data.
 `test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
 It shows that a failed create and the Hana `down` each leave no request, box, disk, bucket or stack.
 A failed update keeps only the recorded box and its root disk.

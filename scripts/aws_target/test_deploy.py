@@ -25,10 +25,12 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, ledger, quota_requests, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_spend, ledger, quota_requests, remote
+from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
+from scripts.aws_target.test_spot_end import FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
 from scripts.mac_test import mac_test
@@ -419,6 +421,274 @@ class GateImageAws:
         transition = [row for row in ledger.rows(policy, 'Statement') if row.get('Sid') == 'GateImageTransition']
         return {self.image_parameter, *[ledger.text(ledger.mapping(row['Resource']), 'Fn::Sub').split('/')[-1]
                                       for row in transition]}
+
+
+class HanaSetupFailureTests(CostFixture):
+    clock: TestClock = TestClock()
+    workload: Path = Path()
+    setup_path: Path = Path()
+    book: ledger.CostLedger = ledger.CostLedger(Path())
+    calls: list[list[str]] = []
+    deleted_stacks: dict[str, tuple[int, list[dict[str, str]]]] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.clock = TestClock()
+        self.workload = self.root / 'hana_aws.conf'
+        self.setup_path = self.state / 'hana/setup.json'
+        self.book = ledger.CostLedger(self.state)
+        self.calls = []
+        self.deleted_stacks = {}
+        _ = self.workload.write_bytes((deploy.TEMPLATE.parents[3] / 'config/hana_aws.conf').read_bytes())
+        for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id'):
+            text_setting(self.workload, key, 'fixture-' + key)
+        self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
+        self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
+        original = conf.read_or_repository
+
+        def configuration(name: str) -> conf.ConfigRead:
+            return conf.read(self.workload) if name == 'hana_aws' else original(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
+        settings = aws_config.DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gate', 'image',
+            'owner', 'fixture-release', 'us-east-2b', 'vpc', 'subnet', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
+        _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=settings))
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_check_credentials'))
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_validate_inputs'))
+
+    def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False) -> deploy.Deployment:
+        status = 'CREATE_IN_PROGRESS'
+        created = self.clock.now
+        stack_id = 'active-stack'
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal status, created, stack_id
+            self.calls.append(list(arguments))
+            offset = arguments.index('--region') + 2
+            operation = arguments[offset + 1]
+            if operation == 'create-change-set':
+                created = self.clock.now
+                stack_id = f'active-stack-{len(self.deleted_stacks)}'
+                status = 'CREATE_IN_PROGRESS'
+            if operation == 'describe-stacks' and fake.stack:
+                fake.operations.append(operation)
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [
+                    {'StackStatus': status, 'StackId': stack_id}]}), '')
+            if operation == 'list-stacks':
+                self.assertIn('DELETE_COMPLETE', arguments)
+                fake.operations.append(operation)
+                stack_name = conf.read(self.workload).text('stack_name')
+                summaries = [{'StackName': stack_name, 'StackId': identity, 'StackStatus': 'DELETE_COMPLETE',
+                              'CreationTime': datetime.fromtimestamp(at, UTC).isoformat()}
+                             for identity, (at, _) in self.deleted_stacks.items()]
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'StackSummaries': summaries}), '')
+            if operation == 'describe-stack-events':
+                identity = arguments[arguments.index('--stack-name') + 1]
+                if identity in self.deleted_stacks:
+                    fake.operations.append(operation)
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps({
+                        'StackEvents': self.deleted_stacks[identity][1]}), '')
+            if 'stack-create-complete' in arguments:
+                self.clock.advance(1)
+                if waiter_timeout:
+                    raise subprocess.TimeoutExpired('fixture stack create waiter', timeout)
+                status = 'ROLLBACK_COMPLETE'
+                fake.events.append({'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
+                    'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'No capacity in this zone',
+                    'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat()})
+            if operation == 'delete-stack' and fake.stack:
+                if retain_on_delete:
+                    fake.create_retained()
+                fake.roll_back()
+                self.deleted_stacks[stack_id] = (created, fake.events.copy())
+            return fake(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+
+        def api(settings: aws_config.DeploymentSettings) -> aws_cli.AwsCli:
+            return aws_cli.AwsCli(settings.profile, settings.region, settings.timeout_s, execute)
+
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_api', side_effect=api))
+        return deploy.Deployment(self.settings, self.state, self.root / 'output', clock=self.clock, notify=lambda _event: True)
+
+    def write_leftover(self, subject: deploy.Deployment, *, instance: str = '') -> int:
+        limits = hana_spend.read_settings(conf.read(self.workload))
+        reservation = hana_spend.HanaSpending(self.book, self.settings, limits).reserve_setup(
+            self.clock.now, self.clock.now + limits.permit_max_seconds)
+        assert isinstance(reservation, hana_spend.StartReserved)
+        generation = reservation.exposure.generation
+        self.setup_path.parent.mkdir()
+        saved = {'version': 1, 'deployment': HANA_TAG[1], 'stack': conf.read(self.workload).text('stack_name'),
+                 'region': limits.region, 'requested': True, 'generation': generation,
+                 'template_sha256': 'old-template', 'parameters_sha256': 'old-parameters'}
+        if instance:
+            saved['instance'] = instance
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        self.clock.advance(limits.permit_max_seconds + 1)
+        _ = subject.prepare_hana()
+        return generation
+
+    def test_failed_hana_create_reports_resource_failure_and_retries_with_changed_ceiling(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
+        subject = self.subject(fake)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaises(aws_cli.AwsUnavailable) as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('Instance (AWS::EC2::Instance): CREATE_FAILED: No capacity in this zone', str(failure.exception))
+        self.assertLess(fake.operations.index('describe-stack-events'), fake.operations.index('delete-stack'))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+
+        ceiling = str(state.hana_compute[0].usd_per_hour / 2)
+        text_setting(self.workload, 'spot_max_usd_per_hour', ceiling)
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'fixture rollback'):
+            _ = subject.hana_setup(approve_resources=True)
+        first, second = [call for call in self.calls if 'create-change-set' in call]
+        self.assertIn('CREATE', first)
+        self.assertIn('CREATE', second)
+        parameters = cast(object, json.loads(second[second.index('--parameters') + 1]))
+        self.assertIn({'ParameterKey': 'SpotMaxPrice', 'ParameterValue': ceiling},
+                      ledger.rows({'parameters': parameters}, 'parameters'))
+
+    def test_failed_hana_cleanup_keeps_the_setup_and_reservation(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete', fail='delete-volume')
+        subject = self.subject(fake)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'did not remove what it made'):
+            _ = subject.hana_setup(approve_resources=True)
+        saved = remote.read_record(self.setup_path)
+        exposure, = self.book.read_snapshot().hana_compute
+        self.assertEqual(saved['generation'], exposure.generation)
+        self.assertIs(saved['requested'], True)
+        self.assertIsInstance(exposure.state, ledger.HanaExposureOpen)
+        self.assertFalse(fake.stack)
+        self.assertTrue(fake.disks)
+        fake.fail = ''
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        storage, = state.hana_storage
+        self.assertEqual(storage.state, ledger.HanaExposureClosed(self.clock.now))
+        charges = ledger.hana_intervals(state, self.clock.now, 0)
+        self.assertEqual(ledger.hana_intervals(state, self.clock.now + 3600, 0), charges)
+
+    def test_hana_create_timeout_before_rollback_keeps_the_setup_and_reservation(self) -> None:
+        fake = FakeEc2(launch_on_execute=True)
+        subject = self.subject(fake, waiter_timeout=True)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'terminal rollback') as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertNotIsInstance(failure.exception, deploy.HanaCreateRolledBack)
+        self.assertTrue(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureOpen)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureOpen)
+        self.assertTrue(fake.stack)
+        self.assertNotIn('delete-stack', fake.operations)
+
+    def test_failed_hana_create_deletes_resources_retained_by_stack_delete(self) -> None:
+        fake = FakeEc2(fail_wait='stack-create-complete')
+        subject = self.subject(fake, retain_on_delete=True)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaises(deploy.HanaCreateRolledBack):
+            _ = subject.hana_setup(approve_resources=True)
+
+        waited = fake.operations.index('wait stack-delete-complete')
+        self.assertGreater(fake.operations.index('delete-volume'), waited)
+        self.assertGreater(fake.operations.index('delete-bucket'), waited)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_setup_clears_a_missing_stack_record_before_creating_again(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
+        _ = fake.launch(tagged=True)
+        created = self.clock.now
+        fake.create_retained()
+        fake.roll_back()
+        self.deleted_stacks['previous-stack'] = (created, fake.events.copy())
+        fake.events.clear()
+        subject = self.subject(fake)
+        previous_generation = self.write_leftover(subject)
+
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'fixture rollback'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('hana-setup: cleared the saved setup for the missing stack', output.getvalue())
+        create = fake.operations.index('create-change-set')
+        self.assertLess(fake.operations.index('wait instance-terminated'), create)
+        self.assertLess(fake.operations.index('delete-volume'), create)
+        self.assertLess(fake.operations.index('delete-bucket'), create)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        evidence = self.book.read_snapshot()
+        first, second = evidence.hana_compute
+        self.assertEqual(first.generation, previous_generation)
+        self.assertIsInstance(first.state, ledger.HanaExposureClosed)
+        self.assertGreater(second.generation, previous_generation)
+        self.assertIsInstance(evidence.hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_setup_refuses_to_clear_a_record_without_deleted_stack_evidence(self) -> None:
+        fake = FakeEc2()
+        self.deleted_stacks['older-stack'] = (self.clock.now - 1, [])
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks', 'list-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_down_clears_the_record_and_charges_without_deleted_stack_history(self) -> None:
+        fake = FakeEc2()
+        subject = self.subject(fake)
+        generation = self.write_leftover(subject)
+        self.assertIs(remote.read_record(self.setup_path)['requested'], True)
+        before = self.book.read_snapshot()
+        self.assertIsInstance(before.hana_compute[0].state, ledger.HanaExposureOpen)
+        self.assertIsInstance(before.hana_storage[0].state, ledger.HanaExposureOpen)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+
+        self.assertIn('down --workload hana: no deleted Hana stack since setup started', output.getvalue())
+        self.assertFalse(self.setup_path.exists())
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        after = self.book.read_snapshot()
+        compute, = after.hana_compute
+        storage, = after.hana_storage
+        self.assertEqual(compute.generation, generation)
+        closed = ledger.HanaExposureClosed(self.clock.now)
+        self.assertEqual(compute.state, closed)
+        self.assertEqual(storage.state, closed)
+
+    def test_hana_setup_refuses_a_missing_stack_record_that_names_an_instance(self) -> None:
+        fake = FakeEc2()
+        instance = fake.launch(tagged=True)
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject, instance=instance)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
 
 
 class DeploymentTests(CostFixture):

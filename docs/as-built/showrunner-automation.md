@@ -598,7 +598,7 @@ The answer returns the record to For you.
 An exact repeat of an answer-ready or read operation changes nothing.
 Other state changes receive one refusal line.
 
-1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>"`.
+1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>" --waiting-why "<reason>"`.
 2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
 3. Mark its answer read with `investigation.py read --id I<n>`.
 4. List waiting investigations with `investigation.py list`.
@@ -677,6 +677,7 @@ A missing folder uses its nearest existing parent until the folder appears.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  The Python `followup` API requires `waiting_why`; the Review action uses the user's question text automatically.
   It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.

@@ -79,6 +79,10 @@ class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
 
 
+class HanaCreateRolledBack(AwsUnavailable):
+    """The create failed and cleanup removed its resources."""
+
+
 class GateRegionOperation(StrEnum):
     NETWORK = 'network'
     STACK = 'stack'
@@ -418,31 +422,58 @@ class Deployment:
         self._authorize(True)
         child = self._hana_output()
         with control_lock(self.directory):
+            path = self.directory / 'hana' / 'setup.json'
+            saved = remote.read_record(path) if path.exists() else {}
             settings, parameters, template = self._hana_inputs()
-            now = int(self.clock())
+            if not saved:
+                prepared = cast(object, json.loads((child.output / 'parameters.json').read_text()))
+                prepared_parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
+                                       for row in ledger.rows({'parameters': prepared}, 'parameters')}
+                parameters['DeploymentId'] = ledger.text(prepared_parameters, 'DeploymentId')
             child.confirm_preparation_evidence(settings, parameters, template)
+            book = ledger.CostLedger(self.directory)
+            spending = hana_spend.HanaSpending(book, self.settings_path, limits)
+            outputs: dict[str, str] = {}
+            if saved.get('requested'):
+                saved_settings = replace(settings, region=ledger.text(saved, 'region'))
+                outputs = child._stack(saved_settings, require_outputs=True)
+                if not outputs:
+                    if any(saved.get(key) for key in ('instance', 'data_volume', 'bucket')):
+                        raise DeploymentRefused('The Hana stack is missing and the setup record names resources. '
+                                                + 'Run down --workload hana --approve-destroy before setup.')
+                    try:
+                        saved_api = self._api(saved_settings)
+                        started = self._hana_setup_started(book, saved)
+                        kept = retained.deleted_since(saved_api, saved_settings.stack_name, started)
+                        if kept is None:
+                            raise AwsUnavailable('No deleted stack matches the saved setup.')
+                        _ = spot_end.end_boxes(saved_api, ('HanaDeployment', ledger.text(saved, 'deployment')))
+                        retained.delete(saved_api, kept, wait_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+                        self._clear_hana_setup(spending, path, saved)
+                    except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as error:
+                        raise DeploymentRefused(f'The saved Hana setup remains. {error}\n'
+                                                + 'Run down --workload hana --approve-destroy before setup.') from None
+                    print('hana-setup: cleared the saved setup for the missing stack')
+                    saved = {}
             _ = self._guard()
             api = self._api(settings)
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
                 self._validate_inputs(settings)
-            path = self.directory / 'hana' / 'setup.json'
-            saved = remote.read_record(path)
-            book = ledger.CostLedger(self.directory)
-            spending = hana_spend.HanaSpending(book, self.settings_path, limits)
             if 'generation' not in saved:
                 # Explicit setup approval reserves resources without enabling command admission.
+                now = int(self.clock())
                 reservation = spending.reserve_setup(now, now + limits.permit_max_seconds)
                 if isinstance(reservation, hana_spend.PermitRefused):
                     raise DeploymentRefused(reservation.reason)
-                saved['generation'] = reservation.exposure.generation
+                saved.update(version=1, deployment=parameters['DeploymentId'], stack=settings.stack_name,
+                             region=settings.region, generation=reservation.exposure.generation)
                 saved['template_sha256'] = sha256(template).hexdigest()
                 saved['parameters_sha256'] = sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()
                 write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
-            elif (saved.get('template_sha256') != sha256(template).hexdigest()
+            elif (saved.get('region') != settings.region
+                    or saved.get('template_sha256') != sha256(template).hexdigest()
                     or saved.get('parameters_sha256') != sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()):
                 raise DeploymentRefused('The approved Hana template changed; review the saved deployment')
-            # Resume existing resources through reads before another stack mutation.
-            outputs = child._stack(settings) if 'generation' in saved and saved.get('requested') else {}
             if not outputs:
                 active = [row for row in book.read_snapshot().hana_compute
                     if row.generation == saved['generation'] and isinstance(row.state, ledger.HanaExposureOpen)]
@@ -451,8 +482,15 @@ class Deployment:
                 saved['requested'] = True
                 write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
                 with step('hana-setup', 'updating the separate Hana stack', self.settings_path):
-                    self._hana_stack_change(api, settings, child.output / 'template.json', parameters,
-                                            keep=str(saved.get('instance', '')))
+                    try:
+                        self._hana_stack_change(api, settings, child.output / 'template.json', parameters,
+                                                keep=str(saved.get('instance', '')))
+                    except HanaCreateRolledBack as error:
+                        try:
+                            self._clear_hana_setup(spending, path, saved)
+                        except (OSError, ValueError) as cleanup_error:
+                            raise AwsUnavailable(f'{error}\nThe saved Hana setup remains: {cleanup_error}') from None
+                        raise
                 outputs = child._stack(settings)
             instance, bucket = outputs['Instance'], outputs['ControlBucket']
             if saved.get('instance', instance) != instance or saved.get('data_volume', outputs['DataVolume']) != outputs['DataVolume']:
@@ -483,6 +521,24 @@ class Deployment:
             clock=self.clock).register(hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region))
         print('Hana setup complete: the box is stopped; placement remains disabled')
         return True
+
+    @staticmethod
+    def _hana_setup_started(book: ledger.CostLedger, saved: dict[str, object]) -> int:
+        generation = ledger.instant(saved, 'generation')
+        for row in book.read_snapshot().hana_compute:
+            if row.generation == generation:
+                return row.at
+        raise DeploymentRefused('The saved Hana setup has no reservation time.')
+
+    def _clear_hana_setup(self, spending: hana_spend.HanaSpending, path: Path, saved: dict[str, object]) -> None:
+        generation = ledger.instant(saved, 'generation')
+        now = int(self.clock())
+        spending.reconcile(now, 'terminated', generation=generation)
+        if any(row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen)
+               for row in spending.book.read_snapshot().hana_compute):
+            raise DeploymentRefused('The Hana setup reservation is still open. Repeat approved setup.')
+        spending.confirm_storage_deleted(now)
+        path.unlink()
 
     def hana_image(self, result: Path, *, approve_resources: bool = False) -> bool:
         """Upload the built Hana image to one snapshot, register it, and save the image and network identity."""
@@ -580,11 +636,7 @@ class Deployment:
 
     def _hana_stack_change(self, api: AwsCli, settings: DeploymentSettings, template: Path, parameters: dict[str, str],
                            *, keep: str) -> None:
-        """Change the Hana stack through a change set that refuses a box or disk replacement.
-
-        The Hana box, disks and bucket are retained, so CloudFormation never deletes them. A failed change
-        ends every Hana box except the kept one, then deletes what the rollback kept.
-        A failed create also deletes the failed stack and every unattached Hana disk."""
+        """Change the Hana stack without replacing its box or disk."""
         timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
         started = self.clock()
         try:
@@ -631,22 +683,35 @@ class Deployment:
                          '--stack-name', settings.stack_name, service='cloudformation', timeout_s=timeout)
         except (AwsUnavailable, subprocess.SubprocessError) as error:
             tag = ('HanaDeployment', parameters['DeploymentId'])
+            lines = [str(error), *failed_stack_events(api, settings.stack_name, started)]
             try:
-                ended = spot_end.end_boxes(api, tag, keep=keep)
-                # Read the rollback events before a stack delete makes them unreadable by name.
-                kept = retained.skipped_since(api, settings.stack_name, started)
+                stack_id = ''
                 if kind == 'CREATE':
-                    _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
-                    _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
+                    stacks = ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name,
+                                                  service='cloudformation'), 'Stacks')
+                    if len(stacks) != 1 or stacks[0].get('StackStatus') not in ('ROLLBACK_COMPLETE', 'ROLLBACK_FAILED'):
+                        raise AwsUnavailable('CloudFormation did not confirm a terminal rollback. The saved setup remains.')
+                    stack_id = ledger.text(stacks[0], 'StackId')
+                ended = spot_end.end_boxes(api, tag, keep=keep)
+                if stack_id:
+                    _ = api.call('delete-stack', '--stack-name', stack_id, service='cloudformation')
+                    _ = api.call('wait', 'stack-delete-complete', '--stack-name', stack_id,
                                  service='cloudformation', timeout_s=timeout)
+                    kept = retained.skipped_since(api, stack_id, started)
+                else:
+                    kept = retained.skipped_since(api, settings.stack_name, started, missing_ok=True)
                 retained.delete(api, kept, wait_s=timeout)
-            except (AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
-                raise AwsUnavailable(f'{error}\nthe failed Hana change did not remove what it made: {end_error}') from None
-            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests, '
-                                 + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets') from None
+            except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
+                lines.append(f'The failed Hana change did not remove what it made. {end_error}')
+                raise AwsUnavailable('\n'.join(lines)) from None
+            lines.append(f'the failed Hana change ended {ended} Spot boxes and their requests, '
+                         + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets')
+            if kind == 'CREATE':
+                raise HanaCreateRolledBack('\n'.join(lines)) from None
+            raise AwsUnavailable('\n'.join(lines)) from None
 
     def hana_down(self, *, approve_destroy: bool = False) -> bool:
-        """Cancel every Hana Spot request, terminate its boxes, delete the Hana stack, then its data disk and bucket."""
+        """Delete Hana resources and close their charges."""
         print('down --workload hana cancels each Hana Spot request, then terminates its boxes and deletes the Hana stack.')
         print('down --workload hana then deletes the Hana data disk and control bucket; their data is lost.')
         if not approve_destroy:
@@ -654,31 +719,46 @@ class Deployment:
             return True
         self._check_credentials()
         path = self.directory / 'hana' / 'setup.json'
-        if not path.exists():
-            print('down --workload hana: no Hana deployment is saved')
-            return True
-        saved = remote.read_record(path)
-        settings, _, _ = self._hana_inputs()
-        api = self._api(settings)
-        timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
-        tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
         with control_lock(self.directory):
+            if not path.exists():
+                print('down --workload hana: no Hana deployment is saved')
+                return True
+            saved = remote.read_record(path)
+            settings, _, _ = self._hana_inputs()
+            if 'region' in saved:
+                settings = replace(settings, region=ledger.text(saved, 'region'))
+            api = self._api(settings)
+            timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+            tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
             # Read the stack's disk and bucket before the stack delete removes the record of them.
             kept = retained.in_stack(api, settings.stack_name) | retained.Retained(
                 frozenset([str(saved['data_volume'])] if saved.get('data_volume') else []),
                 frozenset([str(saved['bucket'])] if saved.get('bucket') else []))
+            book = ledger.CostLedger(self.directory)
+            started = self._hana_setup_started(book, saved) if saved.get('requested') and not saved.get('instance') else None
             with step('hana-down', 'ending the Hana Spot boxes', self.settings_path):
                 ended = spot_end.end_boxes(api, tag)
-            if 'generation' in saved:
-                hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
-                    hana_spend.read_settings(conf.read_or_repository('hana_aws'))).reconcile(
-                        int(self.clock()), 'terminated', generation=ledger.instant(saved, 'generation'))
             with step('hana-down', 'deleting the Hana stack', self.settings_path, hint='can take several minutes'):
                 _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
                 _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
                              service='cloudformation', timeout_s=timeout)
+            with step('hana-down', 'checking for Spot boxes that the stack kept', self.settings_path):
+                ended += spot_end.end_boxes(api, tag)
             with step('hana-down', 'deleting the Hana data disk and control bucket', self.settings_path):
+                if started is not None:
+                    deleted = retained.deleted_since(api, settings.stack_name, started)
+                    if deleted is None:
+                        print('down --workload hana: no deleted Hana stack since setup started')
+                    else:
+                        kept |= deleted
                 retained.delete(api, kept, wait_s=timeout)
+            spending = hana_spend.HanaSpending(book, self.settings_path,
+                hana_spend.read_settings(conf.read_or_repository('hana_aws')))
+            now = int(self.clock())
+            compute = book.read_snapshot().hana_compute if book.path.exists() else []
+            if compute:
+                spending.reconcile(now, 'terminated', generation=max(row.generation for row in compute))
+            spending.confirm_storage_deleted(now)
             for name in ('lifecycle.json', 'setup.json'):
                 (self.directory / 'hana' / name).unlink(missing_ok=True)
         print(f'down --workload hana: done; {ended} Spot boxes ended; '
@@ -758,7 +838,7 @@ class Deployment:
             template = TEMPLATE.read_bytes()
             return self._write_preparation(settings, parameters, template, decision, resources)
 
-    def _stack(self, settings: DeploymentSettings) -> dict[str, str]:
+    def _stack(self, settings: DeploymentSettings, *, require_outputs: bool = False) -> dict[str, str]:
         try:
             row = self._api(settings).call('describe-stacks', '--stack-name', settings.stack_name, service='cloudformation')
         except AwsUnavailable as error:
@@ -774,7 +854,7 @@ class Deployment:
                 and stack.get('StackId') != saved['stack_id']):
             raise DeploymentRefused('the live StackId differs from the deployment record')
         status = ledger.text(stack, 'StackStatus')
-        if status == 'REVIEW_IN_PROGRESS':
+        if status == 'REVIEW_IN_PROGRESS' and not require_outputs:
             return {}
         if status not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'):
             raise DeploymentRefused(f'reconcile the stack before deployment: {status}')
@@ -784,6 +864,8 @@ class Deployment:
             if not isinstance(value, str):
                 raise DeploymentRefused('stack output values must contain text')
             outputs[ledger.text(item, 'OutputKey')] = value
+        if require_outputs and not outputs:
+            raise DeploymentRefused('The existing Hana stack has no outputs. Reconcile it before setup.')
         return outputs
 
     def _validate_inputs(self, settings: DeploymentSettings) -> None:
@@ -1581,7 +1663,7 @@ def failed_stack_events(api: AwsCli, stack: str, started: float) -> list[str]:
                 lines.append(f"{ledger.text(event, 'LogicalResourceId')} ({ledger.text(event, 'ResourceType')}): "
                              + f"{status}: {event.get('ResourceStatusReason', '')}")
         return lines
-    except (ValueError, AwsUnavailable, subprocess.SubprocessError):
+    except (ValueError, OSError, AwsUnavailable, subprocess.SubprocessError):
         return ['stack events are unavailable']
 
 
