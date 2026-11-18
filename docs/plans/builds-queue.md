@@ -2920,6 +2920,8 @@ Work:
 2. Name the test and the cause from the failed log. An outcome of Granted with exit 1 means the step was granted but the wait function returned non-zero.
 3. Fix the cause in the code or the fixture, never with a retry. The repro then passes in each loop.
 
+**Second case (builds, from aws, 2026-11-18):** on c50a38369 a slot-wait test got `RepositorySlotReady` where it expects `RepositorySlotWaiting`. It failed 1 time in 903 modules and passed alone. That change does not touch queue code. Run the same loaded loop for this test. If both failures have one cause, fix them in this phase. Otherwise make a separate phase after 44cg for this case.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
