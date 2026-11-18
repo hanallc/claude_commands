@@ -14,7 +14,8 @@ from scripts.aws_target.hana_placement import (
 )
 if TYPE_CHECKING:
     from scripts.aws_target import hana_box as box
-    from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
+    from scripts.aws_target.hana_placement import HanaEvidenceRequest
+    from scripts.build_queue import admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
     from scripts.lib import conf
     from scripts.mac_test import claim_state
@@ -230,7 +231,8 @@ def release_assigned(assignment: placement.PlacementAssignment, holder: placemen
         return _release_claims(controller, execution, matching)
 
 
-def _release_claims(controller: box.HanaController, execution: str, matching: tuple[claim_state.HeldClaim, ...]) -> bool:
+def _release_claims(controller: box.HanaController, execution: str, matching: tuple[claim_state.HeldClaim, ...],
+                    *, detached_only: bool = False) -> bool:
     from scripts.aws_target import hana_box as box
 
     snapshot = controller.inspect()
@@ -238,7 +240,10 @@ def _release_claims(controller: box.HanaController, execution: str, matching: tu
         return False
     current = any(claim.execution == execution for claim in snapshot.claims)
     pending = isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution
-    if not matching and not current:
+    if detached_only:
+        if current or pending or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING):
+            return False
+    elif not matching and not current:
         return not pending
     elif snapshot.claims:
         if len(snapshot.claims) != 1 or not current or not controller.release(execution):
@@ -268,12 +273,12 @@ def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) ->
     return settings
 
 
-def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest) -> placement.HostEvidence:
+def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) -> placement.HostEvidence:
     """Read provider records and release claims for ended local holders when safe."""
     from functools import partial
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
-    from scripts.aws_target.hana_execution import HanaSettled, read_claim_execution, settle_unpublished_claim
+    from scripts.aws_target.hana_execution import HanaSettled, claim_admission_refused, read_claim_execution, settle_unpublished_claim
     from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.lib import process_start
@@ -311,7 +316,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
             if ('remote_host' not in record or record['remote_host'] != transport.host
                     or execution != placement.assigned_claim_id(record['episode'], record['attempt'])
                     or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
-                    or isinstance(snapshot.operation, box.PendingOperation)):
+                    or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution):
                 held.append(claim)
                 continue
             owner = process_start.process_start(record['pid'])
@@ -320,10 +325,13 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
                 reference = placement.ProviderClaimReference('ssh', target.name, claim.scope,
                     execution, record['episode'], record['attempt'])
                 attached = any(row.execution == execution for row in snapshot.claims)
+                release = partial(_release_claims, controller, execution, (claim,), detached_only=not attached)
+                if claim_admission_refused(controller.directory, reference):
+                    if not attached and release():
+                        continue
                 # The lifecycle controller owns a start until a journal proves that dispatch did not occur.
-                if not attached or isinstance(read_claim_execution(controller.directory, reference), placement.ExecutionNotStarted):
-                    closed = settle_unpublished_claim(controller.directory, reference,
-                        release_claim=partial(_release_claims, controller, execution, (claim,)),
+                elif not attached or isinstance(read_claim_execution(controller.directory, reference), placement.ExecutionNotStarted):
+                    closed = settle_unpublished_claim(controller.directory, reference, release_claim=release,
                         reason='The Hana start owner exited')
                     if isinstance(closed, HanaSettled):
                         if attached:

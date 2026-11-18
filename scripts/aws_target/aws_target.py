@@ -22,6 +22,7 @@ import time
 from typing import cast, final
 
 from scripts.aws_target import ledger, measurement, price_days, run_cost
+from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
@@ -139,6 +140,147 @@ def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
                                 *gpu_price_sizes(values))))
 
 
+def spot_placement_requests(values: conf.ConfigRead) -> tuple[ledger.SpotPlacementRequest, ...]:
+    """Use the same ordered batches for each hour of the collection."""
+    regions = tuple(dict.fromkeys(values.words('regions')))
+    batches = tuple(regions[start:start + 10] for start in range(0, len(regions), 10))
+    gate_types = tuple(dict.fromkeys(values.words('instance_types')))
+    gate_32_vcpu = tuple(size for size in gate_types if ledger.gate_vcpus(size) == 32)
+    pair, all_types = ledger.SpotPlacementTypeSet.GATE_32_VCPU, ledger.SpotPlacementTypeSet.ALL_GATE_TYPES
+    regional, zonal = ledger.SpotPlacementScope.REGION, ledger.SpotPlacementScope.ZONE
+    shapes = (
+        (regional, 8, pair, gate_32_vcpu),
+        (regional, 8, all_types, gate_types),
+        (zonal, 8, pair, gate_32_vcpu),
+        (zonal, 8, all_types, gate_types),
+        (regional, 20, all_types, gate_types),
+    )
+    return tuple(ledger.SpotPlacementRequest(scope, type_set, boxes, types, batch)
+                 for scope, boxes, type_set, types in shapes if types for batch in batches)
+
+
+def read_spot_placement(api: AwsCli, request: ledger.SpotPlacementRequest, now: int) -> ledger.SpotPlacementReading:
+    """Keep the scores that AWS returns and record any failed request once."""
+    zonal = request.scope is ledger.SpotPlacementScope.ZONE
+    try:
+        reply = api.call('get-spot-placement-scores', '--instance-types', *request.instance_types,
+                         '--target-capacity', str(request.boxes), '--target-capacity-unit-type', 'units',
+                         '--single-availability-zone' if zonal else '--no-single-availability-zone',
+                         '--region-names', *request.regions)
+        if reply.get('NextToken'):
+            raise ValueError('The Spot placement score reply is incomplete')
+        scores: dict[ledger.SpotPlacementLocation, ledger.SpotPlacementScore] = {}
+        for row in ledger.rows(reply, 'SpotPlacementScores'):
+            region = ledger.text(row, 'Region')
+            if region not in request.regions:
+                continue
+            place = (ledger.SpotPlacementZone(region, ledger.text(row, 'AvailabilityZoneId')) if zonal
+                     else ledger.SpotPlacementRegion(region))
+            scores[place] = ledger.SpotPlacementScore(place, ledger.instant(row, 'Score'))
+        return ledger.SpotPlacementSample(request, now, tuple(scores.values()))
+    except AwsUnavailable as error:
+        reason = aws_error_code(error, operation='GetSpotPlacementScores') or 'AWS request failed'
+        return ledger.SpotPlacementFailure(request, now, reason)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return ledger.SpotPlacementFailure(request, now, type(error).__name__)
+
+
+def collect_spot_placement(api: AwsCli, requests: Sequence[ledger.SpotPlacementRequest],
+                           history: Sequence[ledger.SpotPlacementReading], now: int) -> tuple[ledger.SpotPlacementReading, ...]:
+    """Refresh accepted shapes and add at most one shape after the initial shapes."""
+    first = now - ledger.SPOT_PLACEMENT_RETENTION_SECONDS
+    accepted = {row.request for row in history if isinstance(row, ledger.SpotPlacementSample) and first <= row.at <= now}
+    recent = {row.request for row in history if now - 24 * 3600 < row.at <= now}
+    shapes: dict[tuple[ledger.SpotPlacementScope, int, ledger.SpotPlacementTypeSet],
+                 list[ledger.SpotPlacementRequest]] = {}
+    for request in requests:
+        shapes.setdefault((request.scope, request.boxes, request.type_set), []).append(request)
+    scheduled: list[list[ledger.SpotPlacementRequest]] = []
+    pending: list[list[ledger.SpotPlacementRequest]] = []
+    initial_accepted = True
+    for (scope, boxes, _), batches in shapes.items():
+        if scope is ledger.SpotPlacementScope.REGION and boxes == 8:
+            scheduled.append(batches)
+            initial_accepted = initial_accepted and accepted.issuperset(batches)
+        elif accepted.issuperset(batches):
+            scheduled.append(batches)
+        else:
+            pending.append(batches)
+
+    readings: list[ledger.SpotPlacementReading] = []
+    can_start = True
+    for batches in (*scheduled, *(pending[:1] if initial_accepted else ())):
+        new = set(batches) - recent
+        if not can_start and (new or batches in pending):
+            continue
+        if new and len(recent) + len(new) > ledger.SPOT_PLACEMENT_AWS_24_HOUR_CONFIGURATION_LIMIT:
+            can_start = False
+            continue
+        recent.update(new)
+        results = tuple(read_spot_placement(api, request, now) for request in batches)
+        readings.extend(results)
+        can_start = can_start and all(isinstance(result, ledger.SpotPlacementSample) for result in results)
+    return tuple(readings)
+
+
+def scaler_snapshot_api(configuration: conf.ConfigRead, credential_file: Path, execute: AwsExecutor,
+                        *, single_attempt: bool = False) -> AwsCli:
+    environment = {key: value for key, value in os.environ.items() if key not in (
+        'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN',
+        'AWS_CONFIG_FILE', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE')}
+    environment['AWS_SHARED_CREDENTIALS_FILE'] = str(credential_file)
+    environment['AWS_CONFIG_FILE'] = os.devnull
+    environment['AWS_EC2_METADATA_DISABLED'] = 'true'
+    if single_attempt:
+        environment['AWS_MAX_ATTEMPTS'] = '1'
+
+    def scaler_execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                       timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        _ = env
+        return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=environment)
+
+    return AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
+                  configuration.number('aws_timeout_s'), scaler_execute)
+
+
+def placement_snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
+                       clock: Callable[[], float] = time.time) -> None:
+    """Collect placement scores once per UTC hour, independent of prices."""
+    from scripts.aws_target import admin_secrets
+
+    try:
+        credential_file = admin_secrets.credentials_file()
+        if not credential_file.is_file():
+            return
+        requests = spot_placement_requests(conf.read_or_repository('cloud_gate'))
+        api = scaler_snapshot_api(conf.read(settings_path), credential_file, execute, single_attempt=True)
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / 'spot-placement-scores.lock').open('a+') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            now = int(clock())
+            hour = str(now // 3600)
+            _ = lock.seek(0)
+            if lock.read().strip() == hour:
+                return
+            try:
+                history = ledger.read_spot_placement_scores(directory)
+            except (OSError, ValueError, KeyError) as error:
+                print(f'aws_target: Spot placement history unreadable: {type(error).__name__}', file=sys.stderr)
+                history = ()
+            # Claim the hour before AWS calls so a restart does not repeat them.
+            _ = lock.seek(0)
+            _ = lock.truncate()
+            _ = lock.write(hour)
+            lock.flush()
+            readings = collect_spot_placement(api, requests, history, now)
+            ledger.write_spot_placement_scores(directory, (*history, *readings), now)
+    except (OSError, ValueError, KeyError) as error:
+        print(f'aws_target: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
+
+
 def hours_gap_push(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> push_texts.RenderedPush:
     gap = f'{check.hours_gap_ratio:.0%}' if check.hours_gap_ratio is not None else 'all billed hours'
     return push_texts.render('aws.hours_gap', day=day, size=size, region=region, billed=f'{check.billed_hours or 0:.2f}',
@@ -210,20 +352,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             last = 0
         if not force and last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
             return 0
-        environment = {key: value for key, value in os.environ.items() if key not in (
-            'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN',
-            'AWS_CONFIG_FILE', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE')}
-        environment['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
-        environment['AWS_CONFIG_FILE'] = os.devnull
-        environment['AWS_EC2_METADATA_DISABLED'] = 'true'
-
-        def scaler_execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                           timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            _ = env
-            return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=environment)
-
-        api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'),
-                     configuration.number('aws_timeout_s'), scaler_execute)
+        api = scaler_snapshot_api(configuration, admin_secrets.credentials_file(), execute)
         document = read_snapshot(directory)
         prices = list(ledger.rows(document, 'prices'))
         readings = list(ledger.rows(document, 'regions')) if 'regions' in document else []
@@ -410,8 +539,19 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
 
 
 def hourly(settings_path: Path, directory: Path) -> int:
-    """Read the Spot prices, then check billed hours against gate box hours; buildlog hourly runs this."""
-    return max(snapshot(settings_path, directory), hours_gap_notices(settings_path, directory))
+    """Read prices and placement scores and check billed hours."""
+    status = 0
+    for label, operation in (('price snapshot', snapshot), ('hours-gap check', hours_gap_notices)):
+        try:
+            status = max(status, operation(settings_path, directory))
+        except Exception as error:
+            print(f'aws_target: {label} failed: {type(error).__name__}', file=sys.stderr)
+            status = max(status, 1)
+    try:
+        placement_snapshot(settings_path, directory)
+    except Exception as error:
+        print(f'aws_target: placement snapshot failed: {type(error).__name__}', file=sys.stderr)
+    return status
 
 
 def main() -> int:

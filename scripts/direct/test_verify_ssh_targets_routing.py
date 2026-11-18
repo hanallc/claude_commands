@@ -335,6 +335,34 @@ raise SystemExit(1)
                 self.assertEqual(result.stdout.count("The build did not run on linux."), 1)
                 self.assertEqual(self.local_runs(), [])
 
+    def test_pinned_hana_command_admission_refusal_prints_one_cause(self) -> None:
+        self.configure("natedev,linux")
+        self.write_executable(self.runner, r'''
+import os
+from pathlib import Path
+import sys
+
+cause = os.environ["TEST_GUEST_REFUSAL"]
+with (Path(os.environ["TEST_RUNNER_STATE"]) / "command-attempts").open("a") as attempts:
+    attempts.write("attempt\n")
+Path(sys.argv[sys.argv.index("--result") + 1]).write_text(
+    f"outcome=hana_command_admission_refused\ntarget=linux\nreason={cause}\nseconds=0\n")
+raise SystemExit(75)
+''')
+        attempts = self.runner_state / "command-attempts"
+        for cause in ("The data mount and a fresh permit are required",
+                      "Hana command admission is disabled on the guest"):
+            with self.subTest(cause=cause):
+                attempts.unlink(missing_ok=True)
+                result = self.verify("check", "sample", "--target", "linux", extra={"TEST_GUEST_REFUSAL": cause})
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, output)
+                self.assertEqual([line for line in output.splitlines() if "target linux refused:" in line],
+                                 [f"verify.sh: target linux refused: {cause}"])
+                self.assertEqual(output.count(cause), 1)
+                self.assertEqual(attempts.read_text().splitlines(), ["attempt"])
+                self.assertEqual(self.local_runs(), [])
+
     def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
         from scripts.mac_test import eligibility, offload
 
