@@ -265,6 +265,17 @@ class StopResumeTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "no unique native foreground process"):
                             _ = stop_resume.producer_adoption_launch(world.identity, world.pane, client)
 
+    def test_producer_admission_refuses_an_incomplete_registry_before_reserving_a_pane(self) -> None:
+        with producer_first_fixture("claude") as world:
+            path = runtime_sessions.sessions_dir() / "unfinished.json"
+            _ = path.write_text("{")
+            result = stop_resume.resume("dwight")
+            self.assertIsInstance(result, stop_resume.ResumeFailed)
+            assert isinstance(result, stop_resume.ResumeFailed)
+            self.assertIn(f"session registry unreadable: {path}", result.reason)
+            self.assertEqual(world.case.client.opened, [])
+            self.assertEqual(world.arguments, [])
+
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
         for shown in (None, "old-producer-title"):
             with self.subTest(native_title=shown), producer_first_fixture("claude") as world:
@@ -629,6 +640,32 @@ class StopResumeTests(unittest.TestCase):
                     self.assertIn("pane pane", result.reason)
                     self.assertIn(f"foreground processes: {', '.join(activity.commands)}", result.reason)
 
+    def test_worker_stop_with_a_closed_pane_requires_a_complete_registry(self) -> None:
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId("native-worker"))
+        before = worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)
+        for cause in ("missing folder", "unreadable record"):
+            registry = self.root / cause
+            unreadable = registry
+            if cause == "unreadable record":
+                registry.mkdir()
+                unreadable = registry / "unfinished.json"
+                _ = unreadable.write_text("{")
+            with (self.subTest(cause=cause),
+                  patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+                  patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                  patch.object(worker_panes, "observe", return_value=[before]),
+                  patch.object(self.client, "panes", return_value=[]),
+                  patch.object(runtime_sessions, "session_liveness", side_effect=session_records.session_liveness),
+                  patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped(row.current_session, 123)),
+                  patch.object(stop_resume, "_retire_prompt") as retired):
+                result = stop_resume.stop(row.id, "claude")
+            self.assertIsInstance(result, stop_resume.StopUnproved)
+            assert isinstance(result, stop_resume.StopUnproved)
+            self.assertIn(f"session registry unreadable: {unreadable}", result.reason)
+            retired.assert_not_called()
+        self.kill.assert_not_called()
+
     def test_worker_stop_rejects_an_unreadable_retained_pane(self) -> None:
         row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
                              current_session=staff.StaffId("native-worker"))
@@ -639,6 +676,55 @@ class StopResumeTests(unittest.TestCase):
               patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("native-worker", 123))):
             result = stop_resume.stop(row.id)
         self.assertIsInstance(result, stop_resume.StopFailed)
+
+    def test_recorded_codex_worker_checks_both_stop_steps_without_the_claude_registry(self) -> None:
+        identity = self.entry["session_id"]
+        home = self.root / ".codex"
+        (home / "sessions").mkdir(parents=True, exist_ok=True)
+        (home / "sessions" / f"rollout-{identity}.jsonl").touch()
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId(identity), home=staff.SessionHome(home))
+        snapshot = staff.StaffSnapshot((row,), running_sessions=frozenset())
+        self.assertEqual(snapshot.backends.get(row.id), staff.CodexBackend(home))
+        atomic_file.write_text_atomic(pane_record.record_path("agents"), "{}\n")
+        with (patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "missing-sessions")}),
+              patch.object(staff, "initial_snapshot", return_value=snapshot),
+              patch.object(worker_panes, "observe", return_value=[
+                  worker_panes.OpenWorker(row, "pane", "terminal", herdr.AgentStatus.WORKING)]),
+              patch.object(self.client, "panes", return_value=[]),
+              patch.object(runtime_sessions, "session_liveness", wraps=session_records.session_liveness) as claude,
+              patch.object(herdr, "read_conversation", wraps=herdr.read_conversation) as native):
+            self.assertIsNone(pane_record.publication_for_session(identity))
+            for reference in (row.id, row.name):
+                with self.subTest(reference=reference):
+                    native.reset_mock()
+                    self.assertEqual(stop_resume.stop(reference), stop_resume.NotRunning(identity))
+                    self.assertEqual([seen.args for seen in native.call_args_list],
+                                     [(identity, "codex"), (identity, "codex")])
+        claude.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_stopped_codex_worker_with_unknown_thread_cannot_prove_absence(self) -> None:
+        identity = self.entry["session_id"]
+        home = self.root / ".codex"
+        (home / "sessions").mkdir(parents=True, exist_ok=True)
+        (home / "sessions" / f"rollout-{identity}.jsonl").touch()
+        row = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "impl", staff.ReportsTo(staff.StaffId("holder")),
+                             current_session=staff.StaffId(identity), home=staff.SessionHome(home))
+        snapshot = staff.StaffSnapshot((row,), running_sessions=frozenset())
+        self.assertEqual(snapshot.backends.get(row.id), staff.CodexBackend(home))
+        atomic_file.write_text_atomic(pane_record.record_path("agents"), "{}\n")
+        with (patch.object(staff, "initial_snapshot", return_value=snapshot),
+              patch.object(worker_panes, "observe", return_value=[
+                  worker_panes.StoppedWorker(row, "pane", "terminal")]),
+              patch.object(self.client, "panes", return_value=[]),
+              patch.object(stop_resume, "_retire_prompt") as retired):
+            result = stop_resume.stop(row.id, codex=herdr.CodexConversations({}, ("sdlc (Codex thread unknown)",)))
+        self.assertIsInstance(result, stop_resume.StopUnproved)
+        assert isinstance(result, stop_resume.StopUnproved)
+        self.assertIn("Codex thread unknown", result.reason)
+        retired.assert_not_called()
+        self.kill.assert_not_called()
 
     def test_stopped_codex_worker_needs_no_launch_or_signal_on_a_repeated_stop(self) -> None:
         identity = self.entry["session_id"]
@@ -655,7 +741,7 @@ class StopResumeTests(unittest.TestCase):
             return result
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
               patch.object(worker_panes, "observe", return_value=[observed]),
-              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ("sdlc (Codex thread unknown)",))),
+              patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
               patch.object(stop_resume, "stop", side_effect=finish),
               patch.object(stop_resume, "_stop", wraps=stop_resume._stop) as native_stop,  # pyright: ignore[reportPrivateUsage]
               patch.object(stop_resume, "_worker_stopped", wraps=stop_resume._worker_stopped) as proof,  # pyright: ignore[reportPrivateUsage]
