@@ -62,6 +62,7 @@ scripts/lib/git_files.py
 scripts/lib/git_index.py
 scripts/lib/git_rescue.py
 scripts/lib/inotify.py
+scripts/lib/local_release_events.py
 scripts/lib/process_failure.py
 scripts/lib/process_group.py
 scripts/lib/scratch.py

@@ -20,9 +20,9 @@ from scripts.review_links import question_record
 from scripts.review_links import review_legacy
 from scripts.review_links import review_actions
 from scripts.review_links import staff_names
+from scripts.review_links.paths import PAGE_PATH as PAGE_PATH
 from scripts.review_links.review_items import ReviewItem, ReviewState, ReviewType
 
-PAGE_PATH = '/console/review.html'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',

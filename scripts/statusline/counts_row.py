@@ -38,6 +38,7 @@ from scripts.production import staff
 from scripts.review_links import for_you, review_items, review_later
 from scripts.production.update_registration import QuestionStaff
 from scripts.lib.user_zone import user_zone
+from scripts.statusline.cache_file import write_cache
 
 
 def global_action_count() -> str:
@@ -80,13 +81,6 @@ def console_action_count() -> str:
 
 def cache_path(name: str) -> Path:
     return showrunner_footer.state_root() / "counts" / name
-
-
-def watched(path: Path) -> Path:
-    """The path itself, or for one that does not exist yet its nearest folder that does."""
-    while not path.exists() and path.parent != path:
-        path = path.parent
-    return path
 
 
 def retry_due(sources: list[Path]) -> str:
@@ -211,16 +205,6 @@ def write_unit(identity: str) -> Path:
         due = retry_due(sources)
     write_cache(cache, line, due, sources, began, details=f"source=unit:{identity}")
     return cache
-
-
-def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: int, details: str = "") -> None:
-    """Replace the cache with the answer, deadline, source paths, and optional result details."""
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    scratch = cache.with_name(f".{cache.name}.{os.getpid()}")
-    named = dict.fromkeys(str(watched(path)) for path in sources)
-    _ = scratch.write_text("\n".join([line, due, *named, *([details] if details else [])]) + "\n", encoding="utf-8")
-    os.utime(scratch, ns=(began, began))
-    _ = scratch.replace(cache)
 
 
 def main(argv: list[str]) -> int:

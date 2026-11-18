@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 from scripts.lib import atomic_file, conf_reads
 from scripts.rebuild import need
+from scripts.statusline.cache_file import write_cache
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
 
@@ -395,8 +396,6 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
 
 def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
     """Refresh the configured cache without concurrent evaluations."""
-    from scripts.statusline import counts_row
-
     try:
         cache = cache_path(config)
     except (OSError, ValueError, KeyError):
@@ -439,7 +438,7 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             fields = cast(dict[str, object], json.loads(details))
             fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
             details = json.dumps(fields)
-        counts_row.write_cache(cache, line, due, [config], began, details)
+        write_cache(cache, line, due, [config], began, details)
 
 
 def main(argv: list[str]) -> int:

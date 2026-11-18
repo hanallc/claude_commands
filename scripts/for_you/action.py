@@ -197,10 +197,11 @@ class ActionStore:
 
 def card_url(key: str) -> str:
     """Use the existing Review origin and path without creating a console page."""
-    from scripts.review_links import review_link, review_page
+    from scripts.review_links import review_link
+    from scripts.review_links.paths import PAGE_PATH
 
     root = review_link.review_root()
-    url = review_link.snapshot_url(root, root / review_page.PAGE_PATH.lstrip("/"))
+    url = review_link.snapshot_url(root, root / PAGE_PATH.lstrip("/"))
     return url + "?" + urlencode({"type": "for-you", "show": "open", "item": key})
 
 
