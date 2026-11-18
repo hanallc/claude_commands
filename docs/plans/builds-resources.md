@@ -2835,3 +2835,23 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `1454f2907`; row `b13507879` on main `78de4e3ec`.
 
 **Files:** `scripts/aws_target/test_measurement.py`.
+
+### Phase 153 — A gate uses the cheapest region again as soon as it has quota room  · status: todo
+
+`cloud_gate.rank_variants` (cloud_gate.py:548) cools a whole region for `capacity_cooldown_seconds` after one Spot quota refusal. Gates then use dearer regions while the cheap region has room again.
+
+1. A quota refusal does not cool the region. Zone refusals keep their cooldown.
+2. A region counts as full only when our live gate boxes there, plus one, exceed its Spot quota snapshot (`ledger.read_spot_quotas`).
+3. A quota refusal at launch still moves to the next variant.
+4. Proof: the cheapest region refused 5 min ago, a box there ended, and the next gate picks that region.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`.
+
+### Phase 154 — A buildlog report day never falls back to UTC by itself  · status: done
+
+`scripts/buildlog/report.py:1571` and `cli.py:253` set the user zone through `TZ` and `tzset()`. With `TZDIR` unset (NixOS), the zone name does not resolve, and the report day is UTC without a warning.
+
+1. Resolve the zone without `TZDIR` (`zoneinfo`), or fail with a clear error. Never use UTC by itself.
+2. Test with `TZDIR` unset and with a wrong zone name.
+
+**Files:** `scripts/buildlog/report.py`, `scripts/buildlog/cli.py`, and their tests.
