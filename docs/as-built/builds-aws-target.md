@@ -146,10 +146,8 @@ It passes when every region passes.
 
 ## Hana guest safety files
 
-`scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
-These files do not provision a machine or add a deployment command.
-Phase D must install and enable the units before the box accepts work.
-`config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
+`scripts/aws_target/hana_guest.py` renders safety files for the kept Hana box.
+`config/hana_aws.conf` supplies the image's admission setting, safety timing, and resource values.
 
 `scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
 It writes nine files by base name and applies each `GuestFile` mode.
@@ -160,6 +158,9 @@ The NixOS build uses the renderer from its pinned `claude-commands` input.
 `scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
 The filter excludes unrelated repository changes from the image inputs.
 The NixOS integration replaces the manually copied guest files.
+The image installs the rendered settings and guest code.
+User data supplies the boot descriptor and signed control access.
+A change to guest admission requires a rebuilt image and a box provisioned from that image.
 
 Run this command from the repository root:
 
@@ -191,6 +192,10 @@ An unchanged permit retains that deadline across later reads and service restart
 A renewal with a changed expiry records a new bounded deadline when safety next reads it.
 The watchdog stops at the earlier of wall-clock expiry and the boot-clock deadline.
 A backward wall-clock change cannot extend the boot-clock deadline.
+Command admission reports disabled guest settings, a missing data mount, or an invalid permit separately.
+The receiver sends a refusal code with the diagnostic text.
+The permit refusal names the failed identity, expiry, or deadline check.
+An invalid or missing expiry field in a permit with valid identity fields gets a specific expiry refusal.
 
 Safety, permit renewal, and command admission share `/run/hana-aws/permit.lock` through `fcntl.flock`.
 Safety holds the lock from the permit read through the shutdown decision.
@@ -1317,6 +1322,20 @@ Permit renewals retain that generation.
 F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
 Only an adopted claim can request the queue's first launch authorization.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
+An exact guest observation can settle an accepted execution that ended without a compiler result.
+The observation must confirm termination and lease release, and the sender must have issued no source update.
+The sender uses the guest cause when it is available and keeps a specific sender rejection if the guest reports a pending result.
+For other confirmed departures, the sender attempts to release the claim without another fence observation.
+The sender uses the refusal code from a new image to report `HanaCommandAdmissionRefused`.
+For the old image, the sender recognizes only the exact reason `The data mount and a fresh permit are required`.
+The refusal proves the command did not start.
+The sender reports the refusal before claim cleanup.
+The controller checks whether the holder exited in every lifecycle state, including after a Spot interruption.
+An unresolved start still requires provider recovery.
+The next Hana evidence read can remove the detached target claim.
+The queue excludes Hana for the refused build and continues in the configured candidate order.
+For a different build, the queue needs provider evidence at or after the refusal report before it can assign the same scope.
+For a pinned build, `verify.sh` prints one line with the refusal cause and exits with status 2.
 An ended local holder cannot settle an unresolved Hana dispatch.
 A failed boot needs a terminal `ExecutionReport`; pending settlement retains capacity and the live retry deadline.
 The queue permits fallback only after settlement.
