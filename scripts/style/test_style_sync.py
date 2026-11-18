@@ -594,7 +594,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.assertEqual(self.recorded_wakes(), [
             ["--to", "session:fake-" + unit, "--from", "sample-style", "--text",
-             "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10"]
+             "ticket 3001 merged; refill.", "--timeout", "10"]
             for unit in ("names", "types")
         ])
         self.assertEqual(self.remaining_waiters(), [])
@@ -668,8 +668,8 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual((second.unit, second.since), (first.unit, first.since))
         self.assertNotEqual(second.token, first.token)
         self.assertEqual([call[5] for call in self.recorded_wakes()], [
-            "From the showrunner of sample-style: ticket 3002 merged; refill.",
-            "From the showrunner of sample-style: ticket 3001 merged; refill.",
+            "ticket 3002 merged; refill.",
+            "ticket 3001 merged; refill.",
         ])
 
     def test_failed_wake_keeps_only_that_waiter_and_an_already_merged_ticket_retries_it(self) -> None:
@@ -734,7 +734,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.merge_for_wake(), (0, f"style_ledger: wake {style_unit_id('names')}: no live director\n", ""))
         self.assertEqual(self.recorded_wakes(), [[
             "--to", "session:fake-types", "--from", "sample-style", "--text",
-            "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10",
+            "ticket 3001 merged; refill.", "--timeout", "10",
         ]])
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
 
@@ -1542,7 +1542,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual(rows[checkpoint][1:3], ("sent", "parent"))
         notices = self.handoff_notices()
         self.assertEqual(len(notices), 1)
-        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+        self.assertIn(f"hand-off {checkpoint}", notices[0])
         self.assertIn("session:fake-parent", notices[0])
 
     def test_resume_replays_same_parent_without_touching_the_row(self) -> None:
@@ -1630,7 +1630,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         notices = self.handoff_notices()
         self.assertEqual(len(notices), 1)
         self.assertIn("session:fake-parent", notices[0])
-        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+        self.assertIn(f"hand-off {checkpoint}", notices[0])
 
     def test_send_handoff_as_root_sends_nothing_and_leaves_the_row_pending(self) -> None:
         checkpoint = self.handoff_checkpoint()
@@ -1724,7 +1724,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
                 ledger.handoff_add(first)
         self.assertEqual(self.resume_handoffs()[0], 0)
         texts = [notice[notice.index("--text") + 1] for notice in self.handoff_notices()]
-        self.assertEqual(texts, [f"From the showrunner of sample-style: hand-off {checkpoint}" for checkpoint in (first, second)])
+        self.assertEqual(texts, [f"hand-off {checkpoint}" for checkpoint in (first, second)])
         self.assertEqual({row[1:3] for row in self.handoff_rows()}, {("sent", "parent")})
 
 

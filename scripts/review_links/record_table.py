@@ -451,24 +451,27 @@ function animateRow(table,item,showRow){
 function showHiddenActionResults(items){
  const status=content.querySelector('[data-hidden-action-status]');
  if(!status) return;
- let text='';
- if(latestActionFailure){
-  const {key,label,message}=latestActionFailure;
+ const hidden=key=>{
   const item=items.find(item=>item.dataset.key===key);
-  if(!item || item.hidden || item.querySelector('[data-detail]').hidden) text=label+': '+message;
- }
+  return !item || item.hidden || isLinkedOnly(item) || item.querySelector('[data-detail]').hidden;
+ };
+ const messages=[];
+ for(const [key,{hiddenMessage}] of actionNotices)
+  if(hiddenMessage && hidden(key)) messages.push(hiddenMessage);
+ if(latestActionFailure && hidden(latestActionFailure.key)) messages.push(latestActionFailure.message);
+ const text=messages.join(' ');
  if(status.textContent!==text) status.textContent=text;
  status.hidden=!text;
 }
-/** @param {{kind:'success' | 'failure', message:string}} result */
-function showActionResult(item,submission,label,{kind,message}){
+/** @param {{kind:'success' | 'failure', message:string, hiddenMessage?:string}} result */
+function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  const key=item.dataset.key;
- actionNotices.set(key,message);
- if(kind==='failure' && submission===latestSubmission) latestActionFailure={key,label,message};
+ actionNotices.set(key,{message,hiddenMessage});
+ if(kind==='failure' && submission===latestSubmission) latestActionFailure={key,message:label+': '+message};
  const status=item.querySelector('[data-send-status]');
  if(status) status.textContent=message;
  apply(false,{animate:true});
- const restored=mounted.get(item.dataset.key);
+ const restored=mounted.get(key);
  if(kind==='failure' && restored && restored!==item && !matchMedia('(prefers-reduced-motion: reduce)').matches){
   stopMotion(item);
   animateRow(content.querySelector('table'),restored,true);
@@ -734,7 +737,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
   return submission;
  },
  showActionResult,
- actionNotice(item){return actionNotices.get(item.dataset.key) ?? '';},
+ actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
  applyAction(){apply(false,{animate:true});},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
