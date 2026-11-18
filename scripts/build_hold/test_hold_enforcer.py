@@ -307,6 +307,24 @@ class HoldEnforcerTests(unittest.TestCase):
             step_record.AnyTarget(("mac", "natedev"), ("mac",)), state, "2026-10-28T12:00:00+00:00",
         ))
 
+    def stopped_worker_lineages(self) -> tuple[tuple[str, dict[str, str], dict[str, str], tuple[str, ...]], ...]:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        director = fixture_member("showrunner", name="stop-director")
+        run = self.root / "director-run"
+        _ = staff.set_run(director.id, staff.OpenRun(run))
+        owner = director.current_session
+        unit = {"UNIT_SESSION_DIR": str(run)}
+        return (
+            ("Codex command", {**unit, "CODEX_THREAD_ID": "t1", "CLAUDE_CODE_SESSION_ID": owner},
+             {"CLAUDE_CODE_SESSION_ID": "farther"}, (owner, "codex:t1")),
+            ("Codex ancestor", unit, {"CODEX_THREAD_ID": "t1", "CLAUDE_CODE_SESSION_ID": "farther"},
+             (owner, "codex:t1")),
+            ("Claude ancestor", unit, {"CLAUDE_CODE_SESSION_ID": "claude-worker"}, (owner, "claude-worker")),
+            ("agent is owner", {**unit, "CLAUDE_CODE_SESSION_ID": owner}, {"CODEX_THREAD_ID": "farther"}, (owner,)),
+            ("no agent", unit, {}, (owner,)),
+            ("lone Codex", {"CODEX_THREAD_ID": "t1"}, {}, ("codex:t1",)),
+        )
+
     def test_drain_command_keeps_working_runs_and_waits_without_stopping(self) -> None:
         from scripts.build_targets import build_targets
         from scripts.build_hold.owning_session import NoOwningSession
@@ -809,6 +827,39 @@ class HoldEnforcerTests(unittest.TestCase):
                     saved = cast(dict[str, object], json.loads(record.read_text()))
                     self.assertNotIn("stop_reason", saved)
 
+        for index, (label, environment, ancestor_environment, recipients) in enumerate(self.stopped_worker_lineages()):
+            with self.subTest(agent=label):
+                started = 12_000 + index * 10
+                cycle = build_hold.read_cycle()
+                assert not isinstance(cycle, build_hold.NoCycle)
+                cycle["recipients"], cycle["entries"] = {}, []
+                build_hold.save_cycle(cycle)
+                _ = self.process(40, "worker", start=10_000, environment=ancestor_environment)
+                _ = self.process(10, "bash", parent=40, start=started,
+                                 argv=("bash", "verify.sh", "check"), environment=environment)
+                table = self.table()
+                run = hold_enforcer.WaitingRun(table[10], build_hold.audit_owner(
+                    table[10], build_hold.audit_ancestors(table[10], table)))
+                self.assertEqual(run.owner, OwningSession("t1" if label == "lone Codex" else recipients[0]))
+                worker_signals: list[tuple[int, int]] = []
+                register = build_hold.register_wait
+                with mock.patch.object(build_hold, "register_wait", wraps=register) as registration:
+                    def signal_worker(pid: int, signum: int) -> None:
+                        saved = build_hold.read_cycle()
+                        assert not isinstance(saved, build_hold.NoCycle)
+                        self.assertCountEqual(saved["recipients"], recipients)
+                        self.assertEqual([call.args[0] for call in registration.call_args_list], list(recipients))
+                        worker_signals.append((pid, signum))
+
+                    result = hold_enforcer.stop_waiting_run(
+                        run, holder, table, self.proc, signal_process=signal_worker,
+                        signal_group=lambda pid, signum: self.fail(f"unexpected group signal {pid} {signum}"),
+                    )
+                self.assertIsInstance(result, hold_enforcer.StoppedRun)
+                self.assertEqual(worker_signals, [(10, signal.SIGTERM)])
+                if label == "lone Codex":
+                    self.assertEqual(self.rows()[-1]["session"], "t1")
+
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
         table = self.table()
@@ -1046,6 +1097,36 @@ class HoldEnforcerTests(unittest.TestCase):
         stopper.kill_survivors(self.table(), build_hold.natedev_holds(self.holders).in_force, 999, self.claimed)
         self.assertEqual(sent[-1], (30, signal.SIGKILL))
         self.assertEqual(len(sent), 4)
+
+        for index, (label, environment, ancestor_environment, recipients) in enumerate(self.stopped_worker_lineages()):
+            with self.subTest(agent=label):
+                started = 12_000 + index * 10
+                cycle = build_hold.read_cycle()
+                assert not isinstance(cycle, build_hold.NoCycle)
+                cycle["recipients"], cycle["entries"] = {}, []
+                build_hold.save_cycle(cycle)
+                _ = self.process(40, "worker", start=10_000, environment=ancestor_environment)
+                _ = self.process(30, "cargo", parent=40, start=started, argv=("cargo", "check"), environment=environment)
+                _ = self.process(20, "rustc", parent=30, start=started + 1)
+                _ = self.process(10, "linker", parent=20, start=started + 2)
+                decision = next(item for item in self.decisions() if item.process.identity.pid == 30)
+                assert isinstance(decision, hold_enforcer.WouldStopBuild)
+                self.assertEqual(decision.owner, OwningSession("t1" if label == "lone Codex" else recipients[0]))
+                signals: list[tuple[int, int]] = []
+                register = build_hold.register_wait
+                with mock.patch.object(build_hold, "register_wait", wraps=register) as registration:
+                    def signal_worker(pid: int, signum: int) -> None:
+                        saved = build_hold.read_cycle()
+                        assert not isinstance(saved, build_hold.NoCycle)
+                        self.assertCountEqual(saved["recipients"], recipients)
+                        self.assertEqual([call.args[0] for call in registration.call_args_list], list(recipients))
+                        signals.append((pid, signum))
+
+                    stopper = hold_enforcer.StopBuildsAndTests(self.proc, signal_process=signal_worker, register=registration)
+                    stopper.stop(decision, self.table(), build_hold.natedev_holds(self.holders).in_force, 999, self.claimed)
+                self.assertEqual(signals, [(30, signal.SIGTERM), (20, signal.SIGTERM), (10, signal.SIGTERM)])
+                if label == "lone Codex":
+                    self.assertEqual(self.rows()[-1]["session"], "t1")
 
     def test_codex_mac_idle_cargo_and_claude_unittest_and_reparented_worker_test_are_stopped(self) -> None:
         _ = self.process(10, "codex", start=100, environment={"CODEX_THREAD_ID": "codex-worker"})
