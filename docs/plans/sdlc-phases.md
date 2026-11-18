@@ -1288,6 +1288,29 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** A review-trial row records its full checkpoint hash, and `merge_checkpoint.py` passes `--checkpoint`. Two rows name one phase only when unit, plan, phase and checkpoint match; a row with no checkpoint matches by start time. `--checkpoint` stays optional for the landing merge; a follow-up makes it required. The lost postmaster 45bef9a09 and admin-console reviewask 6aff8187c rows are in the natedev ledger. On main b8e30ad51 (hash 767ac1df9).
 
+### Phase 80 — Review-trial rows require a checkpoint  · status: todo
+**Depends on:** phase 79
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18), the phase 79 follow-up. Phase 79 kept `--checkpoint` optional and a start-time match for rows with no checkpoint, only for the landing merge. Main now passes `--checkpoint` on every merge, so both go. No old-shape reader stays in main code (user rule 11-05).
+
+**Spec:**
+1. `review_regime.py add` requires `--checkpoint`. A call without it fails with a usage error and writes nothing.
+2. Two rows name the same phase only when unit, plan, phase and checkpoint match. Remove the start-time match.
+3. A ledger row written before phase 79 has no checkpoint, and none is known for it. It stays as a recorded history row: reports and watch read it, and no new row ever matches it.
+4. Update the as-built docs that describe the optional flag and the start-time match.
+5. Change rows in the existing review_regime and merge_checkpoint tests; add no new module.
+
+**Files:** `scripts/production/review_regime.py`, `scripts/production/merge_checkpoint.py`, their tests, `docs/as-built/review-regime-trial.md`, `docs/as-built/showrunner-automation.md`.
+
+**Workers:** 1 writer.
+
+**Order:** on main 51d3608ad. No other open phase touches these files.
+
+**Acceptance gate:**
+1. A test fails on main for a missing `--checkpoint` and for a start-time match. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
