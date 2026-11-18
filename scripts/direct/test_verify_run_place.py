@@ -190,7 +190,7 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             launcher = script.with_name("detach.py")
             started = fixture.root / "detach-started"
             _ = launcher.write_text(f"from pathlib import Path\n_ = Path({str(started)!r}).write_text('started')\n")
-            process = self.start(script, "build", "style_reader", "--release", "--attached",
+            process = self.start(script, "build", "sample", "--release", "--attached",
                                  CODEX_THREAD_ID="fixture", VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
             probe = self.probe(process)
             self.assertEqual(probe["pid"], process.pid)

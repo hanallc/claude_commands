@@ -1,5 +1,7 @@
 # Style refill in Rust
 
+Replaced by [docs/plans/cargo-style.md](cargo-style.md). The reader moved to `crates/cargo-style` in cargo-liner in M1.
+
 Status: 2026-11-16. Phases 1–6 are complete. Phases 7–12 continue as phases S3–S8 of docs/plans/cargo-style.md, after its move and API phases.
 
 The showrunner selected Rust for selection. SQLite remains the ledger. The user controls the switch to Rust.
@@ -19,7 +21,7 @@ Later, the user: "a refill shouldn't even take minutes - you have the wrong desi
 
 ## Result
 
-Move the complete selection calculation into the existing `style_reader` package.
+Move the complete selection calculation into the `cargo-style` package.
 Keep Git facts inside Rust throughout selection.
 Read authoritative SQLite rows in batches, then calculate with indexed Rust values.
 Save compact selection partitions in a separate SQLite cache.
@@ -160,7 +162,7 @@ The new selector can avoid old derived pages without shrinking the ledger.
 
 ### Calculation ownership
 
-Extend `rust/style_reader` with selection modules and a versioned selection request.
+Extend `crates/cargo-style` in cargo-liner with selection modules and a versioned selection request.
 Keep the current fact request compatible during overlap.
 Reuse its token semantics, Unicode tables, Git reader, and error conventions.
 Do not replace the token reader with `syn` during this port.
@@ -1034,11 +1036,11 @@ Use this scope for heavy natedev probes:
 systemd-run --user --scope -q -p MemoryMax=2G -p MemorySwapMax=0 <probe-command>
 ```
 
-Run Rust checks and tests through the required wrapper:
+Run Rust checks and tests from the cargo-liner checkout:
 
 ```sh
-bash ~/.claude/scripts/direct/verify.sh check style_reader
-bash ~/.claude/scripts/direct/verify.sh test style_reader
+bash ~/.claude/scripts/direct/verify.sh check cargo-style
+bash ~/.claude/scripts/direct/verify.sh test cargo-style
 ```
 
 Do not invoke Cargo directly.
