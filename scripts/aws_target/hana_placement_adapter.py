@@ -289,7 +289,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     target = admission_records.effective_target(key.destination.target, key.settings)
     if not isinstance(target, target_config.SshTarget):
         return placement.HostEvidenceUnavailable(key, now, 'The SSH target is no longer configured')
-    configuration = conf.read(target.settings)
+    configuration = conf.read(target.settings, load=conf.read_bytes)
     transport = target_config.read_execution_transport(target, configuration=configuration)
     if not isinstance(transport, HanaControlTransport):
         return placement.HostEvidenceUnavailable(key, now, 'The target does not use Hana control')
@@ -374,7 +374,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
         eligibility = placement.TemporaryExclusion('starting')
     elif snapshot.state == box.Lifecycle.IDLE_STOPPED:
         preview = hana_spend.preview_placement_start(ledger.CostLedger(controller.directory),
-            controller.settings_path, transport.settings, controller.path)
+            controller.settings_path, configuration, controller.path)
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,

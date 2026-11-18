@@ -455,7 +455,6 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
     from scripts.lib import conf
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
-    account_paths: set[Path] = set()
     if isinstance(settings, placement.ExplicitProviderSettings):
         paths.add(settings.path)
     for target in targets:
@@ -470,18 +469,17 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
             except conf.Unusable:
                 continue
             if isinstance(transport, hana_placement.HanaControlTransport):
-                account_paths.add(conf.path("aws_target"))
+                paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
-    for path in sorted(paths | account_paths):
+    for path in sorted(paths):
         digest.update(str(path).encode())
         try:
             contents = read_bytes(path)
         except FileNotFoundError:
             contents = b"missing"
         except OSError as error:
-            if path not in account_paths:
-                raise
-            # The Hana spending preview reports the account read error.
+            # The provider reads and reports its own settings error.
+            digest.update(b"\0unreadable\0")
             contents = type(error).__name__.encode()
         digest.update(contents)
     return digest.hexdigest()

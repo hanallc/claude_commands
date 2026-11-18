@@ -69,6 +69,10 @@ class ConfigurationStamp:
     modified_ns: int
     changed_ns: int
 
+    @classmethod
+    def from_stat(cls, info: os.stat_result) -> ConfigurationStamp:
+        return cls(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+
 
 class UnstampedConfiguration(Enum):
     UNSTAMPED = "no file stamp"
@@ -289,15 +293,15 @@ class ConfigurationBytes:
 
 
 def _file_stamp(descriptor: int) -> ConfigurationStamp:
-    info = os.fstat(descriptor)
-    return ConfigurationStamp(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+    return ConfigurationStamp.from_stat(os.fstat(descriptor))
 
 
 def read_bytes(source: Path) -> ConfigurationBytes:
     """Read bytes for a pass that also needs a configuration digest."""
     with source.open("rb") as stream:
-        data = stream.read()
-        return ConfigurationBytes(data, _file_stamp(stream.fileno()))
+        # An edit during the read must invalidate the stamp.
+        stamp = _file_stamp(stream.fileno())
+        return ConfigurationBytes(stream.read(), stamp)
 
 
 def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None = None) -> ConfigRead:

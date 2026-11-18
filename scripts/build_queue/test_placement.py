@@ -1860,6 +1860,35 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(mac_test.slot_capacity(paths, RepositoryScope("hana")), 2)
             self.assertEqual(warnings.getvalue().count("slots.hana='broken'"), 1)
 
+    def test_unreadable_mac_settings_allow_local_placement(self) -> None:
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()):
+            request = placement_request(fixture)
+            mac, = request.constraints.candidates
+            local = local_candidate(fixture)
+            request = replace(request, prerequisite=placement.TokenRequired(), constraints=replace(
+                request.constraints, candidates=(mac, local)))
+            mac_settings = fixture.root / "mac_test.conf"
+            read_bytes = conf.read_bytes
+
+            def read_settings(path: Path) -> conf.ConfigurationBytes:
+                if path == mac_settings:
+                    raise PermissionError("The Mac settings are unreadable")
+                return read_bytes(path)
+
+            with mock.patch.object(conf, "read_bytes", side_effect=read_settings):
+                reply, = fixture.connect(request).replies()
+                assert isinstance(reply, wire.PlacementWait), reply
+                eligibility = {row.destination: row.eligibility for row in reply.eligibility}
+                self.assertEqual(eligibility[local.destination], ALLOWED_HOST)
+                mac_eligibility = eligibility[mac.destination]
+                assert isinstance(mac_eligibility, placement.EvidenceNeeded), mac_eligibility
+                self.assertIn("The Mac settings are unreadable", mac_eligibility.reason)
+
+                _ = fixture.connect(wire.PrerequisiteReport(
+                    "token-checked", request.episode, request.owner, placement.TokenHeld())).replies()
+                granted, = fixture.connect(request).replies()
+                self.assertIsInstance(granted, wire.LocalPlacementGranted)
+
     def test_unreadable_aws_settings_confine_the_refusal_to_hana(self) -> None:
         with PlacementFixture() as fixture:
             _settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")
