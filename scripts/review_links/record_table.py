@@ -245,7 +245,7 @@ const rowMotion=new Map(),actionNotices=new Map();
 let latestSubmission=0,latestActionFailure=null;
 const boundRoots=new WeakSet();
 const collator=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
-let windowItems=[],prefix=[0],pendingFrame=0,revealKey='',windowGap=null,initial=false;
+let windowItems=[],prefix=[0],pendingFrame=0,revealKey='',windowGap=null;
 const measured=new Map(),mounted=new Map();
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
 function scheduleWindow(){if(options.mount && !pendingFrame) pendingFrame=requestAnimationFrame(()=>{pendingFrame=0;drawWindow();});}
@@ -262,7 +262,7 @@ function locate(y){
  return low;
 }
 function drawWindow(){
- if(!options.mount || initial) return;
+ if(!options.mount) return;
  const table=content.querySelector('table'),before=table.querySelector('[data-window-before]'),after=table.querySelector('[data-window-after]');
  for(const [key,node] of mounted){const height=node.getBoundingClientRect().height;if(height>0) measured.set(key,height);}
  offsets();
@@ -318,14 +318,6 @@ function mount(data){
  node.querySelector('.list-row').classList.toggle('open',expanded);
  return node;
 }
-function openInitial(data){
- const filters={owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys};
- if(keys.size || linkedItem || !opened.has(data.key) || !options.visible(data,filters)) return false;
- initial=true;
- content.querySelector('[data-window-before]').after(mount(data));
- filterSelection('show').set(show);
- return true;
-}
 if(options.mount){
  addEventListener('scroll',scheduleWindow,{passive:true});
  addEventListener('resize',()=>{measured.clear();scheduleWindow();});
@@ -357,13 +349,17 @@ function filterSelection(name){
   }
  };
 }
-function place(){
- placeHash=location.hash;
+function placeParams(){
  const params=new URLSearchParams(location.search);
  const fragment=new URLSearchParams(location.hash.slice(1));
  for(const key of new Set(fragment.keys())) params.delete(key);
  for(const [key,value] of fragment) params.append(key,value);
  options.place?.(params);
+ return params;
+}
+function place(){return readPlace(placeParams());}
+function readPlace(params,followingItemLink=false){
+ placeHash=location.hash;
  keys=new Set(params.getAll('key'));
  owner=params.get('owner') || params.get('showrunner') || '';show=params.get('show') || 'open';query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
@@ -372,13 +368,13 @@ function place(){
  for(const name of filterNames) filters[name]=params.get(name) || '';
  if(!options.shows.includes(show)) show='open';
  if(!columns.includes(sort)) sort='';
- const item=params.get('item');if(item){
+ const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';query='';type='';for(const name of filterNames) filters[name]='';}
   if(options.single) opened.clear();opened.add(item);revealKey=item;
  }
- const saved=history.state?.recordTable;
+ const saved=followingItemLink ? null : history.state?.recordTable;
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
  if(saved && (!options.mount || saved.top!==undefined)){
@@ -388,6 +384,20 @@ function place(){
  owner=options.resolveOwner?.(owner) ?? owner;
  if(sharedWords()) words().value=query;
  return saved?.top;
+}
+function followItemLink({inheritFilters=false,beforeJump}={}){
+ const params=placeParams();
+ const jumpKey=params.get('jump'),key=jumpKey || params.get('item');
+ if(!key) return false;
+ if(inheritFilters){
+  for(const [name,value] of Object.entries({owner,show,q:query,sort,dir:direction,type,'source-owner':sourceOwner,...filters}))
+   if(!params.has(name)) params.set(name,value);
+  if(!params.has('key')) keys.forEach(key=>params.append('key',key));
+ }
+ beforeJump?.(key);
+ readPlace(params,true);
+ jump(key,{pushPlace:false,focusTarget:Boolean(jumpKey),keepMatchingFilters:true});
+ return true;
 }
 function compare(a,b){
  if(Array.isArray(a)) return a[0]-b[0] || compare(a[1],b[1]);
@@ -490,7 +500,6 @@ function apply(write=true,layout={}){
  applyRows(write,layout);
 }
 function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false,top}={}){
- initial=false;
  const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
  if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
  const rows=options.entries ? options.entries().map(dataset=>({dataset})) : [...content.querySelectorAll('[data-list-item]')];
@@ -604,7 +613,7 @@ function saveDeparturePlace(){
   writePlace(false,scrollY);
  }else history.replaceState({recordTable:{opened:[...opened],linkedItem,top:scrollY}},'');
 }
-function jump(key,{pushPlace=true}={}){
+function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}){
  if(pushPlace) saveDeparturePlace();
  const target=options.entries ? options.entries().map(dataset=>({dataset})).find(item=>item.dataset.key===key) :
   [...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===key);
@@ -615,7 +624,9 @@ function jump(key,{pushPlace=true}={}){
   opened.add(key);
   if(!matches(target,currentSelection())){
    const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
-   owner='';sourceOwner='';show='all';
+   if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
+   if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
+   if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
    if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
@@ -631,7 +642,7 @@ function jump(key,{pushPlace=true}={}){
   return;
  }
  const row=mountedTarget.querySelector('.list-row');
- if(mountedTarget.hidden) return;
+ if(mountedTarget.hidden || !focusTarget) return;
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
  const banner=document.querySelector('[data-page-status]');
@@ -691,7 +702,7 @@ function bind(){
   type=button.dataset.typeChip;changePlace();
  }));
 }
-return {place,apply,bind,opened,restorePlace,drawWindow,openInitial,jump,saveDeparturePlace,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
  setShownExpanded(expanded){
   const currentQuery=words().value;
   if(query!==currentQuery){

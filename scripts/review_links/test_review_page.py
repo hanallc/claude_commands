@@ -3041,7 +3041,33 @@ window.fetch=(url,options={})=>{
  window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
   ? Promise.resolve(Response.json({version:document.querySelector('[data-review]').dataset.version,facts:pageRefreshFacts()}))
   : read(url,options);
+ const review=document.querySelector('[data-review]');
+ const selectShow=value=>document.querySelector('[data-show-chip="'+value+'"]').click();
+ const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip;
+ const follow=async params=>{
+  const link=document.createElement('a');
+  link.href='#'+new URLSearchParams({item:'page-owner/C1',...params});
+  link.textContent='Open Change C1';
+  document.body.append(link);
+  const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  link.click();
+  await navigated;
+  link.remove();
+  return change('page-owner/C1');
+ };
+ const expanded=(row,state)=>row?.dataset.state===state && !row.hidden && !row.querySelector('[data-detail]').hidden;
  try{
+  const owner=change('page-owner/C1').dataset.owner;
+  document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
+  selectShow('Done');
+  check(expanded(await follow({show:'Done'}),'Open') && review.dataset.show==='all' && selectedOwner()===owner,
+   'F003: A link with Done selected shows the Open Change C1.');
+  selectShow('open');
+  if(selectedOwner()!==owner) document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
+  check(expanded(await follow({}),'Open') && review.dataset.show==='open' && selectedOwner()===owner,
+   'F003: A bare link preserves the matching Show and Owner filters.');
+  change('page-owner/C1').querySelector('.list-toggle').click();
+
   for(const key of ['page-owner/C2','page-owner/C1']){
    const row=change(key);
    check(row && !row.hidden,key+' is visible before the save.');
@@ -3061,25 +3087,13 @@ window.fetch=(url,options={})=>{
    check(row.hidden,'The save hides '+key+'.');
   }
 
-  const follow=async show=>{
-   const link=document.createElement('a');
-   link.href='#'+new URLSearchParams({show,item:'page-owner/C1'});
-   link.textContent='Open Change C1';
-   document.body.append(link);
-   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-   link.click();
-   await navigated;
-   link.remove();
-   return change('page-owner/C1');
-  };
-  const openDone=row=>row?.dataset.state==='Done' && !row.hidden && !row.querySelector('[data-detail]').hidden;
-  const linked=await follow('all');
-  check(openDone(linked),'The same-tab link shows the closed Change C1.');
+  const linked=await follow({show:'all'});
+  check(expanded(linked,'Done'),'The same-tab link shows the closed Change C1.');
   check(linked?.querySelector('[data-review-body]'),'The reopened card keeps its cached details.');
   check(!linked?.querySelector('[data-review-form]'),'The reopened card hides stale actions until the snapshot arrives.');
-  document.querySelector('[data-show-chip="open"]').click();
-  check(document.querySelector('[data-review]').dataset.show==='open','Open is selected before the link.');
-  check(openDone(await follow('open')) && document.querySelector('[data-review]').dataset.show==='all',
+  selectShow('open');
+  check(review.dataset.show==='open','Open is selected before the link.');
+  check(expanded(await follow({show:'open'}),'Done') && review.dataset.show==='all',
    'A link from Open selects All and shows the closed Change C1.');
   check(!change('page-owner/C2'),'The unlinked Change C2 stays hidden.');
  }catch(error){failures.push(String(error));}
@@ -3087,7 +3101,23 @@ window.fetch=(url,options={})=>{
 })();</script>"""
         markup = browser_markup(self.root, show='all')
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+        with self.subTest(navigation='same tab'):
+            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+        fixture = self.fixture
+        _ = change_review.record_verdict(fixture.review_list, 'C1', 'works', datetime.now(user_zone()).date(),
+                                         fixture.production)
+        markup = browser_markup(self.root)
+        initial_link = '<script>history.replaceState(null, "", "#show=open&item=page-owner%2FC1");</script>'
+        initial_probe = r"""<script>
+const review=document.querySelector('[data-review]'),row=review.querySelector('[data-key="page-owner/C1"]');
+const opened=row?.dataset.state==='Done' && !row.hidden && !row.querySelector('[data-detail]').hidden;
+void fetch('/results',{method:'POST',body:JSON.stringify(opened && review.dataset.show==='all' ? [] :
+ ['F004: A fresh link with Open selected shows the Done Change C1.'])});
+</script>"""
+        page = markup.replace('<head>', '<head>'+initial_link, 1).replace('</body>', initial_probe+'</body>', 1)
+        with self.subTest(navigation='fresh load'):
+            self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
@@ -3225,9 +3255,10 @@ window.fetch=async(_url,options={})=>{
   const reloaded=document.createElement('iframe');reloaded.src='/console/review.html#'+new URLSearchParams({item:target.dataset.key});
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
-  check(!linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
-  check(showValue(reloaded.contentDocument)==='all' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
-    reloaded.contentDocument.getElementById('list-search').value==='','a Review item link clears filters');
+  check(linkedTarget.dataset.state==='Open' && !linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,
+   'The fixture still shows the Change as Open on a fresh load.');
+  check(showValue(reloaded.contentDocument)==='open' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
+    reloaded.contentDocument.getElementById('list-search').value==='','A bare link keeps the default filters for an Open Change.');
   reloaded.remove();
   const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'open',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();

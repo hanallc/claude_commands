@@ -826,8 +826,8 @@ let selectedShow=content.dataset.show;
 const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
 const kinds=['question','change','investigation','proposal','efficiency'],states=['Open','Waiting','Done','Validating'];
-let initialIndex=JSON.parse(content.querySelector('[data-review-index]').textContent);
-let index=new Map(),focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
+let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
+let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
@@ -837,15 +837,7 @@ function indexEntry(payload,row,at){
 function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
-function allEntries(){
- if(initialIndex){
-  const initial=index;
-  index=readIndex(initialIndex);
-  for(const [key,entry] of initial) index.set(key,entry);
-  initialIndex=null;
- }
- return [...index.values()];
-}
+function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 function summary(entry){
  const node=document.createElement('tbody'),panel='review-detail-'+encodeURIComponent(entry.key);
@@ -1159,7 +1151,7 @@ async function refresh(_supersede=false,current=()=>true){
  if(pendingSaves.size || !current()) return;
  const top=scrollY;focusAfterLoad=rememberFocus();
  content.querySelectorAll('[data-review-form]').forEach(rememberForm);
- initialIndex=null;index=readIndex(payload.index);content.dataset.version=payload.version;
+ index=readIndex(payload.index);content.dataset.version=payload.version;
  if(payload.presentation){
   content.dataset.zone=payload.presentation.zone;
   content.dataset.later=JSON.stringify(payload.presentation.later);
@@ -1206,28 +1198,17 @@ async function refresh(_supersede=false,current=()=>true){
  if(!revealed) scrollTo({top,behavior:'instant'});
  return {...payload.facts,answeredAt:version.facts.answeredAt};
 }
-view.place();bind();
+bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
-const entryJump=new URLSearchParams(location.hash.slice(1)).get('jump');
-const start=firstRequest ? initialIndex.r.findIndex(row=>row[0]===firstRequest.key) : -1;
-if(entryJump) view.jump(entryJump,{pushPlace:false});
-else if(start>=0){
- const entry=indexEntry(initialIndex,initialIndex.r[start],start);
- index.set(entry.key,entry);
- if(view.openInitial(entry)){
-  loadBodies();
-  requestAnimationFrame(()=>requestAnimationFrame(()=>{
-   if(initialIndex){view.place();view.apply();}
-  }));
- }else view.apply();
-}else view.apply();
+function followItemLink(inheritFilters){
+ return view.followItemLink({inheritFilters,beforeJump:key=>{
+  if(!saved.get(key)?.closes && !saved.get(key)?.question) saved.delete(key);
+ }});
+}
+if(!followItemLink(false)){view.place();view.apply();}
 function restorePlace(event){
- const fragment=new URLSearchParams(location.hash.slice(1)),jump=fragment.get('jump'),item=jump || fragment.get('item');
- if(item && !saved.get(item)?.closes && !saved.get(item)?.question) saved.delete(item);
- const entry=index.get(item);
- const closedLink=event.type==='hashchange' && !history.state?.recordTable && entry?.type==='change' && entry.state==='Done';
- if(jump || closedLink){view.place();view.jump(item,{pushPlace:false});}
- else view.restorePlace(event);
+ if(event.type==='hashchange' && !history.state?.recordTable && followItemLink(true)) return;
+ view.restorePlace(event);
 }
 addEventListener('popstate',restorePlace);
 addEventListener('hashchange',restorePlace);
