@@ -84,8 +84,17 @@ class AwsHanaProvider:
         action = PROVIDER_OPERATIONS[operation]
         try:
             return self.api.call(operation, *arguments, service='s3api' if action.startswith('s3:') else 'ec2')
-        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
-            raise ProviderPending('Hana provider call failed: ' + action) from None
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            message = 'Hana provider call failed: ' + action
+            if isinstance(error, AwsUnavailable):
+                code = re.match(
+                    r'\s*(?:aws: \[ERROR\]: )?An error occurred '
+                    + r'\(([A-Z][a-z][A-Za-z0-9]*(?:\.[A-Z][a-z][A-Za-z0-9]*)*)\)'
+                    + r' when calling the [A-Z][A-Za-z0-9]* operation'
+                    + r'(?: \(reached max retries: [0-9]+\))?(?::|\Z)', str(error))
+                if code:
+                    message += f' ({code[1]})'
+            raise ProviderPending(message) from None
 
     def _object(self, key: str, document: dict[str, object] | None = None) -> dict[str, object]:
         if not self.bucket:
