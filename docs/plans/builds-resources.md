@@ -2905,3 +2905,11 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `edc419d50`; row `957f7dd04` on main `f6c11ee64`.
 
 **Files:** `scripts/aws_target/run_cost.py`, `scripts/buildlog/test_aws_report.py`.
+
+### Phase 158 — The Phase 151 cloud slot groups merge with main  · status: todo
+
+**Cause:** the Phase 151 row `49dc19798` conflicts with main `f6c11ee64` in `aws_trial.py`, `cloud_gate.py`, `test_cloud_gate.py` and `admission_service.py`. Main now records the gate job in the cloud reservation request and the admission record; Phase 151 adds the cloud slot group.
+
+**Fix:** a new row on main that keeps both changes. Same behavior as Phase 151.
+
+**Proof:** the cloud gate, trial, admission, memory feed and queue view suites pass on the new row.
