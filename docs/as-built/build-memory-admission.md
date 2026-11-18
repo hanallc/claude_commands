@@ -27,6 +27,48 @@ It refuses a nested verify step while the same reservation and holder (pid and s
 The memory and cargo-token entry points use the same check before waiting.
 Markers for other queues, dead holders, reused pids, and released reservations do not block a step.
 
+### Installed writers and private test state
+
+Only the installed scripts under `~/.claude/scripts` may change shared build state.
+Checkout scripts may change private test directories.
+`override_guard.shared_state_access()` checks the actual paths, including paths reached through symbolic links.
+`SharedStateWriteRefused` stops an imported mutation before it writes shared state.
+The CLI prints the refusal and returns status 2.
+The installed scripts retain their environment override refusal.
+
+`AdmissionServer` validates its state directory before restoration.
+`ServiceStateWrites.register()` checks saved paths during restoration and new paths when a reservation enters state.
+These checks include maximum, wave, history, lifecycle, and sidecar paths.
+Later requests and passes reuse this validation.
+`StateIntents` uses this same boundary.
+`export_priority()` checks its directory and saved reservation paths separately.
+Cancellation recovery retains its saved time and queue identity.
+The client still obtains its initial estimate through `step_estimate()`.
+The estimate cache has no writer.
+
+`release_lock()` validates both hold directories before it creates the lock.
+It yields `ReleaseLockHeld`, bound to those directories and the open lock.
+Receipt migration and damaged record recovery require this capability.
+The helpers do not acquire another lock.
+`cycle_path()` and `read_cycle()` return `NoCycle` when no current cycle exists.
+Hold status reads records without a lock or a mutation capability.
+The hold stop guards the real process root and hold, release, and enforcer directories before any signal or record write.
+The stop still targets the command group and preserves supervisor result delivery.
+
+`override_guard.helper_root()` and `build_helper_root()` select the helpers for Python and shell callers.
+A caller with any `OVERRIDE_VARIABLES` name set uses the helpers beside its own file.
+An empty override value also selects those helpers.
+Other callers use `$HOME/.claude/scripts`.
+This rule covers admission, hold, target, release wait, detached run, recipient registration, and unit retirement helpers.
+Test fixtures create no helper links in the real home.
+`merge_gate.py` already runs from the installed copy; its hold reader remains unchanged.
+
+Service waiters retain `repository_name` separately from `step`.
+Reservations retain `repo` separately from `step`.
+Queue queries use these recorded fields without a repository prefix parser or a required live `.waiting` file.
+This rule changes no Builds page layout.
+The guard obtains each shared root from its owner's default.
+
 The admission service keeps `/proc/vmstat` `pswpin` samples in memory.
 `agent_swap_window_seconds=600` sets the sample window.
 The window total is the newest page count minus the oldest page count inside the window, multiplied by the page size.
@@ -163,6 +205,11 @@ An empty remote observation cannot establish that condition.
 A settled prelaunch refusal permits retry only after fresh provider evidence confirms that the exact claim has departed.
 The service retains terminal reports while cached evidence still contains the claim.
 Later passes reevaluate those reports after provider evidence refreshes.
+An exact settled Hana journal can confirm a prelaunch refusal with no command start.
+The first pass after service replacement can use this journal to close a saved refusal.
+The step can then use another eligible target in the same episode.
+A pending Hana refusal with unused permission returns the same assignment so the adapter can finish settlement.
+A repeated request for an assignment with consumed permission returns a wait.
 The saved terminal report preserves the outcome, dispatch settlement, and original report time across restart.
 Execution observations remain reconstructed evidence.
 The retry deadline uses the original report time.
@@ -1305,7 +1352,12 @@ Each stopped root writes a permanent `hold_build` row through the shared audit w
 Schema 21 adds `action=audit|stopped`; readers treat old rows as audit rows.
 The row carries the root's `call_id` from `BUILDLOG_CALL_ID`, or an empty value.
 Verify can thus find a stop after the hold ends.
-The owning session registers for one release notice.
+Both stop paths register the owning session before the first signal.
+They also register the nearest command agent when its recipient key differs from the owner's session id.
+`run_agent(process, ancestors)` returns `RunAgent(session_id)` or `NoRunAgent`.
+It checks the command first, then each ancestor in order.
+At each process, `CODEX_THREAD_ID` gives the key `codex:<thread>` before `CLAUDE_CODE_SESSION_ID` gives a Claude session key.
+The cycle keeps both recipients without adding a field.
 The enforcer does not signal `verify.sh`, `targeted_test.py`, or `merge_gate.py` without a call id.
 Each waits at its own hold gate.
 With a call id, the record decides.
@@ -1400,7 +1452,21 @@ These fields no longer control a build.
 
 **Release** (`release_cycle`). Under `release.lock`, `release_hold` first removes the holder file and queues the `ended` event. Only then does `release_cycle` record the holder's `released_at`. With another holder file present it prints `released; still held by <holder> (for ..., release eta ...)` and sends no notice. After the last file is gone it records `release_started_at` and sends notices. A stopped release leaves either a present file that still holds, or no file and a released hold; cycle fields grant nothing. All `wait-local` calls can then return and enter their memory gates. No waiter acknowledgement or turn can delay release. The memory gate orders the builds and starts each only when memory is available.
 
-After the file is gone, `notify_release` sends one notice to each recorded recipient: start builds and BRP launches now; the memory gate orders them. No answer is needed. A notice's outcome is saved after its sender returns; a stopped send stays pending and is retried, so a session can receive a notice twice. `socket_for` returns `RecipientLive | RecipientGone | RecipientLookupFailed`; lookup exit 1 means gone, other failures retry three times with one second between tries. Send exit 0 is delivered, 1 queued but unconfirmed, other failed. `Not reached, tell them yourself: <session name> (<reason>)` names failed, gone and unconfirmed deliveries. `cycle_status_lines` prints delivery outcomes. Release waits for no answer, build or memory allocation.
+After the file is gone, `notify_release` sends one notice to each recorded recipient.
+The notice says to start builds and BRP launches now; the memory gate orders them.
+No answer is needed.
+Claude session keys use `socket_for`, which returns `RecipientLive | RecipientGone | RecipientLookupFailed`.
+Lookup exit 1 means gone; other lookup failures retry three times with one second between tries.
+`codex:` keys bypass socket lookup and use `session_send.send_argv` with `send.py --to codex:<thread> --text <notice>`.
+Both routes use the same notice text.
+The sender handles a closed worker pane through its holder.
+Send exit 0 gives `Delivered`; exit 1 gives `QueuedUnconfirmed`; other exits give `DeliveryFailed`.
+A failed Codex send prints the sender's error detail on stderr.
+The cycle saves the outcome after the sender returns.
+A stopped send stays pending and can repeat the notice on retry.
+`Not reached, tell them yourself: <session name> (<reason>)` names failed, gone and unconfirmed deliveries.
+`cycle_status_lines` prints delivery outcomes.
+Release waits for no answer, build or memory allocation.
 
 `release --resume` supports a file left by an old release. It refuses while any hold is in force. With no cycle, the holder broadcasts the release. `open_cycle`, `save_cycle` and `write_hold` write a complete temporary file before `os.replace`; holder temporary files stay outside the holder directory.
 

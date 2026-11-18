@@ -3259,23 +3259,25 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(scan, expected)
             self.assertEqual(errors.getvalue(), notice if printed else "")
 
-    def test_claude_pane_that_starts_or_exits_keeps_placement_without_a_notice(self) -> None:
+    def test_pane_that_starts_or_exits_keeps_placement_without_a_notice(self) -> None:
         client = self.herdr
         owner = staff.StaffRow(staff.native_id(fixture_runtime_id("changing-owner")), "unit", "changing",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("changing-session")))
         pane: dict[str, object] = {"pane_id": "w1:p1", "tab_id": "w1:t1"}
-        info = {"process_info": {"shell_pid": 992000, "foreground_process_group_id": 992001,
-                                "foreground_processes": [{"pid": 992001, "argv": ["claude"]}]}}
         registry = self.root / "changing-sessions"
         registry.mkdir()
         unavailable = "pid 992001: native registry identity is unavailable"
-        for case, births, record, notice in (
-                ("starting", ["birth", "birth"], False, ""),
-                ("exits during the check", ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
-                ("exits before the read", [herdr.NativeRegistryChanging("pid 992001: process exited")], True, ""),
-                ("steady", ["birth", "birth"], True,
+        for agent, case, births, record, notice in (
+                ("claude", "starting", ["birth", "birth"], False, ""),
+                ("claude", "exits during the check",
+                 ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
+                ("claude", "exits before the read", [herdr.NativeRegistryChanging("pid 992001: process exited")], True, ""),
+                ("codex", "exits before the read", [herdr.NativeRegistryChanging("pid 992001: process exited")], False, ""),
+                ("claude", "steady", ["birth", "birth"], True,
                  f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {unavailable}; row placement retained\n")):
-            with (self.subTest(case=case),
+            info = {"process_info": {"shell_pid": 992000, "foreground_process_group_id": 992001,
+                                    "foreground_processes": [{"pid": 992001, "argv": [agent]}]}}
+            with (self.subTest(agent=agent, case=case),
                   patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
                   patch.object(client, "result", return_value=info),
                   patch.object(herdr, "_process_birth", side_effect=births),

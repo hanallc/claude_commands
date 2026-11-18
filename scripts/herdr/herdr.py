@@ -3377,6 +3377,8 @@ def _pane_sessions(info: dict[str, object], pane: Mapping[str, object], *,
             session = read_foreground_pane_owner(owner, pane)
             return CodexPaneSession(session.current_identity, owner.terminal_input)
         except (HerdrFailure, ValueError) as error:
+            if isinstance(error.__cause__, NativeRegistryChanging):
+                raise
             programs = ", ".join(_foreground_program(process) for process in _foreground_processes(info))
             raise HerdrFailure(f"{error}. Foreground programs are {programs}") from error
     return frozenset({read_foreground_pane_owner(owner, pane).current_identity})

@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from decimal import Decimal
 from io import StringIO
 import base64
@@ -23,10 +23,10 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
-from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable, largest_gate_vcpus
+from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog import index, store
 from scripts.build_targets import target_config
@@ -295,6 +295,20 @@ class CloudGateTests(CostFixture):
         ledger.write_spot_prices(self.state, [ledger.RegionalSpotPrice(row.region, row.zone, row.instance_type,
             Decimal(rates.get((row.region, row.instance_type, row.zone), '.5')), int(self.now) - age) for row in variants])
 
+    def west_quota(self, standard_vcpus: int, *, gpu_vcpus: int = 0, age: int = 0) -> None:
+        path = self.state / 'spot-prices.json'
+        document = cloud_gate.read(path)
+        document['regions'] = [{'region': 'us-west-2', 'read_at': int(self.now) - age,
+                                'standard_vcpus': str(standard_vcpus), 'gpu_vcpus': str(gpu_vcpus)}]
+        cloud_gate.save(path, document)
+
+    def record_running_gate(self, attempt: str, instance_type: str, region: str) -> None:
+        self.assertIsInstance(self.book.reserve_gate(self.settings, ledger.GateReservation(
+            attempt, int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal('.02'),
+            region=region)), ledger.GateReserved)
+        with mock.patch.object(time, 'time', return_value=self.now):
+            self.book.resolve_gate(attempt, ledger.GateRunning('i-' + attempt), instance_type=instance_type)
+
     def live_price_fixture(self) -> tuple[cloud_gate.GateWorker, list[cloud_gate.GateLaunchVariant]]:
         worker, variants = self.steering_fixture()
         regions = ('us-east-2', 'us-west-2', 'eu-north-1', 'eu-south-2')
@@ -506,33 +520,18 @@ class CloudGateTests(CostFixture):
         with redirect_stdout(StringIO()):
             self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
 
-    def test_a_region_whose_spot_quota_is_below_one_box_is_not_tried(self) -> None:
+    def test_a_region_whose_spot_quota_is_below_one_box_stays_in_the_order(self) -> None:
         worker, variants = self.steering_fixture()
-        types = conf.read(self.root / 'cloud_gate.conf').words('instance_types')
-        self.variant_prices(variants, {})
-        boxes = {size: largest_gate_vcpus((size,)) for size in types}
-        largest = max(boxes.values())
-        path = self.state / 'spot-prices.json'
-        def quotas(west: int, *, age: int = 0) -> None:
-            document = ledger.mapping(cast(object, json.loads(path.read_text())))
-            document['regions'] = [{'region': region, 'read_at': int(self.now) - age, 'standard_vcpus': str(vcpus),
-                                    'gpu_vcpus': '0'} for region, vcpus in (('us-east-2', largest), ('us-west-2', west))]
-            _ = path.write_text(json.dumps(document))
-        # us-west-2 fits only the smaller boxes, so only the largest type there is skipped.
-        quotas(largest - 1)
-        with redirect_stdout(StringIO()) as output:
-            ranked = worker.rank_variants(variants, 'merge-gate')
-        skipped = {size for size, vcpus in boxes.items() if vcpus == largest}
-        self.assertEqual({(row.region, row.instance_type) for row in variants} - {(row.region, row.instance_type) for row in ranked},
-                         {('us-west-2', size) for size in skipped})
-        self.assertEqual(output.getvalue().count('Cloud gate skips '), len(skipped))
-        self.assertIn(f'its Spot quota {largest - 1} vCPUs is below one box ({largest} vCPUs)', output.getvalue())
-        # A quota of exactly one box is tried, and a stale quota never causes a skip.
-        for west, age in ((largest, 0), (0, conf.read(self.settings).whole('price_max_age_seconds') + 1)):
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        self.west_quota(31)
+        ranked = worker.rank_variants(variants, 'merge-gate')
+        self.assertCountEqual(ranked, variants)
+        self.assertCountEqual(ranked[-4:], variants[6:10])
+        # One box fits at equality. An expired snapshot does not set the order.
+        for west, age in ((32, 0), (0, conf.read(self.settings).whole('price_max_age_seconds') + 1)):
             with self.subTest(west=west, age=age):
-                quotas(west, age=age)
-                with redirect_stdout(StringIO()):
-                    self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
+                self.west_quota(west, age=age)
+                self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
 
     def test_every_type_above_max_gate_minutes_falls_back_before_launch(self) -> None:
         cap = conf.read(self.root / 'cloud_gate.conf').whole('max_gate_minutes') * 60
@@ -600,27 +599,114 @@ class CloudGateTests(CostFixture):
 
     def test_zone_capacity_cooldown_ends_after_the_configured_window(self) -> None:
         worker, variants = self.steering_fixture()
-        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1',
+                                      ('us-west-2', 'm7a.8xlarge', 'us-west-2a'): '.2'})
         for code in ('InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'):
             with self.subTest(code=code):
                 _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
                     time=self.now - 600, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
                     availability_zone='us-west-2b', error_code=code)) + '\n')
-                self.assertEqual(worker.rank_variants(variants, 'merge-gate')[-1], variants[7])
+                ranked = worker.rank_variants(variants, 'merge-gate')
+                self.assertEqual(ranked[0], variants[6])
+                self.assertEqual(ranked[-1], variants[7])
         self.advance(1260)
         self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
 
-    def test_quota_cooldown_moves_every_variant_of_the_region_last(self) -> None:
+    def test_quota_refusal_does_not_cool_a_region_after_a_box_ends(self) -> None:
         worker, variants = self.steering_fixture()
+        self.record_running_gate('ended', 'm7a.8xlarge', 'us-west-2')
+        self.advance(600)
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        self.west_quota(32)
+        self.book.resolve_gate('ended', ledger.GateTerminated(int(self.now), 'i-ended'))
         for code in ('MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded'):
             with self.subTest(code=code):
                 _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
-                    time=self.now - 600, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
+                    time=self.now - 300, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
                     availability_zone='us-west-2b', error_code=code)) + '\n')
                 ranked = worker.rank_variants(variants, 'merge-gate')
-                self.assertEqual([row.region for row in ranked], ['us-east-2'] * 6 + ['us-west-2'] * 6)
-                self.assertEqual(len(ranked), len(variants))
+                self.assertEqual(ranked[0], variants[7])
+                self.assertCountEqual(ranked, variants)
+        self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+
+    def test_live_gate_vcpus_rank_a_full_region_after_regions_with_room(self) -> None:
+        worker, variants = self.steering_fixture()
+        east, full, fits = variants[0], variants[7], variants[10]
+        gpu = replace(full, instance_type='g6.xlarge')
+        variants = [full, east, fits, gpu]
+        self.record_running_gate('standard', 'm7a.4xlarge', 'us-west-2')
+        self.record_running_gate('gpu', 'g6.2xlarge', 'us-west-2')
+        self.record_running_gate('east', 'm7a.8xlarge', 'us-east-2')
+        for priced in (True, False):
+            with self.subTest(priced=priced):
+                self.variant_prices(variants if priced else [], {
+                    (full.region, full.instance_type, full.zone): '.1',
+                    (fits.region, fits.instance_type, fits.zone): '.2',
+                    (gpu.region, gpu.instance_type, gpu.zone): '.3'})
+                self.west_quota(32, gpu_vcpus=12)
+                ranked = worker.rank_variants(variants, 'merge-gate')
+                self.assertEqual(ranked[-1], full)
+                self.assertCountEqual(ranked[:-1], [east, fits, gpu])
+        self.advance(1200)
+        self.variant_prices(variants, {(full.region, full.instance_type, full.zone): '.1'})
+        self.west_quota(32, gpu_vcpus=12)
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], full)
+
+    def test_full_gpu_quota_preserves_the_standard_variant_with_room(self) -> None:
+        worker, variants = self.steering_fixture()
+        east, standard = variants[0], variants[7]
+        gpu = replace(standard, instance_type='g6.xlarge')
+        graphics_trial = 'g6.8xlarge'
+        self.assertNotIn(graphics_trial, cloud_gate.settings().words('gpu_instance_types'))
+        self.record_running_gate('graphics', graphics_trial, 'us-west-2')
+        self.variant_prices([east, standard, gpu], {
+            (standard.region, standard.instance_type, standard.zone): '.2',
+            (gpu.region, gpu.instance_type, gpu.zone): '.1'})
+        self.west_quota(32, gpu_vcpus=32)
+        self.assertEqual(worker.rank_variants([east, standard, gpu], 'merge-gate'), [standard, east, gpu])
+
+    def test_launch_quota_refusal_marks_the_class_until_live_use_drops(self) -> None:
+        worker, variants = self.steering_fixture()
+        numeric_settings(self.root / 'cloud_gate.conf', {'capacity_cooldown_seconds': '30'})
+        west = variants[7]
+        self.record_running_gate('other', west.instance_type, west.region)
+        self.variant_prices(variants, {(west.region, west.instance_type, west.zone): '.1'})
+        self.west_quota(256)
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.fake.refusals = ['MaxSpotInstanceCountExceeded']
+        with mock.patch.object(time, 'time', return_value=self.now):
+            self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
+        launches = [command for command in self.fake.commands if 'run-instances' in command]
+        self.assertEqual([command[command.index('--region') + 1] for command in launches], ['us-west-2', 'us-east-2'])
+        pool = ledger.SpotQuotaPool(west.region, ledger.SpotQuotaClass.STANDARD)
+        self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [ledger.GateQuotaRefusal(pool, 32, int(self.now))])
+        ranked = worker.rank_variants(variants, 'merge-gate')
+        self.assertEqual(ranked[:6], variants[:6])
+        self.assertCountEqual(ranked[6:], variants[6:])
+        self.book.resolve_gate('other', ledger.GateTerminated(int(self.now) + 1, 'i-other'))
+        self.advance(1)
+        self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.record_running_gate('replacement', west.instance_type, west.region)
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+
+    def test_quota_refusal_at_zero_live_vcpus_expires_at_the_cooldown(self) -> None:
+        worker, variants = self.steering_fixture()
+        numeric_settings(self.root / 'cloud_gate.conf', {'capacity_cooldown_seconds': '30'})
+        east, west = variants[0], variants[7]
+        variants = [east, west]
+        self.variant_prices(variants, {(west.region, west.instance_type, west.zone): '.1'})
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [west, east])
+        pool = ledger.SpotQuotaPool(west.region, ledger.SpotQuotaClass.STANDARD)
+        self.book.record_gate_quota_refusal(pool, self.now)
+        self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [ledger.GateQuotaRefusal(pool, 0, int(self.now))])
+        self.advance(29)
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [east, west])
+        self.advance(1)
+        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [west, east])
+        self.book.resolve_gate('attempt', ledger.GateAbsent(int(self.now)))
+        self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
 
     def test_saved_variant_order_survives_capacity_refusal_and_price_changes(self) -> None:
         worker, variants = self.steering_fixture()
@@ -1008,6 +1094,29 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 worker.reconcile()
         self.assertEqual(self.fake.commands, [])
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
+    def test_reconcile_closes_the_missing_box_in_a_batch(self) -> None:
+        worker, _ = self.steering_fixture()
+        timeout = cloud_gate.settings().number('termination_timeout_s')
+        pause: Callable[[float], None] = lambda _seconds: self.advance(timeout)
+        worker.pause = pause
+        self.record_running_gate('missing', 'm7a.8xlarge', 'us-west-2')
+        self.record_running_gate('present', 'm7a.8xlarge', 'us-west-2')
+        self.advance(1200)
+        self.fake.confirm_termination = False
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if 'describe-instances' in arguments and 'i-missing' in arguments:
+                raise AwsUnavailable('An error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation')
+            return self.fake(arguments, **options)
+
+        worker.apis.clear()
+        worker.api = AwsCli('fixture', 'us-east-2', 1, execute=transport)
+        worker.reconcile()
+        by_attempt = {row.attempt: row.state for row in self.book.read_snapshot().gate_reservations}
+        self.assertIsInstance(by_attempt['missing'], ledger.GateTerminated)
+        self.assertEqual(by_attempt['present'], ledger.GateRunning('i-present'))
+        self.assertIn('i-present', self.fake.terminated_instances)
 
     def test_trial_sweep_preserves_an_expired_trial_with_a_live_worker(self) -> None:
         worker = self.worker_with_pending_gate()
@@ -1645,6 +1754,76 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertNotIn('result', cloud_gate.read(self.folder / 'imported.json'))
         reported.assert_called_once()
 
+    def test_first_import_skips_existing_rows(self) -> None:
+        destination = store.host_file('aws', self.now)
+        destination.parent.mkdir(parents=True)
+        prefix = b'{"id":"older-record"}\n' * 10000 + b'invalid JSON\n'
+        _ = destination.write_bytes(prefix)
+
+        cloud_gate.import_record(self.folder, self.result())
+
+        saved = cloud_gate.read(self.folder / 'import-boundary.json')
+        self.assertEqual(saved, {'id': 'gate-attempt', 'destination': str(destination), 'offset': len(prefix)})
+        contents = destination.read_bytes()
+        self.assertEqual(contents[:len(prefix)], prefix)
+        self.assertEqual(len(contents[len(prefix):].splitlines()), 1)
+        self.assertEqual(ledger.mapping(cast(object, json.loads(contents[len(prefix):])))['id'], 'gate-attempt')
+
+    def test_import_retries_after_append_without_appending_again(self) -> None:
+        destination = store.host_file('aws', self.now)
+        result_path = self.folder / cloud_gate.RESULT_FILE
+        imported = self.folder / 'imported.json'
+        result = self.result()
+        cloud_gate.save(result_path, result)
+        save = cloud_gate.save
+
+        def interrupt_imported_save(path: Path, row: dict[str, object]) -> None:
+            if path == imported:
+                raise OSError('fixture interrupted the import')
+            save(path, row)
+
+        with mock.patch('scripts.test_times.gate_record.keep_failure_logs') as keep_failure_logs:
+            with mock.patch.object(cloud_gate, 'save', side_effect=interrupt_imported_save):
+                with self.assertRaisesRegex(OSError, 'fixture interrupted'):
+                    cloud_gate.import_record(self.folder, result)
+            self.assertFalse(imported.exists())
+            store.append_line(destination, {'id': 'another-record'})
+            contents = destination.read_bytes()
+            cloud_gate.import_record(self.folder, cloud_gate.read(result_path))
+
+        keep_failure_logs.assert_called_once()
+        self.assertEqual(destination.read_bytes(), contents)
+        self.assertEqual(cloud_gate.read(imported)['id'], 'gate-attempt')
+        self.assertFalse(result_path.exists())
+
+    def test_reused_import_folder_ignores_the_previous_record_marker(self) -> None:
+        destination = store.host_file('aws', self.now)
+        cloud_gate.import_record(self.folder, self.result())
+        first_end = destination.stat().st_size
+        result = self.result()
+        result['attempt'] = 'next-attempt'
+        ledger.mapping(result['record'])['id'] = 'gate-next-attempt'
+
+        cloud_gate.import_record(self.folder, result)
+
+        self.assertEqual([row['id'] for row in store.locked_rows(destination)], ['gate-attempt', 'gate-next-attempt'])
+        self.assertEqual(cloud_gate.read(self.folder / 'import-boundary.json'),
+                         {'id': 'gate-next-attempt', 'destination': str(destination), 'offset': first_end})
+
+    def test_import_saves_the_offset_after_tail_repair(self) -> None:
+        destination = store.host_file('aws', self.now)
+        store.append_line(destination, {'id': 'older-record'})
+        whole_end = destination.stat().st_size
+        with destination.open('ab') as handle:
+            _ = handle.write(b'{"id":"unfinished')
+
+        cloud_gate.import_record(self.folder, self.result())
+        cloud_gate.import_record(self.folder, self.result())
+
+        self.assertEqual(cloud_gate.read(self.folder / 'import-boundary.json')['offset'], whole_end)
+        rows = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_bytes().splitlines()]
+        self.assertEqual([row['id'] for row in rows], ['older-record', 'gate-attempt'])
+
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
         for mode, full in ((gate.SuiteMode.MERGE_GATE, False), (gate.SuiteMode.TARGETED_TEST, True)):
@@ -1708,7 +1887,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                         raise KeyboardInterrupt
                     resolve(attempt, state, instance_type=instance_type)
                 @contextmanager
-                def slot(_repo: Path, sidecar: Path, _mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
+                def slot(_repo: Path, sidecar: Path, job: object) -> Generator[cloud_gate.CloudReservation]:
+                    self.assertEqual(job, aws_trial.PAIRED_TRIAL_JOB)
                     try:
                         yield cloud_gate.CloudReservation(sidecar)
                     finally:
@@ -2516,6 +2696,173 @@ class CloudRouteTests(CostFixture):
         self.assertNotEqual(folders[0], folders[1])
         self.assertFalse(any((folder / 'outcome.json').exists() for folder in folders))
 
+    def _run_gate_for_resume(self, service: Callable[[Sequence[str]], int]) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
+        with mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The controller must not call AWS')):
+            return cloud_gate.run_cloud(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+                module_time_limit_s=1800, service=service, attempt=cloud_gate.CloudAttempt(self.state, gate.SuiteMode.MERGE_GATE))
+
+    def _finish_gate_for_resume(self, command: Sequence[str], *, status: int = 0) -> int:
+        folder = Path(command[command.index('--worker') + 1])
+        request = cloud_gate.read(folder / 'request.json')
+        run = gate.GateRun(tuple(gate.GateJobResult(suite, path.name, status, 1, '') for suite, path in self.modules), 1, 1)
+        result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
+        result.update(host='fixture-guest', verdict='pass' if run.passed else 'fail', gate=gate_box.encode_run(run),
+            record=gate_box.completion_record(run, folder.name, ledger.text(request, 'commit'),
+                ledger.text(request, 'tree'), 'fixture-guest', 0, 1, 'merge-gate'))
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        booked = book.reserve_gate(self.settings, ledger.GateReservation(
+            folder.name, now, ledger.instant(request, 'expires'), Decimal('.8'), Decimal('.02')))
+        self.assertIsInstance(booked, ledger.GateReserved)
+        book.resolve_gate(folder.name, ledger.GateTerminated(now, 'fixture-guest'))
+        cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+        _ = (folder / 'gate.log').write_text('fixture gate log\n')
+        cloud_gate.save(folder / 'outcome.json', {'status': 'complete', 'result_file': cloud_gate.RESULT_FILE})
+        return 0
+
+    def _unimported_gate(self, *, status: int = 0) -> Path:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        book = ledger.CostLedger(self.state)
+        now = int(time.time())
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+
+        def interrupt_after_completion(command: Sequence[str]) -> int:
+            _ = self._finish_gate_for_resume(command, status=status)
+            raise SystemExit('fixture controller crash')
+
+        with self.assertRaisesRegex(SystemExit, 'fixture controller crash'):
+            _ = self._run_gate_for_resume(interrupt_after_completion)
+        root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
+        return root / ledger.text(cloud_gate.read(root / 'current.json'), 'attempt')
+
+    def test_complete_unimported_gate_resumes_without_a_service(self) -> None:
+        folder = self._unimported_gate(status=1)
+        (self.state / 'gate-deployment.json').unlink()
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        with (mock.patch.object(cloud_gate, 'service_command', side_effect=AssertionError('A completed gate needs no command')),
+              mock.patch.object(queue_place, 'release_place', wraps=queue_place.release_place) as release,
+              redirect_stdout(StringIO()) as output):
+            outcome = self._run_gate_for_resume(service)
+
+        assert isinstance(outcome, cloud_gate.CloudCompleted)
+        self.assertFalse(outcome.run.passed)
+        self.assertIn('fixture gate log', output.getvalue())
+        service.assert_not_called()
+        self.assertEqual(release.call_args.args[1], 1)
+        self.assertTrue(self.admission.callers_released())
+        self.assertEqual([path for path in folder.parent.iterdir() if path.is_dir()], [folder])
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))], ['gate-' + folder.name])
+        self.assertEqual(cloud_gate.read(folder / 'imported.json')['id'], 'gate-' + folder.name)
+
+    def test_complete_imported_gate_starts_a_new_attempt(self) -> None:
+        folder = self._unimported_gate()
+        cloud_gate.import_record(folder, cloud_gate.read(folder / cloud_gate.RESULT_FILE))
+        self.assertFalse((folder / cloud_gate.RESULT_FILE).exists())
+
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(self._finish_gate_for_resume)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        current = cloud_gate.read(folder.parent / 'current.json')
+        self.assertNotEqual(current['attempt'], folder.name)
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))],
+                         ['gate-' + folder.name, 'gate-' + ledger.text(current, 'attempt')])
+
+    def test_complete_gate_for_a_different_tree_starts_a_new_attempt(self) -> None:
+        folder = self._unimported_gate()
+        request = cloud_gate.read(folder / 'request.json')
+        result = cloud_gate.read(folder / cloud_gate.RESULT_FILE)
+        request['tree'] = result['tree'] = 'different-tree'
+        ledger.mapping(result['record'])['tree'] = 'different-tree'
+        cloud_gate.save(folder / 'request.json', request)
+        cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+
+        service = mock.Mock(wraps=self._finish_gate_for_resume)
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        current = cloud_gate.read(folder.parent / 'current.json')
+        self.assertNotEqual(current['attempt'], folder.name)
+        service.assert_called_once()
+        self.assertFalse((folder / 'imported.json').exists())
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))],
+                         ['gate-' + ledger.text(current, 'attempt')])
+
+    def test_complete_gate_with_a_missing_result_starts_a_new_attempt(self) -> None:
+        folder = self._unimported_gate()
+        (folder / cloud_gate.RESULT_FILE).unlink()
+
+        service = mock.Mock(wraps=self._finish_gate_for_resume)
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        current = cloud_gate.read(folder.parent / 'current.json')
+        self.assertNotEqual(current['attempt'], folder.name)
+        service.assert_called_once()
+        self.assertFalse((folder / 'imported.json').exists())
+        self.assertEqual([row['id'] for row in store.locked_rows(store.host_file('aws', 0))],
+                         ['gate-' + ledger.text(current, 'attempt')])
+
+    def test_resume_after_gate_record_append_keeps_one_record(self) -> None:
+        folder = self._unimported_gate()
+        imported = folder / 'imported.json'
+        save = cloud_gate.save
+
+        def interrupt_before_receipt(path: Path, row: dict[str, object]) -> None:
+            if path == imported:
+                raise SystemExit('fixture controller crash after append')
+            save(path, row)
+
+        with mock.patch.object(cloud_gate, 'save', side_effect=interrupt_before_receipt):
+            with self.assertRaisesRegex(SystemExit, 'fixture controller crash after append'):
+                cloud_gate.import_record(folder, cloud_gate.read(folder / cloud_gate.RESULT_FILE))
+        self.assertFalse(imported.exists())
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        destination = store.host_file('aws', 0)
+        previous = destination.read_bytes()
+        with redirect_stdout(StringIO()):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+        self.assertEqual(destination.read_bytes(), previous)
+        self.assertEqual(cloud_gate.read(imported)['id'], 'gate-' + folder.name)
+        service.assert_not_called()
+
+    def test_head_change_during_gate_resume_falls_back(self) -> None:
+        folder = self._unimported_gate()
+        reserve = cloud_gate.cloud_reservation
+
+        @contextmanager
+        def change_head(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
+            with reserve(repo, sidecar, mode) as reservation:
+                _ = gate.checked_git(repo, 'commit', '--allow-empty', '-qm', 'Fixture changed HEAD')
+                yield reservation
+
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        with mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=change_head):
+            outcome = self._run_gate_for_resume(service)
+
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
+        self.assertFalse((folder / 'imported.json').exists())
+        self.assertFalse(store.host_file('aws', 0).exists())
+        service.assert_not_called()
+
+    def test_invalid_unimported_gate_result_falls_back(self) -> None:
+        folder = self._unimported_gate()
+        result = cloud_gate.read(folder / cloud_gate.RESULT_FILE)
+        result['tree'] = 'different-tree'
+        cloud_gate.save(folder / cloud_gate.RESULT_FILE, result)
+        cloud_gate.save(folder / 'imported.json', {'id': 'gate-previous-attempt'})
+
+        service = mock.Mock(side_effect=AssertionError('A completed gate needs no service'))
+        outcome = self._run_gate_for_resume(service)
+
+        self.assertEqual(outcome, cloud_gate.LocalFallback('The result differs from the current tree'))
+        self.assertFalse(store.host_file('aws', 0).exists())
+        service.assert_not_called()
+
     def test_pending_attempt_reuses_only_the_same_working_tree(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
         folders: list[Path] = []
@@ -2625,6 +2972,17 @@ class CloudRouteTests(CostFixture):
                             record.need, admission_records.ReadyForAdmission(), unit=identity.get('unit', ''))
                         self.assertEqual(queue_evidence.step_labels(step, {'fixture-owner': owner}), owner)
                         self.assertEqual(read_step_names().for_owner(step.step, owner.unit, owner.role), 'fixture-unit merge')
+
+    def test_paired_trial_admission_records_its_named_test_job(self) -> None:
+        with cloud_gate.cloud_reservation(self.repo, self.root / 'trial.sidecar', aws_trial.PAIRED_TRIAL_JOB):
+            record, = self.admission.caller_reservations().values()
+            self.assertEqual(record.step, 'test-modules')
+            self.assertEqual(record.queue_waiter.get('step'), 'test-modules')
+            self.assertEqual(record.gate_job, aws_trial.PAIRED_TRIAL_JOB)
+            reading = admission_client.view()
+            assert isinstance(reading, wire.CloudQueueRead)
+            row, = reading.cloud
+            self.assertEqual(row.identity.job, aws_trial.PAIRED_TRIAL_JOB)
 
     def test_service_command_preserves_credential_override(self) -> None:
         credential = self.root / 'override-credentials'

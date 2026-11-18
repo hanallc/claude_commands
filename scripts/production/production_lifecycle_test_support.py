@@ -14,6 +14,7 @@ import tempfile
 import shutil
 import unittest
 from pathlib import Path
+from collections.abc import Callable
 from typing import ClassVar, cast, override
 from unittest import mock
 
@@ -24,9 +25,24 @@ from scripts.production import unit_lookup
 from scripts.production import session_records_test_support
 from scripts.production import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
+from scripts.direct import phase_table
+from scripts.lib.process_failure import failure_detail
 
 
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
+
+
+def phase_table_in_process(command: Callable[..., str]) -> Callable[..., str]:
+    """Run the phase table archive as its CLI does, without a new interpreter for each wrap."""
+    def run(step: str, cwd: Path, *args: str) -> str:
+        if args[1:2] != (str(production_lifecycle.PHASE_TABLE),):
+            return command(step, cwd, *args)
+        result = invoke_cli(phase_table, phase_table.main, list(args[2:]), dict(os.environ), cwd)
+        if result.returncode:
+            raise production_lifecycle.LifecycleStop(
+                step, "failed", f"{' '.join(args)}: {failure_detail(result)}")
+        return result.stdout.strip()
+    return run
 # Only an interpreter can run the showrunners.py stub, so it stays Python and records any call.
 INTERPRETER_STUB = '''import os
 import sys
@@ -285,7 +301,8 @@ class LifecycleFixture(unittest.TestCase):
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.
         with mock.patch.object(tidy_wrapped, "STATE_DIR", self.state / "showrunner"), \
-             mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.state / "notifier"):
+             mock.patch.object(tidy_wrapped, "NOTIFIER_STATE_DIR", self.state / "notifier"), \
+             mock.patch.object(production_lifecycle, "command", phase_table_in_process(production_lifecycle.command)):
             return invoke_cli(production_lifecycle, production_lifecycle.main,
                               [action, "--production", "example", *extra],
                               self.env, self.checkout, production_state=True)

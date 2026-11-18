@@ -216,7 +216,7 @@ class NoticeRetryTests(unittest.TestCase):
         with mock.patch.object(broadcast, "send", side_effect=Killed):
             with self.assertRaises(Killed):
                 _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         current = staff.native_id(fixture_runtime_id("winddown-after-clear"))
         _ = staff.update_current_session(self.unit.current_session, current)
         from scripts.message import sessions

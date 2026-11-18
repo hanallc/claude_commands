@@ -1,30 +1,242 @@
 #!/usr/bin/env python3
-"""Keep waiting configuration rows live across every fast-forward.
-
-A waiting row is a configuration line that the live file holds and HEAD does
-not. A fast-forward gives git the target's blob in the index, so the live file
-keeps its rows; then the rows replay onto the target's text.
-"""
+"""Keep waiting configuration rows live across a Git move."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
 
-from dataclasses import dataclass
+from collections.abc import Callable, Generator, Iterable, Mapping
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+import fcntl
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import conf, git_index, registry_rows
+from scripts.lib import build_folders, conf, conf_reads, git_index, registry_rows
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcripts import config_dirs
 
-WAITING_GLOB = "config/*.conf"
-WAITING_PATHS = f":(glob){WAITING_GLOB}"
+WAITING_PATHS = ":(glob)config/*.conf"
 REGISTRY_PATH = "config/models.conf"
+ORDER_PATH = "config/settings-orders.json"
+RegistryReplay = Callable[[str, str, str], str]
+
+
+def model_color_host(key: str) -> str:
+    """Return the reserved host suffix of a model color key, if present."""
+    base = key.rpartition(".")[0]
+    if conf.full_model_color_key("statusline", base):
+        return conf.host_suffix(key, conf.known_host_names())
+    return ""
+
+
+def model_color_key(stem: str, key: str) -> bool:
+    """Allow a new color only for a full model ID in its catalog."""
+    if not conf.full_model_color_key(stem, key):
+        return False
+    model = key.removeprefix("model.")
+    if model.startswith("gpt-"):
+        override = os.environ.get("MODELS_CONFIG_FILE")
+        source = Path(override) if override else conf.path("models")
+        try:
+            if not override and not source.exists():
+                source = Path(__file__).resolve().parents[2] / REGISTRY_PATH
+            registry = registry_rows.parse_registry(conf_reads.read_text(source))
+        except (OSError, UnicodeError):
+            return False
+        return model in registry.get("codex.agents", {}) and model not in registry.get("codex.families", {})
+    return _claude_model_listed(model)
+
+
+def _claude_model_listed(model: str) -> bool:
+    for directory in config_dirs():
+        for path in (directory / "cache/model-catalog").glob("*-cc.json"):
+            try:
+                value = cast(object, json.loads(path.read_bytes()))
+            except (OSError, ValueError):
+                continue
+            for key in ("catalog", "config", "models"):
+                value = cast(dict[str, object], value).get(key) if isinstance(value, dict) else None
+            if isinstance(value, list) and any(isinstance(entry, dict)
+                    and cast(dict[str, object], entry).get("id") == model for entry in cast(list[object], value)):
+                return True
+    return False
+
+
+def model_color_value(value: str) -> bool:
+    return re.fullmatch(r"#[0-9a-f]{6}", value) is not None
+
+
+def append_setting(source: str, key: str, value: str) -> str:
+    ending = "\n" if source and not source.endswith("\n") else ""
+    return f"{source}{ending}{key}={value}\n"
+
+
+@dataclass(frozen=True)
+class WaitingChange:
+    """A live Save that waits for publication or a Mac pull."""
+
+    stem: str
+    key: str
+    value: str
+    message: str
+    publish_on_main: bool = True
+    save_order: int = 0
+
+
+class WaitingChangeRecord(TypedDict):
+    stem: str
+    key: str
+    value: str
+    message: str
+    publish_on_main: NotRequired[bool]
+    save_order: NotRequired[int]
+
+
+def journal_path() -> Path:
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    return Path(state) / "live-settings" / "waiting.json"
+
+
+@dataclass(frozen=True)
+class AcceptedOrder:
+    order: int
+
+
+@dataclass(frozen=True)
+class AcceptedSave(AcceptedOrder):
+    """An accepted Save whose value is still pending."""
+
+    value: str
+    legacy_base: str | None = None
+
+
+type SaveOrders = dict[str, dict[str, int]]
+
+
+class AcceptedSaveRecord(TypedDict):
+    order: int
+    value: NotRequired[str | None]
+    legacy_base: NotRequired[str | None]
+
+
+class SettingsJournalRecord(TypedDict):
+    last_order: int
+    accepted: NotRequired[dict[str, dict[str, AcceptedSaveRecord]]]
+    register: NotRequired[dict[str, dict[str, AcceptedSaveRecord]]]
+    changes: list[WaitingChangeRecord]
+
+
+@dataclass
+class LockedJournal:
+    """The accepted orders, pending values, and publication queue under the journal lock."""
+
+    path: Path
+    last_order: int
+    accepted: dict[str, dict[str, AcceptedOrder]]
+    changes: list[WaitingChange]
+    migrating: bool = False
+
+    def save(self) -> None:
+        record = {"last_order": self.last_order, "register": self.accepted,
+                  "changes": self.changes}
+        write_text_atomic(self.path, json.dumps(record, default=asdict, indent=2) + "\n", new_file_mode=0o600)
+        self.migrating = False
+
+    def order(self, stem: str, key: str) -> int:
+        save = self.accepted.get(stem, {}).get(key)
+        return save.order if save else 0
+
+    def accept(self, stem: str, key: str, save: AcceptedSave) -> bool:
+        if 0 < self.order(stem, key) >= save.order:
+            return False
+        self.accepted.setdefault(stem, {})[key] = save
+        self.last_order = max(self.last_order, save.order)
+        return True
+
+    def restore(self, checkout: Path, head: str) -> None:
+        """Recover the move and apply pending values to the live files."""
+        recover_move(checkout, head)
+        if (checkout / "config").resolve() != conf.directory().resolve():
+            return
+        orders = published_orders(checkout, head)
+        changed = self._migrate(checkout, head)
+        files: dict[str, str] = {}
+        for stem in self.accepted.keys() | orders.keys():
+            path = f"config/{stem}.conf"
+            keys = self.accepted.setdefault(stem, {})
+            published = orders.get(stem, {})
+            for key in dict.fromkeys((*keys, *published)):
+                save = keys.get(key, AcceptedOrder(0))
+                order = published.get(key, 0)
+                if not isinstance(save, AcceptedSave) or published_save(checkout, head, stem, key, save, order):
+                    current = AcceptedOrder(max(save.order, order))
+                    changed = changed or current != keys.get(key)
+                    keys[key] = current
+                    self.last_order = max(self.last_order, current.order)
+                else:
+                    text = files[path] if path in files else live_text(conf.path(stem)) or ""
+                    setting = conf.settings(text).get(key)
+                    files[path] = replace_value(text, setting.line, save.value) if setting else append_setting(text, key, save.value)
+        if changed or self.migrating:
+            self.save()
+        write_files(checkout, files)
+
+    def _migrate(self, checkout: Path, head: str) -> bool:
+        """Move old Mac receipts into the register and assign orders to old publication rows."""
+        old = self.changes
+        self.changes = []
+        for row in old:
+            if not row.publish_on_main:
+                if row.save_order >= self.order(row.stem, row.key):
+                    base = tree_value(checkout, head, row.stem, row.key) if not row.save_order else None
+                    self.accepted.setdefault(row.stem, {})[row.key] = AcceptedSave(row.save_order, row.value, base)
+                    self.last_order = max(self.last_order, row.save_order)
+                continue
+            if not row.save_order:
+                row = replace(row, save_order=self.last_order + 1)
+                _ = self.accept(row.stem, row.key, AcceptedSave(row.save_order, row.value))
+            self.changes.append(row)
+        return old != self.changes
+
+
+def _read_journal(path: Path) -> LockedJournal:
+    try:
+        data = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        if isinstance(data, list):
+            return LockedJournal(path, 0, {}, [WaitingChange(**row) for row in cast(list[WaitingChangeRecord], data)])
+        record = cast(SettingsJournalRecord, data)
+        register = record.get("register")
+        changes = [WaitingChange(**row) for row in record["changes"]]
+        if register is None:
+            waiting = {(row.stem, row.key, row.save_order) for row in changes}
+            register = {stem: {key: AcceptedSaveRecord(order=row["order"], value=row.get("value")
+                                                      if (stem, key, row["order"]) in waiting else None)
+                               for key, row in keys.items()} for stem, keys in record.get("accepted", {}).items()}
+        accepted = {stem: {key: AcceptedSave(row["order"], value, row.get("legacy_base"))
+                           if (value := row.get("value")) is not None else AcceptedOrder(row["order"])
+                           for key, row in keys.items()} for stem, keys in register.items()}
+        return LockedJournal(path, record["last_order"], accepted, changes, migrating="register" not in record)
+    except FileNotFoundError:
+        return LockedJournal(path, 0, {}, [])
+    except (ValueError, TypeError, KeyError) as error:
+        raise OSError(f"cannot read settings journal {path}: {error}") from error
+
+
+@contextmanager
+def locked_journal(path: Path) -> Generator[LockedJournal]:
+    """Share one lock between live Saves and checkout moves."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield _read_journal(path)
 
 
 def replace_value(source: str, index: int, value: str) -> str:
@@ -47,22 +259,11 @@ def replace_value(source: str, index: int, value: str) -> str:
     return "".join(lines)
 
 
-def replay(path: str, head: str, local: str, target: str) -> str:
-    """Put the rows that local changed from head onto target."""
-    if path == REGISTRY_PATH:
-        return registry_rows.replay_pending(head, local, target)
-    before, wanted, base = conf.settings(head), conf.settings(local), conf.settings(target)
-    text = target
-    for key, setting in wanted.items():
-        if key in base and (key not in before or before[key].value != setting.value):
-            text = replace_value(text, base[key].line, setting.value)
-    return text
-
-
 def git(checkout: Path, *arguments: str, input_text: str | None = None,
         environment: dict[str, str] | None = None) -> str:
     done = subprocess.run(["git", "-C", str(checkout), *arguments], input=input_text, text=True,
-                          capture_output=True, env=environment, check=False)
+                          capture_output=True, env=environment,
+                          pass_fds=build_folders.held_build_folder_descriptors(), check=False)
     if done.returncode:
         detail = (done.stderr or done.stdout).strip() or f"exit {done.returncode}"
         raise OSError(f"git {' '.join(arguments)}: {detail}")
@@ -81,79 +282,259 @@ def waiting_files(checkout: Path) -> list[str]:
 
 @dataclass(frozen=True)
 class WaitingRows:
-    """The waiting files that a move to target changes, with their texts before the move."""
+    """The checked index entries and file text for a move to the target."""
 
-    target: str
+    merge_source: str
     entries: str
-    head: dict[str, str]
-    local: dict[str, str]
+    plan: MovePlan
 
 
-def hold(checkout: Path, target: str, *, skip: tuple[str, ...] = ()) -> WaitingRows:
-    """Read the waiting rows that a move to target must keep; refuse other local edits in them."""
-    changed = set(git(checkout, "diff", "--name-only", "-z", "HEAD", target, "--").split("\0"))
-    touched = [path for path in waiting_files(checkout) if path in changed and path not in skip]
-    entries = git(checkout, "ls-tree", "-z", target, "--", *touched).replace("\0", "\n") if touched else ""
-    if len(entries.splitlines()) != len(touched):
-        raise OSError(f"{target} removes a file with waiting rows: {', '.join(touched)}")
-    head = {path: show(checkout, "HEAD", path) for path in touched}
-    local = {path: (checkout / path).read_text(encoding="utf-8") for path in touched}
-    for path in touched:
-        if path != REGISTRY_PATH and replay(path, head[path], local[path], head[path]) != local[path]:
-            raise OSError(f"{path} has local edits other than setting values")
-    return WaitingRows(target, entries, head, local)
+def live_text(path: Path) -> str | None:
+    try:
+        return path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def write_files(checkout: Path, files: Mapping[str, str | None]) -> None:
+    for name, text in files.items():
+        path = checkout / name
+        if text is None:
+            path.unlink(missing_ok=True)
+        elif live_text(path) != text:
+            write_text_atomic(path, text)
+
+
+def tree_text(checkout: Path, commit: str, path: str) -> str | None:
+    return show(checkout, commit, path) if git(checkout, "ls-tree", commit, "--", path) else None
+
+
+def tree_value(checkout: Path, commit: str, stem: str, key: str) -> str | None:
+    setting = conf.settings(tree_text(checkout, commit, f"config/{stem}.conf") or "").get(key)
+    return setting.value if setting else None
+
+
+def published_save(checkout: Path, commit: str, stem: str, key: str, save: AcceptedSave, order: int) -> bool:
+    if save.order or order > 0:
+        return order >= save.order
+    value = tree_value(checkout, commit, stem, key)
+    return value == save.value or value != save.legacy_base
+
+
+def published_orders(checkout: Path, commit: str) -> SaveOrders:
+    text = tree_text(checkout, commit, ORDER_PATH)
+    try:
+        return cast(SaveOrders, json.loads(text)) if text else {}
+    except ValueError as error:
+        raise OSError(f"{commit}:{ORDER_PATH}: {error}") from error
+
+
+def pending_files(checkout: Path, journal: LockedJournal) -> dict[str, dict[str, AcceptedOrder]]:
+    if (checkout / "config").resolve() != conf.directory().resolve():
+        return {}
+    return {f"config/{stem}.conf": keys for stem, keys in journal.accepted.items()
+            if any(isinstance(save, AcceptedSave) for save in keys.values())}
+
+
+def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *, replace_registry: bool,
+         replay_registry: RegistryReplay) -> WaitingRows:
+    """Plan writes for paths that Git must leave in place."""
+    target = move.tip
+    changed = set(git(checkout, "diff", "--name-only", "--no-renames", "-z", move.head, target, "--", WAITING_PATHS).split("\0"))
+    managed = pending_files(checkout, pending)
+    orders = published_orders(checkout, target)
+    entries: list[str] = []
+    plan = MovePlan(source=move.head, target=target, before={}, after={})
+    forced = {REGISTRY_PATH} if replace_registry else set[str]()
+    touched = (changed & set(waiting_files(checkout))) | managed.keys() | forced
+    for path in sorted(touched):
+        stem, saves = Path(path).stem, managed.get(path, {})
+        published = orders.get(stem, {})
+        settled = {key: order for key, save in saves.items() if isinstance(save, AcceptedSave)
+                   and published_save(checkout, target, stem, key, save, order := published.get(key, 0))}
+        if path not in changed and not settled and path not in forced:
+            continue
+        entry = git(checkout, "ls-tree", target, "--", path)
+        incoming = show(checkout, target, path) if entry else None
+        head = tree_text(checkout, move.head, path)
+        local = live_text(checkout / path)
+        entries.append(entry or f"0 {'0' * len(target)}\t{path}\n")
+        plan["before"][path] = local
+        if path == REGISTRY_PATH and incoming is not None:
+            plan["after"][path] = incoming if replace_registry else replay_registry(head or "", local or "", incoming)
+        else:
+            plan["after"][path] = replay_settings(path, head or "", local or "", incoming, saves, settled)
+    return WaitingRows(move.head, "".join(entries), plan)
+
+
+def replay_settings(path: str, head: str, local: str, target: str | None,
+                    saves: dict[str, AcceptedOrder], settled: dict[str, int]) -> str | None:
+    before, incoming = conf.settings(head), conf.settings(target or "")
+    lines = local.splitlines(keepends=True)
+    head_lines = head.splitlines(keepends=True)
+    baseline = head_lines.copy()
+    target_lines = (target or "").splitlines(keepends=True)
+    for key, setting in conf.settings(local).items():
+        old, new = before.get(key), incoming.get(key)
+        if isinstance(save := saves.get(key), AcceptedSave):
+            line = lines[setting.line]
+            same_save = new and new.value == save.value and settled.get(key) == save.order
+            if (key not in settled or same_save) and re.search(r"[ \t]#", line.partition("=")[2]):
+                if new:
+                    ending = "\n" if target_lines[new.line].endswith("\n") else ""
+                    target_lines[new.line] = replace_value(line, 0, save.value).rstrip("\r\n") + ending
+                else:
+                    target_lines.extend(("\n" if target_lines and not target_lines[-1].endswith("\n") else "",
+                                         replace_value(line, 0, save.value)))
+            lines[setting.line] = head_lines[old.line] if old else ""
+        elif old is None and new and new.value == setting.value and (
+                saves or (conf.full_model_color_key(Path(path).stem, key) and model_color_value(setting.value)
+                          and lines[setting.line].rstrip("\r\n") == target_lines[new.line].rstrip("\r\n"))):
+            lines[setting.line] = ""
+        elif old and setting.value != old.value:
+            baseline[old.line] = replace_value(baseline[old.line], 0, setting.value)
+            if new and new.value == old.value:
+                target_lines[new.line] = replace_value(target_lines[new.line], 0, setting.value)
+    # Appending a key adds a separator when the last line has no newline.
+    normalized, expected = "".join(lines), "".join(baseline)
+    if normalized != expected and not ("" in lines and normalized == expected + "\n" and not expected.endswith("\n")):
+        raise OSError(f"{path} has local edits other than setting values")
+    if target is None and expected != head:
+        raise OSError(f"the target removes a file with waiting rows: {path}")
+    return "".join(target_lines) if target_lines or target is not None else None
 
 
 def give(checkout: Path, rows: WaitingRows, environment: dict[str, str] | None = None) -> None:
-    """Give git the target's blob for each waiting file, so the move keeps the live file."""
+    """Give Git the target's blobs for waiting rows and refresh the index."""
     if rows.entries:
         _ = git(checkout, "update-index", "--index-info", input_text=rows.entries, environment=environment)
+    # Refresh can report changed paths. The merge checks them.
+    _ = subprocess.run(["git", "-C", str(checkout), "update-index", "-q", "--refresh"], env=environment,
+                       capture_output=True, pass_fds=build_folders.held_build_folder_descriptors(), check=False)
 
 
-def restore(checkout: Path, rows: WaitingRows) -> None:
-    """Put the waiting rows onto the target's text of each file after the move."""
-    for path in rows.head:
-        text = replay(path, rows.head[path], rows.local[path], show(checkout, rows.target, path))
-        if (checkout / path).read_text(encoding="utf-8") != text:
-            write_text_atomic(checkout / path, text)
+@dataclass(frozen=True)
+class CheckoutMove:
+    head: str
+    tip: str
 
 
-def move_to(checkout: Path, target: str) -> None:
-    """Move the checkout to target, as a fast-forward does, and keep every waiting row live.
+class Diverged(OSError):
+    """The target does not descend from the required parent."""
 
-    Target need not descend from HEAD: a publisher replaces its own local commits with copies on main.
 
-    The check runs on a private index before any write. Another local edit on
-    a path that target changes refuses the move, as git does.
-    """
+def move_target(checkout: Path, target: str, pending: LockedJournal, *, fast_forward: bool,
+                allow_contained: bool = False, expected_head: str = "") -> CheckoutMove:
+    """Check the target against HEAD while the caller holds the journal lock."""
     if Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip()).exists():
         raise OSError("an unfinished merge must be completed first")
     if git(checkout, "ls-files", "--unmerged").strip():
         raise OSError("unmerged index entries must be resolved first")
-    rows = hold(checkout, target)
-    index = Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
-    with tempfile.TemporaryDirectory(prefix="waiting-rows-index-") as directory:
-        trial = Path(directory) / "index"
-        git_index.private_copy(index, trial)
-        environment = {**os.environ, "GIT_INDEX_FILE": str(trial)}
-        give(checkout, rows, environment)
-        _refresh(checkout, environment)
-        _ = git(checkout, "read-tree", "--dry-run", "-m", "-u", "HEAD", target, environment=environment)
     head = git(checkout, "rev-parse", "HEAD").strip()
-    tip = git(checkout, "rev-parse", f"{target}^{{commit}}").strip()
-    give(checkout, rows)
-    _refresh(checkout)
-    # The two-tree merge that `git merge --ff-only` runs; it keeps staged work on paths target does not change.
-    _ = git(checkout, "read-tree", "-m", "-u", "HEAD", tip)
-    _ = git(checkout, "update-ref", "-m", f"waiting_rows: move to {target}", "HEAD", tip, head)
-    restore(checkout, rows)
+    pending.restore(checkout, head)
+    if expected_head and head != expected_head:
+        raise Diverged("HEAD changed while the publisher prepared the move")
+    tip = head if target == "HEAD" else git(checkout, "rev-parse", f"{target}^{{commit}}").strip()
+    if head == tip:
+        return CheckoutMove(head, head)
+    if fast_forward:
+        result = subprocess.run(["git", "-C", str(checkout), "merge-base", head, tip],
+                                capture_output=True, text=True, check=False)
+        ancestor = result.stdout.strip()
+        if allow_contained and ancestor == tip:
+            return CheckoutMove(head, head)
+        if ancestor != head:
+            raise Diverged(f"{target} is not a fast-forward of HEAD")
+    if staged := git(checkout, "diff", "--cached", "--name-only", "--no-renames", "-z", head, "--", WAITING_PATHS):
+        raise OSError(f"staged settings prevent the move: {staged.split(chr(0), 1)[0]}")
+    return CheckoutMove(head, tip)
 
 
-def _refresh(checkout: Path, environment: dict[str, str] | None = None) -> None:
-    """Refresh file times in the index, as git merge does first; a stale time reads as an edit."""
-    # It exits 1 for each modified file; the merge judges those.
-    _ = subprocess.run(["git", "-C", str(checkout), "update-index", "-q", "--refresh"], env=environment,
-                       capture_output=True, check=False)
+def move_marker(checkout: Path) -> Path:
+    return Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "waiting-rows.move").strip())
+
+
+class MovePlan(TypedDict):
+    source: str
+    target: str
+    before: dict[str, str | None]
+    after: dict[str, str | None]
+    reverse_from: NotRequired[str]
+
+
+def recover_move(checkout: Path, head: str) -> None:
+    """Finish the planned writes or return the checkout to its source."""
+    marker = move_marker(checkout)
+    if (record := live_text(marker)) is None:
+        return
+    plan = cast(MovePlan, json.loads(record))
+    if head == "HEAD":
+        head = git(checkout, "rev-parse", "HEAD").strip()
+    for path, text in plan["after"].items():
+        if live_text(checkout / path) not in (plan["before"].get(path), text):
+            raise OSError(f"{path} changed after the move started")
+    if head == plan["source"]:
+        if paths := plan["after"]:
+            _ = git(checkout, "--literal-pathspecs", "reset", "-q", head, "--", *paths)
+        _ = git(checkout, "read-tree", "-m", "-u", plan.get("reverse_from", plan["target"]), head)
+        write_files(checkout, plan["before"])
+    elif head == plan["target"]:
+        write_files(checkout, plan["after"])
+    else:
+        raise OSError("HEAD is outside the pending settings move")
+    marker.unlink()
+
+
+def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: dict[str, str]) -> str:
+    _ = git(checkout, "read-tree", tree, environment=environment)
+    _ = git(checkout, "update-index", "--force-remove", "--", *paths, environment=environment)
+    return git(checkout, "write-tree", environment=environment).strip()
+
+
+def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
+               replace_registry: bool = False, registry_move: bool = False,
+               replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
+    """Check the move on a private index before Git changes the checkout."""
+    rows = hold(checkout, move, pending, replace_registry=replace_registry, replay_registry=replay_registry)
+    index = Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    folder = (build_folders.tool_folder("models-ff-index") if registry_move
+              else tempfile.TemporaryDirectory(prefix="waiting-rows-index-"))
+    with folder as directory:
+        trial = Path(directory) / "index"
+        environment = {**os.environ, "GIT_INDEX_FILE": str(trial)}
+        if paths := rows.plan["after"]:
+            rows.plan["reverse_from"] = tree_without(checkout, move.tip, paths, environment)
+        if removed := [entry.partition("\t")[2] for entry in rows.entries.splitlines() if entry.startswith("0 ")]:
+            rows = replace(rows, merge_source=tree_without(checkout, move.head, removed, environment))
+        git_index.private_copy(index, trial)
+        give(checkout, rows, environment)
+        _ = git(checkout, "read-tree", "--dry-run", "-m", "-u", rows.merge_source, move.tip, environment=environment)
+    return rows
+
+
+def apply_move(checkout: Path, rows: WaitingRows, pending: LockedJournal) -> None:
+    """Move HEAD and restore settings while the caller holds the journal lock."""
+    plan = rows.plan
+    source, target = plan["source"], plan["target"]
+    write_text_atomic(move_marker(checkout), json.dumps(plan) + "\n", new_file_mode=0o600)
+    try:
+        give(checkout, rows)
+        _ = git(checkout, "read-tree", "-m", "-u", rows.merge_source, target)
+        _ = git(checkout, "update-ref", "-m", f"waiting_rows: move to {target}", "HEAD", target, source)
+    finally:
+        pending.restore(checkout, "HEAD")
+
+
+def move_to(checkout: Path, target: str, *, fast_forward: bool = False, expected_head: str = "") -> None:
+    with locked_journal(journal_path()) as pending:
+        move = move_target(checkout, target, pending, fast_forward=fast_forward, expected_head=expected_head)
+        if move.head != move.tip:
+            apply_move(checkout, check_move(checkout, move, pending), pending)
+
+
+def restore_live(checkout: Path) -> None:
+    with locked_journal(journal_path()) as pending:
+        pending.restore(checkout, "HEAD")
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -164,10 +545,7 @@ def main(arguments: list[str] | None = None) -> int:
         return 2
     checkout = Path.cwd()
     try:
-        if subprocess.run(["git", "-C", str(checkout), "merge-base", "--is-ancestor", "HEAD", argv[1]],
-                          check=False).returncode:
-            raise OSError(f"{argv[1]} is not a fast-forward of HEAD")
-        move_to(checkout, argv[1])
+        move_to(checkout, argv[1], fast_forward=True)
     except (OSError, UnicodeError) as error:
         print(f"waiting_rows: {error}", file=sys.stderr)
         return 1

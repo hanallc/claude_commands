@@ -258,32 +258,35 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         handle_request = fixture.server.handle_request
         first_gate_request = threading.Event()
 
-        def fit_older(request: wire.Request,
-                      connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+        def keep_older_waiting(request: wire.Request,
+                               connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             with fixture.loop_turn():
                 if isinstance(request, wire.AdmitRequest) and request.owner != older.owner and not first_gate_request.is_set():
                     first_gate_request.set()
                     self.assertIn(older.episode, fixture.server.waiters)
-                    fixture.free(23 * admission_records.GIB // 2)
+                    fixture.free(11 * admission_records.GIB)
                 return handle_request(request, connection)
 
         admit = client.admit
         output = io.StringIO()
+        waits: list[wire.Wait] = []
 
         def acquire(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None], refresh: Callable[[], wire.AdmitRequest], *,
                     _attempt: Callable[[], None]) -> wire.Admitted | wire.Refused | client.LeftQueue:
             def held(reply: wire.Wait) -> None:
+                waits.append(reply)
                 on_wait(reply)
                 fixture.proc.kill(older.owner)
                 fixture.free(60 * admission_records.GIB)
             return admit(request, held, refresh, _attempt=_attempt)
 
         with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(fixture.server, "handle_request", side_effect=fit_older), \
+             mock.patch.object(fixture.server, "handle_request", side_effect=keep_older_waiting), \
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with merge_gate.gate_reservation(self.checkout, self.state, merge_gate.BuildHoldWait()):
                 pass
         self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
+        self.assertIsInstance(waits[0].reason, admission_records.BehindHead)
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()
 

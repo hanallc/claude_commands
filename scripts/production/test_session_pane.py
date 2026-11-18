@@ -431,6 +431,18 @@ class SessionPaneTests(unittest.TestCase):
                 self.assertIn(("pane", "close", place.pane), commands)
 
 
+    def test_missing_registry_folder_returns_an_error(self) -> None:
+        with mock.patch.dict(self.environment, {"NOTIFIER_SESSIONS_DIR": str(self.root / "absent")}):
+            result = self.run_cli("where", "session", "missing")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (3, "", "session missing: one or more session records could not be read\n"))
+
+    def test_denied_registry_folder_returns_an_error(self) -> None:
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError(self.records)):
+            result = self.run_cli("where", "session", "missing")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (3, "", "session missing: one or more session records could not be read\n"))
+
     def test_usage_missing_targets_and_unreadable_hosts_have_distinct_exits(self) -> None:
         for args in ((), ("keys", "unit", "show", "herdr"),
                      ("read", "unit", "show", "herdr", "--lines", "0"),

@@ -39,7 +39,7 @@ from scripts.agents import pane_record as hook_pane_record
 from scripts.agents import inventory, pane_record
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr.test_herdr import ClaudeForegroundSocket
-from scripts.message import sessions
+from scripts.message import session_records, sessions
 from scripts.production import unit_lookup
 from scripts.whoami import quota_alert
 from scripts.lib.atomic_file import write_text_atomic
@@ -128,9 +128,11 @@ class UnitWatchdogTests(unittest.TestCase):
         self.fixture.reading("four@example.invalid", 80)
         self.write_doc()
 
-    def session_liveness(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-        return (sessions.LiveSessionProcess(self.units[identity]["pid"]) if identity in
-                {entry["sessionId"] for entry in self.fixture.live} else sessions.SessionNotLive())
+    def session_liveness(self, identity: str,
+                         ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+        registry = sessions.read_registry()
+        with patch.object(session_records, "running_session", return_value=True):
+            return session_records.session_liveness(identity, registry)
 
     def write_doc(self) -> None:
         for name in self.units:
@@ -302,8 +304,11 @@ class UnitWatchdogTests(unittest.TestCase):
         for owner in self.units.values():
             fake_unit_host.process({"HERDR_PROC": str(proc)}, owner["pid"], 1, ["claude"], {}, cwd=self.home)
 
-        def reader_liveness(identity: str) -> reader_sessions.LiveSessionProcess | reader_sessions.SessionNotLive:
+        def reader_liveness(identity: str) -> (
+                reader_sessions.LiveSessionProcess | reader_sessions.SessionNotLive | reader_sessions.SessionLivenessUnknown):
             observed = self.session_liveness(identity)
+            if isinstance(observed, sessions.SessionLivenessUnknown):
+                return reader_sessions.SessionLivenessUnknown(observed.reason)
             return (reader_sessions.LiveSessionProcess(observed.pid) if isinstance(observed, sessions.LiveSessionProcess)
                     else reader_sessions.SessionNotLive())
 
@@ -602,6 +607,23 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(failure, "")
         self.assertEqual(len(launches), 1)
         self.assertEqual(launches[0][launches[0].index("--to") + 1], "claude4")
+
+    def test_unreadable_registry_prevents_queued_recovery(self) -> None:
+        source = self.queued_unit()
+        directory = sessions.sessions_dir()
+        iterdir = Path.iterdir
+
+        def denied(path: Path) -> Generator[Path]:
+            if path == directory:
+                raise PermissionError(path)
+            yield from iterdir(path)
+
+        with (patch.object(Path, "iterdir", new=denied),
+              patch.object(stop_resume, "resume", wraps=self.resume) as resume):
+            failure, launches = self.recover_queued(source)
+        self.assertEqual(failure, f"session registry unreadable: {directory}")
+        self.assertEqual(launches, [])
+        resume.assert_not_called()
 
     def test_queued_recovery_uses_its_launch_even_when_the_units_group_is_unavailable(self) -> None:
         source = self.queued_unit()

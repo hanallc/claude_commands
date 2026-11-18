@@ -201,6 +201,31 @@ class HanaPlacementTests(CostFixture):
         self.assertFalse(self.controller.release(pending.reference.claim_id))
         self.assertEqual(self.claim(), pending)
 
+    def test_placement_releases_only_a_dead_claim_after_lifecycle_abandonment(self) -> None:
+        from scripts.aws_target import hana_execution
+
+        pending = self.claim()
+        assert isinstance(pending, hana.HanaClaimPending)
+        other = replace(self.request(), episode='other')
+        self.clock.advance(1)
+        self.assertEqual(self.controller.tick(), box.Lifecycle.STARTING)
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            evidence = self.evidence(other)
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+            self.clock.advance(1)
+            self.assertEqual(self.controller.tick(), box.Lifecycle.IDLE_STOPPED)
+        evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertIsInstance(evidence.eligibility, placement.AllowedHost)
+        self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+        self.assertIsInstance(hana_execution.read_claim_execution(self.state, pending.reference),
+                              placement.ExecutionNotStarted)
+
     def test_failed_boot_never_recommits_demand_for_the_same_assignment(self) -> None:
         pending = self.claim()
         assert isinstance(pending, hana.HanaClaimPending)

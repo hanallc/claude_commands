@@ -1,4 +1,4 @@
-"""Keep The List as numbered records under the producer's fixed staff ID."""
+"""Keep The List as numbered records under morty's fixed staff ID."""
 from __future__ import annotations
 
 try:
@@ -11,9 +11,11 @@ import ast
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -23,7 +25,8 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone
-from scripts.production import record_store, staff
+from scripts.message import send_result, session_send
+from scripts.production import delivery_state, record_store, staff
 from scripts.review_links import change_page, page_question, question_record
 
 
@@ -131,12 +134,13 @@ class ReadCurrentUpdate(StrEnum):
 
 @dataclass(frozen=True)
 class PageRequest:
-    """Identify a List action and the words it must match on retry."""
+    """Identify the action and its input for a retry."""
 
     request: str
-    action: Literal["tell", "remove", "park", "read", "question"]
+    action: Literal["tell", "remove", "park", "unpark", "read", "question"]
     words: str
     form_words: str = ""
+    parked_until: Timestamp = NoTimestamp.UNSET
 
 
 class NoPageRequest(StrEnum):
@@ -149,6 +153,17 @@ class QuestionRequestReceipt:
     question_id: str
 
 
+class UnparkNoChangeReason(StrEnum):
+    EXPIRED = "expired"
+    NO_ACTIVE_PARKING = "no_active_parking"
+
+
+@dataclass(frozen=True)
+class UnparkNoChangeReceipt:
+    request: PageRequest
+    reason: UnparkNoChangeReason
+
+
 @dataclass(frozen=True)
 class PageFeedback:
     request: str
@@ -156,11 +171,12 @@ class PageFeedback:
     state: Literal["pending", "sent", "alerted"] = "pending"
     alerted_to: str = ""
     read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
-    action: Literal["tell", "remove", "park"] = "tell"
+    action: Literal["tell", "remove", "park", "unpark"] = "tell"
     form_words: str = ""
+    parked_until: Timestamp = NoTimestamp.UNSET
 
     def key(self) -> PageRequest:
-        return PageRequest(self.request, self.action, self.words, self.form_words)
+        return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
 
 
 @dataclass(frozen=True)
@@ -169,8 +185,9 @@ class PageItemNotice:
 
     request: str
     words: str
-    action: Literal["remove", "park"]
+    action: Literal["remove", "park", "unpark"]
     form_words: str = ""
+    parked_until: Timestamp = NoTimestamp.UNSET
 
 
 PAGE_SOURCE = "nate via List"
@@ -207,9 +224,51 @@ class ListItem:
     reviews: tuple[str, ...] = ()
     questions: tuple[question_record.Question, ...] = ()
 
+    def __post_init__(self) -> None:
+        if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
+            return
+        # A Closed item can have an unread answer after its last close.
+        for entry in reversed(self.log):
+            if isinstance(entry.what, QuestionAnswered):
+                if entry.time == self.unread_since:
+                    return
+                break
+            if isinstance(entry.what, MarkedRead) or isinstance(entry.what, FieldChange) and entry.what.action == "Closed":
+                break
+        object.__setattr__(self, "unread_since", NoTimestamp.UNSET)
+
     @property
     def id(self) -> str:
         return f"L{self.number}"
+
+
+class AllItems(StrEnum):
+    INCLUDED = "all items"
+
+
+@dataclass(frozen=True)
+class SavedEdit:
+    before: ListItem
+    item: ListItem
+
+
+@dataclass(frozen=True)
+class UnchangedEdit:
+    item: ListItem
+
+
+ListEdit = SavedEdit | UnchangedEdit
+
+
+class ProducerRecordOmission(StrEnum):
+    OUTSIDE_SCOPE = "outside the producer's scope"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class ProducerListRead:
+    items: list[ListItem]
+    incomplete: bool
 
 
 class ItemChanges(TypedDict, total=False):
@@ -248,6 +307,14 @@ class LegacyFieldChange(FieldChange):
 
 
 @dataclass(frozen=True)
+class PageParkingChange(FieldChange):
+    """Link the parking change to the List page request."""
+
+    action: Literal["Parked"]
+    request: str
+
+
+@dataclass(frozen=True)
 class QuestionAnswered:
     question_id: str
 
@@ -263,6 +330,11 @@ class Reopened:
 
 
 @dataclass(frozen=True)
+class Unparked:
+    pass
+
+
+@dataclass(frozen=True)
 class ReviewLinksChanged:
     action: Literal["Linked reviews", "Unlinked reviews"]
     keys: tuple[str, ...]
@@ -273,8 +345,8 @@ class EvidenceCopyRemoved:
     copy: Literal["checkins.json", "the List row"]
 
 
-PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt
-ListEvent = FieldChange | QuestionAnswered | MarkedRead | Reopened | ReviewLinksChanged | EvidenceCopyRemoved | PageActivity
+PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
+ListEvent = FieldChange | QuestionAnswered | MarkedRead | Reopened | Unparked | ReviewLinksChanged | EvidenceCopyRemoved | PageActivity
 LogContent = str | ListEvent
 
 
@@ -469,7 +541,7 @@ def _validate(item: ListItem) -> None:
     for change in item.log:
         if isinstance(change.what, str):
             _log_line(change.what, "log text")
-        if isinstance(change.what, (PageFeedback, PageRequest, QuestionRequestReceipt)):
+        if isinstance(change.what, (PageFeedback, PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt)):
             _validate_page_source(change.source)
         _log_line(change.source, "source")
         if " — " in change.source or change.time.utcoffset() is None:
@@ -506,16 +578,6 @@ def _review_keys(value: object) -> tuple[str, ...]:
     if any(not isinstance(entry, str) for entry in entries):
         raise ListError("reviews must be a list of keys")
     return tuple(cast(list[str], entries))
-
-
-def _read_questions(text: str) -> tuple[question_record.Question, ...]:
-    value = cast(object, json.loads(text))
-    if not isinstance(value, list):
-        raise ListError("invalid List questions")
-    questions = tuple(question_record.read(question) for question in cast(list[object], value))
-    if len({question.question_id for question in questions}) != len(questions):
-        raise ListError("duplicate question id")
-    return questions
 
 
 def _log_fields(fields: LogFields) -> dict[str, object]:
@@ -694,7 +756,10 @@ def _question_id(value: object) -> str:
 
 
 def _request_fields(request: PageRequest) -> dict[str, str]:
-    return {"request": _request_id(request.request), "action": request.action, "words": request.words, "form_words": request.form_words}
+    fields = {"request": _request_id(request.request), "action": request.action, "words": request.words, "form_words": request.form_words}
+    if isinstance(request.parked_until, datetime):
+        fields["parked_until"] = request.parked_until.isoformat()
+    return fields
 
 
 def _log_content(content: LogContent) -> dict[str, object]:
@@ -702,6 +767,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"note": content}
     if isinstance(content, LegacyFieldChange):
         return {"note": content.note}
+    if isinstance(content, PageParkingChange):
+        return {"action": content.action, "fields": _log_fields(content.fields), "request": _request_id(content.request)}
     if isinstance(content, FieldChange):
         return {"action": content.action, "fields": _log_fields(content.fields)}
     if isinstance(content, QuestionAnswered):
@@ -710,6 +777,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": "Marked read"}
     if isinstance(content, Reopened):
         return {"action": "Reopened"}
+    if isinstance(content, Unparked):
+        return {"action": "Unparked"}
     if isinstance(content, ReviewLinksChanged):
         return {"action": content.action, "keys": content.keys}
     if isinstance(content, EvidenceCopyRemoved):
@@ -722,6 +791,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
         return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
+    if isinstance(content, UnparkNoChangeReceipt):
+        return {"receipt": {**_request_fields(content.request), "unpark_no_change": content.reason.value}}
     return {"receipt": _request_fields(content)}
 
 
@@ -752,6 +823,9 @@ def _read_log_line(line: str, number: int) -> ItemChange:
         match fields:
             case {"note": str(note)} if len(fields) == 1:
                 content = _read_legacy_note(note, source, number)
+            case {"action": "Parked", "fields": values, "request": request} if len(fields) == 3:
+                parking = _read_field_change("Parked", values, number)
+                content = PageParkingChange("Parked", parking.fields, _request_id(request))
             case {"action": action, "fields": values} if len(fields) == 2 and action in ("Added", "Updated", "Parked", "Closed"):
                 content = _read_field_change(action, values, number)
             case {"action": "Answered", "question_id": question_id} if len(fields) == 2:
@@ -760,6 +834,8 @@ def _read_log_line(line: str, number: int) -> ItemChange:
                 content = MarkedRead()
             case {"action": "Reopened"} if len(fields) == 1:
                 content = Reopened()
+            case {"action": "Unparked"} if len(fields) == 1:
+                content = Unparked()
             case {"action": action, "keys": values} if len(fields) == 2 and action in ("Linked reviews", "Unlinked reviews"):
                 keys = _review_keys(values)
                 _validate_review_keys(keys)
@@ -785,6 +861,10 @@ def _read_log_line(line: str, number: int) -> ItemChange:
 def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> ListItem:
     store = _store(keeper)
     fields, body = store.read(identity, sources=sources)
+    return _read_item(store, identity, fields, body)
+
+
+def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[str, str], body: str) -> ListItem:
     try:
         marker = "## Next step\n\n"
         if not body.startswith(marker):
@@ -800,7 +880,7 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
         changes = tuple(_read_log_line(line.removesuffix("\r"), number) for line in log_lines)
         item = ListItem(number, fields["title"],
                         UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
-                        staff.StaffId(fields.get("producer", keeper)),
+                        staff.StaffId(fields.get("producer", store.owner)),
                         fields["unit"], _item_state(fields["state"]), next_check_value(fields["next_check"]),
                         _read_eta(fields["eta"], fields["eta_kind"]),
                         time_value(fields["unread_since"]), time_value(fields["parked_until"]),
@@ -809,13 +889,27 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
                         time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
                         fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
                         _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
-                        _read_questions(fields.get("questions", "[]")))
+                        delivery_state.read_list_questions(fields.get("questions", "[]")))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
         return item
     except (ValueError, KeyError, TypeError) as error:
         raise store.invalid(identity, error) from None
+
+
+def _require_active_open_producers(items: Sequence[ListItem]) -> None:
+    producers = dict.fromkeys(item.producer for item in items if item.state != ItemState.CLOSED)
+    if not producers:
+        return
+    try:
+        record = staff.authority_snapshot()
+    except staff.StaffAbsent:
+        return
+    for identity in producers:
+        producer = record.by_id(identity)
+        if producer is not None and isinstance(producer.retirement, staff.RetiredProducer):
+            raise ListError(f"{producer.name}: retired producer. Choose an active producer.")
 
 
 def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
@@ -848,6 +942,61 @@ def records(keeper: staff.StaffId, *, include_closed: bool = False,
             sources: list[Path] | None = None) -> list[ListItem]:
     items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
+
+
+def _producer_records(keeper: staff.StaffId, producer: staff.StaffId, *, include_closed: bool) -> ProducerListRead:
+    store = _store(keeper)
+
+    def read_visible(identity: str) -> ListItem | ProducerRecordOmission:
+        try:
+            fields, body = store.read(identity)
+            assigned = fields.get("producer", keeper)
+            _staff_id(assigned, "producer")
+            if assigned != producer:
+                return ProducerRecordOmission.OUTSIDE_SCOPE
+            return _read_item(store, identity, fields, body)
+        except (ListError, OSError):
+            return ProducerRecordOmission.UNREADABLE
+
+    try:
+        # Request source paths so the directory scan reports read errors.
+        results = store.records(read_visible, sources=[])
+    except OSError:
+        return ProducerListRead([], incomplete=True)
+    items = [item for item in results if isinstance(item, ListItem) and (include_closed or item.state != ItemState.CLOSED)]
+    return ProducerListRead(items, incomplete=ProducerRecordOmission.UNREADABLE in results)
+
+
+@dataclass(frozen=True)
+class WaitingForAnswer:
+    """Each unanswered question reached the producer or has a live or scheduled send."""
+
+
+@dataclass(frozen=True)
+class QuestionResend:
+    question: question_record.Question
+    delivery: change_page.QuestionDeliveryView
+
+
+@dataclass(frozen=True)
+class QuestionResends:
+    questions: tuple[QuestionResend, ...]
+
+
+def question_visibility(keeper: staff.StaffId, item: ListItem,
+                        status: change_page.DeliveryStatus) -> WaitingForAnswer | QuestionResends:
+    """Read the delivery state of each unanswered question."""
+    unanswered = tuple(question for question in item.questions if question.answer is None)
+    if not unanswered:
+        return QuestionResends(())
+    target = _list_question_target(keeper, item)
+    resends: list[QuestionResend] = []
+    with status.locked():
+        for question in unanswered:
+            delivery = change_page.question_delivery_view(status, target.saved(question))
+            if not delivery.state.waits:
+                resends.append(QuestionResend(question, delivery))
+    return QuestionResends(tuple(resends)) if resends else WaitingForAnswer()
 
 
 def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChanges) -> None:
@@ -887,6 +1036,7 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
             if store.path(item.id).exists():
                 raise ListError(f"{item.id}: the item already exists")
             _check_links(read, item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to})
+        _require_active_open_producers(items)
         for item in items:
             _save(store, item)
 
@@ -914,24 +1064,33 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
         _validate(item)
         _check_links(lambda number: load(keeper, f"L{number}"), item.number, changes)
+        _require_active_open_producers((item,))
         _save(store, item)
         return item
 
 
 def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, datetime], ListItem],
             what: ListEvent, source: str, *, unread: bool = True,
-            page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+            page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT,
+            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
     store = _store(keeper)
     _ = store.path(identity)
     with store.locked():
-        item = load(keeper, identity)
+        if assigned_to is AllItems.INCLUDED:
+            item = load(keeper, identity)
+        else:
+            fields, body = store.read(identity)
+            if fields.get("producer", keeper) != assigned_to:
+                raise ListError(f"{identity} is assigned to another producer")
+            item = _read_item(store, identity, fields, body)
         request = page_action
         if isinstance(page_action, PageItemNotice):
             if not page_action.words.strip():
                 raise ListError("an item notice needs words")
-            request = PageRequest(page_action.request, page_action.action, page_action.words, page_action.form_words)
+            request = PageRequest(page_action.request, page_action.action, page_action.words, page_action.form_words,
+                                  page_action.parked_until)
         if isinstance(request, PageRequest) and _previous_page_request(item, request) is not NoPageRequest.ABSENT:
-            return item
+            return UnchangedEdit(item)
         moment = now()
         changed = edit(item, moment)
         entries: list[ItemChange] = []
@@ -941,18 +1100,25 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if isinstance(request, PageRequest):
             if entries and isinstance(page_action, PageItemNotice):
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
-                                       form_words=page_action.form_words)
+                                       form_words=request.form_words, parked_until=request.parked_until)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
+            elif request.action == "unpark":
+                reason = (UnparkNoChangeReason.EXPIRED if isinstance(item.parked_until, datetime)
+                          else UnparkNoChangeReason.NO_ACTIVE_PARKING)
+                entries.insert(0, ItemChange(moment, UnparkNoChangeReceipt(request, reason), PAGE_SOURCE))
             else:
                 entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
         if not entries:
-            return item
+            return UnchangedEdit(item)
         changed = replace(changed, log=(*item.log, *entries))
         _validate(changed)
+        if item.state == ItemState.CLOSED or changed.producer != item.producer:
+            _require_active_open_producers((changed,))
         if isinstance(request, PageRequest):
-            return _save_page_request(store, keeper, changed, request)
-        _save(store, changed)
-        return changed
+            changed = _save_page_request(store, keeper, changed, request)
+        else:
+            _save(store, changed)
+        return SavedEdit(item, changed)
 
 
 def _open(item: ListItem) -> None:
@@ -1020,6 +1186,11 @@ def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
 
 
 def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str) -> ListItem:
+    return _update(keeper, identity, changes, source=source).item
+
+
+def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str,
+            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         if changes.get("state") == ItemState.CLOSED:
@@ -1028,7 +1199,31 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
         _validate(changed)
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
-    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source)
+    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=assigned_to)
+
+
+def move_open_producer(keeper: staff.StaffId, identity: str, previous: staff.StaffId,
+                       producer: staff.StaffId, *, source: str) -> ListItem:
+    """Move an open item only while it belongs to the previous producer."""
+    def edit(item: ListItem, _: datetime) -> ListItem:
+        if item.state == ItemState.CLOSED or item.producer != previous:
+            return item
+        return replace(item, producer=producer)
+
+    return _change(keeper, identity, edit, FieldChange("Updated", {"producer": producer}), source).item
+
+
+@contextmanager
+def require_no_open_producer_items(keeper: staff.StaffId, producer: staff.StaffId) -> Generator[None]:
+    """Hold the List lock after confirming the producer has no open items."""
+    store = _store(keeper)
+    with store.locked():
+        for path in store.folder().iterdir():
+            if path.suffix == ".md" and store.valid_id(path.stem):
+                item = load(keeper, path.stem)
+                if item.state != ItemState.CLOSED and item.producer == producer:
+                    raise ListError("new open items belong to the producer. Run agents retire again.")
+        yield
 
 
 def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
@@ -1038,7 +1233,7 @@ def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(dict.fromkeys((*item.reviews, *chosen))))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source)
+    return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source).item
 
 
 def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
@@ -1048,17 +1243,35 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(review for review in item.reviews if review not in chosen))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source)
+    return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
 
 
 def park(keeper: staff.StaffId, identity: str, until: Timestamp, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+    fields: LogFields = {"parked_until": until}
+    event = FieldChange("Parked", fields)
+    if isinstance(notice, PageItemNotice) and isinstance(until, datetime):
+        _validate_time(until)
+        notice = replace(notice, parked_until=until.astimezone(UTC))
+        event = PageParkingChange("Parked", fields, notice.request)
+
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if isinstance(notice, PageItemNotice) and (not isinstance(until, datetime) or until <= moment):
             raise ListError("Choose a future parking date.")
         _open(item)
         return replace(item, parked_until=until)
-    return _change(keeper, identity, edit, FieldChange("Parked", {"parked_until": until}), source, page_action=notice)
+    return _change(keeper, identity, edit, event, source, page_action=notice).item
+
+
+def unpark(keeper: staff.StaffId, identity: str, *, source: str,
+           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListEdit:
+    """Clear an active parking time and save its notice in the same write."""
+    def edit(item: ListItem, moment: datetime) -> ListItem:
+        if not isinstance(item.parked_until, datetime) or item.parked_until <= moment:
+            return item
+        _open(item)
+        return replace(item, parked_until=NoTimestamp.UNSET)
+    return _change(keeper, identity, edit, Unparked(), source, page_action=notice)
 
 
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
@@ -1070,7 +1283,8 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
                 return item
             raise ListError("the item is already Closed with different closing words")
         return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words)
-    return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source, page_action=notice)
+    return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
+                   unread=False, page_action=notice).item
 
 
 def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
@@ -1078,7 +1292,7 @@ def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
         if item.state != ItemState.CLOSED:
             return item
         return replace(item, state=ItemState.NEW, closed=NoTimestamp.UNSET, closing_words="", parked_until=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, Reopened(), source)
+    return _change(keeper, identity, edit, Reopened(), source).item
 
 
 def _unread_log_content(content: LogContent) -> str | dict[str, object]:
@@ -1099,18 +1313,33 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
 
 
+def unread_answer_ids(item: ListItem) -> frozenset[str]:
+    """Find answers since the last action that cleared the item's unread state."""
+    if not isinstance(item.unread_since, datetime):
+        return frozenset()
+    unread: set[str] = set()
+    for change in reversed(item.log):
+        content = change.what
+        if (isinstance(content, (MarkedRead, Reopened)) or content in ("Marked read", "Reopened")
+                or isinstance(content, FieldChange) and content.action == "Closed"):
+            break
+        if isinstance(content, QuestionAnswered):
+            unread.add(content.question_id)
+    return frozenset(unread)
+
+
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
-              update: UnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
+              update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
               page_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
     def edit(item: ListItem, _: datetime) -> ListItem:
-        if isinstance(update, UnreadUpdate) and unread_update(item) != update:
+        if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
         return replace(item, unread_since=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
+    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request).item
 
 
 def is_page_request_receipt(entry: ItemChange) -> bool:
-    return entry.source == PAGE_SOURCE and (isinstance(entry.what, (PageRequest, QuestionRequestReceipt))
+    return entry.source == PAGE_SOURCE and (isinstance(entry.what, (PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt))
         or isinstance(entry.what, str) and entry.what.startswith(_LEGACY_RECEIPT))
 
 
@@ -1131,28 +1360,40 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     action = fields.get("action")
     if not isinstance(words, str) or not isinstance(form_words, str):
         raise ListError("invalid List request log")
+    parking_time = fields.get("parked_until", "")
+    if not isinstance(parking_time, str) or (parking_time and action != "park"):
+        raise ListError("invalid List request parking time")
+    parked_until = _required_time(parking_time).astimezone(UTC) if parking_time else NoTimestamp.UNSET
+    if "unpark_no_change" in fields and (not receipt or action != "unpark"):
+        raise ListError("invalid Unpark receipt")
     if receipt:
-        if action not in ("read", "remove", "park", "question") or (action != "read" and not words.strip()):
+        if action not in ("read", "remove", "park", "unpark", "question") or (action != "read" and not words.strip()):
             raise ListError("invalid List request receipt")
-        received = PageRequest(request, action, words, form_words)
+        received = PageRequest(request, action, words, form_words, parked_until)
         if action == "question":
             return QuestionRequestReceipt(received, _question_id(fields.get("question_id")))
+        if "unpark_no_change" in fields:
+            reason = fields["unpark_no_change"]
+            if reason not in (UnparkNoChangeReason.EXPIRED, UnparkNoChangeReason.NO_ACTIVE_PARKING):
+                raise ListError("invalid Unpark outcome")
+            return UnparkNoChangeReceipt(received, UnparkNoChangeReason(reason))
         return received
     state, alerted_to, target = fields.get("state"), fields.get("alerted_to", ""), fields.get("read_update", "")
     if state not in ("pending", "sent", "alerted") or not isinstance(alerted_to, str) or not isinstance(target, str):
         raise ListError("invalid List feedback log")
-    if action not in ("tell", "remove", "park") or not words.strip():
+    if action not in ("tell", "remove", "park", "unpark") or not words.strip():
         raise ListError("invalid List feedback action")
     return PageFeedback(request, words, state, alerted_to,
-                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words)
+                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words, parked_until)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:
     requests: dict[str, PageActivity] = {}
     for entry in item.log:
         content = entry.what
-        if entry.source == PAGE_SOURCE and isinstance(content, (PageRequest, PageFeedback, QuestionRequestReceipt)):
-            identity = content.request.request if isinstance(content, QuestionRequestReceipt) else content.request
+        if entry.source == PAGE_SOURCE and isinstance(content, (PageRequest, PageFeedback, QuestionRequestReceipt, UnparkNoChangeReceipt)):
+            identity = (content.request.request if isinstance(content, (QuestionRequestReceipt, UnparkNoChangeReceipt))
+                        else content.request)
             requests[identity] = content
     return requests
 
@@ -1162,17 +1403,39 @@ def feedback_requests(item: ListItem) -> dict[str, PageFeedback]:
     return {request: saved for request, saved in _page_requests(item).items() if isinstance(saved, PageFeedback)}
 
 
+def unpark_no_change_reason(item: ListItem, request: str) -> UnparkNoChangeReason:
+    """Read the original reason from an Unpark receipt."""
+    saved = _page_requests(item).get(_request_id(request))
+    if isinstance(saved, UnparkNoChangeReceipt):
+        return saved.reason
+    if isinstance(saved, PageRequest) and saved.action == "unpark":
+        # Older receipts do not record why the request made no change.
+        return UnparkNoChangeReason.NO_ACTIVE_PARKING
+    raise ListError("the List item has no Unpark receipt for this request")
+
+
 def _previous_page_request(
-        item: ListItem, request: PageRequest) -> PageFeedback | PageRequest | QuestionRequestReceipt | NoPageRequest:
+        item: ListItem, request: PageRequest) -> PageActivity | NoPageRequest:
     previous = _page_requests(item).get(_request_id(request.request), NoPageRequest.ABSENT)
     if previous is not NoPageRequest.ABSENT:
         if isinstance(previous, PageFeedback):
             key = previous.key()
-        elif isinstance(previous, QuestionRequestReceipt):
+        elif isinstance(previous, (QuestionRequestReceipt, UnparkNoChangeReceipt)):
             key = previous.request
         else:
             key = previous
-        if key != request:
+        if key.action == request.action == "park" and isinstance(request.parked_until, datetime):
+            target = key.parked_until
+            if target is NoTimestamp.UNSET:
+                recorded = [change.fields.get("parked_until", NoTimestamp.UNSET) for entry in item.log
+                            if isinstance(change := entry.what, PageParkingChange) and change.request == key.request]
+                if len(recorded) == 1 and isinstance(recorded[0], datetime):
+                    target = recorded[0].astimezone(UTC)
+            if target != request.parked_until:
+                raise ListError("this request already has a different parking time")
+            if key.form_words != request.form_words:
+                raise ListError("this request already has a different action or words")
+        elif key != request:
             raise ListError("this request already has a different action or words")
     return previous
 
@@ -1193,9 +1456,11 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
 class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
+    resend_id: str = ""
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
-        return load(self.keeper, item).questions
+        questions = load(self.keeper, item).questions
+        return tuple(question for question in questions if question.question_id == self.resend_id) if self.resend_id else questions
 
     def add(self, item: str, question: question_record.Question) -> None:
         # ask_question holds the List lock from the receipt check through this write.
@@ -1233,7 +1498,6 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
         raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
-    source = store.path(identity)
     questions = _ListQuestionStore(keeper, request)
     with store.locked():
         item = load(keeper, identity)
@@ -1245,10 +1509,29 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
                 return change_page.NoMessageDelivery()
         elif open_question is not None:
             questions.save_request(item, request, open_question)
-        command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
-                   + 'answer {item} --question {question_id} --text "<answer>"')
-        return page_question.ask(questions, identity, keeper, source, f"List item {item.number}", item.title,
-                                 request.words, command, status)
+        return _claim_question(questions, item, request.words, status)
+
+
+def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
+                    status: change_page.DeliveryStatus, *, resend_request: str = "") -> change_page.MessageDelivery:
+    return page_question.ask(questions, _list_question_target(questions.keeper, item), words, status,
+                             resend_unknown=bool(questions.resend_id), resend_request=resend_request)
+
+
+def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
+    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title, keeper)
+
+
+def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
+                    request: str, status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Claim delivery for the saved question with this ID."""
+    with _store(keeper).locked():
+        item = load(keeper, identity)
+        for question in item.questions:
+            if question.question_id == question_id and question.answer is None:
+                return _claim_question(_ListQuestionStore(keeper, resend_id=question_id), item, question.words, status,
+                                       resend_request=request)
+        return change_page.NoMessageDelivery()
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
@@ -1319,14 +1602,19 @@ def order(item: ListItem) -> tuple[bool, bool, float, int]:
 
 
 def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked: bool = False) -> str:
+    return _format_table(records(keeper, include_closed=include_closed), staff.snapshot(), include_parked=include_parked)
+
+
+def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, include_parked: bool,
+                  show_latest_status: bool = False) -> str:
     moment = now()
-    items = records(keeper, include_closed=include_closed)
-    items = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
-    items.sort(key=order)
-    record = staff.snapshot()
-    lines = ["| # | Owner | Producer | Item | State | Next step | ETA | Update |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for item in items:
+    visible = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
+    visible.sort(key=order)
+    columns = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
+    if show_latest_status:
+        columns += ("Latest status",)
+    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
+    for item in visible:
         owner = record.by_id(item.owner) if not isinstance(item.owner, UnassignedOwner) else None
         state = item.state.value
         if item.state != ItemState.CLOSED and isinstance(item.next_check, datetime):
@@ -1339,6 +1627,8 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
         cells = (str(item.number), owner.name if owner is not None else item.owner,
                  producer.name if producer is not None else item.producer, item.title, state,
                  item.next_step, eta_text(item.eta), "●" if isinstance(item.unread_since, datetime) else "—")
+        if show_latest_status:
+            cells += (item.latest_status,)
         lines.append("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines)
 
@@ -1393,17 +1683,64 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
     return changes
 
 
+def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
+    command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
+                                     "--from", "morty", "--text", text)
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in ("sent", "skipped"):
+        return
+    raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
+
+
+def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId) -> int:
+    if item.producer in (keeper, previous_producer):
+        return 0
+    try:
+        members = staff.snapshot()
+    except (ValueError, staff.StaffRefused, OSError) as error:
+        raise ListError(f"{item.id} was saved. The producer and showrunner notices were not sent. {error}") from error
+    producer = next((row for row in staff.active(members, "producer") if row.id == item.producer), None)
+    owner = next((row for row in staff.active(members, "showrunner") if row.id == item.owner), None)
+    showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
+    item_text = f"item {item.number}: {item.title}"
+    launcher = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
+    notices = (
+        ("producer", item.producer, producer, f"You are the producer of {item_text}. {showrunner}\n"
+         + f"Run `{launcher} list --all --latest-status` to read it. "
+         + f"Run `{launcher} update --id {item.id}` with `--latest-status`, `--next-step`, or `--eta` to update it."),
+        ("showrunner", item.owner, owner, f"The saved assignment for {item_text} needs a new producer."
+         if producer is None else f"{producer.name} is the producer of {item_text}. "
+         + f"Send design questions on this item to {producer.name}."),
+    )
+    status = 0
+    for role, reference, recipient, message in notices:
+        try:
+            if recipient is None:
+                if role == "producer":
+                    raise ListError("The producer has no current producer staff row.")
+                if isinstance(reference, UnassignedOwner):
+                    raise ListError("the item has no assigned showrunner")
+                raise ListError("the owner has no current showrunner staff row")
+            _send_assignment_notice(recipient, message)
+        except (ListError, OSError, subprocess.SubprocessError, UnicodeError) as error:
+            details = " ".join(str(error).splitlines())
+            print(f"the_list: {item.id} was saved. The {role} notice to {reference} failed. {details}", file=sys.stderr)
+            status = 1
+    return status
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    answer = commands.add_parser("answer", help="answer a List question and mark the item unread")
+    answer = commands.add_parser("answer", help="save an answer to a List question")
     _ = answer.add_argument("id", help="the List item ID, such as L1")
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
-            _ = command.add_argument("--source", required=True)
+            _ = command.add_argument("--source", required=name != "update")
         if name in ("link", "unlink"):
             _ = command.add_argument("id")
             _ = command.add_argument("--review", dest="reviews", action="append", type=ReviewByShownId, default=[])
@@ -1429,6 +1766,7 @@ def main(argv: list[str] | None = None) -> int:
         elif name == "list":
             _ = command.add_argument("--all", action="store_true")
             _ = command.add_argument("--include-parked", action="store_true")
+            _ = command.add_argument("--latest-status", action="store_true", help="show the latest status column")
     args = parser.parse_args(argv)
     name = cast(str, args.command)
     if name in ("link", "unlink") and not cast(list[ReviewByShownId | ReviewByKey], args.reviews):
@@ -1438,13 +1776,47 @@ def main(argv: list[str] | None = None) -> int:
         caller = record.by_current_session(staff.caller_identity())
         if caller is None:
             raise ListError("the current session has no staff row")
-        if caller.kind != "producer" or caller.name != "morty":
-            raise ListError("the current session must be the morty producer")
-        keeper = caller.id
+        if caller.kind != "producer":
+            raise ListError("the current session must be a producer")
+        keeper = producer_id(record, "morty")
+        assigned_to = AllItems.INCLUDED if caller.id == keeper else caller.id
         if name == "list":
-            print(table(keeper, include_closed=cast(bool, args.all),
-                        include_parked=cast(bool, args.all) or cast(bool, args.include_parked)))
+            include_closed = cast(bool, args.all)
+            if assigned_to is AllItems.INCLUDED:
+                items = records(keeper, include_closed=include_closed)
+                incomplete = False
+            else:
+                read = _producer_records(keeper, assigned_to, include_closed=include_closed)
+                items = read.items
+                incomplete = read.incomplete
+            print(_format_table(items, record, include_parked=include_closed or cast(bool, args.include_parked),
+                                show_latest_status=cast(bool, args.latest_status)))
+            if incomplete:
+                raise ListError("The List results are incomplete. Could not read every record.")
             return 0
+        if name == "update":
+            identity = cast(str, args.id)
+            if identity.isascii() and identity.isdecimal():
+                identity = f"L{identity}"
+            if assigned_to is not AllItems.INCLUDED:
+                options = cast(dict[str, object], vars(args))
+                allowed = {"command", "id", "source", "latest_status", "next_step", "eta"}
+                refused = sorted(f"--{key.replace('_', '-')}" for key, value in options.items()
+                                 if value is not None and key not in allowed)
+                if refused:
+                    raise ListError("producers can update only --latest-status, --next-step, and --eta. "
+                                    + f"Refused options: {', '.join(refused)}")
+                _ = _update(keeper, identity, _cli_changes(args, record), source=caller.name, assigned_to=assigned_to)
+                return 0
+            source = cast(str | None, args.source)
+            if source is None:
+                parser.error("update requires --source for morty")
+            changed = _update(keeper, identity, _cli_changes(args, record), source=source)
+            if isinstance(changed, UnchangedEdit):
+                return 0
+            return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
+        if assigned_to is not AllItems.INCLUDED:
+            raise ListError(f"only morty can run {name}")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
             result = page_question.answer(_ListQuestionStore(keeper), identity, question, cast(str, args.text))
@@ -1489,10 +1861,10 @@ def main(argv: list[str] | None = None) -> int:
             owner = changes.get("owner")
             if owner is None:
                 raise ListError("owner must name a showrunner staff id")
-            print(add(keeper, cast(str, args.title), owner=owner, source=source,
-                      number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes).id)
-        elif name == "update":
-            _ = update(keeper, cast(str, args.id), _cli_changes(args, record), source=source)
+            item = add(keeper, cast(str, args.title), owner=owner, source=source,
+                       number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes)
+            print(item.id)
+            return _notify_producer_assignment(item, keeper, keeper)
         elif name == "park":
             _ = park(keeper, cast(str, args.id), time_value(cast(str, args.until)), source=source)
         elif name == "close":

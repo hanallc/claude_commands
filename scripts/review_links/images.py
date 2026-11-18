@@ -20,6 +20,7 @@ from urllib.parse import parse_qs
 
 from scripts.lib import conf, file_lock
 from scripts.lib.user_zone import shown_time
+from scripts.production.delivery_state import QuestionSendState
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -36,20 +37,35 @@ ANSWERS = {"approved": "your image is approved.", "not approved": "your image is
 ACTIONS = frozenset(("delete", "question", *ANSWERS))
 
 
-class QuestionDeliveryNotice(StrEnum):
-    NONE = "No delivery notice"
+class QuestionDelivery(StrEnum):
+    ACCEPTED = "Waiting for the owner"
     SENDING = "Question saved. Sending to the owner."
     RETRY = "Not sent. Press Ask question again with the same words."
     UNCONFIRMED = "The send result is unknown. Enter the same words and press Ask question to send it again."
 
+    @property
+    def waits(self) -> bool:
+        return self in (self.ACCEPTED, self.SENDING)
+
+
+type ImageQuestionDelivery = QuestionDelivery | change_page.ResendBlocked
+NO_OPEN_QUESTIONS: Mapping[str, ImageQuestionDelivery] = MappingProxyType({})
+
 
 @dataclass(frozen=True)
-class QuestionDeliveryView:
-    notice: QuestionDeliveryNotice
-    poll: bool = False
+class ImageReview:
+    record: image_store.ImageRecord
+    open_questions: Mapping[str, ImageQuestionDelivery] = NO_OPEN_QUESTIONS
 
+    def visible(self) -> bool:
+        if self.open_questions:
+            return any(isinstance(delivery, change_page.ResendBlocked) or not delivery.waits
+                       for delivery in self.open_questions.values())
+        return "feedback_at" not in self.record
 
-NO_QUESTION_NOTICES: Mapping[str, QuestionDeliveryNotice] = MappingProxyType({})
+    def refresh(self) -> bool:
+        return any(isinstance(delivery, change_page.ResendBlocked) or delivery.waits
+                   for delivery in self.open_questions.values())
 
 
 class AnswerNotSent(Exception):
@@ -96,21 +112,46 @@ def records(root: Path) -> list[image_store.ImageRecord]:
     return sorted(found, key=lambda record: record["registered_at"])
 
 
-def waiting_records(root: Path) -> list[image_store.ImageRecord]:
-    """Return the Images records that still wait for the user's answer."""
-    return [record for record in records(root) if "feedback_at" not in record and not has_open_question(record)]
+def question_delivery(status: change_page.DeliveryStatus, saved: change_page.SavedQuestionDelivery
+                      ) -> ImageQuestionDelivery:
+    """Read the delivery state while the caller holds the delivery lock."""
+    delivery = change_page.question_delivery_view(status, saved)
+    match delivery.state:
+        case QuestionSendState.CLAIMED | QuestionSendState.SENDING:
+            return QuestionDelivery.SENDING
+        case QuestionSendState.READY | QuestionSendState.PREPARED:
+            if status.startup_recovery_pending.is_set():
+                return QuestionDelivery.SENDING
+            return QuestionDelivery.RETRY
+        case QuestionSendState.FAILED:
+            return QuestionDelivery.RETRY
+        case QuestionSendState.UNKNOWN:
+            return delivery if isinstance(delivery, change_page.ResendBlocked) else QuestionDelivery.UNCONFIRMED
+        case QuestionSendState.SENT | QuestionSendState.QUEUED:
+            return QuestionDelivery.ACCEPTED
 
 
-def has_open_question(record: image_store.ImageRecord) -> bool:
-    return any(question['answer'] is None for question in record.get('questions', []))
+def image_review(status: change_page.DeliveryStatus, record: image_store.ImageRecord) -> ImageReview:
+    open_questions = [question_record.read(saved) for saved in record.get('questions', []) if saved['answer'] is None]
+    if not open_questions:
+        return ImageReview(record)
+    target = change_page.image_question_target(images_root(status.root) / record['id'] / image_store.RECORD, record)
+    with status.locked():
+        return ImageReview(record, {
+            question.question_id: question_delivery(status, target.saved(question))
+            for question in open_questions
+        })
 
 
-def waiting_images(request: console.NewsRequest) -> frozenset[str]:
+def waiting_images(request: console.NewsRequest, *, status: change_page.DeliveryStatus | None = None) -> frozenset[str]:
     """Name the images that wait for the user, for the console's new mark."""
+    if status is None:
+        status = change_page.DeliveryStatus(request.root)
     waiting: set[str] = set()
-    for record in waiting_records(request.root):
-        questions = record.get('questions', [])
-        waiting.add(record['id'] + (':'+questions[-1]['question_id'] if questions else ''))
+    for record in records(request.root):
+        if image_review(status, record).visible():
+            answers = [saved['question_id'] for saved in record.get('questions', []) if saved['answer'] is not None]
+            waiting.add(record['id'] + (':'+answers[-1] if answers else ''))
     return frozenset(waiting)
 
 
@@ -160,19 +201,27 @@ def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
 
-def question_html(question: question_record.Question, notice: QuestionDeliveryNotice) -> str:
-    """Show the answer, a delivery failure, or a pending delivery for this question."""
-    if question.answer is not None:
-        return page_question.answered_question_html(question)
+def question_html(question: question_record.Question, open_questions: Mapping[str, ImageQuestionDelivery]) -> str:
+    answer = question.answer
+    if answer is not None:
+        return page_question.answered_question_html(question, answer)
     content = page_question.open_question_html(question)
-    if notice is QuestionDeliveryNotice.NONE:
+    delivery = open_questions.get(question.question_id, QuestionDelivery.ACCEPTED)
+    if delivery is QuestionDelivery.ACCEPTED:
         return content
-    return content.removesuffix('</section>') + f'<p role="status">{notice}</p></section>'
+    if isinstance(delivery, change_page.ResendBlocked):
+        notice = f'<p role="status" data-resend-blocked>{html.escape(delivery.reason)}</p>'
+    elif delivery is QuestionDelivery.SENDING:
+        notice = f'<p role="status">{delivery}</p>'
+    else:
+        words = html.escape(question.words, quote=True)
+        notice = f'<p role="status" data-resend-question="{words}">{delivery}</p>'
+    return content.removesuffix('</section>') + notice + '</section>'
 
 
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
-         question_notices: Mapping[str, QuestionDeliveryNotice] = NO_QUESTION_NOTICES) -> str:
+         open_questions: Mapping[str, ImageQuestionDelivery] = NO_OPEN_QUESTIONS) -> str:
     """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
@@ -196,8 +245,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
             + (f'<div class="image-pair">{pictures}</div>' if pair else pictures)
-            + ''.join(question_html(question, question_notices.get(question.question_id, QuestionDeliveryNotice.NONE))
-                      for question in questions)
+            + ''.join(question_html(question, open_questions) for question in questions)
             + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
@@ -205,29 +253,6 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
             + page_frame.review_action_groups(closing_buttons, returning_buttons)
             + '<span role="status" data-image-status></span></form></article>')
-
-
-def question_delivery_view(status: change_page.DeliveryStatus, page: change_page.ReviewPage,
-                           row: str) -> QuestionDeliveryView:
-    """Read the notice and polling state under the delivery lock."""
-    intent = status.slots(page, row).verdict
-    if isinstance(intent, change_page.DeliveryIntent) and status.startup_recovery_pending.is_set():
-        return QuestionDeliveryView(QuestionDeliveryNotice.SENDING, poll=True)
-    live_intent = isinstance(intent, change_page.DeliveryIntent) and status.owns_live_attempt(page, row, intent)
-    if isinstance(status.failed_delivery(page, row), change_page.FailedDelivery):
-        return QuestionDeliveryView(QuestionDeliveryNotice.RETRY, poll=live_intent)
-    if live_intent:
-        return QuestionDeliveryView(QuestionDeliveryNotice.SENDING, poll=True)
-    dispatch = status.image_question_dispatch(page, row)
-    if not isinstance(dispatch, change_page.NoImageQuestionDispatch):
-        if dispatch["state"] == "accepted":
-            return QuestionDeliveryView(QuestionDeliveryNotice.NONE)
-        if status.owns_live_claim(page, row, dispatch["attempt"]):
-            return QuestionDeliveryView(QuestionDeliveryNotice.SENDING, poll=True)
-        return QuestionDeliveryView(QuestionDeliveryNotice.UNCONFIRMED)
-    if isinstance(intent, change_page.DeliveryIntent) or status.image_question_intent_was_not_saved(page, row):
-        return QuestionDeliveryView(QuestionDeliveryNotice.RETRY)
-    return QuestionDeliveryView(QuestionDeliveryNotice.NONE)
 
 
 def render(status: change_page.DeliveryStatus) -> bytes:
@@ -238,30 +263,25 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     names = staff_names.StaffNames(members)
     settings = conf.read("review_links")
     rows = settings.whole("feedback_rows")
-    has_pending_delivery = False
-    cards = ""
+    waiting: list[str] = []
+    cards: list[str] = []
+    refresh_needed = False
     for record in records(root):
-        if "feedback_at" in record and not has_open_question(record):
-            continue
-        source = images_root(root) / record['id'] / image_store.RECORD
-        page = change_page.ReviewPage(source, source.parent, (), '')
-        open_rows = {saved['question_id']: f"{change_page.IMAGE_QUESTION_ROW_PREFIX}{record['id']}/{saved['question_id']}"
-                     for saved in record.get('questions', []) if saved['answer'] is None}
-        notices: dict[str, QuestionDeliveryNotice] = {}
-        if open_rows:
-            with status.locked():
-                for identity, row in open_rows.items():
-                    delivery = question_delivery_view(status, page, row)
-                    notices[identity] = delivery.notice
-                    has_pending_delivery = has_pending_delivery or delivery.poll
-        cards += card(record, token, members, rows, names, question_notices=notices)
-    delivery_refresh_seconds = settings.number("page_refresh_seconds")
-    refresh_seconds = delivery_refresh_seconds if has_pending_delivery else 0
+        review = image_review(status, record)
+        if review.visible():
+            cards.append(card(record, token, members, rows, names, open_questions=review.open_questions))
+        elif review.open_questions:
+            waiting.append(record['id'])
+        refresh_needed |= review.refresh()
+    answer_refresh_seconds = settings.number("page_refresh_seconds")
+    refresh_seconds = answer_refresh_seconds if refresh_needed else 0
+    waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
     content = (STYLE + page_frame.title("Images", "images")
+               + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
-               + f' data-delivery-refresh-seconds="{delivery_refresh_seconds}">'
-               + f'{cards}</div><p hidden data-empty></p></div></div>'
+               + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
+               + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
                + f'<script>{SCRIPT}</script>')
     return page_frame.rendered(change_page.document(content, "Images"), started, read_at)
@@ -302,10 +322,8 @@ def ask_question(root: Path, identity: str, words: str, status: change_page.Deli
     store = image_store.ImageQuestionStore(images_root(root))
     folder = store.folder(identity)
     record = image_store.read_record(folder)
-    command = ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer '
-               + '--id {item} --question {question_id} --text "<answer>"')
-    return page_question.ask(store, identity, staff.StaffId(record['owner']), folder / image_store.RECORD,
-        change_page.IMAGE_QUESTION_ROW_PREFIX+identity, record['caption'], words, command, status)
+    target = change_page.image_question_target(folder / image_store.RECORD, record)
+    return page_question.ask(store, target, words, status, resend_unknown=True)
 
 
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
@@ -397,12 +415,16 @@ SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
 const motion = createCardMotion();
 const empty = document.querySelector('[data-empty]');
 const groups = document.querySelector('[data-image-groups]');
+const layout = document.querySelector('[data-image-layout]');
+const waiting = document.querySelector('[data-image-waiting]');
 let list = document.querySelector('[data-images]');
 let sending = 0;
 let refreshRequest = 0;
-let needsDeliveryRead = false;
-const refreshSeconds = () => needsDeliveryRead ? list.dataset.deliveryRefreshSeconds : list.dataset.refreshSeconds;
+const refreshSeconds = () => list.dataset.refreshSeconds;
+const imageLink = () => new URLSearchParams(location.hash.slice(1));
 function apply() {
+  layout.hidden = list.dataset.waitingImages.split(' ').includes(imageLink().get('image'));
+  waiting.hidden = !layout.hidden;
   empty.hidden = list.children.length > 0;
   showGroups();
   empty.textContent = 'No images registered.';
@@ -466,8 +488,17 @@ function bind(root) {
         throw new Error(reason || 'HTTP ' + response.status);
       }
       if (question) {
-        form.elements.feedback.value = '';
-        needsDeliveryRead = true;
+        const words = form.elements.feedback.value.trim();
+        const otherResend = [...card.querySelectorAll('[data-resend-question],[data-resend-blocked]')]
+          .some(notice => notice.dataset.resendQuestion !== words);
+        if (otherResend) {
+          form.elements.feedback.value = '';
+        } else {
+          card.remove();
+          list.dataset.waitingImages += ' ' + card.dataset.image;
+        }
+        list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
+        apply();
         pageRefresh.restart();
       }
     } catch (error) {
@@ -478,7 +509,8 @@ function bind(root) {
     } finally {
       sending--;
       buttons.forEach(button => button.disabled = false);
-      void refresh().catch(error => {
+      if (question && !postFailed) void pageRefresh.refresh(true);
+      else void refresh().catch(error => {
         if (postFailed) return;
         status.dataset.refreshFailed = 'true';
         status.textContent = 'Update failed: ' + error.message;
@@ -514,6 +546,7 @@ async function refresh(_supersede=false,current=()=>true) {
       if (!oldStatus.dataset.refreshFailed) form.querySelector('[data-image-status]').textContent = oldStatus.textContent;
     });
     const top = scrollY;
+    const wasWaiting = !waiting.hidden;
     const previousRate = refreshSeconds();
     const restoreFocus = restoreFocusAfterRefresh();
     motion.finish();
@@ -522,9 +555,9 @@ async function refresh(_supersede=false,current=()=>true) {
     bind(list);
     apply();
     restoreFocus();
-    needsDeliveryRead = false;
     if (previousRate !== refreshSeconds()) pageRefresh.restart();
     scrollTo({top, behavior: 'instant'});
+    if (wasWaiting && waiting.hidden) scrollToLinkedImage();
     return facts;
   } catch (error) {
     if (isCurrent()) throw error;
@@ -533,24 +566,21 @@ async function refresh(_supersede=false,current=()=>true) {
 function selectImage(target) {
   void motion.scrollCard(target);
 }
-function openImageLink() {
-  const start = new URLSearchParams(location.hash.slice(1));
+function scrollToLinkedImage(animate = false) {
+  const start = imageLink();
   const target = document.getElementById('image-' + start.get('image'));
-  if (target) selectImage(target);
+  if (target && animate) selectImage(target);
+  else if (target) motion.scroll(target, true);
 }
-const start = new URLSearchParams(location.hash.slice(1));
-addEventListener('hashchange', openImageLink);
+addEventListener('hashchange', () => {
+  apply();
+  scrollToLinkedImage(true);
+});
 const pageRefresh = createPageRefresh(refresh, refreshSeconds);
 bind(list);
 // An image link opens its image at once.
-const linkedImage = start.get('image');
 apply();
-if (linkedImage) {
-  const target = document.getElementById('image-' + linkedImage);
-  if (target) {
-    motion.scroll(target, true);
-  }
-}
+scrollToLinkedImage();
 })();"""
 SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
 

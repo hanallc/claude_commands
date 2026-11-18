@@ -170,7 +170,9 @@ Reduced motion stops the loader icon.
 `page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
 Each loader checks the request identity before it changes content.
 An older response cannot replace a newer response.
-Accounts, List and Review read their rendered page at `page_refresh_seconds` intervals.
+Accounts and List read their rendered page at `page_refresh_seconds` intervals.
+Review checks the snapshot version at that interval.
+It requests the compact index only when the version changes.
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
@@ -326,8 +328,9 @@ The console inlines the icons and makes no CDN, font, script, or stylesheet requ
 The old addresses redirect to Review with the corresponding type filter.
 The redirect retains the owner, filters, sort and open item.
 Legacy `row` fields become `item` fields.
-The former Investigations Show values select the same records on Review.
-`not-read` and `answer ready` select Open; `open` selects Waiting; `read` selects Done; `all` selects All.
+`not-read` and `answer ready` select Open.
+Old Investigations links with `show=open` or `show=all` select All.
+`read` selects Done.
 Legacy investigation owner filters retain the exact record owner.
 The Review navigation entry uses the Lucide `inbox` icon.
 Selected-row snapshots retain their signed legacy forms.
@@ -336,10 +339,13 @@ Selected-row snapshots retain their signed legacy forms.
 It projects each record into one `ReviewItem`; it stores no second record.
 Each item has an ID, type, owner, source unit, title, state, times, log and permitted actions.
 Each item also exposes `waiting_why`, which is empty on older records without a reason.
-Waiting filers must supply a reason; one shared rule refuses empty or whitespace-only text.
-Changes store `waiting_why` with their delivery state; questions store it in their registration.
-Investigations and proposals store it in their frontmatter; efficiencies store it in the existing review file beside the ledger.
-The user's Ask question text becomes the reason automatically for every type.
+Waiting filers must supply a reason.
+The shared rule refuses empty text and text that contains only spaces.
+Questions store the reason in their registration.
+Investigations and proposals store it in their frontmatter.
+Efficiencies store it in the review file beside the ledger.
+The user's Ask question text supplies the reason.
+Changes store the request reason with their delivery state.
 Validation uses the user's feedback when the feedback contains text.
 Validation uses the stated validation request when the feedback is empty or contains only spaces.
 `waiting_why.py list` lists Waiting items without a reason, with their key, type, title and filer.
@@ -351,13 +357,17 @@ The command prints one plain error line for a refused update.
 `investigation.py file` requires `--waiting-why`. The Python `followup` API stores the follow-up words as the reason.
 `proposal_issue.record_review` and `efficiency_reviews.record` require `waiting_why` when setting the Waiting mark.
 `candidates.py outcome E<n> deferred --waiting-why "<reason>"` stores the reason beside the ledger.
-The states are **Open**, **Waiting** and **Done**.
-A future time hides an item without changing its state.
+The states are **Open**, **Validating**, **Waiting** and **Done**.
+Changes use Validating while the showrunner has the request.
+Questions, investigations, proposals and efficiencies use Waiting while they await a response or action.
+Later hides an item without changing its state.
+Validating changes remain visible in Validating and All.
 The count readers and `/next` use this shared reader.
 Open items count in the status line.
 An open investigation and a deferred efficiency item do not count.
-Questions receive a stable owner-local `Q<n>` ID in their existing registration record.
-The first read shows the allocated ID.
+Questions receive a stable, shared `Q<n>` ID in their registration records.
+The native writer assigns the ID under the question owner's lock.
+The snapshot uses the file name for a legacy question until a native write assigns its ID.
 Ordinary reminders serve the owner's session; Review excludes them from items and counts.
 Questions without an owner remain visible under Owner unavailable.
 These questions have the state Open and retain their previous count totals.
@@ -368,11 +378,16 @@ Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the ow
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
-When the user submits a Review action, the row and its open details fade and collapse together in 200 ms.
-The rows below slide into place as the row collapses.
+When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
+The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
+If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
-The status region above the table shows the result when the row or its details are hidden.
+A successful save adds no notice above the table.
+The status region above the table shows a failure only for the most recent submission.
+It shows that failure when the row or its details are hidden.
+The next save attempt or reload clears this notice.
 Filter and sort changes apply at once.
 The reduced motion preference disables row animations.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
@@ -388,30 +403,51 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The Show row offers Open, Waiting, Done and All below the Type row.
+The Show row offers Open, Validating, Done and All below the Type row.
+Old Waiting links open All.
 The Owner row follows the Show row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
 Each Show count uses the selected type, owner and words.
 One typed `ReviewIndexEntry` record defines the index for counts, filters and column sorting.
-Each page and refresh carries the complete index, including states outside the rendered view.
-The index contains the key, ID, type, owner, source owner, owner name, title, state, filed time and revision time.
-It contains no bodies or HTML.
+The shell carries the complete index, including states outside the selected view.
+Each changed version supplies a complete replacement index.
+The index contains the key, ID, type, owner, source owner, owner name, title, state, filed time and update time.
+It also supplies the source name, urgency label and Later time for each summary.
+A Validating Change supplies the time of its request.
+The wire format shares identity names and omits an ID when it equals the key.
+The index contains summary values and shared staff labels.
+The server sends card bodies on demand.
+The server sends gzip when the browser accepts it with a positive quality.
+Each body response carries its snapshot version.
+If the versions differ, the browser refreshes the index before it displays the body.
 The browser uses the index for every count and filter.
 The Show chips replace the right count text.
-Each chip selects its state. All selects every state.
-Waiting includes active showrunner checks.
-A save changes its index entry to Waiting, Done or a Later time.
-The next refresh replaces the index.
-When a refresh excludes the focused Owner chip, focus moves to the selected Owner chip.
+Open, Validating and Done select their states.
+Ask showrunner to check, Ask question and Send feedback move a change to Validating after the save.
+The change leaves Open and its counts when the request starts.
+A failed save restores the row and its counts.
+Validating and All show the change with **With <showrunner> since <time>** and no buttons.
+The Validating and All chips count the change.
+The Validating chip is dim at zero.
+The name comes from current staff data.
+The time comes from the saved request and uses the user zone.
+Older requests without a saved time use the delivery file time.
+The next changed snapshot replaces the index.
+An unchanged version retains the index and checks expired Later times.
 The fresh index supplies each item's state and revision, including items outside the rendered Show.
 The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
-An owner answer returns to Open after a refresh from Waiting or Done.
+A showrunner answer, feedback action or fault returns a Validating change to Open.
+A works result moves the change to Done without a notice.
 Stable chip IDs retain keyboard focus after a Show load or refresh.
-The shared table owns the Show state for both chip groups and selects.
-The List keeps its Show select.
+The row window keeps the focused row mounted during scroll.
+A refresh restores focus to the same control by row key.
+The browser keeps each pending save by key while the form leaves the window.
+Review and The List use Show chips.
+The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 The Type, Show and Owner chip rows wrap at phone width.
+If a refresh hides the focused Owner chip, focus moves to the selected Owner chip.
 All types that wait on the user have the state Open.
 The Open view shows only Open records.
 Legacy For you Show values select Open.
@@ -423,16 +459,70 @@ An address with only `item` selects All and clears the filters.
 The default order uses the existing urgency levels and age.
 Questions use a violet circle-help icon; Changes use a blue diff icon; Investigations use a teal microscope icon.
 Proposals use a pink lamp icon; Efficiencies use a lime zap icon.
-A proposal card loads the issue text without its front matter when the card opens (`review.html?body=<key>`).
-The Open view does not carry the proposal texts.
+The HTTP server retains one `ReviewSnapshot` with the records, index and shell.
+The worker records source timestamps before it reads the sources.
+The background worker checks source timestamps every half second.
+It also checks all stores every thirty seconds.
+A complete update replaces the current snapshot.
+Requests retain the current snapshot during an update.
+The server starts recovery before the snapshot worker.
+The first Review GET on a fresh root starts the worker's first build.
+The native Question writer assigns stable IDs to legacy Questions under the owner lock.
+The same guard tracks and skips each source or record that fails during a build.
+A notice names each skipped source or record.
+An invalid efficiency mark or Later time leaves the other entries available.
+The snapshot converts offset-free times to the user's time zone before it sorts records.
+A card with invalid display data opens with an error.
+A change to a tracked path starts a new build.
+If a shared read fails, the worker keeps the current snapshot.
+The worker logs the failure once until a build succeeds.
+Review GET and Review news read the retained snapshot.
+Each card form carries the record revision.
+The revision includes the complete retained record and the card assets.
+A Question prerequisite resolves to a Review key during sorting.
+A Change with an unreadable delivery record produces a notice and stays out of the snapshot.
+A Review save reads the selected record and its sources.
+An Efficiency save checks the ledger in the production document retained for its row.
+An unreadable Proposal prerequisite leaves its relationship empty in both the snapshot and the save.
+The save checks the revision under the store's write lock.
+The server returns HTTP 409 if the record is missing or its revision differs from the form revision.
+A current Done card accepts Later.
+The browser refreshes the index and shows a conflict reason above the table.
+The reason stays visible if the refresh removes the card.
+After a save, the server reads and publishes the saved record if it can.
+If publication fails, the server retains the current snapshot and requests a full rebuild.
+The store write determines success, so the server returns HTTP 200 and runs delivery after either publication result.
+A Change verdict uses the current staff assignment to select the production and the recipients.
+The server writes the cleanup intent and prepares the verdict file before feature-log closeout.
+The server cleans the Change scratch folders after the Review response and before delivery.
+On restart, the server reads each cleanup intent and checks its saved verdict.
+The server releases the list and delivery locks before it cleans the scratch folders.
+An unreadable Change list produces one recovery notice. Recovery continues with the other lists and intents.
+The delivery message includes the cleanup result and warnings.
+A message uses retained fields if a staff read fails after a verdict.
+The server retries a delivery claim that fails before sending.
+A rebuild that started before the save must retry.
+
+The browser filters, sorts and counts the index without a request.
+It mounts at most ninety viewport and margin summaries, plus one distant row with focus.
+It removes distant rows and retains the open key and form draft.
+The draft records edits during a pending save and retains them if the save fails.
+A card requests its body by key only when it opens (`review.html?body=<key>`).
+The snapshot supplies the body, form, log and image reference.
+The body uses the time zone from the snapshot.
+A change to the time zone changes the snapshot version.
+A proposal body includes its issue text without front matter.
+An item fragment selects its summary before any body request.
+A Done item uses the same direct body request.
 An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
-Changes offer Works, Does not work, Ask showrunner to check and Send feedback in that group.
+Changes offer Works and Does not work in the closing group.
+Ask showrunner to check, Ask question and Send feedback transfer the change to the showrunner.
 Investigations offer Mark read and Send feedback in that group.
 Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
 A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
-Each card has Ask question in a separate return group and a **Later** button that opens a menu.
+Cards with actions offer Ask question in the return group and **Later** in its own group.
 The menu lists four presets, then a divider and **Choose a time…**:
 1. **In 1 hour**: `later_soon_minutes` from now; the label follows the setting.
 2. **This evening**: `later_evening` today. The item shows only before `later_evening_until`.
@@ -442,6 +532,7 @@ Each preset shows its time on the right, such as `Tue 09:00`, in the user zone.
 The page computes the preset times each time the menu opens.
 A preset click hides the item at once.
 **Choose a time…** shows a calendar and a time field in the same menu.
+Review Later and List Park until share the date and time picker in `record_table.py`.
 The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
 The month header has previous and next buttons.
@@ -466,19 +557,24 @@ The arrow keys, Home and End move between items, Enter picks one and Escape clos
 A click outside the menu closes it.
 The page refresh waits while a Later menu is open.
 The server stores a preset time, sent as UTC, in the user zone.
-Waiting cards retain the actions of their Open cards, in the same groups and order.
+Waiting cards for questions, investigations, proposals and efficiencies retain their Open actions.
 Unowned questions retain only Later.
-Waiting cards keep their state and counts until the user acts.
-An action supersedes the open question, showrunner check, investigation or decision wait.
+Waiting cards for these types keep their state and counts until the user acts.
+An action on those cards supersedes the open request.
 The record and the owner's production log retain the superseded wait.
 Questions archive the old followup before the new action saves.
-Changes remove the old question and validation slots before the new action saves.
+The Review and change pages use one server check to refuse another change action during an open hand-off.
+The refusal preserves the request and its delivery state.
 Investigations close or replace their open request.
 Proposals replace their review mark; efficiencies also clear a deferred ledger state.
 The primary button comes first.
 The shared sender handles all five types, including retries, owner alerts and startup recovery.
-Send feedback sends the words to the owner and finishes the item with the result **feedback sent**.
-Ask question sends the words to the owner and moves the item to Waiting.
+Send feedback sends the words to the owner.
+It finishes the item for questions, investigations, proposals and efficiencies.
+It transfers a change to the showrunner until the showrunner records what they did.
+The change log shows the feedback once and includes the showrunner's reply.
+Ask question sends the words to the owner.
+It moves a change to Validating and other types to Waiting.
 The owner's answer returns every type to Open.
 The answer stays in the item log.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
@@ -486,13 +582,15 @@ Each new request supplies a question ID to identify the pending exchange.
 The existing question ID rule refuses a reply to a superseded exchange.
 `update_registration.py reply` and `investigation.py answer` apply this rule before they save a native answer.
 A native answer without the current question ID cannot replace a newer Review question.
-`change_review.py verdict` applies the same rule when a Review question replaces a showrunner check.
+`change_review.py verdict` also refuses a verdict during an open question or feedback request.
 These commands retain the existing refusal text and exit 1.
 Each showrunner check uses its delivery attempt as the validation ID.
 Initial and recovered messages include `change_review.py verdict --validation <id>` with the complete answer command.
 The native verdict command refuses a missing, old or completed validation ID under the same rule.
 Every request message includes the complete answer command.
-Later keeps the state and hides the item from every page view, the count totals and `/next` until its time.
+Later keeps the state and hides the item from the page views, the counts and `/next` until its time.
+A change hand-off or return to Open clears the saved Later time.
+The shared reader ignores any old Later time on a Validating change.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
 The shared reader applies that timestamp without copying the item or its state.
 The status cache watches that file and expires at the first pending Later time.
@@ -500,9 +598,11 @@ The item returns after that time without a new action.
 Every action keeps its time, actor and words in the existing record log.
 Closed question records retain the user's words without the answer replay archive's 48-hour limit.
 Ask showrunner to check transfers the next action to the showrunner.
-A successful check closes the item; only a problem returns it to Open.
-After a save, the row shows its result and leaves every Show view.
-Refresh keeps a completed row hidden until the page reloads.
+A successful check moves the change to Done without a notice.
+A fault returns the change to Open.
+A saved answer or feedback action also returns the change to Open.
+After a save, the page shows its result.
+A change with the showrunner appears in All as soon as the page reads the saved request.
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
 Refresh retains the open row, scroll position and typed text.
@@ -539,7 +639,18 @@ A cached Accounts response carries its render failure to the status line.
 
 The table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
-The role swatch column is between **role** and **busy**.
+The role swatch column is between **role** and **next**.
+All named headers sort on click or Enter.
+The dot and swatch headers have no sort control.
+The arrow sits before a right-aligned label and after a left-aligned label.
+The arrow uses the column gap without adding to the table width.
+The column gap and arrow scale with the root font size.
+The viewer's sort choice stays through refreshes.
+The Models card below the accounts table uses the same sort controls.
+It stores the viewer's sort choice separately and starts in model order.
+The card shows the model ID and its swatch at the start of each consecutive group of that model.
+The model ID and swatch use the theme ink color when no model color is set.
+The two tables have the same total.
 A swatch shows for each board span with a `color_key`.
 An account has one when `config/statusline.conf` has a valid `account.<label>` color.
 The units, showrunners and workers roles use `role.unit-director`, `role.showrunner` and `role.worker`.
@@ -551,7 +662,11 @@ Cancel or Escape restores the saved color.
 The page pauses refresh while the popup is open or a save is pending.
 Save closes the popup at once and posts `key` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
 Saves of one key publish in order; saves of different keys run at the same time.
-The server accepts only an `account.` key or one of the three role keys, and only when the key is in the configuration.
+The server accepts configured `account.` keys, configured keys in `ROLE_COLOR_KEYS`, and valid `model.<id>` keys.
+Save can add a missing model color to `config/statusline.conf` for a full ID in the model catalog.
+A key that ends in a known host name is a host override.
+Save refuses a model ID with that suffix.
+The settings journal lets the Mac keep an accepted color during a pull after the model leaves the catalog.
 It runs this checkout's `scripts/lib/tune.py` through `scripts/lib/py` to publish the value.
 The tune command records the user's Save action and commits the configuration change through its normal publication path.
 Success clears the kept page and refreshes the board when no save is pending.
@@ -560,15 +675,17 @@ A failed publication returns 503 with tune's last stderr line.
 A failed save restores the prior color and shows `<name>: <reason>` in the status line.
 
 The `next` column follows the role color swatch.
-A selected Claude group (`units ✓` or `showrunners ✓`) shows its first target in that account's color and bold text.
+A selected Claude group shows its first target in bold text with the target account color.
+The same control serves units, showrunners, and producers.
 An empty group shows gray `none`.
 Its arrow button opens the move menu with a click, Enter, or Space.
+The move button leaves the sort order as it was.
 The button exposes its menu state through ARIA attributes.
 A selected Codex workers line shows its first target, or gray `auto`, without a button.
 The `auto` title explains that Codex workers move between Codex accounts by themselves.
 Other lines show a gray Lucide minus icon; the total cell stays empty.
 An unavailable queue shows gray `unavailable`; selected Claude groups retain their buttons.
-One status read supplies both the first targets and the upcoming list.
+The page uses the first targets from the status read.
 The menu title is **When <account> reaches <percent>%, move <group> to**.
 `next_move_percent` in `config/accounts.conf` sets the percent.
 The menu lists the other Claude accounts in board order, each with its weekly percent left when known.
@@ -585,13 +702,13 @@ When the group has an entry, **No next move** posts `group` and `clear=first`.
 The server calls `next_moves.remove_next_move()` at `FIRST_GROUP_POSITION`.
 It refuses a clear for an empty group.
 The cell then shows the next queued target, or `none`.
-Success clears the kept page and refreshes the board, so the upcoming moves show the new entry.
+Success clears the cached page and refreshes the `next` cell.
 A refused request returns 400 and a failed write returns 503, each with its reason.
 A failed move shows `<group>: <reason>` in the status line.
 Codex workers keep their own moves; the menu shows no Codex account.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
-- The upcoming moves and the problems follow the table.
+- The problems follow the table.
 - The page reads the stored usage only, as `accounts.py status --stored` does.
 
 The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.
@@ -613,6 +730,27 @@ The Producer cell shows the name of the record's producer.
 The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
+
+The List starts with All selected in its single row of status chips.
+The chip order is All, Needs me, Morty answering, Working, Blocked, Parked, and Closed.
+Morty answering includes all items with an open question, including parked items and items that need Resend.
+The other status chips contain items with no open question.
+Needs me includes unparked items in Waiting for nate or Delivered.
+Working includes unparked items in New or Working.
+Blocked includes unparked items in Blocked or Paused.
+Parked includes items with a future parking time in states other than Done and Closed.
+Closed includes items in Done or Closed, even when they have a future parking time.
+Each item belongs to one status category. The six counts add up to All.
+The Unread only switch limits the visible items and chip counts to unread items.
+The Owner and Producer menus and the words box also limit the chip counts.
+The “need you” total uses the Needs me chip count.
+A zero-count chip stays visible and dimmed.
+
+The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
+They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.
+Each button applies to all items that match the current filters.
+Each button applies the current text in the words box before it selects the items.
+Hidden items keep their open or closed state.
 
 A link under Links opens the target item in the console.
 The table changes Show to All if the target is outside the current view.
@@ -644,6 +782,8 @@ Each List record stores a `producer`: the fixed staff ID of a staff row with the
 The option refuses a name or ID that does not resolve to exactly one current producer row.
 A new item without the option, and an old record without the field, belong to the record keeper, morty.
 The terminal list shows a Producer column after Owner.
+The CLI shows producers only their assigned items. Morty can see every item.
+See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
 
 When List records have review links, the page reads review items once per render and indexes them by key.
 It stores no review states on the List record.
@@ -658,8 +798,23 @@ The open row repeats the line above its actions and shows each review's shown ID
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
 Review links use the console place query, so the navigator remains visible.
-A card link selects and opens that exact card, including Done and parked reviews.
-A summary link selects the linked review keys through the All view.
+A card link opens and highlights that card in the full Review list.
+The link uses the current Review filters. The same jump rule applies to List and Review.
+If the filters hide the target, the jump sets Show and Owner to All.
+The jump also clears other filters that hide the target.
+The linked parked card stays visible while its details are open, including after reload.
+A successful action that closes the linked card removes its target from the address.
+Back restores the List search text, scroll position, and surviving open rows for that history entry.
+The List saves the search text that is in the box when the user clicks the link.
+The List removes stale filters after it restores the open rows.
+The browser tab keeps at most eight return records for up to one hour.
+Repeated Back navigation can use the same record until it expires or the tab removes it.
+Reload keeps the Review card open with the current filters.
+A summary for one available review opens its card in the full list.
+A summary for multiple available reviews selects those reviews through the All view.
+The Linked reviews chip clears that selection with one click.
+A summary without an available review shows plain text.
+If the linked card disappears after the List renders, Review shows a missing-card message.
 An explicit item target joins the linked selection and opens its card.
 The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.
@@ -669,20 +824,32 @@ The List number column and the Review ID column use the shared no-wrap rule.
 The Owner menu includes record owners without a current staff row.
 The Producer menu beside it lists each producer that a record names.
 An address with a producer that no record names shows all producers.
-The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
-Open excludes Done, Closed, and items with a future parking time.
+The State column shows the saved state of each item.
+Closing an item clears its unread mark. A later answer can mark it unread again.
+An older address with `show=done` opens the Closed view.
+An older address with `show=unread` turns on Unread only.
 The search field matches the item number, owner name, title, or state words.
 Numbers can include `L` or `#`.
 One match function ignores case for every field.
 Parked items also match the word `Parked`.
-The address retains the owner, producer, view, search, column, and direction.
+The address retains the owner, producer, status chip, unread switch, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
 The record keeps Evidence, and the open row has no separate Evidence section.
 The log shows its newest entry first.
+On a wide page, the log column fits the height of the left column, including the feedback controls.
+The log entries scroll below the heading when they exceed the available height.
+A short log has no scroll bar.
+On a narrow page, `list_log_max_height_rem` in `config/review_links.conf` limits the height of the entries.
+The setting starts at 16 rem.
+Refresh keeps the first visible log entry at the same offset when new entries arrive.
+A log at the top stays at the top to show the newest entry.
+The List keeps the position by item while a filter hides the row.
+The log restores that position when the row returns.
 Each log writer saves a typed event.
 The table and log use the same format for staff names, local ETAs, and field values.
-The table, log, and Park response show parking dates in the user's zone.
+The table, log, and Park response show parking times in the user zone.
+At local midnight, the label shows the date.
 The log uses plain field labels, such as Next step and Latest status.
 The reader converts old Added, Updated, Parked, Closed, and feedback entries to the same format.
 An old entry keeps its text if the reader cannot parse it.
@@ -710,60 +877,146 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry without sending a message.
-Tell morty also marks an unread update read through the same path.
-It saves the feedback before it marks the update read.
-Each request keeps the identity of the update it saw.
+Ask question and Tell morty use the same path to mark the update read after the action saves.
+The form signature includes the identity of the unread update that the row shows.
+A new Ask question or Tell morty request can mark only that update read.
 A repeated request cannot mark a newer update read.
+An exact Tell morty retry uses the read target saved with the feedback.
 The store checks the update identity under its lock.
-This check also preserves an update that arrives between feedback storage and the read write.
+This check preserves an update that arrives between the action save and the read write.
 An update identity includes its time and log history.
 Two updates with the same time keep separate identities.
-Tell morty adds no read entry when the item has no unread update.
+Ask question and Tell morty add no read entry when the form shows no unread update.
 The POST response includes the current unread state.
+The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
-If the read write fails, the feedback remains saved and the sender can deliver it.
-The page shows “sent to morty; update remains unread” and keeps the unread controls.
-The same notice appears when a newer update remains unread.
-It applies the current filter again, so a read item leaves the Unread view at once.
+If the read write fails, the question or feedback remains saved and the sender can deliver it.
+The store keeps the unread update if the read write fails or a newer update exists.
+Tell morty shows “sent to morty; update remains unread” in both cases.
+Tell morty applies the current filters. A read item leaves the view when Unread only is on.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
 The page uses the question and delivery code shared with Images.
 The server replies to the browser before it sends morty the item number, title, question, and answer command.
-Equal words retry an open question. Different words create a new question.
+Equal words select the open question. Different words create a new question.
 An exact request retry uses the same question ID, even after morty answers it.
-The expanded row shows each question and its answer when available.
+The row moves to Morty answering when the question saves.
+The row shows a waiting note when each unanswered question has a live sender or confirmed acceptance.
+Acceptance includes a confirmed place in the transport queue.
+The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
+The console updates its unread indicator on its own news refresh.
+The next List refresh shows the delivery notice and Resend when a question needs another send.
+An unknown result shows “Question Qn may not have reached morty.”
+The List shows why Resend is unavailable if the previous sender is active or cannot be checked.
+Images shows the same reason when it cannot retry the question.
+All attempts for one question use the same sender lock.
+A damaged delivery record keeps the question visible and cannot grant Resend while the lock is held.
+A released sender lock lets Resend proceed even if the previous process identity is unreadable.
+Resend uses the saved question, its ID, and the current recipient to repair a mismatched delivery record.
+The question reader checks the stored question words and answer command.
+A List title edit preserves the delivery state. Recovery sends the prepared message with its original title.
+Only an explicit Resend question action can retry that delivery on the List.
+Repeating the same signed resend request does not authorize another send.
+If Ask removes the focused row, focus moves to a nearby row with an available toggle or to Search.
+After a failed POST restores the row, the List waits for the animation before it returns focus to the submit button.
+After a successful Ask keeps the row visible, the row toggle receives lost focus and keeps it through refresh.
+Focus stays on the user's selection if they move it during the request, including to the parent console.
+On refresh, the List restores focus to an available action button with the same item key and action.
+Column sort buttons keep focus through refresh.
+A waiting row shows “The producer will answer” and has no action buttons.
+The panel shows each open question with its asked time.
+The waiting row keeps its log after Ask saves.
+A link opens a filtered-out question or read item in a separate section and preserves the current filters.
+The section does not change the results count.
+An open question adds a Morty answering note below the saved state.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one log entry and marks the item unread.
+The answer adds one record event and marks the item unread, including when the item is Closed.
+After the last answer, the next refresh returns the row to its status chip.
+Parked shows the item after the last answer if its parking time is still active.
+A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
+That request keeps the item in Morty answering and shows its confirmation next to Show.
+An unread answer appears in the panel with the question, both times, and an Unread mark.
+Mark read clears the signed update shown by the form.
+Opening an individual row with an unread answer uses the same signed read operation.
+The List sends this request after the text of each unread answer enters the viewport while the row is open.
+The tab and console frame must also be visible.
+Expand all leaves answers unread.
+A newer update stays unread if it arrives before the read saves.
+With Unread only on, an item can stay visible after this read until the user closes its row or changes Show.
+Changing the Unread only switch ends this exception.
+After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
+The panel clears the question when the log shows it.
+The List uses its local date and time format for questions and answers.
+A newer unread update leaves previously read answers in the log.
 The command refuses an unknown ID, a second answer, and empty text.
+
+List and Images questions share one delivery record for each question and recipient.
+The record stores the source, stable message ID, revision, attempt ID, job owner, transport receipt, and error.
+The delivery lock protects every atomic update.
+A job holds the question's sender lock from claim through result publication.
+The sender publishes `sending` before it calls the transport.
+The transport can confirm `sent`, `queued`, or `failed`.
+A missing confirmation leaves the outcome `unknown`.
+Recovery claims unsent work only after the shared question reader verifies the delivery.
+Recovery leaves uncertain outcomes for the user.
+An older pending attempt with no live sender appears as uncertain.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
-Park writes the chosen date through `the_list.park` with the same source.
-Park uses midnight in the user's time zone.
-The writer checks the date against the current time under the List lock.
-An exact retry can return the saved result after the date arrives.
-The page uses the date for Park and retains other words for Tell morty.
-Morty does not perform these two button actions.
+Remove sits at the left edge of the row above the four-line text box.
+**Unpark** and **Park until** sit at the right edge of the row.
+An expanded parked item shows its parking time above the buttons.
+**Unpark** appears in the form when the parking time is in the future and the item is in a state other than Closed.
+**Park until** opens the shared calendar and 24-hour time field directly.
+The picker aligns with the right edge of the text box.
+The page refresh waits while the picker is open.
+**Save** sends the chosen time in UTC.
+Park writes the time through `the_list.park` with the same source.
+The server still accepts a date as midnight in the user zone.
+The writer checks a new parking time against the current time under the List lock.
+The writer compares the saved instant when it checks a Park retry.
+The writer requires the instant in the receipt or in a parking change with the same request ID.
+The picker can resend the original request and instant after the parking time passes.
+When the saved date has passed, the picker gives focus to an enabled day.
+The page keeps the words for Tell morty.
+**Unpark** clears the parking time through `the_list.unpark` and keeps the item state.
+It records one Unparked event and saves one notice for morty.
+If the item has no active parking time, the writer saves only a hidden request receipt.
+The receipt records whether the time expired or was absent.
+A replay of that request preserves any newer parking time.
+The response reports the saved request outcome and the current parking state.
+The page shows “Parking time already expired” for an expired time.
+It shows “No active parking time to clear” when the time is absent.
+Both results preserve the parking draft.
+A replay of a successful Unpark reports the original result and any newer active parking time.
+When Unpark clears parking and removes the row from Parked, the page shows “Item #N unparked.”
+The page shows confirmations for hidden rows next to the Show filter.
+It keeps one confirmation per hidden row after overlapping Unpark requests.
+Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
+In All, the row stays expanded and focus moves from **Unpark** to its item number.
+After Unpark, the item's saved state sets its status chip.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
-Remove leaves Open at once when the user presses the button.
-Park leaves Open and enters Parked at once.
-The row leaves Unread as soon as the user presses Mark read or Tell morty.
-The row returns if the server reports an unread update.
+Remove moves the item to Closed at once.
+Park moves an item to Parked at once when its state is outside Closed.
+With Unread only on, the row leaves the view when the user presses Mark read, Ask question, Tell morty, or Remove.
+The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved date to update one parking label.
-A refusal restores the last state and parking status from the server.
-A failed Mark read or Tell morty request restores the unread state.
+The page uses the saved time to update the parking labels for the expanded and collapsed row.
+A refusal restores the last confirmed item state, parking status, and unread state together.
+The unread state includes the Update sort key.
+If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
-The page keeps a separate failure notice for each row.
-The notice appears above the table while the row or its details hide the inline notice.
+After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
+Each row keeps its own inline failure notice.
+The List uses the same rules as Review for notices above the table.
 If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps each unconfirmed request ID for an exact retry, even after another action.
@@ -776,7 +1029,7 @@ The row block requires the record's own number, a List state line, and field bul
 Only field bullets and their continuation lines belong to the block.
 A continuation line starts with at least two spaces or a tab.
 A second run changes nothing.
-The page can mark an item read, close it, park it, or append feedback and delivery states.
+The page can mark an item read, close it, park it, unpark it, or append feedback and delivery states.
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, action, and words with each change in one locked write.
 The same write saves a pending notice for actions that send one.
@@ -888,6 +1141,10 @@ The server checks the token.
 **Approved** and **Not Approved** need no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Otherwise the card leaves the page at once, and the request runs in the background.
 The page skips its refresh while a send runs.
+An image leaves the page while each open question has a live sender or confirmed acceptance.
+The page also hides an image while the server recovers its verified delivery on startup.
+A failed or uncertain delivery returns the card with a delivery notice.
+When the owner answers the last open question, the card returns and the console shows a new update.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
@@ -1057,7 +1314,7 @@ The verdict cell joins stripped, nonblank lines with one space.
 The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
 Does not work with text saves `not works: <text>`.
-Send feedback sends the words and closes the change.
+Send feedback sends the words and transfers the change to the showrunner.
 Each verdict saves the text from **Your words** as its comment.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.
 
@@ -1081,7 +1338,7 @@ The message names the row, list, production, change, and question.
 It includes a separate `Question id: <id>` line.
 The saved row leaves the view without opening another card.
 An open question survives page loads and server restarts.
-A failed HTTP save keeps the row waiting with its typed question and answer form.
+A failed HTTP save keeps the typed words and restores the form.
 A direct link shows the open question without verdict buttons.
 
 The owner answers with `scripts/review_links/change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
@@ -1096,10 +1353,9 @@ The answer keeps its internal line breaks and strips only whitespace at its two 
 All text is escaped, including text in list items.
 The user can ask another question or save a verdict.
 
-Send feedback sends the words through the existing sender and closes the change.
-Legacy forms from pages already open retain their prior feedback delivery record.
-Those forms store `kind: feedback` and accept `change_page.py answer-question --question <Feedback id>` replies.
-The feedback message supplies the ID.
+Send feedback uses the existing sender and stores `kind: feedback`.
+The message includes the feedback ID and the command to record the action.
+The recorded action returns the change to Open.
 
 Each answer uses a background `fetch` POST.
 The row shows **Saving…** during the save and **Saved: <result>** after success.
@@ -1178,13 +1434,20 @@ Each call takes its own `flock` on a new open file.
 
 The all-list page returns JSON with status 200 after `change_review.save_verdict` writes the answer.
 Older selected-row pages retain their 303 response.
-The feature-log operation still runs before the verdict.
+The server checks whether the feature proposal can accept the verdict before it saves.
+The pending intent records the feature proposal and the reason for replacing a wait.
+The server syncs the list directory and commits the verdict before it closes the feature proposal.
+If the sync or commit fails, recovery confirms both before it closes the proposal.
+Recovery retries temporary closeout failures.
+A permanent conflict alerts the row's showrunner once and ends the closeout.
+Recovery uses the saved reason to write the same production log entry as the request.
 The request thread flushes the response before it runs the existing `scripts/message/send.py` sender.
 The server starts no detached shell for message delivery.
 The all-list page sends to the row's current staff showrunner.
 Older selected-row pages use the same staff route.
 The saved verdict selects recipients when a new message attempt begins.
-An exact `works` verdict goes only to the showrunner, including requests from the older feedback endpoint.
+An exact `works` verdict goes only to the showrunner.
+Send feedback and Ask question on either change page send the words to the showrunner and move the change to Validating.
 When one staff unit owns the change, every other verdict also goes to that unit.
 The Producer cell identifies that unit through its fixed staff id.
 An empty Producer cell belongs to the list's staff showrunner.
@@ -1249,7 +1512,8 @@ An older attempt cannot clear or change a newer attempt's record.
 Each server guards active attempts against duplicate sends.
 A request owns its attempt from creation through completion.
 Startup recovery skips that request's record under the same lock.
-Recovery clears a true orphan verdict intent if the previous process never saved its verdict.
+Recovery clears an unfinished verdict intent if the previous process did not save the verdict.
+The pending question and its reply ID stay in the delivery record until the verdict saves.
 
 A failed POST keeps its 4xx or 503 status.
 The all-list page returns a short JSON reason and keeps the typed answer in the browser.
@@ -1276,7 +1540,19 @@ No NixOS or service configuration change is necessary.
 `serve.py [--port PORT]` reads its default port from `server_port`.
 The setting starts at 8765.
 `--port` overrides the setting for one server run.
-The times below describe the initial config values.
+
+Use `--list-fixture FOLDER` to serve a private List from an existing folder.
+The server reads List records from `FOLDER/records` and staff records from `FOLDER/staff.json`.
+Open `/console/list.html` on the fixture port.
+Remove uses the normal List save path in the fixture store.
+The fixture serves only the List page and accepts only Remove.
+The fixture omits counts from other pages.
+It skips message delivery, recovery, snapshot sweeps, and code restarts.
+The server checks the fixture folder before it checks the Tailscale address.
+Fixture requests use the scratch directory lock during file access.
+It exits with status 0 when the folder disappears.
+
+The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.

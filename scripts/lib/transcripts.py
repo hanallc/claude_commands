@@ -1,4 +1,4 @@
-"""Open plain and zstd transcripts through one seekable binary stream."""
+"""Find transcript folders and open plain and compressed transcripts."""
 from __future__ import annotations
 
 from collections.abc import Generator, Iterable
@@ -13,6 +13,15 @@ from typing import BinaryIO
 
 def uncompressed_path(path: Path) -> Path:
     return path.with_suffix("") if path.suffix == ".zst" else path
+
+
+def config_dirs() -> list[Path]:
+    """List Claude config folders, including the configured override."""
+    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        directories.add(Path(override).expanduser())
+    return sorted(directories)
 
 
 def codex_transcript_homes(extra_homes: Iterable[Path] = ()) -> list[Path]:
@@ -54,14 +63,18 @@ def distinct_files(paths: Iterable[Path]) -> list[Path]:
     return sorted({path.resolve() for path in paths})
 
 
+def transcript_source(path: Path) -> Path:
+    if path.suffix != ".zst" and not path.exists():
+        compressed = path.with_suffix(path.suffix + ".zst")
+        if compressed.exists():
+            return compressed
+    return path
+
+
 @contextmanager
 def open_transcript(path: Path) -> Generator[BinaryIO]:
     """Keep decompression outside memory and permit existing readers to seek."""
-    source = path
-    if source.suffix != ".zst" and not source.exists():
-        compressed = source.with_suffix(source.suffix + ".zst")
-        if compressed.exists():
-            source = compressed
+    source = transcript_source(path)
     if source.suffix != ".zst":
         with source.open("rb") as stream:
             yield stream
@@ -76,6 +89,19 @@ def open_transcript(path: Path) -> Generator[BinaryIO]:
             raise
         _ = stream.seek(0)
         yield stream
+
+
+def compressed_transcript_lines(path: Path) -> Generator[bytes]:
+    """Read compressed transcript lines in order through a pipe."""
+    command = ["zstd", "-q", "-d", "-c"]
+    with path.open("rb") as source, subprocess.Popen(
+        command, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    ) as decoder:
+        assert decoder.stdout is not None
+        with decoder.stdout:
+            yield from decoder.stdout
+        if status := decoder.wait():
+            raise subprocess.CalledProcessError(status, command)
 
 
 def compress_transcript(path: Path, output: BinaryIO) -> int:

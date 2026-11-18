@@ -10,7 +10,7 @@ from statistics import median
 from typing import Literal
 
 from scripts.aws_target import ledger, run_cost
-from scripts.aws_target.aws_target import SnapshotFailure, gate_sizes, largest_gate_vcpus, read_snapshot, snapshot_failures
+from scripts.aws_target.aws_target import SnapshotFailure, gate_sizes, gpu_price_sizes, largest_gate_vcpus, read_snapshot, snapshot_failures
 from scripts.lib import conf
 
 
@@ -138,7 +138,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
     configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
     standard = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'))))
-    gpu = tuple(size for size in dict.fromkeys(values.words('gpu_instance_types')) if size not in standard)
+    gpu = tuple(size for size in gpu_price_sizes(values) if size not in standard)
     document = read_snapshot(directory)
     readings = {ledger.text(row, 'region'): row for row in ledger.rows(document, 'regions')} if 'regions' in document else {}
     failures = {row.region: row for row in snapshot_failures(document)}

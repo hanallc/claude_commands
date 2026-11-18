@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 
-from scripts.production import session_staff, staff, unit_config
+from scripts.production import investigation, session_staff, staff, unit_config
 from scripts.agents import stop_resume
 from scripts.lib import land_main, main_publish, main_push_lock
 from scripts.herdr import worker_panes
@@ -42,6 +42,7 @@ from scripts.production.update_registration import QuestionStaff, RegistrationFa
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import berth_board
+from scripts.worktree.worktrees import release_worktree_pair
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
 
@@ -645,6 +646,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         if unit.worktree.exists():
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
+            release_worktree_pair(unit.worktree)
             report("retire", "ok", f"removed {unit.name} worktree")
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
             if not branch_is_landed(production.checkout, unit.branch, production.merge_branch):
@@ -683,7 +685,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         report("notifier", "ok", "update timer removed")
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
-        write_text_atomic(production.doc, "\n".join(updated) + "\n")
+        with investigation.recipient_locks(runner.id):
+            write_text_atomic(production.doc, "\n".join(updated) + "\n")
     doc_paths = [doc_path_in_checkout(production, production.doc)]
     archive = archived_doc(production)
     if archive is not None:

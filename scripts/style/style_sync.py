@@ -140,7 +140,7 @@ def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
     caller = showrunners.own_name() or "style_sync"
     sent = subprocess.run(session_send.send_argv("--to", address, "--from", caller,
-        "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
+        "--text", f"branch point {branch} moved to {tip[:7]}; sync.",
         "--key", f"style-sync:{target}",
         "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
     ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
@@ -515,7 +515,7 @@ def handoff_notice(name: str, parent: str, checkpoint: str) -> HandoffDelivery:
     if not address:
         raise Refusal(f"no address for {parent}")
     result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
-        "--text", f"From the showrunner of {name}: hand-off {checkpoint}",
+        "--text", f"hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
     ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
@@ -601,7 +601,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 name = next(production.name for production in productions
                             if unit in {assignment.unit for assignment in production.config.assignments})
                 result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
-                    "--text", f"From the showrunner of {name}: ticket {ticket_id} merged; refill.",
+                    "--text", f"ticket {ticket_id} merged; refill.",
                     "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
                 ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:

@@ -21,7 +21,7 @@ from scripts.production import staff
 from scripts.message import sessions
 
 ENTRY_ID = "0123456789abcdef0123456789abcdef"
-TEXT = "Message from Sender via postmaster: Question [01234567]\n\nQuestion"
+TEXT = "Sender: Question\nSender native id: unavailable\nTag: 01234567\n\nQuestion"
 EPOCH = 1_800_000_000.0
 
 

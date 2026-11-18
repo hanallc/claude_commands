@@ -9,6 +9,7 @@ import re
 import secrets
 import shlex
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -16,14 +17,12 @@ from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
-from scripts.lib.user_zone import shown_time
+from scripts.lib.user_zone import shown_time, user_zone
 from scripts.production import change_review, change_routing, next_item, staff, update_registration
 from scripts.production.production_doc import Production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_page, console, page_frame
-from scripts.review_links import question_record
-from scripts.review_links import staff_names
+from scripts.review_links import change_page, console, page_frame, question_record, review_events, review_items, staff_names
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -154,7 +153,7 @@ def change_orders(grouped: dict[str, list[WaitingChange]], source: change_review
     roots: dict[str, tuple[Path, next_item.Queue]] = {}
     for tab in sorted(grouped):
         runner = routing.runners_by_name.get(tab)
-        doc = routing.production_by_runner.get(runner.id) if runner is not None else None
+        doc = routing.production(tab) if runner is not None else None
         if runner is None or doc is None:
             queues[tab] = change_review.ChangeQueue("", [])
             orders[tab] = tuple(item.key for item in grouped[tab] if item.waiting)
@@ -276,7 +275,9 @@ INLINE_CHOICE = re.compile(r"(?:^|(?<=[.!?;])\s+)" + CHOICE_LABEL_PATTERN, re.IG
 
 
 def split_at(text: str, mark: re.Pattern[str]) -> tuple[str, str]:
-    found = mark.search(text)
+    blocks = list(page_frame.CODE_BLOCK.finditer(text))
+    found = next((match for match in mark.finditer(text)
+                  if not any(block.start() <= match.start() < block.end() for block in blocks)), None)
     return (text, "") if found is None else (text[:found.start()].strip(), text[found.end():].strip())
 
 
@@ -351,15 +352,8 @@ def followup_sections(item: update_registration.OutstandingItem) -> str:
 
 
 def answer_html(text: str) -> str:
-    """Show a showrunner reply or answer; a line that holds only a command is a code block with a copy button."""
-    content: list[str] = []
-    start = 0
-    for block in page_frame.CODE_BLOCK.finditer(text):
-        content.append(question_paragraphs(text[start:block.start()]))
-        content.append(page_frame.code_block_html(block))
-        start = block.end()
-    content.append(question_paragraphs(text[start:]))
-    return "".join(content)
+    """Show a showrunner reply or answer with copy buttons for code blocks."""
+    return page_frame.render_code_blocks(text, paragraph_text_html)
 
 
 def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
@@ -381,9 +375,20 @@ def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
 
 
 def question_paragraphs(text: str) -> str:
-    """Keep paragraphs and list lines separate; split sentences in text stored on one line."""
+    """Show question paragraphs with copy buttons for code blocks."""
+    return page_frame.render_code_blocks(text, paragraph_text_html)
+
+
+def paragraph_text_html(text: str) -> str:
+    """Keep paragraphs and list lines separate. Split sentences in text on one line."""
     paragraphs = BLANK_LINE.split(text.strip()) if "\n" in text else SENTENCE_END.split(text.strip())
-    return "".join(change_page.review_text_html(paragraph, inline=True) for paragraph in paragraphs if paragraph)
+    return "".join(change_page.review_prose_html(paragraph, inline=True) for paragraph in paragraphs if paragraph)
+
+
+def unmarked_choices_html(text: str) -> str:
+    """Show choice text without radio buttons when the choice boundaries are unknown."""
+    lines = [part.strip() for part in re.split(r";\s+|\n+|(?<=[.!?])\s+", text) if part.strip()]
+    return "<ul>" + "".join(f"<li>{change_page.inline_html(line)}</li>" for line in lines) + "</ul>"
 
 
 def reviewed_choices(text: str) -> tuple[str, list[str]]:
@@ -422,8 +427,7 @@ def text_sections(text: str, *, reviewed: bool = False) -> tuple[str, str]:
     body += (item_list(items) if items else "") + (question_paragraphs(trailing) if trailing else "")
     # Unmarked choices stay text because their boundaries do not identify safe answer values.
     if choice_text and not choices:
-        lines = [part.strip() for part in re.split(r";\s+|\n+|(?<=[.!?])\s+", choice_text) if part.strip()]
-        body += '<h2>Choices</h2><ul>' + "".join(f'<li>{change_page.inline_html(line)}</li>' for line in lines) + '</ul>'
+        body += '<h2>Choices</h2>' + page_frame.render_code_blocks(choice_text, unmarked_choices_html)
     elif choice_lead:
         body += '<h2>Choices</h2>' + question_paragraphs(choice_lead)
     if choice_trailing:
@@ -441,7 +445,8 @@ def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]
         return body + followup_sections(item), choices
     parts = item["parts"]
     same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
-    body = "" if same else f'<p class="question-ask">{change_page.inline_html(parts["ask"])}</p>'
+    body = "" if same else page_frame.render_code_blocks(
+        parts["ask"], lambda part: f'<p class="question-ask">{change_page.inline_html(part)}</p>')
     if parts["context"].strip():
         body += '<h2>Context</h2>' + question_paragraphs(parts["context"])
     if parts["items"]:
@@ -679,6 +684,31 @@ def question_message(outcome: change_page.QuestionOutcome, production: str, text
     return message
 
 
+def submit_review_change(item: review_items.ReviewItem, browser: ReviewBrowser, outcome: str, words: str,
+                         status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Send the current row through the shared change action."""
+    source = item.source
+    assert isinstance(source, review_items.ChangeSource)
+    assignment = source.assignment
+    production = assignment.production
+    if isinstance(production, UnavailableProduction):
+        raise change_page.AnswerRefused('the production document is not available')
+    row = source.row['#']
+    token = row_token(browser, item.key)
+    page = change_page.AssignedReviewPage(source.path, production, (row,), token, assignment.owner)
+    prepared = change_review.ChangeQueue(item.queue, [urgency.Entry(item.queue_key, source.row)])
+    superseded = ''
+    if outcome == 'validate' and item.state == review_items.ReviewState.WAITING:
+        # The exact row is already in the prepared queue after its wait ends.
+        _ = change_page.row_production(page, source.row)
+        superseded = status.supersede_wait(page, source.row, outcome)
+    delivery = change_page.submit(page, urlencode({'row':row, 'token':token, 'outcome':outcome, 'feedback':words}),
+                                  status, prepared=prepared, feedback_closes=True, defer_verdict_cleanup=True)
+    if superseded and isinstance(delivery, change_page.MessageDelivery):
+        return replace(delivery, message=delivery.message+'\n'+superseded)
+    return delivery
+
+
 def save_outcome(production: update_registration.QuestionScope, question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
                  identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
     """Answer, send a follow-up or move the question to the end of its queue; return whom the message goes to."""
@@ -693,8 +723,57 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
         question.record.item, update_registration.OpenItemWithoutAsker(), identities), identities)
 
 
+def save_question_record(production: update_registration.QuestionScope, question: WaitingQuestion,
+                         outcome: change_page.QuestionOutcome, words: str,
+                         verify_revision: Callable[[], object] | None = None) -> None:
+    """Validate and write one canonical question under its owner's lock."""
+    path = update_registration.outstanding_path(production)
+    superseded = ''
+    with update_registration.outstanding_lock(path):
+        if verify_revision is not None:
+            _ = verify_revision()
+        records = update_registration.selected_question_records([question.record.path], (), None)
+        if not records or records[0].owner != question.owner or records[0].status != 'open':
+            raise review_items.ReviewRecordChanged('This question is no longer open.')
+        current = records[0]
+        item = current.item
+        pending = item.get('followup')
+        if pending != question.record.item.get('followup'):
+            raise review_items.ReviewRecordChanged('The follow-up on this question changed.')
+        if item != question.record.item:
+            raise review_items.ReviewRecordChanged('This question changed. Check it again before saving.')
+        now = datetime.now(production.zone)
+        events = review_events.decode(item.get('review_log', ''))
+        if pending is not None:
+            _ = item.pop('followup')
+            superseded = f'User chose {outcome} before the answer; superseded the previous wait.'
+            for event in ('Superseded followup: '+pending['text'], superseded):
+                events = review_events.append(events, review_events.ReviewLog(now, 'nate', event))
+        if outcome in ('answer', 'feedback'):
+            current = replace(current, status='closed')
+        elif outcome in ('followup', 'question'):
+            reason = review_events.require_waiting_why(words)
+            item['followup'] = update_registration.PendingFollowup(text=reason, sent=now.strftime('%Y-%m-%dT%H:%M'))
+            item['waiting_why'] = reason
+        else:
+            raise change_page.AnswerRefused('choose an action on this card')
+        label = 'feedback sent' if outcome == 'feedback' else outcome
+        item['review_log'] = review_events.encode(review_events.append(
+            events, review_events.ReviewLog(now.astimezone(user_zone()), 'nate', label+': '+words)))
+        update_registration.write_question_record(current)
+        if current.status == 'closed':
+            with review_items.after_store_write(question.key):
+                update_registration.record_answer(path, production.name, item, now)
+    if superseded and isinstance(production, Production):
+        with review_items.after_store_write(question.key):
+            update_registration.append_log(production, f"Review {production.name}/{item.get('review_id', current.path.stem)}: "+
+                                           superseded, None, False)
+
+
 def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
-                    status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
+                    status: change_page.DeliveryStatus, *,
+                    exact_record: bool = False,
+                    verify_revision: Callable[[], object] | None = None) -> tuple[change_page.MessageDelivery, str]:
     """Save through the production API before the existing sender delivers the message to the asker."""
     if question.tab == "unrouted":
         raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
@@ -714,31 +793,40 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     page = change_page.UserQuestionPage(question.record.path, document, (question.record.path.stem,), "", saved)
     # The delivery lock prevents startup recovery from reading an answer during its save.
     with status.locked():
-        if frontmatter(question.record.path).get("status") != ["open"]:
+        if not exact_record and frontmatter(question.record.path).get("status") != ["open"]:
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
+        previous_page = status.metadata_page(page)
+        previous_slots = status.slots(page, page.rows[0])
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(recipient,))
-        status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), intent)
+        status.write_slots(page, page.rows[0], slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
         try:
-            relay = save_outcome(production, question, outcome, words, identities)
-            if outcome != "skip":
-                update_registration.record_review_log(question.record.path,
-                    ('feedback sent' if outcome == 'feedback' else outcome)+": "+words)
-            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
-            if outcome in ('feedback','question'):
-                recipient = question.owner
-            intent = replace(intent, recipients=(recipient,))
-            page = replace(page, saved={**saved, "saved": True})
-            status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
+            if exact_record:
+                save_question_record(production, question, outcome, words, verify_revision)
+            else:
+                relay = save_outcome(production, question, outcome, words, identities)
         except BaseException as error:
             try:
-                status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
+                if exact_record:
+                    status.write_slots(previous_page, page.rows[0], previous_slots)
+                else:
+                    status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
             finally:
                 _ = status.request_attempts.pop(attempt, None)
             if isinstance(error, update_registration.RegistrationFailure):
                 raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
             raise
+        if outcome not in ('feedback', 'question'):
+            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
+        intent = replace(intent, recipients=(recipient,))
+        page = replace(page, saved={**saved, "saved": True})
+        status.mark_review_saved(page, page.rows[0], replace(slots, verdict=intent), intent)
+        if not exact_record and outcome != "skip":
+            with review_items.after_store_write(question.key):
+                update_registration.record_review_log(question.record.path,
+                    ('feedback sent' if outcome == 'feedback' else outcome)+": "+words, owner=question.owner)
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
@@ -835,7 +923,9 @@ async function save(row,form,outcome){
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
-  state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' ? 'The showrunner will answer this' : outcome==='feedback' ? 'The showrunner will act on this' :
+  state.textContent=reply.answer ? 'Saved: '+reply.answer :
+   outcome==='question' ? ''' + json.dumps(page_frame.QUESTION_WAITING.format(owner_role="showrunner")) + r''' :
+   outcome==='feedback' ? 'The showrunner will act on this' :
    outcome==='followup' ? 'Follow-up sent to the asker' : outcome==='skip' ? 'Moved to the end of the list' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   saved=true;
