@@ -188,7 +188,7 @@ def preview_placement_start(book: ledger.CostLedger, account: Path, configuratio
     return _placement_preview.read(book, account, configuration, lifecycle)
 
 
-class HanaSpending[Settings: StartPermitSettings = PermitSettings]:
+class HanaSpending[Settings: StartPermitSettings]:
     """Serialize permits and lifecycle evidence with the account ledger."""
 
     def __init__(self, book: ledger.CostLedger, account_settings: Path, settings: Settings):
