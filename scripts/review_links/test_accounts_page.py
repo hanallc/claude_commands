@@ -54,8 +54,7 @@ def sort_reading() -> accounts.StatusReading:
         replace(status_row("codex1"), tool="codex", roles=("producers",), weekly_left_percent=0,
                 role_counts=(accounts.RoleSessionCounts(0, 1, 0, 0),)),
         replace(status_row("codex2"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),),
-                weekly_left_percent=accounts.StatusUnavailable("fixture"))), (), (), timezone.utc, AT,
-        upcoming_moves=("Upcoming moves:", "units → claude2"))
+                weekly_left_percent=accounts.StatusUnavailable("fixture"))), (), (), timezone.utc, AT)
 
 
 class ProducerRoleColorTests(unittest.TestCase):
@@ -223,7 +222,7 @@ class AccountsPageTests(unittest.TestCase):
             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
-    def test_board_draws_the_board_table_with_moves_and_problems(self) -> None:
+    def test_board_draws_the_table_and_problems_without_the_upcoming_list(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
         _ = write_config_fixture(config / "accounts.conf", ACCOUNT_SETTINGS)
         _ = (config / 'statusline.conf').write_text('account.claude1=brown\nrole.unit-director=yellow\nrole.worker=#c0c0c0\n')
@@ -260,7 +259,8 @@ class AccountsPageTests(unittest.TestCase):
         self.assertIn('<td class="left" data-account-name><span class="default bold">total</span></td>', markup)
         self.assertIn('<td class="left"></td>', markup)
         self.assertIn('<td class="right"><span class="default">60%</span></td>', markup)
-        self.assertIn('<li>units → claude1</li>', markup)
+        self.assertNotIn('Upcoming moves:', markup)
+        self.assertNotIn('units → claude1', markup)
         self.assertIn('<h2>Problems</h2><ul class="problems"><li>&lt;stale&gt;</li></ul>', markup)
         multiple_roles = replace(reading, rows=(replace(status_row("claude1"), roles=("units", "workers", "spare"),
             role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),) * 2 + (accounts.NoRoleCount(),)),))
@@ -339,13 +339,11 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  try{
   frameElement.style.width='1280px';frameElement.style.height='700px';await flush();
   const original=keys(),total=document.querySelector('tbody').lastElementChild.outerHTML;
-  const moves=document.querySelector('.moves').textContent;
   const geometry=()=>[...document.querySelectorAll('th')].map(node=>[node.getBoundingClientRect().x,node.getBoundingClientRect().width]);
   const initialGeometry=geometry();
   const same=(indices,label)=>{
    check(JSON.stringify(keys())===JSON.stringify(indices.map(index=>original[index])),label);
    check(document.querySelector('tbody').lastElementChild.outerHTML===total,'the total stays last and unchanged: '+label);
-   check(document.querySelector('.moves').textContent===moves,'moves stay unchanged: '+label);
    check(geometry().every((box,index)=>box.every((value,side)=>Math.abs(value-initialGeometry[index][side])<.5)),
     'columns keep their positions: '+label);
   };
