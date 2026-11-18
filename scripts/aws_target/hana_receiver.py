@@ -308,6 +308,8 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 if not launch_attempted:
                     record['refused'] = True
+                    if isinstance(error, (guest.GuestAdmissionDisabled, guest.GuestDataNotMounted, guest.GuestPermitRefused)):
+                        record['refusal_code'] = error.code.value
                 record['reason'] = str(error)
                 guest.atomic_record(record_path, record)
         accepted, fenced = record['accepted'] is True, record['fenced'] is True
@@ -327,16 +329,20 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
                 if isinstance(source_outcome, hana_runner.HanaSourceUpdated) and source_outcome.identity == identity:
                     record['source_updated'] = True
                     guest.atomic_record(record_path, record)
-        outcome = supervisor.outcome(directory) if accepted else hana_runner.HanaExecutionLost('The command never started')
-        reason = str(record.get('reason', 'The command result is pending'))
-        if isinstance(outcome, hana_runner.HanaExecutionRefused):
-            reason = outcome.reason
-        elif isinstance(outcome, hana_runner.HanaExecutionLost) and 'reason' not in record:
-            reason = outcome.reason
+        reason = str(record.get('reason', execution.COMMAND_RESULT_PENDING))
+        refusal_code = (guest.CommandAdmissionRefusalCode(hana_result.string_field(record, 'refusal_code'))
+                        if 'refusal_code' in record else execution.NoCommandAdmissionRefusalCode())
+        if accepted and isinstance(refusal_code, execution.NoCommandAdmissionRefusalCode):
+            outcome = supervisor.outcome(directory)
+            if isinstance(outcome, hana_runner.HanaExecutionRefused) and outcome.reason != execution.COMMAND_RESULT_PENDING:
+                reason = outcome.reason
+            elif isinstance(outcome, hana_runner.HanaExecutionLost) and reason == execution.COMMAND_RESULT_PENDING:
+                reason = outcome.reason
         evidence = (placement.ExecutionEvidenceUnavailable(reason, clock()) if accepted
                     else placement.ExecutionNotStarted())
         return execution.HanaCommandObservation(key, slot, accepted, fenced, departure.terminated,
-                                                departure.lease_free, clock(), evidence, record.get('source_updated') is True)
+                                                departure.lease_free, clock(), evidence, record.get('source_updated') is True,
+                                                refusal_code)
 
 
 @dataclass(frozen=True)

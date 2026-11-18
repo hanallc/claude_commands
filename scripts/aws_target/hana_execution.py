@@ -6,7 +6,7 @@ import json
 import time
 from typing import TYPE_CHECKING, Protocol, cast
 
-from scripts.aws_target.hana_guest import WorkPermit
+from scripts.aws_target.hana_guest import CommandAdmissionRefusalCode, WorkPermit
 from scripts.aws_target import hana_result, hana_source
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.aws_target.hana_source import SourceManifest
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from scripts.buildlog.sync import TransferBytes
 
 CONTROL_MAX_BYTES = 65536
+COMMAND_RESULT_PENDING = 'The command result is pending'
 
 
 def fence_settlement_seconds(control_timeout_s: int, poll_seconds: int) -> int:
@@ -77,6 +78,11 @@ HanaExecutionEnvelope = HanaCommandEnvelope | HanaFenceEnvelope | HanaSourceUpda
 
 
 @dataclass(frozen=True)
+class NoCommandAdmissionRefusalCode:
+    """The observation has no typed command admission refusal."""
+
+
+@dataclass(frozen=True)
 class HanaCommandObservation:
     """The guest reports acceptance, fencing, termination, and slot lease release."""
     key: HanaAttemptKey
@@ -88,6 +94,7 @@ class HanaCommandObservation:
     observed_at: float
     evidence: placement.ExecutionEvidence
     source_updated: bool = False
+    refusal_code: CommandAdmissionRefusalCode | NoCommandAdmissionRefusalCode = NoCommandAdmissionRefusalCode()
 
 
 def encode_envelope(envelope: HanaExecutionEnvelope) -> bytes:
@@ -137,10 +144,13 @@ def decode_envelope(content: bytes) -> HanaExecutionEnvelope:
 
 def encode_observation(observation: HanaCommandObservation) -> bytes:
     """Encode one observation with its exact attempt and slot."""
+    evidence = _evidence_fields(observation.evidence)
+    if isinstance(observation.refusal_code, CommandAdmissionRefusalCode):
+        evidence['refusal_code'] = observation.refusal_code.value
     return _encode({'version': 1, 'key': hana_result.encode_attempt_key(observation.key), 'slot': observation.slot,
         'accepted': observation.accepted, 'fenced': observation.fenced, 'terminated': observation.terminated,
         'lease_free': observation.lease_free, 'observed_at': observation.observed_at,
-        'evidence': _evidence_fields(observation.evidence), 'source_updated': observation.source_updated})
+        'evidence': evidence, 'source_updated': observation.source_updated})
 
 
 def decode_observation(content: bytes) -> HanaCommandObservation:
@@ -152,12 +162,19 @@ def decode_observation(content: bytes) -> HanaCommandObservation:
         if not isinstance(value, bool):
             raise ValueError('The Hana observation flag is invalid: ' + name)
         flags.append(value)
+    evidence_row = hana_result.object_fields(row['evidence'])
+    refusal_code = (CommandAdmissionRefusalCode(hana_result.string_field(evidence_row, 'refusal_code'))
+                    if 'refusal_code' in evidence_row else NoCommandAdmissionRefusalCode())
     observation = HanaCommandObservation(hana_result.decode_attempt_key(row['key']), _positive_integer(row, 'slot'),
-        flags[0], flags[1], flags[2], flags[3], hana_result.seconds_field(row, 'observed_at'), _decode_evidence(row['evidence']), flags[4])
+        flags[0], flags[1], flags[2], flags[3], hana_result.seconds_field(row, 'observed_at'),
+        _decode_evidence(evidence_row), flags[4], refusal_code)
     if observation.accepted and isinstance(observation.evidence, placement.ExecutionNotStarted):
         raise ValueError('An accepted Hana command needs execution evidence')
     if observation.source_updated and not observation.accepted:
         raise ValueError('A Hana source update needs the original accepted attempt')
+    if isinstance(refusal_code, CommandAdmissionRefusalCode) and not isinstance(
+            command_admission_refusal(observation), placement.HanaCommandAdmissionRefused):
+        raise ValueError('A Hana command admission refusal needs confirmed departure and a cause')
     return observation
 
 
@@ -307,8 +324,27 @@ class HanaSettled:
 
 
 @dataclass(frozen=True)
+class HanaGuestEndedWithoutResult(HanaSettled):
+    """The guest confirmed departure and the sender has no accepted compiler result."""
+    outcome: placement.AttemptDeclined
+    evidence: placement.ExecutionEvidenceUnavailable
+
+
+@dataclass(frozen=True)
+class HanaAdmissionRefusalSettled(HanaSettled):
+    """The guest confirmed that the command did not start."""
+    outcome: placement.HanaCommandAdmissionRefused
+    evidence: placement.ExecutionNotStarted
+
+
+@dataclass(frozen=True)
 class HanaSettlementPending:
     reason: str
+
+
+@dataclass(frozen=True)
+class HanaGuestEndedClaimRetained(HanaSettlementPending):
+    """The guest confirmed departure and the lifecycle claim still needs release."""
 
 
 HanaSettlement = HanaSettled | HanaSettlementPending
@@ -401,6 +437,16 @@ def claim_dispatch_pending(directory: Path, reference: placement.ProviderClaimRe
         return True
 
 
+def claim_admission_refused(directory: Path, reference: placement.ProviderClaimReference) -> bool:
+    """Check that the exact claim has a durable command admission refusal."""
+    try:
+        row = _read_journal(directory, reference.claim_id)
+        return (row['phase'] == 'settled' and _journal_attempt(row) == (reference.episode, reference.attempt)
+                and isinstance(_settled_dispatch(row), HanaAdmissionRefusalSettled))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def read_claim_execution(directory: Path, reference: placement.ProviderClaimReference) -> placement.ExecutionEvidence:
     """Supply durable remote evidence without using the local holder as proof of departure."""
     import time
@@ -480,13 +526,20 @@ def dispatch_publication_attempted(directory: Path, request: HanaExecutionReques
     return _read_journal(directory, request.key.claim_id)['publication_attempted'] is True
 
 
-def read_dispatch_observation(directory: Path, request: HanaExecutionRequest) -> HanaCommandObservation | HanaObservationUnavailable:
+def _checked_observation(row: dict[str, object], request: HanaExecutionRequest
+                         ) -> HanaCommandObservation | HanaObservationUnavailable:
     try:
-        row = _read_journal(directory, request.key.claim_id)
         observation = decode_observation(_encode(hana_result.object_fields(row['observation'])))
         if observation.key != request.key or observation.slot != request.slot:
             raise ValueError('The Hana observation belongs to another dispatch')
         return observation
+    except (OSError, ValueError, KeyError, TypeError):
+        return HanaObservationUnavailable('The Hana command has no checked observation')
+
+
+def read_dispatch_observation(directory: Path, request: HanaExecutionRequest) -> HanaCommandObservation | HanaObservationUnavailable:
+    try:
+        return _checked_observation(_read_journal(directory, request.key.claim_id), request)
     except (OSError, ValueError, KeyError, TypeError):
         return HanaObservationUnavailable('The Hana command has no checked observation')
 
@@ -691,9 +744,45 @@ def _terminal(row: dict[str, object]) -> placement.TerminalAttemptOutcome:
         return placement.AttemptCancelled(reason)
     if outcome.get('kind') == 'prelaunch':
         return placement.PrelaunchRefused(reason)
-    if outcome.get('kind') != 'declined':
+    if outcome.get('kind') == placement.HANA_COMMAND_ADMISSION_REFUSED:
+        return placement.HanaCommandAdmissionRefused(reason)
+    if outcome.get('kind') not in ('declined', 'guest-ended'):
         raise ValueError('The Hana settlement outcome is invalid')
     return placement.AttemptDeclined(reason)
+
+
+def _settled_dispatch(row: dict[str, object]) -> HanaSettled:
+    outcome = _terminal(row)
+    evidence = _decode_evidence(row['evidence'])
+    if isinstance(outcome, placement.HanaCommandAdmissionRefused):
+        if not isinstance(evidence, placement.ExecutionNotStarted):
+            raise ValueError('The Hana admission refusal has invalid evidence')
+        return HanaAdmissionRefusalSettled(outcome, evidence)
+    if hana_result.object_fields(row['outcome']).get('kind') == 'guest-ended':
+        if (not isinstance(outcome, placement.AttemptDeclined)
+                or not isinstance(evidence, placement.ExecutionEvidenceUnavailable)):
+            raise ValueError('The Hana guest departure has invalid evidence')
+        return HanaGuestEndedWithoutResult(outcome, evidence)
+    return HanaSettled(outcome, evidence)
+
+
+@dataclass(frozen=True)
+class NoCommandAdmissionRefusal:
+    """The observation does not prove a command admission refusal."""
+
+
+def command_admission_refusal(observation: HanaCommandObservation
+                              ) -> placement.HanaCommandAdmissionRefused | NoCommandAdmissionRefusal:
+    """Classify a command admission refusal after the guest confirms departure."""
+    evidence = observation.evidence
+    if (not observation.accepted or not observation.terminated or not observation.lease_free
+            or observation.source_updated or not isinstance(evidence, placement.ExecutionEvidenceUnavailable)):
+        return NoCommandAdmissionRefusal()
+    # The old guest image sends only this exact reason for an admission refusal.
+    if (isinstance(observation.refusal_code, CommandAdmissionRefusalCode)
+            or evidence.reason == 'The data mount and a fresh permit are required'):
+        return placement.HanaCommandAdmissionRefused(' '.join(evidence.reason.splitlines()))
+    return NoCommandAdmissionRefusal()
 
 
 def _await_fence_acknowledgement(request: HanaExecutionRequest, objects: ExecutionObjects,
@@ -717,8 +806,8 @@ def _await_fence_acknowledgement(request: HanaExecutionRequest, objects: Executi
 
 def settle_execution(directory: Path, request: HanaExecutionRequest, objects: ExecutionObjects, *,
                      release_claim: Callable[[], bool], reason: str, fence_window: FenceAcknowledgementWindow,
-                     cancelled: bool = False) -> HanaSettlement:
-    """Fence the exact attempt and require command termination and lease release before lifecycle release."""
+                     cancelled: bool = False, result_transfer_lost: bool = False) -> HanaSettlement:
+    """Require exact command closure before lifecycle release."""
     import base64
 
     execution = request.key.claim_id
@@ -726,45 +815,77 @@ def settle_execution(directory: Path, request: HanaExecutionRequest, objects: Ex
         with _journal_lock(directory, execution):
             row = _read_journal(directory, execution)
             if row['phase'] == 'settled':
-                return HanaSettled(_terminal(row), _decode_evidence(row['evidence']))
+                return _settled_dispatch(row)
+            resume_fence = row['phase'] == 'fenced'
             row['phase'] = 'fenced'
             _save_journal(directory, execution, row)
             published = row['publication_attempted'] is True
             command_settled = row['command_settled'] is True
+        guest_ended = False
+        refusal: placement.HanaCommandAdmissionRefused | NoCommandAdmissionRefusal = NoCommandAdmissionRefusal()
         if published and not command_settled:
-            fence = HanaFenceEnvelope(request.key, request.slot, objects.execution_access(request.key))
-            try:
-                objects.publish_execution(fence)
-            except (OSError, ValueError, RuntimeError):
-                # An earlier PUT attempt can have saved the fence before the final error.
-                pass
-            observation = _await_fence_acknowledgement(request, objects, fence_window)
-            if isinstance(observation, HanaSettlementPending):
-                return observation
-            evidence = observation.evidence
+            observation = _checked_observation(row, request)
+            if (not cancelled and 'accepted_result' not in row and row.get('source_update_attempted') is not True
+                    and isinstance(observation, HanaCommandObservation) and observation.accepted
+                    and observation.terminated and observation.lease_free and not observation.source_updated
+                    and isinstance(observation.evidence, placement.ExecutionEvidenceUnavailable)
+                    and (isinstance(refusal := command_admission_refusal(observation), placement.HanaCommandAdmissionRefused)
+                         or not (resume_fence or result_transfer_lost))):
+                # The guest records acceptance before launch and refuses duplicate delivery.
+                evidence = observation.evidence
+                guest_ended = True
+            else:
+                fence = HanaFenceEnvelope(request.key, request.slot, objects.execution_access(request.key))
+                try:
+                    objects.publish_execution(fence)
+                except (OSError, ValueError, RuntimeError):
+                    # An earlier PUT attempt can have saved the fence before the final error.
+                    pass
+                observation = _await_fence_acknowledgement(request, objects, fence_window)
+                if isinstance(observation, HanaSettlementPending):
+                    return observation
+                evidence = observation.evidence
+                refusal = command_admission_refusal(observation)
         else:
             evidence = _decode_evidence(row['evidence'])
         with _journal_lock(directory, execution):
             row = _read_journal(directory, execution)
+            if row['phase'] == 'settled':
+                return _settled_dispatch(row)
             if 'outcome' not in row:
                 if cancelled:
                     outcome: dict[str, object] = {'kind': 'cancelled', 'reason': reason}
                 elif 'accepted_result' in row:
                     result = hana_result.decode_result(base64.b64decode(cast(str, row['accepted_result']), validate=True))
                     outcome = {'kind': 'completed', 'status': result.status}
+                elif isinstance(refusal, placement.HanaCommandAdmissionRefused):
+                    outcome = {'kind': placement.HANA_COMMAND_ADMISSION_REFUSED, 'reason': refusal.reason}
+                    evidence = placement.ExecutionNotStarted()
+                    row['phase'] = 'settled'
+                elif guest_ended and isinstance(evidence, placement.ExecutionEvidenceUnavailable):
+                    cause = ' '.join(evidence.reason.splitlines())
+                    if cause == COMMAND_RESULT_PENDING:
+                        cause = ' '.join(reason.splitlines())
+                    outcome = {'kind': 'guest-ended', 'reason': cause}
                 else:
                     outcome = {'kind': 'declined' if published else 'prelaunch', 'reason': reason}
                 row['outcome'] = outcome
             row['command_settled'] = True
             row['evidence'] = _evidence_fields(evidence)
             _save_journal(directory, execution, row)
+            if row['phase'] == 'settled':
+                # The controller settles the claim after the local holder exits.
+                return _settled_dispatch(row)
         if not release_claim():
+            retained = _settled_dispatch(row)
+            if isinstance(retained, HanaGuestEndedWithoutResult):
+                return HanaGuestEndedClaimRetained(retained.outcome.reason)
             return HanaSettlementPending('The exact Hana lifecycle claim remains retained')
         with _journal_lock(directory, execution):
             row = _read_journal(directory, execution)
             row['phase'] = 'settled'
             _save_journal(directory, execution, row)
-            return HanaSettled(_terminal(row), _decode_evidence(row['evidence']))
+            return _settled_dispatch(row)
     except (OSError, ValueError, RuntimeError, ConnectionError, KeyError, TypeError):
         return HanaSettlementPending('The Hana dispatch or cleanup observation is unavailable')
 
@@ -780,7 +901,7 @@ def reject_settled_result(directory: Path, request: HanaExecutionRequest, reason
             if isinstance(_terminal(row), placement.AttemptCompleted):
                 row['outcome'] = {'kind': 'declined', 'reason': reason}
                 _save_journal(directory, request.key.claim_id, row)
-            return HanaSettled(_terminal(row), _decode_evidence(row['evidence']))
+            return _settled_dispatch(row)
     except (OSError, ValueError, KeyError, TypeError):
         return HanaSettlementPending('The Hana result rejection could not be saved')
 

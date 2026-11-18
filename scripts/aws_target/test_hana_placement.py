@@ -233,6 +233,46 @@ class HanaPlacementTests(CostFixture):
                 mock.patch.object(self.controller, 'request', side_effect=AssertionError('Do not restart the failed boot'))):
             self.assertEqual(self.claim(), hana.HanaClaimRefused('boot failed'))
 
+    def test_placement_releases_a_dead_claim_after_command_admission_refusal(self) -> None:
+        from scripts.aws_target import hana_execution as execution, test_hana_execution as fixtures
+
+        adopted = self.ready()
+        claim = adopted.reserved.claim.reference
+        template = fixtures.HanaExecutionTests().request
+        key = replace(template.key, claim_id=claim.claim_id, generation=adopted.generation)
+        self.assertEqual((key.episode, key.attempt), (claim.episode, claim.attempt))
+        source = self.assignment.source_key
+        assert isinstance(source, placement.SourceKeyKnown)
+        request = replace(template, key=key, source_key=source)
+        objects = fixtures.FakeExecutionObjects(request, terminated=True, lease_free=True, fail_fence=True)
+        permit = self.provider.published[-1]
+        _ = execution.dispatch_execution(self.state, request, adopted, objects,
+            consume=lambda selected: wire.FirstAuthorization(selected.assignment, selected.claim),
+            current_permission=lambda: self.controller.permission(claim.claim_id, key.generation.boot_id, permit.generation),
+            current_source_key=lambda: source)
+        reason = 'The data mount and a fresh permit are required'
+        observation = replace(objects.observe_execution(key), evidence=placement.ExecutionEvidenceUnavailable(reason, self.clock.now))
+        with mock.patch.object(objects, 'observe_execution', return_value=observation):
+            _ = execution.observe_execution(self.state, request, objects)
+        with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
+            settled = execution.settle_execution(self.state, request, objects,
+                release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
+                fence_window=execution.FenceAcknowledgementWindow(0, 1))
+        self.assertIsInstance(settled, execution.HanaAdmissionRefusalSettled)
+        release.assert_not_called()
+        other = replace(self.request(), episode='other')
+        evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            for state in (box.Lifecycle.STOPPING, box.Lifecycle.STOPPING, box.Lifecycle.IDLE_STOPPED):
+                self.clock.advance(1)
+                self.assertEqual(self.controller.tick(), state)
+            evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.AllowedHost())
+        self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+
     def test_settled_attempt_cannot_commit_another_lifecycle_claim(self) -> None:
         from scripts.aws_target import hana_execution
         with (mock.patch.object(hana_execution, 'execution_command_settled', return_value=True),

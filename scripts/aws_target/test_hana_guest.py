@@ -17,7 +17,6 @@ from unittest import mock
 from scripts.aws_target import hana_guest as guest, hana_receiver
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,8 +40,20 @@ class HanaGuestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config_path = self.root / 'hana_aws.conf'
-        _ = write_config_fixture(self.config_path,
-            'guard_grace_seconds=60\npermit_max_seconds=120\nwatchdog_check_seconds=10\n')
+        _ = self.config_path.write_text('''enabled=off
+# whole: 1..
+guard_grace_seconds=60
+# whole: 1..
+permit_max_seconds=120
+# whole: 1..
+watchdog_check_seconds=10
+# whole: 1..
+step_cpu_limit=4
+# whole: 1..
+step_memory_gib=24
+# whole: 1..
+mount_timeout_seconds=15
+''')
         self.settings = guest.read_settings(conf.read(self.config_path))
         self.paths = guest.GuestPaths(self.root / 'state', self.root / 'boot-id')
         self.paths.directory.mkdir()
@@ -186,11 +197,21 @@ class HanaGuestTests(unittest.TestCase):
 
     def test_command_refuses_missing_disk_disabled_mode_and_stale_permission(self) -> None:
         enabled = replace(self.settings, enabled=True)
-        for settings, mounted, permit in ((enabled, False, self.fresh()),
-                                          (replace(enabled, enabled=False), True, self.fresh()),
-                                          (enabled, True, replace(self.fresh(), expires_at=self.now))):
-            _ = self.permit.write_text(json.dumps(asdict(permit)))
-            with self.assertRaises(ValueError):
+        for settings, mounted, permit, refusal, reason in (
+            (enabled, False, self.fresh(), guest.GuestDataNotMounted, 'The Hana data directory is not mounted'),
+            (replace(enabled, enabled=False), True, self.fresh(), guest.GuestAdmissionDisabled,
+             'Hana command admission is disabled on the guest'),
+            (enabled, True, replace(self.fresh(), expires_at=self.now), guest.GuestPermitRefused,
+             'the wall-clock expiry has passed'),
+            (enabled, True, replace(self.fresh(), expires_at=float('nan')), guest.GuestPermitRefused,
+             'the permit expiry is invalid'),
+            (enabled, True, replace(self.fresh(), boot_id='other-boot'), guest.GuestPermitRefused,
+             'the permit does not match the current boot'),
+            (enabled, True, replace(self.fresh(), generation='older_generation'), guest.GuestPermitRefused,
+             'the permit does not match the current generation'),
+        ):
+            with self.subTest(reason=reason), self.assertRaisesRegex(refusal, reason):
+                _ = self.permit.write_text(json.dumps(asdict(permit)))
                 _ = guest.admit_command(settings, ('cargo', 'check'), guest.DATA / 'slot/source',
                     mounted=mounted, clock=self.clock, uptime=self.uptime, paths=self.paths, start=lambda argv: argv)
 
@@ -258,7 +279,8 @@ class HanaGuestTests(unittest.TestCase):
     def test_config_values_drive_the_rendered_settings(self) -> None:
         files = self.files()
         self.assertEqual(json.loads(files['safety.json'].content), asdict(self.settings))
-        _ = write_config_fixture(self.config_path, 'watchdog_check_seconds=11\n')
+        _ = self.config_path.write_text(self.config_path.read_text().replace('watchdog_check_seconds=10',
+                                                                            'watchdog_check_seconds=11'))
         settings = guest.read_settings(conf.read(self.config_path))
         self.assertEqual(settings.watchdog_check_seconds, 11)
 
@@ -282,6 +304,10 @@ class HanaGuestTests(unittest.TestCase):
         self.assertLessEqual(first.monotonic_deadline - self.monotonic, self.settings.permit_max_seconds)
         # A restarted reader must retain the first reader's deadline after a clock change.
         self.now -= self.settings.watchdog_check_seconds
+        with guest.guest_lock(self.paths):
+            refusal = guest.bound_permit(self.settings, self.paths, clock=self.clock,
+                                         uptime=lambda: first.monotonic_deadline)
+        self.assertIs(refusal, guest.PermitRefusal.BOOT_CLOCK_EXPIRED)
         commands: list[list[str]] = []
 
         def pause(seconds: float) -> None:

@@ -444,9 +444,12 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
         self.assertEqual(len(self.supervisor.starts), 1)
 
     def test_changed_permission_refuses_the_exact_command(self) -> None:
+        self.supervisor.outcome_value = runner.HanaExecutionRefused(execution.COMMAND_RESULT_PENDING)
         observed = self.receive(replace(self.envelope, permission=replace(self.permit, expires_at=1099)))
         self.assertTrue(observed.terminated and observed.lease_free)
         self.assertEqual(self.supervisor.starts, [])
+        self.assertEqual(observed.evidence, placement.ExecutionEvidenceUnavailable(
+            'The acknowledged command permit changed', 1000))
 
     def test_source_update_acknowledgement_requires_departure_and_never_repeats_cargo(self) -> None:
         _ = self.receive(self.envelope)
@@ -764,8 +767,12 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
 
     def test_missing_mount_changed_permit_and_boot_refuse_launch(self) -> None:
         self.supervisor.mounted_value = False
+        self.supervisor.outcome_value = runner.HanaExecutionRefused('Unrelated runner diagnostic')
         observed = self.receive(self.envelope)
         self.assertTrue(observed.terminated and observed.lease_free)
+        self.assertEqual(observed.refusal_code, guest.CommandAdmissionRefusalCode.DATA_NOT_MOUNTED)
+        self.assertEqual(observed.evidence, placement.ExecutionEvidenceUnavailable('The Hana data directory is not mounted', 1000))
+        self.assertEqual(self.receive(self.envelope), observed)
         self.assertEqual(self.supervisor.starts, [])
         with self.assertRaises(ValueError):
             _ = self.receive(replace(self.envelope, request=replace(self.request,
