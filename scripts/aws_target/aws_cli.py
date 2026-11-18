@@ -87,10 +87,10 @@ class AwsCli:
             raise AwsUnavailable(f'{operation}: invalid reply')
         return cast(dict[str, object], raw)
 
-    def ec2_dry_run(self, operation: str, *arguments: str) -> None:
+    def ec2_dry_run(self, operation: str, *arguments: str, timeout_s: float | None = None) -> None:
         """Require AWS to confirm permission with DryRunOperation."""
         try:
-            _ = self._run('ec2', operation, (*arguments, '--dry-run'), self.timeout_s)
+            _ = self._run('ec2', operation, (*arguments, '--dry-run'), self.timeout_s if timeout_s is None else timeout_s)
         except AwsUnavailable as error:
             if aws_error_code(error) == 'DryRunOperation':
                 return
