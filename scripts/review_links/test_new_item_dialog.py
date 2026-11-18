@@ -16,7 +16,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import investigation, staff
-from scripts.review_links import console_theme, new_item_dialog, review_submissions
+from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
@@ -224,7 +224,7 @@ def fixture_page(width: int, *, photo: bool) -> bytes:
              .replace("__DISPLAY_WORDS__", json.dumps(DISPLAY_WORDS)))
     return (f'<!doctype html><html lang="en" data-theme="dark"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Builds</title>'
-            f'<style>{console_theme.CSS}</style>{SHELL}{new_item_dialog.render()}<script>{probe}</script>').encode()
+            f'<style>{console_theme.CSS}{page_frame.BUTTON_STATES}</style>{SHELL}{new_item_dialog.render()}<script>{probe}</script>').encode()
 
 
 @dataclass
@@ -357,6 +357,7 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
         self.assertIn('name="words" rows="4"', markup)
         self.assertEqual(markup.count('type="radio" name="kind"'), 4)
+        self.assertEqual(markup.count('<span data-button-face>'), 4)
         self.assertIn('data-kind="bug"', markup)
         self.assertIn('<svg aria-hidden="true"', markup)
         self.assertLess(markup.index('data-evidence'), markup.index('name="words"'))

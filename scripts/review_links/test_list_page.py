@@ -31,7 +31,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, serve, staff_names
+from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
@@ -1167,6 +1167,7 @@ document.body.append(result);
             "blocked_by": (the_list.ItemDependency(105, "The status page reaches main"),)}, source="morty")
         markup = list_page.render(self.root / "reviews").decode()
         body = without_role_colors(markup)
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertEqual(body.count('<tbody data-list-item'), 6)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)

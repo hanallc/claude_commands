@@ -190,10 +190,23 @@ def render_code_blocks(text: str, render_text: Callable[[str], str]) -> str:
     return "".join(content)
 
 
+BUTTON_STATES = '''
+:where(button[aria-pressed=true]){--button-hover-tint:rgb(0 0 0 / 24%)}
+:where(:is(button:enabled,summary,th[aria-sort][tabindex="0"]):not([aria-disabled=true]):hover,
+label:hover>input:enabled+[data-button-face],tr[aria-expanded]:not([aria-disabled=true]):hover>:is(th,td)){
+box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 75%,transparent),
+inset 0 0 0 100vmax var(--button-hover-tint,rgb(255 255 255 / 28%))}
+:where(:is(button:enabled,summary,th[aria-sort][tabindex="0"]):not([aria-disabled=true]):active,
+label:active>input:enabled+[data-button-face],tr[aria-expanded]:not([aria-disabled=true]):active>:is(th,td)){
+box-shadow:inset 0 0 0 2px currentColor,
+inset 0 0 0 100vmax light-dark(rgb(0 0 0 / 32%),rgb(0 0 0 / 64%))}
+'''
+
 # The title, status and content share one centered column and page background.
 # A text page keeps a 1124 px column; a page whose main has the page-wide class uses the pane width.
 # A page that measures its layout uses the desktop gutter.
-STYLE = (':root{scrollbar-gutter:stable}'
+STYLE = (BUTTON_STATES
+         + ':root{scrollbar-gutter:stable}'
          + 'body{background:var(--bg,Canvas);color:var(--ink,CanvasText)}'
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
          + 'main:has(>.page-status):not(.page-wide){max-width:1124px}'
@@ -260,7 +273,7 @@ COPY_STYLE = '''
 box-sizing:border-box;width:28px;min-height:28px;height:28px;padding:4px;margin:0;border:0;border-radius:4px;
 background:transparent;color:inherit;opacity:.55;cursor:pointer;user-select:none}
 .code-block:hover [data-copy-code],.code-block [data-copy-code]:focus-visible{opacity:1}
-.code-block [data-copy-code]:hover,.code-block [data-copy-code]:focus-visible{background:#8882}
+.code-block [data-copy-code]:focus-visible{background:#8882}
 [data-copy-code] [hidden]{display:none}
 '''
 

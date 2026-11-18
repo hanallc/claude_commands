@@ -228,6 +228,7 @@ class ImagesTests(ImagesFixture):
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(older_folder, older)
         source = images.render(self.status).decode()
+        self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         self.assertEqual(source.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.MOTION_SCRIPT), 1)
