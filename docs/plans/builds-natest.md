@@ -4805,3 +4805,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `build_queue/first_step.py` reads `--affected` and `--type-dirs` only after the script word through the public `build_steps.parse_command_program`.
 - `lint/memory_test_support.py` has one source of admission defaults, the committed fixture; `lib/test_build_folders.py` expects it. `copies/test_live_roots_guard.py` accepts any caller TMPDIR outside the live roots.
 - Proof: tests pass with request_max_bytes=1, names.suffix_length=128, another patterns.tool, guard_grace_seconds=30 and enabled=disabled in the live config. Full suite: 852 modules, all exit 0, 422 s.
+
+### Phase 345 — the status line tests use less aws CPU  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Hash 2954b844c on branch `natest-statusline345`, parent origin/main b494ff74c.
+- `statusline/test_statusline.py` calls the Python row builders in process where a test checks Python output. One real `statusline.sh` and jq run stays for each row kind. A drift check proves the in-process helper passes the same jq argument names and values as the shell.
+- The module uses a private pane store, zone file and TZDIR, and clears inherited Git variables. `statusline.sh` strips trailing slashes before its legacy home check.
+- AWS pair (3 rounds, c7a.4xlarge): 131.8 -> 41.9 CPU s, a saving of 89.9 s; 113 tests pass.
+- Floor: Python starts and jq. Architecture proposal: one Python entry point reads the For you count and the assignment before it starts jq.
