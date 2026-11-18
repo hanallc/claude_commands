@@ -5,12 +5,22 @@ import base64
 from dataclasses import dataclass
 import hashlib
 import json
-import math
+import sys
 from typing import cast
 
 from scripts.aws_target.hana_generation import HanaHostGeneration
 
 RESULT_MAX_BYTES = 32 * 1024 * 1024
+RESULT_UPLOAD_TIMEOUT = 'HanaResultUploadTimedOut'
+RESULT_UPLOAD_FAILED = 'HanaResultUploadFailed'
+
+
+class HanaResultDownloadTimedOut(RuntimeError):
+    """The sender did not receive a result within its transfer limit."""
+
+    def __init__(self, timeout_s: int) -> None:
+        super().__init__(f'HanaResultDownloadTimedOut: The result download exceeded {timeout_s} s '
+                         + '(result_transfer_timeout_s)')
 
 
 @dataclass(frozen=True)
@@ -101,7 +111,7 @@ def encode_attempt_key(key: HanaAttemptKey) -> dict[str, object]:
 def decode_attempt_key(value: object) -> HanaAttemptKey:
     """Decode the shared identity without creating another generation type."""
     row = object_fields(value)
-    generation = object_fields(row['generation'])
+    generation = object_fields(row.get('generation'))
     return HanaAttemptKey(string_field(row, 'episode'), string_field(row, 'attempt'), string_field(row, 'claim_id'),
         HanaHostGeneration(string_field(generation, 'deployment'), string_field(generation, 'start_token'),
                            string_field(generation, 'boot_id')))
@@ -224,6 +234,6 @@ def integer_field(row: dict[str, object], name: str) -> int:
 
 def seconds_field(row: dict[str, object], name: str) -> float:
     value = row.get(name)
-    if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+    if not isinstance(value, int | float) or isinstance(value, bool) or not 0 <= value <= sys.float_info.max:
         raise ValueError(f'Invalid Hana time: {name}')
     return float(value)
