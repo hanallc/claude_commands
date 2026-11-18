@@ -369,6 +369,66 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.UnprovedForegroundOwner)
             self.assertEqual(read.call_args_list, [call(457), call(457)])
 
+    def test_codex_target_refreshes_once_when_a_foreground_process_exits(self) -> None:
+        identity = fixture_runtime_id("codex-child-exits")
+        client = herdr.Herdr("agents")
+        place = herdr.HerdrPlace(client.session, "w1:p1")
+        row: herdr.PaneIdentity = {"pane_id": place.pane, "terminal_id": "fixture-terminal",
+                                  "workspace_id": "w1", "session_id": identity}
+        native = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "fixture-start", {})
+        codex = {"pid": 456, "argv": ["codex"]}
+        child = {"pid": 457, "argv": ["exe"]}
+        request = ("pane", "process-info", "--pane", place.pane)
+        for refreshed, outcome, reason in (
+            ([codex], True, ""),
+            ([codex, child], False, "foreground process ancestry is unavailable"),
+            ([codex, {"pid": 458, "argv": ["editor"]}], False, "outside the Codex process tree"),
+        ):
+            with self.subTest(refreshed=refreshed):
+                replies = [json.dumps({"result": {"process_info": {"shell_pid": 455,
+                    "foreground_process_group_id": 456, "foreground_processes": processes}}})
+                    for processes in ([codex, child], refreshed)]
+                def state(pid: int) -> list[str]:
+                    if pid == 458:
+                        return ["S", "1"]
+                    raise FileNotFoundError("fixture process exited")
+
+                with (herdr.observation_snapshot(), patch.object(client, "_process_info_batch"),
+                      patch.object(client, "run", side_effect=replies) as read,
+                      patch.object(herdr, "_PLATFORM", "linux"),
+                      patch.object(herdr, "_linux_process_stat", side_effect=state) as stat_read,
+                      patch.object(herdr, "native_process", return_value=native) as native_read,
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(herdr.check_target(identity, action="signal", place=place,
+                                                        pane_info=row, client=client), outcome)
+                self.assertEqual(read.call_args_list, [call(*request), call(*request)])
+                if outcome:
+                    self.assertEqual(errors.getvalue(), "")
+                    stat_read.assert_called_once_with(457)
+                    native_read.assert_called_once_with(456, "codex", identity)
+                else:
+                    self.assertIn(reason, errors.getvalue())
+                    self.assertEqual(stat_read.call_args_list, [call(457), call(refreshed[1]["pid"])])
+                    native_read.assert_not_called()
+
+    def test_codex_target_refuses_live_unrelated_foreground_without_refresh(self) -> None:
+        identity = fixture_runtime_id("codex-unrelated-foreground")
+        client = herdr.Herdr("agents")
+        place = herdr.HerdrPlace(client.session, "w1:p1")
+        row: herdr.PaneIdentity = {"pane_id": place.pane, "terminal_id": "fixture-terminal",
+                                  "workspace_id": "w1", "session_id": identity}
+        reply = json.dumps({"result": {"process_info": {"shell_pid": 455, "foreground_process_group_id": 456,
+            "foreground_processes": [{"pid": 456, "argv": ["codex"]}, {"pid": 457, "argv": ["exe"]}]}}})
+        with (patch.object(client, "run", return_value=reply) as read,
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(herdr, "_linux_process_stat", return_value=["S", "1"]) as stat_read,
+              patch.object(herdr, "native_process") as native_read, redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(herdr.check_target(identity, action="signal", place=place, pane_info=row, client=client))
+        self.assertIn("outside the Codex process tree", errors.getvalue())
+        read.assert_called_once_with("pane", "process-info", "--pane", place.pane)
+        stat_read.assert_called_once_with(457)
+        native_read.assert_not_called()
+
     def test_codex_launch_refreshes_process_state_inside_an_observation(self) -> None:
         identity = fixture_runtime_id("launch-fresh-proof")
         client = herdr.Herdr("agents")
