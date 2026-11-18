@@ -324,7 +324,7 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
         raise ValueError(f"session {identity}, pane {pane}: producer adoption is unproved: {error}") from error
 
 
-def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str,
+def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str, why: str = "resumed by name", requester: str = "",
                                   client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     """Serialize producer admission and replacement."""
     path = _producer_admission_path(request.name)
@@ -332,15 +332,15 @@ def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str,
         record = staff.initial_snapshot()
         row = next((row for row in record.rows if row.kind == "producer" and row.name == request.name), None)
         if row is None:
-            return _first_producer_resume(request, to=to, client=client)
+            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client)
         with staff.row_operation(str(row.id)):
             if not path.exists() and (not isinstance(request, ProducerFamilyChange)
                                       or row.current_session != request.session):
-                return _resume(str(row.id), to=to, client=client)
-            return _first_producer_resume(request, to=to, client=client, member=row)
+                return _resume(str(row.id), to=to, why=why, requester=requester, client=client)
+            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client, member=row)
 
 
-def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
+def _first_producer_resume(request: ProducerFirstStart, *, to: str, why: str, requester: str,
                            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW,
                            member: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW) -> ResumeResult:
     """Retain the pane before launch and admit only its proved native identity."""
@@ -356,6 +356,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
         path = _producer_admission_path(request.name)
         recovering_admission = path.exists()
         if isinstance(request, ProducerFamilyChange) and not recovering_admission:
+            if kind == request.kind:
+                return _resume(request.session, to=to, why=why, requester=requester, client=client)
             _ = member_account.producer_account(kind, to=to)
             _stop_producer_for_family_change(request)
         conflicts = producer_conflicts(request.name, client)
@@ -1310,7 +1312,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 elif isinstance(source_pane, pane_launch.ResumeSourcePane):
                     old_pane = source_client.pane_row(source_pane.pane)
                 change = ProducerFamilyChange(request.name, request.folder, row.current_session, current_kind, source_client, old_pane)
-                return _locked_first_producer_resume(change, to=to or "", client=client)
+                return _locked_first_producer_resume(change, to=to or "", why=why, requester=requester, client=client)
             if entry is not None:
                 entry = names.resume(entry)
                 entry["kind"] = kind

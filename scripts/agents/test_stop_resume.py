@@ -267,7 +267,7 @@ class StopResumeTests(unittest.TestCase):
             ("codex", "claude", "before ended write"),
             ("codex", "claude", "before close"), ("claude", "codex", "after close"),
             ("codex", "claude", "after launch"), ("codex", "claude", "stop refused"),
-            ("claude", "claude", "same family"),
+            ("claude", "claude", "same family"), ("claude", "codex", "configuration restored"),
         )
         for previous, configured, interruption in cases:
             with self.subTest(previous=previous, configured=configured, interruption=interruption), producer_first_fixture(previous) as world:
@@ -351,8 +351,23 @@ class StopResumeTests(unittest.TestCase):
                     self.assertIsInstance(first, stop_resume.ClaudeUp, first)
                     old_row = staff.initial_snapshot().rows[0]
                     old_pane = world.pane
-                    if previous == configured:
-                        repeated = stop_resume.resume("dwight")
+                    configuration = root / "configuration/models.conf"
+                    if previous != configured:
+                        setting = "claude:opus:high" if configured == "claude" else "codex:gpt-test:high"
+                        _ = write_registry(configuration, {"producers": {"dwight": setting}}, update=True)
+                    if previous == configured or interruption == "configuration restored":
+                        first_arguments = restart.producer_first_arguments
+
+                        def restore_configuration(name: str) -> tuple[Literal["claude", "codex"], list[str]]:
+                            selected = first_arguments(name)
+                            if selected[0] == configured:
+                                _ = write_registry(configuration, {"producers": {name: "claude:opus:high"}}, update=True)
+                            return selected
+
+                        restore = (patch.object(restart, "producer_first_arguments", side_effect=restore_configuration)
+                                   if interruption == "configuration restored" else nullcontext())
+                        with restore:
+                            repeated = stop_resume.resume("dwight")
                         self.assertIsInstance(repeated, stop_resume.ClaudeUp, repeated)
                         assert isinstance(repeated, stop_resume.ClaudeUp)
                         self.assertEqual(repeated.start_state, ClaudeStartState.ALREADY_RUNNING)
@@ -360,9 +375,9 @@ class StopResumeTests(unittest.TestCase):
                         self.assertEqual(staff.initial_snapshot().rows, (old_row,))
                         self.assertEqual((len(case.client.opened), case.client.closed), (1, []))
                         case.kill.assert_not_called()
+                        self.assertEqual(world.started_panes, [old_pane])
+                        self.assertFalse(stop_resume.producer_admission_record("dwight").exists())
                         continue
-                    setting = "claude:opus:high" if configured == "claude" else "codex:gpt-test:high"
-                    _ = write_registry(root / "configuration/models.conf", {"producers": {"dwight": setting}}, update=True)
                     if interruption == "stop refused":
                         retained = pane_record.read_strict("agents")
                         self.assertFalse(retained[old_pane].get("ended", False))
