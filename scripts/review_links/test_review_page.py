@@ -1540,7 +1540,7 @@ window.fetch=async url=>{
         change_page.recover_pending(change_page.DeliveryStatus(self.root))
         self.assertEqual(len(self.fixture.messages),before)
 
-    def test_sent_question_feedback_recovers_when_the_saved_mark_write_fails(self) -> None:
+    def file_sent_question(self) -> str:
         document = self.fixture.production
         _ = document.write_text(document.read_text().replace(
             '# Demo\n', '# Demo\n\n> **Status: PRODUCTION — running.**\n', 1))
@@ -1549,7 +1549,10 @@ window.fetch=async url=>{
         request_id = f'r1-{"a" * 32}-{kind}-{owner}'
         filed = review_submissions.submit(review_submissions.NewItemRequest(
             request_id, kind, owner, 'Which layout should the page use?', review_submissions.NoEvidence()))
-        key = f'question/{owner}/{filed.path.name}'
+        return f'question/{owner}/{filed.path.name}'
+
+    def test_sent_question_feedback_recovers_when_the_saved_mark_write_fails(self) -> None:
+        key = self.file_sent_question()
         words = 'Use the wide layout for the next review.'
         write = atomic_file.write_bytes_atomic
 
@@ -1576,6 +1579,67 @@ window.fetch=async url=>{
         self.assertEqual([recipient for recipient, _, message in self.fixture.messages if words in message], ['page-owner'])
         self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
         self.assertFalse(restarted.review_save_receipt(delivery.page, delivery.row).exists())
+
+    def test_recovery_does_not_send_again_when_the_completion_write_fails(self) -> None:
+        question = self.file_sent_question()
+        record = self.investigation()
+        for key in (question, f'investigation/{record.owner}/{record.id}'):
+            with self.subTest(key=key):
+                status = change_page.DeliveryStatus(self.root)
+                write_slots = status.write_slots
+
+                def fail_saved_mark(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+                    if isinstance(page, (change_page.UserQuestionPage, change_page.ReviewMessagePage)) and page.saved['saved']:
+                        raise OSError('fixture delivery save mark failed')
+                    write_slots(page, row, slots)
+
+                words = f'Use the wider layout for {key}.'
+                with patch.object(status, 'write_slots', new=fail_saved_mark):
+                    delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                receipt = status.review_save_receipt(delivery.page, delivery.row)
+                self.assertTrue(receipt.exists())
+                path = status.path(delivery.page, delivery.row)
+                restarted = change_page.DeliveryStatus(self.root)
+                write = atomic_file.write_bytes_atomic
+
+                def fail_completion(target: Path, content: bytes, *, mode: int | None = None) -> None:
+                    if target == path and 'verdict' not in json.loads(content):
+                        raise OSError('fixture delivery completion failed')
+                    write(target, content, mode=mode)
+
+                self.fixture.messages.clear()
+                with patch.object(atomic_file, 'write_bytes_atomic', new=fail_completion):
+                    change_page.recover_pending(restarted)
+                self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.DeliveryIntent)
+                self.assertTrue(receipt.exists())
+                self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+                self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
+                self.assertFalse(receipt.exists())
+
+    def test_recovery_keeps_the_message_when_the_send_result_write_fails(self) -> None:
+        record = self.investigation()
+        key = f'investigation/{record.owner}/{record.id}'
+        words = 'Keep the saved layout.'
+        delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        path = self.status.closeout_path(delivery.page, delivery.row)
+        write = atomic_file.write_bytes_atomic
+
+        def fail_result(target: Path, content: bytes, *, mode: int | None = None) -> None:
+            if target == path and self.fixture.messages:
+                raise OSError('fixture send result failed')
+            write(target, content, mode=mode)
+
+        with patch.object(atomic_file, 'write_bytes_atomic', new=fail_result):
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+        change_page.recover_pending(change_page.DeliveryStatus(self.root))
+        self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+        verdict = self.status.slots(delivery.page, delivery.row).verdict
+        assert isinstance(verdict, change_page.DeliveryIntent)
+        self.assertEqual(verdict.attempt, delivery.attempt)
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,

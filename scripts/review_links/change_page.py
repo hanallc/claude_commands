@@ -168,11 +168,17 @@ class StoredReviewMessage(TypedDict):
     image_question_dispatch: NotRequired[ImageQuestionDispatch]
 
 
-class SentCloseoutAlerts(TypedDict):
+class StoredDeliveryCloseout(TypedDict):
     review_list: str
     row: str
     messages: list[str]
     failed_delivery: NotRequired[StoredFailedDelivery]
+    review_dispatch: NotRequired[StoredReviewDispatch]
+
+
+class StoredReviewDispatch(TypedDict):
+    attempt: str
+    state: Literal["started", "finished"]
 
 
 class StoredFailedDelivery(TypedDict):
@@ -409,11 +415,7 @@ class DeliveryStatus:
 
     def failed_delivery(self, page: ReviewPage, row: str) -> FailedDelivery | NoFailedDelivery:
         """Read a failure unless an earlier send may have reached the owner."""
-        try:
-            fields = cast(SentCloseoutAlerts, json.loads(self.closeout_path(page, row).read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            return NoFailedDelivery()
-        failed = fields.get("failed_delivery")
+        failed = self.closeout_fields(page, row).get("failed_delivery")
         if failed is None:
             return NoFailedDelivery()
         dispatch = self.image_question_dispatch(page, row)
@@ -422,20 +424,42 @@ class DeliveryStatus:
             return NoFailedDelivery()
         return FailedDelivery(failed["attempt"], Path(failed["review_list"]), failed["row"], failed["last_error"])
 
+    def closeout_fields(self, page: ReviewPage, row: str) -> StoredDeliveryCloseout:
+        try:
+            return cast(StoredDeliveryCloseout, json.loads(self.closeout_path(page, row).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            return {"review_list": str(page.review_list.resolve()), "row": row, "messages": []}
+
+    def start_review_dispatch_locked(self, delivery: MessageDelivery, slots: DeliverySlots,
+                                     intent: DeliveryIntent) -> bool:
+        """Save the attempt before sending. Finish an attempt that already has a result."""
+        page, row = delivery.page, delivery.row
+        fields = self.closeout_fields(page, row)
+        dispatch = fields.get("review_dispatch")
+        if dispatch is not None and dispatch["attempt"] == intent.attempt:
+            if dispatch["state"] == "finished":
+                self.finish_intent_locked(delivery, slots, intent)
+            else:
+                print(f"review-links delivery {row}: send result unknown for attempt {intent.attempt}; message kept",
+                      file=sys.stderr)
+            return False
+        fields["review_dispatch"] = {"attempt": intent.attempt, "state": "started"}
+        atomic_file.write_bytes_atomic(self.closeout_path(page, row), (json.dumps(fields) + "\n").encode(), mode=0o600)
+        return True
+
     def record_result_locked(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery) -> None:
         """Keep alert history and the delivery result while the caller holds the delivery lock."""
         path = self.closeout_path(delivery.page, delivery.row)
-        fields: SentCloseoutAlerts
-        try:
-            fields = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            fields = {"review_list": str(delivery.page.review_list.resolve()), "row": delivery.row, "messages": []}
+        fields = self.closeout_fields(delivery.page, delivery.row)
+        dispatch = fields.get("review_dispatch")
+        if dispatch is not None and dispatch["attempt"] == delivery.attempt:
+            dispatch["state"] = "finished"
         if isinstance(result, FailedDelivery):
             fields["failed_delivery"] = {"attempt": result.attempt, "review_list": str(result.review_list.resolve()),
                                          "row": result.row, "last_error": result.last_error}
         else:
             _ = fields.pop("failed_delivery", None)
-            if not fields["messages"]:
+            if not fields["messages"] and dispatch is None:
                 path.unlink(missing_ok=True)
                 return
         atomic_file.write_bytes_atomic(path, (json.dumps(fields) + "\n").encode("utf-8"), mode=0o600)
@@ -447,10 +471,7 @@ class DeliveryStatus:
             return
         path = self.closeout_path(page, row)
         with self.locked():
-            try:
-                sent: SentCloseoutAlerts = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
-            except FileNotFoundError:
-                sent = {"review_list": str(page.review_list.resolve()), "row": row, "messages": []}
+            sent = self.closeout_fields(page, row)
             if message in sent["messages"]:
                 return
             for identity in recipients:
@@ -565,17 +586,21 @@ class DeliveryStatus:
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
                     self.record_result_locked(delivery, result)
-                    if current.kind == "validation":
-                        updated = replace(slots, validation=ValidationRequested(current.attempt, current.feedback))
-                    else:
-                        updated = slots.updated(current.kind, NoDelivery())
-                    self.write_slots(delivery.page, delivery.row, updated)
-                    if current.kind == "verdict" and isinstance(page, (ReviewMessagePage, UserQuestionPage)):
-                        try:
-                            self.review_save_receipt(page, row).unlink(missing_ok=True)
-                        except OSError as error:
-                            print(f"review-links delivery save receipt {row}: {error}", file=sys.stderr)
+                    self.finish_intent_locked(delivery, slots, current)
                     return
+
+    def finish_intent_locked(self, delivery: MessageDelivery, slots: DeliverySlots, intent: DeliveryIntent) -> None:
+        page, row = delivery.page, delivery.row
+        if intent.kind == "validation":
+            updated = replace(slots, validation=ValidationRequested(intent.attempt, intent.feedback))
+        else:
+            updated = slots.updated(intent.kind, NoDelivery())
+        self.write_slots(page, row, updated)
+        if intent.kind == "verdict" and isinstance(page, (ReviewMessagePage, UserQuestionPage)):
+            try:
+                self.review_save_receipt(page, row).unlink(missing_ok=True)
+            except OSError as error:
+                print(f"review-links delivery save receipt {row}: {error}", file=sys.stderr)
 
     def clear(self, page: ReviewPage, row: str, kind: Literal["verdict", "validation", "question"]) -> None:
         with self.locked():
@@ -1314,6 +1339,11 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
                 "attempt": delivery.attempt, "state": "started_after_unconfirmed" if unconfirmed else "started"}})
             # Save the send mark before the sender can accept the message.
             status.write_slots(started, delivery.row, slots.updated("verdict", NoDelivery()))
+        elif (isinstance(page, (ReviewMessagePage, UserQuestionPage)) and isinstance(slots.verdict, DeliveryIntent)
+                and slots.verdict.attempt == delivery.attempt):
+            if not status.start_review_dispatch_locked(delivery, slots, slots.verdict):
+                _ = status.request_attempts.pop(delivery.attempt, None)
+                return
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
     failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
@@ -1473,7 +1503,7 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 identities = update_registration.QuestionStaff.read()
                 owner = identities.record.by_id(staff.StaffId(saved["owner"]))
                 source = owner if owner is not None and owner.kind == "producer" else page.production
-                question = next((item for item in update_registration.question_records_for_document(source, identities)
+                question = next((item for item in update_registration.question_records_for_document(source, identities, strict=True)
                                  if item.path == page.review_list), None)
                 # An answer closes its question; a follow-up or a skip leaves it open.
                 if question is None or question.status != ("closed" if saved.get("kind", "answer") in ("answer", "feedback") else "open"):

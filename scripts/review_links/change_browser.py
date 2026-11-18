@@ -724,19 +724,14 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(recipient,))
-        status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), intent)
+        status.write_slots(page, page.rows[0], slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
         try:
             relay = save_outcome(production, question, outcome, words, identities)
             if outcome != "skip":
                 update_registration.record_review_log(question.record.path,
                     ('feedback sent' if outcome == 'feedback' else outcome)+": "+words)
-            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
-            if outcome in ('feedback','question'):
-                recipient = question.owner
-            intent = replace(intent, recipients=(recipient,))
-            page = replace(page, saved={**saved, "saved": True})
-            status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
         except BaseException as error:
             try:
                 status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
@@ -745,6 +740,11 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
             if isinstance(error, update_registration.RegistrationFailure):
                 raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
             raise
+        if outcome not in ('feedback', 'question'):
+            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
+        intent = replace(intent, recipients=(recipient,))
+        page = replace(page, saved={**saved, "saved": True})
+        status.mark_review_saved(page, page.rows[0], replace(slots, verdict=intent), intent)
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
