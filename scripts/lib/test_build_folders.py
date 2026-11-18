@@ -22,6 +22,7 @@ from contextlib import contextmanager, nullcontext
 from typing import ContextManager
 
 from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
+from scripts.lint import memory_test_support
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
@@ -1620,7 +1621,17 @@ assert not loaded, loaded
 
     def test_configuration_helper_supplies_missing_files_and_preserves_overrides(self) -> None:
         copied = self.root / "copied-config"
-        _ = config_environment(copied)
+        admission_source = self.root / "build_admission.conf"
+        defaults = {"min_pass_gap_seconds": "0", "build_reserve_share_percent": "65"}
+        _ = admission_source.write_text("[memory]\n" + "".join(f"{key}={value}\n" for key, value in defaults.items()))
+        admission_copy = copied / admission_source.name
+        with mock.patch.object(memory_test_support, "ADMISSION_CONFIG_FIXTURE", admission_source):
+            for overrides in ({}, {"build_reserve_share_percent": "35"}):
+                with self.subTest(overrides=overrides):
+                    if overrides:
+                        _ = admission_copy.write_text("[memory]\nmin_pass_gap_seconds=0\nbuild_reserve_share_percent=35\n")
+                    _ = config_environment(copied)
+                    self.assertEqual(conf.read(admission_copy).values(), defaults | overrides)
         config = copied / "build_folders.conf"
         config.unlink()
         environment = config_environment(config.parent)
@@ -1628,12 +1639,8 @@ assert not loaded, loaded
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
         for source in sources.glob("*.conf"):
-            private = config.parent / source.name
-            if source.name == "build_admission.conf":
-                shipped = conf.read(source).values()
-                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
-            else:
-                self.assertEqual(private.read_bytes(), source.read_bytes())
+            if source.name != admission_source.name:
+                self.assertEqual((copied / source.name).read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))

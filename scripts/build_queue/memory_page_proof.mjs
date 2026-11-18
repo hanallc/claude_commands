@@ -1023,31 +1023,36 @@ try {
             await show(shortReading);
             if(theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
-                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const alert=document.getElementById('mac-idle-alert').getBoundingClientRect();
                 const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
-                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+                return {x:running.left,y:alert.top+scrollY,width:running.width,height:running.bottom-alert.top,scale:1};
               })()`);
               const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
               await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
             }
-            // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
+            // The user, 11-17: a short reserve has a red outline, one alert line names it, and its tooltip names the missing part.
             const overBar=await evaluate(`(() => {
-              const box=id=>{const r=document.getElementById(id).getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
-              const tip=Object.fromEntries(tooltipRows('over',latest).map(row=>[row.label,row.value]));
-              return {hidden:document.getElementById('b-overlay').hidden,overlay:box('b-overlay'),cap:box('b-cap'),over:box('b-over'),
-                brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
+              const outline=id=>({short:document.getElementById(id).classList.contains('short-reserve'),
+                shadow:getComputedStyle(document.getElementById(id)).boxShadow});
+              const probe=document.createElement('i');
+              probe.style.color='var(--error)';
+              document.body.append(probe);
+              const errorColor=getComputedStyle(probe).color;
+              probe.remove();
+              const alert=document.getElementById('mac-idle-alert');
+              return {reserved:outline('s-reserved'),safety:outline('s-safety'),swap:outline('s-swap'),errorColor,
+                alert:alert.hidden?'':alert.textContent,old:['b-overlay','b-over','bc-reserved'].filter(id=>document.getElementById(id)),
+                tip:Object.fromEntries(tooltipRows('reserved',latest).map(row=>[row.label,row.value]))};
             })()`);
-            assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
+            assert.equal(overBar.reserved.short,true,'Build reserved has no red outline when it is short.');
+            assert.ok(overBar.reserved.shadow.includes(overBar.errorColor),'The short outline is not the error color. '+JSON.stringify(overBar));
+            assert.equal(overBar.safety.short,false);
+            assert.equal(overBar.swap.short,false);
+            assert.deepEqual(overBar.old,[],'The old over-cap drawing is still on the page.');
+            assert.match(overBar.alert,/Free RAM is short by 4\.0 GiB\. Build reserved holds [0-9.]+ of [0-9.]+ GiB\./);
+            assert.equal(overBar.tip.Missing,'4.0 GiB');
             // A small hana CI part stays visible, so the builds parts add up on screen.
             assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
-            assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
-            assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
-            assert.equal(overBar.brace,'over cap 4.0');
-            assert.match(overBar.reserved,/^build reserved [0-9.]+ · [0-9.]+ covered$/);
-            assert.equal(overBar.tip['Over cap'],'4.0 GiB');
-            assert.equal(overBar.tip['= Over cap'],'4.0 GiB');
-            assert.ok(Math.abs(parseFloat(overBar.tip['Build reserved (full)'])-parseFloat(overBar.tip['− Free RAM after safety net and swap'])-4)<=0.1+1e-9,
-              'Build reserved (full) − covered is not the amount over the cap. '+JSON.stringify(overBar.tip));
             proof.overBar=overBar;
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
@@ -1070,7 +1075,7 @@ try {
             assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
-            assert.equal(await evaluate(`document.getElementById('b-overlay').hidden`),true,'The bar draws an over-cap box when nothing is over the cap.');
+            assert.equal(await evaluate(`document.querySelectorAll('.short-reserve').length`),0,'A reserve has a red outline when nothing is short.');
             proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
@@ -2185,7 +2190,8 @@ try {
               for(const [key,reserve] of [['reserved','build'],['safety','safety'],
                 ['swap','swap'],['swap-pool:outside','swap']]) {
                 for(const target of [2,3]) {
-                  const reading={...latest,swap:{...latest.swap,outside_bytes:2*GIB},
+                  // Without a recorded basis, a Target row shows only when it differs from the title.
+                  const reading={...latest,build_reserve:undefined,swap:{...latest.swap,outside_bytes:2*GIB,window_seconds:0},
                     ram:{...latest.ram,[reserve+'_covered_bytes']:2*GIB,
                       [reserve+'_target_bytes']:target*GIB,[reserve+'_missing_bytes']:(target-2)*GIB}};
                   cases.push({key,target,rows:tooltipRows(key,reading)});
@@ -2193,6 +2199,21 @@ try {
               }
               return cases;
             })()`);
+            const basisProof = await evaluate(`(() => {
+              const reading={...latest,
+                build_reserve:{growth_bytes:5*GIB,share_percent:80,between_steps_bytes:GIB,unread_bytes:0},
+                swap:{...latest.swap,reserve_share_percent:20,window_seconds:600,swap_in_window_bytes:10*GIB},
+                ram:{...latest.ram,build_covered_bytes:5*GIB,build_target_bytes:5*GIB,build_missing_bytes:0,
+                  swap_covered_bytes:2*GIB,swap_target_bytes:2*GIB,swap_missing_bytes:0}};
+              return Object.fromEntries(['reserved','swap'].map(key=>[key,tooltipRows(key,reading)]));
+            })()`);
+            // With a recorded basis, each tooltip ends in its sum, also when the sum equals the title.
+            assert.deepEqual(basisProof.reserved.filter(row=>row.kind!=='title'&&row.kind!=='caption')
+              .map(row=>[row.label,row.value]),
+              [['Room to grow','5.0 GiB'],['× Share held','80%'],['+ Held between steps','1.0 GiB'],['= Target','5.0 GiB']]);
+            assert.deepEqual(basisProof.swap.filter(row=>row.kind!=='title'&&row.kind!=='caption')
+              .map(row=>[row.label,row.value]),
+              [['Swap-in, last 10 min','10.0 GiB'],['× Share held','20%'],['= Target','2.0 GiB']]);
             for(const {key,target,rows} of reserveProof) {
               const title=rows.find(row=>row.kind==='title');
               const targetRow=rows.find(row=>row.label==='Target');

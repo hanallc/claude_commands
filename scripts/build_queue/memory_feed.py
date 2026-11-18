@@ -806,6 +806,24 @@ class SwapTotals(TypedDict):
     builds_ci_bytes: int
     outside_bytes: int
     reserve_share_percent: int
+    # Swap-in within the window, at most the swap outside builds and CI.
+    swap_in_window_bytes: int
+    window_seconds: int
+
+
+class BuildReserveBasis(TypedDict):
+    """Build reserved is the share of room to grow, plus memory held between steps and needs with no use reading."""
+    growth_bytes: int
+    share_percent: int
+    between_steps_bytes: int
+    unread_bytes: int
+
+
+def build_reserve_basis(room: admission_records.MemoryRoom, share_percent: int) -> BuildReserveBasis:
+    parts = [admission_records.keep_aside_parts(hold.memory, share_percent) for hold in room.runs]
+    return {"growth_bytes": sum(part.growth for part in parts), "share_percent": share_percent,
+            "between_steps_bytes": sum(part.between_steps for part in parts),
+            "unread_bytes": sum(part.unread for part in parts)}
 
 
 class MemoryPage(TypedDict):
@@ -834,6 +852,7 @@ class MemoryPage(TypedDict):
     smallest_need: float
     pressure: str
     swap: SwapTotals
+    build_reserve: BuildReserveBasis
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
     swap_by: list[SwapRow]
@@ -2319,7 +2338,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
                  "outside_bytes": swap.used - swap.builds_ci,
-                 "reserve_share_percent": explanation.policy.agent_swap_share_percent},
+                 "reserve_share_percent": explanation.policy.agent_swap_share_percent,
+                 "swap_in_window_bytes": captured.returning_swap, "window_seconds": host.swap_in_window_seconds},
+        "build_reserve": build_reserve_basis(captured, explanation.policy.build_reserve_share_percent),
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
