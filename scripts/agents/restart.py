@@ -83,6 +83,11 @@ class WorkerRestartScope(Enum):
     SELECTED_ROWS = "restart only selected rows"
 
 
+class LiveWorkerRecovery(Enum):
+    LEAVE_RUNNING = "leave a live worker unchanged"
+    RESTORE_BEFORE_REMOVAL = "restore the worker before removing its restart entry"
+
+
 class RestartDisposition(Enum):
     STARTED = "this attempt launched the row"
     RESTORED = "the row needs no new launch"
@@ -505,7 +510,7 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if row.kind == "worker":
         parent = record.parent_of(row)
         if parent is None:
-            return ""
+            raise OSError("worker parent is unavailable")
         result = worker.restore(parent.id, record=record, only=frozenset({row.id}), started_panes=started_panes,
             account=target_account,
             runs=observed.runs if observed is not None else None,
@@ -541,6 +546,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               observed: RestartObservations | None = None,
               opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
               resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT,
+              live_worker_recovery: LiveWorkerRecovery = LiveWorkerRecovery.LEAVE_RUNNING,
               success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
     with operation_deadline.within(deadline):
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
@@ -548,6 +554,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if isinstance(live, herdr.LiveConversation):
             if live.pids:
                 member_account.repair_home(row, live.kind, live.pids[0])
+            if row.kind == "worker" and live_worker_recovery is LiveWorkerRecovery.RESTORE_BEFORE_REMOVAL:
+                return _restore_workers(row, record, observed=observed, target_account=target_account)
             if row.kind != "worker" and worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                 _ = (_restore_workers(row, record) if observed is None else
                      _restore_workers(row, record, observed=observed))
@@ -1277,7 +1285,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                 if isinstance(fresh, herdr.UnknownConversation):
                     raise OSError(fresh.reason)
                 if isinstance(fresh, herdr.LiveConversation):
-                    if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                    if current.kind == "worker":
+                        _ = _restore_workers(current, current_record)
+                    elif worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                         _ = _restore_workers(current, current_record, observed=observed)
                     print(f"{current.name}: unchanged")
                     shutdown_record.remove_started([member for member in members_by_holder[holder.id]
@@ -1288,6 +1298,8 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                        if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
             launch_row = (start_row if success_report is RestartSuccessReport.START_ROW else
                           partial(start_row, success_report=success_report))
+            if current.kind == "worker":
+                launch_row = partial(launch_row, live_worker_recovery=LiveWorkerRecovery.RESTORE_BEFORE_REMOVAL)
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                 pane = launch_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
                                   opening=opening, resume_checks=resume_checks)

@@ -1306,13 +1306,20 @@ process.stdout.write(JSON.stringify({
         queued = replace(queued, measured=replace(memory, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
         reads: Counter[Path] = Counter()
         original = Path.read_text
+        original_bytes = Path.read_bytes
 
         def read(path: Path) -> str:
             reads[path] += 1
             return original(path)
 
+        def read_bytes(path: Path) -> bytes:
+            if path == self.root / "proc/meminfo":
+                reads[path] += 1
+            return original_bytes(path)
+
         names = read_step_names()
-        with mock.patch.object(Path, "read_text", new=read):
+        with (mock.patch.object(Path, "read_text", new=read),
+              mock.patch.object(Path, "read_bytes", new=read_bytes)):
             swap = memory_feed.read_swap((queued, queued), {}, 6, names)
         assert isinstance(swap, memory_feed.SwapReading)
         rows = {row["name"]: row for row in swap.rows}

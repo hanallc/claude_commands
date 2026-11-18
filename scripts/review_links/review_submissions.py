@@ -519,6 +519,8 @@ def owner_is_active(row: staff.StaffRow) -> bool:
     if isinstance(row.doc, staff.WrappedDoc) or isinstance(row.worktree, staff.RemovedWorktree):
         return False
     if isinstance(row.doc, staff.LiveDoc):
+        if row.kind == "producer" and row.doc.path.is_dir():
+            return True
         try:
             lines = row.doc.path.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
@@ -555,7 +557,7 @@ class RecipientOption(TypedDict):
 def proposal_folder(recipient: staff.StaffRow) -> Path | NoNativeFolder:
     from scripts.production import proposals_folder
 
-    if isinstance(recipient.doc, (staff.LiveDoc, staff.WrappedDoc)):
+    if isinstance(recipient.doc, (staff.LiveDoc, staff.WrappedDoc)) and not recipient.doc.path.is_dir():
         folder = proposals_folder.issues_folder(recipient.doc.path)
         if folder is not None:
             return folder

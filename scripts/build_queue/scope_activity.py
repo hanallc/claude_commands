@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 
+from scripts.lib.proc_text import decode_proc_text, read_proc_text
 from scripts.lib.suite_runners import starts_suite_runner
 
 
@@ -30,7 +31,7 @@ def environment_values(environ: Path, keys: tuple[str, ...]) -> dict[str, str]:
         if start >= 0:
             start += len(marker)
             end = raw.find(b"\0", start)
-            values[key] = raw[start:end if end >= 0 else len(raw)].decode(errors="replace")
+            values[key] = decode_proc_text(raw[start:end if end >= 0 else len(raw)])
     return values
 
 
@@ -131,7 +132,7 @@ class ScopeActivityReader:
         self.resolved_runs: dict[int, LiveBuildRun | NoLiveBuildRun] = {}
         self.boot: float = 0.0
         try:
-            self.boot = float(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
+            self.boot = float(next(line.split()[1] for line in read_proc_text(proc / "stat").splitlines()
                                    if line.startswith("btime ")))
         except (OSError, ValueError, StopIteration, IndexError):
             pass
@@ -145,8 +146,8 @@ class ScopeActivityReader:
     def command(self, pid: int) -> tuple[str, ...]:
         if pid not in self.commands:
             try:
-                self.commands[pid] = tuple(item for item in
-                    (self.proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0") if item)
+                arguments = read_proc_text(self.proc / str(pid) / "cmdline").split("\0")
+                self.commands[pid] = tuple(item for item in arguments if item)
             except OSError:
                 self.commands[pid] = ()
         return self.commands[pid]
