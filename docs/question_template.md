@@ -9,7 +9,7 @@ The user reads the question days later, with nothing else in front of them.
 
 ## Parts
 
-- `--ask`: the question in one line. The lists use it as the title.
+- `--ask`: the one-line title, at most `question_title_max_chars` characters from `config/production.conf`. Put the rest in `--context` and `--item`.
 - `--context`: two sentences at most. Say why you ask now and which work waits.
 - `--item`: one fact, step or command. Repeat `--item` for each one.
   - Put a command in backticks, as its own item. The page shows it as a code block.

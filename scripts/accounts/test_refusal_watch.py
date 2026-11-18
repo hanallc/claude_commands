@@ -32,6 +32,7 @@ from unittest.mock import ANY, Mock, call, patch
 from scripts.lib import conf, transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.agents import stop_resume
@@ -1848,6 +1849,21 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(len(self.moves.calls), 1)
 
+    def test_automatic_producer_move_uses_the_inherited_source_and_saves_its_own_selection(self) -> None:
+        path = self.groups(showrunners="claude1")
+        owner = self.owner("producer")
+        self.reading(SOURCE_LOGIN, 1)
+        self.next_entries(self.low_rule("producers-low", group="producers"))
+        member = accounts.LiveGroupMember(owner["session_id"], owner["name"], "producers", accounts.account_dir("claude1"))
+        with patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": [], "producers": [member]}):
+            _ = self.cli()
+        self.assertEqual(stored_group_labels(path),
+                         {"units": "claude1", "showrunners": "claude1", "producers": "claude2"})
+        self.assertEqual(self.moves.calls, [MoveCall("producer", "claude2", "auto: producers-low")])
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(role_map.recorded_auto_moves(accounts.roles_history_file()),
+                         role_map.RecordedAutoMoves(frozenset({"producers-low"})))
+
     def test_automatic_low_rule_requires_a_fresh_source_reading(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
@@ -2162,8 +2178,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
 
     def test_deferred_build_move_keeps_its_destination_until_a_later_check(self) -> None:
-        _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
-                         Path(os.environ["CONF_DIR"]) / "shutdown.conf")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         _ = accounts.set_group_account("units", "claude3", why="auto: build", now=NOW, origin=accounts.AutoOrigin())

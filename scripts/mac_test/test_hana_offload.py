@@ -21,6 +21,7 @@ from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_targets import target_config
 from scripts.buildlog import record
 from scripts.lib import process_start
+from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, offload
 
 
@@ -42,6 +43,7 @@ class HanaOffloadTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
         self.transport = hana.HanaControlTransport(self.root / 'hana.conf', 'fixture-host')
         source = Path(__file__).resolve().parents[2] / 'config' / 'hana_aws.conf'
         _ = self.transport.settings.write_text(source.read_text())
@@ -194,6 +196,13 @@ class HanaOffloadTests(unittest.TestCase):
         self.assertIsInstance(outcome, offload.DeclinedMacRun)
         claim.assert_not_called()
         ssh.assert_not_called()
+
+    def test_policy_reads_the_worktree_path(self) -> None:
+        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        with mock.patch.object(eligibility, 'repository_identity', return_value=repository), \
+                mock.patch.object(hana, 'fixed_policy', return_value=hana.HanaStepRefused('off')) as policy:
+            _ = offload.run_offload(self.controller, self.transport, self.request, time.monotonic())
+        self.assertEqual(policy.call_args.args[1], str(self.request.repo_root))
 
     def test_disabled_unbound_assignment_reports_claim_failure_without_retaining_dispatch(self) -> None:
         from scripts.build_queue import admission_client

@@ -16,6 +16,17 @@ GPU trial boxes then import the prepared GPU system and reboot.
 The ledger reserves spending before launch and records confirmed termination.
 The configuration files remain the source for cap values.
 
+The spending guard reads `notification_recipient` and `notification_timeout_s` for each limit notice it attempts to send.
+The ledger keeps the recipient and timeout from when the guard created the notice.
+Each notice names the day or month that reached the limit.
+The guard retries a failed notice after its saved retry deadline if the accounting period is still open.
+The guard rounds the saved retry deadline up to a whole second for older readers.
+When a notice's period ends in `accounting_zone`, the guard marks the pending notice as expired on its next check.
+The ledger records an expired notice as `"delivery": "delivered"` with `"expired": true`.
+Older readers treat the record as delivered.
+A retry after a recipient change can send the same notice to both recipients. A duplicate notice is safer than a lost notice.
+Code older than this change still sends a pending notice after its period ends. That ends when every branch has this change.
+
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
 `sync.hosts.aws=aws-build` identifies historical steps.
@@ -242,15 +253,46 @@ It reserves setup costs within both account and workload limits before the stack
 It does not permit demand starts or guest command admission.
 Setup resumes an existing stack through reads before another mutation.
 It refuses changed resource inputs or an expired reservation before another stack request.
+If AWS confirms that the stack is missing, setup checks the local record for resource identities.
+If the record names an instance, data disk, or bucket, setup asks the user to run `down --workload hana --approve-destroy`.
+If the record names none of these resources, setup searches the deleted stack history for the saved stack name.
+It uses stacks that AWS created at or after the saved reservation time.
+Setup reads the events of each matching stack by ID to find retained disks and buckets.
+It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
+If it cannot verify cleanup, setup keeps the record and asks the user to run `down --workload hana --approve-destroy`.
 It registers the deployment only after the Spot request and stopped state match.
+Setup then probes the scaler path with the same credential file and profile as `aws-target.service`.
+It checks credential export and reads the instance, Spot request, and user data.
+It uses EC2 `--dry-run` for the user data change, start, and stop commands.
+AWS confirms permission for these commands with `DryRunOperation`. [AWS CLI dry-run reference](https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html#options)
+The user data dry run uses the value from the user data read, or an empty value if the read fails.
+Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` and compares the bytes it reads back.
+It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
+When AWS supplies an error code, the failure line includes it in parentheses.
+For a pending policy update, setup labels the probe runs `before the policy update` and `after the policy update`.
+Setup requires an idle-stopped lifecycle with no claims or pending start.
+It confirms that EC2 reports the instance as stopped.
+Setup compares the effective change set parameters with the approved parameters before execution.
+The second run starts after CloudFormation confirms the update.
+Setup continues the update if the first probe run fails.
+Setup returns exit status 1 if any operation in the last probe run fails.
 Setup adds no route, target, or slot capacity.
-Setup changes the stack through a change set, never through `cloudformation deploy`.
-It refuses an Instance, Volume or VolumeAttachment replace or remove before it executes the change set.
-A failed create or update calls `spot_end.end_boxes` before it reports the error.
-That call keeps only the box that `hana/setup.json` records.
-It then deletes, through `retained.delete`, the disks and buckets that the rollback kept (`DELETE_SKIPPED`).
-A failed create also deletes the failed stack.
-The launch template sets `DeleteOnTermination` true on the root disk, so AWS deletes each root disk with its box.
+Setup uses a change set to change the stack.
+It refuses changes that replace or remove an instance, volume, or volume attachment.
+When a policy update fails, setup prints the failed progress step and the update error.
+When an ordinary setup change fails, setup reads failed stack events from the current change before cleanup.
+The error gives the name, type, status, and AWS reason for each failed resource.
+If setup cannot read the events, it reports that they are unavailable and continues cleanup.
+Setup ends the Spot boxes other than the box in `hana/setup.json`.
+After a failed create, setup requires `ROLLBACK_COMPLETE` or `ROLLBACK_FAILED` before it deletes the stack.
+It waits for stack deletion and reads events by stack ID for disks and buckets marked `DELETE_SKIPPED`.
+It deletes these resources before it closes the spending reservation and removes `hana/setup.json`.
+If the rollback or cleanup is incomplete, setup keeps the record and reservation for `down`.
+For an incomplete setup, `down` also checks deleted stack history for retained resources.
+If that history has no match, `down` reports it and continues with any disk or bucket in the saved record.
+After a failed ordinary setup update, setup deletes resources retained during rollback and keeps the stack and record.
+Run `prepare --workload hana` again before retrying with changed inputs.
+The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 
 ## Ending persistent Spot boxes
 
@@ -263,9 +305,11 @@ The request then launches a new box with no tags.
 4. Terminate the boxes and wait until they are terminated.
 5. Read again. `SpotEndIncomplete` names any request or box that stays live.
 A failed cancel raises before any terminate.
-`deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, and deletes the Hana stack.
-It then deletes the data disk and the control bucket, and removes the local Hana records.
-The data on those disks and in the bucket is lost; `--approve-destroy` is the approval.
+`deploy.py down --workload hana --approve-destroy` ends Hana boxes before and after it deletes the Hana stack.
+The second check ends any box that CloudFormation kept during deletion.
+The command then deletes the data disk and the control bucket.
+It closes the compute and storage charges before it removes the local Hana records.
+The `--approve-destroy` flag authorizes deletion of the disk and bucket data.
 `test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
 It shows that a failed create and the Hana `down` each leave no request, box, disk, bucket or stack.
 A failed update keeps only the recorded box and its root disk.
@@ -1092,7 +1136,13 @@ The command policy rejects repairs, builds, nextest, final steps, path overrides
 The active target order remains unchanged, and `enabled=off` still prevents placement.
 
 Provider evidence reads lifecycle and execution records through the existing background worker.
-Spending previews use the account ledger lock without saving a reservation or changing the ledger.
+The stopped Hana target shares one spending preview across placement probes in the admission process.
+The preview expires after `preview_max_age_s` seconds, which defaults to two.
+Changes to the ledger, launch history, lifecycle journal, bills, or spending configuration invalidate the preview.
+The cache skips previews that use configuration recovered from Git.
+A full preview uses the account ledger lock and reads the launch history once.
+The preview gives placement evidence only.
+The controller still performs its full reservation and start checks.
 The controller alone owns demand starts, spending reservations, and idle-stop serialization.
 One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.

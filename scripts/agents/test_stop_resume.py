@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 from scripts.agents import remote
 from scripts.herdr import herdr_types
 
@@ -107,8 +110,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
         case.setUp()
         world = ProducerAdmissionWorld(case, kind)
         staff_configuration = case.root / "configuration/staff.conf"
-        atomic_file.write_text_atomic(staff_configuration, staff_configuration.read_text().replace(
-            "PRODUCER_FOLDER_ROOT=~/rust/hanadocs", "PRODUCER_FOLDER_ROOT=" + str(world.folder.parent)))
+        _ = write_config_fixture(staff_configuration, f"PRODUCER_FOLDER_ROOT={world.folder.parent}\n")
         configuration = case.root / "configuration/models.conf"
         _ = write_registry(configuration, {"producers": {"dwight": kind + (":opus:high" if kind == "claude" else ":gpt-test:high")}}, update=True)
         result = case.client.result
@@ -138,13 +140,18 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
             del pane, terminal
             if len(shlex.join(command).encode()) > 4096:
                 raise herdr_types.HerdrFailure("fixture shell command exceeds the terminal input limit")
+            _, export, assignments = command[-1].rpartition("; export ")
+            if export:
+                for assignment in shlex.split(assignments):
+                    key, _, value = assignment.partition("=")
+                    world.environment[key] = value
 
         def activity(pane: str) -> herdr.PaneRunning | herdr.PaneAtShell:
             return (herdr.PaneRunning((kind,)) if pane == "w1:p2" or (pane == world.pane and world.active)
                     else herdr.PaneAtShell())
 
         def role_account(role: str) -> accounts.AccountSelection:
-            return (accounts.NamedAccount("claude3", world.home) if role == "showrunner" else
+            return (accounts.NamedAccount("claude3", world.home) if role == "producer" else
                     accounts.CodexWorkersAccount("codex3", world.home))
 
         def conversation(identity: str, family: str = "", *, codex: herdr.CodexConversations | None = None
@@ -155,7 +162,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
 
         def claude_home(pid: int) -> account.ConfiguredClaudeFolder:
             del pid
-            return account.ConfiguredClaudeFolder(world.home)
+            return account.ConfiguredClaudeFolder(Path(world.environment["CLAUDE_CONFIG_DIR"]))
 
         def codex_home(pid: int) -> account.ProcessCodexHome:
             del pid
@@ -409,6 +416,23 @@ class StopResumeTests(unittest.TestCase):
                     self.assertEqual(stop_resume.producer_conflicts(member.name, world.case.client),
                                      [(world.identity, "outside herdr")])
                     self.assertEqual(stop_resume.producer_conflicts("old-producer", world.case.client), [])
+
+    def test_reserved_producer_shell_retries_with_the_current_claude_group_account(self) -> None:
+        with producer_first_fixture("claude") as world:
+            with patch.object(world.case.client, "start_agent", side_effect=OSError("fixture launch failure")):
+                self.assertIsInstance(stop_resume.resume("dwight"), stop_resume.ResumeFailed)
+            self.assertEqual(staff.initial_snapshot().rows, ())
+            self.assertEqual(world.environment["CLAUDE_CONFIG_DIR"], str(world.home))
+            target = world.case.root / ".claude4"
+            with patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude4", target)) as select:
+                result = stop_resume.resume("dwight")
+            self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+            assert isinstance(result, stop_resume.ClaudeUp)
+            select.assert_called_once_with("producer")
+            self.assertEqual((result.session_id, result.pane_id, result.account), (world.identity, "w1:p3", "claude4"))
+            self.assertEqual(world.environment["CLAUDE_CONFIG_DIR"], str(target))
+            self.assertEqual(staff.initial_snapshot().rows[0].home, staff.SessionHome(target))
+            self.assertEqual(len(world.case.client.opened), 1)
 
     def test_interrupted_producer_admission_reuses_its_live_native_conversation(self) -> None:
         lost_stages = {"lost", "replaced", "unpublished", "foreign-recovery", "native-recovery"}
@@ -903,7 +927,7 @@ class StopResumeTests(unittest.TestCase):
                     else:
                         self.assertNotIn("config_dir", entry)
                     if target is None:
-                        role = "showrunner" if kind == "producer" else kind if kind in ("unit", "showrunner") else "unit"
+                        role = kind if kind in ("unit", "showrunner", "producer") else "unit"
                         selection.assert_called_once_with(role)
                     else:
                         selection.assert_not_called()
@@ -2184,7 +2208,10 @@ class StopResumeTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = self.root / "configuration"
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            atomic_file.write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
+        write_machine_config(configuration)
+        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\nSTOP_GRACE_SECONDS=2\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "alpha": "claude:opus:max", "renamed-alpha": "claude:opus:max",
             "TEST-account-home": "claude:opus:max", "row-name": "claude:opus:max",
@@ -4511,6 +4538,10 @@ class BuildWaitTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "VERIFY_STEPS_DIR": str(self.root / "records"), "VERIFY_PROC_ROOT": str(self.root / "proc"),

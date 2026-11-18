@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 
 from scripts.lib.terminal_cells import terminal_width
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import live_units
 from scripts.production import proposal_issue
 from scripts.production.issues import frontmatter
@@ -55,6 +56,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "table-conf"
         _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
+        _ = write_config_fixture(config / "production.conf", "units_table_columns=170\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.database = self.root / "ledger.sqlite"
@@ -270,7 +272,7 @@ class StyleUnitsTests(unittest.TestCase):
 
     def test_idle_step_shows_the_whole_refill_outcome_once_and_ticket_keeps_its_time(self) -> None:
         config = self.root / "table-conf/production.conf"
-        _ = config.write_text(config.read_text().replace("units_table_columns=170", "units_table_columns=1000"))
+        _ = write_config_fixture(config, "units_table_columns=1000\n")
         outcomes = (
             "waiting for structure: cargo-liner",
             "waiting for sync: listed tui_pane names: main touched crates/tui_pane/src/a.rs, crates/tui_pane/Cargo.toml",
@@ -290,10 +292,9 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(decision, "built", 2, built_at="2026-10-28T11:00:00+00:00")
         self.findings(decision, "filed", 3)
         config = self.root / "table-conf/production.conf"
-        configured = config.read_text()
         for columns in (170, 130):
             with self.subTest(columns=columns):
-                _ = config.write_text(configured.replace("units_table_columns=170", f"units_table_columns={columns}"))
+                _ = write_config_fixture(config, f"units_table_columns={columns}\n")
                 lines = self.render_open_step("test", "Check " + "界" * 60,
                                               eta="2026-10-28T16:15:00+02:00").splitlines()
                 headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]

@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from typing import cast
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -85,7 +87,7 @@ class CargoGateTests(unittest.TestCase):
         ps.chmod(0o755)
         _ = write_config_fixture(root / "config/mac_gate.conf",
             "placement_check_command=" + shlex.join([sys.executable, str(check)])
-            + "\nplacement_check_timeout_seconds=1\nplacement_recheck_seconds=15\n")
+            + "\nplacement_check_timeout_seconds=1\nplacement_recheck_seconds=15\nrefusal_exit_code=125\n")
         ssh = fake / "ssh"
         _ = ssh.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n"
             + "root = Path(os.environ['GATE_TEST_ROOT'])\n"
@@ -104,6 +106,28 @@ class CargoGateTests(unittest.TestCase):
         return subprocess.run([str(GATE / name), *arguments], env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS)
 
+    def test_copied_gate_links_find_the_copied_configuration_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            copied = copy_helpers(root, "scripts/mac_test")
+            gate_bin = copied / "mac_test/cargo_gate/bin"
+            _ = write_config_fixture(root / "config/mac_gate.conf", "refusal_exit_code=83\n")
+            environment.update(CLAUDECODE="1", GATE_TEST_BIN=str(gate_bin),
+                               PATH=os.pathsep.join((str(gate_bin), str(root / "fake"), str(root / "real"),
+                                                    "/usr/bin", "/bin")))
+            self.assertFalse((copied / "mac_test/test_cargo_gate.py").exists())
+            for name in ("cargo", "cargo-nextest", "rustc"):
+                with self.subTest(program=name):
+                    command = gate_bin / name
+                    self.assertTrue(command.is_symlink())
+                    self.assertEqual(os.readlink(command), "../gate.zsh")
+                    self.assertTrue(command.resolve().is_relative_to(root))
+                    result = subprocess.run([str(command)], env=environment, capture_output=True, text=True,
+                                            timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 83, result.stdout + result.stderr)
+                    self.assertIn("mac cargo gate refused: no placement", result.stderr)
+
     def test_terminal_and_placed_calls_keep_arguments_status_and_root_records(self) -> None:
         for placement, readable in ((False, True), (False, False), (True, True)):
             for name in ("cargo", "rustc", "cargo-nextest"):
@@ -113,8 +137,9 @@ class CargoGateTests(unittest.TestCase):
                     environment["REAL_STATUS"] = "23"
                     if placement:
                         _ = write_config_fixture(root / "config/mac_gate.conf",
-                            (Path(__file__).resolve().parents[2] / "config/mac_gate.conf").read_text()
-                            .replace("placement_check_timeout_seconds=10", "placement_check_timeout_seconds=1"))
+                            "placement_check_command=ssh -o BatchMode=yes -o ConnectTimeout=6 natedev "
+                            + "'~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py placement-status'\n"
+                            + "placement_check_timeout_seconds=1\n")
                         environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
                     if not readable:
                         (root / "config/mac_gate.conf").unlink()

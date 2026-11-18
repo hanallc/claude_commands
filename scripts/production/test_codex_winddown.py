@@ -1,5 +1,6 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from scripts.agents import remote
 
@@ -9,7 +10,6 @@ import json
 import os
 import io
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -196,7 +196,7 @@ class NoticeRetryTests(unittest.TestCase):
         with mock.patch.object(broadcast, "send", side_effect=Killed):
             with self.assertRaises(Killed):
                 _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         current = staff.native_id(fixture_runtime_id("winddown-after-clear"))
         _ = staff.update_current_session(self.unit.current_session, current)
         from scripts.message import sessions
@@ -618,7 +618,9 @@ class MessageTests(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "CONF_DIR": str(self.root / "config"),
         }
-        _ = shutil.copytree(SCRIPT.parents[2] / "config", self.root / "config")
+        configuration = self.root / "config"
+        _ = copy_config_fixture(SCRIPT.parents[2] / "config", configuration)
+        _ = write_config_fixture(configuration / "accounts.conf", "codex_credit_accounts=none\n")
         self.environment.update(fake_unit_host.environment(self.root))
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
@@ -716,8 +718,7 @@ class MessageTests(unittest.TestCase):
 
     def test_start_and_triage_say_first_that_paid_credits_stay_on(self) -> None:
         accounts = self.root / "config/accounts.conf"
-        _ = accounts.write_text(accounts.read_text(encoding="utf-8").replace(
-            "\ncodex_credit_accounts=none\n", "\ncodex_credit_accounts=codex2 codex1\n"), encoding="utf-8")
+        _ = write_config_fixture(accounts, "codex_credit_accounts=codex2 codex1\n")
         line = ("Paid credits stay on for codex1, codex2. The wind-down does not stop them. "
                 + "To stop them, get the user's go and run: /tune accounts codex_credit_accounts none")
         before = accounts.read_bytes()

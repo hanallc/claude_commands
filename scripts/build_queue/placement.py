@@ -133,6 +133,20 @@ RetryDecision = RetryAt | DoNotRetry
 
 
 @dataclass(frozen=True)
+class AssignedSettingsGeneration:
+    """The digest identifies the provider settings that qualified the assignment."""
+    digest: str
+
+
+@dataclass(frozen=True)
+class UnknownAssignedSettingsGeneration:
+    """An older assignment has no saved settings digest."""
+
+
+SETTINGS_REFUSAL_REASONS = frozenset({"off", "repo"})
+
+
+@dataclass(frozen=True)
 class DispatchPathSettled:
     """The dispatch path has settled."""
 
@@ -532,7 +546,7 @@ def assigned_claim_id(episode: str, attempt: str) -> str:
 
 def retry_decision(destination: PlacementDestination, reason: str, now: float) -> RetryDecision:
     """Keep the existing remote decline delays separate from evidence age."""
-    if reason in ("no_tests", "off", "repo", "linux_only", "local_flag", "command"):
+    if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
     delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0
     return RetryAt(now + delay)
