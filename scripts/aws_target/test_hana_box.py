@@ -441,14 +441,14 @@ class HanaBoxTests(CostFixture):
         publications = list(self.provider.published)
         self.assertEqual(len(publications), 1)
         _ = self.tick()
-        self.assertEqual(len(self.provider.recoveries), 1)
+        self.assertEqual(self.provider.recoveries, [])
         self.assertEqual(self.provider.published, publications)
         self.assertIsNone(self.record()['delivered'])
         self.assertIsInstance(self.controller.permission('execution-one', 'fixture-boot', self.generation()), hana_box.ClaimRefused)
         self.assertEqual(self.record()['state'], hana_box.Lifecycle.STOPPING.value)
         _ = self.tick()
         self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertEqual(self.record()['claims'], [])
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
 
     def test_stale_recovery_cannot_settle_a_different_mutation(self) -> None:
@@ -477,6 +477,34 @@ class HanaBoxTests(CostFixture):
         _ = self.tick()
         self.assertFalse(any(row.action == hana_box.Action.PUBLISH for row in self.provider.calls))
         self.assertIsInstance(self.controller.permission('execution-one', 'old-boot', self.generation()), hana_box.ClaimRefused)
+
+    def test_abandonment_stops_a_late_permit_acknowledgment_and_a_ready_box(self) -> None:
+        _ = self.controller.request('execution-one')
+        for _step in range(3):
+            _ = self.tick()
+        self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.PUBLISH.value)
+
+        def reach_deadline() -> None:
+            self.clock.now = ledger.instant(ledger.mapping(self.record()['start']), 'deadline')
+
+        self.provider.during_call = reach_deadline
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.provider.during_call = lambda: None
+        self.assertEqual(len(self.provider.published), 1)
+        self.assertIsNone(self.record()['delivered'])
+        self.assertEqual(self.record()['claims'], [])
+        _ = self.tick()
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+
+        self.ready()
+        self.clock.now = ledger.instant(ledger.mapping(self.record()['start']), 'deadline')
+        self.assertEqual(self.tick(), hana_box.Lifecycle.READY)
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.record()['claims'], [])
+        self.assertIsNone(self.record()['delivered'])
+        _ = self.tick()
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
 
     def test_stale_acknowledgment_keeps_the_publication_unresolved(self) -> None:
         _ = self.controller.request('execution-one')

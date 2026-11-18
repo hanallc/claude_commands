@@ -38,6 +38,13 @@ PROVIDER_OPERATIONS = {
 }
 
 
+BOOTSTRAP_OBJECTS: tuple[tuple[str, dict[str, object]], ...] = (
+    ('/permit.json', {'version': 1}),
+    ('/command.json', {'version': 1, 'action': 'idle'}),
+    ('/fence.json', {'version': 1, 'action': 'idle'}),
+)
+
+
 class ProviderPending(RuntimeError):
     """The provider has no settled response for the saved operation."""
 
@@ -213,16 +220,11 @@ class AwsHanaProvider:
     def _write_bootstrap(self, identity: box.DeploymentIdentity, start: box.DemandStart,
                          path: Path, saved: dict[str, object]) -> None:
         prefix = self._prefix(identity, start)
-        objects: tuple[tuple[str, dict[str, object]], ...] = (
-            ('/permit.json', {'version': 1}),
-            ('/command.json', {'version': 1, 'action': 'idle'}),
-            ('/fence.json', {'version': 1, 'action': 'idle'}),
-        )
         completed = saved.get('bootstrap_puts', 0)
-        if type(completed) is not int or not 0 <= completed <= len(objects):
+        if type(completed) is not int or not 0 <= completed <= len(BOOTSTRAP_OBJECTS):
             raise ValueError('The saved Hana bootstrap progress is invalid')
         descriptor = ledger.mapping(saved['descriptor'])
-        for index, (suffix, document) in enumerate(objects[completed:], start=completed + 1):
+        for index, (suffix, document) in enumerate(BOOTSTRAP_OBJECTS[completed:], start=completed + 1):
             _ = self._object(prefix + suffix, document)
             # Save each write so the next tick can continue after a timeout.
             saved['bootstrap_puts'] = index
@@ -248,7 +250,7 @@ class AwsHanaProvider:
                 if saved.get('accepted') is True:
                     return self._accepted(identity, start, operation)
                 if saved:
-                    recovered = self._recover(identity, start, operation, saved)
+                    recovered = self._recover(identity, start, operation, path, saved)
                     if isinstance(recovered, box.MutationUnresolved):
                         if (operation.action != box.Action.BOOTSTRAP or recovered.observed.state != 'stopped'
                                 or not isinstance(start, box.DemandStart)):
@@ -263,6 +265,7 @@ class AwsHanaProvider:
                         if not isinstance(start, box.DemandStart):
                             raise ValueError('Hana bootstrap needs a demand start')
                         saved['descriptor'] = self._bootstrap(identity, start)
+                        saved['bootstrap_puts'] = 0
                     self._save_mutation(path, saved)
                     self._dispatch(identity, start, operation, path, saved)
                 saved['accepted'] = True
@@ -317,29 +320,50 @@ class AwsHanaProvider:
             try:
                 saved = remote.read_record(path) if path.exists() else {}
                 if abandon_start:
+                    read_started_at = self.clock()
                     observed = self._observation(identity, start)
-                    self._save_mutation(path, {**saved, 'version': 1, 'token': operation.token, 'cancelled': True})
-                    if (operation.action == box.Action.START and saved.get('accepted') is True
-                            and observed.state == 'stopped'):
-                        return box.StartMayBeRunning(operation.token, observed)
+                    if saved.get('cancelled') is not True:
+                        saved = {**saved, 'version': 1, 'token': operation.token,
+                            'cancelled': True, 'cancelled_at': float(self.clock())}
+                        self._save_mutation(path, saved)
+                    if operation.action == box.Action.START and observed.state == 'stopped':
+                        if saved.get('accepted') is True:
+                            return box.StartMayBeRunning(operation.token, observed)
+                        if saved.get('dispatched') is True:
+                            return self._recover_fenced_start(path, operation, saved, observed, read_started_at)
                     return box.MutationSettled(operation.token, observed)
-                return self._recover(identity, start, operation, saved)
+                return self._recover(identity, start, operation, path, saved)
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
+    def _recover_fenced_start(self, path: Path, operation: box.PendingOperation, saved: dict[str, object],
+                              observed: box.BoxObservation, read_started_at: float) -> box.MutationRecovery:
+        fenced_at = saved.get('cancelled_at')
+        # Start a new wait if the saved time lacks full precision.
+        if type(fenced_at) is not float:
+            self._save_mutation(path, {**saved, 'cancelled_at': float(self.clock())})
+        elif read_started_at >= fenced_at + max(1, self.api.timeout_s):
+            return box.MutationSettled(operation.token, observed)
+        return box.MutationUnresolved(operation.token, observed)
+
     def _recover(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
-                 operation: box.PendingOperation, saved: dict[str, object]) -> box.MutationRecovery:
+                 operation: box.PendingOperation, path: Path, saved: dict[str, object]) -> box.MutationRecovery:
         if not saved:
-            path, _ = self._paths(operation)
             self._save_mutation(path, {'version': 1, 'token': operation.token, 'cancelled': True})
+        read_started_at = self.clock()
         observed = self._observation(identity, box.NoDemandStart() if operation.action == box.Action.BOOTSTRAP else start)
+        if (operation.action == box.Action.START and observed.state == 'stopped'
+                and saved.get('dispatched') is True and saved.get('accepted') is not True
+                and saved.get('cancelled') is True):
+            return self._recover_fenced_start(path, operation, saved, observed, read_started_at)
         settled = not saved or saved.get('accepted') is True or saved.get('cancelled') is True
         if saved and saved.get('accepted') is not True and saved.get('cancelled') is not True:
             if operation.action == box.Action.START:
                 settled = observed.state in ('pending', 'running', 'stopping')
             elif operation.action == box.Action.STOP:
                 settled = observed.state in ('stopped', 'stopping', 'terminated')
-            elif operation.action == box.Action.BOOTSTRAP:
+            elif (operation.action == box.Action.BOOTSTRAP
+                    and saved.get('bootstrap_puts', len(BOOTSTRAP_OBJECTS)) == len(BOOTSTRAP_OBJECTS)):
                 actual = self._call('describe-instance-attribute', '--instance-id', identity.instance, '--attribute', 'userData')
                 encoded = ledger.mapping(actual.get('UserData', {})).get('Value', '')
                 if not isinstance(encoded, str):

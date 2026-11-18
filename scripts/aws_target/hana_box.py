@@ -340,8 +340,9 @@ def _start_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str
     if not row.claims:
         return 'The Hana start has no owner'
     claim = row.claims[0]
-    deadline = row.start.deadline if isinstance(row.start, DemandStart) else claim.requested_at + settings.start_timeout_seconds
-    if now >= deadline:
+    deadline = (row.start.deadline if row.state == Lifecycle.STARTING and isinstance(row.start, DemandStart)
+                else claim.requested_at + settings.start_timeout_seconds)
+    if not claim.active and now >= deadline:
         return 'The Hana start deadline expired'
     if isinstance(claim.owner, LocalClaimOwner):
         owner = process_start.process_start(claim.owner.pid)
@@ -467,7 +468,7 @@ class HanaController:
             if isinstance(row, NoDeployment) or not row.claims or row.claims[0].execution != execution:
                 return ClaimRefused(row.reason if isinstance(row, BoxRecord) and row.reason else 'No current claim owns this execution')
             claim = row.claims[0]
-            if row.state == Lifecycle.STARTING:
+            if row.state in (Lifecycle.STARTING, Lifecycle.READY):
                 settings = read_settings(conf.read(self.workload_path))
                 reason = _start_refusal(row, int(self.clock()), settings)
                 if reason:
@@ -586,8 +587,11 @@ class HanaController:
             operation = row.operation
             assert isinstance(operation, PendingOperation)
             abandonment = ''
-            if row.state == Lifecycle.STARTING and operation.action in (Action.BOOTSTRAP, Action.START):
+            if row.state == Lifecycle.STARTING or (row.state == Lifecycle.READY and row.claims):
                 abandonment = _start_refusal(row, now, settings)
+            if abandonment and operation.action not in (Action.BOOTSTRAP, Action.START):
+                self._stop_abandoned(row, now, abandonment)
+                return row.state
             recover = bool(abandonment)
             if abandonment:
                 row.reason = abandonment
@@ -629,7 +633,11 @@ class HanaController:
                 else:
                     _ = self._intent(row, Action.OBSERVE, now)
             else:
-                self._accept_permit(row, operation, reply, now)
+                reason = _start_refusal(row, now, settings)
+                if reason:
+                    self._stop_abandoned(row, now, reason)
+                else:
+                    self._accept_permit(row, operation, reply, now)
             self._save(row)
             return row.state
 
@@ -665,6 +673,10 @@ class HanaController:
             if abandon_start:
                 row.claims = []
             self._observe(row, observed, settings, now)
+
+    def _stop_abandoned(self, row: BoxRecord, now: int, reason: str) -> None:
+        row.reason, row.claims = reason, []
+        self._stop(row, now, StopCause.IDLE if _boot_is_current(row, row.boot) else StopCause.UNKNOWN)
 
     def _stop(self, row: BoxRecord, now: int, cause: StopCause) -> None:
         row.state, row.stop_cause, row.delivered = Lifecycle.STOPPING, cause, NoDeliveredPermit()
