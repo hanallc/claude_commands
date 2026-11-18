@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 from threading import Event
 from typing import cast
@@ -92,11 +93,13 @@ if not script.endswith("/verify_scoped_step.py"):
             self.assertEqual(len(self.cargo_calls()), 1)
             self.assertEqual(len(self.pass_records()), 1)
 
-    def assert_doc_retains_checkout_until_scope_empties(self, *, interrupt: bool) -> None:
+    def assert_doc_retains_checkout_until_scope_empties(self, *, interrupt: bool,
+                                                       sweep_scope_sidecar: bool = False) -> None:
         admission = self.use_real_scope()
         scope_file = self.root / "doc-scope"
         child_pid = self.root / "doc-descendant"
         pending_pid = child_pid.with_suffix(".new")
+        lease_at_launch = self.root / "lease-at-launch.json"
         release = self.root / "end-cargo"
         helper = VERIFY.with_name("wait_for_test_state.py")
         self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
@@ -104,6 +107,9 @@ if not script.endswith("/verify_scoped_step.py"):
     sys.path.insert(0, {str(VERIFY.parents[2])!r})
     from scripts.direct.wait_for_test_state import wait_for_file
 
+    checkout = Path.cwd()
+    lease = checkout.with_name(checkout.name + ".lease.json")
+    Path({str(lease_at_launch)!r}).write_text(lease.read_text())
     child = subprocess.Popen([sys.executable, {str(helper)!r}, {str(self.root / "end-descendant")!r}],
                              close_fds=True)
     Path({str(scope_file)!r}).write_text(os.environ["BUILDLOG_STEP_SCOPE"])
@@ -119,17 +125,27 @@ if not script.endswith("/verify_scoped_step.py"):
         scope = Path(scope_file.read_text())
         call, = self.cargo_calls()
         checkout = Path(call["cwd"])
+        lease = cast(dict[str, object], json.loads(lease_at_launch.read_text()))
+        copy_owner = os.pidfd_open(cast(int, lease["pid"]))
+        self.addCleanup(os.close, copy_owner)
         kill_file = scope / "cgroup.kill"
         self.assertIn(descendant, scope_members(scope))
         kill_file.chmod(0)
         try:
+            if sweep_scope_sidecar:
+                reservation, = admission.caller_reservations().values()
+                Path(reservation.sidecar).unlink()
             if interrupt:
                 process.terminate()
             else:
                 release.touch()
             status = process.wait(TEST_HANG_GUARD_SECS)
             self.assertIn(descendant, scope_members(scope))
-            self.assertEqual(build_folders.build_folder_state(checkout), "held", log.read_text())
+            ended, _, _ = select.select([copy_owner], [], [], TEST_HANG_GUARD_SECS)
+            self.assertTrue(ended, "the checkout copy owner remained after Verify exited")
+            with build_folders.collector_lease(checkout) as free:
+                self.assertFalse(free, "the collector accepted a checkout with a populated scope")
+            self.assertEqual(lease["scope"], str(scope))
             self.assertEqual(status, 125, log.read_text())
             self.assertIn("keeping the reservation", log.read_text())
             _ = admission.run_pass()
@@ -152,36 +168,33 @@ if not script.endswith("/verify_scoped_step.py"):
     def test_doc_scope_stop_failure_retains_checkout_after_interrupt(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(interrupt=True)
 
-    def assert_doc_refuses_without_holder(self, failure: str) -> None:
+    def test_doc_scope_stop_failure_retains_checkout_and_reservation_after_sidecar_sweep(self) -> None:
+        self.assert_doc_retains_checkout_until_scope_empties(interrupt=False, sweep_scope_sidecar=True)
+
+    def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
+        recorded_failure = self.root / "recorded-scope-failure"
         self.install_scope_interpreter(f'''
 import runpy
-import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
-start = subprocess.Popen
-def start_process(arguments, *args, **kwargs):
-    if "--hold-doc-checkout" in arguments:
-        {failure}
-    return start(arguments, *args, **kwargs)
-
-with patch.object(subprocess, "Popen", start_process):
+with patch.object(os, "setpgid", side_effect=OSError("cannot set the supervisor group")):
     sys.argv = script_arguments
-    runpy.run_path(script, run_name="__main__")
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except SystemExit:
+        Path({str(recorded_failure)!r}).write_text(Path(sys.argv[3]).read_text())
+        raise
 ''')
         result = self.verify()
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 125, output)
-        self.assertIn("cannot hold the doc checkout before launch", output)
+        self.assertIn("cannot set the supervisor group", recorded_failure.read_text())
+        self.assertIn("keeping the reservation", output)
         self.assertFalse(self.events.exists())
         self.assertFalse(self.pass_records())
         with self.occupy_doc_slot(build_slots.SlotWaitPolicy.REFUSE):
             pass
-
-    def test_doc_refuses_when_lease_holder_cannot_start(self) -> None:
-        self.assert_doc_refuses_without_holder('raise OSError("fixture cannot start the lease holder")')
-
-    def test_doc_refuses_when_lease_holder_does_not_confirm(self) -> None:
-        self.assert_doc_refuses_without_holder('arguments = [sys.executable, "-c", "raise SystemExit(0)"]')
 
     def test_doc_scope_command_does_not_inherit_checkout_pipe(self) -> None:
         _ = self.use_real_scope()
@@ -189,8 +202,7 @@ with patch.object(subprocess, "Popen", start_process):
         cargo_pipes = self.root / "cargo-pipes"
         self.install_scope_interpreter(f'''
 from pathlib import Path
-descriptor = os.environ["VERIFY_DOC_LEASE_FD"]
-Path({str(lease_pipe)!r}).write_text(os.readlink(f"/proc/self/fd/{{descriptor}}"))
+Path({str(lease_pipe)!r}).write_text(os.readlink("/proc/self/fd/9"))
 os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 ''')
         self.executable(self.root / "bin/cargo", CARGO_STUB.replace(

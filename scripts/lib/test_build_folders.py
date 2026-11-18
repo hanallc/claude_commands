@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator
 import os
 import fcntl
+import io
 import json
 import select
 import signal
@@ -18,7 +19,7 @@ import threading
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr
 from typing import ContextManager
 
 from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
@@ -1026,6 +1027,58 @@ print('signals')
 
         with folders.folder_removal_lease(path, children=True) as lease:
             self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
+
+    def slot_with_recorded_scope(self) -> tuple[folders.BuildFolderSpec, Path, Path]:
+        source, tip, _ = self.editable_source()
+        spec = folders.BuildFolderSpec(kind="slot", parent=self.root / "slots", suffix_length=0, slot=1, repository=source.name,
+                                       slot_checkout=folders.SlotCheckout(source, tip))
+        with folders.slot_build_folder(spec) as checkout:
+            scope = self.root / "checkout.scope"
+            scope.mkdir()
+            lease = checkout.with_name(checkout.name + ".lease.json")
+            record = cast(dict[str, object], json.loads(lease.read_text()))
+            record["scope"] = str(scope)
+            _ = lease.write_text(json.dumps(record))
+        return spec, checkout, scope
+
+    def assert_scope_blocks_slot_and_collector(self, spec: folders.BuildFolderSpec, checkout: Path) -> None:
+        with folders.collector_lease(checkout) as free:
+            self.assertFalse(free)
+        with self.assertRaises(BlockingIOError), folders.slot_build_folder(spec):
+            self.fail("the allocator took a checkout with a busy scope")
+
+    def assert_scope_allows_slot_and_collector(self, spec: folders.BuildFolderSpec, checkout: Path) -> None:
+        with folders.collector_lease(checkout) as free:
+            self.assertTrue(free)
+        with folders.slot_build_folder(spec) as reused:
+            self.assertEqual(reused, checkout)
+        lease = checkout.with_name(checkout.name + ".lease.json")
+        self.assertNotIn("scope", cast(dict[str, object], json.loads(lease.read_text())))
+
+    def test_checkout_scope_blocks_reuse_and_collection_until_empty(self) -> None:
+        spec, checkout, scope = self.slot_with_recorded_scope()
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        self.assert_scope_blocks_slot_and_collector(spec, checkout)
+        _ = events.write_text("populated 0\n")
+        self.assert_scope_allows_slot_and_collector(spec, checkout)
+
+    def test_checkout_scope_blocks_reuse_and_collection_until_removed(self) -> None:
+        spec, checkout, scope = self.slot_with_recorded_scope()
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        self.assert_scope_blocks_slot_and_collector(spec, checkout)
+        events.unlink()
+        scope.rmdir()
+        self.assert_scope_allows_slot_and_collector(spec, checkout)
+
+    def test_checkout_scope_read_error_reports_and_blocks_reuse_and_collection(self) -> None:
+        spec, checkout, scope = self.slot_with_recorded_scope()
+        (scope / "cgroup.events").mkdir()
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assert_scope_blocks_slot_and_collector(spec, checkout)
+        self.assertIn("cannot check checkout scope", diagnostics.getvalue())
 
     def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
         path = self.root / "absent-parent" / "tree"

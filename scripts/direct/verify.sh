@@ -879,7 +879,11 @@ run_step() {
         monitor=0
         [[ $- != *m* ]] || monitor=1
         if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] && verify_uses_build_scope; then
-            PLACEMENT_SCOPE_STATE=$(mktemp "$HOLD_WAIT_DIR/scope-release.XXXXXX") || return 125
+            if ! PLACEMENT_SCOPE_STATE=$(mktemp "$HOLD_WAIT_DIR/scope-release.XXXXXX"); then
+                PLACEMENT_SCOPE_UNRESOLVED=1 PLACEMENT_OUTCOME=unresolved
+                printf '%s\n' 'verify.sh: cannot create the scope release state. Keeping the reservation.' >&2
+                return 125
+            fi
         fi
         set -m
         (
@@ -2750,12 +2754,18 @@ run_placed_scope() {
     printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
         "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
     export BUILDLOG_RESERVED_STEP
-    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_pipe=/dev/null
-    # Reopen the pipe because the coprocess descriptor closes on exec.
-    if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then checkout_pipe="/dev/fd/$DOC_COPY_LEASE_FD"; fi
+    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_pipe=/dev/null checkout_owner=""
+    # Keep the copy owner alive while the supervisor binds the scope.
+    if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
+        checkout_pipe="/dev/fd/$DOC_COPY_LEASE_FD"
+        checkout_owner=$DOC_COPY_OWNER_PID
+    fi
     # The scope writes to a file. Only the reader can write to the log pipeline.
-    : > "$output" || return 125
-    VERIFY_DOC_LEASE_FD="${DOC_COPY_LEASE_FD:+9}" \
+    if ! : > "$output"; then
+        printf 'cannot create the scope output file\n' > "$PLACEMENT_SCOPE_STATE"
+        return 125
+    fi
+    VERIFY_DOC_CHECKOUT_OWNER="$checkout_owner" \
         "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
         "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@" 9>"$checkout_pipe" > "$output" 2>&1 &
     supervisor=$!
@@ -2764,6 +2774,9 @@ run_placed_scope() {
     wait "$supervisor" || status=$?
     wait "$reader" || true
     rm -f -- "$output"
+    if (( status == 125 )) && [[ ! -s "$PLACEMENT_SCOPE_STATE" ]]; then
+        printf 'the scope supervisor did not confirm exit\n' > "$PLACEMENT_SCOPE_STATE"
+    fi
     return "$status"
 }
 

@@ -10,6 +10,7 @@ from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from enum import Enum, auto
 import fcntl
 import json
 import os
@@ -438,17 +439,70 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
         os.close(descriptor)
 
 
-def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released: bool = False,
+@dataclass(frozen=True)
+class CheckoutScopeBinding:
+    scope: Path
+    lease_owner: int
+
+
+class LeaseReadPurpose(Enum):
+    ACQUIRE = auto()
+    UPDATE_HELD = auto()
+
+
+def _read_lease(path: Path, directory: int, purpose: LeaseReadPurpose) -> dict[str, object]:
+    """Read the lease. Refuse acquisition while its recorded scope is busy."""
+    try:
+        descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    except FileNotFoundError:
+        if purpose is LeaseReadPurpose.UPDATE_HELD:
+            raise
+        return {}
+    with os.fdopen(descriptor) as source:
+        lease = cast(dict[str, object], json.load(source))
+    if purpose is LeaseReadPurpose.UPDATE_HELD or "scope" not in lease:
+        return lease
+    scope_name = lease["scope"]
+    try:
+        if not isinstance(scope_name, str) or not Path(scope_name).is_absolute():
+            raise ValueError("the scope path must be absolute")
+        scope = Path(scope_name)
+        try:
+            fields = (scope / "cgroup.events").read_text().splitlines()
+        except FileNotFoundError:
+            try:
+                _ = scope.stat()
+            except FileNotFoundError:
+                return lease
+            raise
+        if "populated 1" not in fields:
+            if "populated 0" in fields:
+                return lease
+            raise ValueError("cgroup.events has no populated state")
+    except (OSError, ValueError) as error:
+        print(f"{path}: cannot check checkout scope {scope_name!r}: {error}", file=sys.stderr)
+        raise BlockingIOError(errno.EWOULDBLOCK, "cannot confirm the checkout scope is empty", str(path)) from error
+    raise BlockingIOError(errno.EWOULDBLOCK, "the checkout scope is populated", str(path))
+
+
+def _write_lease(path: Path, directory: int, spec: BuildFolderSpec | CheckoutScopeBinding, *, released: bool = False,
                  ready: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    record = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
-              "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
-              "start_time": now}
-    if spec.kind == "slot" and isinstance(spec.slot_checkout, SlotCheckout):
-        if released:
-            record = cast(dict[str, str | int], json.loads(path.with_name(path.name + ".lease.json").read_text()))
-        record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
-                      commit=spec.slot_checkout.commit, last_use=now, ready=ready)
+    record: dict[str, object]
+    if isinstance(spec, CheckoutScopeBinding):
+        record = _read_lease(path, directory, LeaseReadPurpose.UPDATE_HELD)
+        if record.get("pid") != spec.lease_owner or record.get("ready") is not True:
+            raise ValueError(f"{path}: the checkout lease owner changed before scope publication")
+        record["scope"] = str(spec.scope)
+    else:
+        record = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
+                  "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
+                  "start_time": now}
+        if spec.kind == "slot" and isinstance(spec.slot_checkout, SlotCheckout):
+            if released:
+                record = _read_lease(path, directory, LeaseReadPurpose.UPDATE_HELD)
+            record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
+                          commit=spec.slot_checkout.commit, last_use=now, ready=ready)
     name = path.name + ".lease.json"
     try:
         existing = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -473,6 +527,9 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
             os.unlink(temporary, dir_fd=directory)
         except FileNotFoundError:
             pass
+
+
+write_checkout_lease = _write_lease
 
 
 @dataclass(frozen=True)
@@ -577,11 +634,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     if isinstance(spec.slot_checkout, SlotCheckout):
                         import subprocess
 
-                        try:
-                            lease = cast(dict[str, object], json.loads(
-                                path.with_name(path.name + ".lease.json").read_text()))
-                        except FileNotFoundError:
-                            lease = {}
+                        lease = _read_lease(path, directory, LeaseReadPurpose.ACQUIRE)
                         if existing is None or lease.get("ready") is not True:
                             try:
                                 source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
@@ -823,10 +876,12 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     try:
         descriptor = _open_lock(path, directory, create=False)
     except FileNotFoundError:
+        _ = _read_lease(path, directory, LeaseReadPurpose.ACQUIRE)
         return UnreservedRemovalFolder()
     _ = stack.callback(os.close, descriptor)
     if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) or not _lock_current(path, directory, descriptor):
         return RefusedRemovalLease()
+    _ = _read_lease(path, directory, LeaseReadPurpose.ACQUIRE)
     _ = stack.callback(_locks.pop, descriptor, None)
     _locks[descriptor] = path
     return HeldFolderRemovalLease(path, directory, descriptor)
