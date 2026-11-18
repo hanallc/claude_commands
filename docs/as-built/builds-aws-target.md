@@ -100,6 +100,7 @@ deploy.py hana-setup --plan
 ```
 
 The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
+The plan refuses immediately if the controller lock or the lifecycle is busy.
 It refuses first-time setup, pending instance or volume work, direct-owned boxes, and merge gate setup.
 
 The plan checks the local credential file and reads the scaler identity with STS.
@@ -382,7 +383,19 @@ Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` 
 It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
 When AWS supplies an error code, the failure line includes it in parentheses.
 For a policy-only change, setup probes before and after the update.
-Setup requires an idle-stopped lifecycle with no claims or pending start for this change.
+Approved setup waits for an idle-stopped lifecycle with no claim or pending start.
+It makes no AWS write calls while it waits.
+The default setup wait is 1,500 seconds.
+This allows time for work to finish, the 600-second warm idle interval, and the 600-second stop wait.
+Set `setup_idle_wait_timeout_s` above the sum of `idle_stop_seconds` and `stop_wait_timeout_s`.
+The `setup_idle_heartbeat_s` setting reports the lifecycle state every 15 seconds.
+Setup checks the lifecycle again at the wait limit.
+If the box is still busy, setup reports the lifecycle state and the claim holder kind.
+Setup takes exclusive control of the box under the controller lock.
+The setup plan and other commands that manage Hana use the same hold.
+A competing command refuses before it calls AWS.
+Build claims and queue evidence report the box as busy during the hold.
+The kernel releases the hold when the command closes it or the process exits.
 It checks the saved stack outputs and confirms the instance is stopped and the disk is attached.
 Setup verifies the live and effective change set parameters against the approved stack parameters.
 The second run starts after CloudFormation confirms the update.
@@ -1283,7 +1296,8 @@ One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.
 Permit renewals retain that generation.
 
-F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
+F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, `HanaClaimRetained`, or `HanaClaimResourcesHeld` from `claim_assigned()`.
+`HanaClaimResourcesHeld` means a resource command holds Hana and prevents a new claim.
 Only an adopted claim can request the queue's first launch authorization.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
 An ended local holder cannot settle an unresolved Hana dispatch.

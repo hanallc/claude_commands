@@ -134,6 +134,10 @@ stop_wait_timeout_s=600
 # whole: 1..
 stop_poll_seconds=10
 # whole: 1..
+setup_idle_wait_timeout_s=1500
+# whole: 1..
+setup_idle_heartbeat_s=15
+# whole: 1..
 intent_lookup_timeout_s=120
 image_upload_tool=fixture-nixos#coldsnap
 # whole: 60..

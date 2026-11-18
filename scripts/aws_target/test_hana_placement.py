@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager, redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -10,13 +11,16 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
+import threading
 from typing import cast, override
 from unittest import mock
 
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY
 from scripts.build_targets import build_targets, target_config
@@ -176,6 +180,89 @@ class HanaPlacementTests(CostFixture):
                 self.assertEqual(constraints.candidates[0].eligibility, placement.FixedExclusion('command'))
                 self.assertIsInstance(placement.retry_decision(constraints.candidates[0].destination, 'command', 0), placement.DoNotRetry)
 
+    def test_claim_waits_for_a_controller_tick(self) -> None:
+        entered, release = threading.Event(), threading.Event()
+        read = self.controller._read  # pyright: ignore[reportPrivateUsage]
+
+        def hold_tick() -> box.BoxRecord | box.NoDeployment:
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError('The test did not release the controller tick')
+            return read()
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            # After the tick releases the lock, the claim can hold it during the provider call.
+            with (mock.patch.object(self.controller, '_read', side_effect=hold_tick),
+                    mock.patch.object(self.provider, 'check_intent')):
+                tick = workers.submit(self.controller.tick)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    claim = workers.submit(self.controller.request, 'fixture-after-tick')
+                    with self.assertRaises(TimeoutError):
+                        _ = claim.result(timeout=0.1)
+                finally:
+                    release.set()
+                self.assertIsInstance(claim.result(timeout=5), box.ClaimCommitted)
+                self.assertEqual(tick.result(timeout=5), box.Lifecycle.IDLE_STOPPED)
+
+    def test_setup_hold_excludes_assigned_claim_and_queue_evidence(self) -> None:
+        execution = placement.assigned_claim_id(self.assignment.episode, self.assignment.attempt)
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            with hana_command_lock(self.state) as access:
+                self.assertIs(access, HanaCommandAccess.ACQUIRED)
+                claim = worker.submit(self.claim)
+                self.assertIsInstance(claim.result(timeout=5), hana.HanaClaimResourcesHeld)
+                inspect = worker.submit(self.controller.inspect)
+                self.assertIsInstance(inspect.result(timeout=5), box.HanaResourcesHeld)
+                evidence = worker.submit(self.evidence, self.request())
+                snapshot = evidence.result(timeout=5)
+                assert isinstance(snapshot, placement.FreshHostEvidence)
+                self.assertEqual(snapshot.eligibility, placement.TemporaryExclusion('busy'))
+                bound = worker.submit(self.controller.execution_bound, execution)
+                self.assertFalse(bound.result(timeout=5))
+                tick = worker.submit(self.controller.tick)
+                self.assertIsInstance(tick.result(timeout=5), box.HanaResourcesHeld)
+            self.assertIsInstance(worker.submit(self.claim).result(timeout=5), hana.HanaClaimPending)
+        self.assertEqual(self.provider.calls, [])
+
+    def test_provider_reply_settles_during_a_resource_hold(self) -> None:
+        with ExitStack() as hold:
+            def take_hold() -> None:
+                self.assertIs(hold.enter_context(hana_command_lock(self.state)), HanaCommandAccess.ACQUIRED)
+
+            self.provider.during_call = take_hold
+            self.assertEqual(self.controller.tick(), box.Lifecycle.IDLE_STOPPED)
+            snapshot = self.controller.inspect_for_settlement()
+            assert isinstance(snapshot, box.HanaLifecycleEvidence)
+            self.assertIsInstance(snapshot.operation, box.NoOperation)
+            self.assertIsInstance(self.controller.tick(), box.HanaResourcesHeld)
+            self.assertEqual(len(self.provider.calls), 1)
+
+    def test_kernel_releases_the_setup_hold_when_setup_is_killed(self) -> None:
+        child = """
+import sys
+from pathlib import Path
+from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
+directory = Path(sys.argv[1])
+with hana_command_lock(directory) as access:
+    assert access is HanaCommandAccess.ACQUIRED
+    print('held', flush=True)
+    sys.stdin.read()
+"""
+        with (ThreadPoolExecutor(max_workers=1) as worker,
+                subprocess.Popen([sys.executable, '-B', '-c', child, str(self.state)], cwd=REPOSITORY,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as process):
+            try:
+                assert process.stdout is not None
+                self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+                self.assertEqual(process.stdout.readline(), 'held\n')
+                inspect = worker.submit(self.controller.inspect)
+                self.assertIsInstance(inspect.result(timeout=5), box.HanaResourcesHeld)
+            finally:
+                process.kill()
+                _ = process.communicate(timeout=5)
+        self.assertIsInstance(self.claim(), hana.HanaClaimPending)
+
     def test_claim_is_exact_and_busy_across_worktrees(self) -> None:
         first = self.claim()
         self.assertIsInstance(first, hana.HanaClaimPending)
@@ -218,13 +305,18 @@ class HanaPlacementTests(CostFixture):
         evidence = self.evidence(other)
         assert isinstance(evidence, placement.FreshHostEvidence)
         self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
-        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+        with (hana_command_lock(self.state) as access,
+                mock.patch.object(process_start, 'process_start', return_value=process_start.Gone())):
+            self.assertIs(access, HanaCommandAccess.ACQUIRED)
             evidence = self.evidence(other)
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+            self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+            self.assertIsInstance(hana_execution.read_claim_execution(self.state, pending.reference),
+                                  placement.ExecutionNotStarted)
+        evidence = self.evidence(other)
         assert isinstance(evidence, placement.FreshHostEvidence)
         self.assertIsInstance(evidence.eligibility, placement.AllowedHost)
-        self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
-        self.assertIsInstance(hana_execution.read_claim_execution(self.state, pending.reference),
-                              placement.ExecutionNotStarted)
 
     def test_failed_boot_never_recommits_demand_for_the_same_assignment(self) -> None:
         pending = self.claim()

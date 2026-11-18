@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -15,8 +16,10 @@ from typing import cast, final, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import hana_box as box, hana_execution as execution, hana_placement as hana
-from scripts.aws_target import hana_result, hana_transport, test_hana_execution as fixtures
+from scripts.aws_target import admin_secrets, deploy, hana_box as box, hana_execution as execution, hana_placement as hana
+from scripts.aws_target import hana_placement_adapter, hana_result, hana_transport, test_hana_execution as fixtures
+from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
+from scripts.aws_target.ledger_test_support import install_hana_spending_settings, text_setting
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_targets import target_config
 from scripts.buildlog import record
@@ -90,6 +93,132 @@ class HanaOffloadTests(unittest.TestCase):
         self.assertEqual(self.output.getvalue(), b'compiler output')
         self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
         self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
+
+    def test_accepted_result_releases_the_claim_during_account_prepare(self) -> None:
+        text_setting(self.transport.settings, 'enabled', 'on')
+        self.lifecycle.register(box.DeploymentIdentity('deployment', 'instance', 'spot', 'us-east-2'),
+                                state=box.Lifecycle.READY)
+        self.assertIsInstance(self.lifecycle.request(self.fixture.key.claim_id, assigned=True), box.ClaimCommitted)
+        account = deploy.Deployment(self.lifecycle.settings_path, self.root, self.root / 'output')
+        inspect = self.lifecycle.inspect
+        released: list[bool] = []
+
+        def release_while_preparing(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
+                                    lifecycle: box.HanaController) -> bool:
+            def finish_claim(*_arguments: object) -> deploy.PreparedDeployment:
+                with mock.patch.object(lifecycle, 'inspect', wraps=inspect):
+                    self.assertIsInstance(lifecycle.inspect(), box.HanaResourcesHeld)
+                    released.append(hana_placement_adapter.release_assigned(assignment, holder, lifecycle))
+                return deploy.PreparedDeployment(1000, 'fixture', {})
+
+            with mock.patch.object(account, '_write_preparation', side_effect=finish_claim):
+                _ = account.prepare()
+            return released[-1]
+
+        target = target_config.SshTarget('configured-target', 'linux', self.transport.settings)
+        with (self.context(),
+                mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                mock.patch.object(hana_placement_adapter, 'read_execution_transport', return_value=self.transport),
+                mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(self.root / 'targets')}),
+                mock.patch.object(admin_secrets, 'refuse_plain_admin'),
+                mock.patch.object(deploy, 'read_deployment_settings'),
+                mock.patch.object(deploy, 'read_budget_notification_address'),
+                mock.patch.object(account, '_parameters'),
+                mock.patch.object(account, '_guard'),
+                mock.patch.object(hana, 'release_assigned', side_effect=release_while_preparing),
+                mock.patch.object(record, 'publish_hana_result') as publish):
+            outcome = self.run_claimed()
+
+        self.assertIsInstance(outcome, offload.PassedOnTarget)
+        self.assertEqual(released, [True])
+        self.assertIsInstance(self.lifecycle.claim_status(self.fixture.key.claim_id), box.ClaimRefused)
+        publish.assert_called_once()
+
+    def pinned_verify(self) -> subprocess.CompletedProcess[str]:
+        scripts = Path(__file__).resolve().parents[1]
+        verify = (scripts / 'direct' / 'verify.sh').read_text()
+        functions: list[str] = []
+        for name in ('pinned_target_refuse', 'route_test'):
+            header = f'{name}() {{'
+            body = verify.split(f'\n{header}', 1)[1].split('\n}\n', 1)[0]
+            functions.append(header + body + '\n}\n')
+        result = self.root / 'runner.result'
+        target = target_config.SshTarget('hana-aws', 'linux', self.transport.settings)
+        with (self.context(),
+                mock.patch.object(hana_placement_adapter, 'validate_assignment', return_value=self.transport),
+                mock.patch.object(hana, 'claim_assigned', wraps=hana_placement_adapter.claim_assigned),
+                mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(self.root / 'targets')})):
+            outcome = self.run_claimed()
+            status = offload.write_result(outcome, offload.ResultFile(result), verb='check', target=target.name)
+        stubs = r"""
+PINNED_TARGET=hana-aws
+CMD=lint
+MAC_ONLY=0
+STEP_TARGET_TABLE=''
+PLACEMENT_PROVIDER=ssh
+HOLD_WAIT_DIR=.
+DOC_REPO_TOP=.
+release_token() { :; }
+check_routing_hold() { :; }
+placement_once() { :; }
+collect_routing_wait() { :; }
+remote_step_kind() { printf 'check'; }
+verify_helper() { :; }
+note_event() { :; }
+wait_for_placement() { exit 78; }
+try_reserved_target() {
+    local -a fields
+    mapfile -t fields < <("${VERIFY_FIXTURE[@]}" 0)
+    LAST_TARGET_OUTCOME=${fields[0]}
+    LAST_TARGET_REASON=${fields[1]}
+}
+route_test
+"""
+        # The shell uses the real runner decoder and the pinned refusal branch.
+        command = 'VERIFY_FIXTURE=("$@")\n' + ''.join(functions) + stubs
+        return subprocess.run(['bash', '-c', command, 'verify.sh', sys.executable,
+            str(scripts / 'direct' / 'runner_result.py'), str(result), str(status)],
+            cwd=self.root, check=False, capture_output=True, text=True, timeout=5)
+
+    def establish_pinned_hana_assignment(self) -> None:
+        install_hana_spending_settings(self.transport.settings)
+        assignment = replace(self.fixture.assignment, destination=replace(self.fixture.assignment.destination,
+            target='hana-aws'))
+        self.request = replace(self.request, target='hana-aws', placement=offload.AssignedOffloadRequest(assignment))
+        self.lifecycle.register(box.DeploymentIdentity('deployment', 'instance', 'spot', 'us-east-2'))
+
+    def test_pinned_verify_refuses_when_another_claim_holds_hana(self) -> None:
+        self.establish_pinned_hana_assignment()
+        self.assertIsInstance(self.lifecycle.request('other-claim'), box.ClaimCommitted)
+
+        result = self.pinned_verify()
+
+        self.assertEqual((result.returncode, result.stderr), (2, 'verify.sh: target hana-aws refused: Hana is busy\n'))
+
+    def test_pinned_verify_refuses_the_same_way_during_setup(self) -> None:
+        self.establish_pinned_hana_assignment()
+        with hana_command_lock(self.lifecycle.directory) as access:
+            self.assertIs(access, HanaCommandAccess.ACQUIRED)
+            result = self.pinned_verify()
+        self.assertEqual((result.returncode, result.stderr), (2, 'verify.sh: target hana-aws refused: Hana is busy\n'))
+
+    def test_setup_hold_refuses_without_a_provider_claim(self) -> None:
+        from scripts.build_queue import admission_client
+
+        with self.context(), mock.patch.object(hana, 'claim_assigned', return_value=hana.HanaClaimResourcesHeld()), \
+                mock.patch.object(execution, 'settle_unpublished_claim') as settle, \
+                mock.patch.object(admission_client, 'claim_failure') as claim_failure:
+            outcome = self.run_claimed()
+            offload.report_placement_result(self.controller, self.request, outcome)
+        assert isinstance(outcome, offload.DeclinedMacRun)
+        self.assertEqual(outcome.detail, 'Hana is busy')
+        self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
+        self.assertIsInstance(self.controller.attempt_evidence.provider, placement.NoProviderClaim)
+        settle.assert_not_called()
+        claim_failure.assert_called_once()
+        report = cast(wire.ClaimFailure, claim_failure.call_args.args[0])
+        self.assertEqual(report.reason, 'state')
 
     def test_nonzero_compiler_status_remains_a_terminal_failure(self) -> None:
         with self.context(), mock.patch.object(self.fixture.objects, 'execution_result',

@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import write_config_fixture
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -26,14 +27,15 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_spend, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_spend, ledger, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
+from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
 from scripts.aws_target.test_spot_end import Disk, FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -450,7 +452,8 @@ class HanaSetupFailureTests(CostFixture):
         self.scaler_calls = []
         self.instance_reads = []
         self.deleted_stacks = {}
-        numeric_settings(self.workload, {'intent_lookup_timeout_s': '15'})
+        numeric_settings(self.workload, {'intent_lookup_timeout_s': '15', 'idle_stop_seconds': '10',
+                                          'stop_wait_timeout_s': '25', 'setup_idle_wait_timeout_s': '45'})
         self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
         self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
         original = conf.read_or_repository
@@ -1429,8 +1432,9 @@ class HanaSetupFailureTests(CostFixture):
         self.assertNotIn('execute-change-set', operations)
         self.assertEqual(self.setup_path.read_bytes(), saved)
 
-    def test_hana_policy_update_refuses_a_busy_lifecycle(self) -> None:
+    def test_hana_policy_update_refuses_when_the_lifecycle_stays_busy(self) -> None:
         subject, _ = self.policy_update_fixture([])
+        subject.pause = self.advance_pause
         path = self.setup_path.with_name('lifecycle.json')
         lifecycle = remote.read_record(path)
         busy_values: tuple[dict[str, object], ...] = (
@@ -1441,11 +1445,137 @@ class HanaSetupFailureTests(CostFixture):
             with self.subTest(values=values):
                 self.calls.clear()
                 write_text_atomic(path, json.dumps({**lifecycle, **values}))
-                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'again when the box is idle'):
+                state = values.get('state', 'idle-stopped')
+                holder = 'unrecorded' if 'claims' in values else 'none'
+                with redirect_stdout(StringIO()) as output, mock.patch.object(time, 'monotonic', self.clock), \
+                        self.assertRaisesRegex(deploy.DeploymentRefused,
+                            rf'still busy after 45 s \(state {state}, claim holder {holder}\).*again when the box is idle'):
                     _ = subject.hana_setup(approve_resources=True)
+                self.assertIn('waiting up to 45 s for Hana to become idle', output.getvalue())
                 self.assertEqual(self.instance_reads, [])
                 self.assertEqual(self.scaler_calls, [])
-                self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+                self.assertEqual(self.policy_calls, [])
+
+    def test_hana_setup_takes_the_box_at_the_deadline_and_holds_it_through_the_probe(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], stack_owned=True)
+        text_setting(self.workload, 'enabled', 'on')
+        controller = hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
+                                            clock=self.clock)
+        path = self.setup_path.with_name('lifecycle.json')
+        idle = path.read_bytes()
+        self.assertIsInstance(controller.request('fixture-live-claim'), hana_box.ClaimCommitted)
+        lifecycle = remote.read_record(path)
+        write_text_atomic(path, json.dumps(lifecycle | {'state': 'starting'}))
+        live_claim, = ledger.rows(lifecycle, 'claims')
+        pauses: list[float] = []
+
+        def advance(seconds: float) -> None:
+            self.assertEqual(self.policy_calls, [])
+            self.assertIsInstance(controller.inspect(), hana_box.HanaLifecycleEvidence)
+            pauses.append(seconds)
+            self.advance_pause(seconds)
+            if len(pauses) == 1:
+                write_text_atomic(path, json.dumps(lifecycle | {
+                    'state': 'ready', 'claims': [live_claim | {'active': True}],
+                }))
+            elif len(pauses) == 3:
+                _ = path.write_bytes(idle)
+
+        original_probe = subject._probe_hana_scaler  # pyright: ignore[reportPrivateUsage]
+
+        subject.pause = advance
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            def check_claim(provider: AwsHanaProvider, identity: hana_box.DeploymentIdentity) -> bool:
+                claim = worker.submit(controller.request, 'fixture-late-claim')
+                self.assertIsInstance(claim.result(timeout=5), hana_box.HanaResourcesHeld)
+                self.assertEqual(path.read_bytes(), idle)
+                return original_probe(provider, identity)
+
+            with mock.patch.object(time, 'monotonic', self.clock), \
+                    mock.patch.object(subject, '_probe_hana_scaler', side_effect=check_claim) as probe:
+                status, output, errors = self.run_hana_setup_cli(subject)
+        self.assertEqual((status, errors), (0, ''), output)
+        self.assertEqual(pauses, [15, 15, 15])
+        self.assertEqual([line for line in output.splitlines() if line.startswith('hana-setup:')][:4], [
+            'hana-setup: waiting up to 45 s for Hana to become idle (state starting, claim holder local process).',
+            'hana-setup: still waiting for Hana (state ready, claim holder local process, 15 s of 45 s).',
+            'hana-setup: still waiting for Hana (state ready, claim holder local process, 30 s of 45 s).',
+            'hana-setup: Hana is idle-stopped. Setup holds the box.',
+        ])
+        self.assertEqual(probe.call_count, 2)
+        self.assertIn(('cloudformation', 'execute-change-set'), self.policy_calls)
+        self.assertIsInstance(controller.request('fixture-late-claim'), hana_box.ClaimCommitted)
+
+    def test_exclusive_commands_refuse_while_approved_hana_setup_holds_the_box(self) -> None:
+        subject, _ = self.policy_update_fixture([], stack_owned=True)
+        unexpected_aws = mock.Mock(side_effect=AssertionError('Unexpected AWS call'))
+        plan = plan_run.PlanRun(unexpected_aws, unexpected_aws, unexpected_aws)
+        planned = deploy.Deployment(self.settings, self.state, self.root / 'plan', mode=plan)
+        image = hana_image.BuiltImage('fixture-image', self.root / 'image.raw', 'raw', 'uefi', 1024)
+        operations: tuple[tuple[str, Callable[[], object]], ...] = (
+            ('hana-down', lambda: subject.hana_down(approve_destroy=True)),
+            ('hana-image', lambda: subject.hana_image(self.root, approve_resources=True)),
+            ('hana-setup', lambda: subject.hana_setup(approve_resources=True)),
+            ('hana-setup --plan', planned.hana_setup),
+            ('prepare --workload hana', subject.prepare_hana),
+            ('prepare', subject.prepare),
+            ('apply', lambda: subject.apply(approve_resources=True)),
+            ('down', lambda: subject.down(approve_destroy=True)),
+        )
+
+        def check_competing_commands(*_arguments: object) -> bool:
+            with (mock.patch.object(subject, '_api', side_effect=AssertionError('Unexpected AWS call')) as api,
+                    mock.patch.object(subject, 'pause', side_effect=AssertionError('Unexpected idle wait')),
+                    mock.patch.object(hana_image, 'read_built', return_value=image)):
+                for name, operation in operations:
+                    with self.subTest(command=name), self.assertRaisesRegex(deploy.HanaControlRefused,
+                            f'^{name}: another command holds exclusive control of Hana'):
+                        _ = operation()
+                api.assert_not_called()
+                unexpected_aws.assert_not_called()
+            return True
+
+        with (redirect_stdout(StringIO()),
+                mock.patch.object(subject, '_update_stack_owned_hana', side_effect=check_competing_commands) as update):
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+        update.assert_called_once()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.policy_calls, [])
+        self.assertEqual(self.scaler_calls, [])
+
+    def test_hana_setup_rejects_a_wait_that_cannot_cover_the_warm_idle_and_stop_intervals(self) -> None:
+        subject, _ = self.policy_update_fixture([])
+        for timeout in ('34', '35'):
+            with self.subTest(timeout=timeout), redirect_stdout(StringIO()):
+                numeric_settings(self.workload, {'setup_idle_wait_timeout_s': timeout})
+                with self.assertRaisesRegex(deploy.HanaSetupTimingRefused,
+                        'setup_idle_wait_timeout_s must exceed idle_stop_seconds plus stop_wait_timeout_s'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(self.calls, [])
+        numeric_settings(self.workload, {'setup_idle_wait_timeout_s': '36'})
+        self.assertEqual(deploy.HanaSetupTiming.read(conf.read(self.workload)).idle_wait_s, 36)
+
+    def test_hana_setup_interrupt_while_waiting_leaves_the_lifecycle_and_aws_untouched(self) -> None:
+        subject, _ = self.policy_update_fixture([], stack_owned=True)
+        path = self.setup_path.with_name('lifecycle.json')
+        write_text_atomic(path, json.dumps(remote.read_record(path) | {'state': 'ready'}))
+        busy = path.read_bytes()
+
+        def interrupt(_seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        subject.pause = interrupt
+        status, output, errors = self.run_hana_setup_cli(subject)
+        self.assertEqual(status, 130)
+        self.assertIn('waiting up to 45 s for Hana to become idle', output)
+        self.assertEqual(errors, 'hana-setup: interrupted\n')
+        self.assertEqual(self.policy_calls, [])
+        self.assertEqual(path.read_bytes(), busy)
+        with file_lock.exclusive(self.state / 'controller.lock', wait=False) as result:
+            self.assertIs(result, file_lock.LockResult.ACQUIRED)
 
     def test_hana_policy_update_requires_the_live_instance_to_be_stopped(self) -> None:
         subject, _ = self.policy_update_fixture([], live_state='running')

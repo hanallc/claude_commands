@@ -452,6 +452,7 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
                                    transport_for: Callable[[target_config.SshTarget], ExecutionTransport],
                                    read_bytes: Callable[[Path], bytes]) -> str:
     """Hash the configuration for placement or an adapter refusal."""
+    from scripts.build_targets.execution_transport import HanaControlTransport
     from scripts.lib import conf
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
@@ -459,10 +460,8 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
         paths.add(settings.path)
     for target in targets:
         if isinstance(target, target_config.SshTarget) and target.name == target_name:
-            from scripts.aws_target import hana_placement
-
             paths.add(target.settings)
-            if isinstance(transport_for(target), hana_placement.HanaControlTransport):
+            if isinstance(transport_for(target), HanaControlTransport):
                 paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
     for path in sorted(paths):

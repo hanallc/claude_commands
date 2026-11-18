@@ -1,6 +1,7 @@
 """Check the Hana setup plan with private fixtures and a restricted AWS fake."""
-from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
@@ -14,7 +15,7 @@ from scripts.aws_target import admin_secrets, deploy, hana_box, ledger, plan_ide
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.controller_lock import control_lock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
-from scripts.lib import conf, file_lock
+from scripts.lib import conf
 
 
 OWNER = plan_identity.PlanAccount('aws', '0' * 12)
@@ -300,9 +301,18 @@ class PlanSetupTests(CostFixture):
 
     def test_stack_owned_plan_accepts_the_explicit_hana_workload(self) -> None:
         self.prepare_hana()
-        status, output = self.run_plan('hana-setup', '--workload', 'hana')
-        self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
+        for invalid_timing in (False, True):
+            with self.subTest(invalid_timing=invalid_timing):
+                if invalid_timing:
+                    workload = conf.path('hana_aws')
+                    text_setting(workload, 'setup_idle_wait_timeout_s', 'invalid')
+                    text_setting(workload, 'setup_idle_heartbeat_s', 'invalid')
+                self.calls.clear()
+                self.deleting = False
+                self.confirmations = 0
+                status, output = self.run_plan('hana-setup', '--workload', 'hana')
+                self.assertEqual(status, 0, output)
+                self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
 
     def test_plan_blocks_claims_after_the_idle_check_and_through_the_last_simulation(self) -> None:
         self.prepare_hana()
@@ -311,24 +321,35 @@ class PlanSetupTests(CostFixture):
         controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
         blocked: list[str] = []
 
-        @contextmanager
-        def try_controller_lock(directory: Path) -> Generator[None]:
-            with file_lock.exclusive(directory / 'controller.lock', wait=False) as result:
-                if result is file_lock.LockResult.BUSY:
-                    raise BlockingIOError
-                yield
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            def check_claim() -> None:
+                claim = worker.submit(controller.request, 'fixture-claim')
+                self.assertIsInstance(claim.result(timeout=5), hana_box.HanaResourcesHeld)
+                blocked.append(self.calls[-1][1])
 
-        def check_claim() -> None:
-            with mock.patch.object(hana_box, 'control_lock', new=try_controller_lock), \
-                    self.assertRaises(BlockingIOError):
-                _ = controller.request('fixture-claim')
-            blocked.append(self.calls[-1][1])
-
-        self.check_claim = check_claim
-        status, output = self.run_plan('hana-setup')
+            self.check_claim = check_claim
+            status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 0, output)
         self.assertEqual(blocked, ['get-template', 'simulate-principal-policy'])
         self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
+
+    def test_hana_down_refuses_while_the_plan_holds_the_box(self) -> None:
+        self.prepare_hana()
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=self.execute)
+        refused: list[str] = []
+
+        def check_teardown() -> None:
+            before = list(self.calls)
+            with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.HanaControlRefused,
+                    '^hana-down: another command holds exclusive control of Hana'):
+                _ = subject.hana_down(approve_destroy=True)
+            self.assertEqual(self.calls, before)
+            refused.append(before[-1][1])
+
+        self.check_claim = check_teardown
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 0, output)
+        self.assertEqual(refused, ['get-template', 'simulate-principal-policy'])
 
     def test_busy_controller_lock_refuses_before_aws(self) -> None:
         self.prepare_hana()
@@ -338,6 +359,20 @@ class PlanSetupTests(CostFixture):
         self.assertEqual(self.calls, [])
         self.assertTrue(output.endswith('plan run: refused: The Hana lifecycle is busy. '
                                         + 'Run hana-setup again when the box is idle.\n'))
+
+    def test_claimed_box_refuses_without_waiting_or_creating_a_change_set(self) -> None:
+        self.prepare_hana()
+        workload = conf.path('hana_aws')
+        text_setting(workload, 'enabled', 'on')
+        controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
+        self.assertIsInstance(controller.request('existing-claim'), hana_box.ClaimCommitted)
+        with mock.patch.object(time, 'sleep') as pause:
+            status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1, output)
+        self.assertEqual(self.calls, list(PLAN_CALLS[:2]))
+        self.assertTrue(output.endswith('plan run: refused: The Hana lifecycle is busy. '
+                                        + 'Run hana-setup again when the box is idle.\n'))
+        pause.assert_not_called()
 
     def test_stack_owned_plan_passes_without_a_bucket_policy(self) -> None:
         self.prepare_hana()

@@ -2794,6 +2794,9 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     if isinstance(claim, (hana.HanaClaimPending, hana.HanaClaimRetained)):
         evidence.provider = claim.reference
         return close_prelaunch('The Hana startup wait ended before command dispatch')
+    if isinstance(claim, hana.HanaClaimResourcesHeld):
+        controller.pending = SettledDispatchOperations()
+        return DeclinedMacRun('state', elapsed_seconds(started), box.HANA_CLAIM_BUSY)
     if isinstance(claim, hana.HanaClaimRefused):
         return close_prelaunch(claim.reason)
     evidence.provider = claim.reserved.claim.reference
@@ -2828,7 +2831,9 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
 
     def permission() -> box.CommandPermission | box.ClaimRefused:
         snapshot = lifecycle.inspect()
-        if not isinstance(snapshot, hana.HanaLifecycleEvidence) or not isinstance(snapshot.permit, box.DeliveredPermit):
+        if isinstance(snapshot, (box.HanaUnprovisioned, box.HanaLifecycleUnavailable, box.HanaResourcesHeld)):
+            return box.ClaimRefused('The Hana acknowledged permit is unavailable')
+        if not isinstance(snapshot.permit, box.DeliveredPermit):
             return box.ClaimRefused('The Hana acknowledged permit is unavailable')
         return lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
 

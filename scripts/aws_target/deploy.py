@@ -33,13 +33,14 @@ from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
+from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
 from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
-from scripts.lib import conf, file_lock, user_zone
+from scripts.lib import conf, user_zone
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
@@ -185,6 +186,39 @@ def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generato
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
+
+
+class HanaControlRefused(DeploymentRefused):
+    """Another command holds exclusive control of Hana."""
+
+    def __init__(self, command: str) -> None:
+        super().__init__(f'{command}: another command holds exclusive control of Hana.')
+
+
+class HanaSetupTimingRefused(DeploymentRefused):
+    """The settings do not give Hana enough time to stop."""
+
+
+@dataclass(frozen=True)
+class HanaSetupTiming:
+    idle_wait_s: int
+    heartbeat_s: int
+    stop_wait_s: int
+    stop_poll_s: int
+
+    @classmethod
+    def read(cls, workload: conf.ConfigRead) -> HanaSetupTiming:
+        idle_wait = workload.whole('setup_idle_wait_timeout_s')
+        heartbeat = workload.whole('setup_idle_heartbeat_s')
+        warm_idle = workload.whole('idle_stop_seconds')
+        stop_wait = workload.whole('stop_wait_timeout_s')
+        stop_poll = workload.whole('stop_poll_seconds')
+        if min(idle_wait, heartbeat, warm_idle, stop_wait, stop_poll) <= 0:
+            raise HanaSetupTimingRefused('Hana setup requires positive idle and stop intervals.')
+        if idle_wait <= warm_idle + stop_wait:
+            raise HanaSetupTimingRefused(
+                'setup_idle_wait_timeout_s must exceed idle_stop_seconds plus stop_wait_timeout_s.')
+        return cls(idle_wait, heartbeat, stop_wait, stop_poll)
 
 
 class HanaCreateRolledBack(AwsUnavailable):
@@ -417,6 +451,28 @@ def _print_hana_placement(workload: conf.ConfigRead) -> None:
     print(f'Hana placement is {state}. This command does not change it.')
 
 
+def _hana_lifecycle_idle(registration: dict[str, object]) -> bool:
+    operation = registration.get('operation', {})
+    observing = (isinstance(operation, dict)
+                 and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
+    return (registration.get('state') == hana_box.Lifecycle.IDLE_STOPPED and registration.get('claims') == []
+            and registration.get('start', {}) is None and (operation is None or observing))
+
+
+def _hana_wait_status(registration: dict[str, object], lock_busy: bool) -> str:
+    state = registration.get('state')
+    holder = 'unknown'
+    claims = registration.get('claims')
+    if claims == []:
+        holder = 'none'
+    elif isinstance(claims, list) and claims:
+        claim = cast(list[object], claims)[0]
+        if isinstance(claim, dict):
+            holder = 'local process' if isinstance(cast(dict[str, object], claim).get('owner'), dict) else 'unrecorded'
+    status = f'state {state if state in tuple(hana_box.Lifecycle) else "unavailable"}, claim holder {holder}'
+    return status + (', controller lock busy' if lock_busy else '')
+
+
 def deployment_parameters(path: Path, settings: DeploymentSettings,
                           notification: BudgetNotificationAddress, deployment_id: str) -> dict[str, str]:
     spending = read_settings(path)
@@ -613,7 +669,7 @@ class Deployment:
     def prepare_hana(self) -> PreparedDeployment:
         """Save local preparation without accessing AWS or changing placement."""
         admin_secrets.refuse_plain_admin(self.settings_path)
-        with control_lock(self.directory):
+        with self._require_hana_control('prepare --workload hana'):
             settings, parameters, template = self._hana_inputs()
             decision = self._guard()
             prepared = self._hana_output()._write_preparation(settings, parameters, template, decision)
@@ -633,15 +689,13 @@ class Deployment:
         _print_hana_placement(workload)
         if not approve_resources and isinstance(self.mode, plan_run.ApprovedSetup):
             return False
-        stop_timeout = workload.whole('stop_wait_timeout_s')
-        stop_interval = workload.whole('stop_poll_seconds')
-        if min(stop_timeout, stop_interval) <= 0:
-            raise DeploymentRefused('Hana setup requires positive values for stop_wait_timeout_s and stop_poll_seconds.')
         if isinstance(self.mode, plan_run.PlanRun):
             return self._plan_hana_update(workload, limits, self.mode)
+        timing = HanaSetupTiming.read(workload)
         self._authorize(True)
         child = self._hana_output()
-        with self._hana_setup_lock():
+        stop_timeout, stop_interval = timing.stop_wait_s, timing.stop_poll_s
+        with self._hana_setup_lock(timing):
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
             ownership = _hana_setup_ownership(saved)
@@ -822,45 +876,84 @@ class Deployment:
                 spending.reconcile(int(self.clock()), 'stopped', generation=ledger.instant(saved, 'generation'))
                 del saved['stop_pending']
                 _save_hana_setup(path, saved)
-        provider = self._hana_provider()
-        identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region)
-        hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
-            clock=self.clock).register(identity)
-        print('Hana setup complete. The box is stopped.')
-        _print_hana_placement(workload)
-        return self._probe_hana_scaler(provider, identity)
+            provider = self._hana_provider()
+            identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region)
+            hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
+                clock=self.clock).register(identity)
+            print('Hana setup complete. The box is stopped.')
+            _print_hana_placement(workload)
+            return self._probe_hana_scaler(provider, identity)
 
     @contextmanager
-    def _hana_setup_lock(self, *, wait: bool = True) -> Generator[None]:
-        path = self.directory / 'controller.lock'
-        if wait:
-            self.directory.mkdir(parents=True, exist_ok=True)
-        elif not path.is_file():
-            raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
-        with file_lock.exclusive(path, wait=wait) as result:
-            if result is file_lock.LockResult.BUSY:
-                raise DeploymentRefused(HANA_BUSY)
+    def _require_hana_control(self, command: str) -> Generator[None]:
+        with hana_command_lock(self.directory) as access:
+            if access is not HanaCommandAccess.ACQUIRED:
+                raise HanaControlRefused(command)
             yield
+
+    @contextmanager
+    def _hana_setup_lock(self, timing: HanaSetupTiming) -> Generator[None]:
+        lifecycle = self.directory / 'hana' / 'lifecycle.json'
+        status = 'state unavailable, claim holder unknown'
+        waiting = False
+
+        def is_idle() -> bool:
+            nonlocal status
+            try:
+                registration = remote.read_record(lifecycle)
+            except FileNotFoundError:
+                return True
+            status = _hana_wait_status(registration, False)
+            return _hana_lifecycle_idle(registration)
+
+        timeout = timing.idle_wait_s
+        for started in self._hana_check_times(timeout, timing.heartbeat_s, check_at_deadline=True):
+            with hana_command_lock(self.directory, ready=is_idle, wait_for_controller=False) as access:
+                if access is HanaCommandAccess.ACQUIRED:
+                    if waiting:
+                        print('hana-setup: Hana is idle-stopped. Setup holds the box.', flush=True)
+                    yield
+                    return
+                if access is HanaCommandAccess.RESOURCES_HELD:
+                    raise HanaControlRefused('hana-setup')
+                if access is HanaCommandAccess.CONTROLLER_BUSY:
+                    try:
+                        registration = remote.read_record(lifecycle)
+                    except FileNotFoundError:
+                        registration = {}
+                    status = _hana_wait_status(registration, True)
+            if not waiting:
+                print(f'hana-setup: waiting up to {timeout} s for Hana to become idle ({status}).', flush=True)
+                waiting = True
+            else:
+                elapsed = int(time.monotonic() - started)
+                print(f'hana-setup: still waiting for Hana ({status}, {elapsed} s of {timeout} s).', flush=True)
+        raise DeploymentRefused(f'The Hana lifecycle is still busy after {timeout} s ({status}). '
+                                + 'Run hana-setup again when the box is idle.')
 
     def _plan_hana_update(self, workload: conf.ConfigRead, limits: hana_spend.PermitSettings,
                           plan: plan_run.PlanRun) -> bool:
-        path = self.directory / 'hana' / 'setup.json'
-        try:
-            saved = remote.read_record(path)
-        except FileNotFoundError:
-            raise plan_run.unsupported('first-time Hana setup') from None
-        if any(key in saved for key in ('pending_launch', 'pending_volume', 'stop_pending')):
-            raise plan_run.unsupported('Hana setup has pending instance or volume work')
-        try:
-            ownership = _hana_setup_ownership(saved)
-        except DeploymentRefused:
-            raise plan_run.unsupported('the saved Hana setup has an unsupported format') from None
-        if ownership != HanaBoxOwnership.STACK:
-            raise plan_run.unsupported('Hana uses direct-owned resources')
-        self._check_credentials()
-        with self._hana_setup_lock(wait=False):
-            if remote.read_record(path) != saved:
-                raise DeploymentRefused('The saved Hana setup changed. Run hana-setup again.')
+        with hana_command_lock(self.directory, wait_for_controller=False, existing_controller=True) as access:
+            if access is HanaCommandAccess.RESOURCES_HELD:
+                raise HanaControlRefused('hana-setup --plan')
+            if access is HanaCommandAccess.CONTROLLER_BUSY:
+                raise DeploymentRefused(HANA_BUSY)
+            path = self.directory / 'hana' / 'setup.json'
+            try:
+                saved = remote.read_record(path)
+            except FileNotFoundError:
+                raise plan_run.unsupported('first-time Hana setup') from None
+            if any(key in saved for key in ('pending_launch', 'pending_volume', 'stop_pending')):
+                raise plan_run.unsupported('Hana setup has pending instance or volume work')
+            try:
+                ownership = _hana_setup_ownership(saved)
+            except DeploymentRefused:
+                raise plan_run.unsupported('the saved Hana setup has an unsupported format') from None
+            if ownership != HanaBoxOwnership.STACK:
+                raise plan_run.unsupported('Hana uses direct-owned resources')
+            self._check_credentials()
+            if access is HanaCommandAccess.CONTROLLER_MISSING:
+                raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
             plan.confirm_account(limits.region, workload.whole('aws_timeout_s'))
             return self._update_stack_owned_hana(path, saved, workload, limits)
 
@@ -951,11 +1044,7 @@ class Deployment:
             raise DeploymentRefused('The Hana lifecycle registration differs from the saved setup.')
         identity = hana_box.DeploymentIdentity(fields['deployment'], fields['instance'], fields['spot_request'], fields['region'])
         retry = 'Run hana-setup again when the box is idle.'
-        operation = registration.get('operation', {})
-        observing = (isinstance(operation, dict)
-                     and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
-        if (registration.get('state') != hana_box.Lifecycle.IDLE_STOPPED or registration.get('claims') != []
-                or registration.get('start', {}) is not None or (operation is not None and not observing)):
+        if not _hana_lifecycle_idle(registration):
             raise DeploymentRefused(HANA_BUSY)
         try:
             observed = api.observe(identity.instance, int(self.clock()))
@@ -1143,7 +1232,7 @@ class Deployment:
         raise DeploymentRefused('No Hana Spot candidate launched. The stack is ready for another setup run.\n'
                                 + '\n'.join(failures))
 
-    def _hana_check_times(self, timeout: int, interval: int) -> Generator[float]:
+    def _hana_check_times(self, timeout: int, interval: int, *, check_at_deadline: bool = False) -> Generator[float]:
         started = time.monotonic()
         deadline = started + timeout
         while time.monotonic() < deadline:
@@ -1151,6 +1240,8 @@ class Deployment:
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 self.pause(min(interval, remaining))
+        if check_at_deadline:
+            yield started
 
     def _attach_hana_data(self, api: AwsCli, path: Path, saved: dict[str, object],
                           size: int, timeout: int, interval: int) -> None:
@@ -1241,8 +1332,8 @@ class Deployment:
                             (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
                             // hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS)
         wait_attempts = upload_timeout // wait_interval
-        api = self._api(settings)
-        with control_lock(self.directory):
+        with self._require_hana_control('hana-image'):
+            api = self._api(settings)
             _ = self._guard()
             subnets = [row for row in gate_subnets(api, settings.vpc_id) if row['zone'] == zone]
             if not subnets:
@@ -1513,7 +1604,7 @@ class Deployment:
             return True
         self._check_credentials()
         path = self.directory / 'hana' / 'setup.json'
-        with control_lock(self.directory):
+        with self._require_hana_control('hana-down'):
             if not path.exists():
                 print('down --workload hana: no Hana deployment is saved')
                 return True
@@ -1752,7 +1843,7 @@ class Deployment:
 
     def prepare(self) -> PreparedDeployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        with control_lock(self.directory):
+        with self._require_hana_control('prepare'):
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
@@ -1999,7 +2090,7 @@ class Deployment:
 
     def apply(self, *, approve_resources: bool = False) -> dict[str, str]:
         self._authorize(approve_resources)
-        with control_lock(self.directory):
+        with self._require_hana_control('apply'):
             settings, parameters = self._load(read_budget_notification_address(self.settings_path))
             stack = self._stack(settings)
             previous_path = self.directory / 'deployment.json'
@@ -2697,7 +2788,7 @@ class Deployment:
             return True
         self._check_credentials()
         settings = read_deployment_settings(self.settings_path)
-        with step('down', 'removing local and cloud resources', self.settings_path):
+        with self._require_hana_control('down'), step('down', 'removing local and cloud resources', self.settings_path):
             return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
@@ -2902,7 +2993,11 @@ def main() -> int:
                 raise DeploymentRefused('Use hana-image --image RESULT [--approve-resources]')
             return 0 if deploy.hana_image(args.image, approve_resources=args.approve_resources) else 1
         elif args.command == 'hana-setup':
-            return 0 if deploy.hana_setup(approve_resources=args.approve_resources) else 1
+            try:
+                return 0 if deploy.hana_setup(approve_resources=args.approve_resources) else 1
+            except KeyboardInterrupt:
+                print('hana-setup: interrupted', file=sys.stderr)
+                return 130
         elif args.command == 'prepare':
             prepared = deploy.prepare_hana() if args.workload == 'hana' else deploy.prepare()
             print(json.dumps({'at': prepared.at, 'fingerprint': prepared.fingerprint, 'output': str(args.output)}))

@@ -223,37 +223,39 @@ class HanaQueueTests(unittest.TestCase):
                 self.assertEqual(assignment_for(fixture, next_request).destination, assignment.destination)
 
     def test_unbound_refusal_reaches_fallback_after_worker_evidence_with_a_live_coordinator(self) -> None:
-        with PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker):
-            target = hana_target(fixture)
-            controller = hana_box.HanaController(fixture.root / 'hana-state', fixture.root / 'account.conf',
-                target.settings, hana_box.ProviderNotInstalled())
-            request = placement_request(fixture)
-            candidate = request.constraints.candidates[0]
-            remote = replace(candidate, destination=replace(candidate.destination, provider='ssh', target=target.name))
-            request = replace(request, prerequisite=placement.TokenNotRequired(),
-                constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
-            with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
-                    mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
-                _ = publish_candidate(fixture, request)
-                assignment = assignment_for(fixture, request)
-                failure = wire.ClaimFailure('disabled-before-bind', assignment, 'disabled')
-                _ = fixture.server.handle_request(failure)
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
-                pending = fixture.server.assignments[key]
-                self.assertIsInstance(pending.state, placement.CurrentAssignment)
-                self.assertIsInstance(pending.terminal_report, placement.TerminalAttemptReport)
-                fixture.clock.advance(10)
-                _ = fixture.server.handle_request(failure)
-                self.assertEqual(fixture.server.assignments[key].retry, pending.retry)
-                _ = publish_candidate(fixture, request, placement.TemporaryExclusion('disabled'))
-                _ = fixture.run_pass()
-                worker = fixture.server.host_targets[('ssh', target.name)]
-                assert isinstance(worker, ManualEvidenceWorker)
-                _ = worker.probe_next()
-                _ = fixture.run_pass()
-                self.assertIsInstance(fixture.server.assignments[key].state, placement.ClosedAssignment)
-                self.assertIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
-                self.assertEqual(fixture.proc.owner_start(request.owner.pid), service.LiveOwnerIdentity(request.owner.start_time))
+        for reason in ('disabled', 'busy'):
+            with self.subTest(reason=reason):
+                with PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker):
+                    target = hana_target(fixture)
+                    controller = hana_box.HanaController(fixture.root / 'hana-state', fixture.root / 'account.conf',
+                        target.settings, hana_box.ProviderNotInstalled())
+                    request = placement_request(fixture)
+                    candidate = request.constraints.candidates[0]
+                    remote = replace(candidate, destination=replace(candidate.destination, provider='ssh', target=target.name))
+                    request = replace(request, prerequisite=placement.TokenNotRequired(),
+                        constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
+                    with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
+                            mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
+                        _ = publish_candidate(fixture, request)
+                        assignment = assignment_for(fixture, request)
+                        failure = wire.ClaimFailure('refused-before-bind', assignment, reason)
+                        _ = fixture.server.handle_request(failure)
+                        key = placement.attempt_key(assignment.episode, assignment.attempt)
+                        pending = fixture.server.assignments[key]
+                        self.assertIsInstance(pending.state, placement.CurrentAssignment)
+                        self.assertIsInstance(pending.terminal_report, placement.TerminalAttemptReport)
+                        fixture.clock.advance(10)
+                        _ = fixture.server.handle_request(failure)
+                        self.assertEqual(fixture.server.assignments[key].retry, pending.retry)
+                        _ = publish_candidate(fixture, request, placement.TemporaryExclusion(reason))
+                        _ = fixture.run_pass()
+                        worker = fixture.server.host_targets[('ssh', target.name)]
+                        assert isinstance(worker, ManualEvidenceWorker)
+                        _ = worker.probe_next()
+                        _ = fixture.run_pass()
+                        self.assertIsInstance(fixture.server.assignments[key].state, placement.ClosedAssignment)
+                        self.assertIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
+                        self.assertEqual(fixture.proc.owner_start(request.owner.pid), service.LiveOwnerIdentity(request.owner.start_time))
 
     def test_prelaunch_refusal_with_an_earlier_claim_settles_only_without_a_bound_dispatch(self) -> None:
         for bound in (False, True):

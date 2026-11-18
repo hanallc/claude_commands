@@ -176,7 +176,9 @@ class HanaBoxTests(CostFixture):
 
     def tick(self) -> hana_box.Lifecycle:
         self.clock.advance(1)
-        return self.controller.tick()
+        result = self.controller.tick()
+        assert isinstance(result, hana_box.Lifecycle)
+        return result
 
     def ready(self) -> None:
         self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
@@ -532,7 +534,7 @@ class HanaBoxTests(CostFixture):
         self.assertTrue(self.controller.release('execution-one'))
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
-        received: list[hana_box.ClaimCommitted | hana_box.ClaimRefused] = []
+        received: list[hana_box.ClaimCommitted | hana_box.ClaimRefused | hana_box.HanaResourcesHeld] = []
         self.provider.during_call = lambda: received.append(self.controller.request('execution-two'))
         _ = self.tick()
         self.assertIsInstance(received[0], hana_box.ClaimRefused)
