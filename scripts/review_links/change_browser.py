@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import shlex
+import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -729,9 +730,6 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
         try:
             relay = save_outcome(production, question, outcome, words, identities)
-            if outcome != "skip":
-                update_registration.record_review_log(question.record.path,
-                    ('feedback sent' if outcome == 'feedback' else outcome)+": "+words)
         except BaseException as error:
             try:
                 status.clear_locked(page, page.rows[0], status.slots(page, page.rows[0]), "verdict")
@@ -745,6 +743,12 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         intent = replace(intent, recipients=(recipient,))
         page = replace(page, saved={**saved, "saved": True})
         status.mark_review_saved(page, page.rows[0], replace(slots, verdict=intent), intent)
+        if outcome != "skip":
+            try:
+                update_registration.record_review_log(question.record.path,
+                    ('feedback sent' if outcome == 'feedback' else outcome)+": "+words)
+            except (OSError, ValueError, update_registration.RegistrationFailure, update_registration.InputError) as error:
+                print(f"review-links question log {page.rows[0]}: {error}", file=sys.stderr)
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 

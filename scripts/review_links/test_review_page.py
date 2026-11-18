@@ -1619,6 +1619,73 @@ window.fetch=async url=>{
                 self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
                 self.assertFalse(receipt.exists())
 
+    def test_recovery_sends_after_the_dispatch_marker_sync_fails(self) -> None:
+        question = self.file_sent_question()
+        record = self.investigation()
+        for key in (question, f'investigation/{record.owner}/{record.id}'):
+            with self.subTest(key=key):
+                words = f'Recover the send for {key}.'
+                delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                mark = self.status.closeout_path(delivery.page, delivery.row)
+                sync = atomic_file.sync_folder
+                failed = False
+
+                def fail_sync(folder: Path) -> None:
+                    nonlocal failed
+                    if folder == mark.parent and mark.exists() and not failed:
+                        failed = True
+                        raise OSError('fixture dispatch directory sync failed')
+                    sync(folder)
+
+                with patch.object(atomic_file, 'sync_folder', new=fail_sync):
+                    change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertTrue(failed)
+                self.assertFalse(any(words in message for _, _, message in self.fixture.messages))
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(sum(words in message for _, _, message in self.fixture.messages), 1)
+
+    def test_recovery_alerts_the_owner_after_a_failed_send_and_completion_write(self) -> None:
+        question = self.file_sent_question()
+        record = self.investigation()
+        for key in (question, f'investigation/{record.owner}/{record.id}'):
+            with self.subTest(key=key):
+                words = f'Keep the feedback for {key}.'
+                delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                path = self.status.path(delivery.page, delivery.row)
+                original_message = delivery.message
+                write = atomic_file.write_bytes_atomic
+                send = change_page.send_to_staff
+                original_sends = 0
+
+                def fail_completion(target: Path, content: bytes, *, mode: int | None = None) -> None:
+                    if target == path and 'verdict' not in json.loads(content):
+                        raise OSError('fixture delivery completion failed')
+                    write(target, content, mode=mode)
+
+                def reject_feedback(recipient: staff.StaffId, sender: str, message: str) -> None:
+                    nonlocal original_sends
+                    if message == original_message:
+                        original_sends += 1
+                        raise RuntimeError('fixture recipient offline')
+                    send(recipient, sender, message)
+
+                with patch.object(change_page, 'send_to_staff', new=reject_feedback):
+                    with patch.object(atomic_file, 'write_bytes_atomic', new=fail_completion):
+                        change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                    sends_before_recovery = original_sends
+                    self.assertGreater(sends_before_recovery, 0)
+                    self.assertFalse(any(words in message for _, _, message in self.fixture.messages))
+                    change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                    change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(original_sends, sends_before_recovery)
+                alerts = [message for _, _, message in self.fixture.messages if words in message]
+                self.assertEqual(len(alerts), 1)
+                self.assertIn('Last error: fixture recipient offline', alerts[0])
+                self.assertIsInstance(self.status.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
+
     def test_recovery_keeps_the_message_when_the_send_result_write_fails(self) -> None:
         record = self.investigation()
         key = f'investigation/{record.owner}/{record.id}'

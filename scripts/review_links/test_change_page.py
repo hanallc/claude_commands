@@ -2099,6 +2099,41 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Keep it", self.messages[0][2])
         self.assertFalse(status.review_save_receipt(delivery.page, delivery.row).exists())
 
+    def test_a_failed_question_log_write_preserves_the_answer_delivery(self) -> None:
+        key = self.file_user_question("Keep the answer if its log fails")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        with patch.object(update_registration, "record_review_log", side_effect=OSError("fixture log write failed")):
+            delivery, answer = change_browser.submit_question(question, "answer", "Keep this answer", status)
+        self.assertEqual(answer, "Keep this answer")
+        self.assertIsInstance(status.slots(delivery.page, delivery.row).verdict, change_page.DeliveryIntent)
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn(answer, self.messages[0][2])
+
+    def test_question_recovery_ignores_read_errors_on_other_questions(self) -> None:
+        key = self.file_user_question("Recover this answer")
+        unrelated_key = self.file_user_question("Leave this question alone")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        questions = {item.key: item for item in change_browser.prepare(browser, status).questions}
+        unrelated = questions[unrelated_key].record.path
+        _ = change_browser.submit_question(questions[key], "answer", "Use this answer", status)
+        open_path = Path.open
+
+        def read(path: Path, mode: Literal["r"] = "r", buffering: int = -1,
+                 encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> TextIO:
+            if path == unrelated:
+                raise OSError("fixture unrelated question read failed")
+            return open_path(path, mode, buffering, encoding, errors, newline)
+
+        with patch.object(Path, "open", new=read):
+            change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn("Use this answer", self.messages[0][2])
+
     def test_question_recovery_keeps_the_receipt_when_the_source_read_fails(self) -> None:
         key = self.file_user_question("Read the saved answer again")
         status = change_page.DeliveryStatus(self.root)
