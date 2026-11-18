@@ -267,7 +267,6 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     from scripts.aws_target.hana_execution import read_claim_execution
     from scripts.build_queue import placement
     from scripts.build_targets import target_config
-    from scripts.lib import conf
     from scripts.mac_test import claim_state, mac_test
     from scripts.build_hold.owning_session import NoOwningSession, OwningSession
     from scripts.buildlog import store
@@ -287,7 +286,6 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     step = classify_step(request.profile, request.constraints)
     if isinstance(step, HanaStepRefused):
         return placement.FreshHostEvidence(key, now, '', placement.FixedExclusion('command'))
-    config = conf.read(transport.settings)
     controller = controller_for(transport, read_only=True)
     snapshot = controller.inspect()
     if isinstance(snapshot, HanaUnprovisioned):
@@ -340,9 +338,8 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     elif snapshot.state == box.Lifecycle.READY and not generation:
         eligibility = placement.TemporaryExclusion('starting')
     elif snapshot.state == box.Lifecycle.IDLE_STOPPED:
-        spending = hana_spend.HanaSpending(ledger.CostLedger(controller.directory), controller.settings_path,
-            hana_spend.read_settings(config))
-        preview = spending.preview_start(int(now), int(now) + config.whole('permit_max_seconds'))
+        preview = hana_spend.preview_placement_start(ledger.CostLedger(controller.directory),
+            controller.settings_path, transport.settings, controller.path)
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,
