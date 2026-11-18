@@ -1250,7 +1250,19 @@ No NixOS or service configuration change is necessary.
 `serve.py [--port PORT]` reads its default port from `server_port`.
 The setting starts at 8765.
 `--port` overrides the setting for one server run.
-The times below describe the initial config values.
+
+Use `--list-fixture FOLDER` to serve a private List from an existing folder.
+The server reads List records from `FOLDER/records` and staff records from `FOLDER/staff.json`.
+Open `/console/list.html` on the fixture port.
+Remove uses the normal List save path in the fixture store.
+The fixture serves only the List page and accepts only Remove.
+The fixture omits counts from other pages.
+It skips message delivery, recovery, snapshot sweeps, and code restarts.
+The server checks the fixture folder before it checks the Tailscale address.
+Fixture requests use the scratch directory lock during file access.
+It exits with status 0 when the folder disappears.
+
+The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
