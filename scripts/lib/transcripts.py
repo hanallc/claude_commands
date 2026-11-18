@@ -1,4 +1,4 @@
-"""Open plain and zstd transcripts through one seekable binary stream."""
+"""Read plain and zstd transcripts."""
 from __future__ import annotations
 
 from collections.abc import Generator, Iterable
@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 
 def uncompressed_path(path: Path) -> Path:
@@ -54,14 +54,38 @@ def distinct_files(paths: Iterable[Path]) -> list[Path]:
     return sorted({path.resolve() for path in paths})
 
 
+def transcript_source(path: Path) -> Path:
+    if path.suffix != ".zst" and not path.exists():
+        compressed = path.with_suffix(path.suffix + ".zst")
+        if compressed.exists():
+            return compressed
+    return path
+
+
+@contextmanager
+def stream_transcript(path: Path) -> Generator[BinaryIO]:
+    """Read the transcript in order without a temporary file."""
+    source = transcript_source(path)
+    with source.open("rb") as stream:
+        if source.suffix != ".zst":
+            yield stream
+            return
+        with subprocess.Popen(["zstd", "-q", "-d", "-c"], stdin=stream, stdout=subprocess.PIPE) as decoder:
+            assert decoder.stdout is not None
+            output = cast(BinaryIO, decoder.stdout)
+            yield output
+            # Check the complete archive even when the caller uses only the first lines.
+            while output.read(65536):
+                pass
+            status = decoder.wait()
+            if status:
+                raise OSError(f"{source}: zstd decompression failed with status {status}")
+
+
 @contextmanager
 def open_transcript(path: Path) -> Generator[BinaryIO]:
     """Keep decompression outside memory and permit existing readers to seek."""
-    source = path
-    if source.suffix != ".zst" and not source.exists():
-        compressed = source.with_suffix(source.suffix + ".zst")
-        if compressed.exists():
-            source = compressed
+    source = transcript_source(path)
     if source.suffix != ".zst":
         with source.open("rb") as stream:
             yield stream
