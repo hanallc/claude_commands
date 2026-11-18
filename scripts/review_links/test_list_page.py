@@ -110,7 +110,7 @@ class ListPageTests(unittest.TestCase):
         _ = self.add("Deploy delta")
         self.browser_bulk_expansion(r'''
  chip('show','needs-me').click();
- chip('owner',OWNER).click();
+ selectOwner(OWNER);
  const words=document.querySelector('#list-search');
  const filtered=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
  words.value='deploy';words.dispatchEvent(new Event('input'));
@@ -128,11 +128,11 @@ class ListPageTests(unittest.TestCase):
         self.browser_bulk_expansion(r'''
  for(const row of rows) row.querySelector('.list-toggle').click();
  check(rows.every(row=>isExpanded(row,true)),'All items start open.');
- chip('owner',OWNER).click();
+ selectOwner(OWNER);
  check(rows.filter(row=>!row.hidden).length===2,'Two items match the owner filter.');
  document.querySelector('[aria-label="Collapse all"]').click();
  for(const row of rows) check(isExpanded(row,row.hidden),'Collapse all leaves hidden items open.');
- chip('owner','all').click();
+ selectOwner('');
  check(rows.find(row=>row.dataset.owner!==OWNER).querySelector('[data-detail]').hidden===false,
   'The hidden item remains open after the filter clears.');
 '''.replace('OWNER', json.dumps(OWNER.id)))
@@ -170,6 +170,9 @@ class ListPageTests(unittest.TestCase):
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const rows=[...document.querySelectorAll('[data-list-item]')];
 const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+value+'"]');
+const selectOwner=value=>{
+ const menu=document.getElementById('list-owner');menu.value=value;menu.dispatchEvent(new Event('change'));
+};
 const isExpanded=(row,expanded)=>row.querySelector('[data-detail]').hidden===!expanded &&
  row.querySelector('.list-toggle').getAttribute('aria-expanded')===String(expanded);
 try{
@@ -624,7 +627,10 @@ frame.addEventListener('load',async()=>{
   const source=row(1),target=row(number),search=doc.querySelector('#list-search');
   const chip=(name,value)=>doc.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
   const selected=name=>doc.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
-  const filters=()=>[selected('owner'),selected('producer'),search.value,selected('state')];
+  const menu=name=>doc.getElementById('list-'+name);
+  const unread=doc.getElementById('list-unread');
+  const setMenu=(name,value)=>{const field=menu(name);field.value=value;field.dispatchEvent(new win.Event('change'));};
+  const filters=()=>[menu('owner').value,menu('producer').value,search.value,unread.checked];
   const pendingWords=scenario==='pending-words' ? 'item' : '';
   const originalFilters=filters();
   if(pendingWords) originalFilters[2]=pendingWords;
@@ -634,7 +640,7 @@ frame.addEventListener('load',async()=>{
    const rect=element.getBoundingClientRect();
    return rect.top>=0 && rect.bottom<=win.innerHeight;
   };
-  const originalShow=scenario==='unread-words' ? 'unread' : 'open';
+  const originalShow='working';
   check(!source.hidden && expanded(source) && selected('show')===originalShow,'the source starts open in the selected view');
   check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator is visible');
   link.scrollIntoView({block:'center'});
@@ -681,7 +687,7 @@ frame.addEventListener('load',async()=>{
   }else{
    const title=target.querySelector('.list-row');
    const fallback=['closed','repeat','producer','open','pending-words','unread-words','proof'].includes(scenario);
-   check(selected('show')===(fallback ? 'all' : 'open'),'the view after the click is '+selected('show'));
+   check(selected('show')===(fallback ? 'all' : 'working'),'the view after the click is '+selected('show'));
    check(!target.hidden && expanded(target),'the target is visible and open');
    check(inView(title),'the target row is outside the viewport at '+title.getBoundingClientRect().top);
    check(title.getAnimations().some(animation=>animation.playState==='running'),'the target row has a short highlight');
@@ -692,9 +698,8 @@ frame.addEventListener('load',async()=>{
    }
   }
   const expected=originalFilters.slice();
-  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='all';
-  if(scenario==='closed') expected[3]='all';
-  if(scenario==='producer') expected[1]='all';
+  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='';
+  if(scenario==='producer') expected[1]='';
   if(['open','unread-words'].includes(scenario) || pendingWords) expected[2]='';
   check(filters().every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters()));
   if(scenario==='repeat'){
@@ -720,7 +725,7 @@ frame.addEventListener('load',async()=>{
     check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
    }
    check(selected('show')===originalShow && !source.hidden && expanded(source),'Back restores the open source');
-   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the former chip selections');
+   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the menus, search and switch.');
    check(!target || !expanded(target),'Back collapses the target row');
    if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
   }
@@ -734,9 +739,9 @@ frame.addEventListener('load',async()=>{
    });
    const changes=[
     ['Show',()=>chip('show','all').click()],
-    ['State',()=>chip('state','all').click()],
-    ['Owner',()=>chip('owner','all').click()],
-    ['Producer',()=>chip('producer','all').click()],
+    ['Unread only',()=>unread.click()],
+    ['Owner',()=>setMenu('owner','')],
+    ['Producer',()=>setMenu('producer','')],
     ['Search',clearSearch],
     ['sort',()=>doc.querySelector('[data-sort]').click()],
    ];
@@ -801,10 +806,10 @@ frame.addEventListener('load',async()=>{
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
                         filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
                         if case in ("open", "closed", "producer", "missing"):
-                            filters.update(owner=OWNER.id, producer=MORTY.id, state="Working", q="linked item")
+                            filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
                         if case == "unread-words":
-                            filters.update(show="unread", q="item")
-                        place = list_page.PAGE_PATH + "?show=open#" + urlencode(filters)
+                            filters.update(unread="1", q="item")
+                        place = list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
                         command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
@@ -1050,7 +1055,7 @@ document.body.append(result);
  await refresh();
  await refresh();
  check(row(1).hidden,'The row stays hidden after both refreshes.');
- show('open');
+ show('working');
  check(!row(1).hidden && !row(1).querySelector('[data-detail]').hidden,'The filter reveals the expanded row.');
  const after=firstVisible(log(1));
  check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
@@ -1175,23 +1180,20 @@ document.body.append(result);
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
         controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
-        self.assertNotIn('<select', controls)
+        self.assertEqual(controls.count('<select'), 2)
         self.assertEqual(controls.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
-                         ['show', 'state', 'owner', 'producer'])
-        for value, label in list_page.SHOWS:
-            self.assertRegex(controls, f'data-filter-value="{value}"[^>]*>{label}<b>')
-        self.assertRegex(controls, f'data-filter-value="{OWNER.id}"[^>]*>sdlc<b>')
-        self.assertRegex(controls, f'data-filter-value="{OTHER.id}"[^>]*>builds<b>')
-        producers = markup.split('data-filter-row="producer"', 1)[1].split('<p data-missing-item', 1)[0]
-        choices: list[tuple[str, str]] = []
-        for match in re.finditer(r'<button\b[^>]*>.*?</button>', producers, re.DOTALL):
-            button = ElementTree.fromstring(match.group())
-            count = button[-1]
-            self.assertEqual(count.tag, 'b')
-            button.remove(count)
-            choices.append((button.attrib["data-filter-value"], ''.join(button.itertext())))
-        self.assertEqual(choices, [('all', 'All'), (DWIGHT.id, 'dwight'), (MORTY.id, 'morty')])
+                         ['show'])
+        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', controls),
+                         [("all", "All"), ("needs-me", "Needs me"), ("morty-answering", "Morty answering"),
+                          ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked"), ("closed", "Closed")])
+        self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
+        owners = controls.split('<select id="list-owner">', 1)[1].split('</select>', 1)[0]
+        self.assertRegex(owners, f'value="{OWNER.id}"[^>]*>sdlc</option>')
+        self.assertRegex(owners, f'value="{OTHER.id}"[^>]*>builds</option>')
+        producers = controls.split('<select id="list-producer">', 1)[1].split('</select>', 1)[0]
+        self.assertEqual(re.findall(r'<option value="([^"]*)"[^>]*>([^<]+)</option>', producers),
+                         [('', 'All'), (DWIGHT.id, 'dwight'), (MORTY.id, 'morty')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 1)
         self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 5)
         self.assertIn(f'data-producer="{DWIGHT.id}"', body)
@@ -1342,9 +1344,9 @@ document.body.append(result);
         for owner in (missing, the_list.UnassignedOwner.NATE, the_list.UnassignedOwner.NOT_RECORDED):
             _ = self.add("Work for " + owner, owner=owner)
         body = list_page.render(self.root / "reviews").decode()
-        owners = body.split('data-filter-row="owner"', 1)[1].split('data-filter-row="producer"', 1)[0]
+        owners = body.split('<select id="list-owner">', 1)[1].split('</select>', 1)[0]
         for label in (str(missing), "nate", "Not recorded"):
-            self.assertIn('>' + label + '<b></b></button>', owners)
+            self.assertIn('>' + label + '</option>', owners)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
 
@@ -1435,10 +1437,12 @@ document.body.append(result);
 const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
 const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')];
-chip('unread').click();
-check(chip('unread').querySelector('b').textContent==='1','the Unread chip counts only the open item');
+const unread=document.getElementById('list-unread');
+unread.click();
+check(chip('all').querySelector('b').textContent==='1','All counts only the unread item when the switch is on.');
 check(visible().map(row=>row.dataset.number).join() === '1','the Unread view shows only the open item');
 check(document.querySelector('[data-list-count]').textContent.endsWith(' · 1 unread'),'the page total counts one unread item');
+unread.click();
 chip('closed').click();
 const closed=visible()[0];
 check(closed?.dataset.number==='2','the closed record remains in Closed');
@@ -1451,6 +1455,87 @@ document.body.append(result);
         self.assertEqual(list_page.waiting_updates(console.NewsRequest(self.root)),
                          frozenset({f"{MORTY.id}/{open_item.id}/{NOW.isoformat()}"}))
         self.assertEqual(list_page.saved_action_state(MORTY.id, closed.id)["unread"], "false")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_status_counts_partition_all_items_with_and_without_unread(self) -> None:
+        for offset in (0, 8):
+            for number, state in enumerate(the_list.ItemState, start=1 + offset):
+                closed = state is the_list.ItemState.CLOSED
+                item = self.add(f"Check {state.value}", the_list.ItemState.WORKING if closed else state, number=number)
+                if offset:
+                    _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="nate")
+                if closed:
+                    _ = the_list.close(MORTY.id, item.id, "The work is complete.", source="nate")
+                elif number in (2, 5, 7, 10, 12, 14):
+                    _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        for number, state in ((17, the_list.ItemState.DELIVERED), (18, the_list.ItemState.WORKING),
+                              (19, the_list.ItemState.WORKING), (20, the_list.ItemState.BLOCKED)):
+            item = self.add("Check the question result", state, number=number)
+            if number == 18:
+                item = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="nate")
+            outcome = question_outcome("refused", "Producer offline") if number == 19 else question_outcome()
+            with (patch.object(change_page, "send_question", return_value=outcome),
+                  patch.object(change_page, "alert_delivery_failures")):
+                list_page.deliver(list_page.submit(root, urlencode(
+                    self.fields(item, "question", words="Which check passed?")), status))
+            if number in (18, 19):
+                _ = the_list.update(MORTY.id, item.id, {"latest_status": "A new check passed."}, source="morty")
+            if number == 20:
+                with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+                      redirect_stdout(io.StringIO())):
+                    self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1",
+                                                    "--text", "The gate passed."]), 0)
+        markup = list_page.render(root, status=status, include_counts=False).decode()
+        controls = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
+        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["20", "2", "3", "2", "3", "6", "4"])
+        probe = '''<script>
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const chips=[...document.querySelectorAll('[data-filter-row="show"] button')];
+const unread=document.getElementById('list-unread');
+const total=document.querySelector('[data-list-count]');
+const entries=[
+ ['all',Array.from({length:20},(_,index)=>index+1),[1,3,4,6,9,11,13,15,18,19,20]],
+ ['needs-me',[4,5],[4]],['morty-answering',[17,18,19],[18,19]],['working',[1,2],[1]],['blocked',[3,7,20],[3,20]],
+ ['parked',[9,10,11,12,13,15],[9,11,13,15]],['closed',[6,8,14,16],[6]],
+];
+const count=button=>Number(button.dataset.filterCount);
+const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
+ .map(row=>Number(row.dataset.number)).sort((a,b)=>a-b);
+for(const onlyUnread of [false,true]){
+ if(unread.checked!==onlyUnread) unread.click();
+ check(count(chips[0])===chips.slice(1).reduce((sum,button)=>sum+count(button),0),'The six counts sum to All.');
+ check(total.textContent.includes(' · '+count(chips[1])+' need you · '),'The total equals the Needs me count.');
+ entries.forEach(([name,all,unreadItems],index)=>{
+  const expected=onlyUnread ? unreadItems : all;
+  const button=chips[index];
+  button.click();
+  check(button.dataset.filterValue===name && count(button)===expected.length && visible().join()===expected.join(),
+   name+' counts and shows its items with Unread only '+(onlyUnread ? 'on' : 'off')+'.');
+ });
+}
+const row=number=>document.querySelector('[data-number="'+number+'"]');
+const expand=number=>row(number).querySelector('.list-toggle').click();
+const detail=number=>row(number).querySelector('[data-detail]:not([hidden])');
+unread.click();
+chips[2].click();
+expand(17);expand(18);expand(19);
+check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]'),
+ 'The unparked item shows the waiting note in Morty answering.');
+check(!row(18).hidden && row(18).dataset.parked==='true' && detail(18)?.querySelector('[data-waiting-note]'),
+ 'The parked item shows the waiting note in Morty answering.');
+check(!row(19).hidden && detail(19)?.querySelector('[value="resend-Q1"]'),
+ 'The failed question stays in Morty answering with Resend.');
+chips[4].click();
+expand(20);
+check(!row(20).hidden && row(20).querySelector('[aria-label="Unread update"]') &&
+ detail(20)?.querySelector('.list-log').textContent.includes('The gate passed.'),
+ 'The answered item returns to Blocked and has an unread answer.');
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+</script>'''
+        self.browser_actions(markup, "", probe)
 
     def test_count_strip_colors_its_showrunner_with_the_page_name_reading(self) -> None:
         members = staff.StaffSnapshot((replace(OWNER, doc=staff.LiveDoc(local_machine(), self.root / "sdlc.md")),))
@@ -1769,7 +1854,7 @@ window.fetch=async(_path,options={})=>{
     ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','54']]){
    await choose('all',query);check(visible()===expected,'words filter: '+query);
   }
-  await choose('open','106');row('106').querySelector('.list-toggle').click();
+  await choose('working','106');row('106').querySelector('.list-toggle').click();
   const removed=submit('106','remove');
   check(row('106').hidden,'Remove hides the row before the response');
   check(row('106').dataset.unread==='false' && !row('106').querySelector('.list-dot') &&
@@ -1777,10 +1862,10 @@ window.fetch=async(_path,options={})=>{
   check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
-  check(row('106').hidden,'Remove stays outside Open after success');
+  check(row('106').hidden,'Remove stays outside Working after success');
   await choose('closed','106');check(visible()==='106','Remove updates the Closed view');
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
-  await choose('open','105');row('105').querySelector('.list-toggle').click();
+  await choose('working','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
   finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
@@ -1791,10 +1876,10 @@ window.fetch=async(_path,options={})=>{
   refused.elements.until.value='2026-12-03';const parked=submit('105','park');
   check(row('105').hidden,'Park hides the row before the response');
   check(document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
-   'Park animates the row when it leaves Open');
+   'Park animates the row when it leaves Working');
   submit('105','park');check(requests.length===3,'a second Park press sends nothing');
   finishPost({item_state:'Working',parked:'true'});await flush();await flush();
-  check(row('105').hidden,'Park stays outside Open after success');
+  check(row('105').hidden,'Park stays outside Working after success');
   await choose('parked','105');check(visible()==='105','Park updates the Parked view');
   check(parked.querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
   await choose('all','58');row('58').querySelector('.list-toggle').click();
@@ -1805,7 +1890,7 @@ window.fetch=async(_path,options={})=>{
   check(row('58').dataset.unread==='true' && row('58').querySelector('.list-dot'),'an unread response restores the dot');
   check(Boolean(form.querySelector('[value="read"]')),'an unread response restores Mark read');
   if(form.querySelector('[value="read"]')){
-   await choose('unread','58');
+   document.getElementById('list-unread').click();
    submit('58','read');finishPost({item_state:'Waiting for nate',parked:'false',unread:'false'});await flush();await flush();
    check(!row('58').querySelector('.list-dot') && !form.querySelector('[value="read"]'),'the restored Mark read button works');
    check(row('58').hidden && document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
@@ -1888,9 +1973,10 @@ window.fetch=async(_path,options={})=>{
  const toggle=form.querySelector('[data-later-toggle]');
  toggle.click();
  const time=form.querySelector('[data-later-time]');
+ show('working');
  time.focus();
  time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
- check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Open');
+ check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Working');
  finishPost({reason:'The fixture refuses Park'});
  await flush();
  for(const animation of document.getAnimations()) animation.finish();
@@ -1937,9 +2023,10 @@ window.fetch=async(_path,options={})=>{
  Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
  form.querySelector('[data-later-toggle]').click();
  const time=form.querySelector('[data-later-time]');
+ show('working');
  time.focus();
  time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
- check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Open');
+ check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Working');
  finishPost({reason:'The fixture refuses Park'});
  await flush();
  const search=document.getElementById('list-search');
@@ -2053,8 +2140,8 @@ window.fetch=async(_path,options={})=>{
  check(unpark.hidden && form.querySelector('[data-parked-detail]').hidden,'the parking controls update');
  check(form.elements.until.value==='' && form.elements.words.value==='Keep these words.',
        'Unpark clears the parking draft and keeps the words');
- show('open');
- check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Open shows the expanded unparked row');
+ show('working');
+ check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Working shows the expanded unparked row');
 """, reduced_motion=True, add_item=False, window_size=(1440, 1120))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -2592,7 +2679,7 @@ observer.observe(original.parentNode,{childList:true});
                 self.assertEqual(list_page.saved_action_state(MORTY.id, second.id, status=recovering)["waiting_for_answer"], "true")
                 markup = list_page.render(root, include_counts=False, status=recovering).decode().split('<script>', 1)[0]
                 self.assertIn('Question Q1 may not have reached morty', markup)
-                self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root), status=recovering)), 1)
+                self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 2)
             return transport.send(recipient, message, message_id)
 
         with (patch.object(change_page, "publish_question_attempt", side_effect=fail_first_result),
@@ -2901,7 +2988,7 @@ observer.observe(original.parentNode,{childList:true});
         self.assertIn("Question Q4 may not have reached morty", body)
         for identity in ("Q1", "Q2", "Q3", "Q4"):
             self.assertEqual(f'value="resend-{identity}"' in body, identity in ("Q3", "Q4"))
-        self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root), status=reopened)), 1)
+        self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 1)
         self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["unread"], "true")
         current = the_list.load(MORTY.id, item.id)
         fields = self.fields(current, "resend-Q4")
@@ -2911,7 +2998,7 @@ observer.observe(original.parentNode,{childList:true});
             send.assert_called_once()
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_hides_a_saved_ask_from_all_views_and_counts(self) -> None:
+    def test_browser_moves_a_saved_question_to_morty_answering(self) -> None:
         _ = self.add("Only this row matches the search", the_list.ItemState.WAITING_FOR_NATE, number=1)
         _ = self.add("Other item", number=2, owner=OTHER.id)
         self.browser_action_sequence(r"""
@@ -2925,28 +3012,30 @@ observer.observe(original.parentNode,{childList:true});
  form.elements.words.value='Which check passed?';
  submit('question');
  check(!row.hidden,'The row stays in All until the save succeeds');
- finishPost({unread:'false',waiting_for_answer:'true'});await flush();
- check(row.hidden,'The saved row leaves All');
- check(changes.join()==='POST','The row leaves without a refresh');
- check(count.textContent==='1 of 1 items shown · 0 need you · 1 unread','All totals exclude the saved row');
- const chip=(group,value)=>[...document.querySelectorAll('[data-filter-row="'+group+'"] button')]
-  .find(button=>button.dataset.filterValue===value);
- for(const [group,value] of [['show','needs-me'],['state','Waiting for nate'],['owner',row.dataset.owner]])
-  check(chip(group,value).dataset.filterCount==='0',group+' excludes the saved row');
- check(chip('producer',row.dataset.producer).dataset.filterCount==='1','Producer excludes the saved row');
- for(const view of ['open','needs-me','unread','done','parked','closed','all']){
+ finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ check(!row.hidden,'The saved row stays in All.');
+ check(row.querySelector('[data-open-question-note]').getClientRects().length &&
+  row.querySelector('.list-state').textContent==='Waiting for nate','The note appears below the saved state.');
+ check(changes.join()==='POST','The chip changes without a refresh.');
+ check(count.textContent==='2 of 2 items shown · 0 need you · 1 unread','All counts the saved row.');
+ const needsMe=document.getElementById('filter-show-needs-me');
+ const option=(menu,value)=>[...document.getElementById('list-'+menu).options].find(choice=>choice.value===value);
+ check(needsMe.dataset.filterCount==='0' && option('owner',row.dataset.owner).dataset.filterCount==='1',
+  'Needs me excludes the saved row and Owner includes it.');
+ check(option('producer',row.dataset.producer).dataset.filterCount==='2','Producer counts the saved row.');
+ for(const view of ['needs-me','blocked','parked','closed','working']){
   show(view);check(row.hidden,view+' hides the saved row');
  }
- const target=location.pathname+'#item='+encodeURIComponent(row.dataset.key);
- location.hash=target.slice(target.indexOf('#'));
+ location.hash=new URLSearchParams({show:'working',item:row.dataset.key}).toString();
  await flush();
- check(!row.hidden && !row.querySelector('[data-detail]').hidden &&
+ check(!row.hidden && row.closest('[data-linked-item]:not([hidden])') && !row.querySelector('[data-detail]').hidden &&
   row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
   !row.querySelector('[value="question"]'),'A direct link opens only the waiting row without Ask');
- check(count.textContent.startsWith('1 of 1'),'Direct links do not count the waiting row');
+ check(count.textContent.startsWith('1 of 2'),'The linked row counts in All and stays outside Working.');
+ show('morty-answering');
  input.value='Only this row';input.dispatchEvent(new Event('input'));
  await new Promise(resolve=>setTimeout(resolve,150));
- check(row.hidden && count.textContent.startsWith('0 of 1'),'Search excludes the waiting row');
+ check(!row.hidden && count.textContent.startsWith('1 of 2'),'Search finds the waiting row in Morty answering.');
 """, reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -2961,7 +3050,7 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden && chip.dataset.filterCount==='1','Parked includes the item before the question.');
  unpark.focus();
  submit('unpark');
- finishPost({parked:'true',waiting_for_answer:'true',unpark_outcome:'cleared_newer_parking_active'});
+ finishPost({parked:'true',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared_newer_parking_active'});
  await flush();
  check(row.hidden && chip.dataset.filterCount==='0','The waiting item leaves Parked and its count.');
  check(document.activeElement===chip,'The Parked filter receives focus.');
@@ -2974,13 +3063,16 @@ observer.observe(original.parentNode,{childList:true});
   !row.querySelector('form'),'The direct link opens the item with only the waiting line.');
  check(chip.dataset.filterCount==='0' && !status.hidden,
   'The direct link leaves the item out of the count and keeps the Unpark confirmation.');
+ show('morty-answering');
+ check(!row.hidden && !status.hidden,'Morty answering keeps the Unpark confirmation.');
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_open_row_and_shows_the_refusal_after_a_lost_remove(self) -> None:
         self.browser_action_sequence('''
+ show('working');
  const remove=submit('remove');
- check(row.hidden,'Remove immediately hides the row in Open');
+ check(row.hidden,'Remove immediately hides the row in Working');
  losePost();await flush();
  show('closed');
  check(!row.hidden,'the unconfirmed row appears in Closed');
@@ -2990,8 +3082,8 @@ observer.observe(original.parentNode,{childList:true});
  check(row.hidden && hiddenStatus.getClientRects().length>0 &&
   hiddenStatus.textContent==='Item 1: Not saved: Fixture refuses Remove',
   'the refusal is visible when the Closed filter hides the restored row');
- show('open');
- check(!row.hidden && row.dataset.state==='Working','the refusal restores the confirmed row to Open');
+ show('working');
+ check(!row.hidden && row.dataset.state==='Working','the refusal restores the confirmed row to Working');
  const notice=form.querySelector('[data-send-status]');
  check(notice.getClientRects().length>0 && notice.textContent==='Not saved: Fixture refuses Remove',
   'the refusal is visible on the restored row');
@@ -3023,6 +3115,7 @@ observer.observe(original.parentNode,{childList:true});
         with patch.object(the_list, "now", return_value=NOW - timedelta(minutes=1)):
             _ = self.add("An older unread update", number=2)
         self.browser_action_sequence(r"""
+ show('working');
  const sort=document.querySelector('[data-sort="7"]');sort.click();sort.click();
  const first=()=>document.querySelector('[data-list-item]:not([hidden])').dataset.number;
  const animation=()=>document.querySelector('[data-record-motion]')?.getAnimations({subtree:true})[0];
@@ -3043,20 +3136,44 @@ observer.observe(original.parentNode,{childList:true});
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_closed_response_clears_unread_without_a_sort_key(self) -> None:
+    def test_browser_closed_response_clears_unread_when_the_server_reports_read(self) -> None:
         self.browser_action_sequence(r"""
  show('all');
  const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
  check(updateKey()>0 && row.querySelector('.list-dot'),'the item starts unread');
  submit('remove');
- finishPost({item_state:'Closed',unread:'true'});await flush();
+ finishPost({item_state:'Closed',unread:'false'});await flush();
  check(row.dataset.state==='Closed' && row.dataset.unread==='false','the Closed item is read');
  check(updateKey()===0,'the Closed item has a zero Update key');
  check(!row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
   'the Closed item has no unread controls');
- show('unread');
+ onlyUnread();
  check(row.hidden,'the Closed item stays out of Unread');
 """)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_shows_unread_answer_on_a_closed_item(self) -> None:
+        item = self.add("Check the result after closure", number=1)
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            list_page.deliver(list_page.submit(root, urlencode(
+                self.fields(item, "question", words="Which check passed?")), status))
+        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1",
+                                            "--text", "The gate passed."]), 0)
+        self.browser_action_sequence(r"""
+ show('closed');onlyUnread();
+ check(!row.hidden && row.querySelector('.list-dot') && form.querySelector('[value="read"]'),
+  'Closed with Unread only shows the answer and Mark read.');
+ check(document.getElementById('filter-show-closed').dataset.filterCount==='1' &&
+  !row.querySelector('[data-open-question-note]'),'The answer counts in Closed and clears the question note.');
+ submit('read');finishPost({item_state:'Closed',unread:'false',open_question:'false'});await flush();
+ check(row.hidden && document.getElementById('filter-show-closed').dataset.filterCount==='0',
+  'Mark read removes the item from Unread only.');
+""", add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_refusal_restores_unread_after_a_lost_remove(self) -> None:
@@ -3068,7 +3185,7 @@ observer.observe(original.parentNode,{childList:true});
  form.elements.until.value='2026-12-03';
  submit('park');
  finishPost({reason:'Fixture refuses Park'});await flush();
- show('unread');
+ show('all');onlyUnread();
  check(!row.hidden && row.dataset.state==='Working','the refusal returns the Working row to Unread');
  check(row.querySelector('.list-dot') && form.querySelector('[value="read"]'),
   'the refusal restores the unread controls');
@@ -3081,6 +3198,7 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence(r"""
  document.querySelector('[data-sort="0"]').click();
  const next=document.querySelector('[data-number="2"]');
+ show('working');
  const top=element=>element.getBoundingClientRect().top;
  const start=top(next),first=top(row);
  const motion=()=>document.querySelector('[data-record-motion]');
@@ -3120,6 +3238,7 @@ observer.observe(original.parentNode,{childList:true});
         for reduced_motion in (False, True):
             with self.subTest(reduced_motion=reduced_motion):
                 self.browser_action_sequence(r"""
+ show('working');
  const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
  check(reduced===EXPECTED_REDUCTION,'the browser uses the selected motion preference');
  submit('remove');
@@ -3137,7 +3256,7 @@ observer.observe(original.parentNode,{childList:true});
         item = self.add("Check the unread update", number=1)
         _ = the_list.update(MORTY.id, item.id, {"latest_status": "An update is ready."}, source="morty")
         self.browser_action_sequence(r"""
- show('unread');
+ onlyUnread();
  const motion=()=>document.querySelector('[data-record-motion]')?.getAnimations({subtree:true})[0];
  const read=submit('read'),firstExit=motion();
  check(row.hidden && firstExit,'Mark read starts the fade before the response');
@@ -3161,29 +3280,30 @@ observer.observe(original.parentNode,{childList:true});
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_ask_leaves_unread_and_clears_the_dot_after_saving(self) -> None:
         self.browser_action_sequence(r"""
- show('unread');
+ onlyUnread();
  check(!row.hidden && row.querySelector('.list-dot'),'the item starts unread');
  form.elements.words.value='Which check passed?';
  form.elements.words.dispatchEvent(new Event('input'));
  submit('question');
  check(row.hidden,'Ask question starts the fade before the response in Unread');
- finishPost({unread:'false',waiting_for_answer:'true'});await flush();
+ finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
  check(row.hidden && row.dataset.unread==='false','the saved question keeps the row outside Unread');
- show('open');
+ onlyUnread(false);show('working');
  check(row.hidden && row.dataset.unread==='false' && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
-  'the saved question also keeps the row outside Open with unread cleared');
+  'The saved question also keeps the row outside Working with unread cleared.');
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_moves_question_focus_only_when_the_submitted_row_had_focus(self) -> None:
         _ = self.add("The question item", number=1)
         _ = self.add("The next item", number=2, owner=OTHER.id)
-        for destination in ("next row", "empty view", "user selection"):
+        for destination in ("next row", "empty view", "user selection", "same row"):
             with self.subTest(destination=destination):
                 self.browser_action_sequence("const destination=" + json.dumps(destination) + r""";
  const search=document.getElementById('list-search');
  const next=document.querySelector('[data-number="2"] .list-toggle');
  const all=document.querySelector('[data-filter-row="show"] [data-filter-value="all"]');
+ if(destination!=='same row') show('working');
  if(destination==='empty view'){
   search.value='The question item';
   search.dispatchEvent(new CustomEvent('filterchange',{detail:search.value}));
@@ -3193,8 +3313,9 @@ observer.observe(original.parentNode,{childList:true});
  form.querySelector('[value="question"]').focus();
  submit('question');
  if(destination==='user selection') all.focus();
- finishPost({unread:'false',waiting_for_answer:'true'});await flush();
- const expected=destination==='next row' ? next : destination==='empty view' ? search : all;
+ finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ const expected=destination==='same row' ? row.querySelector('.list-toggle') :
+  destination==='next row' ? next : destination==='empty view' ? search : all;
  check(document.activeElement===expected,'The browser keeps focus at '+destination);
 """, add_item=False, reduced_motion=True)
 
@@ -3210,24 +3331,49 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence(r"""
  const search=document.getElementById('list-search');
  const target=document.querySelector('[data-number="2"]');
- const owner=[...document.querySelectorAll('[data-filter-row="owner"] button')]
-  .find(button=>button.dataset.filterValue===row.dataset.owner);
- owner.click();
+ const owner=document.getElementById('list-owner');
+ show('working');
+ owner.value=row.dataset.owner;owner.dispatchEvent(new Event('change'));
  search.value='check';search.dispatchEvent(new CustomEvent('filterchange',{detail:search.value}));
- check(target.hidden,'The waiting item stays out of Open');
+ check(target.hidden,'The waiting item stays out of Working.');
  row.querySelector('a[data-record-jump]').click();
  const place=new URLSearchParams(location.hash.slice(1));
- check(!target.hidden && !target.querySelector('[data-detail]').hidden,'The related link reveals its waiting item');
- check(place.get('show')==='open' && place.get('owner')===row.dataset.owner && search.value==='check',
+ check(!target.hidden && target.closest('[data-linked-item]:not([hidden])') &&
+  !target.querySelector('[data-detail]').hidden,'The related link opens the waiting item outside the results.');
+ check(place.get('show')==='working' && place.get('owner')===row.dataset.owner && search.value==='check',
   'The related link keeps Show, Owner and the search');
- check(document.querySelector('[data-list-count]').textContent.startsWith('1 of 1'),
-  'The linked waiting row stays outside the totals');
+ const results=document.querySelector('table[aria-label="The List"]');
+ check(results.querySelectorAll('[data-list-item]:not([hidden])').length===1 &&
+  document.querySelector('[data-list-count]').textContent.startsWith('1 of 2'),
+  'The linked waiting row counts in All and stays outside Working.');
+""", add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_direct_link_keeps_a_read_item_outside_unread_results(self) -> None:
+        _ = self.add("The unread item", number=1)
+        target = self.add("The read item", number=2)
+        _ = the_list.mark_read(MORTY.id, target.id, source="nate")
+        self.browser_action_sequence(r"""
+ const target=document.querySelector('[data-number="2"]');
+ const results=document.querySelector('table[aria-label="The List"]');
+ const section=document.querySelector('[data-linked-item]');
+ const count=document.querySelector('[data-list-count]');
+ const unread=document.getElementById('list-unread');
+ location.hash=new URLSearchParams({show:'all',unread:'1',item:target.dataset.key}).toString();
+ await flush();
+ check(unread.checked && results.querySelectorAll('[data-list-item]:not([hidden])').length===1 &&
+  count.textContent.startsWith('1 of 2'),'Unread only keeps one row in the results.');
+ check(!section.hidden && section.contains(target) && !target.hidden && !target.querySelector('[data-detail]').hidden,
+  'The direct link opens the read item outside the results.');
+ onlyUnread(false);
+ check(section.hidden && results.contains(target) && !target.hidden && count.textContent.startsWith('2 of 2'),
+  'The read item rejoins the results when Unread only is off.');
 """, add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_ask_focus_after_a_failed_post(self) -> None:
         self.browser_action_sequence(r"""
- show('unread');
+ onlyUnread();
  const ask=form.querySelector('[value="question"]'),input=form.elements.words;
  input.value='Which check passed?';input.dispatchEvent(new Event('input'));
  ask.focus();
@@ -3250,7 +3396,7 @@ observer.observe(original.parentNode,{childList:true});
         for user_selects_search in (False, True):
             with self.subTest(user_selects_search=user_selects_search):
                 self.browser_action_sequence(r"""
- show('unread');
+ onlyUnread();
  const ask=form.querySelector('[value="question"]'),input=form.elements.words;
  input.value='Which check passed?';input.dispatchEvent(new Event('input'));
  ask.focus();
@@ -3300,7 +3446,7 @@ observer.observe(original.parentNode,{childList:true});
         _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
         _ = self.add("The next unread item", number=2)
         self.browser_action_sequence(r"""
- show('unread');
+ onlyUnread();
  check(!row.hidden && form.querySelector('[value="resend-Q1"]'),'Unread shows the item with a failed question');
  const snapshot=document.documentElement.cloneNode(true);
  snapshot.querySelector('[data-number="1"]').dataset.unread='false';
@@ -3360,7 +3506,7 @@ observer.observe(original.parentNode,{childList:true});
         _ = self.add("The first unread item", number=1)
         _ = self.add("The second unread item", number=2)
         self.browser_action_sequence(r"""
- show('unread');
+ onlyUnread();
  const second=document.querySelector('[data-number="2"]');
  second.querySelector('.list-toggle').click();
  function ask(target){
@@ -3376,7 +3522,7 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden && !row.querySelector('.list-toggle').getClientRects().length,
   'The first row returns but its animation still hides its toggle');
  returning.pause();
- finishPost({unread:'false',waiting_for_answer:'true'});await flush();
+ finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
  check(document.activeElement===document.getElementById('list-search'),
   'Search receives focus because neither row has an available toggle');
  returning.finish();
@@ -3395,8 +3541,8 @@ observer.observe(original.parentNode,{childList:true});
  submit('question');
  nav.focus();
  check(!document.hasFocus() && parent.document.activeElement===nav,'The user focuses the console during the request');
- finishPost({unread:'false',waiting_for_answer:'true'});await flush();
- check(row.hidden,'The successful POST hides the row');
+ finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ check(!row.hidden,'The saved question stays in All.');
  check(parent.document.activeElement===nav,'The response preserves the console focus');
 """, add_item=False, reduced_motion=True, in_frame=True)
 
@@ -3409,9 +3555,9 @@ observer.observe(original.parentNode,{childList:true});
         probe = b"""<!doctype html><iframe></iframe><img hidden src="/complete"><script>
 const frame=document.querySelector('iframe'), errors=[];
 const check=(ok,message)=>{if(!ok) errors.push(message);};
-const open=(show,key='')=>new Promise(resolve=>{
+const open=(show,key='',unread='')=>new Promise(resolve=>{
  frame.onload=resolve;
- frame.src='LIST_PATH?fixture='+show+'#'+new URLSearchParams({show,...(key ? {item:key} : {})});
+ frame.src='LIST_PATH?fixture='+show+'#'+new URLSearchParams({show,unread,...(key ? {item:key} : {})});
 });
 const row=()=>frame.contentDocument.querySelector('[data-list-item]');
 const hasDot=()=>Boolean(row().querySelector('.list-dot'));
@@ -3441,26 +3587,30 @@ const change=async path=>{
 };
 (async()=>{
  try{
-  await open('unread');
+  await open('all','','1');
   check(!row().hidden && hasDot(),'the item starts in Unread');
   check(await ask('Which check passed?')==='Question saved','the first question saves');
   check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
   const key=row().dataset.key;
-  await open('open');
-  check(row().hidden,'a saved question stays out of Open after a page load');
+  await open('working');
+  check(row().hidden && !row().querySelector('[data-open-question-note]').hidden,
+   'The saved question has its note and stays out of Working.');
   await open('all',key);
   check(!row().hidden && !row().querySelector('[data-detail]').hidden &&
    row().querySelector('[data-waiting-note]')?.textContent==='The producer will answer.' &&
    !row().querySelector('[value="question"]'),'a direct link shows the waiting line without Ask');
   await change('/answer');
-  await open('unread');
+  await open('working','','1');
   check(!row().hidden && hasDot() && row().querySelector('.list-log').textContent.includes('Which check passed?') &&
-   row().querySelector('.list-log').textContent.includes('The gate passed.'),
-   'the answer returns the item to Unread with the question and answer in the log');
+   row().querySelector('.list-log').textContent.includes('The gate passed.') &&
+   !row().querySelector('[data-open-question-note]'),
+   'The answer returns the item to Working with the unread answer in the log.');
   await change('/newer');
   check(await ask('Which check is next?')==='Question saved; update remains unread',
    'the notice says the newer update remains unread');
-  check(hasDot() && row().hidden,'the newer update stays unread while the question hides the row');
+  check(hasDot() && row().hidden,'The unread item leaves Working after the question saves.');
+  frame.contentDocument.getElementById('filter-show-morty-answering').click();
+  check(hasDot() && !row().hidden,'Morty answering shows the unread item.');
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
@@ -3548,6 +3698,7 @@ window.fetch=async(_path,options={})=>{
   return {id:request.get('request'),token:request.get('token')};
  };
  const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
+ const onlyUnread=(on=true)=>{const control=document.getElementById('list-unread');if(control.checked!==on) control.click();};
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  try{
   row.querySelector('.list-toggle').click();
@@ -3785,7 +3936,7 @@ window.fetch=async(_path,options={})=>{
         probe = '''<script>
 (async()=>{
  const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
- document.querySelector('[data-filter-row="show"] [data-filter-value="unread"]').click();
+ document.getElementById('list-unread').click();
  const before=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
  form.requestSubmit(form.querySelector('[value="ACTION"]'));
@@ -3996,10 +4147,14 @@ const until=async (ready,label)=>{
 };
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
-const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
-const select=(name,value)=>chip(name,value).click();
-const selectedChip=name=>document.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
-const count=(name,value)=>Number(chip(name,value).querySelector('b').textContent);
+const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+const show=value=>chip(value).click();
+const selectedShow=()=>document.querySelector('[data-filter-row="show"] [aria-pressed="true"]').dataset.filterValue;
+const menu=name=>document.getElementById('list-'+name);
+const select=(name,value)=>{const field=menu(name);field.value=value;field.dispatchEvent(new Event('change'));};
+const count=value=>Number(chip(value).querySelector('b').textContent);
+const menuCount=(name,value)=>Number([...menu(name).options].find(option=>option.value===value).dataset.filterCount);
+const unread=()=>document.getElementById('list-unread');
 const bulk=action=>document.querySelector('.list-table-tools [data-list-expansion="'+action+'"]');
 const search=value=>new Promise(done=>{
  const field=document.getElementById('list-search');
@@ -4018,7 +4173,7 @@ try{
  check(near(expand.left,bounds(table).left) && near(shown.right,bounds(table).right) &&
        near(center(expand),center(collapse)) && near(center(expand),center(shown)) && expand.right<collapse.left,
        'The two buttons and the right-aligned count share one row.');
- check(countLine.textContent.startsWith('3 of 6 items shown') && countLine.getAttribute('role')==='status',
+ check(countLine.textContent.startsWith('6 of 6 items shown') && countLine.getAttribute('role')==='status',
        'The count in the row reports the visible items.');
  for(const action of ['expand','collapse']){
   const button=bulk(action),box=bounds(button),icon=bounds(button.querySelector('svg'));
@@ -4041,28 +4196,29 @@ try{
    check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
   }
  }
- check(visible().map(row=>row.dataset.number).join(',')==='58,105,106','the default order and Open filter');
+ check(visible().map(row=>row.dataset.number).join(',')==='58,105,106,41,63,54','The default order in All.');
  document.querySelector('[data-sort="0"]').click();
- check(visible().map(row=>row.dataset.number).join(',')==='58,105,106','the number sort is numeric');
+ check(visible().map(row=>row.dataset.number).join(',')==='41,54,58,63,105,106','the number sort is numeric');
  document.querySelector('[data-sort="0"]').click();
- check(visible().map(row=>row.dataset.number).join(',')==='106,105,58','a second click reverses the sort');
+ check(visible().map(row=>row.dataset.number).join(',')==='106,105,63,58,54,41','a second click reverses the sort');
  for(let column=1;column<8;column++){
   document.querySelector('[data-sort="'+column+'"]').click();
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
  }
- select('show','needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
- select('show','unread');
+ show('needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
+ show('all');unread().click();
  check(visible().map(row=>row.dataset.number).sort().join() === '105,106,41,63','Unread excludes the closed item');
- select('show','done');check(visible().length===1 && visible()[0].dataset.number==='63','Done');
- select('show','parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
- select('show','closed');check(visible().length===1 && visible()[0].dataset.number==='54','Closed');
- select('show','all');check(visible().length===6,'All');
- select('show','open');
- const showRow=chip('show','open').closest('[data-filter-row]');
+ unread().click();
+ show('parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
+ show('closed');
+ check(visible().map(row=>row.dataset.number).sort().join()==='54,63','Closed includes Done and Closed.');
+ show('all');check(visible().length===6,'All');
+ show('working');
+ const showRow=chip('working').closest('[data-filter-row]');
  const showValues=filterControl.buttons(showRow).map(button=>button.dataset.filterValue);
- filterControl.setVisible(showRow,showValues.filter(value=>value!=='open'));
+ filterControl.setVisible(showRow,showValues.filter(value=>value!=='working'));
  dispatchEvent(new PopStateEvent('popstate'));
- check(selectedChip('show')==='all' && visible().length===6,'hiding Open selects All and shows all six items');
+ check(selectedShow()==='all' && visible().length===6,'Hiding Working selects All and shows all six items.');
  check(new URLSearchParams(location.hash.slice(1)).get('show')==='all','the address records the fallback to All');
  filterControl.setVisible(showRow,showValues);
  const theme=document.documentElement.dataset.theme;
@@ -4075,51 +4231,53 @@ try{
   });
   return .2126*r+.7152*g+.0722*b;
  };
- select('show','open');select('owner',OWNER);select('producer',MORTY);
- check(Boolean(chip('owner',OWNER).querySelector('.staff-name')) &&
-  Boolean(chip('producer',MORTY).querySelector('.staff-name')),'the contrast case includes staff labels');
+ show('working');select('owner',OWNER);select('producer',MORTY);
+ check(menu('owner').selectedOptions[0].textContent.startsWith('sdlc (') &&
+  menu('producer').selectedOptions[0].textContent.startsWith('morty ('),'The menus show the selected names and counts.');
  for(const themeName of ['light','dark']){
   document.documentElement.dataset.theme=themeName;
-  for(const state of ['Working','Done']){
-   select('state',state);
-   for(const button of document.querySelectorAll('[data-filter-row] button[aria-pressed="true"]')){
-    const background=luminance(getComputedStyle(button).backgroundColor);
-    for(const element of [button,...button.querySelectorAll('b,.staff-name')]){
+  for(const view of ['working','blocked']){
+   show(view);
+   for(const control of [chip(view),menu('owner'),menu('producer')]){
+    const background=luminance(getComputedStyle(control).backgroundColor);
+    for(const element of [control,...control.querySelectorAll('b')]){
      const ink=luminance(getComputedStyle(element).color);
      const contrast=(Math.max(ink,background)+.05)/(Math.min(ink,background)+.05);
-     check(getComputedStyle(button).opacity==='1' && contrast>=4.5,
-      themeName+' contrast for '+button.textContent+': '+contrast);
+     check(getComputedStyle(control).opacity==='1' && contrast>=4.5,
+      themeName+' contrast for '+control.textContent+': '+contrast);
     }
    }
   }
  }
  if(theme===undefined) delete document.documentElement.dataset.theme;
  else document.documentElement.dataset.theme=theme;
- select('state','all');select('producer','all');select('owner','all');select('show','all');
+ select('producer','');select('owner','');show('all');
  select('owner',OWNER);check(visible().length===5,'Owner');
- select('owner','all');
+ select('owner','');
  select('producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
  check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'the address keeps the producer');
- select('producer','all');
+ select('producer','');
  check(visible().length===6 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
- for(const name of ['show','state','owner','producer'])
-  check(document.querySelector('[data-filter-row="'+name+'"] button').dataset.filterValue==='all',name+' starts with All');
- select('show','open');select('state','Working');
- check(visible().length===2 && count('state','Waiting for nate')===1 && count('state','Done')===0,
-  'State filters within Open, and each State count follows Show');
- const zero=chip('state','Done'),zeroPosition=zero.getBoundingClientRect();
+ check(showRow.querySelector('button').dataset.filterValue==='all' &&
+  menu('owner').options[0].value==='' && menu('producer').options[0].value==='','Each filter starts with All.');
+ show('working');
+ check(visible().length===2 && count('working')===2 && count('blocked')===0,
+  'Working shows both matching records. Blocked counts zero.');
+ const zero=chip('blocked'),zeroPosition=zero.getBoundingClientRect();
  check(!zero.hidden && !zero.disabled && Number(getComputedStyle(zero).opacity)<1 && zeroPosition.width>0,
   'a zero chip stays in the row, dimmed and enabled');
- select('state','Done');check(visible().length===0 && count('show','done')===1,'a zero chip can select an empty view');
- select('show','done');check(visible().map(row=>row.dataset.number).join(',')==='63','Done Show and Done State match together');
- select('show','all');select('state','Working');select('owner',OWNER);select('producer',DWIGHT);
- check(visible().length===0 && count('owner','all')===1 && count('producer','all')===1 && count('state','all')===0,
-  'each count ignores only its own row');
- select('producer','all');await search('console');
- check(visible().map(row=>row.dataset.number).join(',')==='106' && count('show','open')===1 &&
-  count('producer',DWIGHT)===0 && count('owner','all')===2,'the words box and all four rows combine');
+ show('blocked');
+ check(visible().length===0 && count('working')===2,'Selecting a zero chip keeps the other status counts.');
+ show('closed');
+ check(visible().map(row=>row.dataset.number).sort().join()==='54,63','Closed replaces the Blocked selection.');
+ show('working');select('owner',OWNER);select('producer',DWIGHT);
+ check(visible().length===0 && menuCount('owner','')===1 && menuCount('producer','')===1 && count('all')===0,
+  'Each count ignores only its own filter.');
+ select('producer','');await search('console');
+ check(visible().map(row=>row.dataset.number).join(',')==='106' && count('working')===1 &&
+  menuCount('producer',DWIGHT)===0 && menuCount('owner','')===2,'The search, menus and status chip combine.');
  check(zero.getBoundingClientRect().left===zeroPosition.left,'a zero chip retains its place');
- await search('');select('state','all');select('owner','all');
+ await search('');show('all');select('owner','');
  await search('#106');
  check(visible().length===1 && visible()[0].dataset.number==='106','number search');
  await search('console');check(visible().length===2,'title search');
@@ -4210,25 +4368,28 @@ try{
  await flush();await flush();await flush();await flush();
  realFeedback=false;failRefresh=true;
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
- check(visible().length===1 && visible()[0].dataset.number==='54','hash navigation restores the filters');
+ check(visible().map(row=>row.dataset.number).join(',')==='63,54','Hash navigation restores Closed and the sort order.');
+ location.hash=new URLSearchParams({show:'done'});await flush();
+ check(selectedShow()==='closed' && visible().map(row=>row.dataset.number).sort().join()==='54,63',
+  'An old Done address opens Closed.');
  location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
- check(selectedChip('producer')===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
+ check(menu('producer').value===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
- check(selectedChip('producer')==='all' && visible().length===6,'an unknown producer shows all items');
+ check(menu('producer').value==='' && visible().length===6,'an unknown producer shows all items');
  location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
- check(selectedChip('state')==='Working' && selectedChip('owner')===OWNER && selectedChip('show')==='unread' &&
-  visible().map(row=>row.dataset.number).join(',')==='106','an address restores Show, State, Owner and words together');
+ check(selectedShow()==='working' && menu('owner').value===OWNER && unread().checked &&
+  visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Working chip, switch, menu and search.');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
-  check(selectedChip('show')==='all' && selectedChip('owner')==='all' &&
-    selectedChip('producer')==='all' && document.getElementById('list-search').value==='','an item link clears filters');
+  check(selectedShow()==='all' && menu('owner').value==='' && !unread().checked &&
+    menu('producer').value==='' && document.getElementById('list-search').value==='','an item link clears filters');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
- location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'open',q:'106',sort:'#',dir:'desc'});await flush();
- check(selectedChip('owner')===retained.dataset.owner && selectedChip('show')==='open' &&
+ location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'working',q:'106',sort:'#',dir:'desc'});await flush();
+ check(menu('owner').value===retained.dataset.owner && selectedShow()==='working' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');

@@ -245,7 +245,8 @@ SCRIPT = r'''const filterControl={
 };
 function createRecordTable(options){
 const contentProxy=()=>options.content();
-let content=contentProxy(),owner='',show='open',query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
+const defaultShow=options.defaultShow ?? 'open';
+let content=contentProxy(),owner='',show=defaultShow,query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
 let linkedItem='';
 let placeHash=location.hash;
 let highlightedRow,highlightTimer;
@@ -356,9 +357,26 @@ function filterSelection(name){
  const row=chipRow(name),all=name==='show' ? 'all' : '';
  if(row) return {
   set(value){const selected=filterControl.select(row,value || 'all');return selected==='all' ? all : selected;},
-  bind(change){filterControl.bind(row,value=>change(value==='all' ? all : value));}
+  bind(change){filterControl.bind(row,value=>change(value==='all' ? all : value));},
+  setCounts(counts){filterControl.setCounts(row,counts);}
  };
- const control=content.querySelector('#list-'+name),attribute='data-'+name+'-chip';
+ const control=content.querySelector('#list-'+name);
+ if(control?.matches('select')) return {
+  set(value){control.value=value;if(control.selectedIndex<0) control.value='';return control.value;},
+  bind(change){control.addEventListener('change',()=>change(control.value));},
+  setCounts(counts){
+   for(const option of control.options){
+    const count=String(counts[option.value || 'all'] ?? 0);
+    option.dataset.filterCount=count;
+    option.textContent=option.dataset.filterLabel+' ('+count+')';
+   }
+  }
+ };
+ if(control?.matches('input[type="checkbox"]')) return {
+  set(value){control.checked=value===control.value;return control.checked ? control.value : '';},
+  bind(change){control.addEventListener('change',()=>change(control.checked ? control.value : ''));}
+ };
+ const attribute='data-'+name+'-chip';
  return {
   set(value){
    control.querySelectorAll('['+attribute+']').forEach(button=>button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value)));
@@ -384,12 +402,12 @@ function place(){return readPlace(placeParams());}
 function readPlace(params,followingItemLink=false){
  placeHash=location.hash;
  keys=new Set(params.getAll('key'));
- owner=params.get('owner') || params.get('showrunner') || '';show=params.get('show') || 'open';query=params.get('q') || '';
+ owner=params.get('owner') || params.get('showrunner') || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
  sourceOwner=params.get('source-owner') || '';
  for(const name of filterNames) filters[name]=params.get(name) || '';
- if(!options.shows.includes(show)) show='open';
+ if(!options.shows.includes(show)) show=defaultShow;
  if(!columns.includes(sort)) sort='';
  const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
@@ -487,7 +505,7 @@ function showHiddenActionResults(items){
  if(!status) return;
  const hidden=key=>{
   const item=items.find(item=>item.dataset.key===key);
-  return !item || item.hidden || isLinkedOnly(item) || item.querySelector('[data-detail]').hidden;
+  return !item || item.hidden || item.querySelector('[data-detail]').hidden || !item.querySelector('[data-send-status]');
  };
  const messages=[];
  for(const [key,{hiddenMessage}] of actionNotices)
@@ -511,11 +529,11 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  }
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
-function isLinkedOnly(item){return options.linkedOnly?.(item.dataset);}
+function canRevealLinked(item,selection){return options.revealLinked?.(item.dataset,selection);}
 function matches(item,selection,counts){
- if(isLinkedOnly(item) || !isSelected(item)) return false;
+ if(!isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
- const values=options.filterValues(item.dataset,selection.query);
+ const values=options.filterValues(item.dataset,selection.query,selection);
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
  const excluded=Object.entries(values).filter(([name,choices])=>
@@ -547,7 +565,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   opened.delete(linkedItem);
   if(dismissMissingItem) linkedItem='';
  }
- if(dismissMissingItem && rows.some(item=>item.dataset.key===linkedItem && isLinkedOnly(item))){
+ if(dismissMissingItem && rows.some(item=>item.dataset.key===linkedItem && canRevealLinked(item,currentSelection()))){
   opened.delete(linkedItem);
   linkedItem='';
  }
@@ -572,7 +590,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare(sortValue(a),sortValue(b)) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0,linkedVisible=false;
+ const table=content.querySelector('table');let count=0;
  if(options.mount){
   const visibleKeys=new Set(items.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
@@ -588,21 +606,31 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   });
   drawWindow();
  }else{
-  if(items.some((item,index)=>item!==rows[index])) for(const item of items){
+  const linkedSection=content.querySelector('[data-linked-item]');
+  const linkedTable=linkedSection?.querySelector('table');
+  const linked=linkedTable && opened.has(linkedItem) && items.find(item=>
+   item.dataset.key===linkedItem && canRevealLinked(item,active) && !matches(item,active));
+  if(linked && linked.parentElement!==linkedTable){
+   stopMotion(linked);
+   linkedTable.append(linked);
+  }
+  const results=linked ? items.filter(item=>item!==linked) : items;
+  const tableRows=linkedTable ? rows.filter(item=>item.parentElement===table) : rows;
+  if(results.some((item,index)=>item!==tableRows[index])) for(const item of results){
+   if(linkedTable && item.parentElement===linkedTable) stopMotion(item);
    table.append(item);
    const spacer=rowMotion.get(item)?.spacer;
    if(spacer) table.append(spacer);
   }
+  if(linkedSection) linkedSection.hidden=!linked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const linked=expanded && item.dataset.key===linkedItem && isLinkedOnly(item);
-   const matched=matches(item,active,counts),showRow=matched || linked,wasShown=!item.hidden;
+   const matched=matches(item,active,counts),showRow=matched || item===linked,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(table,item,false);
    item.hidden=!showRow;if(matched) count++;
-   if(linked) linkedVisible=true;
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
-   if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(table,item,true);
+   if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(item.parentElement,item,true);
    else if(expansionChanged && transition) setExpanded(transition.copy,expanded);
   });
  }
@@ -622,7 +650,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || linkedVisible || missing.length>0;
+ empty.hidden=count>0 || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -631,10 +659,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  }
  const group=content.querySelector('[data-clear-linked-reviews]');
  if(group) group.hidden=!keys.size;
- const selection=items.filter(item=>!isLinkedOnly(item) && isSelected(item));
- if(counts) for(const [name,values] of Object.entries(counts)) filterControl.setCounts(chipRow(name),values);
+ const selection=items.filter(isSelected);
+ if(counts) for(const [name,values] of Object.entries(counts)) filterSelection(name).setCounts?.(values);
  const countLine=content.querySelector('[data-list-count]');
- if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
+ if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
  options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
  if(write || location.hash===placeHash &&
@@ -676,7 +704,8 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
   if(keys.size) keys.add(key);
   if(options.single) opened.clear();
   opened.add(key);
-  if(!isLinkedOnly(target) && !matches(target,currentSelection())){
+  const selection=currentSelection();
+  if(!canRevealLinked(target,selection) && !matches(target,selection)){
    const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
@@ -746,10 +775,9 @@ function bind(){
   const selected=columns[Number(button.dataset.sort)];direction=sort===selected && direction==='asc' ? 'desc' : 'asc';
   sort=selected;changePlace();
  }));
- content.querySelector('table').addEventListener('click',event=>{
-  const row=event.target.closest('.list-row');if(!row) return;
+ content.addEventListener('click',event=>{
+  const item=event.target.closest('.list-row')?.closest('[data-list-item]');if(!item) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
-  const item=row.parentElement;
   setRowsExpanded([item],!opened.has(item.dataset.key));
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
@@ -763,7 +791,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
    query=currentQuery;
    apply(false,{dismissMissingItem:true});
   }
-  setRowsExpanded(content.querySelectorAll('[data-list-item]:not([hidden])'),expanded);
+  setRowsExpanded(content.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])'),expanded);
  },
  closeCard(key){
   const wasOpen=opened.delete(key);

@@ -715,7 +715,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(reopened.unread_since, reopened_at)
         self.assertIsInstance(the_list.unread_update(reopened), the_list.UnreadUpdate)
 
-    def test_answer_updates_a_closed_item_without_marking_it_unread(self) -> None:
+    def test_answer_marks_a_closed_item_unread_until_mark_read(self) -> None:
         item = self.add()
         status = change_page.DeliveryStatus(self.root / "reviews")
         _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Which check passed?"), status)
@@ -729,8 +729,15 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(saved.state, the_list.ItemState.CLOSED)
         self.assertEqual(saved.updated, answered_at)
         self.assertIsInstance(saved.questions[0].answer, question_record.Answer)
-        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(saved.unread_since, answered_at)
+        self.assertIsInstance(the_list.unread_update(saved), the_list.UnreadUpdate)
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        self.assertIn(f'unread_since: {json.dumps(answered_at.isoformat())}\n', path.read_text())
+        with patch.object(the_list, "now", return_value=answered_at):
+            _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        read = the_list.load(MORTY.id, item.id)
+        self.assertIs(read.state, the_list.ItemState.CLOSED)
+        self.assertIs(the_list.unread_update(read), the_list.NoUnreadUpdate.ABSENT)
         self.assertIn('unread_since: ""\n', path.read_text())
 
     def test_load_reads_a_legacy_closed_record_without_an_unread_update(self) -> None:
@@ -756,14 +763,15 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", words),
                              (0, f"answered {item.id} Q1\n", ""))
         saved = the_list.load(MORTY.id, item.id)
-        self.assertIn('unread_since: ""\n', path.read_text())
+        self.assertIn(f'unread_since: {json.dumps(answered_at.isoformat())}\n', path.read_text())
         self.assertEqual(saved.log, (*closed.log, the_list.ItemChange(answered_at, the_list.QuestionAnswered("Q1"), "morty")))
         self.assertEqual(saved.updated, answered_at)
         answer = saved.questions[0].answer
         assert isinstance(answer, question_record.Answer)
         self.assertEqual(answer.text, words)
         self.assertEqual(saved.questions, (replace(closed.questions[0], answer=answer),))
-        self.assertEqual(replace(saved, updated=closed.updated, log=closed.log, questions=closed.questions), closed)
+        self.assertEqual(replace(saved, updated=closed.updated, unread_since=closed.unread_since,
+                                 log=closed.log, questions=closed.questions), closed)
 
     def test_list_command_keeps_an_item_while_its_question_waits(self) -> None:
         item = self.add("Check the List")
@@ -773,7 +781,8 @@ class TheListTests(unittest.TestCase):
         request = the_list.PageRequest("ask", "question", "Which check passed?")
         _ = the_list.ask_question(MORTY.id, item.id, request, status)
         waiting = list_page.render(status.root, include_counts=False, status=status).decode()
-        self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]* hidden>')
+        self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]*">')
+        self.assertIn('data-open-question="true"', waiting)
         result, output, errors = self.command("list")
         self.assertEqual((result, errors), (0, ""))
         self.assertIn(item.title, output)
@@ -782,6 +791,7 @@ class TheListTests(unittest.TestCase):
         answered = the_list.load(MORTY.id, item.id)
         returned = list_page.render(status.root, include_counts=False).decode()
         self.assertRegex(returned, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+        self.assertIn('data-open-question="false"', returned)
         self.assertEqual(answered.unread_since, START)
 
     def test_typed_log_refuses_invalid_fields(self) -> None:
