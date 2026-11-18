@@ -14,12 +14,15 @@ import time
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_spend, ledger, remote
+from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_render, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config
 from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
+
+
+FIXTURE_GUEST_DIGEST = hana_render.GuestDigest('a' * 64)
 
 
 class HanaSetupTests(CostFixture):
@@ -192,6 +195,9 @@ class HanaSetupTests(CostFixture):
         pauses: list[float] = []
         other_zone = 'us-east-2c'
         saved_path = self.state / 'hana/setup.json'
+        digest = hana_render.guest_digest(self.workload)
+        _ = hana_image.save(self.state, hana_image.RegisteredImage(
+            'fixture-name', 'fixture-image', '000000000000', 'fixture-vpc', 'fixture-subnet', digest))
 
         def launch(arguments: tuple[str, ...]) -> None:
             attempts.append(arguments)
@@ -226,6 +232,7 @@ class HanaSetupTests(CostFixture):
             validate.assert_called_once()
         record = remote.read_record(self.state / 'hana/lifecycle.json')
         self.assertEqual(record['state'], hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(remote.read_record(saved_path)['guest_digest'], digest.value)
         self.assertEqual(ledger.mapping(record['identity'])['spot_request'], IDENTITY.spot_request)
         self.assertIn('stop-instances', calls)
         self.assertEqual(pauses, [10, 10, 10])
@@ -498,6 +505,27 @@ class HanaSetupTests(CostFixture):
         with self.assertRaises(hana_image.ImageRefused):
             _ = hana_image.read_built(self.root / 'missing')
 
+    def test_built_image_digest_comes_from_its_renderer_derivation(self) -> None:
+        result = self.built_image()
+        deriver = self.root / 'fixture-image.drv'
+        renderer = self.root / 'fixture-hana-guest-files.drv'
+        output = self.root / 'fixture-hana-guest-files'
+        output.mkdir()
+        answers = {('--deriver', str(result)): str(deriver), ('--requisites', str(deriver)): str(renderer),
+                   ('--outputs', str(renderer)): str(output)}
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(list(arguments[:2]), ['nix-store', '--query'])
+            option, path = arguments[2:]
+            return subprocess.CompletedProcess(arguments, 0, answers[option, path] + '\n', '')
+
+        stamp = output / 'safety.json'
+        _ = stamp.write_text(json.dumps({'guest_digest': FIXTURE_GUEST_DIGEST.value}))
+        self.assertEqual(hana_image.artifact_digest(result, execute, 1), FIXTURE_GUEST_DIGEST)
+        _ = stamp.write_text('{}')
+        with self.assertRaisesRegex(hana_image.ImageRefused, 'no verified guest digest'):
+            _ = hana_image.artifact_digest(result, execute, 1)
+
     def image_aws(self, existing: bool, *, registration_failure: bool = False,
                   snapshot_states: tuple[str, ...] = ()) -> tuple[list[tuple[str, tuple[str, ...]]], object]:
         calls: list[tuple[str, tuple[str, ...]]] = []
@@ -512,7 +540,8 @@ class HanaSetupTests(CostFixture):
                                     {'SubnetId': 'fixture-subnet-b', 'AvailabilityZone': 'us-east-2b', 'State': 'available'}]}
             if operation == 'describe-images':
                 if '--image-ids' in arguments or existing:
-                    return {'Images': [{'ImageId': 'fixture-hana-image', 'OwnerId': 'fixture-owner', 'State': 'available'}]}
+                    return {'Images': [{'ImageId': 'fixture-hana-image', 'OwnerId': 'fixture-owner', 'State': 'available',
+                        'Description': 'Hana guest digest ' + FIXTURE_GUEST_DIGEST.value}]}
                 return {'Images': []}
             if operation == 'describe-snapshots':
                 return {'Snapshots': [{'SnapshotId': 'fixture-snapshot' if index == 0 else f'fixture-snapshot-{index}',
@@ -526,7 +555,8 @@ class HanaSetupTests(CostFixture):
 
     def run_image(self, existing: bool, *, wait_failure: bool = False,
                   registration_failure: bool = False,
-                  snapshot_states: tuple[str, ...] = ()) -> tuple[list[tuple[str, tuple[str, ...]]], list[list[str]], list[list[str]]]:
+                  snapshot_states: tuple[str, ...] = (), retarget_result: bool = False
+                  ) -> tuple[list[tuple[str, tuple[str, ...]]], list[list[str]], list[list[str]]]:
         calls, api_call = self.image_aws(existing, registration_failure=registration_failure, snapshot_states=snapshot_states)
         local: list[list[str]] = []
         uploads: list[list[str]] = []
@@ -553,14 +583,37 @@ class HanaSetupTests(CostFixture):
             return authorized
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=execute,
                                     clock=self.clock, notify=lambda _event: True)
+        built = self.built_image()
+        result = built
+        if retarget_result:
+            result = self.root / 'RESULT'
+            result.symlink_to(built)
+
+        def authorize(_approved: bool) -> None:
+            if retarget_result:
+                result.unlink()
+                result.symlink_to(self.root / 'new-build')
+
+        def read_digest(store: Path, _execute: object, _timeout: float) -> hana_render.GuestDigest:
+            self.assertEqual(store.resolve(), built)
+            if retarget_result:
+                self.assertEqual(result.resolve(), self.root / 'new-build')
+            return FIXTURE_GUEST_DIGEST
+
         with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
-                mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_guard'), \
+                mock.patch.object(subject, '_authorize', side_effect=authorize), mock.patch.object(subject, '_guard'), \
+                mock.patch.object(hana_image, 'artifact_digest', side_effect=read_digest), \
                 mock.patch.object(subject.admin, 'executor', side_effect=admin), \
                 mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
                 mock.patch('sys.stdout', new_callable=StringIO):
-            self.assertTrue(subject.hana_image(self.built_image(), approve_resources=True))
+            self.assertTrue(subject.hana_image(result, approve_resources=True))
         self.assertFalse((subject.output / 'hana/image.raw').exists())
         return calls, local, uploads
+
+    def test_registration_keeps_the_same_artifact_when_result_changes(self) -> None:
+        calls, local, _uploads = self.run_image(existing=False, retarget_result=True)
+        self.assertIn(str(self.built_image() / 'nixos-image-amazon.vhd'), local[0])
+        self.assertIn('Hana guest digest ' + FIXTURE_GUEST_DIGEST.value, dict(calls)['register-image'])
 
     def test_image_without_approval_makes_no_aws_call(self) -> None:
         fake = FakeAws(self.clock)
@@ -591,12 +644,14 @@ class HanaSetupTests(CostFixture):
                                         '--max-attempts', '240', 'fixture-snapshot'])
         self.assertLessEqual(int(uploads[1][uploads[1].index('--max-attempts') + 1]), 255)
         register = dict(calls)['register-image']
+        self.assertEqual(register[register.index('--description') + 1], 'Hana guest digest ' + FIXTURE_GUEST_DIGEST.value)
         self.assertEqual(register[register.index('--tag-specifications') + 1:],
                          (f'ResourceType=image,Tags=[{{{cost_tag}}}]',))
         self.assertIn('v2.0', register)
         self.assertIn('DeviceName=/dev/xvda,Ebs={SnapshotId=fixture-snapshot,VolumeType=gp3,DeleteOnTermination=true}', register)
         self.assertEqual(hana_image.saved(self.state), hana_image.RegisteredImage(
-            'nixos-hana-26.05.fixture-0123456789ab', 'fixture-hana-image', 'fixture-owner', 'fixture-vpc', 'fixture-subnet-b'))
+            'nixos-hana-26.05.fixture-0123456789ab', 'fixture-hana-image', 'fixture-owner', 'fixture-vpc', 'fixture-subnet-b',
+            FIXTURE_GUEST_DIGEST))
 
     def test_image_with_the_same_name_is_not_uploaded_again(self) -> None:
         _ = hana_image.save(self.state, hana_image.PendingImageRegistration(
@@ -638,6 +693,7 @@ class HanaSetupTests(CostFixture):
                 with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
                         mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_guard'), \
                         mock.patch.object(subject, 'execute') as execute, \
+                        mock.patch.object(hana_image, 'artifact_digest', return_value=FIXTURE_GUEST_DIGEST), \
                         mock.patch.object(subject.admin, 'executor', return_value=authorized), \
                         mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
                         mock.patch('sys.stdout', new_callable=StringIO):
