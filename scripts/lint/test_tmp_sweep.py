@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import cached_property
@@ -713,6 +713,27 @@ class NextestLogRetentionTests(TmpSweepCase):
         record, = self.log()
         self.assertIn("expired Mac nextest log", str(record["deleted"]))
         self.assertEqual(cast(dict[str, int], record["kept"])[tmp_sweep.IN_USE], 1)
+
+    def test_mac_sweep_keeps_a_log_locked_after_the_process_scan(self) -> None:
+        logs = self.tmp.parent / "logs"
+        expired = write(logs / "nextest.00000001")
+        old = self.now - 8 * DAY
+        os.utime(expired, (old, old))
+        _ = write_config_fixture(conf.path("mac_test"))
+        result = tmp_sweep.Sweep()
+        with ExitStack() as readers:
+            def scan(*_args: object, **_kwargs: object) -> tmp_sweep.ProcessUsesKnown:
+                reader = readers.enter_context(expired.open("rb"))
+                fcntl.flock(reader, fcntl.LOCK_SH)
+                return tmp_sweep.ProcessUsesKnown([])
+
+            with mock.patch.object(tmp_sweep, "lsof_paths", side_effect=scan):
+                tmp_sweep.remove_expired_nextest_logs(logs, self.now, False, result)
+            self.assertTrue(expired.is_file())
+            self.assertEqual(result.kept, {tmp_sweep.IN_USE: [str(expired)]})
+        with mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([])):
+            tmp_sweep.remove_expired_nextest_logs(logs, self.now, False, result)
+        self.assertFalse(expired.exists())
 
     def test_incomplete_mac_process_scan_keeps_expired_logs(self) -> None:
         logs = self.tmp.parent / "logs"

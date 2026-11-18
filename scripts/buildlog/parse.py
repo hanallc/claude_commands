@@ -235,11 +235,18 @@ def manifest_path(argv: list[str]) -> str | None:
     return None
 
 
+def last_displayed_line(line: str) -> str:
+    """Keep the text after the last carriage return."""
+    return line.rstrip("\r").rsplit("\r", 1)[-1]
+
+
+def clean_line(line: str) -> str:
+    """Remove terminal controls and keep the last displayed text."""
+    return last_displayed_line(ANSI.sub("", line))
+
+
 def clean_lines(text: str) -> list[str]:
-    lines: list[str] = []
-    for raw in ANSI.sub("", text).split("\n"):
-        lines.append(raw.rstrip("\r").rsplit("\r", 1)[-1])
-    return lines
+    return [last_displayed_line(line) for line in ANSI.sub("", text).split("\n")]
 
 
 def seconds(minutes: str | None, secs: str) -> float:

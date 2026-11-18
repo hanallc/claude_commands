@@ -1996,7 +1996,10 @@ def remote_test_command(
         "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
         if isinstance(request.placement, AssignedOffloadRequest) else ""
     )
-    capture = nextest_log.capture_function(config.values) + " && " if request.verb == "nextest" else ""
+    capture = ""
+    if request.verb == "nextest":
+        limits = nextest_log.output_limits(config.settings, config.values)
+        capture = nextest_log.capture_function(limits) + " && "
     runner = "run_nextest_logged " if capture else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
@@ -2602,8 +2605,10 @@ def claimed_run(
             return LostMacRun(elapsed_seconds(started), detail)
         if not linux:
             eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
-        fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
-        if not linux and isinstance(request.fetch, FetchFolder):
+        setup_failed = (linux or request.verb == "nextest") and remote_status.status == os.EX_TEMPFAIL
+        fetched = (fetch_folder(controller, config, request, repository)
+                   if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
+        if not setup_failed and not linux and isinstance(request.fetch, FetchFolder):
             cleanup = controller.stream_mac_run([
                 *ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
@@ -2624,7 +2629,9 @@ def claimed_run(
             release_allowed = True
         sync_after_release = linux
         seconds = elapsed_seconds(started)
-        if linux and remote_status.status == 75:
+        if setup_failed:
+            if not linux:
+                evidence.execution = placement.ExecutionNotStarted()
             return declined("state", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)

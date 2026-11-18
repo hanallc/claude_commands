@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-from scripts.mac_test import eligibility, offload, claim_state
+from scripts.mac_test import eligibility, nextest_log, offload, claim_state
 from scripts.build_queue import admission_client, admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_admission
 if TYPE_CHECKING:
@@ -40,6 +40,7 @@ from scripts.lib import conf, session_folder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
+from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -494,6 +495,21 @@ class OffloadSettingsTests(unittest.TestCase):
                 self.assertEqual(config.values["mac_budget_gib.hana"], "7")
                 self.assertEqual(config.values["linux_only.hana"], "local-package")
                 self.assertEqual(config.mirror_busy_backoff_s, 37)
+
+    def test_explicit_mac_settings_cannot_bypass_the_nextest_summary_limit(self) -> None:
+        request = offload.OffloadRequest(self.root, "hana", "log-limit", offload.NO_RESULT_FILE, (),
+                                        owner="verify", holder_session="fixture-session")
+        for limit in ("", "# whole: 1..2048\n"):
+            with self.subTest(limit=limit):
+                settings = self.root / "summary-limit.conf"
+                _ = settings.write_text(self.settings.read_text().replace(
+                    f"# whole: 1..1024\n{nextest_log.SUMMARY_BYTES}=1024",
+                    f"{limit}{nextest_log.SUMMARY_BYTES}=2048"))
+                config = eligibility.read_config(settings)
+                with (mock.patch.object(subprocess, "run", RUN_SUBPROCESS),
+                      mock.patch.object(subprocess, "Popen", START_SUBPROCESS),
+                      self.assertRaisesRegex(conf.Unusable, nextest_log.SUMMARY_BYTES + "|Summary limit")):
+                    _ = offload.remote_test_command(config, request, HANA)
 
     def test_sender_normalizes_multiline_tool_versions_before_parity(self) -> None:
         versions = {"rustc": " rustc fixture \n", "nextest":
@@ -1466,6 +1482,7 @@ class OffloadCommandTests(OffloadCommandFixture):
             remote = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
             mirror = self.root / offload.remote_mirror(eligibility.KnownRepository("hana"))
         mirror.mkdir(parents=True, exist_ok=True)
+        _ = install_nextest_log_writer(self.root)
         lint = self.root / ".claude/scripts/lint/lint"
         lint.parent.mkdir(parents=True, exist_ok=True)
         capture = self.root / "received-environment.json"

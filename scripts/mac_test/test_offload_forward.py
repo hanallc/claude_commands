@@ -80,7 +80,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
             + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
             + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
-            + nextest_log.capture_function(config.values) + " && "
+            + nextest_log.capture_function(nextest_log.output_limits(config.settings, config.values)) + " && "
             + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
@@ -118,6 +118,15 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)
+
+    def test_nextest_setup_failure_declines_without_fetching(self) -> None:
+        self.configure_fetch(run_status_line="mac_exit=75")
+        result = self.command(runner_options=("--fetch", "target/shots"))
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assert_fetch_wire("not_run", mac="declined", reason="state")
+        self.assertNotIn("Treat the failure as real", result.stdout)
+        self.assertFalse(any("fetch_kib=" in event["args"][-1] for event in self.events_for("ssh")))
+        self.assertFalse(self.claim_file.exists())
 
     def test_placed_mac_command_sends_the_assignment_placement_to_the_cargo_gate(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")

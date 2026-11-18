@@ -323,6 +323,10 @@ Declined, lost, and invalid results return the step to its waiting state.
   It also sends the last nextest Summary line, up to `nextest_failure_summary_bytes` bytes (1,024 by default).
   The hourly Mac `tmp_sweep.py` job removes closed, owned logs after `nextest_failure_log_days` days (seven by default).
   It measures age from the failure time or, for an interrupted run, the last write time.
+  On the Mac, read a saved log with `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/nextest_log.py read PATH`.
+  The reader holds a shared lock until the copy ends.
+  The sweep holds an exclusive lock during removal and also checks for open files with `lsof`.
+  If the log writer cannot start nextest, the runner reports a setup failure.
 - **Markers.** `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
 - `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.
 - SIGINT, SIGTERM, and SIGHUP stop the SSH child.

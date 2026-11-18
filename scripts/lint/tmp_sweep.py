@@ -1608,12 +1608,16 @@ def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: S
                 result.keep(path, IN_USE)
                 continue
             try:
-                current = os.stat(name, dir_fd=folder, follow_symlinks=False)
-                if current != info or current.st_ctime_ns != info.st_ctime_ns:
-                    result.keep(path, "the nextest log changed during the process scan")
-                    continue
-                if not dry_run:
-                    os.unlink(name, dir_fd=folder)
+                with nextest_log.locked_log(folder, name, nextest_log.LogAccess.REMOVE) as descriptor:
+                    current = os.fstat(descriptor)
+                    if current != info or current.st_ctime_ns != info.st_ctime_ns:
+                        result.keep(path, "the nextest log changed during the process scan")
+                        continue
+                    if not dry_run:
+                        os.unlink(name, dir_fd=folder)
+            except BlockingIOError:
+                result.keep(path, IN_USE)
+                continue
             except FileNotFoundError:
                 continue
             except OSError as error:

@@ -108,6 +108,7 @@ class OffloadConfig:
     default_target_budget_gib: str
     values: dict[str, str]
     source: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS
+    settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
 
     @property
     def host(self) -> str:
@@ -216,6 +217,7 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
         default_target_budget_gib=config.text("target_budget_gib" if "target_budget_gib" in values else "mac_budget_gib"),
         values=values,
         source=settings,
+        settings=config,
     )
 
 

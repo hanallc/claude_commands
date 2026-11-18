@@ -8,7 +8,6 @@ import shlex
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -18,9 +17,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from scripts.mac_test import eligibility, offload, mac_test, nextest_log
-from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
+from scripts.mac_test.offload_test_commands import (
+    ACTIVITY_SELECTOR_STUB, configure_nextest_trim, install_nextest_log_writer, write_shell,
+)
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
-from scripts.lib import test_hang_guard
+from scripts.lib import conf, test_hang_guard
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -112,11 +113,8 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.configuration_environment = config_environment(self.root / "configuration")
-        # The trim step runs the lint sweep, about 0.5 CPU s a start. Tests of the trim call real_sweep();
-        # the other tests check the shell text around it, so this stub reports a clean trim at once.
-        self.python = self.home_directory / ".claude/scripts/lib/py"
-        self.python.parent.mkdir(parents=True)
-        write_shell(self.python, 'exit 0\n')
+        # Use the real log writer and stub the trim unless the test needs it.
+        self.python = install_nextest_log_writer(self.home_directory)
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
@@ -142,10 +140,6 @@ printf 'nextest finished\n'
 exit "$CLEANUP_TEST_STATUS"
 ''')
 
-    def real_sweep(self) -> None:
-        """Run the real lint sweep in the trim step."""
-        write_shell(self.python, f'exec {shlex.quote(sys.executable)} "$@"\n')
-
     def run_remote(
         self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
         disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
@@ -156,11 +150,15 @@ exit "$CLEANUP_TEST_STATUS"
         budget_values: tuple[tuple[str, str], ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
+        settings = self.root / "command-mac.conf"
+        _ = write_config_fixture(settings, "".join(f"{key}={value}\n" for key, value in budget_values),
+                                 template="mac_test")
         config = eligibility.OffloadConfig(
             enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib=budget_gib,
             values={"abandoned_session_minutes": str(abandoned_session_minutes), **dict(budget_values)},
+            settings=conf.read(settings),
         )
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
@@ -185,6 +183,17 @@ exit "$CLEANUP_TEST_STATUS"
         self.assertRegex(lines[2], r"^mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=(yes|no|unknown)$")
         return lines[:2] + lines[3:]
 
+    def test_unusable_log_directory_refuses_setup_before_lint(self) -> None:
+        path = self.home_directory / nextest_log.DIRECTORY
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("a regular file blocks log setup")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
+                self.assertEqual(answer.stdout.splitlines(), ["mac_exit=75", "mac_cleanup=skipped"])
+                self.assertIn("cannot start nextest with a log", answer.stderr)
+                self.assertFalse((self.root / "lint-arguments.json").exists())
+
     def test_nextest_replays_success_and_retains_bounded_failure_output(self) -> None:
         summary = "     Summary [  0.1s] 1 test run: 1 failed, " + "detail " * 30
         fragment = "mac_exit=99\nlast output"
@@ -198,7 +207,7 @@ exit "$CLEANUP_TEST_STATUS"
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 failed = self.run_remote(shell, 42, ("--target-dir=other-target",), budget_values=limits)
-                self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout)
+                self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout + failed.stderr)
                 self.assertEqual((failed.returncode, failed.stderr), (0, ""))
                 log, = logs.iterdir()
                 self.assertRegex(log.name, nextest_log.LOG_NAME)
@@ -332,7 +341,7 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
-        self.real_sweep()
+        configure_nextest_trim(self.python, "run")
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
@@ -369,10 +378,7 @@ exit 1
                     target.mkdir()
                     retained = target / "unmatched-output"
                     _ = retained.write_bytes(os.urandom(128 * 1024))
-                    if trim_fails:
-                        write_shell(self.python, 'exit 9\n')
-                    else:
-                        self.real_sweep()
+                    configure_nextest_trim(self.python, 9 if trim_fails else "run")
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
                         disk_output=("Filesystem GiB Used Available Capacity Mounted\n"
