@@ -326,10 +326,14 @@ class PlanRun:
             return self._execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check)
 
         writer = AwsCli('plan', api.region, api.timeout_s, execute)
+        create_confirmed = False
+        interrupted = False
         try:
-            _ = writer.call('create-change-set', *target, '--change-set-type', 'UPDATE', '--template-body', content,
-                            '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(values),
-                            service='cloudformation')
+            created = writer.call('create-change-set', *target, '--change-set-type', 'UPDATE', '--template-body', content,
+                                  '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(values),
+                                  service='cloudformation')
+            _ = ledger.text(created, 'Id')
+            create_confirmed = True
             deadline = time.monotonic() + timeout
             while True:
                 change = api.call('describe-change-set', *target, '--no-paginate', service='cloudformation')
@@ -341,27 +345,51 @@ class PlanRun:
                 if remaining <= 0:
                     raise PlanRefused('CloudFormation did not complete the plan change set before the deadline.')
                 self.pause(min(2, remaining))
+            execution = change.get('ExecutionStatus', 'missing')
+            if change.get('Status') == 'CREATE_COMPLETE' and execution != 'AVAILABLE':
+                raise PlanRefused(f'The change set execution status is {execution}. Expected AVAILABLE.')
             print(f'plan stack: UPDATE in {api.region}', flush=True)
             yield change
+        except BaseException as error:
+            interrupted = isinstance(error, KeyboardInterrupt)
+            raise
         finally:
-            self._remove_change_set(api, writer, stack, name)
+            try:
+                removed = self._remove_change_set(api, writer, target, name, create_confirmed=create_confirmed)
+                if not removed and not interrupted:
+                    raise PlanRefused('change set not removed') from None
+            except KeyboardInterrupt:
+                interrupted = True
+                raise
+            finally:
+                if interrupted:
+                    print(f'plan stack: interrupted with change set {name}', flush=True)
 
-    def _remove_change_set(self, api: AwsCli, writer: AwsCli, stack: str, name: str) -> None:
-        target = ('--stack-name', stack, '--change-set-name', name)
+    @staticmethod
+    def _delete_change_set(writer: AwsCli, target: tuple[str, ...], name: str) -> None:
         try:
             _ = writer.call('delete-change-set', *target, service='cloudformation')
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
             print(f'plan stack: delete call did not confirm removal of {name}', flush=True)
+
+    def _remove_change_set(self, api: AwsCli, writer: AwsCli, target: tuple[str, ...], name: str,
+                           *, create_confirmed: bool) -> bool:
+        self._delete_change_set(writer, target, name)
         for delay in plan_identity.PROOF_RETRY_DELAYS:
             if delay:
                 self.pause(delay)
             try:
-                _ = api.call('describe-change-set', *target, '--no-paginate', service='cloudformation')
+                change = api.call('describe-change-set', *target, '--no-paginate', service='cloudformation')
             except AwsUnavailable as error:
-                if aws_error_code(error) in CHANGE_SET_ABSENT:
+                if create_confirmed and aws_error_code(error) in CHANGE_SET_ABSENT:
                     print('plan stack: change set removal confirmed', flush=True)
-                    return
+                    return True
             except (OSError, ValueError, subprocess.SubprocessError):
                 continue
-        print(f'plan stack: change set may remain: {name}', flush=True)
-        raise PlanRefused('change set not removed') from None
+            else:
+                if not create_confirmed and change.get('ChangeSetName') == name:
+                    create_confirmed = True
+                    self._delete_change_set(writer, target, name)
+        state = 'may remain' if create_confirmed else 'may still appear'
+        print(f'plan stack: change set {state}: {name}', flush=True)
+        return False

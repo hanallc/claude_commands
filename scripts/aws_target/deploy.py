@@ -39,7 +39,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, c
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
-from scripts.lib import conf, user_zone
+from scripts.lib import conf, file_lock, user_zone
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
@@ -51,6 +51,7 @@ PROBE_DENIED_CODES = frozenset(('AccessDenied', 'AccessDeniedException', 'Unauth
 HANA_SETUP_VERSION = 2
 HANA_DATA_DEVICE = '/dev/sdf'
 HANA_DOWN_FIRST = 'Run deploy.py down --workload hana --approve-destroy first.'
+HANA_BUSY = 'The Hana lifecycle is busy. Run hana-setup again when the box is idle.'
 HANA_SPOT_REFUSALS = frozenset(('InsufficientInstanceCapacity', 'SpotMaxPriceTooLow', 'Unsupported',
                                'MaxSpotInstanceCountExceeded'))
 HANA_CREATE_REFUSALS = frozenset((
@@ -640,7 +641,7 @@ class Deployment:
             return self._plan_hana_update(workload, limits, self.mode)
         self._authorize(True)
         child = self._hana_output()
-        with control_lock(self.directory):
+        with self._hana_setup_lock():
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
             ownership = _hana_setup_ownership(saved)
@@ -829,6 +830,18 @@ class Deployment:
         _print_hana_placement(workload)
         return self._probe_hana_scaler(provider, identity)
 
+    @contextmanager
+    def _hana_setup_lock(self, *, wait: bool = True) -> Generator[None]:
+        path = self.directory / 'controller.lock'
+        if wait:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        elif not path.is_file():
+            raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
+        with file_lock.exclusive(path, wait=wait) as result:
+            if result is file_lock.LockResult.BUSY:
+                raise DeploymentRefused(HANA_BUSY)
+            yield
+
     def _plan_hana_update(self, workload: conf.ConfigRead, limits: hana_spend.PermitSettings,
                           plan: plan_run.PlanRun) -> bool:
         path = self.directory / 'hana' / 'setup.json'
@@ -845,8 +858,11 @@ class Deployment:
         if ownership != HanaBoxOwnership.STACK:
             raise plan_run.unsupported('Hana uses direct-owned resources')
         self._check_credentials()
-        plan.confirm_account(limits.region, workload.whole('aws_timeout_s'))
-        return self._update_stack_owned_hana(path, saved, workload, limits)
+        with self._hana_setup_lock(wait=False):
+            if remote.read_record(path) != saved:
+                raise DeploymentRefused('The saved Hana setup changed. Run hana-setup again.')
+            plan.confirm_account(limits.region, workload.whole('aws_timeout_s'))
+            return self._update_stack_owned_hana(path, saved, workload, limits)
 
     def _update_stack_owned_hana(self, path: Path, saved: dict[str, object], workload: conf.ConfigRead,
                                  limits: hana_spend.PermitSettings) -> bool:
@@ -940,7 +956,7 @@ class Deployment:
                      and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
         if (registration.get('state') != hana_box.Lifecycle.IDLE_STOPPED or registration.get('claims') != []
                 or registration.get('start', {}) is not None or (operation is not None and not observing)):
-            raise DeploymentRefused('The Hana lifecycle is busy. ' + retry)
+            raise DeploymentRefused(HANA_BUSY)
         try:
             observed = api.observe(identity.instance, int(self.clock()))
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
@@ -2806,8 +2822,9 @@ class DeploymentArguments(argparse.Namespace):
 
 def run_setup_plan(args: DeploymentArguments) -> int:
     try:
+        workloads = ('rust', 'merge-gates', 'hana') if args.command == 'hana-setup' else ('rust', 'merge-gates')
         if (args.command not in ('up', 'hana-setup')
-                or args.workload not in ('rust', 'merge-gates')
+                or args.workload not in workloads
                 or args.trial_action or args.approve_resources or args.approve_destroy):
             raise DeploymentRefused('Use --plan with hana-setup or up --workload merge-gates without approval flags.')
         if args.command == 'up':
