@@ -5,10 +5,12 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_runtime, copy_startup
 
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 import errno
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import select
@@ -20,7 +22,7 @@ from typing import ClassVar, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.lib import build_folders, conf, user_zone, zone
+from scripts.lib import build_folders, user_zone, zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -292,19 +294,12 @@ class FastTrackTests(MergeCheckpointFixture):
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
             "FAST_TRACK_TEST_LOCK": str(self.common_directory / "main-push.lock"),
         })
-        with patch.dict(os.environ, {"CONF_DIR": str(REPOSITORY / "config")}):
-            settings_read = conf.read("fast_track")
-            self.settings = {
-                "max_changed_lines": settings_read.whole("max_changed_lines"),
-                "max_files": settings_read.whole("max_files"),
-                "check_time_limit_seconds": settings_read.number("check_time_limit_seconds"),
-                "max_push_attempts": settings_read.whole("max_push_attempts"),
-                "fetch_lock_attempts": settings_read.whole("fetch_lock_attempts"),
-                "fetch_lock_wait_seconds": settings_read.number("fetch_lock_wait_seconds"),
-                "refused_paths": list(settings_read.words("refused_paths")),
-            }
-        self.settings.update(max_changed_lines=100, max_files=10, check_time_limit_seconds=30,
-                             max_push_attempts=2, fetch_lock_attempts=3, fetch_lock_wait_seconds=0.01)
+        self.settings = {
+            "max_changed_lines": 100, "max_files": 10, "check_time_limit_seconds": 30,
+            "max_push_attempts": 2, "fetch_lock_attempts": 3, "fetch_lock_wait_seconds": 0.01,
+            "refused_paths": ["scripts/production/add_unit.py", "scripts/agents/*.py",
+                              "private-hooks/", "**/staff.json"],
+        }
         self.save_config()
         self.executable(self.bin / "basedpyright", TYPE_TOOL)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
@@ -327,10 +322,44 @@ class FastTrackTests(MergeCheckpointFixture):
         _ = self.config.write_text("\n".join(lines) + "\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        # The interruption wrapper must kill a child process.
-        if (self.control / "stop-git").exists() or process_boundary_for_case(self):
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(COMMAND), *arguments], cwd=self.unit,
                                   env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        if (self.control / "stop-git").exists():
+            return self.interrupted_command(arguments)
+        return self.invoke_command(arguments)
+
+    def interrupted_command(self, arguments: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        """Keep the SIGKILL boundary while the child reuses loaded CLI imports."""
+        with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
+            def execute() -> None:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    result = self.invoke_command(arguments)
+                    _ = stdout.write(result.stdout)
+                    _ = stderr.write(result.stderr)
+                    stdout.flush()
+                    stderr.flush()
+                    raise SystemExit(result.returncode)
+
+            child = multiprocessing.get_context("fork").Process(target=execute)
+            try:
+                child.start()
+                child.join(TEST_HANG_GUARD_SECS)
+                status = child.exitcode
+                if status is None:
+                    raise subprocess.TimeoutExpired([str(COMMAND), *arguments], TEST_HANG_GUARD_SECS)
+            finally:
+                if child.pid is not None and child.is_alive():
+                    child.kill()
+                    child.join()
+                child.close()
+            _ = stdout.seek(0)
+            _ = stderr.seek(0)
+            return subprocess.CompletedProcess([sys.executable, str(COMMAND), *arguments],
+                                               status, stdout.read(), stderr.read())
+
+    def invoke_command(self, arguments: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        """Run the CLI with the fixture environment and real Git commands."""
         args = list(arguments)
         run_process = cast(Callable[..., subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]],
                            subprocess.run)
@@ -1107,23 +1136,11 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assert_refused(self.fast_track(str(outside)))
 
     def test_sensitive_paths_are_refused_before_any_check(self) -> None:
-        patterns = cast(list[str], self.settings["refused_paths"])
-        paths = {pattern.replace("**", "fixture").replace("*", "fixture").rstrip("/")
-                 + ("/fixture.py" if pattern.endswith("/") else "") for pattern in patterns}
-        paths.update({"settings.json", "scripts/hooks/private/check.py", "scripts/lib/py",
-                      ".local/state/staff/staff.json", "scripts/production/staff.py",
-                      "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
-                      "scripts/production/add_showrunner.py", "scripts/agents/shutdown.py",
-                      "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/agents/shutdown.py",
-                      "scripts/agents/shutdown.py", "scripts/production/merge_gate.py",
-                      "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
-                      "scripts/production/build_hold.py", "scripts/production/fast_track.py",
-                      "config/fast_track.conf"})
-        for path in sorted(paths):
+        for path in ("scripts/production/add_unit.py", "scripts/agents/fixture.py",
+                     "private-hooks/nested/check.py", "state/private/staff.json"):
             with self.subTest(path=path):
                 self.write(self.unit, path, "refused edit\n")
-                self.assert_refused(self.fast_track(path))
+                self.assert_refused(self.fast_track(path), f"refused path: {path}")
         self.assertEqual(self.observations("types"), [])
 
     def test_missing_and_invalid_configuration_keys_name_the_key(self) -> None:

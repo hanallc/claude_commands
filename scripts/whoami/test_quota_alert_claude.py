@@ -48,6 +48,18 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(len(self.noted), 2)
         self.assertEqual(self.sent, [])
 
+    def test_claude_account_used_only_by_producers_records_a_status_note(self) -> None:
+        note = self.note("claude2.md", "active", "1")
+        _ = note.path.write_text(note.path.read_text().replace("role: unit", "role: producer"))
+        loaded = note_file.read_note(note.path)
+        assert isinstance(loaded, note_file.Note)
+        self.assertEqual(loaded.get_list("role"), ("producer",))
+
+        log = self.alert([loaded], self.now)
+
+        self.assertIn("quota status claude2: no Claude group uses this account", log)
+        self.assertEqual((self.noted, self.pushed, self.sent), ([], [], []))
+
     def test_self_targeting_entry_does_not_silence_the_two_percent_claude_reminder(self) -> None:
         _ = quota_alert.CONFIG.write_text(quota_alert.CONFIG.read_text().replace("threshold_percent=1", "threshold_percent=2"))
         entry = next_moves.add_next_move("units", 1, "claude2")

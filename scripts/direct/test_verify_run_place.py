@@ -1,6 +1,8 @@
 """Verify startup gives nested and detached steps one live run identity."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.lib.checkout_test_support import copy_runtime, fixture_shim_source, python_tool_source
 
 import json
@@ -13,7 +15,7 @@ from typing import TypedDict, cast
 import unittest
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 
@@ -46,9 +48,7 @@ class VerifyRunPlaceTests(unittest.TestCase):
         lint = scripts / "lint"
         lint.mkdir()
         _ = (lint / "invoke.sh").write_text("return 0\n")
-        home_scripts = fixture.root / ".claude/scripts"
-        home_scripts.parent.mkdir()
-        home_scripts.symlink_to(scripts, target_is_directory=True)
+        _ = copy_helpers(fixture.root, *VERIFY_HELPERS)
         probe = direct / "probe.py"
         _ = probe.write_text('''import json, os, sys
 print(json.dumps({"pid": int(sys.argv[1]), "run": os.environ.get("BUILDLOG_RUN", ""), "name": sys.argv[2]}), flush=True)
@@ -121,6 +121,9 @@ fi
             run = self.identity(fixture, outer)
             first = fixture.request(run=run)
             _ = fixture.finish_step(first)
+            fixture.allow_next_start()
+            # A live reservation keeps the oversized continuation in the queue.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.free(0)
             fixture.clock.advance(1)
             peer = fixture.request()

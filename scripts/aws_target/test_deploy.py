@@ -1,11 +1,13 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import lru_cache
+from hashlib import sha256
 from io import StringIO
 import json
 import os
@@ -19,15 +21,18 @@ import sys
 import threading
 import time
 from types import CodeType, SimpleNamespace
-from typing import ClassVar, cast, override
+from typing import ClassVar, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_spend, ledger, remote
+from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
+from scripts.aws_target.test_hana_setup import write_hana_config
+from scripts.aws_target.test_spot_end import FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
 from scripts.mac_test import mac_test
@@ -420,6 +425,968 @@ class GateImageAws:
                                       for row in transition]}
 
 
+class HanaSetupFailureTests(CostFixture):
+    PROBE_OPERATIONS: ClassVar[tuple[str, ...]] = ('export-credentials', 'describe-instances',
+        'describe-spot-instance-requests', 'describe-instance-attribute', 'modify-instance-attribute',
+        'start-instances', 'stop-instances', 'put-object', 'get-object')
+    clock: TestClock = TestClock()
+    workload: Path = Path()
+    setup_path: Path = Path()
+    book: ledger.CostLedger = ledger.CostLedger(Path())
+    calls: list[list[str]] = []
+    scaler_calls: list[tuple[str, str]] = []
+    instance_reads: list[list[str]] = []
+    deleted_stacks: dict[str, tuple[int, list[dict[str, str]]]] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.clock = TestClock()
+        self.workload = write_hana_config()
+        self.setup_path = self.state / 'hana/setup.json'
+        self.book = ledger.CostLedger(self.state)
+        self.calls = []
+        self.scaler_calls = []
+        self.instance_reads = []
+        self.deleted_stacks = {}
+        _ = write_config_fixture(self.workload, 'ami_id=fixture-image\nami_owner_id=fixture-owner\n'
+            + 'vpc_id=fixture-vpc\nsubnet_id=fixture-subnet\nregion=us-east-2\navailability_zone=us-east-2b\n')
+        self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
+        self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
+        original = conf.read_or_repository
+
+        def configuration(name: str) -> conf.ConfigRead:
+            return conf.read(self.workload) if name == 'hana_aws' else original(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
+        original_path = conf.path
+
+        def configuration_path(name: str | Path) -> Path:
+            return self.workload if name == 'hana_aws' else original_path(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=configuration_path))
+        settings = aws_config.DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gate', 'image',
+            'owner', 'fixture-release', 'us-east-2b', 'vpc', 'subnet', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
+        _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=settings))
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_check_credentials'))
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_validate_inputs'))
+
+    def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False,
+                spot_prices: tuple[tuple[str, str], ...] = (('us-east-2b', '0.10'),)) -> deploy.Deployment:
+        status = 'CREATE_IN_PROGRESS'
+        created = self.clock.now
+        stack_id = 'active-stack'
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal status, created, stack_id
+            self.calls.append(list(arguments))
+            offset = arguments.index('--region') + 2
+            operation = arguments[offset + 1]
+            if operation == 'describe-spot-price-history':
+                if fake.fail == operation:
+                    return subprocess.CompletedProcess(arguments, 1, '', 'fixture Spot read failed')
+                size = conf.read(self.workload).text('instance_type')
+                rows = [{'InstanceType': size, 'AvailabilityZone': zone, 'SpotPrice': price,
+                         'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat()}
+                        for zone, price in spot_prices]
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'SpotPriceHistory': rows}), '')
+            if operation == 'create-change-set':
+                created = self.clock.now
+                stack_id = f'active-stack-{len(self.deleted_stacks)}'
+                status = 'CREATE_IN_PROGRESS'
+            if operation == 'describe-stacks' and fake.stack:
+                fake.operations.append(operation)
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [
+                    {'StackStatus': status, 'StackId': stack_id}]}), '')
+            if operation == 'list-stacks':
+                self.assertIn('DELETE_COMPLETE', arguments)
+                fake.operations.append(operation)
+                stack_name = conf.read(self.workload).text('stack_name')
+                summaries = [{'StackName': stack_name, 'StackId': identity, 'StackStatus': 'DELETE_COMPLETE',
+                              'CreationTime': datetime.fromtimestamp(at, UTC).isoformat()}
+                             for identity, (at, _) in self.deleted_stacks.items()]
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'StackSummaries': summaries}), '')
+            if operation == 'describe-stack-events':
+                identity = arguments[arguments.index('--stack-name') + 1]
+                if identity in self.deleted_stacks:
+                    fake.operations.append(operation)
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps({
+                        'StackEvents': self.deleted_stacks[identity][1]}), '')
+            if 'stack-create-complete' in arguments:
+                self.clock.advance(1)
+                if waiter_timeout:
+                    raise subprocess.TimeoutExpired('fixture stack create waiter', timeout)
+                status = 'ROLLBACK_COMPLETE'
+                fake.events.append({'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
+                    'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'No capacity in this zone',
+                    'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat()})
+            if operation == 'delete-stack' and fake.stack:
+                if retain_on_delete:
+                    fake.create_retained()
+                fake.roll_back()
+                self.deleted_stacks[stack_id] = (created, fake.events.copy())
+            return fake(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+
+        def api(settings: aws_config.DeploymentSettings) -> aws_cli.AwsCli:
+            return aws_cli.AwsCli(settings.profile, settings.region, settings.timeout_s, execute)
+
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_api', side_effect=api))
+        return deploy.Deployment(self.settings, self.state, self.root / 'output', clock=self.clock, notify=lambda _event: True)
+
+    def write_leftover(self, subject: deploy.Deployment, *, instance: str = '') -> int:
+        limits = hana_spend.read_settings(conf.read(self.workload))
+        reservation = hana_spend.HanaSpending(self.book, self.settings, limits).reserve_setup(
+            self.clock.now, self.clock.now + limits.permit_max_seconds)
+        assert isinstance(reservation, hana_spend.StartReserved)
+        generation = reservation.exposure.generation
+        self.setup_path.parent.mkdir()
+        saved = {'version': 1, 'deployment': HANA_TAG[1], 'stack': conf.read(self.workload).text('stack_name'),
+                 'region': limits.region, 'requested': True, 'generation': generation,
+                 'template_sha256': 'old-template', 'parameters_sha256': 'old-parameters'}
+        if instance:
+            saved['instance'] = instance
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        self.clock.advance(limits.permit_max_seconds + 1)
+        _ = subject.prepare_hana()
+        return generation
+
+    def assert_spot_price_refusal(self, subject: deploy.Deployment) -> str:
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaises(deploy.DeploymentRefused) as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        call, = self.calls
+        self.assertIn('describe-spot-price-history', call)
+        self.assertIn('us-east-2', call)
+        self.assertIn('--instance-types', call)
+        self.assertIn(conf.read(self.workload).text('instance_type'), call)
+        self.assertNotIn('--availability-zone', call)
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        return str(failure.exception)
+
+    def test_hana_setup_refuses_price_above_ceiling_and_suggests_a_new_ceiling(self) -> None:
+        text_setting(self.workload, 'spot_max_usd_per_hour', '0.15')
+        text_setting(self.workload, 'spot_ceiling_margin', '0.27')
+        subject = self.subject(FakeEc2(), spot_prices=(
+            ('us-east-2a', '0.1610'), ('us-east-2b', '0.1828'), ('us-east-2c', '0.1210')))
+        message = self.assert_spot_price_refusal(subject)
+        self.assertIn('The current Spot price for m7a.2xlarge in us-east-2b is 0.1828 USD/hour.', message)
+        self.assertIn('The ceiling is 0.15 USD/hour.', message)
+        self.assertIn('The cheapest zone is us-east-2c at 0.1210 USD/hour.', message)
+        self.assertIn('use a subnet in the new zone', message)
+        self.assertEqual(message.splitlines()[-3:], [
+            '1. Run /tune hana_aws spot_max_usd_per_hour 0.24',
+            '2. Run deploy.py prepare --workload hana',
+            '3. Run deploy.py hana-setup --approve-resources',
+        ])
+
+    def test_hana_setup_suggests_tuning_the_effective_host_ceiling(self) -> None:
+        key = 'spot_max_usd_per_hour.hana-test'
+        text_setting(self.workload, key, '0.15')
+        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2b', '0.18'),))
+        with mock.patch('socket.gethostname', return_value='hana-test.example'):
+            message = self.assert_spot_price_refusal(subject)
+            _ = conf.editable_line(self.workload, key)
+        self.assertIn('The ceiling is 0.15 USD/hour.', message)
+        self.assertIn(f'1. Run /tune hana_aws {key} 0.23', message.splitlines())
+
+    def test_hana_setup_reports_another_host_override_that_blocks_tune(self) -> None:
+        key = 'spot_max_usd_per_hour'
+        text_setting(self.workload, key, '0.15')
+        text_setting(self.workload, f'{key}.other-host', '0.20')
+        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2b', '0.18'),))
+        with mock.patch('socket.gethostname', return_value='hana-test.example'):
+            with self.assertRaises(conf.Unusable) as refusal:
+                _ = conf.editable_line(self.workload, key)
+            message = self.assert_spot_price_refusal(subject)
+        self.assertIn('The suggested ceiling is 0.23 USD/hour.', message.splitlines())
+        self.assertIn(str(refusal.exception), message.splitlines())
+        self.assertNotIn('/tune hana_aws', message)
+
+    def test_hana_setup_and_the_configuration_validator_refuse_a_zero_margin(self) -> None:
+        key = 'spot_ceiling_margin'
+        source = self.workload.read_text()
+        conf.check(self.workload, key, '0.25')
+        with self.assertRaises(conf.Unusable):
+            conf.check(self.workload, key, '0')
+        _ = self.workload.write_text(source.replace('spot_ceiling_margin=0.25', 'spot_ceiling_margin=0'))
+        subject = self.subject(FakeEc2())
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'positive spot_ceiling_margin'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+
+    def test_hana_setup_continues_at_the_price_ceiling(self) -> None:
+        text_setting(self.workload, 'spot_max_usd_per_hour', '0.15')
+        fake = FakeEc2(fail_wait='stack-create-complete')
+        subject = self.subject(fake, spot_prices=(('us-east-2b', '0.15'),))
+        _ = subject.prepare_hana()
+
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(deploy.HanaCreateRolledBack):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('create-change-set', fake.operations)
+        self.assertIn('hana-setup: The current Spot price for m7a.2xlarge in us-east-2b is 0.15 USD/hour. '
+                      + 'The ceiling is 0.15 USD/hour.', output.getvalue().splitlines())
+
+    def test_hana_setup_refuses_a_zone_with_no_price_and_lists_priced_zones(self) -> None:
+        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2c', '0.14'), ('us-east-2a', '0.15')))
+        message = self.assert_spot_price_refusal(subject)
+        self.assertIn('AWS lists no Spot price for m7a.2xlarge in us-east-2b.', message)
+        self.assertIn('Zones with a price in us-east-2: us-east-2a, us-east-2c.', message)
+
+    def test_hana_setup_refuses_when_the_price_read_fails(self) -> None:
+        subject = self.subject(FakeEc2(fail='describe-spot-price-history'))
+        message = self.assert_spot_price_refusal(subject)
+        self.assertIn('Could not read Spot prices for m7a.2xlarge in us-east-2.', message)
+
+    def policy_update_fixture(self, changes: list[dict[str, object]], *, fail_update: bool = False,
+                              change_status: str = 'CREATE_COMPLETE', next_token: str = '',
+                              execution: Literal['accepted', 'refused', 'timeout', 'unknown'] = 'accepted',
+                              stack_disappears: bool = False, changed_scaler_user: str = '',
+                              live_state: ledger.InstanceState = 'stopped', execution_error: str = '',
+                              admin_spot_error: str = '',
+                              scaler_faults: Mapping[tuple[str, str], str] | None = None,
+                              bad_readback: bool = False) -> tuple[deploy.Deployment, dict[str, str]]:
+        scaler_faults = scaler_faults or {}
+        credentials = self.root / '.config/aws-build/credentials'
+        service_settings = self.root / 'service-aws-target.conf'
+        _ = service_settings.write_text('credentials_profile=fixture-service-scaler\n')
+        original_path = conf.path
+
+        def configuration_path(name: str | Path) -> Path:
+            return service_settings if name == 'aws_target' else original_path(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=configuration_path))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'caller-credentials'), 'AWS_ACCESS_KEY_ID': 'fixture-admin-key',
+            'AWS_SECRET_ACCESS_KEY': 'fixture-admin-secret', 'AWS_SESSION_TOKEN': 'fixture-admin-token',
+            'AWS_PROFILE': 'fixture-admin', 'AWS_MAX_ATTEMPTS': '5', 'AWS_CLI_ERROR_FORMAT': 'json'})))
+
+        updated = False
+        object_body = b''
+
+        def scaler(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                   check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal object_body
+            _ = capture_output, text, timeout, check
+            self.assertEqual({key: value for key, value in (env or {}).items() if key.startswith('AWS_')}, {
+                'AWS_SHARED_CREDENTIALS_FILE': str(credentials), 'AWS_CONFIG_FILE': os.devnull,
+                'AWS_EC2_METADATA_DISABLED': 'true'})
+            self.assertEqual(arguments[:5], ['aws', '--profile', 'fixture-service-scaler', '--region', 'us-east-2'])
+            service, operation = arguments[5:7]
+            phase = 'after' if updated else 'before'
+            self.scaler_calls.append((phase, operation))
+            reply: dict[str, object] = {}
+            dry_run = operation in ('modify-instance-attribute', 'start-instances', 'stop-instances')
+            self.assertEqual('--dry-run' in arguments, dry_run)
+            if operation == 'export-credentials':
+                self.assertEqual(service, 'configure')
+                reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret'}
+            elif operation in ('put-object', 'get-object'):
+                self.assertEqual(service, 's3api')
+                self.assertEqual(arguments[7:11], ['--bucket', 'fixture-bucket',
+                    '--key', f"control/{saved['deployment']}/setup-probe.json"])
+                if operation == 'put-object':
+                    object_body = Path(arguments[arguments.index('--body') + 1]).read_bytes()
+                    self.assertTrue(object_body)
+                else:
+                    _ = Path(arguments[-3]).write_bytes(b'wrong' if bad_readback else object_body)
+            else:
+                self.assertEqual(service, 'ec2')
+                if operation == 'describe-spot-instance-requests':
+                    self.assertEqual(arguments[7:9], ['--spot-instance-request-ids', 'fixture-spot-request'])
+                elif operation in ('describe-instance-attribute', 'modify-instance-attribute'):
+                    self.assertEqual(arguments[7:11], ['--instance-id', 'fixture-box', '--attribute', 'userData'])
+                    if operation == 'describe-instance-attribute':
+                        reply = {'UserData': {'Value': 'Zml4dHVyZQ=='}}
+                    else:
+                        value = arguments[arguments.index('--value') + 1]
+                        self.assertTrue(value.startswith('file://'))
+                        original = Path(value.removeprefix('file://')).read_text()
+                        self.assertEqual(original, '' if (phase, 'describe-instance-attribute') in scaler_faults else 'Zml4dHVyZQ==')
+                else:
+                    self.assertEqual(arguments[7:9], ['--instance-ids', 'fixture-box'])
+            code = scaler_faults.get((phase, operation), 'DryRunOperation' if dry_run else '')
+            if code:
+                action = ''.join(word.title() for word in operation.split('-'))
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    f'aws: [ERROR]: An error occurred ({code}) when calling the {action} operation: private diagnostic')
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output',
+                                    execute=scaler, clock=self.clock, notify=lambda _event: True)
+        prepared = subject.prepare_hana()
+        outputs = {'Instance': 'fixture-box', 'DataVolume': 'fixture-volume', 'ControlBucket': 'fixture-bucket'}
+        saved = remote.read_record(self.setup_path)
+        saved.update(requested=True, generation=1, instance=outputs['Instance'], data_volume=outputs['DataVolume'],
+                     bucket=outputs['ControlBucket'], spot_request='fixture-spot-request',
+                     template_sha256=sha256(b'previous fixture template').hexdigest(),
+                     parameters_sha256=sha256(json.dumps(prepared.parameters, sort_keys=True).encode()).hexdigest())
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
+            clock=self.clock).register(hana_box.DeploymentIdentity(ledger.text(saved, 'deployment'), outputs['Instance'],
+                ledger.text(saved, 'spot_request'), ledger.text(saved, 'region')))
+        stack_reads = 0
+        _ = self.enterContext(mock.patch.object(subject.admin, 'environment', side_effect=lambda: dict(os.environ)))
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal stack_reads, updated
+            _ = capture_output, text, check
+            offset = arguments.index('--region') + 2
+            service, operation = arguments[offset:offset + 2]
+            if service == 'ec2' and operation == 'describe-instances':
+                self.instance_reads.append(list(arguments))
+                self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', outputs['Instance']])
+                reply = {'Reservations': [{'Instances': [{'InstanceId': outputs['Instance'],
+                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state},
+                    'SpotInstanceRequestId': 'sir-0123456789abcdef0'}]}]}
+                return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+            if service == 'ec2' and operation == 'describe-spot-instance-requests' and admin_spot_error:
+                self.assertIn('sir-0123456789abcdef0', arguments)
+                assert env is not None
+                self.assertEqual(env['AWS_CLI_ERROR_FORMAT'], 'json')
+                error_format = env['AWS_CLI_ERROR_FORMAT']
+                if '--cli-error-format' in arguments:
+                    error_format = arguments[arguments.index('--cli-error-format') + 1]
+                stderr = (admin_spot_error if error_format == 'legacy' else
+                          json.dumps({'Code': 'InvalidSpotInstanceRequestID.NotFound', 'Message': admin_spot_error}))
+                return subprocess.CompletedProcess(arguments, 1, '', stderr)
+            self.assertEqual(service, 'cloudformation')
+            self.calls.append(list(arguments))
+            reply = {}
+            if operation == 'describe-stacks':
+                stack_reads += 1
+                if stack_disappears and stack_reads == 2:
+                    return subprocess.CompletedProcess(arguments, 1, '', 'ValidationError: stack does not exist')
+                reply = {'Stacks': [{'StackId': 'fixture-stack-id', 'StackStatus': 'CREATE_COMPLETE',
+                    'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()],
+                    'Parameters': [{'ParameterKey': key, 'ParameterValue': value} for key, value in prepared.parameters.items()]}]}
+            elif operation == 'describe-change-set':
+                effective = dict(prepared.parameters)
+                if changed_scaler_user:
+                    effective['ScalerUser'] = changed_scaler_user
+                reply = {'Status': change_status, 'Changes': [{'ResourceChange': change} for change in changes],
+                         'Parameters': [{'ParameterKey': key, 'ParameterValue': value} for key, value in effective.items()]}
+                if change_status == 'FAILED':
+                    reply['StatusReason'] = "The submitted information didn't contain changes."
+                if next_token:
+                    reply['NextToken'] = next_token
+            elif operation == 'execute-change-set':
+                self.assertIsNotNone(env)
+                assert env is not None
+                self.assertEqual(env['AWS_MAX_ATTEMPTS'], '1')
+                if execution_error:
+                    return subprocess.CompletedProcess(arguments, 1, '', execution_error)
+                if execution == 'refused':
+                    return subprocess.CompletedProcess(arguments, 1, '',
+                        'An error occurred (AccessDenied) when calling the ExecuteChangeSet operation '
+                        + '(reached max retries: 0): Fixture refusal')
+                if execution == 'timeout':
+                    raise subprocess.TimeoutExpired('fixture execution', timeout)
+                if execution == 'unknown':
+                    return subprocess.CompletedProcess(arguments, 0, '[]', '')
+            elif operation == 'wait' and arguments[offset + 2] == 'stack-update-complete':
+                self.assertEqual(remote.read_record(self.setup_path), saved)
+                self.assertEqual(self.scaler_calls, [('before', action) for action in self.PROBE_OPERATIONS])
+                if fail_update:
+                    return subprocess.CompletedProcess(arguments, 1, '', 'fixture update failed')
+                updated = True
+            elif operation not in ('create-change-set', 'execute-change-set', 'delete-change-set', 'wait'):
+                raise AssertionError('Unexpected CloudFormation operation: ' + operation)
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        if admin_spot_error:
+            _ = self.enterContext(mock.patch.object(aws_cli, 'subprocess', SimpleNamespace(run=execute)))
+
+        def admin_api(settings: aws_config.DeploymentSettings, *, single_attempt: bool = False) -> aws_cli.AwsCli:
+            executor = subject.admin.executor(aws_cli.execute_command if admin_spot_error else execute,
+                                              single_attempt=single_attempt)
+            return aws_cli.AwsCli(settings.profile, settings.region, settings.timeout_s, executor)
+
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_api', side_effect=admin_api))
+        return subject, prepared.parameters
+
+    def run_hana_setup_cli(self, subject: deploy.Deployment) -> tuple[int, str, str]:
+        argv = ['deploy.py', 'hana-setup', '--approve-resources']
+        output, errors = StringIO(), StringIO()
+        child = deploy.Deployment(self.settings, self.state, subject.output / 'hana', clock=self.clock)
+        with mock.patch.object(sys, 'argv', argv), redirect_stdout(output), redirect_stderr(errors), \
+                mock.patch.object(deploy, 'Deployment', side_effect=(subject, child)):
+            status = deploy.main()
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_scaler_policy_limits_instance_attribute_changes_to_hana_tags(self) -> None:
+        template = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_text())))
+        policy = ledger.mapping(ledger.mapping(ledger.mapping(template['Resources'])['ScalerPolicy'])['Properties'])
+        statements = ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+        action = 'ec2:ModifyInstanceAttribute'
+        attribute_statements: list[dict[str, object]] = []
+        for row in statements:
+            actions = row.get('Action')
+            if actions == action or (isinstance(actions, list) and action in cast(list[object], actions)):
+                attribute_statements.append(row)
+        statement, = attribute_statements
+        self.assertEqual(statement['Action'], [action])
+        self.assertEqual(statement['Condition'], {
+            'StringEquals': {'ec2:ResourceTag/HanaDeployment': {'Ref': 'DeploymentId'},
+                             'ec2:ResourceTag/Workload': 'hana'},
+        })
+
+    def test_hana_setup_updates_only_iam_policies_and_saves_the_template_hash(self) -> None:
+        subject, parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }])
+        saved = remote.read_record(self.setup_path)
+        evidence = self.book.read_snapshot()
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertFalse(subject.hana_setup())
+            self.assertEqual(self.calls, [])
+            self.assertEqual(self.scaler_calls, [])
+            self.assertEqual(remote.read_record(self.setup_path), saved)
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+
+        lines = [line for line in output.getvalue().splitlines() if line.startswith('hana-setup probe:')]
+        passed = [f'hana-setup probe: {action}: pass' for action in self.PROBE_OPERATIONS]
+        self.assertEqual(lines, ['hana-setup probe: before the policy update', *passed,
+                                 'hana-setup probe: after the policy update', *passed])
+        self.assertEqual(self.scaler_calls,
+                         [(phase, action) for phase in ('before', 'after') for action in self.PROBE_OPERATIONS])
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertEqual(operations, ['describe-stacks', 'describe-stacks', 'create-change-set', 'wait',
+                                     'describe-change-set', 'execute-change-set', 'wait'])
+        for call in self.calls[2:]:
+            self.assertEqual(call[call.index('--stack-name') + 1], 'fixture-stack-id')
+        create = self.calls[operations.index('create-change-set')]
+        self.assertEqual(create[create.index('--change-set-type') + 1], 'UPDATE')
+        values = cast(object, json.loads(create[create.index('--parameters') + 1]))
+        self.assertEqual(values, [{'ParameterKey': key, 'UsePreviousValue': True} for key in parameters])
+        self.assertEqual(remote.read_record(self.setup_path),
+                         {**saved, 'template_sha256': sha256(deploy.HANA_TEMPLATE.read_bytes()).hexdigest()})
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_probe_reports_all_calls_after_a_failed_user_data_read(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], scaler_faults={('before', 'describe-instance-attribute'): 'UnauthorizedOperation'})
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+
+        lines = [line for line in output.getvalue().splitlines() if line.startswith('hana-setup probe:')]
+        passed = [f'hana-setup probe: {action}: pass' for action in self.PROBE_OPERATIONS]
+        before = [line if action != 'describe-instance-attribute' else
+                  'hana-setup probe: describe-instance-attribute: fail (UnauthorizedOperation)'
+                  for action, line in zip(self.PROBE_OPERATIONS, passed, strict=True)]
+        self.assertEqual(lines, ['hana-setup probe: before the policy update', *before,
+                                 'hana-setup probe: after the policy update', *passed])
+        self.assertNotIn('private diagnostic', output.getvalue())
+
+    def test_hana_setup_exits_one_when_the_last_probe_run_has_a_failure(self) -> None:
+        for operation, code, bad_readback in (
+            ('start-instances', 'UnauthorizedOperation', False),
+            ('stop-instances', 'IncorrectInstanceState', False),
+            ('start-instances', '', False),
+            ('get-object', '', True),
+        ):
+            with self.subTest(operation=operation, code=code, bad_readback=bad_readback):
+                self.scaler_calls.clear()
+                subject, _ = self.policy_update_fixture([{
+                    'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                    'Action': 'Modify', 'Replacement': 'False',
+                }], scaler_faults={('after', operation): code}, bad_readback=bad_readback)
+                status, output, errors = self.run_hana_setup_cli(subject)
+                self.assertEqual(status, 1)
+                self.assertEqual(errors, '')
+                after = output.split('hana-setup probe: after the policy update\n')[1]
+                detail = f' ({code})' if code else ''
+                self.assertEqual(after.splitlines(), [f'hana-setup probe: {action}: '
+                    + (f'fail{detail}' if action == operation else 'pass') for action in self.PROBE_OPERATIONS])
+                self.assertEqual(remote.read_record(self.setup_path)['template_sha256'],
+                                 sha256(deploy.HANA_TEMPLATE.read_bytes()).hexdigest())
+
+    def test_hana_setup_discards_non_policy_changes_and_replacements(self) -> None:
+        changes: list[dict[str, object]] = []
+        subject, _parameters = self.policy_update_fixture(changes)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+        kinds = {'Instance': 'AWS::EC2::Instance', 'DataVolume': 'AWS::EC2::Volume', 'ControlBucket': 'AWS::S3::Bucket'}
+        unsafe = [(name, kind, 'Modify', replacement) for name, kind in kinds.items() for replacement in ('False', 'True')]
+        unsafe.extend(('ScalerPolicy', 'AWS::IAM::ManagedPolicy', action, replacement) for action, replacement in (
+            ('Add', 'False'), ('Remove', 'False'), ('Modify', 'True'), ('Modify', 'Conditional'), ('Modify', '')))
+
+        for name, kind, action, replacement in unsafe:
+            with self.subTest(name=name, action=action, replacement=replacement):
+                change: dict[str, object] = {'LogicalResourceId': name, 'ResourceType': kind, 'Action': action}
+                if replacement:
+                    change['Replacement'] = replacement
+                changes[:] = [
+                    {'LogicalResourceId': 'FixturePolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                     'Action': 'Modify', 'Replacement': 'False'},
+                    change,
+                ]
+                self.calls.clear()
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'IAM policy|replacement'):
+                    _ = subject.hana_setup(approve_resources=True)
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertNotIn('execute-change-set', operations)
+                self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+                create = self.calls[operations.index('create-change-set')]
+                delete = self.calls[-1]
+                self.assertEqual(delete[delete.index('--change-set-name') + 1], create[create.index('--change-set-name') + 1])
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+                self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_setup_policy_update_refuses_changed_parameters(self) -> None:
+        subject, parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        text_setting(self.workload, 'spot_max_usd_per_hour', str(Decimal(parameters['SpotMaxPrice']) / 2))
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'parameters or region changed'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_changed_live_parameters(self) -> None:
+        subject, live_parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        live_parameters['ScalerUser'] = 'fixture-other-scaler'
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'live Hana stack parameters differ'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks', 'describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_changed_effective_parameters(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], changed_scaler_user='fixture-new-scaler')
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'change set parameters differ'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+        self.assertNotIn('execute-change-set', operations)
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_a_busy_lifecycle(self) -> None:
+        subject, _ = self.policy_update_fixture([])
+        path = self.setup_path.with_name('lifecycle.json')
+        lifecycle = remote.read_record(path)
+        busy_values: tuple[dict[str, object], ...] = (
+            {'state': 'ready'}, {'claims': [{'execution': 'fixture-claim'}]},
+            {'start': {'token': 'fixture-start'}}, {'operation': {'action': 'start'}},
+        )
+        for values in busy_values:
+            with self.subTest(values=values):
+                self.calls.clear()
+                write_text_atomic(path, json.dumps({**lifecycle, **values}))
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'again when the box is idle'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(self.instance_reads, [])
+                self.assertEqual(self.scaler_calls, [])
+                self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+
+    def test_hana_policy_update_requires_the_live_instance_to_be_stopped(self) -> None:
+        subject, _ = self.policy_update_fixture([], live_state='running')
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'stopped.*again when the box is idle'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual(len(self.instance_reads), 1)
+        self.assertEqual(self.scaler_calls, [])
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+
+    def test_hana_policy_update_requires_saved_identities_and_lifecycle_registration(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = remote.read_record(self.setup_path)
+
+        for key in ('instance', 'data_volume', 'bucket'):
+            with self.subTest(key=key):
+                write_text_atomic(self.setup_path, json.dumps({name: value for name, value in saved.items() if name != key}))
+                self.calls.clear()
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, f'lacks {key}'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        self.setup_path.with_name('lifecycle.json').unlink()
+        self.calls.clear()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'no lifecycle registration'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(remote.read_record(self.setup_path), saved)
+
+    def test_hana_policy_update_refuses_changed_resource_identities(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = remote.read_record(self.setup_path)
+        saved['bucket'] = 'fixture-other-bucket'
+        write_text_atomic(self.setup_path, json.dumps(saved))
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'resource identities changed'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(remote.read_record(self.setup_path), saved)
+
+    def test_hana_policy_update_refuses_stale_preparation(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        self.clock.advance(301)
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'preparation expired'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_changed_region(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        text_setting(self.workload, 'region', 'us-east-1')
+        text_setting(self.workload, 'availability_zone', 'us-east-1b')
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'parameters or region changed'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_a_stack_that_disappears(self) -> None:
+        subject, _parameters = self.policy_update_fixture([], stack_disappears=True)
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'stack is absent'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks', 'describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_a_paginated_change_set(self) -> None:
+        subject, _parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], next_token='fixture-next-page')
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'more than one page'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertIn('--no-paginate', self.calls[operations.index('describe-change-set')])
+        self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+        self.assertNotIn('execute-change-set', operations)
+        create, delete = self.calls[operations.index('create-change-set')], self.calls[-1]
+        self.assertEqual(delete[delete.index('--change-set-name') + 1], create[create.index('--change-set-name') + 1])
+        self.assertEqual(delete[delete.index('--stack-name') + 1], 'fixture-stack-id')
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_empty_and_failed_change_sets(self) -> None:
+        for status in ('CREATE_COMPLETE', 'FAILED'):
+            with self.subTest(status=status):
+                subject, _parameters = self.policy_update_fixture([], change_status=status)
+                saved = self.setup_path.read_bytes()
+                self.calls.clear()
+
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'no changes|failed to create'):
+                    _ = subject.hana_setup(approve_resources=True)
+
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+                self.assertNotIn('execute-change-set', operations)
+                self.assertFalse(any('stack-update-complete' in call for call in self.calls))
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_a_definitely_refused_execution(self) -> None:
+        subject, _parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], execution='refused')
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'AccessDenied'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertEqual(operations[-2:], ['execute-change-set', 'delete-change-set'])
+        execute, delete = self.calls[-2:]
+        self.assertEqual(delete[delete.index('--change-set-name') + 1], execute[execute.index('--change-set-name') + 1])
+        self.assertEqual(delete[delete.index('--stack-name') + 1], 'fixture-stack-id')
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_keeps_a_change_set_with_an_uncertain_execution(self) -> None:
+        for execution in ('timeout', 'unknown'):
+            with self.subTest(execution=execution):
+                subject, _parameters = self.policy_update_fixture([{
+                    'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                    'Action': 'Modify', 'Replacement': 'False',
+                }], execution=execution)
+                saved = self.setup_path.read_bytes()
+                self.calls.clear()
+
+                with redirect_stdout(StringIO()), self.assertRaises(aws_cli.AwsUnavailable):
+                    _ = subject.hana_setup(approve_resources=True)
+
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertEqual(operations[-1], 'execute-change-set')
+                self.assertNotIn('delete-change-set', operations)
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_keeps_the_change_set_without_a_definite_first_attempt_refusal(self) -> None:
+        for error in (
+            'An error occurred (InvalidChangeSetStatus) when calling the ExecuteChangeSet operation (reached max retries: 2)',
+            'An error occurred (AccessDenied) when calling the DescribeChangeSet operation',
+            'An error occurred (InternalFailure) when calling the ExecuteChangeSet operation',
+        ):
+            with self.subTest(error=error):
+                self.calls.clear()
+                subject, _ = self.policy_update_fixture([{
+                    'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                    'Action': 'Modify', 'Replacement': 'False',
+                }], execution_error=error)
+                saved = self.setup_path.read_bytes()
+                with redirect_stdout(StringIO()), self.assertRaises(aws_cli.AwsUnavailable):
+                    _ = subject.hana_setup(approve_resources=True)
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertEqual(operations[-1], 'execute-change-set')
+                self.assertNotIn('delete-change-set', operations)
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_setup_policy_update_failure_prints_the_update_error_and_keeps_the_old_hash(self) -> None:
+        subject, _parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], fail_update=True)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        status, output, errors = self.run_hana_setup_cli(subject)
+
+        self.assertEqual(status, 1)
+        self.assertIn('hana-setup: updating the Hana IAM policy failed after', output)
+        self.assertEqual(errors, 'aws_deploy: fixture update failed\n')
+        self.assertEqual(self.scaler_calls, [('before', action) for action in self.PROBE_OPERATIONS])
+        self.assertEqual(self.calls[-1][self.calls[-1].index('cloudformation') + 1:][:2], ['wait', 'stack-update-complete'])
+        self.assertFalse(any('describe-stack-events' in call or 'delete-stack' in call for call in self.calls))
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_setup_spot_lookup_reports_the_code_with_a_json_error_format_override(self) -> None:
+        subject, _ = self.policy_update_fixture([], admin_spot_error=
+            'An error occurred (InvalidSpotInstanceRequestID.NotFound) when calling the DescribeSpotInstanceRequests operation: '
+            + 'The request sir-0123456789abcdef0 was not found')
+        saved = remote.read_record(self.setup_path)
+        saved['template_sha256'] = sha256(deploy.HANA_TEMPLATE.read_bytes()).hexdigest()
+        write_text_atomic(self.setup_path, json.dumps(saved))
+
+        status, output, errors = self.run_hana_setup_cli(subject)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(errors, 'aws_deploy: describe-spot-instance-requests: fail (InvalidSpotInstanceRequestID.NotFound)\n')
+        self.assertNotIn('sir-0123456789abcdef0', output)
+        self.assertEqual(self.scaler_calls, [])
+
+    def test_failed_hana_create_reports_resource_failure_and_retries_with_changed_ceiling(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
+        subject = self.subject(fake)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaises(aws_cli.AwsUnavailable) as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('Instance (AWS::EC2::Instance): CREATE_FAILED: No capacity in this zone', str(failure.exception))
+        self.assertLess(fake.operations.index('describe-stack-events'), fake.operations.index('delete-stack'))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+
+        ceiling = str(state.hana_compute[0].usd_per_hour / 2)
+        text_setting(self.workload, 'spot_max_usd_per_hour', ceiling)
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'fixture rollback'):
+            _ = subject.hana_setup(approve_resources=True)
+        first, second = [call for call in self.calls if 'create-change-set' in call]
+        self.assertIn('CREATE', first)
+        self.assertIn('CREATE', second)
+        parameters = cast(object, json.loads(second[second.index('--parameters') + 1]))
+        self.assertIn({'ParameterKey': 'SpotMaxPrice', 'ParameterValue': ceiling},
+                      ledger.rows({'parameters': parameters}, 'parameters'))
+
+    def test_failed_hana_cleanup_keeps_the_setup_and_reservation(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete', fail='delete-volume')
+        subject = self.subject(fake)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'did not remove what it made'):
+            _ = subject.hana_setup(approve_resources=True)
+        saved = remote.read_record(self.setup_path)
+        exposure, = self.book.read_snapshot().hana_compute
+        self.assertEqual(saved['generation'], exposure.generation)
+        self.assertIs(saved['requested'], True)
+        self.assertIsInstance(exposure.state, ledger.HanaExposureOpen)
+        self.assertFalse(fake.stack)
+        self.assertTrue(fake.disks)
+        fake.fail = ''
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        storage, = state.hana_storage
+        self.assertEqual(storage.state, ledger.HanaExposureClosed(self.clock.now))
+        charges = ledger.hana_intervals(state, self.clock.now, 0)
+        self.assertEqual(ledger.hana_intervals(state, self.clock.now + 3600, 0), charges)
+
+    def test_hana_create_timeout_before_rollback_keeps_the_setup_and_reservation(self) -> None:
+        fake = FakeEc2(launch_on_execute=True)
+        subject = self.subject(fake, waiter_timeout=True)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'terminal rollback') as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertNotIsInstance(failure.exception, deploy.HanaCreateRolledBack)
+        self.assertTrue(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureOpen)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureOpen)
+        self.assertTrue(fake.stack)
+        self.assertNotIn('delete-stack', fake.operations)
+
+    def test_failed_hana_create_deletes_resources_retained_by_stack_delete(self) -> None:
+        fake = FakeEc2(fail_wait='stack-create-complete')
+        subject = self.subject(fake, retain_on_delete=True)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaises(deploy.HanaCreateRolledBack):
+            _ = subject.hana_setup(approve_resources=True)
+
+        waited = fake.operations.index('wait stack-delete-complete')
+        self.assertGreater(fake.operations.index('delete-volume'), waited)
+        self.assertGreater(fake.operations.index('delete-bucket'), waited)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_setup_clears_a_missing_stack_record_before_creating_again(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
+        _ = fake.launch(tagged=True)
+        created = self.clock.now
+        fake.create_retained()
+        fake.roll_back()
+        self.deleted_stacks['previous-stack'] = (created, fake.events.copy())
+        fake.events.clear()
+        subject = self.subject(fake)
+        previous_generation = self.write_leftover(subject)
+
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'fixture rollback'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('hana-setup: cleared the saved setup for the missing stack', output.getvalue())
+        create = fake.operations.index('create-change-set')
+        self.assertLess(fake.operations.index('wait instance-terminated'), create)
+        self.assertLess(fake.operations.index('delete-volume'), create)
+        self.assertLess(fake.operations.index('delete-bucket'), create)
+        price_read = next(index for index, call in enumerate(self.calls) if 'describe-spot-price-history' in call)
+        bucket_delete = next(index for index, call in enumerate(self.calls) if 'delete-bucket' in call)
+        create_call = next(index for index, call in enumerate(self.calls) if 'create-change-set' in call)
+        self.assertLess(bucket_delete, price_read)
+        self.assertLess(price_read, create_call)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        evidence = self.book.read_snapshot()
+        first, second = evidence.hana_compute
+        self.assertEqual(first.generation, previous_generation)
+        self.assertIsInstance(first.state, ledger.HanaExposureClosed)
+        self.assertGreater(second.generation, previous_generation)
+        self.assertIsInstance(evidence.hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_setup_cleans_up_a_missing_requested_stack_before_image_validation(self) -> None:
+        fake = FakeEc2()
+        fake.create_retained()
+        fake.roll_back()
+        self.deleted_stacks['previous-stack'] = (self.clock.now, fake.events.copy())
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+
+        with mock.patch.object(subject, '_validate_inputs', side_effect=aws_cli.AwsUnavailable('Image is unavailable')), \
+                redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'Image is unavailable'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual(fake.operations[:3], ['describe-stacks', 'list-stacks', 'describe-stack-events'])
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+        self.assertFalse(any('describe-spot-price-history' in call for call in self.calls))
+
+    def test_hana_setup_refuses_to_clear_a_record_without_deleted_stack_evidence(self) -> None:
+        fake = FakeEc2()
+        self.deleted_stacks['older-stack'] = (self.clock.now - 1, [])
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks', 'list-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_down_clears_the_record_and_charges_without_deleted_stack_history(self) -> None:
+        fake = FakeEc2()
+        subject = self.subject(fake)
+        generation = self.write_leftover(subject)
+        self.assertIs(remote.read_record(self.setup_path)['requested'], True)
+        before = self.book.read_snapshot()
+        self.assertIsInstance(before.hana_compute[0].state, ledger.HanaExposureOpen)
+        self.assertIsInstance(before.hana_storage[0].state, ledger.HanaExposureOpen)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+
+        self.assertIn('down --workload hana: no deleted Hana stack since setup started', output.getvalue())
+        self.assertFalse(self.setup_path.exists())
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        after = self.book.read_snapshot()
+        compute, = after.hana_compute
+        storage, = after.hana_storage
+        self.assertEqual(compute.generation, generation)
+        closed = ledger.HanaExposureClosed(self.clock.now)
+        self.assertEqual(compute.state, closed)
+        self.assertEqual(storage.state, closed)
+
+    def test_hana_setup_refuses_a_missing_stack_record_that_names_an_instance(self) -> None:
+        fake = FakeEc2()
+        instance = fake.launch(tagged=True)
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject, instance=instance)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+
 class DeploymentTests(CostFixture):
     now: int = 0
     bundle: Path = Path()
@@ -432,7 +1399,7 @@ class DeploymentTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(box, 'urlopen', side_effect=AssertionError('tests require a fake tailnet transport'))))
-        _ = self.settings.write_text((deploy.TEMPLATE.parents[3] / 'config/aws_target.conf').read_text())
+        _ = write_config_fixture(self.settings)
         self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
         self.bundle.mkdir()
@@ -482,8 +1449,8 @@ class DeploymentTests(CostFixture):
         for key, value in values.items():
             self.replace(key, value)
         gates = self.root / 'cloud_gate.conf'
-        _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
-        text_setting(gates, 'regions', 'us-east-1')
+        _ = write_config_fixture(gates,
+            "regions=us-east-1\nroot_gib=40\nspot_max_usd_per_hour=0.8\nshared_usd_per_month=1\n")
         # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
         _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
                                     re.sub(r'^(spot_quota_request_vcpus)=.*$', r'\1=128', gates.read_text(), flags=re.M), flags=re.M))
@@ -643,6 +1610,16 @@ sys.exit(7)
         self.assertEqual(output.getvalue().splitlines(), [
             'up: updating the stack (can take several minutes)',
             'up: updating the stack done in 2 s'])
+
+    def test_deployment_step_reports_failure_and_reraises(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), mock.patch.object(time, 'monotonic', side_effect=[10.0, 12.0]):
+            with self.assertRaises(KeyboardInterrupt):
+                with deploy.step('up', 'updating the stack', self.settings):
+                    raise KeyboardInterrupt
+        self.assertEqual(output.getvalue().splitlines(), [
+            'up: updating the stack',
+            'up: updating the stack failed after 2 s'])
 
     def test_deployment_step_prints_heartbeat_until_completion(self) -> None:
         self.replace('deploy_progress_interval_s', '0.001')
@@ -885,9 +1862,7 @@ sys.exit(7)
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        shipped = (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_text()
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n')
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
@@ -988,11 +1963,128 @@ sys.exit(7)
         self.assertEqual(ledger.rows(saved, 'regions')[1], west)
         self.assertEqual(saved['instance_types'], ['m7a.8xlarge', 'm7a.4xlarge'])
 
+    def test_gate_up_prints_regional_progress_and_uses_saved_times(self) -> None:
+        subject, _commands = self.gate_fixture()
+        regions = ('us-west-2', 'eu-north-1')
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + ' '.join(regions))
+        clock = [0.0]
+        path = self.state / 'gate-region-times.json'
+        network_action = 'preparing the network and image'
+        stack_action = 'updating the gate stack'
+        network_seconds = (2, 4)
+        stack_seconds = (160, 170)
+        output = StringIO()
+
+        def completed(key: str, action: str, region: str, durations: tuple[int, int]) -> None:
+            index = regions.index(region)
+            self.assertIn(f'cloud-gate: {region}: {action} ({index + 1} of 2)', output.getvalue())
+            if index:
+                saved = ledger.mapping(remote.read_record(path)['seconds'])
+                self.assertEqual(ledger.mapping(saved[key])[regions[0]], durations[0])
+            clock[0] += durations[index]
+
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            completed('network', network_action, region, network_seconds)
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+
+        def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+            completed('stack', stack_action, given.region, stack_seconds)
+            return {'region': given.region}
+
+        for run in range(2):
+            output = StringIO()
+            with (mock.patch.object(subject, 'regional_network', side_effect=network),
+                    mock.patch.object(subject, 'regional_gate_stack', side_effect=stack),
+                    mock.patch.object(time, 'monotonic', side_effect=lambda: clock[0]), redirect_stdout(output)):
+                self.assertTrue(subject.gate_up(approve_resources=True))
+            lines = output.getvalue().splitlines()
+            previous = -1
+            for action, durations, total in ((network_action, network_seconds, 6), (stack_action, stack_seconds, 330)):
+                estimate = f'expected total {total} s from saved regional times' if run else 'expected total is not yet measured'
+                expected = [f'cloud-gate: {action} in 2 regions: {estimate}']
+                for index, region in enumerate(regions):
+                    expected.extend((f'cloud-gate: {region}: {action} ({index + 1} of 2)',
+                                     f'cloud-gate: {region}: {action} done in {durations[index]} s'))
+                for line in expected:
+                    position = lines.index(line)
+                    self.assertGreater(position, previous)
+                    previous = position
+            self.assertEqual(remote.read_record(path), {'version': 1, 'seconds': {
+                'network': dict(zip(regions, network_seconds)), 'stack': dict(zip(regions, stack_seconds))}})
+            network_seconds = (3, 5)
+            stack_seconds = (150, 180)
+
+    def test_regional_time_estimate_uses_the_median_for_an_unmeasured_region(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        _ = path.write_text('{"version": 1, "seconds": {"stack": {"us-west-2": 120, "eu-north-1": 180}}}')
+        timings = deploy.GateRegionTimings.read(self.state)
+        output = StringIO()
+        with redirect_stdout(output):
+            timings.announce(deploy.GateRegionOperation.STACK, ('us-west-2', 'eu-north-1', 'us-east-1'))
+        self.assertEqual(output.getvalue(),
+                         'cloud-gate: updating the gate stack in 3 regions: expected total 450 s from saved regional times\n')
+
+    def test_invalid_regional_times_do_not_supply_an_estimate(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        for contents in ('{', '{}', '{"version": 2}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": -1}}}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": true}}}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": NaN}}}'):
+            with self.subTest(contents=contents):
+                _ = path.write_text(contents)
+                with redirect_stdout(StringIO()) as output:
+                    deploy.GateRegionTimings.read(self.state).announce(deploy.GateRegionOperation.STACK, ('us-west-2',))
+                self.assertEqual(output.getvalue(),
+                    'cloud-gate: updating the gate stack in 1 regions: expected total is not yet measured\n')
+
+    def test_regional_time_overflow_does_not_supply_an_estimate(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        _ = path.write_text(json.dumps({'version': 1, 'seconds': {'stack': {'us-west-2': 10**400}}}))
+        with redirect_stdout(StringIO()) as output:
+            deploy.GateRegionTimings.read(self.state).announce(deploy.GateRegionOperation.STACK, ('us-west-2',))
+        self.assertEqual(output.getvalue(),
+            'cloud-gate: updating the gate stack in 1 regions: expected total is not yet measured\n')
+
+    def test_gate_up_warns_and_continues_when_it_cannot_write_regional_times(self) -> None:
+        subject, _commands = self.gate_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
+        (self.state / 'gate-region-times.json').mkdir()
+        network = deploy.RegionalNetwork('us-west-2', 'fixture-vpc', [], 'fixture-image')
+        with (mock.patch.object(subject, 'regional_network', return_value=network),
+                mock.patch.object(subject, 'regional_gate_stack', return_value={'region': network.region}),
+                redirect_stdout(StringIO()) as output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        warnings = [line for line in output.getvalue().splitlines() if 'warning:' in line]
+        self.assertEqual(warnings, ['cloud-gate: warning: could not write gate-region-times.json'] * 2)
+        manifest = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual([row['region'] for row in ledger.rows(manifest, 'regions')], ['us-east-2', 'us-west-2'])
+
+    def test_gate_up_saves_each_successful_region_before_a_later_region_fails(self) -> None:
+        subject, _commands = self.gate_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2 eu-north-1')
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+        def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+            if given.region == 'eu-north-1':
+                raise aws_target.AwsUnavailable('fixture regional failure')
+            return {'region': given.region}
+        with (mock.patch.object(subject, 'regional_network', side_effect=network),
+                mock.patch.object(subject, 'regional_gate_stack', side_effect=stack), redirect_stdout(StringIO())):
+            with self.assertRaisesRegex(aws_target.AwsUnavailable, 'fixture regional failure'):
+                _ = subject.gate_up(approve_resources=True)
+        saved = ledger.mapping(remote.read_record(self.state / 'gate-region-times.json')['seconds'])
+        self.assertEqual(set(ledger.mapping(saved['network'])), {'us-west-2', 'eu-north-1'})
+        self.assertEqual(set(ledger.mapping(saved['stack'])), {'us-west-2'})
+        manifest = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual([row['region'] for row in ledger.rows(manifest, 'regions')], ['us-east-2', 'us-west-2'])
+
     def test_prices_lists_all_region_type_zone_combinations_without_ids(self) -> None:
         subject = self.deployment()
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
-        _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        _ = write_config_fixture(self.root / 'cloud_gate.conf')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
         gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
@@ -1830,14 +2922,14 @@ sys.exit(7)
         return len(attached) + len(blocks) + len(regional) * (regions - 1)
 
     def test_scaler_user_keeps_two_gate_policies_and_the_budget_block_in_every_region_count(self) -> None:
-        gates = conf.read(deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf')
+        gates = conf.read(self.root / 'cloud_gate.conf')
         for key in ('regions', 'spot_candidate_regions'):
             with self.subTest(regions=len(gates.words(key))):
                 # AWS attaches at most 10 managed policies to one IAM user; the budget block needs a free slot.
                 self.assertEqual(self.scaler_policy_count(len(gates.words(key))), 3)
 
     def test_gate_scaler_policy_for_every_candidate_region_fits_the_managed_policy_size(self) -> None:
-        gates = conf.read(deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf')
+        gates = conf.read(self.root / 'cloud_gate.conf')
         regions = gates.words('spot_candidate_regions')
         partition, account = 'aws', '1' * 12
         values: dict[str, object] = {
@@ -1991,8 +3083,6 @@ sys.exit(7)
         for key in ('VpcId', 'NotificationEmail'):
             self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
         self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
-        self.assertEqual(by_name['GateGpuInstanceTypes']['ParameterValue'],
-                         ','.join(gpu_size_trial.settings().spot_max_usd_per_hour))
         self.assertEqual(by_name['GateRootGiB']['ParameterValue'], '40')
         self.assertEqual(by_name['GateSpotMaxPrice']['ParameterValue'], '0.8')
         saved = remote.read_record(self.state / 'gate-deployment.json')
@@ -2002,6 +3092,19 @@ sys.exit(7)
         after = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
         self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
         self.assertTrue(any('execute-change-set' in args for args in commands))
+
+    def test_gate_setup_grants_and_records_the_sorted_union_of_gpu_trial_types(self) -> None:
+        subject, commands = self.gate_fixture()
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'regions=us-east-2\nhana_gpu_instance_types=g6.2xlarge g4dn.2xlarge\n' +
+            'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.98,"g4dn.xlarge":0.5}')
+        self.assertTrue(subject.gate_up(approve_resources=True))
+        arguments = next(args for args in commands if 'create-change-set' in args)
+        parameters = ledger.rows({'rows': cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))}, 'rows')
+        applied = next(row['ParameterValue'] for row in parameters if row['ParameterKey'] == 'GateGpuInstanceTypes')
+        expected = ['g4dn.2xlarge', 'g4dn.xlarge', 'g6.2xlarge']
+        self.assertEqual(applied, ','.join(expected))
+        self.assertEqual(remote.read_record(self.state / 'gate-deployment.json')['gpu_instance_types'], expected)
 
     def test_gpu_trial_command_requires_approval_and_checks_credentials(self) -> None:
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output')
@@ -2532,6 +3635,7 @@ else: raise AssertionError(args)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'targets=mac,natedev\n')
         self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()

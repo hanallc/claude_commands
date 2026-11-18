@@ -356,7 +356,7 @@ class BuildLogIsolatedTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        settings = "capture_timeout_seconds=1\n"
+        settings = "capture_timeout_seconds=1\nhost=127.0.0.1\ndirty_path_limit=10\n"
         if self._testMethodName == "test_screenshot_busy_past_the_resend_limit_fails":
             settings += "resend_seconds=0.05\n"
         _ = write_config_fixture(self.scratch / "config/hana_shot.conf", settings)

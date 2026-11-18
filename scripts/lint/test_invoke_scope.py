@@ -17,6 +17,7 @@ from typing import cast
 from unittest.mock import patch
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.nix_env_test_support import NixFixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
 
 from scripts.buildlog.cgroup_test_support import write_cgroup
@@ -30,6 +31,8 @@ OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
 
 class VerifyTemporaryParentTests(NixFixture):
     def test_verify_creates_missing_tmpdir_before_environment_loading(self) -> None:
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
+            "patterns.legacy-stable={purpose}\n")
         _ = (self.work / "Cargo.toml").write_text("[workspace]\n")
         missing = self.root / "session with spaces" / "tmp"
         _ = self.envrc(self.work)
@@ -517,12 +520,16 @@ class SweepStartupTests(unittest.TestCase):
             tool.chmod(0o755)
             release = root / "release"
             os.mkfifo(release)
+            configuration = root / "config"
+            environment = config_environment(configuration)
+            _ = write_config_fixture(configuration / "build_folders.conf", "patterns.legacy-stable={purpose}\n")
             reader, writer = os.pipe()
             process = subprocess.Popen(
                 ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
-                env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                env={**os.environ, **environment, "HOME": directory, "TMPDIR": directory,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
                      "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
                      "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
                      "LINT_CONFIG_READER": str(root / "missing-config"), "LINT_SKIP_SWEEP": switch,
@@ -765,6 +772,74 @@ run_once cargo check --workspace
             self.assertIn("target command ran\n", result.stdout)
             self.assertEqual(result.stderr, "")
             self.assertFalse((root / "buildlog").exists())
+
+    def test_cargo_seed_runs_after_admission_and_stays_in_the_step_log(self) -> None:
+        shell = r'''
+events="$TMPDIR/events"
+build_hold_wait_local() { :; }
+build_hold_check_local() {
+    echo hold >> "$events"
+    if [[ "${SEED_OUTPUT:-}" == block && -f "$TMPDIR/seed-started" ]]; then return 2; fi
+}
+buildlog_begin() { BUILDLOG_START="" BUILDLOG_PEAK=""; }
+buildlog_wait_for_memory() {
+    echo admission >> "$events"
+    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME="$1"
+}
+cargo_seed_before_step() {
+    echo seed >> "$events"
+    touch "$TMPDIR/seed-started"
+    if [[ "${SEED_OUTPUT:-}" == yes ]]; then
+        echo "cargo seed: donor=fixture distance=1 bytes=10 seconds=0.001"
+    fi
+}
+cargo_seed_needed() { return 0; }
+buildlog_exec() { echo cargo >> "$events"; }
+buildlog_release_memory() { echo release >> "$events"; }
+buildlog_end() { cp "$2" "$TMPDIR/recorded"; }
+sweep_after_step() { :; }
+run_once "$1"
+'''
+        for admission, notice, status, events in (
+            ("Granted", "yes", 0, ["admission", "hold", "seed", "hold", "cargo", "release"]),
+            ("Granted", "no", 0, ["admission", "hold", "seed", "hold", "cargo", "release"]),
+            ("Granted", "block", 2, ["admission", "hold", "seed", "hold", "release"]),
+            ("LeftQueue", "no", 75, ["admission", "release"]),
+        ):
+            with self.subTest(admission=admission, notice=notice), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result = self.run_invoke(root, shell, [admission], environment={"SEED_OUTPUT": notice})
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual((root / "events").read_text().splitlines(), events)
+                if status == 0:
+                    self.assertEqual("cargo seed: donor=fixture" in (root / "recorded").read_text(), notice == "yes")
+
+    def test_warm_cargo_skips_seed_helper_when_a_build_directory_is_known(self) -> None:
+        shell = r'''
+OSTYPE=linux-gnu
+BUILD_FOLDERS_SCRIPT="$TMPDIR/build_folders.py"
+touch "$TMPDIR/cargo_seed.py"
+cargo_seed_needed "$@"
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            warm = root / "warm"
+            warm.mkdir()
+            other = root / "other"
+            other.mkdir()
+            for output, path, arguments, expected in (
+                ("", str(warm), ["cargo", "check"], 1),
+                ("", str(warm), ["env", "RUSTC_WRAPPER=", "cargo", "check"], 1),
+                (f"digest\t{root}\t{root / 'target'}\t{warm}", "", ["cargo", "check"], 1),
+                (f"digest\t{other}\t{other / 'target'}\t{warm}", "", ["cargo", "check"], 0),
+                ("", str(warm), ["cargo", "check", "--config", "build.build-dir='new'"], 0),
+                ("", str(root / "absent"), ["cargo", "check"], 0),
+            ):
+                with self.subTest(arguments=arguments, path=path):
+                    result = self.run_invoke(root, shell, arguments, cwd=root, environment={
+                        "CARGO_BUILD_BUILD_DIR": path, "BUILDLOG_OUTPUT_ROOTS": output,
+                    })
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
         cases = [

@@ -132,6 +132,8 @@ A regional failure prints its error code and permits other regions to continue.
 Any regional failure makes the command exit with status 1.
 A requested quota does not prove an applied quota.
 
+On the AWS page, expand **How to open the quota cases in AWS** under **Quotas** for the sign-in steps.
+
 `quota-status` reports the applied quotas and their request history without creating a request or writing local state.
 It uses the same regions, quota codes, and encrypted administrator credentials as `quota-request`.
 Each region starts one block with its name as the heading.
@@ -202,8 +204,31 @@ AWS attaches at most 10 managed policies to one IAM user.
 When a regional stack fails, `up` prints the failed resource events of that run.
 `up` deletes a regional stack in `ROLLBACK_COMPLETE` before it deploys that stack again.
 Deployment records each completed regional stack in `gate-deployment.json`.
+`up` prints each region before network and image preparation.
+It prints each region again before the gate stack update.
+Each operation shows its position, elapsed seconds, and the existing progress heartbeat.
+Before each regional loop, `up` estimates its total duration from `gate-region-times.json` in the deployment state folder.
+The record stores the last successful duration for each region and operation.
+The record uses the operation keys `network` and `stack`.
+An unmeasured region uses the median saved duration for that operation.
+Without saved durations, the output says the total is not yet measured.
+Each successful region saves its duration before the next region starts.
+Failed operations do not replace saved durations.
+A failed operation shows `failed after N s`.
+If a timing write fails, `up` prints a warning and continues.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
+
+An unchanged regional request still calls `cloudformation deploy`.
+The AWS CLI creates a change set and waits for its result before it detects an empty change set.
+`--no-fail-on-empty-changeset` controls the exit status; it does not skip this work.
+The deployment wrapper captures the AWS CLI output.
+The regional progress lines therefore show work that was previously silent.
+The regional template has no generated timestamp or UserData.
+The recorded Nix revision belongs to the deployment manifest, not the regional template.
+Local templates alone cannot prove whether AWS created resources, updated resources, or returned an empty change set.
+A future optimization could compare the live template and effective parameters before deployment.
+It must also check the stack status before it skips deployment.
 
 ## Foundation maintenance
 
@@ -429,12 +454,26 @@ The setup command needs no active target or slot capacity.
 7. Confirm that the command reports a stopped box.
 
 `hana-image` converts the image to a raw disk and uploads it to one EBS snapshot with coldsnap.
-`image_upload_tool` names the coldsnap package, and `image_upload_timeout_s` bounds each long stage.
+Coldsnap applies the cost tag with `--tag Key=...,Value=...` during the upload.
+`image_upload_tool` names the coldsnap package.
+`image_upload_timeout_s` bounds each long stage, including the snapshot wait.
+`image_wait_interval_s` sets the minimum interval between snapshot checks.
+The command uses `max(image_wait_interval_s, ceil(image_upload_timeout_s / 255))` as the interval.
+Coldsnap uses `image_upload_timeout_s // interval` attempts within that wait bound and its 255-attempt limit.
+The defaults use a 15-second interval and 240 attempts.
+The command saves the image name and snapshot ID as a pending registration before it waits for the snapshot.
 The command registers the snapshot as an x86_64 image that requires IMDSv2.
+The registration applies the cost tag only to the image.
 It selects the public subnet of the gate VPC in `availability_zone`.
 It saves the image, owner, VPC, and subnet in the local `hana/image.json` record.
-An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses that record.
+An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses only a complete registration record.
 A rerun with the same image build finds the registered image by name and does not upload again.
+If AWS has no image with that name, a rerun waits for the saved pending snapshot and registers it.
+Without a matching pending record, the command checks snapshots owned by the account with a description equal to the image name.
+It saves one completed or pending snapshot as the pending record, then waits for it and registers it.
+It refuses multiple matching snapshots or a snapshot in state `error` and reports the count and states.
+It uploads a new snapshot only when no snapshot matches.
+A wait failure or registration failure keeps the pending record for the next run.
 
 The local plan makes no AWS call.
 Approved setup uses the existing encrypted admin session and progress display.
@@ -445,8 +484,20 @@ The root disk keeps its data while the box is stopped. AWS deletes the root disk
 The Spot request is persistent and uses interruption behavior `stop`.
 Setup confirms the instance, request, and stopped state before registering the lifecycle controller.
 Repeat approved setup after a timeout to read the existing stack and confirm its stop.
+Setup skips the Spot price check when it resumes the existing stack.
 An expired reservation cannot authorize another stack request.
 Changed resource inputs require a separate replacement review.
+
+Before it creates or changes the stack, setup checks the Spot price in the configured zone.
+If the price exceeds the ceiling, setup shows the cheapest zone.
+Setup gives a `/tune` command when the effective ceiling key is editable.
+If the configuration rejects the command, setup reports the error and the suggested ceiling.
+
+If setup gives a `/tune` command:
+
+1. Run the displayed `/tune` command.
+2. Run `deploy.py prepare --workload hana`.
+3. Run `deploy.py hana-setup --approve-resources`.
 
 The image must include the independent Hana guard, watchdog, data mount, and root receiver.
 The Natedev owner must install the files from `hana_guest.render_files()` and `hana_receiver.render_files()`.

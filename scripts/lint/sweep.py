@@ -4106,7 +4106,7 @@ def mac_floor_settings(
     """Read a floor that meets the current admission minimum."""
     if isinstance(mirror_root, UseConfiguredValue):
         mirror_root = MacMirrorRoot.read(settings)
-    if not settings.has_key("sweep_floor_gib"):
+    if "sweep_floor_gib" not in settings.values("sweep_floor_gib", validate=False):
         raise conf.Unusable("mac_test.conf: sweep_floor_gib is missing")
     minimum = settings.number("free_floor_gib")
 

@@ -16,10 +16,13 @@ export HOME="$TEST_DIR/home"
 export PYTHONDONTWRITEBYTECODE=1
 export XDG_CACHE_HOME="$TEST_DIR/cache"
 export XDG_STATE_HOME="$TEST_DIR/state"
-mkdir -p "$HOME/.claude/scripts/lib"
-ln -s "$SCRIPT_DIR/../lib/py" "$HOME/.claude/scripts/lib/py"
-ln -s "$SCRIPT_DIR/../whoami" "$HOME/.claude/scripts/whoami"
-ln -s "$SCRIPT_DIR/../accounts" "$HOME/.claude/scripts/accounts"
+"$SCRIPT_DIR/../lib/py" - "$HOME" <<'PYTHON'
+from pathlib import Path
+import sys
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+_ = copy_helpers(Path(sys.argv[1]), *VERIFY_HELPERS, "scripts/accounts", "scripts/maintenance",
+                 "scripts/astra", "scripts/usage")
+PYTHON
 unset CODEX_HOME
 export CLAUDE_BIN="$TEST_DIR/bin/claude"
 mkdir -p "$TEST_DIR/bin"

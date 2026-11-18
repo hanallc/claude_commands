@@ -11,9 +11,11 @@ from collections.abc import Sequence
 from contextlib import redirect_stdout
 from pathlib import Path, PurePath
 from typing import cast
+from unittest import mock
 
 from scripts.disks import disks_page, measure
 from scripts.lib import file_lock
+from scripts.lib.atomic_file import write_text_atomic
 
 GIB = 1 << 30
 KEEP = 256 << 20
@@ -109,6 +111,144 @@ class MeasureTests(unittest.TestCase):
 
     def data(self, folder: Path) -> measure.DisksData:
         return cast(measure.DisksData, json.loads((folder / disks_page.DATA_FILE).read_text()))
+
+    def test_a_measure_publishes_the_next_generation_before_removing_the_active_file(self) -> None:
+        folder = self.temporary()
+        active = folder / disks_page.ACTIVE_FILE
+        write = write_text_atomic
+
+        def publish(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            write(path, text, new_file_mode=new_file_mode)
+            if path.name == disks_page.DATA_FILE:
+                self.assertEqual(int(active.read_text()), self.data(folder).get("generation"))
+                with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as lock:
+                    self.assertIs(lock, file_lock.LockResult.BUSY)
+                with file_lock.exclusive(folder / disks_page.COORD_FILE, wait=False) as coordination:
+                    self.assertIs(coordination, file_lock.LockResult.BUSY)
+
+        def runner(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(timeout, 30)
+            self.assertEqual(int(active.read_text()), expected)
+            with file_lock.exclusive(folder / disks_page.COORD_FILE, wait=False) as coordination:
+                self.assertIs(coordination, file_lock.LockResult.ACQUIRED)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dust_folder(argv[-1], KEEP)), "")
+
+        read_generation = disks_page.published_generation
+
+        def generation_under_locks(path: Path) -> int:
+            for name in (disks_page.LOCK_FILE, disks_page.COORD_FILE):
+                with file_lock.exclusive(path / name, wait=False) as held:
+                    self.assertIs(held, file_lock.LockResult.BUSY)
+            return read_generation(path)
+
+        for previous, expected in ((None, 1), ({"measured_at": 900}, 1), ({"generation": 7}, 8)):
+            with self.subTest(previous=previous):
+                if previous is not None:
+                    write(folder / disks_page.DATA_FILE, json.dumps(previous))
+                with mock.patch.object(measure, "write_text_atomic", side_effect=publish), \
+                        mock.patch.object(disks_page, "published_generation", side_effect=generation_under_locks):
+                    self.assertEqual(measure.measure(settings(folder, str(folder)), runner, no_floors), 0)
+                self.assertEqual(self.data(folder).get("generation"), expected)
+                self.assertFalse(active.exists())
+
+    def test_a_failed_measure_removes_the_active_file_and_keeps_the_published_generation(self) -> None:
+        folder = self.temporary()
+        published = folder / disks_page.DATA_FILE
+        _ = published.write_text('{"generation":7}\n')
+
+        def fail(mounts: Sequence[str]) -> dict[int, int | None]:
+            self.assertEqual(tuple(mounts), (str(folder),))
+            self.assertEqual((folder / disks_page.ACTIVE_FILE).read_text(), "8\n")
+            raise OSError("the measure failed")
+
+        with self.assertRaisesRegex(OSError, "the measure failed"):
+            _ = measure.measure(settings(folder, str(folder)), floors=fail)
+        self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+        self.assertEqual(self.data(folder).get("generation"), 7)
+        with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+            self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_an_inherited_reservation_keeps_its_generation(self) -> None:
+        folder = self.temporary()
+        lock = file_lock.take_exclusive(folder / disks_page.LOCK_FILE)
+        assert isinstance(lock, file_lock.ExclusiveLock)
+        _ = (folder / disks_page.ACTIVE_FILE).write_text("8\n")
+        _ = (folder / disks_page.DATA_FILE).write_text('{"generation":99}')
+
+        def runner(argv: Sequence[str], _timeout: int) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dust_folder(argv[-1], KEEP)), "")
+
+        with mock.patch.object(disks_page, "published_generation", side_effect=AssertionError("generation selected again")):
+            self.assertEqual(measure.measure(settings(folder, str(folder)), runner, no_floors,
+                                             reservation=measure.MeasureReservation(8, lock)), 0)
+        self.assertEqual(self.data(folder).get("generation"), 8)
+        self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+        with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+            self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_a_failed_reserved_measure_publishes_nothing_and_releases_the_lock(self) -> None:
+        folder = self.temporary()
+        lock = file_lock.take_exclusive(folder / disks_page.LOCK_FILE)
+        assert isinstance(lock, file_lock.ExclusiveLock)
+        _ = (folder / disks_page.ACTIVE_FILE).write_text("1\n")
+
+        def fail(_mounts: Sequence[str]) -> dict[int, int | None]:
+            raise OSError("the measure failed")
+
+        with self.assertRaisesRegex(OSError, "the measure failed"):
+            _ = measure.measure(settings(folder, str(folder)), floors=fail,
+                                reservation=measure.MeasureReservation(1, lock))
+        self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+        self.assertFalse((folder / disks_page.DATA_FILE).exists())
+        with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+            self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_measured_at_records_the_end_of_the_drive_measures(self) -> None:
+        folder = self.temporary()
+        clock = [1000.0]
+
+        def runner(argv: Sequence[str], _timeout: int) -> subprocess.CompletedProcess[str]:
+            clock[0] = 1056.0
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dust_folder(argv[-1], KEEP)), "")
+
+        with mock.patch("scripts.disks.measure.time.time", side_effect=lambda: clock[0]):
+            self.assertEqual(measure.measure(settings(folder, str(folder)), runner, no_floors), 0)
+        self.assertGreaterEqual(self.data(folder)["measured_at"], 1056.0)
+        self.assertGreater(self.data(folder)["render_seconds"], 0)
+
+    def test_a_publish_failure_removes_the_active_file_and_releases_the_lock(self) -> None:
+        folder = self.temporary()
+        write = write_text_atomic
+
+        def publish(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if path.name == disks_page.DATA_FILE:
+                raise OSError("cannot publish")
+            write(path, text, new_file_mode=new_file_mode)
+
+        def runner(argv: Sequence[str], _timeout: int) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dust_folder(argv[-1], KEEP)), "")
+
+        with mock.patch.object(measure, "write_text_atomic", side_effect=publish), \
+                self.assertRaisesRegex(OSError, "cannot publish"):
+            _ = measure.measure(settings(folder, str(folder)), runner, no_floors)
+        self.assertFalse((folder / disks_page.ACTIVE_FILE).exists())
+        self.assertFalse((folder / disks_page.DATA_FILE).exists())
+        with file_lock.exclusive(folder / disks_page.LOCK_FILE, wait=False) as released:
+            self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
+    def test_the_command_adopts_the_reserved_descriptor_and_generation(self) -> None:
+        folder = self.temporary()
+        lock = file_lock.take_exclusive(folder / disks_page.LOCK_FILE)
+        assert isinstance(lock, file_lock.ExclusiveLock)
+        _ = (folder / disks_page.ACTIVE_FILE).write_text("8\n")
+        _ = (folder / disks_page.DATA_FILE).write_text('{"generation":7}')
+        with mock.patch.object(measure, "read_settings", return_value=settings(folder, str(folder))), \
+                mock.patch.object(measure, "measure", return_value=0) as run:
+            try:
+                self.assertEqual(measure.main(["--generation", "8", "--lock-fd", str(lock.descriptor)]), 0)
+                run.assert_called_once_with(settings(folder, str(folder)), reservation=measure.MeasureReservation(8, lock))
+            finally:
+                lock.release()
 
     def test_a_measure_writes_each_drive_with_capacity_floor_and_tree(self) -> None:
         folder = self.temporary()

@@ -91,6 +91,11 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 .tile-note { color: var(--ink-3); font-size: 0.82rem; }
 .section-title { font-size: 1.15rem; margin: 24px 0 4px; }
 #spend .note { margin-top: 12px; }
+#quota-help summary { font-weight: 600; cursor: pointer; }
+#quota-help li + li { margin-top: 4px; }
+#quota-help a { color: var(--ink); overflow-wrap: anywhere; }
+#quota-help p { margin: 0; color: var(--ink-2); }
+#quota-help p + p { margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -115,6 +120,10 @@ __PAGE_TITLE__
 <p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span></p>
 <div id="prices"></div>
 <h2 class="section-title">Quotas</h2>
+<details class="card" id="quota-help">
+  <summary>How to open the quota cases in AWS</summary>
+  __AWS_QUOTA_HELP__
+</details>
 <div id="quotas"></div>
 <section class="card" id="runs">
   <div class="card-head">
