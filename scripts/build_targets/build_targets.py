@@ -186,13 +186,16 @@ def target_state(target: LocalTarget | SshTarget) -> TargetState:
         if isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.build_targets.targets import Free, StateUnreadable, Unreachable
             from scripts.aws_target import hana_box
-            snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+            controller = hana_placement.controller_for(transport, read_only=True)
+            snapshot = controller.inspect()
             if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
                 return StateUnreadable(snapshot.reason)
             if isinstance(snapshot, hana_placement.HanaUnprovisioned):
                 return Unreachable('Hana is unprovisioned')
             if isinstance(snapshot, hana_placement.HanaResourcesHeld):
                 return Unreachable('Hana is busy or recovering')
+            if not controller.image_is_current(snapshot.deployment):
+                return Unreachable(hana_box.HANA_IMAGE_STALE)
             if snapshot.claims or snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
                 return Unreachable('Hana is busy or recovering')
             return Free()
@@ -701,7 +704,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         policy = hana_placement.fixed_policy(transport, str(repo_root), kind)
         if isinstance(policy, hana_placement.HanaStepRefused):
             return ExcludedTarget(target, policy.reason)
-        snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+        controller = hana_placement.controller_for(transport, read_only=True)
+        snapshot = controller.inspect()
         if isinstance(snapshot, hana_placement.HanaUnprovisioned):
             return ExcludedTarget(target, 'unprovisioned')
         if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
@@ -709,6 +713,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         if isinstance(snapshot, hana_placement.HanaResourcesHeld):
             return ExcludedTarget(target, 'busy')
         from scripts.aws_target import hana_box
+        if not controller.image_is_current(snapshot.deployment):
+            return ExcludedTarget(target, hana_box.HANA_IMAGE_STALE)
         if snapshot.claims:
             return ExcludedTarget(target, 'busy')
         if snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):

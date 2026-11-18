@@ -34,7 +34,7 @@ from uuid import uuid4
 
 
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
@@ -435,7 +435,8 @@ def _hana_setup_ownership(saved: dict[str, object]) -> HanaBoxOwnership:
     generation = saved.get('generation')
     resource_fields = ('instance', 'spot_request', 'data_volume', 'bucket')
     text_fields = (*resource_fields, 'deployment', 'region', 'stack', 'parameters_sha256', 'template_sha256')
-    if (type(version) is int and version == 1 and saved.keys() == {*text_fields, 'version', 'requested', 'generation'}
+    ownership_keys = saved.keys() - {'guest_digest'}
+    if (type(version) is int and version == 1 and ownership_keys == {*text_fields, 'version', 'requested', 'generation'}
             and saved['requested'] is True and type(generation) is int and generation >= 0
             and all(isinstance(saved[key], str) and saved[key] for key in text_fields)):
         return HanaBoxOwnership.STACK
@@ -842,6 +843,12 @@ class Deployment:
             instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
             if len(instances) != 1 or instances[0].get('InstanceId') != instance:
                 raise DeploymentRefused('Hana instance confirmation differs')
+            registered = hana_image.saved(self.directory)
+            if (isinstance(registered, hana_image.RegisteredImage) and registered.image == settings.ami_id
+                    and isinstance(registered.digest, hana_render.GuestDigest)):
+                if instances[0].get('ImageId') != registered.image:
+                    raise DeploymentRefused('Setup could not confirm the Hana instance image. Review the saved deployment.')
+                saved['guest_digest'] = registered.digest.value
             request = ledger.text(instances[0], 'SpotInstanceRequestId')
             if saved.get('spot_request', request) != request:
                 raise DeploymentRefused('The Hana Spot request differs from the saved request.')
@@ -961,10 +968,14 @@ class Deployment:
             except DeploymentRefused:
                 raise plan_run.unsupported('the saved Hana setup has an unsupported format') from None
             if ownership != HanaBoxOwnership.STACK:
+                current = hana_image.setup_image_is_current(saved, workload.source)
+                print('Hana image is current.' if current else hana_box.HANA_IMAGE_STALE)
                 raise plan_run.unsupported('Hana uses direct-owned resources')
             self._check_credentials()
             if access is HanaCommandAccess.CONTROLLER_MISSING:
                 raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
+            current = hana_image.setup_image_is_current(saved, workload.source)
+            print('Hana image is current.' if current else hana_box.HANA_IMAGE_STALE)
             plan.confirm_account(limits.region, workload.whole('aws_timeout_s'))
             return self._update_stack_owned_hana(path, saved, workload, limits)
 
@@ -1344,6 +1355,8 @@ class Deployment:
                             // hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS)
         wait_attempts = upload_timeout // wait_interval
         with self._require_hana_control('hana-image'):
+            digest = hana_image.artifact_digest(built.store, self.execute, upload_timeout)
+            description = 'Hana guest digest ' + digest.value
             api = self._api(settings)
             _ = self._guard()
             subnets = [row for row in gate_subnets(api, settings.vpc_id) if row['zone'] == zone]
@@ -1402,7 +1415,7 @@ class Deployment:
                         raise DeploymentRefused('the Hana snapshot wait failed: ' + waited.stderr.strip())
                 with step('hana-image', 'registering the image', self.settings_path):
                     image = ledger.text(api.call(
-                        'register-image', '--name', built.name, '--architecture', 'x86_64',
+                        'register-image', '--name', built.name, '--description', description, '--architecture', 'x86_64',
                         '--virtualization-type', 'hvm', '--ena-support', '--sriov-net-support', 'simple',
                         '--boot-mode', built.boot_mode, '--imds-support', 'v2.0',
                         '--root-device-name', settings.root_device_name, '--block-device-mappings',
@@ -1412,9 +1425,11 @@ class Deployment:
                 images = ledger.rows(api.call('describe-images', '--image-ids', image), 'Images')
             if len(images) != 1 or images[0].get('State') != 'available':
                 raise DeploymentRefused('the registered Hana image is not available')
+            if images[0].get('Description') != description:
+                raise DeploymentRefused('The registered Hana image lacks the matching guest digest. Build a fresh Hana image.')
             path = hana_image.save(self.directory, hana_image.RegisteredImage(
                 built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
-                settings.vpc_id, str(subnets[0]['id'])))
+                settings.vpc_id, str(subnets[0]['id']), digest))
         print(f'Hana image ready. The record is in {path}.')
         return True
 

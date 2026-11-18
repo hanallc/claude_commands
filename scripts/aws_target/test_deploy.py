@@ -27,7 +27,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_spend, ledger, plan_run, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
@@ -952,7 +952,8 @@ class HanaSetupFailureTests(CostFixture):
                               admin_spot_error: str = '',
                               scaler_faults: Mapping[tuple[str, str], str] | None = None,
                               bad_readback: bool = False, volume_device: str = '/dev/sdf',
-                              stack_owned: bool = False) -> tuple[deploy.Deployment, dict[str, str]]:
+                              stack_owned: bool = False, current_guest_image: bool = False
+                              ) -> tuple[deploy.Deployment, dict[str, str]]:
         scaler_faults = scaler_faults or {}
         credentials = self.root / '.config/aws-build/credentials'
         service_settings = self.root / 'service-aws-target.conf'
@@ -1022,6 +1023,8 @@ class HanaSetupFailureTests(CostFixture):
 
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output',
                                     execute=scaler, clock=self.clock, notify=lambda _event: True)
+        if current_guest_image:
+            text_setting(self.workload, 'enabled', 'on')
         prepared = subject.prepare_hana()
         outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template',
                    'LaunchTemplateVersion': '3', 'SecurityGroup': 'fixture-group'}
@@ -1043,6 +1046,8 @@ class HanaSetupFailureTests(CostFixture):
             for key in ('launch_template', 'security_group', 'instance_type'):
                 del saved[key]
             shutil.rmtree(subject.output / 'hana')
+        if current_guest_image:
+            saved['guest_digest'] = hana_render.guest_digest(self.workload).value
         pending_template = template
         write_text_atomic(self.setup_path, json.dumps(saved))
         hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
@@ -1461,8 +1466,7 @@ class HanaSetupFailureTests(CostFixture):
         subject, _ = self.policy_update_fixture([{
             'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
             'Action': 'Modify', 'Replacement': 'False',
-        }], stack_owned=True)
-        text_setting(self.workload, 'enabled', 'on')
+        }], stack_owned=True, current_guest_image=True)
         controller = hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
                                             clock=self.clock)
         path = self.setup_path.with_name('lifecycle.json')
@@ -1516,7 +1520,7 @@ class HanaSetupFailureTests(CostFixture):
         unexpected_aws = mock.Mock(side_effect=AssertionError('Unexpected AWS call'))
         plan = plan_run.PlanRun(unexpected_aws, unexpected_aws, unexpected_aws)
         planned = deploy.Deployment(self.settings, self.state, self.root / 'plan', mode=plan)
-        image = hana_image.BuiltImage('fixture-image', self.root / 'image.raw', 'raw', 'uefi', 1024)
+        image = hana_image.BuiltImage('fixture-image', self.root, self.root / 'image.raw', 'raw', 'uefi', 1024)
         operations: tuple[tuple[str, Callable[[], object]], ...] = (
             ('hana-down', lambda: subject.hana_down(approve_destroy=True)),
             ('hana-image', lambda: subject.hana_image(self.root, approve_resources=True)),

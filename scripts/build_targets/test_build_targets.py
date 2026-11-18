@@ -297,6 +297,7 @@ class StatusTests(IsolatedBuildTargetTest):
         with (mock.patch.object(hana_placement, 'read_execution_transport', return_value=transport),
                 mock.patch.object(hana_placement, 'controller_for', return_value=controller),
                 mock.patch.object(hana_placement, 'fixed_policy', return_value=policy),
+                mock.patch.object(controller, 'image_is_current', return_value=True),
                 ThreadPoolExecutor(max_workers=1) as worker):
             with hana_command_lock(controller.directory) as access:
                 self.assertIs(access, HanaCommandAccess.ACQUIRED)
@@ -313,6 +314,21 @@ class StatusTests(IsolatedBuildTargetTest):
         with redirect_stdout(output), redirect_stderr(errors):
             code = build_targets.command_status(probe)
         return code, output.getvalue(), errors.getvalue()
+
+    def test_status_names_the_stale_hana_image_once(self) -> None:
+        from scripts.aws_target import hana_box, hana_placement
+
+        workload = self.root / 'hana_aws.conf'
+        _ = workload.write_text('execution_transport=hana-control\nhost=aws-hana\n')
+        target = target_config.SshTarget('hana-aws', 'linux', workload)
+        controller = hana_box.HanaController(self.root / 'state', self.root / 'account.conf', workload,
+            hana_box.ProviderNotInstalled())
+        controller.register(hana_box.DeploymentIdentity('fixture', 'fixture', 'fixture', 'fixture'))
+        with (mock.patch.object(build_targets, 'read_targets', return_value=[target]),
+                mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
+            status, output, errors = self.capture_status()
+        self.assertEqual((status, errors), (0, ''))
+        self.assertEqual(output, f'hana-aws: unreachable — {hana_box.HANA_IMAGE_STALE}\n')
 
     def test_mac_idle_alert_prints_first_with_red_only_on_a_terminal(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp())

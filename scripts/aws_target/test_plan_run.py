@@ -11,12 +11,12 @@ import time
 from typing import Literal, cast, final, override
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, ledger, plan_identity, plan_run, test_deploy
+from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_image, hana_render, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
-from scripts.aws_target.test_hana_box import IDENTITY, FakeProvider, write_lifecycle_configuration
+from scripts.aws_target.test_hana_box import IDENTITY, FakeProvider, record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
 from scripts.lib.file_lock import LockResult
 
@@ -277,16 +277,34 @@ class PlanSetupTests(CostFixture):
             reply = {'EvaluationResults': [{'EvalActionName': action, 'EvalResourceName': resource,
                      'EvalDecision': 'implicitDeny' if self.failure == action else 'allowed'}]}
         elif operation == 'describe-instances':
-            instance = {'InstanceId': 'fixture-instance', 'LaunchTime': 'fixture-launch',
+            instance = {'InstanceId': 'fixture-instance', 'LaunchTime': 'fixture-launch', 'ImageId': 'fixture-old-image',
                         'State': {'Name': 'running' if self.failure == 'running' else 'stopped'},
                         'Tags': [{'Key': 'HanaDeployment', 'Value': DEPLOYMENT}, {'Key': 'Workload', 'Value': 'hana'}]}
             reply = {'Reservations': [{'Instances': [instance]}]}
         elif operation == 'describe-volumes':
             reply = {'Volumes': [{'VolumeId': 'fixture-disk', 'Attachments': [
                 {'InstanceId': 'fixture-instance', 'Device': '/dev/sdf', 'State': 'attached'}]}]}
+        elif operation == 'describe-images':
+            reply = {'Images': [{'ImageId': 'fixture-image', 'OwnerId': OWNER.account, 'Architecture': 'x86_64',
+                'State': 'available', 'Name': 'nixos-fixture-release', 'RootDeviceName': '/dev/xvda'}]}
+        elif operation == 'describe-subnets':
+            reply = {'Subnets': [{'VpcId': 'fixture-vpc', 'AvailabilityZone': self.region + 'b'}]}
         else:
             raise AssertionError(operation)
         return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+    def test_registered_current_image_keeps_the_stale_notice_and_policy_plan(self) -> None:
+        self.prepare_hana()
+        workload = conf.path('hana_aws')
+        digest = hana_render.guest_digest(workload)
+        _ = hana_image.save(self.state, hana_image.RegisteredImage(
+            'fixture-name', 'fixture-image', OWNER.account, 'fixture-vpc', 'fixture-subnet', digest))
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 0, output)
+        self.assertEqual(output.splitlines().count(hana_box.HANA_IMAGE_STALE), 1)
+        self.assertNotIn('Plan Hana: Replace the stopped instance', output)
+        self.assertNotIn('Plan Hana: Approved setup cannot apply', output)
+        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
 
     def test_stack_owned_plan_passes_with_the_current_allow_list(self) -> None:
         self.prepare_hana()
@@ -336,7 +354,8 @@ class PlanSetupTests(CostFixture):
             status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 0, output)
         self.assertEqual(blocked, ['get-template', 'simulate-principal-policy'])
-        self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
+        with mock.patch.object(controller, 'image_is_current', return_value=True):
+            self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
 
     def test_hana_down_refuses_while_the_plan_holds_the_box(self) -> None:
         self.prepare_hana()
@@ -371,7 +390,8 @@ class PlanSetupTests(CostFixture):
         workload = conf.path('hana_aws')
         text_setting(workload, 'enabled', 'on')
         controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
-        self.assertIsInstance(controller.request('existing-claim'), hana_box.ClaimCommitted)
+        with mock.patch.object(controller, 'image_is_current', return_value=True):
+            self.assertIsInstance(controller.request('existing-claim'), hana_box.ClaimCommitted)
         with mock.patch.object(time, 'sleep') as pause:
             status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 1, output)
@@ -980,6 +1000,7 @@ shared_usd_per_month=1
         provider = FakeProvider(directory, clock)
         controller = hana_box.HanaController(directory, self.settings, workload, provider, clock=clock)
         controller.register(IDENTITY)
+        _ = record_lifecycle_image(directory, workload)
         self.assertIsInstance(controller.request(claim), hana_box.ClaimCommitted)
         for _step in range(4):
             clock.advance(1)

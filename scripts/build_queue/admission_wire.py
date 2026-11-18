@@ -541,6 +541,7 @@ class Assignment:
     assignment: placement.PlacementAssignment
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -550,6 +551,7 @@ class LocalPlacementGranted:
     grant: Admitted
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)
