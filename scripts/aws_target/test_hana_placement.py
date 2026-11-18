@@ -122,9 +122,9 @@ class HanaPlacementTests(CostFixture):
     @contextmanager
     def preview_calls(self) -> Generator[list[int]]:
         calls: list[int] = []
-        preview = hana_spend.HanaSpending.preview_start
+        preview = hana_spend.HanaSpending[hana_spend.StartPermitSettings].preview_start
 
-        def count(spending: hana_spend.HanaSpending, now: int, expires: int
+        def count(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings], now: int, expires: int
                   ) -> hana_spend.StartAffordable | hana_spend.PermitRefused:
             calls.append(now)
             return preview(spending, now, expires)
@@ -263,7 +263,8 @@ class HanaPlacementTests(CostFixture):
             _ = execution.observe_execution(self.state, request, objects)
         with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
             settled = execution.settle_execution(self.state, request, objects,
-                release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost')
+                release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
+                fence_window=execution.FenceAcknowledgementWindow(0, 1))
         self.assertIsInstance(settled, execution.HanaAdmissionRefusalSettled)
         release.assert_not_called()
         other = replace(self.request(), episode='other')
@@ -438,10 +439,10 @@ class HanaPlacementTests(CostFixture):
     def test_provider_start_rechecks_spending_after_an_allowed_preview(self) -> None:
         self.assertEqual(self.eligibility(), placement.AllowedHost())
         self.assertIsInstance(self.claim(), hana.HanaClaimPending)
-        check_start = hana_spend.HanaSpending.check_start
+        check_start = hana_spend.HanaSpending[hana_spend.PermitSettings].check_start
         checked: list[hana_spend.StartReserved | hana_spend.PermitRefused] = []
 
-        def check(spending: hana_spend.HanaSpending, now: int, generation: int
+        def check(spending: hana_spend.HanaSpending[hana_spend.PermitSettings], now: int, generation: int
                   ) -> hana_spend.StartReserved | hana_spend.PermitRefused:
             self.assertEqual(spending.book.read_snapshot().hana_compute[0].generation, generation)
             self.costs({'daily_limit_usd': '0.01', 'limit_reserve_usd': '0'})

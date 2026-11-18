@@ -156,6 +156,9 @@ Without `tool_setup`, `hana_guest.render_files()` omits `hana-tools.service`.
 Phase F2 supplies the tool setup service.
 
 The NixOS build uses the renderer from its pinned `claude-commands` input.
+`hana_render` puts the guest transfer limit in `receiver.json` and copies the receiver code into the image.
+Update that NixOS input and build the Hana image to install a guest transfer change.
+The box must boot from that image to use the change.
 `scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
 The filter excludes unrelated repository changes from the image inputs.
 The NixOS integration replaces the manually copied guest files.
@@ -547,7 +550,8 @@ User-data changes also require `ec2:Attribute=userData`.
 EC2 describe actions use the required wildcard resource.
 Object reads and writes apply only to this deployment's control prefix.
 No guest instance role or SSH key is created.
-Every provider AWS request uses the configured `aws_timeout_s` bound.
+Small provider requests use `aws_timeout_s`.
+Source uploads and result downloads have separate limits.
 Provider errors expose safe action names rather than cloud identifiers or signed URLs.
 
 The provider persists its operation before dispatch and holds a separate mutation lock.
@@ -1328,7 +1332,8 @@ Existing configuration values remain unchanged.
 | `ami_owner_id` | Empty | Require the reviewed image owner. |
 | `vpc_id` | Empty | Require an explicit network. |
 | `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
-| `aws_timeout_s` | `10` | Bound each provider and receiver request. |
+| `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
+| `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
 
@@ -1355,11 +1360,13 @@ A typed `MissingBasis` answer clears that repository's basis before a complete b
 `AwsSourceObjects` implements the typed object boundary through the existing provider.
 It uses conditional `PutObject` and signed `GetObject` access under `source/<deployment>/`.
 The scaler policy grants only `s3:PutObject` and `s3:GetObject` for that deployment's source prefix.
-Each AWS call uses `aws_timeout_s`.
+The sender bounds the 1 GiB source bundle upload with `source_upload_timeout_s` (300 seconds).
+Credential export uses `aws_timeout_s` (10 seconds).
 The guest receives no AWS credentials.
 
 `hana_source.materialize` bounds the download, verifies sha256 and Git prerequisites, checks the advertised commit, and fetches verified objects.
 Curl enforces the total download timeout and maximum file size.
+The guest bounds the source bundle download with `source_download_timeout_s` (120 seconds).
 The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
 The shared maker allocates mirror metadata and temporary bundle files.
 `build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
@@ -1371,6 +1378,36 @@ Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots
 Those values remain unset until the user approves them.
 The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
 Phase F2 will deliver manifests and execute commands with inherited slot locks.
+
+## Hana result transport
+
+The guest sends `result.json` with both compiler output streams and the command status.
+The JSON limit is 32 MiB.
+The guest and sender use `result_transfer_timeout_s` for the upload and download.
+The guest uses curl for the upload and keeps the signed URL out of process arguments.
+The receiver starts curl as a child process with `--max-time`.
+It checks the child once per pass while it continues to read permits and fences.
+The controller starts permit renewal with 105 seconds left under the default settings.
+The separate watchdog can stop the guest before a 120-second upload ends.
+The receiver reads and processes the fence before the permit in every pass.
+A control step can fail during a read, a write, decoding, or validation.
+The receiver continues to process the other control requests in the same pass.
+A fence sends SIGKILL to the upload process and reaps it before the receiver acknowledges the fence.
+The receiver records an upload attempt before the PUT and records its result before it publishes the observation.
+After a restart, the receiver records an unconfirmed upload as `HanaResultUploadFailed` and reports the loss.
+Command and fence documents and execution observations have a 64 KiB protocol limit.
+They use `aws_timeout_s` (10 seconds).
+The guest publishes the terminal observation after the result upload completes or the receiver records a loss.
+The guest checks the expiry of the boot URLs and the attempt URLs before starting an upload.
+The sender reads the boot expiry from the saved bootstrap record.
+The guest and sender reserve 161 seconds under the default settings for fence settlement.
+The sender polls for the exact fence acknowledgement at the control poll interval.
+It polls after every fence PUT attempt, including when S3 returns an error status.
+The sender retains the claim if the window ends before it confirms the fence, command termination, and lease release.
+The offload reports a loss if the transfer cannot fit, times out, or the guest cannot confirm its PUT.
+The offload requires an accepted result before it reports a build verdict.
+The sender also works with older guests.
+Older guests upload results with the 10-second control timeout.
 
 ## Hana placement adapter
 
@@ -1404,6 +1441,7 @@ An exact guest observation can settle an accepted execution that ended without a
 The observation must confirm termination and lease release, and the sender must have issued no source update.
 The sender uses the guest cause when it is available and keeps a specific sender rejection if the guest reports a pending result.
 For other confirmed departures, the sender attempts to release the claim without another fence observation.
+The sender requires a fence acknowledgement after a result transfer loss or when it resumes an unsettled fence.
 The sender uses the refusal code from a new image to report `HanaCommandAdmissionRefused`.
 For the old image, the sender recognizes only the exact reason `The data mount and a fresh permit are required`.
 The refusal proves the command did not start.

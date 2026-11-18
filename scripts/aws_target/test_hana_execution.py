@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 from typing import cast, final, override
@@ -34,6 +35,10 @@ class FakeExecutionObjects:
     missing_basis: bool = False
     source_updated: bool = False
 
+    def boot_control_deadline(self, key: result.HanaAttemptKey) -> int:
+        assert key == self.request.key
+        return 10**10
+
     def execution_access(self, key: result.HanaAttemptKey) -> execution.HanaExecutionAccess:
         assert key == self.request.key
         return execution.HanaExecutionAccess('https://bucket.s3.us-east-2.amazonaws.com/observation',
@@ -56,13 +61,15 @@ class FakeExecutionObjects:
             self.source_updated = True
         else:
             if self.fail_fence:
-                raise RuntimeError('The fence publication failed')
+                raise RuntimeError('The fence PUT failed')
             self.fenced = True
             self.terminated = True
             self.lease_free = self.release_lease
 
-    def observe_execution(self, key: result.HanaAttemptKey) -> execution.HanaCommandObservation:
+    def observe_execution(self, key: result.HanaAttemptKey, *,
+                          timeout_s: float | None = None) -> execution.HanaCommandObservation:
         assert key == self.request.key
+        assert timeout_s is None or timeout_s > 0
         if self.fail_observation:
             raise RuntimeError('The observation failed')
         evidence = (placement.ObservedExecution(placement.ProcessExecution('fixture-host',
@@ -129,9 +136,18 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
         return True
 
-    def settle(self, *, cancelled: bool = False) -> execution.HanaSettlement:
-        return execution.settle_execution(self.root, self.request, self.objects, release_claim=self.release,
-                                           reason='The remote attempt ended', cancelled=cancelled)
+    def settle(self, *, cancelled: bool = False, reason: str = 'The remote attempt ended') -> execution.HanaSettlement:
+        current = 1000.0
+
+        def advance(seconds: float) -> None:
+            nonlocal current
+            current += seconds
+
+        window = execution.FenceAcknowledgementWindow(1001, 1)
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: current),
+              mock.patch.object(time, 'sleep', side_effect=advance)):
+            return execution.settle_execution(self.root, self.request, self.objects, release_claim=self.release,
+                reason=reason, fence_window=window, cancelled=cancelled)
 
     def command_result(self, status: int = 0) -> result.HanaCommandResult:
         return result.HanaCommandResult(self.key, self.source_key.key, self.manifest.commit, self.manifest.toolchain,
@@ -221,12 +237,38 @@ class HanaExecutionTests(unittest.TestCase):
         _ = self.dispatch()
         self.objects.fail_fence = True
         self.assertIsInstance(self.settle(), execution.HanaSettlementPending)
+        observation = replace(self.objects.observe_execution(self.key), terminated=True, lease_free=True,
+                              evidence=placement.ExecutionEvidenceUnavailable(execution.COMMAND_RESULT_PENDING, 1000))
+        with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
+            _ = execution.observe_execution(self.root, self.request, self.objects)
+        self.assertIsInstance(self.settle(), execution.HanaSettlementPending)
         self.objects.fail_fence = False
         self.objects.fail_observation = True
         self.assertIsInstance(self.settle(), execution.HanaSettlementPending)
         self.objects.fail_observation = False
         self.objects.release_lease = False
-        self.assertIsInstance(self.settle(), execution.HanaSettlementPending)
+        current = 1000.0
+        timeouts: list[float | None] = []
+        observe = self.objects.observe_execution
+
+        def observe_held_lease(key: result.HanaAttemptKey, *,
+                               timeout_s: float | None = None) -> execution.HanaCommandObservation:
+            timeouts.append(timeout_s)
+            return observe(key, timeout_s=timeout_s)
+
+        def advance(seconds: float) -> None:
+            nonlocal current
+            current += seconds
+
+        with (mock.patch.object(time, 'monotonic', side_effect=lambda: current),
+              mock.patch.object(time, 'sleep', side_effect=advance),
+              mock.patch.object(self.objects, 'observe_execution', side_effect=observe_held_lease)):
+            window = execution.FenceAcknowledgementWindow(1002.5, 1)
+            self.assertIsInstance(execution.settle_execution(self.root, self.request, self.objects,
+                release_claim=self.release, reason='The remote attempt ended', fence_window=window),
+                execution.HanaSettlementPending)
+        self.assertEqual(timeouts, [2.5, 1.5, 0.5])
+        self.assertEqual(current, window.deadline)
         self.assertEqual(self.releases, 0)
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
         self.objects.release_lease = True
@@ -285,8 +327,7 @@ class HanaExecutionTests(unittest.TestCase):
             rejected = execution.accept_result(self.root, self.request, result.encode_result(replaced),
                                                'fixture-host', lambda: self.source_key)
             assert isinstance(rejected, result.RejectedHanaResult)
-            settled = execution.settle_execution(self.root, self.request, self.objects,
-                                                  release_claim=self.release, reason=rejected.reason)
+            settled = self.settle(reason=rejected.reason)
             assert isinstance(settled, execution.HanaGuestEndedWithoutResult)
             self.assertEqual(settled.outcome, placement.AttemptDeclined('The Hana attempt or host generation changed'))
         decision = execution.accept_result(self.root, self.request, result.encode_result(self.command_result()),
