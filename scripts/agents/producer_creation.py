@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 from scripts.agents import pane_record, remote
 from scripts.lib import atomic_file, models_registry, registry_rows
+from scripts.lib import names as display_names
 from scripts.production import staff
 
 SECTION = "producer_creations"
@@ -43,8 +44,16 @@ def operation(name: str) -> Generator[None]:
         yield
 
 
+def recovery_command(*arguments: str) -> str:
+    loaded = display_names.runtime_names()
+    if isinstance(loaded, display_names.Names):
+        return shlex.join([loaded.audience("agents"), *arguments])
+    scripts = Path(__file__).resolve().parents[1]
+    return shlex.join([str(scripts / "lib/py"), str(scripts / "agents/shutdown.py"), *arguments])
+
+
 def retry(name: str) -> str:
-    return shlex.join(["agents", "add-producer", name])
+    return recovery_command("add-producer", name)
 
 
 @dataclass(frozen=True)

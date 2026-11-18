@@ -482,10 +482,10 @@ def _confirm_producer_opening(request: ProducerFirstStart, opening: PendingProdu
         cursor_type = CodexProducerPromptCursor if pending.kind == "codex" else herdr.TranscriptCursor
         cursor = cursor_type(transcript, opening.since)
         text = f"Read ~/rust/hanadocs/{request.name}/README.md, then run /producer:produce."
-        recovery = shlex.join(["agents", "resume", request.name, "--resend-opening-prompt"])
 
         def reason(state: UnprovedCodexRollout) -> str:
             if state.malformed:
+                recovery = producer_creation.recovery_command("resume", request.name, "--resend-opening-prompt")
                 return f"{state.reason}. Check the pane, then run {recovery} if the prompt is absent."
             return state.reason
 
