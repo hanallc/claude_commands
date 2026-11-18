@@ -549,6 +549,10 @@ Quoted log values preserve line endings as JSON escapes.
 
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking sets a time without changing the state.
+The List hides an item with unanswered questions while each send is pending or successful.
+If any unanswered question needs a resend, the item appears with its resend control.
+The `the_list.py list` command still shows the item.
+The producer uses `the_list.py answer` to save an answer and mark the item unread.
 ETA accepts an offset ISO time, two such times separated by `/`, or `Not asked`, `Pending`, `Paused`, or `Delivered`.
 ETA also accepts a text description when a time or status cannot express the estimate.
 The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
