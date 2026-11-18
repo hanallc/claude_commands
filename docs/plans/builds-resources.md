@@ -2631,7 +2631,7 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** `scripts/build_queue/admission_test_support.py`, `scripts/build_queue/test_admission_service.py`.
 
-### Phase 136 — Every worker that a hold stops gets the release notice  · status: todo
+### Phase 136 — Every worker that a hold stops gets the release notice  · status: done
 **Source:** builds showrunner 2026-11-16 15:5x. The cables hold (11:36-11:43 EST, cycle `b4237a138a894d32b7ca989c90bb0839`) stopped an aws Codex worker's run. The worker ended its turn to wait for the release notice and sat idle until 15:50. The cycle's 24 recipients include the aws director `be0d886f` (Delivered) and no aws worker thread (`01a1…`).
 **Depends on:** Phase 8 (installed writers), Phase 129 (the stop ends the command group; the supervisor delivers the stopped result).
 
