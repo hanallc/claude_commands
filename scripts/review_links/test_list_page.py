@@ -92,11 +92,13 @@ class ListPageTests(unittest.TestCase):
 
     def test_bulk_controls_show_lucide_icons_and_accessible_labels(self) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
-        header = markup.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
-        for label, icon in (("Expand all", "chevrons-up-down"), ("Collapse all", "chevrons-down-up")):
+        controls = markup.split('<div class="list-expansion">', 1)[1].split('</div>', 1)[0]
+        for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
+                                    ("collapse", "Collapse all", "chevrons-down-up")):
             with self.subTest(label=label):
-                self.assertRegex(header, rf'<button\b[^>]*aria-label="{label}"[^>]*>\s*<svg\b')
-                control = header.split(f'aria-label="{label}"', 1)[1].split('</button>', 1)[0]
+                self.assertRegex(controls, rf'<button\b[^>]*aria-label="{label}"[^>]*>\s*<svg\b')
+                self.assertIn(f'id="list-{action}-all" data-list-expansion="{action}"', controls)
+                control = controls.split(f'aria-label="{label}"', 1)[1].split('</button>', 1)[0]
                 self.assertIn(f'title="{label}"', control)
                 self.assertIn(f'class="lucide lucide-{icon}"', control)
 
@@ -1172,7 +1174,7 @@ document.body.append(result);
         self.assertEqual(body.count('<tbody data-list-item'), 6)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
-        controls = body.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
+        controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
         self.assertNotIn('<select', controls)
         self.assertEqual(controls.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
@@ -1181,7 +1183,7 @@ document.body.append(result);
             self.assertRegex(controls, f'data-filter-value="{value}"[^>]*>{label}<b>')
         self.assertRegex(controls, f'data-filter-value="{OWNER.id}"[^>]*>sdlc<b>')
         self.assertRegex(controls, f'data-filter-value="{OTHER.id}"[^>]*>builds<b>')
-        producers = markup.split('data-filter-row="producer"', 1)[1].split('<span data-list-count', 1)[0]
+        producers = markup.split('data-filter-row="producer"', 1)[1].split('<p data-missing-item', 1)[0]
         choices: list[tuple[str, str]] = []
         for match in re.finditer(r'<button\b[^>]*>.*?</button>', producers, re.DOTALL):
             button = ElementTree.fromstring(match.group())
@@ -3656,14 +3658,42 @@ const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [d
 const select=(name,value)=>chip(name,value).click();
 const selectedChip=name=>document.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
 const count=(name,value)=>Number(chip(name,value).querySelector('b').textContent);
+const bulk=action=>document.querySelector('.list-table-tools [data-list-expansion="'+action+'"]');
 const search=value=>new Promise(done=>{
  const field=document.getElementById('list-search');
  field.addEventListener('filterchange',done,{once:true});field.value=value;field.dispatchEvent(new Event('input'));
 });
 try{
  await flush();
+ const tools=document.querySelector('.list-table-tools'),table=tools.nextElementSibling;
+ const countLine=tools.querySelector('[data-list-count]');
+ const bounds=element=>element.getBoundingClientRect();
+ const center=rect=>(rect.top+rect.bottom)/2;
+ const near=(a,b)=>Math.abs(a-b)<1;
+ const expand=bounds(bulk('expand')),collapse=bounds(bulk('collapse')),shown=bounds(countLine);
+ check(table.matches('.list-table') && bounds(tools).bottom<=bounds(table).top,
+       'The controls and count sit directly above the table.');
+ check(near(expand.left,bounds(table).left) && near(shown.right,bounds(table).right) &&
+       near(center(expand),center(collapse)) && near(center(expand),center(shown)) && expand.right<collapse.left,
+       'The two buttons and the right-aligned count share one row.');
+ check(countLine.textContent.startsWith('3 of 6 items shown') && countLine.getAttribute('role')==='status',
+       'The count in the row reports the visible items.');
+ for(const action of ['expand','collapse']){
+  const button=bulk(action),box=bounds(button),icon=bounds(button.querySelector('svg'));
+  const minimum=innerWidth<960 ? 32 : 24;
+  check(box.width>=minimum && box.height>=minimum && box.width<36 && box.height<36 &&
+        icon.width>=16 && icon.height>=16 && icon.left>box.left && icon.right<box.right &&
+        icon.top>box.top && icon.bottom<box.bottom,'The small button fits its icon and has a hit area.');
+  const hit=document.elementFromPoint(box.left+3,center(box));
+  check(button.contains(hit),'The button accepts a click near its edge.');
+ }
+ check(expand.left>=0 && shown.right<=innerWidth && collapse.right<shown.left &&
+       document.documentElement.scrollWidth<=innerWidth,'The row fits without clipping or horizontal overflow.');
  if(innerWidth>=960){
-  check(document.querySelector('main').getBoundingClientRect().width===1124,'the desktop uses the shared column width');
+  check(bounds(document.querySelector('main')).width===Math.min(1124,document.documentElement.clientWidth),
+        'The desktop uses the available width up to the shared limit.');
+  check(collapse.right<=bounds(document.querySelector('[data-sort="0"]').closest('th')).right,
+        'Both buttons sit above the number column.');
   for(const header of document.querySelectorAll('[data-sort]')){
    const label=document.createRange();label.selectNodeContents(header.firstChild);
    check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
@@ -3786,10 +3816,10 @@ try{
  check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
  check(refreshed!==selected,'refresh replaces the row');
- document.querySelector('[aria-label="Expand all"]').click();
+ bulk('expand').click();
  check(visible().length===2 && visible().every(row=>!row.querySelector('[data-detail]').hidden),
   'Expand all opens both matching rows after refresh');
- document.querySelector('[aria-label="Collapse all"]').click();
+ bulk('collapse').click();
  check(visible().length===2 && visible().every(row=>row.querySelector('[data-detail]').hidden),
   'Collapse all closes both matching rows after refresh');
  refreshed.querySelector('.list-toggle').click();
@@ -3874,7 +3904,7 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
 })();</script>'''
         for name, identity in (("OWNER", OWNER.id), ("DWIGHT", DWIGHT.id), ("MORTY", MORTY.id)):
             probe = probe.replace(name, json.dumps(identity))
-        for width in (1440, 390):
+        for width in (1440, 961, 390):
             with self.subTest(width=width):
                 for identity in ("L105", "L106"):
                     _ = the_list.update(MORTY.id, identity,

@@ -611,15 +611,18 @@ def render(root: Path, *, include_counts: bool = True,
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
                + '<div data-record-filters><div class="list-toolbar">'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
-               + '<div class="list-expansion">' + expansion + '</div></div>'
+               + '</div>'
                + record_table.chip_row('Show', shows, 'open')
                + record_table.chip_row('State', states, 'all')
                + record_table.chip_row('Owner', owners, 'all')
                + record_table.chip_row('Producer', producers, 'all')
-               + '<span data-list-count role="status" aria-live="polite"></span></div>'
+               + '</div>'
                + '<p data-missing-item role="status" hidden></p>'
                + '<p data-hidden-action-status role="status" hidden></p>'
-               + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:6%"><col style="width:8%">'
+               + '<div class="list-table-tools"><div class="list-expansion">' + expansion + '</div>'
+               + '<span data-list-count role="status" aria-live="polite"></span></div>'
+               + '<div class="list-table"><table aria-label="The List"><colgroup><col class="list-number-column">'
+               + '<col style="width:8%">'
                + '<col style="width:10%"><col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
                + '<col style="width:8%"></colgroup><thead><tr>' + headers + '</tr></thead>'
                + ''.join(item_rows(entry, members, today, index, secret, reviews, status, names)
@@ -629,11 +632,15 @@ def render(root: Path, *, include_counts: bool = True,
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
-.list-toolbar{display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-bottom:10px}
+.list-toolbar{display:flex;justify-content:flex-end;align-items:center;margin-bottom:10px}
 .list-toolbar .record-filter-words{min-width:0;margin:0}
-.list-expansion{display:flex;gap:6px}
-.list-expansion button{justify-content:center;width:36px;padding:0;cursor:pointer}
-.list-expansion svg{width:18px;height:18px}
+.list-table-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.list-table-tools [data-list-count]{min-width:0;color:var(--ink-2);font-size:13px;text-align:right;overflow-wrap:anywhere}
+.list-number-column{width:6%}
+@media(960px < width <= 1100px){.list-number-column{width:62px}}
+.list-expansion{display:flex;flex:none;gap:6px}
+.list-expansion button{box-sizing:border-box;display:grid;place-items:center;width:26px;height:26px;min-height:0;padding:0;cursor:pointer}
+.list-expansion svg{width:16px;height:16px}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-actions{position:relative}.list-park>[data-later-menu]{left:0;right:auto}
 .list-table:has(.list-park>[data-later-menu]:not([hidden])),
@@ -649,6 +656,7 @@ STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 @media(max-width:960px){
+.list-expansion button{width:34px;height:34px}
 .list-table .list-row td[data-label="Producer"]{font-size:inherit}.list-table .list-row td[data-label="Item"]{font-size:17px}
 .list-table .list-row td[data-label="State"]::before{content:none}
 .list-table [data-keeper-produces=true] .list-row td[data-label="Producer"]{display:none}
