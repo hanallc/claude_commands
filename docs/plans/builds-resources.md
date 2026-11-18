@@ -2790,12 +2790,11 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 149 — The queue-place scope test does not depend on load  · status: done
 
-Builds 11-18: `scripts/build_queue/test_queue_place.py` `test_scope_is_published_at_popen_return_and_survives_holder_death` (line 1428, `assert_scope_survives_holder_death(leader_exits=False)`) is flaky on main `9021efe4b`: full module 3 times gave OK, FAILED (1), OK; the failed run took 66 s against 24 s.
+#### As-built
 
-1. Reproduce under a CPU quota and name the exact wait or race that fails.
-2. If the wait is a real defect in `queue_place`, repair the code. Otherwise remove the timing dependence from the test.
-3. Prove with repeated full-module runs under a CPU quota.
+- Cause: `test_scope_is_published_at_popen_return_and_survives_holder_death` killed the holder before the program wrote its record. `cleanup_program_starts` then correctly stopped the program, because `QueuePlace.popen` makes the caller the holder. Under load the kill came early, so the test failed. `queue_place.py` has no defect and is unchanged.
+- The test checks the sidecar at `popen` return and waits for the program's full `ready` line before it kills the holder. Event waits use `TEST_HANG_GUARD_SECS`; the orphan-slice sweep keeps its 10-second limits. The scope mocks stay until the admission thread stops.
+- Proof: 10/10 full-module runs (47 tests) at 25% CPU, one run with `PYTHONUNBUFFERED=1`, and on the row 6/6 runs in the empty-home and gate layouts at 25% CPU with 0 tripwire calls.
+- Row on main `a66d4f0c8`: `a2fedffde`. Checkpoint `3466c8911`.
 
 **Files:** `scripts/build_queue/test_queue_place.py`.
-
-Result: the failure was a test race, not a `queue_place` defect. Orphan cleanup correctly stops a program whose holder died before the program record existed. The test now waits for the program's full `ready` line before it kills the holder, and checks the sidecar at `popen` return. Event waits use `TEST_HANG_GUARD_SECS`. The scope mocks stay until the admission thread stops. Proof: 10/10 full-module runs (47 tests) at 25% CPU, and one run with `PYTHONUNBUFFERED=1`.
