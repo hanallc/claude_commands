@@ -332,11 +332,10 @@ class PlanRun:
         tags = {ledger.text(row, 'Key'): ledger.text(row, 'Value') for row in ledger.rows(rows[0], 'Tags')}
         if any(tags.get(key) != value for key, value in expected.items()):
             raise PlanRefused('The live Hana instance tags differ from the setup record.')
-        print('plan guard: Hana instance tags passed', flush=True)
         simulate('ec2:DescribeInstances')
         for action in ('ec2:DescribeSpotInstanceRequests', 'ec2:DescribeInstanceAttribute'):
-            print(f'plan Hana scaler: {action} simulation only', flush=True)
             simulate(action)
+            print(f'plan Hana scaler: {action} simulation only', flush=True)
         context = {'ec2:ResourceTag/' + key: tags[key] for key in tags}
         owner = self.credential.owner
         resource = f'arn:{owner.partition}:ec2:{api.region}:{owner.account}:instance/{instance}'
@@ -347,6 +346,26 @@ class PlanRun:
         key = f'control/{deployment}/setup-probe.json'
         for action in ('s3:PutObject', 's3:GetObject'):
             simulate(action, self.s3(f'{bucket}/{key}'), policy=policy)
+        print('plan guard: Hana instance tags passed', flush=True)
+
+    def probe_hana_replacement(self, api: AwsCli, principal: str, policy: ScalerPolicyPlan) -> None:
+        """Check each resource in the proposed root replacement grant."""
+        for action in ('ec2:DescribeImages', 'ec2:DescribeVolumes', 'ec2:DescribeReplaceRootVolumeTasks'):
+            self._simulate(api, principal, policy, action, '*', {}, '')
+        document = ledger.mapping(cast(object, json.loads(policy.proposed_documents[0])))
+        action = 'ec2:CreateReplaceRootVolumeTask'
+        for statement in ledger.rows(document, 'Statement'):
+            if statement['Action'] != action:
+                continue
+            condition = ledger.mapping(statement.get('Condition', {}))
+            values = ledger.mapping(condition.get('StringEquals', {}))
+            context = {key: ledger.text(values, key) for key in values}
+            scope = statement['Resource']
+            resources = cast(list[str], scope) if isinstance(scope, list) else [ledger.text(statement, 'Resource')]
+            for resource in resources:
+                # The task and replacement volume IDs exist only after creation.
+                resource = resource.removesuffix('*') + '00000000000000000' if resource.endswith('*') else resource
+                self._simulate(api, principal, policy, action, resource, context, '')
 
     @staticmethod
     def _simulate(api: AwsCli, principal: str, replacement: ScalerPolicyPlan, action: str, resource: str,
@@ -357,7 +376,7 @@ class PlanRun:
             'PolicyInputList': list(replacement.proposed_documents),
             'ActionNames': [action],
             'ResourceArns': [resource],
-            'ContextEntries': [{'ContextKeyName': key, 'ContextKeyType': 'string', 'ContextKeyValues': [value]}
+            'ContextEntries': [{'ContextKeyName': key, 'ContextKeyValues': [value], 'ContextKeyType': 'string'}
                                for key, value in entries.items()],
         }
         if replacement.live_arns:
@@ -383,10 +402,10 @@ class PlanRun:
         decision = rows[0].get(field)
         if decision not in ('allowed', 'explicitDeny', 'implicitDeny'):
             raise PlanRefused(f'{label} scaler {action} simulation is incomplete.')
-        if show:
-            print(f'plan {label} scaler: {action} {"allowed" if decision == "allowed" else "denied"}', flush=True)
         if decision != 'allowed':
             raise PlanRefused(f'{label} scaler {action} denied.')
+        if show:
+            print(f'plan {label} scaler: {action} allowed', flush=True)
 
     def gate_policy_documents(self, region: str, principal_name: str, template: dict[str, object],
                               parameters: dict[str, str]) -> tuple[tuple[str, ...], GatePolicyResources]:
