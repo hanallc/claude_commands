@@ -147,7 +147,8 @@ Ledger estimates include accrued Hana compute and storage.
 | --- | --- | --- |
 | `region` | `us-east-2` | Use Ohio for the box and retained storage. |
 | `instance_type` | `m7a.2xlarge` | Provide 32 GiB of memory. |
-| `spot_max_usd_per_hour` | `0.15` | Bound reserved compute exposure. |
+| `spot_max_usd_per_hour` | `0.25` | Bound reserved compute exposure and refuse higher Spot prices during setup. |
+| `spot_ceiling_margin` | `0.25` | Add this positive fraction of the current Spot price when setup suggests a new ceiling. |
 | `root_gib` | `40` | Reserve the retained root volume. |
 | `data_gib` | `300` | Reserve the retained data volume. |
 | `daily_budget_usd` | `6` | Bound Hana spending within the account limit. |
@@ -236,11 +237,27 @@ The existing preparation writer, preflight verifier, encrypted admin executor, s
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
 It creates a retained data volume, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
 Its Spot interruption behavior is `stop`.
-Setup uses Hana sizes and prices from `config/hana_aws.conf`.
+Setup uses the Hana instance type and price ceiling from `config/hana_aws.conf`.
+Before it creates or changes the stack, setup reads Spot prices for the Hana instance type in all zones in the configured region.
+Setup refuses the change if the read fails, the configured zone has no price, or the price exceeds the ceiling.
+If the price exceeds the ceiling, setup shows the cheapest zone.
+Setup gives a `/tune` command when the effective ceiling key is editable.
+If the configuration rejects the command, setup reports the error and the suggested ceiling.
+To change zones, use a subnet in the new zone.
+The suggested ceiling includes `spot_ceiling_margin` and rounds up to the next cent when necessary.
+Setup reads the margin only for a stack change.
+If the price is at or below the ceiling, setup prints both values and continues.
+
+If setup gives a `/tune` command:
+
+1. Run the displayed `/tune` command.
+2. Run `deploy.py prepare --workload hana`.
+3. Run `deploy.py hana-setup --approve-resources`.
+
 It reserves setup costs within both account and workload limits before the stack request.
 `reserve_setup()` permits only approved resource setup while placement remains disabled.
 It does not permit demand starts or guest command admission.
-Setup resumes an existing stack through reads before another mutation.
+Setup resumes an already requested stack without a Spot price check.
 It refuses changed resource inputs or an expired reservation before another stack request.
 If AWS confirms that the stack is missing, setup checks the local record for resource identities.
 If the record names an instance, data disk, or bucket, setup asks the user to run `down --workload hana --approve-destroy`.
@@ -249,7 +266,14 @@ It uses stacks that AWS created at or after the saved reservation time.
 Setup reads the events of each matching stack by ID to find retained disks and buckets.
 It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
 If it cannot verify cleanup, setup keeps the record and asks the user to run `down --workload hana --approve-destroy`.
-It registers the deployment only after the Spot request and stopped state match.
+Setup verifies the persistent Spot request before it requests the idle stop.
+It checks the instance state every `stop_poll_seconds` (10 seconds by default).
+Each check reports the state and elapsed time and uses the `aws_timeout_s` command limit.
+Setup starts each check within `stop_wait_timeout_s` (600 seconds by default).
+A check can finish after the wait limit.
+If the wait expires, run `deploy.py hana-setup --approve-resources` again to resume the stop.
+Setup keeps the pending stop and accepts the saved preparation after its age limit if the inputs still match.
+It registers the deployment after it confirms the stopped state.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
 It refuses changes that replace or remove an instance, volume, or volume attachment.

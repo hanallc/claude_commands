@@ -1,11 +1,15 @@
 """Verify preparation, explicit approval, and isolated stack setup with private fakes."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from decimal import Decimal
 from io import StringIO
 import json
 from pathlib import Path
 import subprocess
+import time
 from typing import cast, override
 from unittest import mock
 
@@ -81,13 +85,19 @@ class HanaSetupTests(CostFixture):
                 _ = subject.hana_setup(approve_resources=True)
         self.assertEqual(fake.calls, [])
 
-    def test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop(self) -> None:
-        fake = FakeAws(self.clock, state='running')
-        subject = self.subject(fake)
-        original_call = fake.__call__
-        calls: list[str] = []
+    def setup_api(self, fake: FakeAws, calls: list[str], spot_price: Callable[[], Decimal], *, stop_state: str | None = None
+                  ) -> Callable[..., dict[str, object]]:
+        workload = conf.read(self.workload)
+
         def api_call(operation: str, *arguments: str, service: str = 'ec2', timeout_s: float | None = None) -> dict[str, object]:
             calls.append(operation)
+            if operation == 'describe-spot-price-history':
+                return {'SpotPriceHistory': [{
+                    'InstanceType': workload.text('instance_type'),
+                    'AvailabilityZone': workload.text('availability_zone'),
+                    'SpotPrice': str(spot_price()),
+                    'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat(),
+                }]}
             if operation == 'execute-change-set':
                 evidence = ledger.CostLedger(self.state).read_snapshot()
                 self.assertTrue(any(isinstance(row.state, ledger.HanaExposureOpen) for row in evidence.hana_compute))
@@ -103,17 +113,39 @@ class HanaSetupTests(CostFixture):
                 outputs = {'Instance': IDENTITY.instance, 'ControlBucket': 'fixture-bucket', 'DataVolume': 'fixture-volume'}
                 return {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Outputs': [
                     {'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]}]}
-            import subprocess
-            result = original_call(['aws', '--profile', 'fixture-admin', '--region', IDENTITY.region,
+            result = fake(['aws', '--profile', 'fixture-admin', '--region', IDENTITY.region,
                 service, operation, *arguments, '--output', 'json'], capture_output=True, text=True,
-                timeout=conf.read(self.workload).whole('aws_timeout_s') if timeout_s is None else timeout_s, check=False)
+                timeout=workload.whole('aws_timeout_s') if timeout_s is None else timeout_s, check=False)
             if result.returncode:
                 raise subprocess.CalledProcessError(result.returncode, 'fake')
+            if operation == 'stop-instances' and stop_state is not None:
+                fake.state = stop_state
             return ledger.mapping(cast(object, json.loads(result.stdout)))
+        return api_call
+
+    def stop_progress(self, output: StringIO) -> list[str]:
+        return [line for line in output.getvalue().splitlines() if line.startswith('waiting for the Hana box to stop:')]
+
+    def test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop(self) -> None:
+        fake = FakeAws(self.clock, state='running')
+        subject = self.subject(fake)
+        limits = hana_spend.read_settings(conf.read(self.workload))
+        calls: list[str] = []
+        pauses: list[float] = []
+        api_call = self.setup_api(fake, calls, lambda: limits.spot_max_usd_per_hour, stop_state='stopping')
+
+        def pause(seconds: float) -> None:
+            pauses.append(seconds)
+            self.clock.advance(int(seconds))
+            self.assertFalse((self.state / 'hana/lifecycle.json').exists())
+            if len(pauses) == 2:
+                fake.state = 'stopped'
+
+        subject.pause = pause
         with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
                 mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs') as validate, \
                 mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
-                mock.patch('sys.stdout', new_callable=StringIO):
+                mock.patch.object(time, 'monotonic', self.clock), mock.patch('sys.stdout', new_callable=StringIO) as output:
             prepared = subject.prepare_hana()
             saved_path = self.state / 'hana/setup.json'
             saved = remote.read_record(saved_path)
@@ -127,12 +159,122 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(record['state'], hana_box.Lifecycle.IDLE_STOPPED)
         self.assertEqual(ledger.mapping(record['identity'])['spot_request'], IDENTITY.spot_request)
         self.assertIn('stop-instances', calls)
+        self.assertEqual(pauses, [10, 10])
+        self.assertEqual(self.stop_progress(output), [
+            'waiting for the Hana box to stop: stopping, 0 s of 600 s',
+            'waiting for the Hana box to stop: stopping, 10 s of 600 s',
+            'waiting for the Hana box to stop: stopped, 20 s of 600 s',
+        ])
+        self.assertEqual(fake.calls[fake.calls.index(('ec2', 'stop-instances', 10)) + 1:],
+                         [('ec2', 'describe-instances', 10)] * 3)
+        self.assertLess(calls.index('describe-spot-price-history'), calls.index('create-change-set'))
         self.assertLess(calls.index('create-change-set'), calls.index('execute-change-set'))
         self.assertNotIn('deploy', calls)
         self.assertNotIn('start-instances', calls)
         self.assertFalse((self.state / 'gate-deployment.json').exists())
         self.assertEqual(conf.read(self.workload).text('enabled'), 'off')
         self.assertEqual(prepared.parameters['InstanceType'], conf.read(self.workload).text('instance_type'))
+
+    @contextmanager
+    def prepared_stop_setup(self, fake: FakeAws, calls: list[str]) -> Generator[tuple[deploy.Deployment, StringIO]]:
+        subject = self.subject(fake)
+        ceiling = hana_spend.read_settings(conf.read(self.workload)).spot_max_usd_per_hour
+        api_call = self.setup_api(fake, calls, lambda: ceiling, stop_state='stopping')
+        output = StringIO()
+        with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
+                mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'), \
+                mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
+                mock.patch.object(time, 'monotonic', self.clock), mock.patch('sys.stdout', output):
+            _ = subject.prepare_hana()
+            yield subject, output
+
+    def test_stop_timeout_preserves_setup_and_resumes_after_preparation_expires(self) -> None:
+        _ = self.workload.write_text(self.workload.read_text().replace('stop_wait_timeout_s=600\n', 'stop_wait_timeout_s=25\n'))
+        self.replace('preflight_max_age_s', '20')
+        fake = FakeAws(self.clock, state='running')
+        calls: list[str] = []
+        pauses: list[float] = []
+
+        def pause(seconds: float) -> None:
+            pauses.append(seconds)
+            self.clock.advance(int(seconds))
+
+        with self.prepared_stop_setup(fake, calls) as (subject, output):
+            subject.pause = pause
+            with self.assertRaisesRegex(deploy.DeploymentRefused,
+                                        r'The Hana box is not yet stopped\. Run deploy\.py hana-setup --approve-resources again'):
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertEqual(pauses, [10, 10, 5])
+            self.assertEqual(self.stop_progress(output), [
+                'waiting for the Hana box to stop: stopping, 0 s of 25 s',
+                'waiting for the Hana box to stop: stopping, 10 s of 25 s',
+                'waiting for the Hana box to stop: stopping, 20 s of 25 s',
+            ])
+            self.assertFalse((self.state / 'hana/lifecycle.json').exists())
+            saved_path = self.state / 'hana/setup.json'
+            saved = remote.read_record(saved_path)
+            self.assertIs(saved['stop_pending'], True)
+            self.assertEqual(saved['instance'], IDENTITY.instance)
+            self.assertIn('stop-instances', calls)
+            fake.state = 'stopped'
+            calls.clear()
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+        self.assertNotIn('create-change-set', calls)
+        self.assertNotIn('stop-instances', calls)
+        del saved['stop_pending']
+        self.assertEqual(remote.read_record(saved_path), saved)
+
+    def test_setup_polls_an_already_stopped_box_once(self) -> None:
+        fake = FakeAws(self.clock, state='stopped')
+        calls: list[str] = []
+        with self.prepared_stop_setup(fake, calls) as (subject, output), mock.patch.object(subject, 'pause') as pause:
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+            pause.assert_not_called()
+        self.assertNotIn('stop-instances', calls)
+        self.assertEqual(self.stop_progress(output), ['waiting for the Hana box to stop: stopped, 0 s of 600 s'])
+        self.assertEqual(calls[calls.index('describe-spot-instance-requests') + 1:], ['describe-instances'])
+
+    def assert_requested_setup_recovers(self, retry_price: Callable[[], Decimal]) -> None:
+        fake = FakeAws(self.clock, state='running', lose_response='describe-instances')
+        subject = self.subject(fake)
+        limits = hana_spend.read_settings(conf.read(self.workload))
+        calls: list[str] = []
+        recovering = False
+
+        def spot_price() -> Decimal:
+            return retry_price() if recovering else limits.spot_max_usd_per_hour
+
+        with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
+                mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'), \
+                mock.patch.object(aws_cli.AwsCli, 'call', side_effect=self.setup_api(fake, calls, spot_price)), \
+                mock.patch('sys.stdout', new_callable=StringIO):
+            _ = subject.prepare_hana()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _ = subject.hana_setup(approve_resources=True)
+            saved = remote.read_record(self.state / 'hana/setup.json')
+            self.assertIs(saved['requested'], True)
+            self.assertIn('execute-change-set', calls)
+            self.assertEqual(fake.state, 'running')
+
+            recovering = True
+            calls.clear()
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+
+        self.assertNotIn('describe-spot-price-history', calls)
+        self.assertNotIn('create-change-set', calls)
+        self.assertIn('stop-instances', calls)
+        self.assertEqual(fake.state, 'stopped')
+        self.assertEqual(remote.read_record(self.state / 'hana/lifecycle.json')['state'], hana_box.Lifecycle.IDLE_STOPPED)
+
+    def test_requested_setup_recovers_when_the_price_exceeds_the_ceiling(self) -> None:
+        limits = hana_spend.read_settings(conf.read(self.workload))
+        self.assert_requested_setup_recovers(lambda: limits.spot_max_usd_per_hour * 2)
+
+    def test_requested_setup_recovers_when_the_price_read_fails(self) -> None:
+        def price_read_failure() -> Decimal:
+            raise aws_cli.AwsUnavailable('fixture Spot read failed')
+
+        self.assert_requested_setup_recovers(price_read_failure)
 
     def test_setup_reservation_does_not_enable_start_or_command_permission(self) -> None:
         settings = hana_spend.read_settings(conf.read(self.workload))
