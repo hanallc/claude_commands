@@ -445,6 +445,7 @@ Each preset shows its time on the right, such as `Tue 09:00`, in the user zone.
 The page computes the preset times each time the menu opens.
 A preset click hides the item at once.
 **Choose a time…** shows a calendar and a time field in the same menu.
+Review Later and List Park until share the date and time picker in `record_table.py`.
 The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
 The month header has previous and next buttons.
@@ -704,6 +705,8 @@ The Producer menu beside it lists each producer that a record names.
 An address with a producer that no record names shows all producers.
 The Show menu contains Open, Needs me, Unread, Done, Parked, Closed, and All.
 Open excludes Done, Closed, and items with a future parking time.
+Unread excludes Closed items from the view and the counts.
+Closed items have no unread dot or Mark read button.
 The search field matches the item number, owner name, title, or state words.
 Numbers can include `L` or `#`.
 One match function ignores case for every field.
@@ -713,9 +716,19 @@ The address retains the owner, producer, view, search, column, and direction.
 A row opens to show its latest status, completion condition, item links, and log.
 The record keeps Evidence, and the open row has no separate Evidence section.
 The log shows its newest entry first.
+On a wide page, the log column fits the height of the left column, including the feedback controls.
+The log entries scroll below the heading when they exceed the available height.
+A short log has no scroll bar.
+On a narrow page, `list_log_max_height_rem` in `config/review_links.conf` limits the height of the entries.
+The setting starts at 16 rem.
+Refresh keeps the first visible log entry at the same offset when new entries arrive.
+A log at the top stays at the top to show the newest entry.
+The List keeps the position by item while a filter hides the row.
+The log restores that position when the row returns.
 Each log writer saves a typed event.
 The table and log use the same format for staff names, local ETAs, and field values.
-The table, log, and Park response show parking dates in the user's zone.
+The table, log, and Park response show parking times in the user zone.
+At local midnight, the label shows the date.
 The log uses plain field labels, such as Next step and Latest status.
 The reader converts old Added, Updated, Parked, Closed, and feedback entries to the same format.
 An old entry keeps its text if the reader cannot parse it.
@@ -770,14 +783,20 @@ Equal words retry an open question. Different words create a new question.
 An exact request retry uses the same question ID, even after morty answers it.
 The expanded row shows each question and its answer when available.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one log entry and marks the item unread.
+The answer adds one log entry and marks the item unread if it is not Closed.
 The command refuses an unknown ID, a second answer, and empty text.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
-Park writes the chosen date through `the_list.park` with the same source.
-Park uses midnight in the user's time zone.
-The writer checks the date against the current time under the List lock.
-An exact retry can return the saved result after the date arrives.
-The page uses the date for Park and retains other words for Tell morty.
+**Park until** opens the shared calendar and 24-hour time field directly.
+The page refresh waits while the picker is open.
+**Save** sends the chosen time in UTC.
+Park writes the time through `the_list.park` with the same source.
+The server still accepts a date as midnight in the user zone.
+The writer checks a new parking time against the current time under the List lock.
+The writer compares the saved instant when it checks a Park retry.
+The writer requires the instant in the receipt or in a parking change with the same request ID.
+The picker can resend the original request and instant after the parking time passes.
+When the saved date has passed, the picker gives focus to an enabled day.
+The page keeps the words for Tell morty.
 Morty does not perform these two button actions.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
@@ -786,18 +805,20 @@ A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove leaves Open at once when the user presses the button.
 Park leaves Open and enters Parked at once.
-The row leaves Unread when the user presses Mark read, Ask question, or Tell morty.
+The row leaves Unread when the user presses Mark read, Ask question, Tell morty, or Remove.
 The row returns if the server reports an unread update.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved date to update one parking label.
-A refusal restores the last state and parking status from the server.
-A failed Mark read, Ask question, or Tell morty request restores the unread state.
+The page uses the saved time to update one parking label.
+A refusal restores the last confirmed item state, parking status, and unread state together.
+The unread state includes the Update sort key.
+If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
+After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
 Each row keeps its own inline failure notice.
 The List uses the same rules as Review for notices above the table.
 If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.

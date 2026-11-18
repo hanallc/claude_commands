@@ -276,7 +276,9 @@ INLINE_CHOICE = re.compile(r"(?:^|(?<=[.!?;])\s+)" + CHOICE_LABEL_PATTERN, re.IG
 
 
 def split_at(text: str, mark: re.Pattern[str]) -> tuple[str, str]:
-    found = mark.search(text)
+    blocks = list(page_frame.CODE_BLOCK.finditer(text))
+    found = next((match for match in mark.finditer(text)
+                  if not any(block.start() <= match.start() < block.end() for block in blocks)), None)
     return (text, "") if found is None else (text[:found.start()].strip(), text[found.end():].strip())
 
 
@@ -351,15 +353,8 @@ def followup_sections(item: update_registration.OutstandingItem) -> str:
 
 
 def answer_html(text: str) -> str:
-    """Show a showrunner reply or answer; a line that holds only a command is a code block with a copy button."""
-    content: list[str] = []
-    start = 0
-    for block in page_frame.CODE_BLOCK.finditer(text):
-        content.append(question_paragraphs(text[start:block.start()]))
-        content.append(page_frame.code_block_html(block))
-        start = block.end()
-    content.append(question_paragraphs(text[start:]))
-    return "".join(content)
+    """Show a showrunner reply or answer with copy buttons for code blocks."""
+    return page_frame.render_code_blocks(text, paragraph_text_html)
 
 
 def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
@@ -381,9 +376,20 @@ def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
 
 
 def question_paragraphs(text: str) -> str:
-    """Keep paragraphs and list lines separate; split sentences in text stored on one line."""
+    """Show question paragraphs with copy buttons for code blocks."""
+    return page_frame.render_code_blocks(text, paragraph_text_html)
+
+
+def paragraph_text_html(text: str) -> str:
+    """Keep paragraphs and list lines separate. Split sentences in text on one line."""
     paragraphs = BLANK_LINE.split(text.strip()) if "\n" in text else SENTENCE_END.split(text.strip())
-    return "".join(change_page.review_text_html(paragraph, inline=True) for paragraph in paragraphs if paragraph)
+    return "".join(change_page.review_prose_html(paragraph, inline=True) for paragraph in paragraphs if paragraph)
+
+
+def unmarked_choices_html(text: str) -> str:
+    """Show choice text without radio buttons when the choice boundaries are unknown."""
+    lines = [part.strip() for part in re.split(r";\s+|\n+|(?<=[.!?])\s+", text) if part.strip()]
+    return "<ul>" + "".join(f"<li>{change_page.inline_html(line)}</li>" for line in lines) + "</ul>"
 
 
 def reviewed_choices(text: str) -> tuple[str, list[str]]:
@@ -422,8 +428,7 @@ def text_sections(text: str, *, reviewed: bool = False) -> tuple[str, str]:
     body += (item_list(items) if items else "") + (question_paragraphs(trailing) if trailing else "")
     # Unmarked choices stay text because their boundaries do not identify safe answer values.
     if choice_text and not choices:
-        lines = [part.strip() for part in re.split(r";\s+|\n+|(?<=[.!?])\s+", choice_text) if part.strip()]
-        body += '<h2>Choices</h2><ul>' + "".join(f'<li>{change_page.inline_html(line)}</li>' for line in lines) + '</ul>'
+        body += '<h2>Choices</h2>' + page_frame.render_code_blocks(choice_text, unmarked_choices_html)
     elif choice_lead:
         body += '<h2>Choices</h2>' + question_paragraphs(choice_lead)
     if choice_trailing:
@@ -441,7 +446,8 @@ def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]
         return body + followup_sections(item), choices
     parts = item["parts"]
     same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
-    body = "" if same else f'<p class="question-ask">{change_page.inline_html(parts["ask"])}</p>'
+    body = "" if same else page_frame.render_code_blocks(
+        parts["ask"], lambda part: f'<p class="question-ask">{change_page.inline_html(part)}</p>')
     if parts["context"].strip():
         body += '<h2>Context</h2>' + question_paragraphs(parts["context"])
     if parts["items"]:
