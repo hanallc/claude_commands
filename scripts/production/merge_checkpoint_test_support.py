@@ -79,9 +79,13 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
             return invoke_cli(fake, main, args, child_env, child_cwd)
         if script == Path(progress_history.__file__):
             return invoke_recorder(args, child_env, child_cwd)
+        if errors is not None:
+            return real_run(command, capture_output=capture_output, text=text, check=check,
+                            timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr,
+                            input=input, errors=errors, pass_fds=pass_fds)
         return real_run(command, capture_output=capture_output, text=text, check=check,
                         timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, input=input,
-                        errors=errors, pass_fds=pass_fds)
+                        pass_fds=pass_fds)
 
     with mock.patch.object(subprocess, "run", run), mock.patch.object(
         change_review, "lists_directory", return_value=Path(environment["HOME"]) / "rust/hanadocs/change-review",
