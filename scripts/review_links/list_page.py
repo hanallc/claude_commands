@@ -605,7 +605,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
-        changed = the_list.unpark(morty.id, identity, source=the_list.PAGE_SOURCE, notice=notice)
+        changed = the_list.unpark(morty.id, identity, source=the_list.PAGE_SOURCE, notice=notice).item
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(morty.id, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))

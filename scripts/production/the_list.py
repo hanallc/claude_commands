@@ -1,4 +1,4 @@
-"""Keep The List as numbered records under the producer's fixed staff ID."""
+"""Keep The List as numbered records under morty's fixed staff ID."""
 from __future__ import annotations
 
 try:
@@ -11,6 +11,7 @@ import ast
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
@@ -23,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone
+from scripts.message import send_result, session_send
 from scripts.production import delivery_state, record_store, staff
 from scripts.review_links import change_page, page_question, question_record
 
@@ -237,6 +239,35 @@ class ListItem:
     @property
     def id(self) -> str:
         return f"L{self.number}"
+
+
+class AllItems(StrEnum):
+    INCLUDED = "all items"
+
+
+@dataclass(frozen=True)
+class SavedEdit:
+    before: ListItem
+    item: ListItem
+
+
+@dataclass(frozen=True)
+class UnchangedEdit:
+    item: ListItem
+
+
+ListEdit = SavedEdit | UnchangedEdit
+
+
+class ProducerRecordOmission(StrEnum):
+    OUTSIDE_SCOPE = "outside the producer's scope"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class ProducerListRead:
+    items: list[ListItem]
+    incomplete: bool
 
 
 class ItemChanges(TypedDict, total=False):
@@ -829,6 +860,10 @@ def _read_log_line(line: str, number: int) -> ItemChange:
 def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = None) -> ListItem:
     store = _store(keeper)
     fields, body = store.read(identity, sources=sources)
+    return _read_item(store, identity, fields, body)
+
+
+def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[str, str], body: str) -> ListItem:
     try:
         marker = "## Next step\n\n"
         if not body.startswith(marker):
@@ -844,7 +879,7 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
         changes = tuple(_read_log_line(line.removesuffix("\r"), number) for line in log_lines)
         item = ListItem(number, fields["title"],
                         UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
-                        staff.StaffId(fields.get("producer", keeper)),
+                        staff.StaffId(fields.get("producer", store.owner)),
                         fields["unit"], _item_state(fields["state"]), next_check_value(fields["next_check"]),
                         _read_eta(fields["eta"], fields["eta_kind"]),
                         time_value(fields["unread_since"]), time_value(fields["parked_until"]),
@@ -892,6 +927,29 @@ def records(keeper: staff.StaffId, *, include_closed: bool = False,
             sources: list[Path] | None = None) -> list[ListItem]:
     items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
+
+
+def _producer_records(keeper: staff.StaffId, producer: staff.StaffId, *, include_closed: bool) -> ProducerListRead:
+    store = _store(keeper)
+
+    def read_visible(identity: str) -> ListItem | ProducerRecordOmission:
+        try:
+            fields, body = store.read(identity)
+            assigned = fields.get("producer", keeper)
+            _staff_id(assigned, "producer")
+            if assigned != producer:
+                return ProducerRecordOmission.OUTSIDE_SCOPE
+            return _read_item(store, identity, fields, body)
+        except (ListError, OSError):
+            return ProducerRecordOmission.UNREADABLE
+
+    try:
+        # Request source paths so the directory scan reports read errors.
+        results = store.records(read_visible, sources=[])
+    except OSError:
+        return ProducerListRead([], incomplete=True)
+    items = [item for item in results if isinstance(item, ListItem) and (include_closed or item.state != ItemState.CLOSED)]
+    return ProducerListRead(items, incomplete=ProducerRecordOmission.UNREADABLE in results)
 
 
 @dataclass(frozen=True)
@@ -996,11 +1054,18 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
 
 def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, datetime], ListItem],
             what: ListEvent, source: str, *, unread: bool = True,
-            page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+            page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT,
+            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
     store = _store(keeper)
     _ = store.path(identity)
     with store.locked():
-        item = load(keeper, identity)
+        if assigned_to is AllItems.INCLUDED:
+            item = load(keeper, identity)
+        else:
+            fields, body = store.read(identity)
+            if fields.get("producer", keeper) != assigned_to:
+                raise ListError(f"{identity} is assigned to another producer")
+            item = _read_item(store, identity, fields, body)
         request = page_action
         if isinstance(page_action, PageItemNotice):
             if not page_action.words.strip():
@@ -1008,7 +1073,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             request = PageRequest(page_action.request, page_action.action, page_action.words, page_action.form_words,
                                   page_action.parked_until)
         if isinstance(request, PageRequest) and _previous_page_request(item, request) is not NoPageRequest.ABSENT:
-            return item
+            return UnchangedEdit(item)
         moment = now()
         changed = edit(item, moment)
         entries: list[ItemChange] = []
@@ -1027,13 +1092,14 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             else:
                 entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
         if not entries:
-            return item
+            return UnchangedEdit(item)
         changed = replace(changed, log=(*item.log, *entries))
         _validate(changed)
         if isinstance(request, PageRequest):
-            return _save_page_request(store, keeper, changed, request)
-        _save(store, changed)
-        return changed
+            changed = _save_page_request(store, keeper, changed, request)
+        else:
+            _save(store, changed)
+        return SavedEdit(item, changed)
 
 
 def _open(item: ListItem) -> None:
@@ -1101,6 +1167,11 @@ def clean_evidence(keeper: staff.StaffId, *, source: str) -> tuple[int, int]:
 
 
 def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str) -> ListItem:
+    return _update(keeper, identity, changes, source=source).item
+
+
+def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str,
+            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         if changes.get("state") == ItemState.CLOSED:
@@ -1109,7 +1180,7 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
         _validate(changed)
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
-    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source)
+    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=assigned_to)
 
 
 def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
@@ -1119,7 +1190,7 @@ def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(dict.fromkeys((*item.reviews, *chosen))))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source)
+    return _change(keeper, identity, edit, ReviewLinksChanged("Linked reviews", chosen), source).item
 
 
 def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
@@ -1129,7 +1200,7 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         return replace(item, reviews=tuple(review for review in item.reviews if review not in chosen))
-    return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source)
+    return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
 
 
 def park(keeper: staff.StaffId, identity: str, until: Timestamp, *, source: str,
@@ -1146,11 +1217,11 @@ def park(keeper: staff.StaffId, identity: str, until: Timestamp, *, source: str,
             raise ListError("Choose a future parking date.")
         _open(item)
         return replace(item, parked_until=until)
-    return _change(keeper, identity, edit, event, source, page_action=notice)
+    return _change(keeper, identity, edit, event, source, page_action=notice).item
 
 
 def unpark(keeper: staff.StaffId, identity: str, *, source: str,
-           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListEdit:
     """Clear an active parking time and save its notice in the same write."""
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if not isinstance(item.parked_until, datetime) or item.parked_until <= moment:
@@ -1170,7 +1241,7 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
             raise ListError("the item is already Closed with different closing words")
         return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words)
     return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
-                   unread=False, page_action=notice)
+                   unread=False, page_action=notice).item
 
 
 def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
@@ -1178,7 +1249,7 @@ def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
         if item.state != ItemState.CLOSED:
             return item
         return replace(item, state=ItemState.NEW, closed=NoTimestamp.UNSET, closing_words="", parked_until=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, Reopened(), source)
+    return _change(keeper, identity, edit, Reopened(), source).item
 
 
 def _unread_log_content(content: LogContent) -> str | dict[str, object]:
@@ -1221,7 +1292,7 @@ def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
         if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
         return replace(item, unread_since=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
+    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request).item
 
 
 def is_page_request_receipt(entry: ItemChange) -> bool:
@@ -1488,14 +1559,19 @@ def order(item: ListItem) -> tuple[bool, bool, float, int]:
 
 
 def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked: bool = False) -> str:
+    return _format_table(records(keeper, include_closed=include_closed), staff.snapshot(), include_parked=include_parked)
+
+
+def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, include_parked: bool,
+                  show_latest_status: bool = False) -> str:
     moment = now()
-    items = records(keeper, include_closed=include_closed)
-    items = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
-    items.sort(key=order)
-    record = staff.snapshot()
-    lines = ["| # | Owner | Producer | Item | State | Next step | ETA | Update |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for item in items:
+    visible = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
+    visible.sort(key=order)
+    columns = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
+    if show_latest_status:
+        columns += ("Latest status",)
+    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
+    for item in visible:
         owner = record.by_id(item.owner) if not isinstance(item.owner, UnassignedOwner) else None
         state = item.state.value
         if item.state != ItemState.CLOSED and isinstance(item.next_check, datetime):
@@ -1508,6 +1584,8 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
         cells = (str(item.number), owner.name if owner is not None else item.owner,
                  producer.name if producer is not None else item.producer, item.title, state,
                  item.next_step, eta_text(item.eta), "●" if isinstance(item.unread_since, datetime) else "—")
+        if show_latest_status:
+            cells += (item.latest_status,)
         lines.append("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines)
 
@@ -1562,6 +1640,53 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
     return changes
 
 
+def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
+    command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
+                                     "--from", "morty", "--text", text)
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in ("sent", "skipped"):
+        return
+    raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
+
+
+def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId) -> int:
+    if item.producer in (keeper, previous_producer):
+        return 0
+    try:
+        members = staff.snapshot()
+    except (ValueError, staff.StaffRefused, OSError) as error:
+        raise ListError(f"{item.id} was saved. The producer and showrunner notices were not sent. {error}") from error
+    producer = next((row for row in staff.active(members, "producer") if row.id == item.producer), None)
+    owner = next((row for row in staff.active(members, "showrunner") if row.id == item.owner), None)
+    showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
+    item_text = f"item {item.number}: {item.title}"
+    launcher = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
+    notices = (
+        ("producer", item.producer, producer, f"You are the producer of {item_text}. {showrunner}\n"
+         + f"Run `{launcher} list --all --latest-status` to read it. "
+         + f"Run `{launcher} update --id {item.id}` with `--latest-status`, `--next-step`, or `--eta` to update it."),
+        ("showrunner", item.owner, owner, f"The saved assignment for {item_text} needs a new producer."
+         if producer is None else f"{producer.name} is the producer of {item_text}. "
+         + f"Send design questions on this item to {producer.name}."),
+    )
+    status = 0
+    for role, reference, recipient, message in notices:
+        try:
+            if recipient is None:
+                if role == "producer":
+                    raise ListError("The producer has no current producer staff row.")
+                if isinstance(reference, UnassignedOwner):
+                    raise ListError("the item has no assigned showrunner")
+                raise ListError("the owner has no current showrunner staff row")
+            _send_assignment_notice(recipient, message)
+        except (ListError, OSError, subprocess.SubprocessError, UnicodeError) as error:
+            details = " ".join(str(error).splitlines())
+            print(f"the_list: {item.id} was saved. The {role} notice to {reference} failed. {details}", file=sys.stderr)
+            status = 1
+    return status
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1572,7 +1697,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
-            _ = command.add_argument("--source", required=True)
+            _ = command.add_argument("--source", required=name != "update")
         if name in ("link", "unlink"):
             _ = command.add_argument("id")
             _ = command.add_argument("--review", dest="reviews", action="append", type=ReviewByShownId, default=[])
@@ -1598,6 +1723,7 @@ def main(argv: list[str] | None = None) -> int:
         elif name == "list":
             _ = command.add_argument("--all", action="store_true")
             _ = command.add_argument("--include-parked", action="store_true")
+            _ = command.add_argument("--latest-status", action="store_true", help="show the latest status column")
     args = parser.parse_args(argv)
     name = cast(str, args.command)
     if name in ("link", "unlink") and not cast(list[ReviewByShownId | ReviewByKey], args.reviews):
@@ -1607,13 +1733,47 @@ def main(argv: list[str] | None = None) -> int:
         caller = record.by_current_session(staff.caller_identity())
         if caller is None:
             raise ListError("the current session has no staff row")
-        if caller.kind != "producer" or caller.name != "morty":
-            raise ListError("the current session must be the morty producer")
-        keeper = caller.id
+        if caller.kind != "producer":
+            raise ListError("the current session must be a producer")
+        keeper = producer_id(record, "morty")
+        assigned_to = AllItems.INCLUDED if caller.id == keeper else caller.id
         if name == "list":
-            print(table(keeper, include_closed=cast(bool, args.all),
-                        include_parked=cast(bool, args.all) or cast(bool, args.include_parked)))
+            include_closed = cast(bool, args.all)
+            if assigned_to is AllItems.INCLUDED:
+                items = records(keeper, include_closed=include_closed)
+                incomplete = False
+            else:
+                read = _producer_records(keeper, assigned_to, include_closed=include_closed)
+                items = read.items
+                incomplete = read.incomplete
+            print(_format_table(items, record, include_parked=include_closed or cast(bool, args.include_parked),
+                                show_latest_status=cast(bool, args.latest_status)))
+            if incomplete:
+                raise ListError("The List results are incomplete. Could not read every record.")
             return 0
+        if name == "update":
+            identity = cast(str, args.id)
+            if identity.isascii() and identity.isdecimal():
+                identity = f"L{identity}"
+            if assigned_to is not AllItems.INCLUDED:
+                options = cast(dict[str, object], vars(args))
+                allowed = {"command", "id", "source", "latest_status", "next_step", "eta"}
+                refused = sorted(f"--{key.replace('_', '-')}" for key, value in options.items()
+                                 if value is not None and key not in allowed)
+                if refused:
+                    raise ListError("producers can update only --latest-status, --next-step, and --eta. "
+                                    + f"Refused options: {', '.join(refused)}")
+                _ = _update(keeper, identity, _cli_changes(args, record), source=caller.name, assigned_to=assigned_to)
+                return 0
+            source = cast(str | None, args.source)
+            if source is None:
+                parser.error("update requires --source for morty")
+            changed = _update(keeper, identity, _cli_changes(args, record), source=source)
+            if isinstance(changed, UnchangedEdit):
+                return 0
+            return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
+        if assigned_to is not AllItems.INCLUDED:
+            raise ListError(f"only morty can run {name}")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
             result = page_question.answer(_ListQuestionStore(keeper), identity, question, cast(str, args.text))
@@ -1658,10 +1818,10 @@ def main(argv: list[str] | None = None) -> int:
             owner = changes.get("owner")
             if owner is None:
                 raise ListError("owner must name a showrunner staff id")
-            print(add(keeper, cast(str, args.title), owner=owner, source=source,
-                      number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes).id)
-        elif name == "update":
-            _ = update(keeper, cast(str, args.id), _cli_changes(args, record), source=source)
+            item = add(keeper, cast(str, args.title), owner=owner, source=source,
+                       number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes)
+            print(item.id)
+            return _notify_producer_assignment(item, keeper, keeper)
         elif name == "park":
             _ = park(keeper, cast(str, args.id), time_value(cast(str, args.until)), source=source)
         elif name == "close":
