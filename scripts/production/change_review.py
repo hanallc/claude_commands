@@ -27,18 +27,21 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from typing import TypeVar, cast
+from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic  # noqa: E402
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
 from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
@@ -47,7 +50,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
 from scripts.production import change_routing, delivery_state, session_staff, showrunner_tree, showrunners, staff, unit_config, unit_lookup
-from scripts.production.production_doc import Refusal, production_field
+from scripts.production.production_doc import ProductionDocument, Refusal, production_field
 from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
 
@@ -553,7 +556,8 @@ def _print_warning(message: str) -> None:
 
 
 def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], Result],
-          what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning) -> Result:
+          what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning,
+          publish: Callable[[Path, str], None] | None = None) -> Result:
     """Change the list's lines under the lock, then write and commit them.
 
     A change that raises an error writes nothing. The lock is the list's directory.
@@ -563,7 +567,6 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with _list_lock(path):
-        # Writers always take the list lock before the image reference lock.
         with _image_reference_lock():
             text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
             lines = text.splitlines(keepends=True)
@@ -571,7 +574,7 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
             if lines != text.splitlines(keepends=True):
                 _sort(path, lines)
                 _stamp(path, lines, production, day)
-                write_text_atomic(path, "".join(lines))
+                (publish or write_text_atomic)(path, "".join(lines))
         _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
         return result
 
@@ -593,9 +596,13 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
             raise ChangeReviewError(reason)
         return result.stdout.strip()
 
-    if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
-        return
     try:
+        probe = git("rev-parse", "--is-inside-work-tree")
+        if probe.stdout.strip() != "true":
+            reason = probe.stderr.strip()
+            if probe.returncode and "not a git repository" not in reason:
+                raise ChangeReviewError(reason or "git could not read the list directory")
+            return
         root = Path(checked("rev-parse", "--show-toplevel"))
         folder = root
         blobs = [(str(path.resolve().relative_to(root)),
@@ -1504,14 +1511,48 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
     return filled, untraced
 
 
+_held_review_locks: ContextVar[frozenset[Path]] = ContextVar("held_review_locks", default=frozenset())
+
+
 @contextmanager
 def _list_lock(path: Path) -> Generator[None]:
-    descriptor = os.open(path.parent, os.O_RDONLY)
+    folder = path.parent.resolve()
+    held = _held_review_locks.get()
+    if folder in held:
+        yield
+        return
+    descriptor = os.open(folder, os.O_RDONLY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
+        token = _held_review_locks.set(held | {folder})
+        try:
+            yield
+        finally:
+            _held_review_locks.reset(token)
     finally:
         os.close(descriptor)
+
+
+@contextmanager
+def review_delivery_lock(root: Path) -> Generator[None]:
+    lock = root.resolve() / ".review-link-delivery.lock"
+    held = _held_review_locks.get()
+    if lock in held:
+        yield
+        return
+    with file_lock.exclusive(lock):
+        token = _held_review_locks.set(held | {lock})
+        try:
+            yield
+        finally:
+            _held_review_locks.reset(token)
+
+
+@contextmanager
+def checked_review_write(path: Path, root: Path, check: Callable[[], Result]) -> Generator[Result]:
+    """Check a Review card while holding its list and delivery locks."""
+    with review_delivery_lock(root), _list_lock(path):
+        yield check()
 
 
 @contextmanager
@@ -1671,7 +1712,7 @@ def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
 
 
 def _verdict_write(
-    path: Path, row: str, verdict: str, day: date,
+    path: Path, row: str, verdict: str, day: date, *, superseded: str = '',
 ) -> RowWrite[VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict]:
     """Record a verdict once. Retain its merge and the result of an earlier write."""
     removed_image = ""
@@ -1703,6 +1744,8 @@ def _verdict_write(
             reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
             _insert(lines, len(lines), reviewed_rows)
         _add_column(path, lines, REVIEWED, "Merged")
+        if superseded:
+            append_row_review_log(cells, superseded, "nate", datetime.now().astimezone(user_zone()))
         if cells.get("Review log"):
             _add_column(path, lines, REVIEWED, "Review log")
         if member is not None:
@@ -1730,11 +1773,17 @@ def _verdict_write(
 def record_verdict(
     path: Path, row: str, verdict: str, day: date, production: Path, *,
     report_warning: Callable[[str], None] = _print_warning,
+    publish: Callable[[Path, str], None] | None = None, superseded: str = '',
+    commit_warning: Callable[[str], None] | None = None,
 ) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
-    """Record a verdict once and remove its image when no review row uses it."""
-    change = _verdict_write(path, row, verdict, day)
-    result = _edit(path, production, day, change.write, lambda _: f"verdict {row}", report_warning=report_warning)
-    change.after()
+    """Record a verdict once and remove its image when no row uses it."""
+    change = _verdict_write(path, row, verdict, day, superseded=superseded)
+    result = _edit(path, production, day, change.write, lambda _: f"verdict {row}",
+                   report_warning=commit_warning or report_warning, publish=publish)
+    try:
+        change.after()
+    except Exception as error:
+        report_warning(f"{path} {row}: the verdict is saved. Image cleanup failed: {error}")
     return result
 
 
@@ -1819,6 +1868,12 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
     return snapshots
 
 
+def append_row_review_log(cells: dict[str, str], words: str, who: str, now: datetime) -> None:
+    events = review_events.decode(_plain(cells.get("Review log", "")))
+    event = review_events.ReviewLog(now, who, words)
+    cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
+
+
 def _append_review_log(path: Path, lines: list[str], row: str, event: review_events.ReviewLog) -> None:
     for section in (SECTION, REVIEWED):
         if not any(line.strip() == section for line in lines):
@@ -1830,8 +1885,7 @@ def _append_review_log(path: Path, lines: list[str], row: str, event: review_eve
         columns, first, end = _table(path, lines, section)
         index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
         cells = dict(zip(columns, _cells(lines[index])))
-        events = review_events.decode(_plain(cells.get("Review log", "")))
-        cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
+        append_row_review_log(cells, event.words, event.who, event.time)
         lines[index] = _row(path, columns, cells)+"\n"
         return
 
@@ -1873,12 +1927,137 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         return [f"scratch not removed: {error}"]
 
 
+class VerdictDurabilityUnconfirmed(RuntimeError):
+    """The visible verdict needs a directory sync or a Git commit."""
+
+    def __init__(self, cleanup: PendingVerdictCleanup, reason: str) -> None:
+        super().__init__(f"{cleanup.path} {cleanup.row}: {reason}")
+        self.cleanup: PendingVerdictCleanup = cleanup
+
+
+@dataclass(frozen=True)
+class NoVerdictCleanup:
+    """The verdict has no scratch cleanup left."""
+
+
+NO_VERDICT_CLEANUP = NoVerdictCleanup()
+VERDICT_CLEANUP_PREFIX = ".review-link-scratch-"
+
+
+@dataclass(frozen=True)
+class WaitSupersessionDestination:
+    """The production and log selected before a verdict replaces a wait."""
+
+    owner: staff.StaffId
+    document: ProductionDocument
+
+    def fields(self) -> dict[str, str]:
+        doc = self.document
+        return {'owner':self.owner, 'doc':str(doc.doc), 'name':doc.name, 'merge_branch':doc.merge_branch,
+                'checkout':str(doc.checkout), 'log':str(doc.log), 'zone':str(doc.zone)}
+
+    @classmethod
+    def from_fields(cls, fields: dict[str, str]) -> WaitSupersessionDestination:
+        return cls(staff.StaffId(fields['owner']), ProductionDocument(
+            Path(fields['doc']), fields['name'], fields['merge_branch'], Path(fields['checkout']),
+            Path(fields['log']), ZoneInfo(fields['zone'])))
+
+
+@dataclass(frozen=True)
+class NoSavedWaitLogDestination:
+    """The intent has no saved destination, including intents from older versions."""
+
+
+NO_SAVED_WAIT_LOG_DESTINATION = NoSavedWaitLogDestination()
+
+
+@dataclass(frozen=True)
+class PendingVerdictCleanup:
+    """Remove the saved row's scratch folders after the response."""
+
+    path: Path
+    row: str
+    intent: Path
+    verdict: str = ''
+    feature_review: str = ''
+    superseded_wait: str = ''
+    wait_log: WaitSupersessionDestination | NoSavedWaitLogDestination = NO_SAVED_WAIT_LOG_DESTINATION
+
+    @classmethod
+    def for_row(cls, root: Path, path: Path, row: str) -> PendingVerdictCleanup:
+        name = change_routing.delivery_name(path.resolve(), row)
+        return cls(path, row, root / name.replace('.review-link-delivery-', VERDICT_CLEANUP_PREFIX, 1))
+
+    @classmethod
+    def load(cls, intent: Path, lists: Path) -> PendingVerdictCleanup:
+        """Read the exact list, row and verdict for restart cleanup."""
+        fields = cast(dict[str, object], json.loads(intent.read_text(encoding='utf-8')))
+        path = Path(cast(str, fields['list']))
+        row = _row_id('row', cast(str, fields['row']))
+        cleanup = replace(cls.for_row(intent.parent, path, row),
+                          verdict=_words('verdict', cast(str, fields['verdict'])),
+                          feature_review=cast(str, fields.get('feature_review', '')),
+                          superseded_wait=cast(str, fields.get('superseded_wait', '')))
+        if path.parent != lists or path.is_symlink() or not path.match(PREFIX+'*.md') or cleanup.intent != intent:
+            raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
+        if 'wait_log' in fields:
+            cleanup = replace(cleanup, wait_log=WaitSupersessionDestination.from_fields(
+                cast(dict[str, str], fields['wait_log'])))
+        if fields.get('supersedes_wait') is True and not cleanup.superseded_wait:
+            from scripts.review_links import review_events
+            for saved in review_snapshot(path).reviewed:
+                if saved['#'] == row and saved['Verdict'] == cleanup.verdict:
+                    events = review_events.decode(saved.get('Review log', ''))
+                    reason = next((event.words for event in reversed(events)
+                                   if event.words.startswith('Review ')
+                                   and event.words.endswith(' before the answer arrived.')), '')
+                    cleanup = replace(cleanup, superseded_wait=reason)
+                    break
+        return cleanup
+
+    def commit_failed(self, reason: str) -> None:
+        raise VerdictDurabilityUnconfirmed(self, reason)
+
+    def sync(self) -> None:
+        try:
+            sync_folder(self.path.parent)
+        except OSError as error:
+            raise VerdictDurabilityUnconfirmed(self, f'directory sync failed: {error}') from error
+
+    def confirm_durability(self) -> None:
+        """Confirm the visible verdict before recovery performs its closeout."""
+        self.sync()
+        _commit([self.path], f'{_owner(self.path)} verdict {self.row}', report_warning=self.commit_failed)
+
+    def save(self) -> None:
+        fields: dict[str, object] = {
+            'list':str(self.path.resolve()), 'row':self.row, 'verdict':self.verdict,
+            'feature_review':self.feature_review, 'superseded_wait':self.superseded_wait}
+        if isinstance(self.wait_log, WaitSupersessionDestination):
+            fields['wait_log'] = self.wait_log.fields()
+        write_text_atomic(self.intent, json.dumps(fields)+'\n', new_file_mode=0o600)
+
+    def finish(self, closeout: Callable[[PendingVerdictCleanup], None]) -> list[str]:
+        try:
+            with file_lock.exclusive(self.intent.parent/'.review-link-scratch.lock'):
+                if not self.intent.exists():
+                    return []
+                closeout(self.load(self.intent, self.path.parent.resolve()))
+                lines = end_row_scratch(self.path, self.row)
+                if not any(line.startswith('scratch not removed:') for line in lines):
+                    self.intent.unlink(missing_ok=True)
+                return lines
+        except Exception as error:
+            return [f"{self.path} {self.row}: the verdict is saved. Verdict follow-up failed: {error}"]
+
+
 @dataclass(frozen=True)
 class VerdictSaved:
     """The output lines for a saved or repeated verdict."""
 
     lines: list[str]
     warnings: list[str] = field(default_factory=list)
+    cleanup: PendingVerdictCleanup | NoVerdictCleanup = NoVerdictCleanup()
 
 
 @dataclass(frozen=True)
@@ -1951,7 +2130,9 @@ def _validation_fault_output(shown: str) -> list[str]:
     return [f"{shown}: the check found a problem. The change returned to Open."]
 
 
-def save_verdict(path: Path, row: str, verdict: str, production: Path, *, validation_id: str = '') -> VerdictSaved | VerdictRefused:
+def save_verdict(path: Path, row: str, verdict: str, production: Path, *, validation_id: str = '',
+                 cleanup: PendingVerdictCleanup | NoVerdictCleanup = NO_VERDICT_CLEANUP,
+                 superseded: str = '') -> VerdictSaved | VerdictRefused:
     """Check the exchange and save the verdict under the same delivery lock."""
     verdict = _words("verdict", verdict)
     local_row = _row_id("row", row.rpartition("/")[2])
@@ -1960,8 +2141,10 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
     root = change_routing.review_root()
     root.mkdir(parents=True, exist_ok=True)
     delivery = change_routing.delivery_path(root, path, local_row)
-    with file_lock.exclusive(root / '.review-link-delivery.lock'):
+    with review_delivery_lock(root):
         slots = change_routing.delivery_slots(delivery)
+        if superseded and isinstance(cleanup, PendingVerdictCleanup):
+            slots = replace(slots, validation=delivery_state.NoDelivery(), question=delivery_state.NoQuestion())
         try:
             _require_verdict_exchange(slots, verdict, validation_id)
         except ChangeReviewError as error:
@@ -1974,13 +2157,28 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
             with clear_change_later(path, local_row):
                 write_text_atomic(delivery, cleared)
             return VerdictSaved(_validation_fault_output(shown), warnings)
-        result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
-    return _verdict_output(path, local_row, shown, verdict, result, warnings)
+        def publish(target: Path, text: str) -> None:
+            assert isinstance(cleanup, PendingVerdictCleanup)
+            mode = stat.S_IMODE(target.stat().st_mode)
+            with prepared_replacement(target, text, mode=mode) as temporary:
+                os.replace(temporary, target)
+                try:
+                    cleanup.sync()
+                except VerdictDurabilityUnconfirmed:
+                    cleanup.sync()
+
+        if isinstance(cleanup, NoVerdictCleanup):
+            result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
+        else:
+            result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append,
+                                    publish=publish, superseded=superseded, commit_warning=cleanup.commit_failed)
+    return _verdict_output(path, local_row, shown, verdict, result, warnings, cleanup=cleanup)
 
 
 def _verdict_output(path: Path, local_row: str, shown: str, verdict: str,
                     result: VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict,
-                    warnings: list[str]) -> VerdictSaved | VerdictRefused:
+                    warnings: list[str], *,
+                    cleanup: PendingVerdictCleanup | NoVerdictCleanup = NO_VERDICT_CLEANUP) -> VerdictSaved | VerdictRefused:
     """Make verdict output and end the row's scratch folders after its write."""
     lines: list[str] = []
     if isinstance(result, VerdictConflict):
@@ -1991,7 +2189,12 @@ def _verdict_output(path: Path, local_row: str, shown: str, verdict: str,
         lines.append(f"{shown} already has this verdict ({result.day}); the list is unchanged")
     merged = result.merged.text if isinstance(result.merged, RecordedMerge) else "not recorded"
     lines.append(f"{shown} landed" if lands(verdict) else f"{shown} returns to its unit (merged {merged})")
-    lines.extend(end_row_scratch(path, local_row))
+    if isinstance(cleanup, PendingVerdictCleanup):
+        return VerdictSaved(lines, warnings, cleanup)
+    try:
+        lines.extend(end_row_scratch(path, local_row))
+    except Exception as error:
+        warnings.append(f"{path} {local_row}: the verdict is saved. Scratch cleanup failed: {error}")
     return VerdictSaved(lines, warnings)
 
 
@@ -2552,26 +2755,25 @@ def batch(file: Path) -> list[str]:
     items[0].path.parent.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     after: list[Callable[[], list[str]]] = []
-    with file_lock.exclusive(root / ".review-link-delivery.lock"), _list_lock(items[0].path):
-        with _image_reference_lock():
-            original: dict[Path, str] = {}
-            lines_by_path: dict[Path, list[str]] = {}
-            for item in items:
-                try:
-                    if item.path not in original:
-                        original[item.path] = read(item.path)
-                        lines_by_path[item.path] = original[item.path].splitlines(keepends=True)
-                    after.append(item.write(lines_by_path[item.path]))
-                except (ChangeReviewError, OSError) as error:
-                    raise ChangeReviewError(f"batch item {item.index}: {error}") from error
-            changed = {path: lines for path, lines in lines_by_path.items()
-                       if lines != original[path].splitlines(keepends=True)}
-            for path, lines in changed.items():
-                _sort(path, lines)
-                for production in dict.fromkeys(item.production for item in items if item.path == path):
-                    _stamp(path, lines, production, day)
-            for path, lines in changed.items():
-                write_text_atomic(path, "".join(lines))
+    with review_delivery_lock(root), _list_lock(items[0].path), _image_reference_lock():
+        original: dict[Path, str] = {}
+        lines_by_path: dict[Path, list[str]] = {}
+        for item in items:
+            try:
+                if item.path not in original:
+                    original[item.path] = read(item.path)
+                    lines_by_path[item.path] = original[item.path].splitlines(keepends=True)
+                after.append(item.write(lines_by_path[item.path]))
+            except (ChangeReviewError, OSError) as error:
+                raise ChangeReviewError(f"batch item {item.index}: {error}") from error
+        changed = {path: lines for path, lines in lines_by_path.items()
+                   if lines != original[path].splitlines(keepends=True)}
+        for path, lines in changed.items():
+            _sort(path, lines)
+            for production in dict.fromkeys(item.production for item in items if item.path == path):
+                _stamp(path, lines, production, day)
+        for path, lines in changed.items():
+            write_text_atomic(path, "".join(lines))
         owners: dict[str, int] = {}
         for item in items:
             owner = _owner(item.path)
