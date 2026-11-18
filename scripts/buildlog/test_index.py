@@ -26,7 +26,7 @@ from scripts.buildlog import record as recorder
 from scripts.buildlog import step_outputs
 from scripts.lib import test_hang_guard
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lint import sweep
 from scripts.test_times.gate_record_test_support import gate_run
 from scripts.buildlog.record import TARGET_DIR_UNSET
@@ -185,6 +185,7 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     """Override the suite's temporary log root for this test only."""
     previous = os.environ.get("BUILDLOG_DIR")
     os.environ["BUILDLOG_DIR"] = str(root)
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, config_environment(root.parent / "config"))))
     _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {name: str(root / name) for name in COORDINATION_VARIABLES})))
 
     def restore() -> None:

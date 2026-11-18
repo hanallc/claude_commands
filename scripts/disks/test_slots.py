@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import json
 import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
-from typing import Literal
+from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.disks import measure, slots
@@ -43,6 +45,15 @@ class TreeSizeTests(unittest.TestCase):
 
 
 class ReadSlotsTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = config_environment(folder)
+        _ = write_config_fixture(folder / "build_steps.conf",
+            "names.integrate=integrate\nowned.default={unit} {step}\nowned.integrate={unit} {step}\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+
     def test_lease_names_keep_staff_references_separate_from_work_text(self) -> None:
         from scripts.lib.build_steps import StepNames
 

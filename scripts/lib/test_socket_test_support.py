@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from scripts.lib import build_folders
 from scripts.lib.socket_test_support import PARENT, short_socket_directory
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class ShortSocketDirectoryTests(unittest.TestCase):
@@ -22,12 +22,11 @@ class ShortSocketDirectoryTests(unittest.TestCase):
             root = Path(directory)
             config = root / "build_folders.conf"
             _ = config_environment(root)
-            original = config.read_text()
             with patch.dict(os.environ, {"CONF_DIR": str(root)}):
                 for name in ("first", "second"):
                     parent = root / name
                     parent.mkdir()
-                    _ = config.write_text(original.replace("roots.system=/tmp", f"roots.system={parent}"))
+                    _ = write_config_fixture(config, f"roots.system={parent}\n")
                     with short_socket_directory() as socket_directory:
                         path = Path(socket_directory)
                         self.assertEqual(path.parent, parent / PARENT)
@@ -40,7 +39,11 @@ class ShortSocketDirectoryTests(unittest.TestCase):
             long_tmpdir = Path(root) / ("long-session-" * 8)
             long_tmpdir.mkdir()
             self.assertGreater(len(os.fsencode(long_tmpdir)), 108)
-            with patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}), patch.object(tempfile, "tempdir", None):
+            configuration = Path(root) / "config"
+            _ = config_environment(configuration)
+            _ = write_config_fixture(configuration / "build_folders.conf", "roots.system=/tmp\n")
+            with (patch.dict(os.environ, {"TMPDIR": str(long_tmpdir), "CONF_DIR": str(configuration)}),
+                  patch.object(tempfile, "tempdir", None)):
                 self.assertEqual(tempfile.gettempdir(), str(long_tmpdir))
                 with short_socket_directory() as directory:
                     folder = Path(directory)
@@ -58,7 +61,7 @@ class ShortSocketDirectoryTests(unittest.TestCase):
             root = Path(directory)
             config = root / "build_folders.conf"
             _ = config_environment(root)
-            _ = config.write_text(config.read_text().replace("roots.system=/tmp", f"roots.system={root}"))
+            _ = write_config_fixture(config, f"roots.system={root}\n")
             killed = ("from scripts.lib.socket_test_support import short_socket_directory\n"
                       "import os\nfolder = short_socket_directory()\nprint(folder.name, flush=True)\nos._exit(0)\n")
             with patch.dict(os.environ, {"CONF_DIR": str(root)}):
@@ -76,7 +79,7 @@ class ShortSocketDirectoryTests(unittest.TestCase):
             root = Path(directory)
             config = root / "build_folders.conf"
             _ = config_environment(root)
-            _ = config.write_text(config.read_text().replace("roots.system=/tmp", f"roots.system={root}"))
+            _ = write_config_fixture(config, f"roots.system={root}\n")
             with (patch.dict(os.environ, {"CONF_DIR": str(root)}),
                   patch.object(build_folders, "sweep_temporary_build_folders") as sweep):
                 for _ in range(3):
