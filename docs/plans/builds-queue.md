@@ -2842,6 +2842,7 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 5. From the review of phase 44bu (2026-11-18): Verify does not print the reason of a Mac probe that got no answer (`admission_client.py:1380`). The wait line prints it.
 6. From the same review: under memory pressure, the client hides the hold reason of a held CI step (`admission_client.py:1048`). The line shows the hold reason.
 7. This phase carries the change review row and the image for the wait reasons of 44br and 44bq.
+8. From the live proof of 44br (2026-11-18): the `admitted` record in `queue_times.jsonl` writes need 0 and `is_head` false for an AWS gate grant and does not write its place. Write the place (natedev, Mac, AWS) in each `admitted` record, so a count of line order needs no other log.
 
 ### Phase 44bw — A running step has all that it needs: no admitted step waits for a unit token  · status: todo
 **Ruling (builds, 2026-11-18 03:35 EST), from the user's rule of 2026-11-17:** "it shouldn't be locked down to a unit - if you get into the running that shoudl mean you have a cargo token to use". Measured in 7 days: 764 local calls waited for the unit Cargo token after their memory grant; median 707.5 s, longest 12,452 s. Built after 44bq, 44br and 44bt are on main. Facts with file and line: the token research of 2026-11-18 03:30 EST.
