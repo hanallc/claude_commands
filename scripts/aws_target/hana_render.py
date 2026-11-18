@@ -19,7 +19,7 @@ HANA_TARGET_ALIAS_KEY = 'host'
 HANA_GUEST_KEYS = (
     'enabled', 'guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds',
     'step_cpu_limit', 'step_memory_gib', 'mount_timeout_seconds', 'aws_timeout_s', 'control_poll_seconds',
-    *hana_runner.EXECUTION_CONFIG_KEYS, 'source_max_bytes', 'source_download_timeout_s',
+    'result_transfer_timeout_s', *hana_runner.EXECUTION_CONFIG_KEYS, 'source_max_bytes', 'source_download_timeout_s',
     'source_git_timeout_s', 'source_allowed_environment',
 )
 
