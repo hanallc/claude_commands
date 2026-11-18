@@ -18,13 +18,14 @@ from dataclasses import dataclass
 from functools import cached_property
 import sys
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from scripts.production import showrunners  # noqa: E402
 from scripts.herdr import herdr_types  # noqa: E402
 from scripts.production.production_doc import ProductionDocument  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
 from scripts.herdr import pane_launch  # noqa: E402
+from scripts.herdr.place import HerdrPlace  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.message import morty_identity, sessions  # noqa: E402
 from scripts.agents import remote  # noqa: E402
@@ -38,6 +39,9 @@ from scripts.production.unit_lookup import (  # noqa: E402
     member_sources as _member_sources,
 )
 from scripts.production import unit_lookup  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.herdr import herdr
 
 
 def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
@@ -146,57 +150,90 @@ def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources
     return False
 
 
+@dataclass(frozen=True)
+class UnprovedCodexPaneThread:
+    """The process has no proved Herdr placement."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class NoStandaloneCodexThread:
+    """The process outside Herdr reports no conversation."""
+
+
 class CodexProcessThreads:
-    """Read a thread from its process or native pane record."""
+    """Read each pane's Codex proof once during a report."""
 
     def __init__(self) -> None:
-        self.panes: dict[tuple[str, str], dict[str, object]] = {}
-        self.foreground_pids: dict[tuple[str, str], int] = {}
+        self.panes: dict[HerdrPlace, herdr.ForegroundPaneAgent | herdr.ObservedEmpty | herdr.UnknownPaneOwner] = {}
+        self.conversations: dict[HerdrPlace, herdr.ProvedMatch[str] | herdr.UnknownPaneOwner] = {}
 
     @cached_property
     def morty(self) -> morty_identity.MortyHolder | morty_identity.NoMortyHolder:
         """One staff read serves every process of a report."""
         return morty_identity.holder()
 
-    def thread(self, pid: int, environment: Mapping[str, str]) -> str:
+    def _foreground(self, place: HerdrPlace) -> herdr.ForegroundPaneAgent | herdr.ObservedEmpty | herdr.UnknownPaneOwner:
         from scripts.herdr import herdr
 
         try:
-            try:
-                return herdr.codex_resume_thread(pid)
-            except (OSError, ValueError):
-                pass
-            place = herdr.herdr_place_of(pid)
-            if isinstance(place, herdr.NotInHerdr):
-                return environment.get("CODEX_THREAD_ID", "")
-            key = (place.session, place.pane)
-            client = herdr.Herdr(place.session)
-            if key not in self.foreground_pids:
-                self.foreground_pids[key] = client.pane_codex_pid(place.pane)
-            if self.foreground_pids[key] != pid:
-                return environment.get("CODEX_THREAD_ID", "")
-            if key not in self.panes:
-                self.panes[key] = herdr.json_object(client.result("pane", "get", place.pane).get("pane"),
-                                                  "Codex pane")
-            pane = self.panes[key]
-            if identity := herdr.pane_session(pane):
-                return identity
-            if identity := environment.get("CODEX_THREAD_ID", ""):
-                return identity
-            return ""
-        except (OSError, ValueError, herdr_types.HerdrFailure):
-            return environment.get("CODEX_THREAD_ID", "")
+            result = herdr.Herdr(place.session).result("pane", "process-info", "--pane", place.pane)
+            return herdr.pane_foreground(place, herdr.json_object(result.get("process_info"), "Codex pane process info"))
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+            return herdr.UnknownPaneOwner(place, str(error))
 
+    def _pane_thread(self, place: HerdrPlace, owner: herdr.ProvedCodexForeground
+                     ) -> herdr.ProvedMatch[str] | herdr.UnknownPaneOwner:
+        from scripts.herdr import herdr
+
+        try:
+            result = herdr.Herdr(place.session).result("pane", "get", place.pane)
+            pane = herdr.json_object(result.get("pane"), "Codex pane")
+            native = herdr.read_foreground_pane_owner(owner, {**pane, "pane_id": place.pane})
+            return herdr.ProvedMatch(native.current_identity)
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+            return herdr.UnknownPaneOwner(place, str(error))
+
+    def thread(self, pid: int, environment: Mapping[str, str]
+               ) -> herdr.CheckedPane[str] | UnprovedCodexPaneThread | NoStandaloneCodexThread:
+        from scripts.herdr import herdr
+
+        place = herdr.process_placement(pid, environment=environment)
+        if isinstance(place, herdr.UnprovedHerdrPlacement):
+            return UnprovedCodexPaneThread(place.reason)
+        if isinstance(place, herdr.NotInHerdr):
+            try:
+                identity = herdr.codex_resume_thread(pid)
+            except (OSError, ValueError):
+                identity = environment.get("CODEX_THREAD_ID", "")
+            return herdr.ProvedMatch(identity) if identity else NoStandaloneCodexThread()
+        if place not in self.panes:
+            self.panes[place] = self._foreground(place)
+        owner = self.panes[place]
+        if isinstance(owner, (herdr.ObservedEmpty, herdr.UnknownPaneOwner)):
+            return owner
+        if owner.pid != pid:
+            return herdr.ProvedOtherOwner(owner)
+        if not isinstance(owner, herdr.ProvedCodexForeground):
+            return herdr.UnknownPaneOwner(place, "the foreground process did not prove a Codex owner")
+        if place not in self.conversations:
+            self.conversations[place] = self._pane_thread(place, owner)
+        return self.conversations[place]
 
     def check(self, pid: int, identity: str) -> session_staff.ReportProcessIdentity:
         from scripts.herdr import herdr
 
-        try:
-            native = identity or (self.thread(pid, herdr.process_environment(pid)) if pid else "")
-        except (OSError, ValueError, herdr_types.HerdrFailure):
-            native = identity
+        native = identity
+        if pid and not native:
+            try:
+                result = self.thread(pid, herdr.process_environment(pid))
+                if isinstance(result, herdr.ProvedMatch):
+                    native = result.owner
+            except (OSError, ValueError, herdr_types.HerdrFailure):
+                pass
         return session_staff.ReportProcessIdentity(
-            native, self.morty == morty_identity.MortyHolder(staff.StaffId(native)))
+            native, bool(native) and self.morty == morty_identity.MortyHolder(staff.StaffId(native)))
 
 
 @dataclass(frozen=True)
@@ -290,17 +327,22 @@ class _WorkerSources:
                     if process.pid in process_table.snapshot():
                         raise
                     continue
-                native = threads.thread(process.pid, environment)
-                if session_staff.report_process(process.pid, native).is_morty:
-                    continue
-                if native:
-                    if record.by_current_session(native) is not None:
-                        self.native_running[native] = {"codex": native}
-                elif (pane := environment.get("HERDR_PANE_ID", "")) and pane_holds_staff_member(record, sources, pane):
-                    self.codex_scan_incomplete = True
-                    _problem(f"Codex process {process.pid} in pane {pane}",
-                             "cannot read its thread; staff status may be incomplete", pid=process.pid)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                match threads.thread(process.pid, environment):
+                    case herdr.ProvedOtherOwner() | herdr.ObservedEmpty():
+                        continue
+                    case herdr.UnknownPaneOwner(reason=reason) | UnprovedCodexPaneThread(reason=reason):
+                        self.codex_scan_incomplete = True
+                        _problem(f"Codex process {process.pid}", reason, pid=process.pid)
+                    case herdr.ProvedMatch(owner=native):
+                        if (not session_staff.report_process(process.pid, native).is_morty
+                                and record.by_current_session(native) is not None):
+                            self.native_running[native] = {"codex": native}
+                    case NoStandaloneCodexThread():
+                        if (pane := environment.get("HERDR_PANE_ID", "")) and pane_holds_staff_member(record, sources, pane):
+                            self.codex_scan_incomplete = True
+                            _problem(f"Codex process {process.pid} in pane {pane}",
+                                     "cannot read its thread; staff status may be incomplete", pid=process.pid)
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
                 self.codex_scan_incomplete = True
                 _problem(f"Codex process {process.pid}", error, pid=process.pid)
         for row in record.rows:
@@ -325,12 +367,24 @@ class _WorkerSources:
 
 
 @dataclass(frozen=True)
+class WorkerScanComplete:
+    pass
+
+
+@dataclass(frozen=True)
+class WorkerScanIncomplete:
+    claude: bool
+    codex: bool
+
+
+@dataclass(frozen=True)
 class WorkerEvidence:
     """Raw ownership observations, including workers not yet represented in staff."""
 
     workers: tuple[WorkerObservation, ...]
     identities: dict[staff.StaffId, dict[str, str]]
     diagnostics: tuple[str, ...]
+    completeness: WorkerScanComplete | WorkerScanIncomplete
 
 
 def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
@@ -343,7 +397,9 @@ def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
     if scan.claude_registry_incomplete:
         _ = errors.write("Claude session registry is incomplete\n")
     diagnostics = tuple(errors.getvalue().splitlines())
-    return WorkerEvidence(observed, scan.identities, diagnostics)
+    completeness = (WorkerScanIncomplete(scan.claude_registry_incomplete, scan.codex_scan_incomplete)
+                    if scan.claude_registry_incomplete or scan.codex_scan_incomplete else WorkerScanComplete())
+    return WorkerEvidence(observed, scan.identities, diagnostics, completeness)
 
 
 def production_units(slug: str) -> tuple[staff.StaffRow, ...]:
@@ -497,6 +553,13 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
         and current_session == _observation_session(worker.identity) for worker in evidence.workers
     ):
         raise staff.StaffRefused(f"{identity}: native worker is current; stop it before removing its row")
+    incomplete = evidence.completeness
+    backend = record.backends.get(identity)
+    if isinstance(incomplete, WorkerScanIncomplete) and (
+        (incomplete.claude and not isinstance(backend, staff.CodexBackend))
+        or (incomplete.codex and not isinstance(backend, staff.ClaudeBackend))
+    ):
+        raise staff.StaffRefused(f"{identity}: native worker state is uncertain; cannot remove its row")
     # Remote process evidence belongs to the roster's one peer reader.
     row = record.by_id(identity)
     while row is not None:
@@ -514,6 +577,8 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
                               else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "")
                     if native == current_session:
                         raise staff.StaffRefused(f"{identity}: native session is live on {entry.machine}; stop it before removing its row")
+                if peer.problems:
+                    raise staff.StaffRefused(f"{identity}: remote native session state is uncertain")
             break
         row = record.by_id(row.parent.id) if isinstance(row.parent, staff.ReportsTo) else None
 

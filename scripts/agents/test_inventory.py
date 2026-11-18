@@ -30,7 +30,6 @@ from scripts.whoami import account
 from scripts.herdr import herdr
 from scripts.message import session_records, sessions
 from scripts.production import showrunners
-from scripts.production import unit_lookup
 from scripts.agents import shutdown
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
@@ -510,9 +509,20 @@ class InventoryTests(ShutdownTestCase):
         _live_context: object = self.enterContext(
             patch.object(session_records, "live_session", return_value=True)
         )
-        _unit_live_context: object = self.enterContext(
-            patch.object(unit_lookup, "live_session", return_value=True)
-        )
+        started = session_records.process_start
+        running = session_records.running_session
+
+        def process_start(pid: int) -> str | None:
+            return CURRENT_PROCESS_START if pid == UNIT_PID else started(pid)
+
+        def running_session(record: sessions.SessionRecord) -> bool:
+            if record["pid"] == UNIT_PID:
+                return record.get("procStart") == CURRENT_PROCESS_START
+            return running(record)
+
+        _ = self.enterContext(patch.object(session_records, "process_start", side_effect=process_start))
+        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=process_start))
+        _ = self.enterContext(patch.object(session_records, "running_session", side_effect=running_session))
         _process_environment_context = cast(
             object,
             self.enterContext(patch("scripts.agents.inventory._process_environment", return_value={})),
@@ -526,6 +536,7 @@ class InventoryTests(ShutdownTestCase):
         self.live_socket.close()
         self.live_socket = socket.socket(socket.AF_UNIX)
         self.live_socket.bind(str(socket_path))
+        self.live_socket.listen(128)
         self.addCleanup(self.live_socket.close)
         self.write_account(self.target_config, TARGET_LOGIN)
         self.write_account(self.other_config, OTHER_LOGIN)
@@ -619,8 +630,11 @@ class InventoryTests(ShutdownTestCase):
             responses[f"--session {session} pane list"] = {"code": 0, "stdout": json.dumps({"result": {
                 "panes": [{"pane_id": pane, "workspace_id": pane.split(":", 1)[0]} for pane in shells]}})}
             for pane, shell in shells.items():
+                _, arguments, _ = self.pane_processes[shell]
                 responses[f"--session {session} pane process-info --pane {pane}"] = {
-                    "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": shell}}})}
+                    "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                        "shell_pid": shell, "foreground_process_group_id": shell,
+                        "foreground_processes": [{"pid": shell, "argv": arguments}]}}})}
         _ = path.write_text(json.dumps(responses))
 
     def herdr_sessions(self, names: list[str]) -> None:

@@ -13,11 +13,13 @@ except FileNotFoundError:
 
 import json
 import os
+import subprocess
 import sys
 from typing import TypedDict, cast
 from collections.abc import Mapping
 
 from scripts.agents import pane_record  # noqa: E402
+from scripts.herdr import herdr, herdr_types
 from scripts.production import session_staff, staff  # noqa: E402
 from scripts.hooks import staff_session_identity  # noqa: E402
 
@@ -28,40 +30,65 @@ class HookInput(TypedDict, total=False):
     source: str
 
 
+def _check_pane_owner(session: str, pane: str) -> herdr.ProvedClaudeForeground:
+    """Check ownership before the hook changes staff or launch records."""
+    info = herdr.session_socket_request(session, "pane.process_info", pane_id=pane).get("process_info")
+    owner = herdr.foreground_pane_owner(herdr.json_object(info, "Claude hook process info"))
+    if isinstance(owner, herdr.UnprovedForegroundOwner):
+        raise herdr_types.HerdrFailure(owner.reason)
+    if not isinstance(owner, herdr.ProvedClaudeForeground):
+        raise herdr_types.HerdrFailure("the pane has no proved Claude owner")
+    return owner
+
+
+def _caller_arguments(owner: herdr.ProvedClaudeForeground) -> list[str]:
+    """Read the nearest Claude ancestor and require the proved PID."""
+    pid = os.getppid()
+    for _ in range(pane_record.ANCESTOR_LIMIT):
+        if pid <= 1:
+            break
+        arguments = pane_record.process_arguments(pid)
+        if not arguments:
+            return []
+        if herdr.is_claude_process(arguments):
+            if pid == owner.pid:
+                return arguments
+            break
+        pid = pane_record.process_parent(pid)
+    raise herdr_types.HerdrFailure("the hook is outside the proved Claude launch")
+
+
 def main() -> None:
     environment = dict(os.environ)
     pane_id = environment.get("HERDR_PANE_ID", "")
     if environment.get("HERDR_ENV") != "1" or not pane_id:
         return
     payload = cast(HookInput, json.loads(sys.stdin.read()))
-    # One hook process owns this order; independent commands can run concurrently.
+    session = environment.get("HERDR_SESSION") or "default"
+    try:
+        owner = _check_pane_owner(session, pane_id)
+        arguments = _caller_arguments(owner)
+    except (herdr_types.HerdrFailure, OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
+        print(f"session launch observation: {error}", file=sys.stderr)
+        return
+    if not arguments:
+        print("cannot read Claude arguments; retained launch stays unchanged", file=sys.stderr)
+        return
     identity = staff_session_identity.handle(cast(Mapping[str, object], payload), environment)
     if identity is staff_session_identity.ClearIdentityResult.STAFFED:
         return
     session_id = payload.get("session_id", "")
     if not session_id:
         return
-    session = environment.get("HERDR_SESSION") or "default"
-    arguments = pane_record.claude_arguments(os.getpid())
-    if not arguments:
-        print("cannot read Claude arguments; retained launch stays unchanged", file=sys.stderr)
-        return
     if "-p" in arguments or "--print" in arguments:
         return
     launch = pane_record.launch(pane_id, session_id, payload.get("cwd") or os.getcwd(), environment, arguments)
-    pid = os.getppid()
-    for depth in range(pane_record.ANCESTOR_LIMIT):
-        del depth
-        if staff.runtime_id(pid) == session_id:
-            from scripts.message import sessions
-            started = sessions.process_start(pid)
-            if started:
-                launch["pid"] = pid
-                launch["proc_start"] = started
-            break
-        if pid <= 1:
-            break
-        pid = pane_record.process_parent(pid)
+    if staff.runtime_id(owner.pid) == session_id:
+        from scripts.message import sessions
+        started = sessions.process_start(owner.pid)
+        if started:
+            launch["pid"] = owner.pid
+            launch["proc_start"] = started
     pane_record.write(session, session_staff.record_membership(launch))
 
 
