@@ -93,6 +93,7 @@ def save(key: str, until: datetime, *, record_log: Callable[[Callable[[], None]]
             except atomic_file.AtomicDurabilityUnconfirmed as error:
                 if not confirmed:
                     raise
+                # The log writer only reports this error if its replacement stays visible.
                 logging.getLogger(__name__).warning('Review Later log durability %s: %s', key, error)
         except BaseException:
             if published:
