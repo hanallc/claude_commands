@@ -94,6 +94,8 @@ The panel says `No actions required.`
 The status line shows session review counts under `Review:`.
 It retains adhoc items and the existing review count colors.
 A separate `For you:` row shows the global action count.
+`assignment.py` reads the count and passes it to jq in the same process as the session counts.
+On Linux it uses the shared For you reader.
 The Mac requests only the count from the console host.
 The Mac resolves the peer in `console.conf` setting `for_you.host` with `tailscale ip -4`.
 The status line omits a known zero count and shows `Unavailable` for an incomplete read.

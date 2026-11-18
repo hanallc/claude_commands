@@ -16,7 +16,7 @@ from typing import cast
 
 from scripts.lib import git_files
 from scripts.production import staff
-from scripts.statusline import adhoc_items, rebuild_row
+from scripts.statusline import adhoc_items, for_you_count, rebuild_row
 
 
 def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
@@ -160,12 +160,15 @@ def main() -> None:
             )
         except OSError:
             pass
+    system = os.environ.get("STATUSLINE_SYSTEM", os.uname().sysname)
+    action_count = (for_you_count.console_action_count() if system == "Darwin"
+                    else for_you_count.global_action_count(rebuild_config))
     os.execvp("jq", ["jq", "-n", "--argjson", "payload", json.dumps(payload),
                      "--arg", "assignment", label, "--arg", "role", role,
                      "--arg", "counts", counts_rows(record, session_id),
                      "--arg", "branch", branch,
                      "--arg", "adhoc", adhoc_items.row(session_id),
-                     "--arg", "rebuild", rebuild.row(), *sys.argv[1:]])
+                     "--arg", "for_you", action_count, *sys.argv[1:]])
 
 
 if __name__ == "__main__":

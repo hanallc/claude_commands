@@ -286,6 +286,7 @@ That function returns `/console/rebuilds.html`.
 `?page=rebuilds` still selects that page for commit details.
 The shell refreshes its grouped details while that page is visible.
 The status line separates session `Review:` counts from the global `For you:` action count.
+`assignment.py` reads both counts before it replaces itself with jq.
 The Mac requests `/console/for-you.json?view=count` to read the count without command text.
 The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this count.
 `tailscale ip -4` returns the peer address.
@@ -1007,7 +1008,7 @@ An agent deletes an image with this command:
 
 `/console/rebuilds.html` lists machines that require a rebuild and shows commit details.
 The status line shows an action count or Unavailable.
-Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
+Each render checks whether the rebuild cache needs a refresh.
 The page combines the cached system comparison with open rebuild needs.
 The server serves it only in a folder that holds the browser manifest.
 It has no navigation entry; `?page=rebuilds` opens it.
