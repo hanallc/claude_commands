@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -152,12 +152,17 @@ def review_mark(issue: Issue) -> ReviewMark | NoMark:
     return ReviewMark(value) if value else NoMark()
 
 
-def record_review(path: Path, words: str, change: MarkChange, today: date, who: str = "nate") -> bool:
+def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, today: date, who: str = "nate",
+                  *, check: Callable[[], object] | None = None) -> bool:
     """Append one Review page log line and change its mark. Returns False for an exact repeat."""
     with issue_lock(path):
+        if check is not None:
+            _ = check()
         issue = Issue(path, frontmatter(path))
         before = review_log(issue)
-        events = review_events.append(before, ReviewLog(datetime.now(timezone.utc), who, words))
+        events = before
+        for line in (words,) if isinstance(words, str) else words:
+            events = review_events.append(events, ReviewLog(datetime.now(timezone.utc), who, line))
         mark = review_events.changed_mark(review_mark(issue), change)
         if events == before and mark == review_mark(issue):
             return False
@@ -269,9 +274,11 @@ def _vault_date(today: date) -> str:
     return f"[[{today.isoformat()}]]"
 
 
-def edit(path: Path, fields: dict[str, str], today: date) -> list[str]:
+def edit(path: Path, fields: dict[str, str], today: date, *, check: Callable[[], object] | None = None) -> list[str]:
     """Set the fields and date_modified in the issue at path. Returns the keys whose lines changed."""
     with issue_lock(path):
+        if check is not None:
+            _ = check()
         text, changed = set_fields(read_issue(path), {**fields, "date_modified": _vault_date(today)}, path)
         if changed:
             write_issue(path, text)

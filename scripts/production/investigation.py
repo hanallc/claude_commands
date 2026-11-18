@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 import argparse
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -143,10 +144,11 @@ def answer(owner: staff.StaffId, identity: str, text: str, *, question_id: str =
         return item
 
 
-def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investigation:
+def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
+              check: Callable[[], object] | None = None) -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
     _ = _path(owner, identity)
-    with _store(owner).locked():
+    with _store(owner).locked(check=check):
         item = load(owner, identity)
         if item.state == InvestigationState.READ:
             return item
@@ -158,11 +160,12 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investiga
         return item
 
 
-def review_action(owner: staff.StaffId, identity: str, action: str, words: str) -> Investigation:
+def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *,
+                  check: Callable[[], object] | None = None) -> Investigation:
     """Record feedback or a question and keep each previous answer in the log."""
     if not words.strip():
         raise InvestigationError("enter your words")
-    with _store(owner).locked():
+    with _store(owner).locked(check=check):
         item = load(owner, identity)
         if item.state != InvestigationState.ANSWER_READY:
             raise InvestigationError(f"{identity}: the answer is no longer ready")
@@ -179,8 +182,9 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str) 
         return item
 
 
-def record_review_log(owner: staff.StaffId, identity: str, words: str) -> None:
-    with _store(owner).locked():
+def record_review_log(owner: staff.StaffId, identity: str, words: str, *,
+                      check: Callable[[], object] | None = None) -> None:
+    with _store(owner).locked(check=check):
         item = load(owner, identity)
         event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
         _save(replace(item,log=review_events.append(item.log,event)))

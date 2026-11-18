@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
@@ -947,9 +948,11 @@ def outstanding_file(reference: str, *, identities: QuestionStaff | None = None)
 
 
 def outstanding_path(production: QuestionScope) -> Path:
-    root = state_root()
-    owner = production.owner
-    return root / "outstanding" / f"{owner.id}.json"
+    return outstanding_path_for_owner(production.owner.id)
+
+
+def outstanding_path_for_owner(owner: staff.StaffId) -> Path:
+    return state_root() / "outstanding" / f"{owner}.json"
 
 
 @dataclass(frozen=True)
@@ -1080,45 +1083,44 @@ def close_questions(document: Path, identities: QuestionStaff) -> None:
                 write_question_record(QuestionRecord(record.path, record.owner, record.asker, record.item, "closed"))
 
 
-def question_review_id(record: QuestionRecord) -> str:
-    """Allocate the question's stable owner-local number in its existing record."""
-    if identity := record.item.get("review_id", ""):
-        return identity
-    with outstanding_lock(record.path.parent / ".review-ids"):
-        fields = frontmatter(record.path) if record.path.exists() else {}
-        if fields:
-            current = _question_records([Issue(record.path, fields)])[0]
-            record = current
-        identity = record.item.get("review_id", "")
-        if identity:
-            return identity
-        highest = 0
-        for path in record.path.parent.glob("question-*.md"):
-            fields = frontmatter(path, keys=frozenset(("record_type", "registration")))
-            if fields.get("record_type") != ["question"]:
-                continue
-            registration = next(iter(fields.get("registration", [])), "")
-            number = re.search(r'(?:^|[,{])\s*"review_id"\s*:\s*"Q([1-9][0-9]*)"', registration)
-            if number is not None:
-                highest = max(highest, int(number[1]))
-        identity = f"Q{highest+1}"
-        record.item["review_id"] = identity
-        write_question_record(record)
-        return identity
+def next_question_review_id(record: QuestionRecord) -> str:
+    """Find the next Review id while the caller holds the question owner's lock."""
+    from scripts.production.issues import source_paths
+
+    highest = 0
+    for path in source_paths(record.path.parent, "question-*.md", sources=[]):
+        try:
+            fields = frontmatter(path, sources=[], keys=frozenset(("record_type", "production_id", "registration")))
+        except (FileNotFoundError, IsADirectoryError, ValueError):
+            continue
+        if fields.get("record_type") != ["question"] or fields.get("production_id") != [record.owner]:
+            continue
+        registration = next(iter(fields.get("registration", [])), "")
+        number = re.search(r'(?:^|[,{])\s*"review_id"\s*:\s*"Q([1-9][0-9]*)"', registration)
+        if number is not None:
+            highest = max(highest, int(number[1]))
+    return f"Q{highest+1}"
 
 
 def write_question_record(record: QuestionRecord) -> None:
+    """Save the question and its Review id under its owner's lock."""
+    with outstanding_lock(outstanding_path_for_owner(record.owner)):
+        _write_question_record(record)
+
+
+def _write_question_record(record: QuestionRecord) -> None:
     item = record.item
-    if "review_id" not in item and record.path.exists():
-        stored = _question_records([Issue(record.path, frontmatter(record.path))])
-        if stored and stored[0].item.get("review_id"):
-            item["review_id"] = stored[0].item.get("review_id", "")
-    if "review_log" not in item and record.path.exists():
-        stored = _question_records([Issue(record.path, frontmatter(record.path))])
-        if stored and stored[0].item.get("review_log"):
-            item["review_log"] = stored[0].item.get("review_log", "")
     if "question" not in item:
         raise RegistrationFailure("questions", f"{record.path}: the question text is missing")
+    if ("review_id" not in item or "review_log" not in item) and record.path.exists():
+        stored = _question_records([Issue(record.path, frontmatter(record.path, sources=[]))])
+        if stored:
+            if identity := stored[0].item.get("review_id"):
+                _ = item.setdefault("review_id", identity)
+            if events := stored[0].item.get("review_log"):
+                _ = item.setdefault("review_log", events)
+    if not item.get("review_id"):
+        item["review_id"] = next_question_review_id(record)
     text = "\n".join([
         "---", "record_type: question", "tags: [question]", f"status: {record.status}",
         f"production_id: {record.owner}", f"asked_by: {record.asker}",
@@ -1129,11 +1131,18 @@ def write_question_record(record: QuestionRecord) -> None:
         write_text_atomic(record.path, text)
 
 
-def record_review_log(path: Path, words: str, who: str = "nate") -> None:
+def record_review_log(path: Path, words: str, who: str = "nate", *,
+                      owner: staff.StaffId | None = None, check: Callable[[], object] | None = None) -> None:
     """Keep the user's action on the canonical question record."""
     from scripts.review_links import review_events
-    with outstanding_lock(path.parent / ".review-ids"):
-        record = _question_records([Issue(path, frontmatter(path))])[0]
+    if owner is None:
+        owner = _question_records([Issue(path, frontmatter(path, sources=[]))])[0].owner
+    with outstanding_lock(outstanding_path_for_owner(owner)):
+        if check is not None:
+            _ = check()
+        record = _question_records([Issue(path, frontmatter(path, sources=[]))])[0]
+        if record.owner != owner:
+            raise RegistrationFailure("questions", f"{path}: the question owner changed")
         events = review_events.decode(record.item.get("review_log", ""))
         event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, words)
         record.item["review_log"] = review_events.encode(review_events.append(events, event))
@@ -1142,6 +1151,11 @@ def record_review_log(path: Path, words: str, who: str = "nate") -> None:
 
 def store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
     """Store questions in their records and close questions absent from the new list."""
+    with outstanding_lock(outstanding_path(production)):
+        _store_questions(production, entries, identities)
+
+
+def _store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
     questions = [entry for entry in entries if "question" in entry]
     existing = question_records(production, identities)
     if not questions and not existing:
@@ -1162,7 +1176,6 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
         open_paths.add(path)
         record = QuestionRecord(path, owner, row.id, item, "open")
         write_question_record(record)
-        _ = question_review_id(record)
     for record in existing:
         if record.status == "open" and record.path not in open_paths:
             write_question_record(QuestionRecord(record.path, record.owner, record.asker, record.item, "closed"))
@@ -1222,13 +1235,25 @@ def questions_table(production: QuestionScope, *, identities: QuestionStaff | No
         print("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
 
 
+_held_outstanding_locks: ContextVar[frozenset[Path]] = ContextVar("held_outstanding_locks", default=frozenset())
+
+
 @contextmanager
 def outstanding_lock(outstanding: Path) -> Generator[None]:
-    """Lock the list during reads and writes. Never take this lock twice in one process."""
-    outstanding.parent.mkdir(parents=True, exist_ok=True)
-    with outstanding.with_suffix(".lock").open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    """Lock the owner's records. Reuse the lock in the same call context."""
+    path = outstanding.with_suffix(".lock").resolve()
+    held = _held_outstanding_locks.get()
+    if path in held:
         yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        token = _held_outstanding_locks.set(held | {path})
+        try:
+            yield
+        finally:
+            _held_outstanding_locks.reset(token)
 
 
 def legacy_entries(outstanding: Path) -> list[OutstandingItem]:

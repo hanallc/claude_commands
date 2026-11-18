@@ -61,10 +61,12 @@ class NumberedRecords:
         return self.folder() / f"{identity}.md"
 
     @contextmanager
-    def locked(self) -> Generator[None]:
+    def locked(self, *, check: Callable[[], object] | None = None) -> Generator[None]:
         directory = self.folder()
         directory.mkdir(parents=True, exist_ok=True)
         with exclusive(directory / ".lock"):
+            if check is not None:
+                _ = check()
             yield
 
     def next_number(self) -> int:

@@ -586,6 +586,13 @@ addEventListener('unhandledrejection',event=>errors.push(String(event.reason)));
 (async()=>{
 const failed=[],check=(ok,text)=>{if(!ok) failed.push(text);};
 const flush=()=>new Promise(resolve=>nativeTimeout(resolve,50));
+const until=async (ready,label)=>{
+ const deadline=performance.now()+8000;
+ while(!ready()){
+  if(performance.now()>deadline) throw new Error('Timed out: '+label);
+  await flush();
+ }
+};
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
 const change=(id,value,event='change')=>{const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));};
@@ -656,13 +663,11 @@ try{
  retryForm.elements.words.value='Deliver this feedback once';retryForm.elements.words.dispatchEvent(new Event('input'));
  const retryId=retryForm.elements.request.value,retryToken=retryForm.elements.token.value,startPosts=posts.length;
  retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
- await flush();await flush();await flush();await flush();
- dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await flush();await flush();
+ await until(()=>!retryForm.isConnected,'the refresh after the lost response');
  retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
  check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
  retryForm.requestSubmit(retryForm.querySelector('[value="tell"]'));
- await flush();await flush();await flush();await flush();
+ await until(()=>!retryForm.isConnected,'the refresh after the retry');
  check(posts.length===startPosts+2,'the lost response has one retry');
  check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
  retryForm=rows().find(row=>row.dataset.number==='106').querySelector('form');
@@ -676,10 +681,11 @@ try{
   requestIds.push(form.elements.request.value);
   holdPost=action==='tell';
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
-  if(holdPost){await flush();form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
+  if(holdPost){await until(()=>typeof finishPost==='function','the held response');
+   form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
    check(form.querySelector('[value="tell"]').disabled,'editing words during delivery keeps Tell morty disabled');finishPost();}
   check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
-  await flush();await flush();
+  await until(()=>!form.dataset.sending,'the '+action+' response');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');

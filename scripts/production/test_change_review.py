@@ -213,7 +213,7 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("push", "origin", "main")
         return self.git("rev-parse", "HEAD")
 
-class ProducerWriterTests(ProducerFixture):
+class NativeVerdictTests(unittest.TestCase):
     def test_native_verdict_keeps_the_exchange_locked_until_the_list_save(self) -> None:
         from scripts.review_links import change_page, review_page, test_review_page
 
@@ -250,21 +250,21 @@ class ProducerWriterTests(ProducerFixture):
         from scripts.review_links import change_page, review_items, review_page, test_review_page
 
         for verdict in ('works', 'not works: the spacing differs'):
-            for supplied in ('missing', 'old', 'current'):
-                with self.subTest(verdict=verdict, supplied=supplied):
-                    case = test_review_page.ReviewPageTests('runTest')
-                    case.setUp()
-                    try:
-                        key = 'page-owner/C1'
-                        old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
-                        assert isinstance(old, change_page.MessageDelivery)
-                        change_page.deliver(old, case.status)
-                        current, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the new case.'), case.status)
-                        assert isinstance(current, change_page.MessageDelivery)
-                        change_page.deliver(current, case.status)
-                        listing = current.page.review_list
-                        record = case.status.path(current.page, current.row)
-                        before = listing.read_bytes(), record.read_bytes()
+            case = test_review_page.ReviewPageTests('runTest')
+            try:
+                case.setUp()
+                key = 'page-owner/C1'
+                old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
+                assert isinstance(old, change_page.MessageDelivery)
+                change_page.deliver(old, case.status)
+                current, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the new case.'), case.status)
+                assert isinstance(current, change_page.MessageDelivery)
+                change_page.deliver(current, case.status)
+                listing = current.page.review_list
+                record = case.status.path(current.page, current.row)
+                before = listing.read_bytes(), record.read_bytes()
+                for supplied in ('missing', 'old', 'current'):
+                    with self.subTest(verdict=verdict, supplied=supplied):
                         identity = '' if supplied == 'missing' else old.attempt if supplied == 'old' else current.attempt
                         arguments = ('verdict', '--production', 'page-owner', '--list', str(listing),
                                      '--row', 'C1', '--verdict', verdict)
@@ -298,8 +298,8 @@ class ProducerWriterTests(ProducerFixture):
                             code, output, errors = run(*arguments, '--validation', identity)
                             self.assertEqual((code, output, errors.strip()), (1, '', 'this row has no open question'))
                             self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
-                    finally:
-                        case.doCleanups()
+            finally:
+                case.doCleanups()
 
     def test_native_verdict_refuses_a_superseded_validation(self) -> None:
         from scripts.review_links import change_page, review_page, test_review_page
@@ -330,6 +330,8 @@ class ProducerWriterTests(ProducerFixture):
         assert isinstance(request, change_page.OpenQuestion)
         self.assertTrue(change_page.answer_item(key, 'The new case passes.', request.question_id, case.status))
 
+
+class ProducerWriterTests(ProducerFixture):
     def test_output_capture_adds_an_image_to_add_edit_and_batch_rows(self) -> None:
         output = self.root / "output.txt"
         _ = output.write_text("All checks passed\n", encoding="utf-8")
@@ -483,6 +485,21 @@ class ProducerWriterTests(ProducerFixture):
                 self.assertFalse(folder.exists())
                 reviewed = next(item for item in change_review.review_rows(self.listing) if item["#"] == row)
                 self.assertEqual(reviewed.get(change_review.IMAGE, ""), "")
+
+    def test_verdict_reports_failed_image_cleanup_after_the_write(self) -> None:
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        identity = image_store.register_change(shot)
+        day = date(2026, 11, 15)
+        _ = change_review.append_rows(self.listing, [Visible("Preview", "Read", "The image", image=identity)],
+            day, "", self.doc, producers=[self.unit.id], record=staff.snapshot())
+        warnings: list[str] = []
+        with mock.patch.object(image_store, "remove_change", side_effect=PermissionError("The image cannot be removed.")):
+            result = change_review.record_verdict(self.listing, "C1", "works", day, self.doc, report_warning=warnings.append)
+        self.assertIsInstance(result, change_review.VerdictRecorded)
+        self.assertEqual(change_review.review_snapshot(self.listing).reviewed[0]["Verdict"], "works")
+        warning, = warnings
+        self.assertIn("Image cleanup failed", warning)
 
     def test_open_cells_follow_staff_changes_without_rewriting_review_history(self) -> None:
         _ = change_review.append_rows(self.listing, [Visible("Unit", "Read", "Proof"),

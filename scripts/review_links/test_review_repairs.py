@@ -118,7 +118,7 @@ class ReviewRepairsTests(unittest.TestCase):
             before = waiting.source.record.path.read_bytes()
             self.assertEqual(waiting.actions, ())
             form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'),
-                                    conf.read('review_links').whole('review_words_rows'))
+                                    conf.read('review_links').whole('review_words_rows'), 'fixture-revision')
             self.assertIn('value="later">Later', form)
             for action in ('answer', 'feedback', 'question'):
                 with self.subTest(action=action):
@@ -257,6 +257,7 @@ class ReviewRepairsTests(unittest.TestCase):
         results: list[list[str]] = []
         complete = threading.Event()
         case = self.case
+        markup=markup.replace('<head>','<head><script>'+test_review_page.BODY_READY_SCRIPT+'</script>',1)
         document = markup.replace('</body>','<img hidden src="/complete"><script>'+probe+'</script></body>').encode()
 
         class Handler(BaseHTTPRequestHandler):
@@ -284,13 +285,24 @@ class ReviewRepairsTests(unittest.TestCase):
                     assert isinstance(validation, (change_page.DeliveryIntent, change_page.ValidationRequested))
                     _ = change_review.save_verdict(case.fixture.review_list, row, verdict, case.fixture.production,
                                                    validation_id=validation.attempt)
+                fields = parse_qs(route.query)
+                snapshot = review_page.build_snapshot(case.root) if route.path in ('/fresh', review_page.PAGE_PATH) else None
                 self.send_response(200)
                 self.send_header('Content-Type','text/html; charset=utf-8')
+                if snapshot is not None and 'body' in fields:
+                    self.send_header('X-Review-Version', snapshot.version)
                 self.end_headers()
                 if self.path == '/complete':
                     _ = complete.wait(25)
-                elif self.path.startswith('/fresh') or self.path.startswith('/console/review.html'):
-                    _ = self.wfile.write(review_page.render(case.root, show=parse_qs(route.query).get('show', ['open'])[0]))
+                elif snapshot is not None:
+                    if 'body' in fields:
+                        _ = self.wfile.write(snapshot.body(fields['body'][0]))
+                    elif 'index' in fields:
+                        _ = self.wfile.write(snapshot.index_response())
+                    elif 'version' in fields:
+                        _ = self.wfile.write(json.dumps({'version':snapshot.version,'facts':snapshot.facts()}).encode())
+                    else:
+                        _ = self.wfile.write(snapshot.render(show=fields.get('show',['open'])[0]))
                 else:
                     _ = self.wfile.write(document)
 
@@ -338,18 +350,13 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const nextView=()=>new Promise(resolve=>{
-  const previous=document.querySelector('[data-review]');
-  const observer=new MutationObserver(()=>{
-   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
-  });observer.observe(document.body,{childList:true,subtree:true});
- });
+ const nextView=()=>new Promise(resolve=>document.querySelector('[data-review]').addEventListener('review-refreshed',resolve,{once:true}));
  const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{
   source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
  const show=async value=>{
   const chip=document.querySelector('[data-show-chip="'+value+'"]');
   if(chip.getAttribute('aria-pressed')==='true') return;
-  const loaded=nextView();chip.click();await loaded;
+  chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
  const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
  const owner=()=>document.querySelector('#list-owner');
@@ -367,7 +374,7 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   for(const [id,selected] of [['C1','Waiting'],['C2','Done']]){
    await show('open');const before=count('open');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
-   row.querySelector('.list-toggle').click();await save(row.querySelector('form'));
+   row.querySelector('.list-toggle').click();await readyReviewCard(row);await save(row.querySelector('form'));
    await show(selected);await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
    check(count('open')===before && count('Waiting')===0,
     'F005: the fresh index keeps the owner answer Open while '+selected+' omits its row');
@@ -421,13 +428,7 @@ window.fetch=(url,options={})=>{
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
- const nextView=()=>new Promise(resolve=>{
-  const previous=document.querySelector('[data-review]');
-  const observer=new MutationObserver(()=>{
-   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
-  });
-  observer.observe(document.body,{childList:true,subtree:true});
- });
+ const nextView=()=>new Promise(resolve=>document.querySelector('[data-review]').addEventListener('review-refreshed',resolve,{once:true}));
  const row=id=>document.querySelector('[data-key="page-owner/'+id+'"]');
  const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
  const save=async(form,value)=>{
@@ -440,29 +441,29 @@ window.fetch=(url,options={})=>{
  const show=async value=>{
   const chip=document.querySelector('[data-show-chip="'+value+'"]');
   if(chip.getAttribute('aria-pressed')==='true') return;
-  const loaded=nextView();chip.click();await loaded;
+  chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
  try{
-  row('C1').querySelector('.list-toggle').click();
+  row('C1').querySelector('.list-toggle').click();await readyReviewCard(row('C1'));
   const counts=()=>['open','Waiting','Done','all'].map(value=>
    Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent));
   const before=counts();
   const form=row('C1').querySelector('form');await save(form,'validate');
   check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2],before[3]]),
    'A save moves the entry from Open to Waiting without changing All.');
-  check(row('C1').hidden,'the saved check leaves Open');
+  check(!row('C1') || row('C1').hidden,'the saved check leaves Open');
   await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the waiting check out of Open');
   check(counts()[1]===before[1]+1 && counts()[3]===before[3],
    'F001: refresh replaces the counts with the saved state');
   await show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
-  row('C2').querySelector('.list-toggle').click();
+  row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
   const second=row('C2').querySelector('form');await save(second,'validate');
   await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
   await show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
-  await show('all');row('C3').querySelector('.list-toggle').click();
+  await show('all');row('C3').querySelector('.list-toggle').click();await readyReviewCard(row('C3'));
   const third=row('C3').querySelector('form');await save(third,'works');
-  check(row('C3').hidden,'F010: Works leaves All');
+  check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
   for(let pass=0;pass<2;pass++){
    await refresh();
    for(const choice of ['open','Waiting','Done','all']){
@@ -473,10 +474,10 @@ window.fetch=(url,options={})=>{
   for(const key of keys){
    await show('open');
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
-   asked().querySelector('.list-toggle').click();
+   asked().querySelector('.list-toggle').click();await readyReviewCard(asked());
    const asking=asked().querySelector('form');asking.elements.feedback.value='Check the next case.';
    await save(asking,'question');
-   check(asked().hidden,'F021: Ask question leaves Open for '+key);
+   check(!asked() || asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
     await refresh();check(!asked() || asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
    }
@@ -487,7 +488,7 @@ window.fetch=(url,options={})=>{
   location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
   await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
-  investigation.querySelector('.list-toggle').click();await save(investigation.querySelector('form'),'read');
+  investigation.querySelector('.list-toggle').click();await readyReviewCard(investigation);await save(investigation.querySelector('form'),'read');
   await refresh();
   const owner=document.getElementById('list-owner');
   check(owner.value===UNIT_OWNER && owner.selectedOptions[0]?.textContent===UNIT_NAME+' (0)' &&

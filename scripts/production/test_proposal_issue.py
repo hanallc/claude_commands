@@ -22,6 +22,7 @@ from scripts.production.issues import Issue
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.user_zone import user_zone
+from scripts.review_links.review_events import ReviewMark
 from scripts.style import rules
 
 ISSUE = """---
@@ -544,6 +545,26 @@ class ProposalIssueTests(unittest.TestCase):
                     _ = verb()
                 self.assertEqual(blocked, [True])
                 self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["a proposal.md"])
+
+    def test_review_writes_check_the_record_under_the_issue_lock(self) -> None:
+        before = self.issue.read_bytes()
+        today = date(2026, 11, 15)
+
+        def refuse() -> None:
+            lock, = self.runtime.glob("proposal-issue-*.lock")
+            with lock.open("a") as other, self.assertRaises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.issue.read_bytes(), before)
+            raise proposal_issue.Refusal("The record changed.")
+
+        actions = {
+            "decline": lambda: proposal_issue.edit(self.issue, {"style_answer": "declined"}, today, check=refuse),
+            "approve": lambda: proposal_issue.record_review(self.issue, "Approve", ReviewMark.DONE, today, check=refuse),
+        }
+        for outcome, action in actions.items():
+            with self.subTest(outcome=outcome), self.assertRaisesRegex(proposal_issue.Refusal, "The record changed"):
+                _ = action()
+            self.assertEqual(self.issue.read_bytes(), before)
 
     def test_fill_ranking_writes_an_empty_ranking_once_under_the_issue_lock(self) -> None:
         self.decision_issue()
