@@ -569,6 +569,9 @@ sweep_after_step() {
     # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
+        if [[ "${DOC_COPY_LEASE_FD:-}" =~ ^[0-9]+$ ]]; then
+            eval "exec $DOC_COPY_LEASE_FD>&-"
+        fi
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
