@@ -36,7 +36,7 @@ from urllib.parse import quote
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state
 if TYPE_CHECKING:
-    from scripts.build_queue import placement
+    from scripts.build_queue import admission_records as records, placement
 else:
     class _DeferredPlacement:
         """Load placement types when an offload operation uses them."""
@@ -211,6 +211,12 @@ class LostMacRun:
     detail: str = 'runner sent no final status'
 
 
+def _no_refusal_settings() -> records.NoRefusalSettings:
+    from scripts.build_queue import admission_records
+
+    return admission_records.NoRefusalSettings()
+
+
 @dataclass(frozen=True)
 class DeclinedMacRun:
     """An attempt declined before a Mac test command began."""
@@ -218,6 +224,7 @@ class DeclinedMacRun:
     reason: NonBusyMacDeclineReason
     seconds: float
     detail: str = ""
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = field(default_factory=_no_refusal_settings)
 
 
 @dataclass(frozen=True)
@@ -2707,14 +2714,25 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
                      request: OffloadRequest, started: float) -> MacOffloadResult:
     """Select Hana policy before any SSH probe, process scan, or mirror transfer."""
     from scripts.aws_target import hana_placement as hana
+    from scripts.build_queue import admission_records, admission_wire
 
     repository = eligibility.repository_identity(request.repo_root)
     if not isinstance(repository, KnownRepository):
         return declined('repo', started)
     kind = request.kind or eligibility.verb_kind(request.verb)
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = admission_records.NoRefusalSettings()
+    if isinstance(request.placement, AssignedOffloadRequest):
+        try:
+            # A settings edit between reads permits one retry if the new settings stay current.
+            refusal_settings = admission_records.RefusalSettings(admission_wire.placement_configuration_digest(
+                request.placement.assignment.destination.target, placement.ExplicitProviderSettings(transport.settings),
+                targets=target_config.read_targets(), transport_for=target_config.read_execution_transport,
+                read_bytes=Path.read_bytes))
+        except (OSError, ValueError):
+            pass
     policy = hana.fixed_policy(transport, str(request.repo_root), kind)
     if isinstance(policy, hana.HanaStepRefused):
-        return DeclinedMacRun('off', elapsed_seconds(started), policy.reason)
+        return DeclinedMacRun('off', elapsed_seconds(started), policy.reason, refusal_settings)
     command = ('cargo', request.verb, *request.nextest_words)
     step = hana.classify_command(request.verb, kind, command)
     if (isinstance(step, hana.HanaStepRefused) or request.copy or isinstance(request.fetch, FetchFolder)
@@ -3240,7 +3258,7 @@ def submit_direct_placement(request: OffloadRequest, since: float,
 
 def report_placement_result(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult) -> None:
     """Report a settled adapter path without inventing a remote process identity."""
-    from scripts.build_queue import admission_client, admission_protocol as wire
+    from scripts.build_queue import admission_client, admission_protocol as wire, admission_records
 
     if not isinstance(request.placement, AssignedOffloadRequest):
         return
@@ -3255,7 +3273,9 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
         return
     if isinstance(provider, placement.NoProviderClaim):
         reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "claim unavailable"
-        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason))
+        refusal_settings = result.refusal_settings if isinstance(result, DeclinedMacRun) else admission_records.NoRefusalSettings()
+        _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason,
+            refusal_settings=refusal_settings))
         return
     if not isinstance(controller.hana_settlement, NoHanaSettlement):
         settled = controller.hana_settlement
