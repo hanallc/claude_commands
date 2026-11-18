@@ -700,7 +700,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             with server.list_store_access():
                 delivery = list_page.submit(server.root, body, server.delivery_status)
                 fixture_reply = ({"state": "saved",
-                    **list_page.fresh_request(server.root, fields["keeper"][0], fields["id"][0])}
+                    **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
                     if server.mode is ServerMode.LIST_FIXTURE else None)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
