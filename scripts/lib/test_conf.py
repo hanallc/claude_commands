@@ -217,6 +217,16 @@ conf_reads.record('disabled')
             self.assertEqual(origin.value, Decimal("2.5"))
             self.assertEqual(conf.read("example").values(), {"label": "changed", "amount": "9"})
 
+    def test_values_combines_requested_keys_with_host_only_prefix(self) -> None:
+        self.write("label=base\nlabel.testhost=local\nmodel.active.testhost=blue\n"
+                   + "model.other.anotherhost=green\naccount.active.testhost=red\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example"):
+            settings = conf.read("example")
+            self.assertEqual(settings.values("label", "missing"), {"label": "local"})
+            self.assertEqual(settings.values(host_only_prefix="model."), settings.values() | {"model.active": "blue"})
+            self.assertEqual(settings.values("label", "missing", host_only_prefix="model."),
+                             {"label": "local", "model.active": "blue"})
+
     def test_each_reader_returns_its_type_and_preserves_text_after_the_first_equals(self) -> None:
         self.write("# range: ..\nfraction=2.5\n# whole: ..\ncount=-2\nlabel= a=b c # note\nnames= alpha  beta\tempty\n")
         self.assertEqual(conf.read("example").number("fraction"), 2.5)
