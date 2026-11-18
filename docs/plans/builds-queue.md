@@ -2865,6 +2865,35 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 7. From the director's read of the 44bs repair (2026-11-18): in `build_row_step`, `QueueRowName.recorded_program` and `QueueRowName.recorded_step_text` return the same text when the step text is not empty. Keep one source. A step that the parser cannot read shows `unknown` (the recorded step text) until item 4 saves the command text.
 8. Dispatch (2026-11-18 05:35 EST): items 1, 2, 5, 6 and 7 are built on the 44bs head in `/session/queue/namefix`, branch `builds-queue-44bx`. Item 4 changes the admission wire; it follows after 44bq, 44bt and 44bu are on main.
 
+### Phase 44bz — A release reply comes back fast  · status: todo
+**Ruling (builds, 2026-11-18):** "Find out if the release reply is really slow or only the test is. Fix the cause." `ReleaseRequest` took more than one second in 1 of 5 runs (`test_placement.py` blocked remote evidence) and 2 of 5 runs (`test_hana_placement.py` controller lock).
+1. The history sync runs after the reply. The release saves `Ok`, the reservation removal, the caller version and the pending end event in one state write before the reply.
+2. Startup drains a pending end event and writes it one time only. Crash tests prove it.
+3. The latency limits stay as they were.
+4. Built in `/session/queue/slowreply`. Measured on dd06b6802: release 132/343 ms median/max (blocked evidence), 152/374 ms (Hana).
+
+### Phase 44ca — A process name with bytes that are not UTF-8 does not stop the queue  · status: todo
+**Source:** 10 live crashes on 2026-11-18 at `memory_admit.py` `process_memory` (`path.read_text()`, UnicodeDecodeError 0xff).
+1. `scripts/lib/proc_text.py` `read_proc_text` reads every `/proc` text file with replacement for bad bytes.
+2. All `/proc` reads in the queue, the memory feed, the scope activity and the build log use it.
+3. A test feeds a `/proc` file with a 0xff byte to each reader.
+4. `scripts/lib/proc_text.py` is one more line in `hana_render.files`; tell builds and aws.
+5. Built in `/session/queue/procdecode`. Builds places it right after the Hana items.
+
+### Phase 44cd — A head that waits on a busy Mac keeps its natedev place  · status: todo
+**Source:** builds, 2026-11-18. Slot 6 (joined 11:59) was admitted at 13:09:45 ahead of the head (joined 11:24). The queue offered the head to the Mac 32 times; each offer closed "busy". While an offer was open, the natedev line skipped the head.
+1. An open remote assignment keeps the head's natedev place until the remote target confirms execution.
+2. The hold ends when the remote target confirms, reports busy, passes its time limit, or the caller dies. After busy, the row is head again in its old place.
+3. The hold stops only rows behind the head. The 44bu hold exception stays.
+4. A regression test replays the case; it fails on a78d4afde.
+5. Built in `/session/queue/headkeep`, branch `builds-queue-44cd`.
+
+### Phase 44ce — A live release that keeps sampler files comes back fast  · status: todo
+**Ruling (builds, 2026-11-18 14:00 EST):** go, after 44cd, with this rule: simple before fast. A release that keeps sampler files took 682 ms median, 838 ms max (44bz proof). Before `Ok` it appends peak history with its own fsync, writes `state.json`, and makes a separate generation write; each state write syncs the file and its folder.
+1. First make fewer syncs before `Ok`: one state write that carries the generation, and a history append without its own fsync.
+2. Measure the sampled release (20 runs, median and max). Report the number to builds.
+3. Only if it does not reach about 150 ms, add a replay record so history and cleanup run after `Ok`, with history dedup on restart. Builds reads the measured number first.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
