@@ -125,6 +125,29 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "clippy", "clippy"])
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
 
+    def test_refused_mac_fix_does_not_cache_failed_lint(self) -> None:
+        self.set_verb_answer("mend-check", "failed", 1)
+        self.set_verb_answer("mend-fix", "passed", 0, "refused")
+        # Make the local repair fail before it changes the tree.
+        self.write_executable(self.bin_directory / "cargo", CARGO_STUB + '''
+if arguments[:1] == ["mend"]:
+    raise SystemExit(1)
+''')
+        process = self.queued_lint()
+        self.wait_until(lambda: len(self.runner_events()) == 3, "the Mac judgments and fix pass", (process,),
+                        directory=self.runner_state)
+        self.wait_for_memory_wait(process)
+        self.release_memory()
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(process.returncode, 1, output + errors)
+        self.assertIn("the Mac fix pass did not finish", output)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "clippy"])
+        self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.fail")), [])
+
     def test_busy_mac_keeps_the_lint_in_the_local_memory_queue(self) -> None:
         self.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.runner_state / "mac-free")
         process = self.queued_lint()

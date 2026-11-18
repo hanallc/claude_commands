@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, placement
 from scripts.build_queue.test_queue_view import with_converted_executions
 
 import json
@@ -1545,16 +1545,27 @@ process.stdout.write(JSON.stringify({
 
     def test_each_wait_state_keeps_its_reason_and_the_other_readings(self) -> None:
         reasons = (
-            (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts"),
-            (admission_records.BehindHead("first", 1, "head-session"), "behind"),
+            (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory", False),
+            (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts", False),
+            (admission_records.BehindHead("first", 1, "head-session"), "behind", False),
+            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · second · nextest · compiler", True),
         )
-        for reason, expected in reasons:
+        for reason, expected, has_blocker in reasons:
             with self.subTest(reason=reason):
                 reading = with_wait_reason(reservation_reading(), reason)
+                if has_blocker:
+                    first = admission_records.WaitingStep(201, "first-session", "first", "build",
+                        "/fixture", 1, admission_records.GIB, admission_records.ReadyForAdmission())
+                    second = replace(first, pid=202, session_id="second-session", session_name="second",
+                        step="nextest", since=2, reason=admission_records.NeedsMemory(), unit="compiler")
+                    reading = replace(reading, view=replace(reading.view,
+                        waiting=(first, second, *reading.view.waiting)))
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     page = memory_feed.reading()
-                self.assertIn(expected, page["waiters"][0]["reason"])
+                text = page["waiters"][-1 if has_blocker else 0]["reason"]
+                self.assertIn(expected, text)
+                if has_blocker:
+                    self.assertNotIn("first step in line", text)
                 self.assertTrue(page["walk"])
                 self.assertGreater(page["room"], 0)
 
@@ -2668,6 +2679,7 @@ def write_browser_fixture(folder: Path) -> None:
         for name, reason in (
             ("pressure", admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory")),
             ("spacing", admission_records.StartSpacingWait(110)),
+            ("cargo_folder", placement.CargoFolderWait()),
             ("head", admission_records.BehindHead("first", 1, "head-session")),
         ):
             readings[name] = with_wait_reason(base, reason)
