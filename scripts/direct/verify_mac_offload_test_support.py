@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
+from scripts.build_queue.admission_test_support import (
+    PrivateHostEvidence, caller_admission, caller_provider_controls, private_provider_evidence,
+)
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
 from scripts.lib.berth_test_support import write_unconfigured_berth
@@ -31,7 +33,7 @@ import unittest
 import contextlib
 from contextlib import contextmanager
 from collections.abc import Callable, Generator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, NotRequired, TypedDict, cast, override
@@ -48,6 +50,27 @@ from scripts.lib.shell_test_support import shell_functions
 VERIFY = Path(__file__).with_name("verify.sh")
 
 _REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
+
+
+def drop_released_mac_claim(reader: service.HostEvidenceReader, claim: placement.ProviderClaimReference) -> None:
+    worker, key = reader.worker, reader.key
+    with worker.lock:
+        cached = worker.observations.get(key)
+        if isinstance(cached, placement.FreshHostEvidence):
+            updated = replace(cached,
+                claims=tuple(held for held in cached.claims if held.reference != claim),
+                cleanup_claims=tuple(held for held in cached.cleanup_claims if held.reference != claim),
+                executions=tuple(execution for execution in cached.executions if execution[0] != claim))
+            if isinstance(updated, PrivateHostEvidence) and updated.holder_claim == claim:
+                updated = replace(updated, holder=placement.ResourceHolderUnknown(),
+                    holder_claim=placement.NoProviderClaim(), provider_diagnostic=placement.NO_PROVIDER_DIAGNOSTIC)
+            if updated != cached:
+                worker.observations[key] = updated
+        if key in worker.subscriptions:
+            # Discard probes that started before the claim release.
+            worker.subscriptions[key] = object()
+            worker.due[key] = float("-inf")
+            worker.requested.set()
 
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -1100,15 +1123,15 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             replies = handle_request(request, connection)
             if (isinstance(request, wire.ExecutionReport)
                     and request.assignment.destination.provider == "mac"
+                    and isinstance(request.claim, placement.ProviderClaimReference)
+                    and (request.claim.episode, request.claim.attempt) == (request.assignment.episode, request.assignment.attempt)
                     and isinstance(request.path, placement.DispatchPathSettled)
                     and isinstance(request.outcome, (placement.PrelaunchRefused, placement.AttemptDeclined))):
                 assignment = request.assignment
                 key = admission.server.placement_host_keys.get((assignment.episode, assignment.destination))
                 reader = admission.server.host_readers.get(key) if key is not None else None
                 if reader is not None:
-                    # The runner released its claim. Discard readings from the old subscription.
-                    reader.worker.remove(reader.key)
-                    reader.worker.request(reader.key)
+                    drop_released_mac_claim(reader, request.claim)
             return replies
 
         admission.server.handle_request = refresh_after_release
