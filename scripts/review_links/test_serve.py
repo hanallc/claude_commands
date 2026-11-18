@@ -1378,7 +1378,7 @@ class ServerStartupTests(unittest.TestCase):
         tailscale.chmod(0o755)
         other_store = temporary / "other-store"
         configuration = temporary / "config"
-        _ = shutil.copytree(conf.directory(), configuration)
+        _ = shutil.copytree(checkout / "config", configuration)
         rebuild_cache = temporary / "rebuild-cache"
         _ = (configuration / "statusline.conf").write_text(f"rebuild.cache={rebuild_cache}\n")
         _ = rebuild_cache.write_text("rebuild mac\n0\n")
