@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, review_submissions
-from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG
+from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
 RECIPIENTS = [{"id": str(OWNER), "name": "builds", "proposal": True}] + [
@@ -366,6 +366,8 @@ class NewItemDialogTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         recipient = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((recipient,))))
+        _ = self.enterContext(patch.object(review_submissions, "_identify_image", autospec=True,
+                                           side_effect=identify_fixture_image))
         fixtures = {width: DialogFixture(temporary / str(width)) for width in (1440, 390)}
         capture_dialogs(temporary / "dialog.png", fixtures)
         for width, fixture in fixtures.items():

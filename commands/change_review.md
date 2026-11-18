@@ -12,12 +12,23 @@ For `/change_review` with no action:
 
 The command prints the Hana console link.
 Review combines questions, changes, investigations, proposals and efficiencies.
-Each card has Your words, closing actions, Ask question and Later with a date and time.
-Send feedback closes the item with the result **feedback sent**.
+The Show row offers Open, Validating, Done and All.
+Cards with actions have Your words, closing actions, Ask question and Later.
+Send feedback closes questions, investigations, proposals and efficiencies.
+Ask showrunner to check, Ask question and Send feedback transfer a change to its showrunner.
+The change moves from Open to Validating.
+Validating and All show **With <showrunner> since <time>** in the user zone.
+The row has no buttons.
+Only the Validating chip counts the change.
+The Validating chip is dim at zero.
+The server refuses a second request while the change is Validating.
+A showrunner answer, feedback action or fault returns the change to Open.
+A works result moves the change to Done without a notice.
 Ask question sends the words to the owner and returns the item after the owner answers.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
 Use the question ID from the request message.
 Later keeps the state and hides the item from Review, the For you count and `/next` until its time.
+A change hand-off clears the saved Later time.
 The canonical question log retains the user's answer words without a time limit.
 
 1. Run the page script:
@@ -410,8 +421,9 @@ The validation message asks the row's showrunner to check the change for the use
 3. Save `works (validated by the showrunner: <evidence>; not seen live: <what>)` if the check passes.
 4. Save a verdict that names the fault if the check fails.
 
-Use `verdict --production <name> --row <id> --validation <validation id> --verdict "<result>"` for either result.
-A fault returns the row to For you with the evidence in its log.
+Use the verdict command from the validation message for either result. It includes `--validation <id>`.
+A fault returns the row to Open with the evidence in its log.
+A successful check moves the row to Done without a notice.
 The command refuses a missing or old validation ID.
 
 ## Ask question
@@ -425,7 +437,7 @@ The command refuses a missing or old validation ID.
 ```
 
 Use the question ID from the request message for all five Review types.
-The item returns to For you with the answer in its log.
+The item returns to Open with the answer in its log.
 The answer and cells can hold several lines; lines that start with `- ` or `1. ` show as lists.
 The user can give a verdict or ask another question.
 The same question ID and answer text change nothing and exit 0 on a rerun.
@@ -433,19 +445,18 @@ The command refuses an old or unknown ID, a different answer, or a row without a
 
 ## Feedback
 
-Send feedback finishes the Review item.
-Send any resulting work as a new item.
-The following reply form applies only to a pending feedback request from an older selected-row page.
+Send feedback transfers the change to the showrunner.
+Use the command in the feedback message to record the action.
 
 1. Read the feedback and its `Feedback id` in the change review message.
 2. Complete the directed action.
 3. Record what you did with the feedback id:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<what you did>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --item <Review-key> --question <id> --text "<what you did>"
 ```
 
-The note returns the row to the user's waiting count.
+The note returns the change to Open and its counts.
 A verdict closes the row under the existing verdict rules.
 
 ## Never a question

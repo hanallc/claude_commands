@@ -25,7 +25,9 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 ROLE_MAP_HOST = "natedev"
-Role = Literal["showrunners", "units", "workers"]
+ClaudeGroup = Literal["units", "showrunners", "producers"]
+CLAUDE_GROUPS: tuple[ClaudeGroup, ...] = ("units", "showrunners", "producers")
+Role = ClaudeGroup | Literal["workers"]
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ def selection_reason(selection: StoredGroupSelection) -> TransitionReason:
 class StoredGroupSelections(TypedDict, total=False):
     units: str | StoredGroupSelection
     showrunners: str | StoredGroupSelection
+    producers: str | StoredGroupSelection
 
 
 @dataclass(frozen=True)
@@ -346,7 +349,7 @@ def _object(path: Path) -> dict[str, object]:
 
 def _groups(raw: dict[str, object]) -> StoredGroupSelections:
     groups = StoredGroupSelections()
-    for group in ("units", "showrunners"):
+    for group in CLAUDE_GROUPS:
         if group not in raw:
             continue
         value = raw[group]
@@ -535,7 +538,7 @@ def decode_role_map_change(text: str) -> RoleMapChange | WorkersClaudeRouteChang
             raise ValueError("Claude workers route needs an end time")
         return WorkersClaudeRouteChange(NamedWorkersClaudeAccount(cast(str, label), datetime.fromisoformat(cast(str, until))) if label
             else DEFAULT_WORKERS_CLAUDE_ACCOUNT, cast(str, why), cast(str, at))
-    if role not in ("units", "showrunners", "workers") or not all(isinstance(item, str) for item in (label, why, at)):
+    if role not in ("units", "showrunners", "producers", "workers") or not all(isinstance(item, str) for item in (label, why, at)):
         raise ValueError("invalid role change")
     move_id, reset = fields.get("move_id", ""), fields.get("reset", "")
     cause, window = fields.get("cause", "by hand"), fields.get("window", "unknown")
@@ -746,7 +749,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
                 continue
             fields = cast(dict[str, object], raw)
             why = fields.get("why")
-            if (fields.get("cause") == "auto" and fields.get("group") in ("units", "showrunners")
+            if (fields.get("cause") == "auto" and fields.get("group") in CLAUDE_GROUPS
                     and isinstance(why, str) and why.startswith("auto: ")):
                 consumed.add(why.removeprefix("auto: "))
     except ValueError as error:
@@ -758,7 +761,7 @@ def _read_recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoM
 @dataclass(frozen=True)
 class AutoMoveTarget:
     entry_id: str
-    group: Literal["units", "showrunners"]
+    group: ClaudeGroup
     label: str
 
 
@@ -780,7 +783,10 @@ def repair_selected_auto_moves(entries: tuple[AutoMoveTarget, ...], now: datetim
             consumed = set(recorded.entry_ids)
             missing: list[RoleHistoryEntry] = []
             for entry in entries:
-                selected = selections.get("units") if entry.group == "units" else selections.get("showrunners")
+                if entry.group == "producers":
+                    selected = selections.get("producers")
+                else:
+                    selected = selections.get("units") if entry.group == "units" else selections.get("showrunners")
                 if (selected is None or isinstance(selected, str) or selected["cause"] != "auto"
                         or selected.get("why") != "auto: " + entry.entry_id
                         or selected["label"] != entry.label):

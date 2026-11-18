@@ -368,6 +368,7 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         step = "checkout"
         if held():
             raise TrialDeferred("build hold active")
+        # The raw Cargo commands are OtherCommand and have no first queue step.
         with copies.standing("toolchain-trial", HANA, copies.CommittedSource(revision.stdout.strip()), step="toolchain-trial") as checkout:
             _ = scratch.save_cargo_outputs(checkout)
             clippy_env = env | {

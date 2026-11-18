@@ -436,6 +436,33 @@ class TurnEndTests(unittest.TestCase):
             self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(process.current_identity))), turn_end.TurnOutcome.IGNORED)
             self.assertIn(consultation.pane, self.case.fixture.world.locations)
 
+    def test_a_stopped_worker_pane_held_by_a_detached_run_closes_when_the_run_ends(self) -> None:
+        opened = self.case.opened("held")
+        world = self.case.fixture.world
+        _ = progress_history.begin_dispatch(self.case.run_dir, slot="held", phase="8", role="impl", worker_name="held",
+            worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.case.prompt, kind="impl", lens="")
+        _ = world.stop(opened.row, world)
+        self.assertEqual(progress_history.cancel_worker_passes(self.case.run_dir, opened.row.id), 1)
+        path, record = self.case.detached_record(opened.row, "held-run")
+        with ExitStack() as cleanup:
+            supervisor = cleanup.enter_context(subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                stdin=subprocess.PIPE, text=True))
+            _ = cleanup.callback(supervisor.kill)
+            assert supervisor.stdin is not None
+            _ = cleanup.callback(supervisor.stdin.close)
+            record.update(status="running", pid=supervisor.pid)
+            atomic_file.write_text_atomic(path, json.dumps(record))
+            self.assertEqual(worker_panes.close(self.case.fixture.parent.id, staff.WorkerName.parse("held")),
+                             worker_panes.Kept("a detached run is live"))
+            self.assertEqual(self.case.finish("held", turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.IGNORED)
+            self.assertIn(opened.pane, world.locations)
+        record.update(status="finished", exit_code=0)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.assertEqual(self.case.finish("held", turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.IGNORED)
+        self.assertNotIn(opened.pane, world.locations)
+        self.assertEqual(world.closed[-1], (opened.pane, opened.terminal))
+
     def test_ready_hook_waits_from_publication_through_dispatch(self) -> None:
         for family in ("codex", "claude"):
             with self.subTest(family=family), ThreadPoolExecutor(max_workers=1) as hooks:

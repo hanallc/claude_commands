@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 import contextlib
 import fcntl
 import io
@@ -381,6 +383,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(result_file.read_text(), str(start_folder))
 
     def test_start_refuses_at_the_live_run_limit_without_a_record_or_supervisor(self) -> None:
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
         paths = self.seat_runs(3)
         before = {path: path.read_bytes() for path in paths}
         with patch.object(subprocess, "Popen") as popen, \
@@ -401,6 +404,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertIn("more files in one run", err.getvalue())
 
     def test_a_finished_run_frees_a_place_for_the_next_start(self) -> None:
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
         paths = self.seat_runs(3)
         self.update_record(paths[0], status="finished", exit_code=0)
         popen, _ = self.start(["new-check"])
@@ -462,6 +466,7 @@ class DetachedRunsTests(unittest.TestCase):
     def test_start_completes_cancelled_run_after_releasing_start_lock(self) -> None:
         self.set_pass("active", 0)
         settings = self.root / "config/detached_runs.conf"
+        _ = write_config_fixture(settings, "LIVE_RUN_LIMIT=3\n")
         original = settings.read_text()
         for outcome, expected in (("start", 0), ("twin", 0), ("limit", 4), ("unusable config", 2)):
             with self.subTest(outcome=outcome):
@@ -568,6 +573,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(self.run_files("director-done"), [])
 
     def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
         self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         paths = self.seat_runs(3)
         self.update_record(paths[0], pid=DEAD_PID)
@@ -576,6 +582,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(json.loads(paths[0].read_text())["status"], "finished")
 
     def test_a_live_twin_still_wins_at_the_live_run_limit(self) -> None:
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
         paths = self.seat_runs(3)
         popen, output = self.start(["fixture", "1"])
         popen.assert_not_called()
@@ -598,6 +605,7 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 2)
 
     def test_another_seat_does_not_use_this_seats_live_run_places(self) -> None:
+        _ = write_config_fixture(self.root / "config/detached_runs.conf", "LIVE_RUN_LIMIT=3\n")
         paths = self.seat_runs(3)
         reviewer = self.record_worker("unit-review", fixture_runtime_id("another-seat-review"))
         popen, _ = self.start(["new-check"], to=reviewer.name)
@@ -1507,6 +1515,8 @@ send.deliver_worker_text = fake_sender
         self.assertEqual(record.get("exit_code"), 76)
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
+        _ = write_config_fixture(self.root / "config/detached_runs.conf",
+                                 "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n")
         limits = conf.read("detached_runs")
         line_chars = limits.whole("RESULT_LINE_CHARS")
         text_chars = limits.whole("RESULT_TEXT_CHARS")
@@ -1522,20 +1532,20 @@ send.deliver_worker_text = fake_sender
         self.assertLessEqual(len(message), text_chars)
 
     def test_result_text_caps_the_total_size_including_the_header(self) -> None:
+        config = self.root / "config/detached_runs.conf"
+        _ = write_config_fixture(config, "RESULT_LINE_CHARS=200\nRESULT_TEXT_CHARS=1800\n")
         record = cast(detached_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
         record["label"] = "verification " * 1_000
         _ = Path(record["log"]).write_text("line " * 1_000 + "\n" + ("x" * 5_000 + "\n") * 20 + "last line\n")
 
         text = detached_runs.result_text(record, detached_runs.CompletedCommand(1))
 
-        self.assertLessEqual(len(text), 2_000)
+        self.assertLessEqual(len(text), 1_800)
         self.assertIn("Result: FAIL (exit 1)", text)
         self.assertIn(f"Log: {record['log']}", text)
         self.assertTrue(text.endswith("\nlast line"))
 
-        config = self.root / "config/detached_runs.conf"
-        _ = config.write_text(config.read_text().replace("RESULT_LINE_CHARS=300", "RESULT_LINE_CHARS=100")
-                              .replace("RESULT_TEXT_CHARS=2000", "RESULT_TEXT_CHARS=1200"))
+        _ = write_config_fixture(config, "RESULT_LINE_CHARS=100\nRESULT_TEXT_CHARS=1200\n")
         text = detached_runs.result_text(record, detached_runs.CompletedCommand(1))
         self.assertLessEqual(len(text), 1_200)
         self.assertIn(f"{'x' * 100} [cut: {5_000 - 100} more characters]", text)

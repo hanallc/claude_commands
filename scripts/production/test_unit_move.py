@@ -1802,7 +1802,7 @@ class FolderMoveReviewTests(FolderRenameFixture):
                     rerun = rename_command()
                     self.assertEqual(rerun.returncode, 0, rerun.stderr)
                     self.assertEqual(rerun.stdout, "unchanged\n")
-                    self.assertEqual(rerun.stderr, "1 worker names unchanged: no qualified prefix for destination\n")
+                    self.assertEqual(rerun.stderr, "1 worker name unchanged: no qualified prefix for destination\n")
                     self.assertNotIn("agents restart", rerun.stdout + rerun.stderr)
                     self.assertEqual(file_versions(self.root), before)
                     self.assertEqual((backend.starts, backend.stops), ([], []))

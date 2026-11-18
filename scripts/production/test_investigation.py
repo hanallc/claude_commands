@@ -90,6 +90,21 @@ class InvestigationTests(unittest.TestCase):
         self.assertEqual(investigation.load(OWNER.id, saved.id), saved)
         self.assertEqual((collision.with_stem("I2-2")).read_text().count("Second report"), 1)
 
+    def test_file_without_staff_uses_existing_store_ids(self) -> None:
+        staff_file = self.root / "staff.json"
+        staff_file.unlink()
+        first = investigation.file(OTHER.id, "First report", "Why?", waiting_why="The owner answers.")
+        second = investigation.file(OWNER.id, "Second report", "Why?", waiting_why="The owner answers.")
+        self.assertEqual((first.id, second.id), ("I1", "I2"))
+        self.assertEqual(investigation.load(OTHER.id, first.id), first)
+        self.assertEqual(investigation.load(OWNER.id, second.id), second)
+
+    def test_file_refuses_an_unreadable_staff_record(self) -> None:
+        _ = (self.root / "staff.json").write_text("invalid staff record")
+        with self.assertRaises(staff.StaffUnreadable):
+            _ = investigation.file(OWNER.id, "Check the result", "Why?", waiting_why="The owner answers.")
+        self.assertEqual(investigation.records(OWNER.id), [])
+
     def test_legacy_record_without_kind_is_an_investigation(self) -> None:
         directory = investigation.folder(OWNER.id)
         directory.mkdir(parents=True)

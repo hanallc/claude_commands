@@ -29,7 +29,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, scratch
+from scripts.lib import build_folders, copy_record, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import write_config_fixture
@@ -127,10 +127,16 @@ class StandingTests(unittest.TestCase):
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
         slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
+        configuration = Path(slot_configuration.environment["CONF_DIR"])
+        _ = write_config_fixture(configuration / "build_folders.conf",
+            "patterns.target={purpose}\npatterns.legacy-stable={purpose}\n"
+            + "patterns.editable={repository}-{owner}/{purpose}\n")
+        _ = write_config_fixture(configuration / "build_steps.conf", "names.integrate=integrate\n")
         home = self.base / "home"
         home.mkdir()
         self.configuration = self.base / "copies.conf"
         self.settings = {"root": str(self.base / "configured-gates"),
+                         "owner.verify": "verify",
                          "remote_registry": str(self.base / "remote-mirrors"),
                          "wait_seconds": "0.01", "git_timeout_seconds": "10",
                          "guard_timeout_seconds": "10"}
@@ -579,6 +585,118 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:camera"), [checkout])
         self.assertFalse(checkout.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+    def test_clone_git_child_keeps_both_destination_locks_after_parent_death(self) -> None:
+        task = "gate:orphan-clone"
+        child = """import os, sys
+ready, release, *locks = map(int, sys.argv[2:])
+os.write(ready, os.fsencode(sys.argv[1]) + b'\\n')
+os.read(release, 1)
+for lock in locks:
+    os.close(lock)
+"""
+        maker = """import subprocess, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.copies import copies
+
+source, task, child, ready, release = sys.argv[1:]
+run = subprocess.run
+ready, release = int(ready), int(release)
+
+def pause_clone(arguments, **options):
+    if arguments[0] != 'git' or arguments[5:8] != ['-C', source, 'clone']:
+        return run(arguments, **options)
+    locks = options['pass_fds']
+    options['pass_fds'] = (*locks, ready, release)
+    destination = Path(arguments[-1]).parent
+    return run([sys.executable, '-c', child, str(destination), str(ready), str(release), *map(str, locks)], **options)
+
+with patch.object(subprocess, 'run', pause_clone):
+    copies.clone(Path(source), task, 'orphan')
+"""
+        with ExitStack() as pipes:
+            ready_read, ready_write = os.pipe()
+            ready = pipes.enter_context(os.fdopen(ready_read, "r", encoding="utf-8"))
+            ready_writer = pipes.enter_context(os.fdopen(ready_write, "wb"))
+            release_read, release_write = os.pipe()
+            release_reader = pipes.enter_context(os.fdopen(release_read, "rb"))
+            release = pipes.enter_context(os.fdopen(release_write, "wb"))
+            process = pipes.enter_context(subprocess.Popen(
+                [sys.executable, "-c", maker, str(self.source), task, child, str(ready_write), str(release_read)],
+                env={**os.environ, session_folder.ROOT_ENV: str(self.base / "session")},
+                pass_fds=(ready_write, release_read), stderr=subprocess.PIPE))
+            ready_writer.close()
+            release_reader.close()
+            try:
+                self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], "Git did not start")
+                line = ready.readline().strip()
+                if not line:
+                    _, error = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.fail(f"The clone maker exited before Git started: {error.decode(errors='replace')}")
+                checkout = Path(line)
+                self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
+                process.kill()
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(build_folders.build_folder_state(checkout), "held")
+                with scratch.busy_path(checkout).open("rb") as other, self.assertRaises(BlockingIOError):
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = scratch.end(task)
+                self.assertEqual(result, [])
+                self.assertEqual(result.kept, [scratch.KeptFolder(checkout, scratch.BUSY_REASON)])
+                self.assertTrue(checkout.is_dir())
+                release.close()
+                self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], "Git did not exit")
+                self.assertEqual(ready.read(), "")
+                self.assertEqual(scratch.end(task), [checkout])
+                self.assertFalse(checkout.exists())
+            finally:
+                release.close()
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_removal_retry_claims_a_missing_busy_mark_and_refuses_a_linked_checkout(self) -> None:
+        task = "gate:retry-source"
+        clone = copies.clone(self.source, task, "source")
+        with mock.patch.object(scratch, "remove", side_effect=OSError("stop after removal intent")):
+            self.assertTrue(scratch.end(task).kept)
+        self.assertTrue(scratch.removal_mark(clone).is_file())
+        busy = scratch.busy_path(clone)
+        busy.unlink()
+        destination = self.base / "late-worktree"
+        request = build_folders.LinkedEditableRepository(destination, clone,
+                                                         build_folders.NewWorktreeBranch("late", self.head))
+        with self.assertRaisesRegex(BlockingIOError, "source removal has already started"):
+            _ = build_folders.create_build_folder(request)
+        self.assertFalse(destination.exists())
+        self.assertEqual(self.git(clone, "branch", "--list", "late"), "")
+
+        work = clone / "new-work" / scratch.BUSY
+        work.parent.mkdir()
+        _ = work.write_text("Keep this file")
+        kept = scratch.end(task)
+        self.assertEqual(kept, [])
+        self.assertTrue(kept.kept)
+        self.assertEqual(work.read_text(), "Keep this file")
+        work.unlink()
+        work.parent.rmdir()
+        busy.unlink(missing_ok=True)
+
+        remove = scratch.remove
+
+        def check_retry(path: Path) -> None:
+            self.assertEqual(path, clone)
+            with busy.open("rb") as other, self.assertRaises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                _ = build_folders.create_build_folder(request)
+            remove(path)
+
+        with mock.patch.object(scratch, "remove", side_effect=check_retry):
+            self.assertEqual(scratch.end(task), [clone])
+        self.assertFalse(scratch.removal_mark(clone).exists())
+        self.assertFalse(destination.exists())
 
     def clone_trust_files(self, trusted_homes: tuple[int, ...] = (0, 1, 2)) -> tuple[Path, ...]:
         home = Path.home()
@@ -1379,7 +1497,7 @@ class StandingTests(unittest.TestCase):
                                ("guard_timeout_seconds", "inf"))
         ]
         variants.extend({key: value for key, value in self.settings.items() if key != missing}
-                        for missing in self.settings if missing != "root")
+                        for missing in ("remote_registry", "wait_seconds", "git_timeout_seconds", "guard_timeout_seconds"))
         for settings in variants:
             with self.subTest(settings=settings):
                 self.write_config(settings)

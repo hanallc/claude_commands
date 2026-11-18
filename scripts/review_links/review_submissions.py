@@ -116,15 +116,19 @@ def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
     return tuple(uploads)
 
 
+def _identify_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["magick", "identify", "-regard-warnings", "-limit", "width", "8192",
+         "-limit", "height", "8192", "-limit", "area", "32MP",
+         "-limit", "list-length", "32", "-limit", "memory", "128MiB",
+         "-limit", "map", "128MiB", "-limit", "disk", "0",
+         "-format", "%m\n", extension + ":-"],
+        input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False)
+
+
 def _validate_image(upload: _ImageUpload) -> None:
     try:
-        result = subprocess.run(
-            ["magick", "identify", "-regard-warnings", "-limit", "width", "8192",
-             "-limit", "height", "8192", "-limit", "area", "32MP",
-             "-limit", "list-length", "32", "-limit", "memory", "128MiB",
-             "-limit", "map", "128MiB", "-limit", "disk", "0",
-             "-format", "%m\n", upload.extension + ":-"],
-            input=upload.data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False)
+        result = _identify_image(upload.extension, upload.data)
     except subprocess.TimeoutExpired:
         raise SubmissionError("The pasted image could not be read in time.") from None
     names = result.stdout.splitlines()

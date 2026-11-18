@@ -6,19 +6,168 @@ import shutil
 import subprocess
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from scripts.review_links import record_table, review_page
+from scripts.review_links.test_accounts_page import firefox_probe_results
+
+
+def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> list[list[str]]:
+    """Check the status region during sequential and overlapping saves."""
+    setup = b'''<script>
+const realFetch=fetch;
+let finishPost;
+window.setInterval=()=>0;
+window.fetch=(_path,options={})=>{
+ if(options.method!=='POST') return new Promise(()=>{});
+ return new Promise((resolve,reject)=>{
+  finishPost=reason=>reason ? reject(new Error(reason)) : resolve({ok:true,json:async()=>({
+   answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
+  })});
+ });
+};
+</script>'''
+    probe = r'''<script>
+(async()=>{
+ const reloadKey='save-notice-reload';
+ const status=document.querySelector('[data-hidden-action-status]');
+ const action=ACTION;
+ let failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const clear=()=>status.hidden && !status.textContent;
+ if(sessionStorage.getItem(reloadKey)){
+  failures=JSON.parse(sessionStorage.getItem(reloadKey));
+  sessionStorage.removeItem(reloadKey);
+  check(clear(),'reload clears the failure');
+ }else try{
+  const [first,second,third,older,newer,next,reload,anchor]=document.querySelectorAll('[data-list-item]');
+  const open=row=>{
+   if(row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+  };
+  const startSave=row=>{
+   open(row);
+   const form=row.querySelector('form');
+   const settled=new Promise(resolve=>{
+    const observe=new MutationObserver(()=>{
+     if(!form.dataset.sending){observe.disconnect();resolve();}
+    });
+    observe.observe(form,{attributes:true,attributeFilter:['data-sending']});
+   });
+   finishPost=undefined;
+   form.requestSubmit(form.querySelector('button[value="'+action+'"]'));
+   if(!finishPost) throw new Error('The save did not start.');
+   check(clear(),'the next save clears the notice at submission');
+   const finish=finishPost;
+   return async reason=>{finish(reason);await settled;};
+  };
+  const save=async(row,reason='')=>{
+   const finish=startSave(row);
+   if(!reason){
+    const motion=row.nextElementSibling;
+    check(row.hidden && motion?.matches('[data-record-motion]') &&
+      motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===200),
+      'a successful save starts the 200 ms row fade');
+   }else if(action==='works') open(anchor);
+   await finish(reason);
+  };
+  const failure=(row,reason)=>{
+   const label=action==='works' ? row.querySelector('form').elements.row.value : 'Item '+row.dataset.number;
+   const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
+   check(!status.hidden && status.textContent===label+': '+prefix+reason,
+    'the table shows only '+reason);
+  };
+  for(const row of [first,second,third]){
+   await save(row);
+   check(clear(),'a successful save leaves no notice');
+  }
+  await save(older,'Fixture first failure');failure(older,'Fixture first failure');
+  await save(newer,'Fixture latest failure');failure(newer,'Fixture latest failure');
+  await save(next);
+  check(clear(),'a later success leaves no notice');
+  for(const newerReason of ['Fixture newer overlapping failure','']){
+   const finishOlder=startSave(older),finishNewer=startSave(newer);
+   if(action==='works') open(anchor);
+   await finishNewer(newerReason);
+   await finishOlder('Fixture older overlapping failure');
+   if(newerReason){
+    failure(newer,newerReason);
+    check(newer.querySelector('[data-send-status]').textContent.includes(newerReason),
+     'the newer failure stays on its row');
+   }else check(clear(),'an older failure adds no notice after a newer success');
+   check(older.querySelector('[data-send-status]').textContent.includes('Fixture older overlapping failure'),
+    'the older failure stays on its row');
+  }
+  await save(reload,'Fixture failure before reload');
+  failure(reload,'Fixture failure before reload');
+  sessionStorage.setItem(reloadKey,JSON.stringify(failures));
+  location.reload();
+  return;
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''.replace('ACTION', json.dumps(action)).encode()
+    return firefox_probe_results(page.replace(b'<head>', b'<head>'+setup, 1).replace(b'</body>', probe+b'</body>'))
+
+
+class FilterControlTests(unittest.TestCase):
+    def test_chip_row_starts_with_all_and_renders_counts(self) -> None:
+        row = record_table.chip_row('Owner', (
+            record_table.Chip('one', '<span>One</span>', 0),
+            record_table.Chip('all', 'All', 2),
+            record_table.Chip('two', 'Two'),
+        ), 'one')
+        self.assertIn('role="group" aria-label="Owner" data-filter-row="owner"', row)
+        self.assertEqual([part.split('"', 1)[0] for part in row.split('data-filter-value="')[1:]],
+                         ['all', 'one', 'two'])
+        self.assertIn('aria-pressed="false" data-filter-count="2">All<b>2</b>', row)
+        self.assertIn('aria-pressed="true" data-filter-count="0"><span>One</span><b>0</b>', row)
+        self.assertIn('data-filter-count="">Two<b></b>', row)
+        self.assertIn('aria-label="Filter by &quot;words&quot;"',
+                      record_table.words_box('review-search', 'Filter by "words"'))
+
+    def test_control_keeps_zero_chips_and_selects_all_if_selection_is_hidden(self) -> None:
+        node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
+        result = subprocess.run([node, '-e', record_table.SCRIPT + r'''
+const assert=require('node:assert/strict'),row=new EventTarget(),changes=[];
+const buttons=['all','one','two'].map(value=>{
+ const button=new EventTarget(),attributes={},count={};
+ Object.assign(button,{dataset:{filterValue:value},hidden:false,
+  setAttribute:(name,text)=>attributes[name]=text,getAttribute:name=>attributes[name],
+  querySelector:()=>count});
+ return button;
+});
+Object.assign(row,{querySelectorAll:()=>buttons,hasAttribute:()=>false});
+filterControl.bind(row,value=>changes.push(value));
+filterControl.setCounts(row,{all:2,one:2});
+assert.equal(buttons[2].dataset.filterCount,'0');
+assert.equal(buttons[2].querySelector('b').textContent,'0');
+assert.equal(buttons[2].hidden,false);
+buttons[2].dispatchEvent(new Event('click'));
+assert.deepEqual(changes,['two']);
+assert.equal(buttons[2].getAttribute('aria-pressed'),'true');
+assert.equal(filterControl.setVisible(row,['one']),'all');
+assert.equal(buttons[0].hidden,false);
+assert.equal(buttons[0].getAttribute('aria-pressed'),'true');
+assert.equal(buttons[2].hidden,true);
+assert.equal(filterControl.select(row,'two'),'all');
+assert.deepEqual(changes,['two']);
+'''], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class LinkedTableTests(unittest.TestCase):
-    def render(self, fragment: str) -> dict[str, object]:
+    def render(self, fragment: str, *, closed_item: str = '', park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
         _, start, callbacks = review_page.SCRIPT.partition('function matchesOwner(')
         callbacks = start + callbacks.split('\nfunction loadBodies()', 1)[0]
-        source = 'const fragment=' + json.dumps(fragment) + ';\n' + r'''
+        source = ('const fragment=' + json.dumps(fragment) + ';\n'
+                  + 'const closedItem=' + json.dumps(closed_item) + ';\n'
+                  + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
- setAttribute(key,value){this[key]=value;},classList:{toggle(){}}});
+ setAttribute(key,value){this[key]=value;},
+ toggleAttribute(key,present){if(present)this[key]='';else delete this[key];return present;},
+ classList:{toggle(){}},
+ addEventListener(type,listener){this[type]=listener;}});
 let notice=null;
 const empty=element();empty.after=value=>{notice=value;};
 const search=element();
@@ -46,19 +195,31 @@ const index=new Map(rows.map(({dataset})=>[dataset.key,{...dataset,id:dataset.ke
  hiddenUntil:dataset.parked==='true' ? Date.now()+60000 : 0}]));
 const table={append(){},getAttribute:()=> 'Review'};
 const content={
+ addEventListener(){},
  querySelector:selector=>({'#list-owner':owner,'#list-show':show,'#list-search':search,
   '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
  querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
 };
 const document={createElement:element};
 const location={search:'',hash:fragment,pathname:'/console/review.html'};
-const history={replaceState(){}};
-const window={},parent=window,saved=new Map();
+const history={replaceState(_state,_title,url){this.url=url;}};
+const window={},parent=window,departures=new Map();
 let selectedShow='all',requestedShow='all';
 const reviewPlace=()=>{},loadBodies=()=>{},pageRefresh={refresh(){}};
 ''' + record_table.SCRIPT + '\n' + callbacks + r'''
 view.place();view.apply(false);
+if(parkOpenCard){
+ view.opened.add('sdlc/C1830');view.apply(false);
+ index.get('sdlc/C1830').hiddenUntil=Date.now()+60000;
+ view.apply(false);
+}
+if(closedItem){
+ view.bind();
+ view.opened.delete(closedItem);view.apply(false);
+ search.value='fixture';search.input({target:search});
+}
 console.log(JSON.stringify({
+ itemInUrl:new URLSearchParams(history.url?.split('#')[1]).get('item'),
  shown:rows.filter(row=>!row.hidden).map(row=>row.dataset.key),
  expanded:rows.filter(row=>!row.querySelector('[data-detail]').hidden).map(row=>row.dataset.key),
  missing:notice && !notice.hidden ? notice.textContent : '',
@@ -74,10 +235,20 @@ console.log(JSON.stringify({
         self.assertEqual(result.returncode, 0, result.stderr)
         return cast(dict[str, object], json.loads(result.stdout))
 
+    def test_an_open_card_leaves_the_view_when_parked_elsewhere(self) -> None:
+        result = self.render('#show=all', park_open_card=True)
+        self.assertEqual(result['expanded'], ['sdlc/C1830'])
+        self.assertEqual(result['shown'], ['other/C9'])
+
     def test_explicit_item_remains_visible_outside_the_linked_keys(self) -> None:
         result = self.render('#show=all&key=sdlc%2FC1830&item=hana%2FQ10')
         self.assertEqual(result['shown'], ['sdlc/C1830', 'hana/Q10'])
         self.assertEqual(result['expanded'], ['hana/Q10'])
+
+    def test_search_does_not_write_a_closed_review_row_to_the_address(self) -> None:
+        result = self.render('#show=all&item=hana%2FQ10', closed_item='hana/Q10')
+        self.assertEqual(result['expanded'], [])
+        self.assertIsNone(result['itemInUrl'])
 
     def test_missing_linked_keys_have_a_plain_notice_and_keep_found_cards(self) -> None:
         for keys, shown in (('key=missing%2FC7&key=missing%2FQ8', []),

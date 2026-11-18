@@ -5,14 +5,13 @@ from dataclasses import dataclass
 import html
 import json
 from pathlib import Path
-import re
 from statistics import median
 import subprocess
 import sys
 import time
 
 from scripts.accounts import accounts, next_moves
-from scripts.lib import conf
+from scripts.lib import conf, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, review_link
 
 PAGE_NAME = "accounts.html"
@@ -42,14 +41,17 @@ class SaveFailed:
 
 
 def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
-    """Validate an account or role color and publish it through this checkout's tune."""
+    """Validate the color and publish it through this checkout's tune."""
     try:
+        if host := waiting_rows.model_color_host(key):
+            return Refused(f".{host} is a host override, not a model color.")
         colors = conf.read("statusline").values()
     except (OSError, ValueError) as error:
         return SaveFailed(" ".join(str(error).split()))
-    if not (key.startswith("account.") or key in accounts.ROLE_COLOR_KEYS.values()) or key not in colors:
+    configured = key in colors and (key.startswith(("account.", "model.")) or key in accounts.ROLE_COLOR_KEYS.values())
+    if not configured and not waiting_rows.model_color_key("statusline", key):
         return Refused("The page has no configured color for that key.")
-    if not re.fullmatch(r"#[0-9a-f]{6}", value):
+    if not waiting_rows.model_color_value(value):
         return Refused("Use a color in #rrggbb format.")
     try:
         done = subprocess.run((*TUNE, "statusline", key, value,
@@ -66,14 +68,27 @@ def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
 
 def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
     """Make the target the group's first next move at the configured percent."""
-    if group != "units" and group != "showrunners":
-        return Refused("Choose units or showrunners.")
+    if group not in ("units", "showrunners", "producers"):
+        return Refused("Choose units, showrunners, or producers.")
     try:
         _ = accounts.claude_account_dir(target)
     except accounts.AccountsError as error:
         return Refused(" ".join(str(error).split()))
     try:
         _ = next_moves.set_first_next_move(group, next_moves.console_next_move_percent(), target)
+    except (OSError, ValueError) as error:
+        return SaveFailed(" ".join(str(error).split()))
+    return Saved()
+
+
+def clear_next_move(group: str) -> Saved | Refused | SaveFailed:
+    """Remove the group's first entry and retain later entries."""
+    if group not in ("units", "showrunners", "producers"):
+        return Refused("Choose units, showrunners, or producers.")
+    try:
+        if not any(entry.group == group for entry in next_moves.read_next_moves()):
+            return Refused("The group has no next move.")
+        next_moves.remove_next_move(group, next_moves.FIRST_GROUP_POSITION)
     except (OSError, ValueError) as error:
         return SaveFailed(" ".join(str(error).split()))
     return Saved()
@@ -117,10 +132,63 @@ def _row_open(row: accounts.BoardRow) -> str:
     return f'<tr class="account"{move}>' if row["cells"]["label"] else f"<tr{move}>"
 
 
+def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: dict[str, accounts.BoardSpan]) -> str:
+    """Render the selected group's target or the reason this line has no target."""
+    if row["cells"]["label"] and row["cells"]["label"][0]["text"] == "total":
+        return ""
+    move = accounts.account_board_next_move(row, reading.first_next_moves)
+    editable = row.get("group")
+    if move == "unselected":
+        return ('<span class="next-muted next-minus" title="Not the selected account for a role">'
+                + page_frame.icon_svg("minus") + '</span>')
+    target = ""
+    if isinstance(move, accounts.BoardNextMoveTarget):
+        target = move.label
+        content = _spans([labels.get(target, accounts.BoardSpan(text=target, tone="default", kind="bold"))])
+    elif isinstance(move, accounts.NextMovesUnavailable):
+        content = '<span class="next-muted" title="' + html.escape(move.reason, quote=True) + '">unavailable</span>'
+    elif move == "none":
+        content = '<span class="next-muted">none</span>'
+    else:
+        content = ('<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>')
+    if editable:
+        content += (f'<button type="button" class="next-button" data-next-button data-next-target="{html.escape(target, quote=True)}" '
+                    + f'aria-label="Choose the next account for {editable["group"]}" aria-haspopup="menu" aria-expanded="false">'
+                    + page_frame.icon_svg("chevron-down") + '</button>')
+    return content
+
+
+def _swatch(spans: list[accounts.BoardSpan]) -> str:
+    if not spans or "color_key" not in spans[0]:
+        return ""
+    name = html.escape(spans[0]["text"], quote=True)
+    color = accounts.account_color(spans[0].get("color", ""))
+    css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
+    background = f' style="background:{css}"' if css else ""
+    return (f'<button type="button" class="color-swatch" data-color-key="{html.escape(spans[0]["color_key"], quote=True)}" '
+            + f'data-color-name="{name}" data-saved-color="{css}"{background} '
+            + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
+
+
+def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns: tuple[str, ...]) -> str:
+    key = column["heading"]
+    if not key:
+        return f'<th class="{column["align"]}"></th>'
+    direction = "ascending" if key == default else "none"
+    descending = " data-sort-descending" if key in descending_columns else ""
+    label = html.escape(key)
+    arrow = '<span class="sort-arrow" aria-hidden="true">▲</span>'
+    content = arrow + label if column["align"] == "right" else label + arrow
+    return (f'<th class="{column["align"]}" data-{default}-sort="{label}" tabindex="0" aria-sort="{direction}"{descending}>'
+            + f'<span class="sort-label">{content}</span></th>')
+
+
 def board(reading: accounts.StatusReading) -> str:
-    """The accounts board table, then the upcoming moves and the problems."""
+    """Render the accounts table and its problems."""
     table = accounts.status_board(reading)
     claude = {row.label for row in reading.rows if row.tool == "claude"}
+    labels = {line["cells"]["label"][0]["text"]: line["cells"]["label"][0]
+              for line in table["rows"] if line["cells"]["label"]}
     def target(spans: list[accounts.BoardSpan], left: list[accounts.BoardSpan]) -> list[str]:
         color = accounts.account_color(spans[0].get("color", ""))
         return [spans[0]["text"], "".join(span["text"] for span in left),
@@ -128,37 +196,48 @@ def board(reading: accounts.StatusReading) -> str:
     targets = [target(spans, row["cells"]["left"]) for row in table["rows"]
                if (spans := row["cells"]["label"]) and spans[0]["text"] in claude]
     percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
-    def swatch(spans: list[accounts.BoardSpan]) -> str:
-        if not spans or "color_key" not in spans[0]:
-            return ""
-        name = html.escape(spans[0]["text"], quote=True)
-        color = accounts.account_color(spans[0].get("color", ""))
-        css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
-        return (f'<button type="button" class="color-swatch" data-color-key="{html.escape(spans[0]["color_key"], quote=True)}" '
-                + f'data-color-name="{name}" data-saved-color="{css}" style="background:{css}" '
-                + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
     # A headerless swatch column follows each column whose first span can carry a configured color.
-    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
-                   + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "") for column in table["columns"])
+    def heading(column: accounts.BoardColumn) -> str:
+        return _sort_heading(column, "account", accounts.ACCOUNT_BOARD_DESCENDING_SORTS)
+    next_heading = heading(accounts.BoardColumn(key="next", heading="next", align="left"))
+    head = "".join(heading(column)
+                   + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "")
+                   + (next_heading if column["key"] == "roles" else "") for column in table["columns"])
     rows = "".join(
         _row_open(row)
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
                   + f'{_spans(row["cells"][column["key"]])}</td>'
-                  + (f'<td class="left">{swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
+                  + (f'<td class="left">{_swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
+                  + (f'<td class="left next-cell">{_next_cell(row, reading, labels)}</td>' if column["key"] == "roles" else "")
                   for column in table["columns"])
         + "</tr>" for row in table["rows"])
-    moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
-    return (f'<section class="card" data-move-percent="{percent}" '
+    return (f'<section class="card" data-move-percent="{percent}" data-sort-table="accounts" '
+            + f'data-sort-orders="{html.escape(json.dumps(accounts.account_board_sort_orders(reading, table)), quote=True)}" '
             + f'data-move-targets="{html.escape(json.dumps(targets), quote=True)}"><div class="scroll"><table>'
             + f"<thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>"
-            + (f'<ul class="moves">{moves}</ul>' if moves else "")
             + (f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "") + "</section>")
+
+
+def models_board(reading: accounts.StatusReading) -> str:
+    table = accounts.models_board(reading, accounts.role_colors())
+    head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS)
+                   + ('<th class="left"></th>' if column["key"] == "model" else "")
+                   for column in accounts.MODEL_COLUMNS)
+    rows = "".join("<tr>" + "".join(
+        f'<td class="{column["align"]}">{_spans(row["cells"][column["key"]])}</td>'
+        + (f'<td class="left">{_swatch(row["cells"]["model"])}</td>' if column["key"] == "model" else "")
+        for column in accounts.MODEL_COLUMNS) + "</tr>" for row in table.rows)
+    orders = html.escape(json.dumps(table.orders), quote=True)
+    return (f'<section class="card models-card" data-sort-table="models" data-sort-orders="{orders}">'
+            + f'<div class="scroll"><table aria-label="Models"><thead><tr>{head}</tr></thead>'
+            + f'<tbody>{rows}</tbody></table></div></section>')
 
 
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
-    body = board(accounts.read_status(source=accounts.StoredUsageOnly()))
+    reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
+    body = board(reading) + models_board(reading)
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
@@ -195,16 +274,26 @@ def main() -> int:
 
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
-table{border-collapse:collapse;font-size:.86rem;font-variant-numeric:tabular-nums}
-.card{width:fit-content;max-width:100%}
-th,td{padding:5px 0 5px 18px;white-space:nowrap}th:first-child,td:first-child{padding-left:0}
+.card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
+.models-card{margin-top:24px}
+table{border-collapse:collapse;font-size:var(--table-font-size);font-variant-numeric:tabular-nums}
+/* Let the last sort arrow use the right padding of the card. */
+.card .scroll{margin-right:calc(-1 * var(--column-gap));padding-right:var(--column-gap)}
+th,td{padding:5px 0 5px var(--column-gap);white-space:nowrap}th:first-child,td:first-child{padding-left:0}
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
+th:is([data-account-sort],[data-model-sort]){cursor:pointer}
+th:is([data-account-sort],[data-model-sort]):focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.sort-label{position:relative}
+.sort-arrow{--sort-arrow-gap:calc(var(--table-font-size) * .25);position:absolute;top:50%;
+left:calc(100% + var(--sort-arrow-gap));transform:translateY(-50%);width:var(--table-font-size);text-align:center;visibility:hidden}
+th.right .sort-arrow{left:auto;right:calc(100% + var(--sort-arrow-gap))}
+th[aria-sort=ascending] .sort-arrow,th[aria-sort=descending] .sort-arrow{visibility:visible}
 .left{text-align:left}.right{text-align:right}
 tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
-.color-swatch{width:18px;height:18px;vertical-align:middle;border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
+.color-swatch{width:18px;height:18px;vertical-align:middle;background:var(--ink);border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
 .color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:280px;box-sizing:border-box;max-width:calc(100vw - 16px);
 max-height:calc(100vh - 16px);overflow:auto;
 border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge)}
@@ -232,7 +321,12 @@ background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* A thin red or amber digit falls under 4.5:1; the heavier stroke keeps it at the token contrast. */
 .error,.warning{font-weight:600}
-tr[data-move-group]{cursor:context-menu}
+.next-cell{white-space:nowrap}.next-muted{color:var(--ink-2)}
+.next-button{display:inline-flex;vertical-align:middle;margin-left:5px;padding:2px;border:0;border-radius:4px;
+background:transparent;color:var(--ink-2);cursor:pointer}
+.next-button:hover,.next-button:focus-visible{background:var(--hover)}
+.next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
+.move-menu button[aria-checked=true]{background:var(--hover)}
 .move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
 border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
 font-size:.86rem;font-variant-numeric:tabular-nums}
@@ -243,8 +337,8 @@ background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .move-menu button:hover,.move-menu button:focus-visible{background:var(--hover);outline:none}
 .move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
 .move-empty{padding:6px 10px;color:var(--ink-3)}
-.moves,.problems{list-style:none;padding:0;margin:12px 0 0;font-size:.86rem;color:var(--ink-2)}
-.moves li,.problems li{padding:2px 0}.problems li{color:var(--warning)}.problems li::before{content:"• "}
+.problems{list-style:none;padding:0;margin:12px 0 0;font-size:.86rem}
+.problems li{padding:2px 0;color:var(--warning)}.problems li::before{content:"• "}
 </style>"""
 
 POPUP = '''<dialog class="color-picker" aria-labelledby="color-title" data-color-picker>
@@ -344,10 +438,73 @@ message.setAttribute('role','status');message.setAttribute('aria-live','polite')
 document.querySelector('[data-page-status]').append(message);
 let selected=null;
 const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
-let menuRow=null;
+let menuRow=null, menuButton=null;
 const pendingMoves=new Set();
 const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
  : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
+const sortSelector='[data-account-sort],[data-model-sort]';
+const sortKey=header=>header.dataset.accountSort ?? header.dataset.modelSort;
+const sortTables=new WeakMap();
+const sortChoices=new Map();
+function applySort(card){
+ const name=card.dataset.sortTable, models=name==='models';
+ const headers=[...card.querySelectorAll(sortSelector)];
+ if(!sortChoices.has(name)){
+  let choice={column:models ? 'model' : 'account',reverse:false};
+  try{
+   const saved=JSON.parse(localStorage.getItem(name+'-sort'));
+   if(saved && headers.some(header=>sortKey(header)===saved.column) && typeof saved.reverse==='boolean') choice=saved;
+  }catch{}
+  sortChoices.set(name,choice);
+ }
+ const chosenSort=sortChoices.get(name), nameCell=models ? 0 : 1;
+ const table=card.querySelector('table'), body=table.tBodies[0];
+ if(!sortTables.has(table)){
+  let group='';
+  sortTables.set(table,[...body.rows].slice(0,-1).map(node=>{
+   group=node.cells[nameCell].textContent || group;
+   return {node,group};
+  }));
+ }
+ const sources=sortTables.get(table), details=new Map();
+ const width=table.tHead.rows[0].cells.length;
+ const columns=models ? [0,1] : [0,1,2,3,width-3,width-2,width-1];
+ for(const {node,group} of sources) if(node.cells[nameCell].textContent){
+  details.set(group,columns.map(index=>node.cells[index].innerHTML));
+ }
+ const order=JSON.parse(card.dataset.sortOrders)[chosenSort.column+(chosenSort.reverse ? '-reverse' : '')];
+ const total=body.lastElementChild;
+ for(const place of order){
+  const {node,group}=sources[place.index];
+  columns.forEach((index,offset)=>{node.cells[index].innerHTML=place.details ? details.get(group)[offset] : '';});
+  node.classList.toggle('account',place.details);body.insertBefore(node,total);
+ }
+ for(const header of headers){
+  const selected=sortKey(header)===chosenSort.column;
+  const descending=header.hasAttribute('data-sort-descending')!==(selected && chosenSort.reverse);
+  header.setAttribute('aria-sort',selected ? descending ? 'descending' : 'ascending' : 'none');
+  header.querySelector('.sort-arrow').textContent=descending ? '▼' : '▲';
+ }
+}
+function applySorts(){view.querySelectorAll('[data-sort-table]').forEach(applySort);}
+function chooseSort(header){
+ if(hold()) return;
+ const card=header.closest('[data-sort-table]'), name=card.dataset.sortTable;
+ const column=sortKey(header), prior=sortChoices.get(name);
+ const chosenSort={column,reverse:prior.column===column ? !prior.reverse : false};
+ sortChoices.set(name,chosenSort);
+ try{localStorage.setItem(name+'-sort',JSON.stringify(chosenSort));}catch{}
+ applySort(card);
+}
+document.addEventListener('click',event=>{
+ const header=event.target instanceof Element ? event.target.closest(sortSelector) : null;
+ if(header) chooseSort(header);
+});
+document.addEventListener('keydown',event=>{
+ const header=event.target instanceof Element ? event.target.closest(sortSelector) : null;
+ if(header && event.key==='Enter'){event.preventDefault();chooseSort(header);}
+});
+applySorts();
 async function refresh(supersede=false,current=()=>true) {
   if (hold()) return;
   const request = ++newestRequest;
@@ -359,6 +516,7 @@ async function refresh(supersede=false,current=()=>true) {
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   view.replaceWith(fresh);view = fresh;
+  applySorts();
   scrollTo({top, behavior: 'instant'});
   return pageRefreshFacts(page);
 }
@@ -377,6 +535,7 @@ function queue(key){
  return queues.get(key);
 }
 function savedColor(key){return swatches(key)[0]?.dataset.savedColor || '';}
+function pickerColor(button,value){return value || getComputedStyle(button).getPropertyValue('--ink').trim();}
 function paint(key,value){
  for(const button of swatches(key)) button.style.background=value;
  for(const word of words(key)) word.style.color=value;
@@ -395,7 +554,7 @@ document.addEventListener('click',event=>{
  if(!button) return;
  if(selected) close(true);
  selected=button;
- picker.value=queue(button.dataset.colorKey).at(-1)?.value || button.dataset.savedColor;
+ picker.value=pickerColor(button,queue(button.dataset.colorKey).at(-1)?.value || button.dataset.savedColor);
  readHex();
  popup.querySelector('#color-title').textContent='Change '+button.dataset.colorName+' color';
  popup.showModal();position();area.focus();updates.abandon();
@@ -418,7 +577,7 @@ async function publish(save){
  }catch(error){
   for(const button of swatches(save.key)) button.dataset.savedColor=save.oldColor;
   paint(save.key,save.oldColor);
-  if(selected?.dataset.colorKey===save.key){picker.value=save.oldColor;readHex();}
+  if(selected?.dataset.colorKey===save.key){picker.value=pickerColor(selected,save.oldColor);readHex();}
   message.textContent=save.name+': '+(error.message || 'The color could not be saved.');message.hidden=false;
  }finally{
   pending.shift();pendingSaves.delete(save);
@@ -440,40 +599,48 @@ popup.querySelector('[data-color-save]').addEventListener('click',()=>{
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
 function closeMenu(){
  if(!menuRow) return;
- menuRow=null;menu.hidden=true;menuItems.replaceChildren();updates.changed();
+ const button=menuButton;menuRow=null;menuButton=null;
+ menu.hidden=true;menuItems.replaceChildren();button.setAttribute("aria-expanded","false");
+ button.focus({preventScroll:true});updates.changed();
 }
 function menuItem([label,left,color,tone]){
  const item=document.createElement('button');
- item.type='button';item.setAttribute('role','menuitem');item.dataset.moveTarget=label;
+ item.type='button';item.setAttribute('role','menuitemradio');item.dataset.moveTarget=label;
+ item.setAttribute('aria-checked',String(label===menuButton.dataset.nextTarget));
  const name=document.createElement('span'), room=document.createElement('span');
  name.className='move-name';name.textContent=label;if(color) name.style.color=color;
  room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left && left!=='—' ? left+' left' : '';
  item.append(name,room);return item;
 }
-function openMenu(row,x,y){
+function openMenu(button){
+ const row=button.closest("tr"), box=button.getBoundingClientRect();
  if(selected) close(true);
  const card=view.querySelector('[data-move-targets]');
  const account=row.dataset.moveAccount, group=row.dataset.moveGroup;
  const targets=JSON.parse(card.dataset.moveTargets).filter(([label])=>label!==account);
- menuRow=row;
+ menuRow=row;menuButton=button;button.setAttribute("aria-expanded","true");
  menu.querySelector('[data-move-title]').textContent='When '+account+' reaches '+card.dataset.movePercent+'%, move '+group+' to';
  const empty=document.createElement('div');
  empty.className='move-empty';empty.textContent='No other Claude account';
  menuItems.replaceChildren(...(targets.length ? targets.map(menuItem) : [empty]));
+ if(button.dataset.nextTarget){
+  const clear=document.createElement('button');clear.type='button';clear.dataset.moveClear='first';
+  clear.setAttribute('role','menuitem');clear.textContent='No next move';menuItems.append(clear);
+ }
  menu.hidden=false;
  const size=menu.getBoundingClientRect();
- menu.style.left=Math.max(8,Math.min(x,innerWidth-size.width-8))+'px';
- menu.style.top=Math.max(8,Math.min(y,innerHeight-size.height-8))+'px';
+ menu.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
+ menu.style.top=Math.max(8,Math.min(box.bottom,innerHeight-size.height-8))+'px';
  (menuItems.querySelector('button') || menu).focus({preventScroll:true});
  updates.abandon();
 }
-async function saveMove(group,target){
- const save={group,target};
+async function saveMove(form){
+ const group=form.group, save={form};
  pendingMoves.add(save);message.textContent='';message.hidden=true;
  try{
   const response=await fetch(location.pathname,{method:'POST',
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-   body:new URLSearchParams({group,to:target}).toString()});
+   body:new URLSearchParams(form).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
  }catch(error){
@@ -483,18 +650,25 @@ async function saveMove(group,target){
   if(!hold()) void updates.refresh(true);
  }
 }
-document.addEventListener('contextmenu',event=>{
- const row=event.target instanceof Element ? event.target.closest('tr[data-move-group]') : null;
- if(!row){closeMenu();return;}
- event.preventDefault();closeMenu();openMenu(row,event.clientX,event.clientY);
+document.addEventListener('click',event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
+ if(!button) return;
+ const wasOpen=menuButton===button;closeMenu();if(!wasOpen) openMenu(button);
+});
+document.addEventListener('keydown',event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
+ if(!button || !['Enter',' '].includes(event.key)) return;
+ event.preventDefault();button.click();
 });
 document.addEventListener('pointerdown',event=>{
- if(menuRow && !(event.target instanceof Node && menu.contains(event.target))) closeMenu();
+ if(menuRow && !(event.target instanceof Node && (menu.contains(event.target) || menuButton.contains(event.target)))) closeMenu();
 });
 menu.addEventListener('click',event=>{
- const item=event.target instanceof Element ? event.target.closest('[data-move-target]') : null;
+ const item=event.target instanceof Element ? event.target.closest('[data-move-target],[data-move-clear]') : null;
  if(!item || !menuRow) return;
- void saveMove(menuRow.dataset.moveGroup,item.dataset.moveTarget);closeMenu();
+ const form=item.dataset.moveClear ? {group:menuRow.dataset.moveGroup,clear:'first'}
+  : {group:menuRow.dataset.moveGroup,to:item.dataset.moveTarget};
+ void saveMove(form);closeMenu();
 });
 menu.addEventListener('keydown',event=>{
  const items=[...menuItems.querySelectorAll('button')], at=items.indexOf(document.activeElement);

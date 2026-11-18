@@ -1,4 +1,4 @@
-"""Read the built Hana NixOS image and keep its registered identity in local deployment state."""
+"""Read the built Hana NixOS image and save its registration state."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,6 +14,8 @@ RECORD = Path('hana/image.json')
 # The qemu-img input format for each image file suffix that the NixOS Amazon builder writes.
 SOURCE_FORMATS = {'.vhd': 'vpc', '.raw': 'raw', '.img': 'raw', '.qcow2': 'qcow2'}
 BOOT_MODES = frozenset(('legacy-bios', 'uefi'))
+# Coldsnap parses --max-attempts as a u8 argument.
+COLDSNAP_MAX_WAIT_ATTEMPTS = 255
 
 
 class ImageRefused(ValueError):
@@ -28,6 +30,13 @@ class BuiltImage:
     source_format: str
     boot_mode: str
     logical_bytes: int
+
+
+@dataclass(frozen=True)
+class PendingImageRegistration:
+    """The uploaded Hana snapshot still needs an image registration."""
+    name: str
+    snapshot: str
 
 
 @dataclass(frozen=True)
@@ -66,20 +75,30 @@ def read_built(result: Path) -> BuiltImage:
                       boot_mode, logical_bytes)
 
 
-def saved(directory: Path) -> RegisteredImage | NoRegisteredImage:
+def saved(directory: Path) -> PendingImageRegistration | RegisteredImage | NoRegisteredImage:
     path = directory / RECORD
     if not path.exists():
         return NoRegisteredImage()
     record = remote.read_record(path)
     try:
+        state = record.get('state', 'registered')
+        if state == 'pending':
+            return PendingImageRegistration(ledger.text(record, 'name'), ledger.text(record, 'snapshot'))
+        if state != 'registered':
+            raise ValueError('unknown registration state')
         return RegisteredImage(*(ledger.text(record, key) for key in ('name', 'image', 'owner', 'vpc', 'subnet')))
     except (KeyError, TypeError, ValueError) as error:
         raise ImageRefused(f'{path}: the saved Hana image record is incomplete') from error
 
 
-def save(directory: Path, registered: RegisteredImage) -> Path:
+def save(directory: Path, registration: PendingImageRegistration | RegisteredImage) -> Path:
     path = directory / RECORD
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps({'name': registered.name, 'image': registered.image, 'owner': registered.owner,
-                                        'vpc': registered.vpc, 'subnet': registered.subnet}, sort_keys=True) + '\n')
+    record: dict[str, str] = {'name': registration.name}
+    if isinstance(registration, PendingImageRegistration):
+        record.update(state='pending', snapshot=registration.snapshot)
+    else:
+        record.update(state='registered', image=registration.image, owner=registration.owner,
+                      vpc=registration.vpc, subnet=registration.subnet)
+    write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
     return path

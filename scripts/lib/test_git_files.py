@@ -1,7 +1,9 @@
 """The Git file reader gives the answers Git gives."""
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -86,6 +88,21 @@ class GitFilesTests(unittest.TestCase):
             _ = git_files.locate(worktree)
         self.assertEqual(raised.exception.path, worktree / ".git")
 
+    def test_only_a_missing_gitdir_target_has_the_missing_result(self) -> None:
+        worktree = self.root / "linked"
+        worktree.mkdir()
+        target = self.root / "target"
+        pointer = worktree / ".git"
+        _ = pointer.write_text(f"gitdir: {target}\n", encoding="utf-8")
+        with self.assertRaises(git_files.MissingReferencedGitDirectory) as raised:
+            _ = git_files.at(worktree)
+        self.assertEqual(raised.exception.path, pointer)
+
+        target.touch()
+        with self.assertRaises(git_files.UnreadableGitFiles) as raised:
+            _ = git_files.at(worktree)
+        self.assertIs(type(raised.exception), git_files.UnreadableGitFiles)
+
     def test_at_reads_only_the_given_folder(self) -> None:
         (self.main / "sub").mkdir()
         self.assertEqual(git_files.at(self.main), git_files.locate(self.main / "sub"))
@@ -98,3 +115,72 @@ class GitFilesTests(unittest.TestCase):
         _ = git(self.main, "switch", "-q", "--detach")
         self.assertEqual(git_files.head(checkout), git_files.DetachedHead(git(self.main, "rev-parse", "HEAD")))
 
+    def assert_unreadable_metadata(self, folder: Path, metadata: Path) -> None:
+        program = """import errno, os, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.lib import git_files
+
+folder, metadata = map(Path, sys.argv[1:])
+open_path = os.open
+wrap = os.fdopen
+descriptors = []
+
+def track(path, flags, *args, **kwargs):
+    if path == metadata:
+        assert (flags & os.O_ACCMODE) == os.O_RDONLY
+        assert flags & os.O_NONBLOCK
+    descriptor = open_path(path, flags, *args, **kwargs)
+    if path == metadata:
+        descriptors.append(descriptor)
+    return descriptor
+
+def check_wrap(descriptor, *args, **kwargs):
+    assert descriptor not in descriptors, "The reader wrapped a non-regular file."
+    return wrap(descriptor, *args, **kwargs)
+
+with patch.object(os, "open", track), patch.object(os, "fdopen", check_wrap):
+    try:
+        git_files.locate(folder)
+    except git_files.UnreadableGitFiles as error:
+        assert error.path == metadata, error
+        assert error.reason == "expected a regular file", error
+    else:
+        raise AssertionError("The reader accepted a non-regular file.")
+
+assert len(descriptors) == 1, descriptors
+try:
+    os.fstat(descriptors[0])
+except OSError as error:
+    assert error.errno == errno.EBADF
+else:
+    raise AssertionError("The metadata descriptor is still open.")
+"""
+        run = subprocess.run([sys.executable, "-c", program, str(folder), str(metadata)],
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_fifo_git_entry_is_unreadable_and_closes_its_descriptor(self) -> None:
+        folder = self.root / "fifo-checkout"
+        folder.mkdir()
+        metadata = folder / ".git"
+        os.mkfifo(metadata)
+        self.assert_unreadable_metadata(folder, metadata)
+
+    def test_fifo_commondir_is_unreadable_and_closes_its_descriptor(self) -> None:
+        metadata = self.main / ".git" / "commondir"
+        os.mkfifo(metadata)
+        self.assert_unreadable_metadata(self.main, metadata)
+
+    def test_commondir_directory_is_unreadable_and_closes_its_descriptor(self) -> None:
+        metadata = self.main / ".git" / "commondir"
+        metadata.mkdir()
+        self.assert_unreadable_metadata(self.main, metadata)
+
+
+    def test_commondir_link_to_fifo_is_unreadable_and_closes_its_descriptor(self) -> None:
+        metadata = self.main / ".git" / "commondir"
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        metadata.symlink_to(fifo)
+        self.assert_unreadable_metadata(self.main, metadata)

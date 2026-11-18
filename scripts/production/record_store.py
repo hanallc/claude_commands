@@ -210,19 +210,13 @@ def stored_paths(folders: Iterable[Path], *, strict: bool = False,
 
 def read_header(path: Path, *, sources: list[Path] | None = None, keys: frozenset[str] = ALL_FIELDS,
                 select: Callable[[Issue], bool] | None = None, strict: bool = False) -> dict[str, list[str]]:
-    """Watch each path and skip unreadable files and archive files without frontmatter."""
-    if strict:
+    """Read a header. A source collector requires readable files."""
+    if strict or (sources is not None and "archive" in path.parts):
         if sources is not None:
             sources.append(path)
-        fields = number_fields(path, keys).fields
+        fields = number_fields(path, ALL_FIELDS if select is not None else keys).fields
         return fields if select is None or select(Issue(path, fields)) else {}
-    if sources is not None and "archive" in path.parts:
-        sources.append(path)
-        sources = None
-    try:
-        return issues.frontmatter(path, sources=sources, keys=keys, select=select)
-    except (OSError, UnicodeError):
-        return {}
+    return issues.frontmatter(path, sources=sources, keys=keys, select=select)
 
 
 def number_fields(path: Path, keys: frozenset[str]) -> Issue:
@@ -305,7 +299,15 @@ def local_document(row: staff.StaffRow | None) -> Path | None:
 def staff_store_folders(kind: RecordKind, *, members: staff.StaffSnapshot | None = None,
                         covered_owner: staff.StaffId | None = None) -> Iterator[Path]:
     """Find store roots for owners whose folders the caller still needs."""
-    members = staff.snapshot() if members is None else members
+    if members is None:
+        if kind is RecordKind.INVESTIGATION:
+            # Investigation folders are local. Their locations do not depend on production documents.
+            try:
+                members = staff.local_snapshot()
+            except staff.StaffAbsent:
+                members = staff.StaffSnapshot(())
+        else:
+            members = staff.initial_snapshot()
     owners = store_owners(kind, members, strict=True)
     for owner, row in owners.items():
         if owner != covered_owner:
