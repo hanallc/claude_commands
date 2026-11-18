@@ -18,6 +18,8 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.production import staff, unit_config, fake_unit_host
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, StaffTestCase, isolated_source_readers
 from scripts.lib import unit_runs
@@ -613,11 +615,7 @@ class ProductionRenameFixture(StaffTestCase):
     def build_fixture(self) -> None:
         for path in (self.home, self.checkout, self.notifier, self.worktrees):
             path.mkdir(parents=True)
-        config = self.home / ".claude"
-        config.mkdir()
-        helper = config / "scripts/lib/py"
-        helper.parent.mkdir(parents=True)
-        helper.symlink_to(SCRIPT.parents[1] / "lib/py")
+        _ = copy_helpers(self.home)
         (self.root / "state/sessions").mkdir(parents=True)
         self.write(self.root / "herdr-responses.json",
                    json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0},

@@ -1177,7 +1177,8 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
                and isinstance(step.measured.window, progress.WindowPeak) for step in steps)
 
 
-WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure", "AWS slot", "build hold", "Mac"]
+WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
+                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1193,6 +1194,8 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "its turn"
         case admission_records.MemoryPressure():
             return "memory pressure"
+        case placement.CargoFolderWait():
+            return "the build in the same Cargo folder"
         case admission_records.GpuSlotWait():
             return "GPU slot"
         case admission_records.EstimateExpired():
@@ -2211,15 +2214,29 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             token_rows[pid]["tokens"] = held
     waiters: list[MemoryWaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
+    order_holds = {row.waiter.pid: row.decision.order_hold for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
         checks[explanation.head.waiter.pid] = explanation.head.room
-    for place, waiter in enumerate(parsed.view.waiting, 1):
+        order_holds[explanation.head.waiter.pid] = explanation.head.decision.order_hold
+    waiting = parsed.view.waiting
+    positions = {waiter.pid: place for place, waiter in enumerate(waiting, 1)}
+    for place, waiter in enumerate(waiting, 1):
         check = checks.get(waiter.pid)
         need = check.need if check is not None else waiter.need
         identity = feed_step_labels(waiter, labels, ci_runners)
-        reason = reason_phrase(waiter.reason, parsed.view.waiting)
-        if isinstance(waiter.reason, admission_records.BehindHead):
-            reason += ": the first step in line gets memory first"
+        cause = waiter.reason.cause if isinstance(waiter.reason, admission_records.HeadAdmissionStatus) else waiter.reason
+        if isinstance(cause, admission_records.BehindHead):
+            order = order_holds.get(waiter.pid)
+            blocker = (positions.get(order.waiter["pid"], 0) if isinstance(order, admission_records.HeldBehindHead)
+                       else admission_records.behind_place(cause, waiting))
+            if blocker:
+                ahead = waiting[blocker - 1]
+                reason = admission_client.blocking_waiter_text(f"behind #{blocker}",
+                    ahead.session_name or cause.head_name, ahead.step, ahead.unit, ahead.need / GIB)
+            else:
+                reason = f"behind {cause.head_name}"
+        else:
+            reason = reason_phrase(waiter.reason, waiting)
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
         job = NotGateStep() if ci_label else step_job(waiter.step, waiter.pid)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step))

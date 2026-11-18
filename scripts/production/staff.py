@@ -963,6 +963,12 @@ def validate_name(kind: Kind, name: str) -> None:
         _ = WorkerName.parse(name)
 
 
+def validate_unit_name_for_write(name: str) -> None:
+    """Reserve the -unit suffix for references to existing units."""
+    if name.endswith("-unit"):
+        raise StaffRefused(f"unit name {name!r} must not end in -unit")
+
+
 def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = ()) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
@@ -1507,6 +1513,8 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
                            doc=existing.doc if isinstance(doc, DocUnfilled) else doc)
         rows[rows.index(existing)] = admitted
         return admitted
+    if kind == "unit":
+        validate_unit_name_for_write(name)
     if not runtime_id:
         raise StaffRefused(f"{kind} {name}: native runtime identity is not proved")
     staff_id = native_id(runtime_id)
@@ -1667,6 +1675,7 @@ class UnitRole:
 
 def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -> StaffRow:
     """Change a director's role and preserve its identity and workers."""
+    validate_unit_name_for_write(destination.name)
     promoting = isinstance(destination, ShowrunnerRole)
     location = destination.doc if isinstance(destination, ShowrunnerRole) else destination.worktree
     if not is_owner():
@@ -1763,6 +1772,8 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     else:
         def edit(rows: list[StaffRow]) -> StaffRow:
             row = _required(rows, staff_id)
+            if row.kind == "unit":
+                validate_unit_name_for_write(new_name)
             renamed = replace(row, name=new_name)
             rows[rows.index(row)] = renamed
             return renamed

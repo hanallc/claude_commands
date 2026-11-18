@@ -16,6 +16,17 @@ GPU trial boxes then import the prepared GPU system and reboot.
 The ledger reserves spending before launch and records confirmed termination.
 The configuration files remain the source for cap values.
 
+The spending guard reads `notification_recipient` and `notification_timeout_s` for each limit notice it attempts to send.
+The ledger keeps the recipient and timeout from when the guard created the notice.
+Each notice names the day or month that reached the limit.
+The guard retries a failed notice after its saved retry deadline if the accounting period is still open.
+The guard rounds the saved retry deadline up to a whole second for older readers.
+When a notice's period ends in `accounting_zone`, the guard marks the pending notice as expired on its next check.
+The ledger records an expired notice as `"delivery": "delivered"` with `"expired": true`.
+Older readers treat the record as delivered.
+A retry after a recipient change can send the same notice to both recipients. A duplicate notice is safer than a lost notice.
+Code older than this change still sends a pending notice after its period ends. That ends when every branch has this change.
+
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
 `sync.hosts.aws=aws-build` identifies historical steps.
@@ -147,7 +158,8 @@ Ledger estimates include accrued Hana compute and storage.
 | --- | --- | --- |
 | `region` | `us-east-2` | Use Ohio for the box and retained storage. |
 | `instance_type` | `m7a.2xlarge` | Provide 32 GiB of memory. |
-| `spot_max_usd_per_hour` | `0.15` | Bound reserved compute exposure. |
+| `spot_max_usd_per_hour` | `0.25` | Bound reserved compute exposure and refuse higher Spot prices during setup. |
+| `spot_ceiling_margin` | `0.25` | Add this positive fraction of the current Spot price when setup suggests a new ceiling. |
 | `root_gib` | `40` | Reserve the retained root volume. |
 | `data_gib` | `300` | Reserve the retained data volume. |
 | `daily_budget_usd` | `6` | Bound Hana spending within the account limit. |
@@ -236,11 +248,27 @@ The existing preparation writer, preflight verifier, encrypted admin executor, s
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
 It creates a retained data volume, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
 Its Spot interruption behavior is `stop`.
-Setup uses Hana sizes and prices from `config/hana_aws.conf`.
+Setup uses the Hana instance type and price ceiling from `config/hana_aws.conf`.
+Before it reserves costs for a new stack, setup reads Spot prices for the Hana instance type in the configured region.
+Setup refuses to create the stack if the read fails, the configured zone has no price, or the price exceeds the ceiling.
+If the price exceeds the ceiling, setup shows the cheapest zone.
+Setup gives a `/tune` command when the effective ceiling key is editable.
+If the configuration rejects the command, setup reports the error and the suggested ceiling.
+To change zones, use a subnet in the new zone.
+The suggested ceiling includes `spot_ceiling_margin` and rounds up to the next cent when necessary.
+Setup reads the margin only for a stack change.
+If the price is at or below the ceiling, setup prints both values and continues.
+
+If setup gives a `/tune` command:
+
+1. Run the displayed `/tune` command.
+2. Run `deploy.py prepare --workload hana`.
+3. Run `deploy.py hana-setup --approve-resources`.
+
 It reserves setup costs within both account and workload limits before the stack request.
 `reserve_setup()` permits only approved resource setup while placement remains disabled.
 It does not permit demand starts or guest command admission.
-Setup resumes an existing stack through reads before another mutation.
+Setup resumes an already requested stack without a Spot price check.
 It refuses changed resource inputs or an expired reservation before another stack request.
 If AWS confirms that the stack is missing, setup checks the local record for resource identities.
 If the record names an instance, data disk, or bucket, setup asks the user to run `down --workload hana --approve-destroy`.
@@ -249,11 +277,35 @@ It uses stacks that AWS created at or after the saved reservation time.
 Setup reads the events of each matching stack by ID to find retained disks and buckets.
 It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
 If it cannot verify cleanup, setup keeps the record and asks the user to run `down --workload hana --approve-destroy`.
-It registers the deployment only after the Spot request and stopped state match.
+Setup verifies the persistent Spot request before it requests the idle stop.
+It checks the instance state every `stop_poll_seconds` (10 seconds by default).
+Each check reports the state and elapsed time and uses the `aws_timeout_s` command limit.
+Setup starts each check within `stop_wait_timeout_s` (600 seconds by default).
+A check can finish after the wait limit.
+If the wait expires, run `deploy.py hana-setup --approve-resources` again to resume the stop.
+Setup keeps the pending stop and accepts the saved preparation after its age limit if the inputs still match.
+It registers the deployment after it confirms the stopped state.
+
+Setup then probes the scaler path with the same credential file and profile as `aws-target.service`.
+It checks credential export and reads the instance, Spot request, and user data.
+It uses EC2 `--dry-run` for the user data change, start, and stop commands.
+AWS confirms permission for these commands with `DryRunOperation`. [AWS CLI dry-run reference](https://docs.aws.amazon.com/cli/latest/reference/ec2/modify-instance-attribute.html#options)
+The user data dry run uses the value from the user data read, or an empty value if the read fails.
+Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` and compares the bytes it reads back.
+It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
+When AWS supplies an error code, the failure line includes it in parentheses.
+For a policy-only change, setup probes before and after the update.
+Setup requires an idle-stopped lifecycle with no claims or pending start for this change.
+It confirms that EC2 reports the instance as stopped.
+Setup compares the effective change set parameters with the approved parameters before execution.
+The second run starts after CloudFormation confirms the update.
+Setup continues the update if the first probe run fails.
+Setup returns exit status 1 if any operation in the last probe run fails.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
 It refuses changes that replace or remove an instance, volume, or volume attachment.
-When a create or update fails, setup reads failed stack events from the current change before cleanup.
+When a policy update fails, setup prints the failed progress step and the update error.
+When an ordinary setup change fails, setup reads failed stack events from the current change before cleanup.
 The error gives the name, type, status, and AWS reason for each failed resource.
 If setup cannot read the events, it reports that they are unavailable and continues cleanup.
 Setup ends the Spot boxes other than the box in `hana/setup.json`.
@@ -263,7 +315,7 @@ It deletes these resources before it closes the spending reservation and removes
 If the rollback or cleanup is incomplete, setup keeps the record and reservation for `down`.
 For an incomplete setup, `down` also checks deleted stack history for retained resources.
 If that history has no match, `down` reports it and continues with any disk or bucket in the saved record.
-After a failed update, setup deletes resources retained during rollback and keeps the stack and record.
+After a failed ordinary setup update, setup deletes resources retained during rollback and keeps the stack and record.
 Run `prepare --workload hana` again before retrying with changed inputs.
 The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 

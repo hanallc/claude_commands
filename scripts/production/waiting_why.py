@@ -14,7 +14,7 @@ from typing import cast
 
 from scripts.production import change_review, investigation, staff, update_registration
 from scripts.production.production_doc import Refusal
-from scripts.review_links import change_page, decision_store, review_events, review_items, review_link
+from scripts.review_links import decision_store, review_events, review_items, review_link
 
 
 def missing(root: Path, members: staff.StaffSnapshot) -> list[str]:
@@ -25,18 +25,13 @@ def missing(root: Path, members: staff.StaffSnapshot) -> list[str]:
             for item in sorted(items, key=lambda item: item.key) if not item.waiting_why]
 
 
-def store(item: review_items.ReviewItem, text: str, root: Path) -> None:
+def store(item: review_items.ReviewItem, text: str) -> None:
     """Use each filer's writer and refuse items outside Waiting."""
     reason = review_events.require_waiting_why(text)
     if item.state != review_items.ReviewState.WAITING:
         raise ValueError('The item is not Waiting.')
     source = item.source
-    if isinstance(source, review_items.ChangeSource):
-        if not isinstance(source.assignment.production, Path):
-            raise ValueError('The production document is unavailable.')
-        page = change_page.ReviewPage(source.path, source.assignment.production, (source.row['#'],), '')
-        change_page.DeliveryStatus(root).set_waiting_why(page, source.row['#'], reason)
-    elif isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+    if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         update_registration.set_waiting_why(source.record, reason)
     elif isinstance(source, review_items.InvestigationSource):
         investigation.set_waiting_why(source.record.owner, source.record.id, reason)
@@ -67,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
             found = [item for item in review_items.read(root, members=members, assign_ids=False) if item.key == key]
             if len(found) != 1:
                 raise ValueError('The item key must name one Review item.')
-            store(found[0], cast(str, args.text), root)
+            store(found[0], cast(str, args.text))
         return 0
     except (ValueError, OSError, change_review.ChangeReviewError, update_registration.InputError,
             update_registration.RegistrationFailure, Refusal) as error:

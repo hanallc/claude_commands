@@ -1308,6 +1308,23 @@ try {
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
             }
+            await show(readings.cargo_folder);
+            const folderWait = await evaluate(`(() => {
+              const tip = proofTip('wait', 0);
+              const row = document.querySelector('.wrow.wait[data-tip="' + tip + '"]');
+              row.scrollIntoView({block:'center'});
+              const box = row.getBoundingClientRect();
+              return {note:row.querySelector('.wait-note')?.textContent,
+                reason:tipText(tip,latest)[1],
+                clip:{x:box.x+scrollX,y:box.y+scrollY,width:box.width,height:box.height,scale:1}};
+            })()`);
+            assert.equal(folderWait.note, 'waits for the build in the same Cargo folder');
+            assert.match(folderWait.reason, /the build in the same Cargo folder/);
+            if (theme === 'dark' && width === 1400) {
+              const shot = await call('Page.captureScreenshot',
+                {format:'png',captureBeyondViewport:true,clip:folderWait.clip});
+              await writeFile(join(folder,'cargo-folder-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+            }
             for(const name of ['head_memory','head_shortfall','head_swap_shortfall']) {
               await show(readings[name]);
               const headProof=await evaluate(`(() => {

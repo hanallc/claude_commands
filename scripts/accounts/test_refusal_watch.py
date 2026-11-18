@@ -1849,6 +1849,21 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(len(self.moves.calls), 1)
 
+    def test_automatic_producer_move_uses_the_inherited_source_and_saves_its_own_selection(self) -> None:
+        path = self.groups(showrunners="claude1")
+        owner = self.owner("producer")
+        self.reading(SOURCE_LOGIN, 1)
+        self.next_entries(self.low_rule("producers-low", group="producers"))
+        member = accounts.LiveGroupMember(owner["session_id"], owner["name"], "producers", accounts.account_dir("claude1"))
+        with patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": [], "producers": [member]}):
+            _ = self.cli()
+        self.assertEqual(stored_group_labels(path),
+                         {"units": "claude1", "showrunners": "claude1", "producers": "claude2"})
+        self.assertEqual(self.moves.calls, [MoveCall("producer", "claude2", "auto: producers-low")])
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(role_map.recorded_auto_moves(accounts.roles_history_file()),
+                         role_map.RecordedAutoMoves(frozenset({"producers-low"})))
+
     def test_automatic_low_rule_requires_a_fresh_source_reading(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")

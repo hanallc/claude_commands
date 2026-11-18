@@ -17,6 +17,24 @@ def setUpModule() -> None:
 
 
 class AddUnitStaffRowTests(AddUnitTestCase):
+    def test_unit_name_is_refused_before_create_resume_or_attach(self) -> None:
+        identity = fixture_runtime_id("unit-to-resume")
+        repository = self.repository_state()
+        state = self.staff.staff_file.read_bytes()
+        cases = (
+            ("create-unit", ()),
+            ("resume-unit", ("--resume", identity, "--cwd", str(self.checkout))),
+            ("attach-unit", ("--attach", identity, "--cwd", str(self.checkout))),
+        )
+        for name, arguments in cases:
+            with self.subTest(name=name):
+                result = self.cli(name, "--plan", "docs/plans/given.md", *arguments)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (2, "", f"StaffRefused: unit name {name!r} must not end in -unit\n"))
+                self.assertEqual(self.staff.staff_file.read_bytes(), state)
+                self.assertEqual(self.repository_state(), repository)
+                self.assertEqual(self.herdr_calls(), [])
+
     def test_unit_under_another_showrunner_refuses_with_move_command_without_adding_rows_or_tabs(self) -> None:
         row = unit_membership("sdlc", "alpha")
         before = self.staff.staff_file.read_bytes()

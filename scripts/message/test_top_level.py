@@ -114,6 +114,7 @@ class TopLevelTests(unittest.TestCase):
 
         def record(command: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
             self.assertEqual(Path(command[1]).name, "build_hold.py")
+            self.assertEqual(Path(command[1]), Path(top_level.__file__).resolve().parents[1] / "build_hold/build_hold.py")
             self.assertEqual(command[2], "record-recipient")
             recorded.append((command[command.index("--name") + 1], command[command.index("--session-id") + 1]))
             return subprocess.CompletedProcess(command, record_exit, b"", b"")
