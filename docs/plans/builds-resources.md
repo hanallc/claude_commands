@@ -2801,11 +2801,12 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 150 — Find why the AWS merge gate wall time doubled  · status: done
 
-Builds 11-18: the merge gate wall time rose from about 204 s to about 432 s. AWS full gates, daily wall mean: 11-11 204 s, 11-14 367 s, 11-18 451 s. CPU per run stayed flat; cost per run fell from $0.051 to about $0.015.
+#### As-built
 
-1. Name the cause with measured data: which modules, which stage, natedev or AWS, and since when.
-2. Send builds the cause, the evidence and a proposed fix. Make no config change without builds' go.
+- A read-only study from the gate records; no code change. Evidence: the cost ledger, the launch ledger, the gate index and the guest results.
+- Main cause: on 11-14 at 09:25 EST, AWS placement moved full merge gates from 32-vCPU boxes (`m7a.8xlarge`, `c7a.8xlarge`) to 16-vCPU `c7a.4xlarge` (aws commits `9cf0ac576`, `7dc450e92`, `6b6d3d516`). The gate runs one worker per CPU, so workers fell from 32 to 16. Module CPU stayed flat; the module span grew from 197 s to 388 s median.
+- Second rise on the same type, 11-17/18: median wall 358 s to 451 s, CPU 4322 s to 4930 s. Five modules added most CPU: `statusline/test_statusline.py`, `production/test_mac_run.py`, `direct/test_verify_lint_local_writes.py`, `mac_test/test_offload_lifecycle.py`, `direct/test_assign_claude_claim_follow.py`.
+- Proposed: `c7a.8xlarge` first for full gates, about 210-240 s guest wall at $0.020-0.024 per run. Builds took the box order to the user; natest took the five modules.
+- Checkpoint `74b5acf8d`.
 
-**Files:** none (a study; no code change).
-
-Result: sent to builds 11-18. The 11-14 placement switch to 16-vCPU `c7a.4xlarge` halved the gate workers; a second rise on 11-17/18 came from CPU growth in five modules. Builds took the box order to the user and gave the five modules to natest.
+**Files:** none.
