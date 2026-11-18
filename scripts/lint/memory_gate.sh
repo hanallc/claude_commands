@@ -7,11 +7,11 @@ source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" lint/memory_gate.sh || exit 2
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
-BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
-BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/admission_client.py"
+BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$HOME/.claude/scripts/build_targets/build_targets.py}"
+BUILDLOG_MEM_ADMIT_SCRIPT="$HOME/.claude/scripts/build_queue/admission_client.py"
 # The build queue is the one way in: steps admit, launch and release through queue_place.py.
-BUILDLOG_QUEUE_PLACE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_queue" && pwd)/queue_place.py"
-BUILDLOG_MEM_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/py"
+BUILDLOG_QUEUE_PLACE_SCRIPT="$HOME/.claude/scripts/build_queue/queue_place.py"
+BUILDLOG_MEM_PY="$HOME/.claude/scripts/lib/py"
 
 # Each new wait uses its own identity. Rejoining callers restore it after sourcing.
 BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""

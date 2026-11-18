@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -205,6 +206,37 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         result = self.run_step()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([event["args"] for event in self.fixture.cargo_events()], [["check"]])
+
+    def test_installed_hold_helper_and_explicit_override_both_route_the_step(self) -> None:
+        directory = self.fixture.home / ".claude/scripts/build_targets"
+        directory.unlink()
+        directory.mkdir()
+        for source in (offload_tests.VERIFY.parent.parent / "build_targets").iterdir():
+            if source.name != "build_targets.py":
+                (directory / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        installed = directory / "build_targets.py"
+        calls = self.fixture.root / "helper-calls.jsonl"
+        recording = ("import json, sys\nfrom pathlib import Path\n"
+                     + f"with Path({str(calls)!r}).open('a') as output: "
+                     + "output.write(json.dumps([__file__, *sys.argv[1:]]) + '\\n')\n")
+        for entry, override in (("invoke", False), ("invoke", True), ("verify", False), ("verify", True)):
+            with self.subTest(entry=entry, override=override):
+                self.reset_observations()
+                calls.unlink(missing_ok=True)
+                _ = installed.write_text(recording + CHECK_STUB)
+                _ = self.targets.write_text(recording + CHECK_STUB)
+                if override:
+                    self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(self.targets)
+                else:
+                    _ = self.fixture.environment.pop("BUILD_TARGETS_SCRIPT", None)
+                result = (self.run_step() if entry == "invoke" else
+                          self.fixture.verify("check", "sample", "--no-cache"))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                observed = [cast(list[str], json.loads(line)) for line in calls.read_text().splitlines()]
+                self.assertTrue(observed)
+                self.assertEqual({call[0] for call in observed}, {str(self.targets if override else installed)})
+                self.assertTrue({"check-local", "register-local"}.intersection(call[1] for call in observed))
+                self.assertTrue(any(event["args"][:1] == ["check"] for event in self.fixture.cargo_events()))
 
     def test_verify_wait_check_error_and_missing_path_refuse_before_cargo(self) -> None:
         for failure in ("usage", "crash", "missing"):
