@@ -2621,3 +2621,24 @@ The cutover removal commit deletes the script after the run.
 - The hold never ends by itself. No config key changed. No signal handler, mask or disposition.
 
 **Files:** `scripts/build_hold/build_hold.py`, `scripts/build_hold/hold_enforcer.py`, `scripts/build_targets/targets.py`, `scripts/build_targets/build_targets.py`, their tests, `commands/build/hold.md`, `commands/build/status.md`, `commands/showrunner/bump.md`, `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md`.
+
+### Phase 135 — The caller admission fixture works for a caller without HOME  · status: done
+**Source:** builds showrunner 2026-11-16, check of Phase 8 merged with queue's chain tip acf597c0e: queue's `scripts/build_queue/test_caller_admission_clock.py:32` passes an environment with only `BUILDLOG_DIR`, and both rows of `test_reusing_a_caller_keeps_the_opt_out_in_both_orders` fail with `KeyError: 'HOME'`.
+**Depends on:** Phase 8.
+
+#### Work Order
+
+**Goal:** `caller_admission()` accepts a caller environment without `HOME`, as it did before Phase 8.
+
+**Spec:**
+1. In `scripts/build_queue/admission_test_support.py` `caller_admission()` (near line 1114), install the private helpers into `environment["HOME"]` only when the caller supplies `HOME` and it differs from `Path.home()`. Keep the `Path.home()` install.
+2. Add no field to the caller contract. Change no assertion.
+
+**Files:**
+- `scripts/build_queue/admission_test_support.py` — the caller fixture.
+- `scripts/build_queue/test_admission_service.py` — one row: a caller environment without `HOME` gets a serving fixture.
+
+**Workers:** `1 writer`
+- `test` owns both files.
+
+**Acceptance gate:** the admission tests pass in the worktree; queue's `test_caller_admission_clock` passes on a `copies.py run` merge of this branch with queue's chain tip.
