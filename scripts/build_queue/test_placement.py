@@ -1630,7 +1630,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
             warnings = io.StringIO()
 
-            def preview(spending: hana_spend.HanaSpending, now: int, expires: int) -> hana_spend.StartAffordable:
+            def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
+                        now: int, expires: int) -> hana_spend.StartAffordable:
                 self.assertTrue(spending.settings.enabled)
                 self.assertEqual(expires - now, spending.settings.permit_max_seconds)
                 return hana_spend.StartAffordable(expires)
@@ -1794,7 +1795,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             good = settings.read_text()
             self.commit_settings(settings)
 
-            def preview(spending: hana_spend.HanaSpending, _now: int, expires: int) -> hana_spend.StartAffordable:
+            def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
+                        _now: int, expires: int) -> hana_spend.StartAffordable:
                 self.assertEqual(spending.settings.daily_budget_usd, Decimal(6))
                 return hana_spend.StartAffordable(expires)
 
