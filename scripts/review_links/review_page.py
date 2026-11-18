@@ -34,7 +34,6 @@ LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', Review
 LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
 # Weekday names in the order of the browser's getUTCDay.
 WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
-CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
 FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
 
 
@@ -75,22 +74,14 @@ class CardSettings:
     soon_label: str
 
 
-def clock_minutes(settings: conf.ConfigRead, key: str) -> int:
-    value = settings.text(key)
-    match = CLOCK.fullmatch(value)
-    if match is None:
-        raise ValueError(f'review_links.conf: {key}={value!r} is not a time such as 09:00')
-    return int(match[1])*60+int(match[2])
-
-
 def later_settings(settings: conf.ConfigRead) -> dict[str, int]:
     """Return the Later menu's preset settings for the page script, in minutes and getUTCDay numbers."""
     day = settings.text('later_week_day')
     if day not in WEEKDAYS:
         raise ValueError(f'review_links.conf: later_week_day={day!r} is not a weekday name such as Monday')
-    return {'soon': settings.whole('later_soon_minutes'), 'evening': clock_minutes(settings, 'later_evening'),
-            'eveningUntil': clock_minutes(settings, 'later_evening_until'), 'morning': clock_minutes(settings, 'later_morning'),
-            'weekDay': WEEKDAYS.index(day), 'weekTime': clock_minutes(settings, 'later_week_time')}
+    return {'soon': settings.whole('later_soon_minutes'), 'evening': record_table.clock_minutes(settings, 'later_evening'),
+            'eveningUntil': record_table.clock_minutes(settings, 'later_evening_until'), 'morning': record_table.clock_minutes(settings, 'later_morning'),
+            'weekDay': WEEKDAYS.index(day), 'weekTime': record_table.clock_minutes(settings, 'later_week_time')}
 
 
 def soon_label(minutes: int) -> str:
@@ -150,29 +141,19 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSet
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 else '')+'>'+labels[action]+'</button>'
         (returns if action == 'question' or (item.type == ReviewType.CHANGE and action in change_page.CHANGE_HANDOFFS)
          else closes).append(button)
-    groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>' if closes else ''
-    if returns:
-        heading = 'Sends to showrunner' if item.type == ReviewType.CHANGE else 'The item returns to you'
-        groups += '<div class="review-action-group"><span>'+heading+'</span><div>'+''.join(returns)+'</div></div>'
+    heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
+               else page_frame.ReturningActionHeading.ITEM_RETURNS)
     presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
                       +f'<span>{html.escape(label or settings.soon_label)}</span><small></small></button>' for key, label in LATER_PRESETS)
-    groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div class="later-menu">'
-               +'<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
+    later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
                +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
                +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
-               +'<div class="later-custom" data-later-custom hidden>'
-               +'<input type="hidden" name="later">'
-               +'<div class="later-month-header"><strong data-later-month aria-live="polite"></strong><div>'
-               +'<button type="button" tabindex="-1" data-later-month-step="-1" aria-label="Previous month">‹</button>'
-               +'<button type="button" tabindex="-1" data-later-month-step="1" aria-label="Next month">›</button></div></div>'
-               +'<div role="grid" aria-label="Choose a day" data-later-grid></div>'
-               +'<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>'
-               +'<div class="later-save"><span data-later-summary aria-live="polite"></span>'
-               +'<button class="primary" name="outcome" value="later">Save</button></div></div></div></div></div>')
+               +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
             + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{settings.words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
-            + '<div class="review-actions">'+groups+'</div><span role="status" data-send-status></span></form>')
+            + page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
+            + '<span role="status" data-send-status></span></form>')
 
 
 def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, settings: CardSettings,
@@ -310,15 +291,18 @@ def render(root: Path, *, show: str = 'open') -> bytes:
                     +' <b></b></button>' for value, label in SHOWS)
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
-    content = (record_table.STYLE+STYLE+page_frame.title('Review', 'review')
+    content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review')
         +f'<div data-review data-show="{show}" data-refresh-seconds="{settings.number("page_refresh_seconds")}"'
         +f' data-zone="{html.escape(user_zone_name(), quote=True)}" data-later="{html.escape(json.dumps(later), quote=True)}">'
         +'<div class="review-types" role="group" aria-label="Type">'+chips+'</div>'
         +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div>'
         +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
         +'<div class="list-filters">'
+        +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
+        +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
-        +'</div><p data-hidden-action-status role="status" hidden></p>'
+        +'</div><p data-missing-item role="status" hidden></p>'
+        +'<p data-hidden-action-status role="status" hidden></p>'
         +'<script type="application/json" data-review-index>'+index_json(entries)+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
@@ -389,9 +373,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
 STYLE = '''<style>
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-types{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}
-.review-types button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
+:is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
-.review-types button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+:is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
@@ -401,16 +385,9 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 [data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
 [data-review-form] textarea{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
 color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
-.review-actions{display:flex;align-items:flex-end;gap:26px;margin-top:12px;flex-wrap:wrap}
-.review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
-.review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}.review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
-.review-later{margin-left:auto}.review-actions input{font:inherit;min-height:40px;max-width:100%;box-sizing:border-box;
-padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+.review-actions{margin-top:12px}
+.review-later{margin-left:auto}
 .list-log span{white-space:pre-wrap}
-.later-menu{position:relative}
-[data-later-menu]{position:absolute;right:0;bottom:calc(100% + 6px);z-index:5;width:280px;max-width:calc(100vw - 32px);padding:5px;box-sizing:border-box;
-background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
-[data-later-menu] [hidden]{display:none!important}
 .review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
 min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
 .review-actions [data-later-menu] [role=menuitem]:is(:hover,:focus){background:var(--accent);color:#fff;outline:none}
@@ -418,24 +395,6 @@ min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;colo
 [data-later-menu] [role=menuitem]:is(:hover,:focus) small{color:inherit;opacity:.85}
 [data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
 [data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
-.later-custom{padding:6px}
-.later-month-header,.later-month-header>div,.later-save{display:flex;align-items:center;justify-content:space-between;gap:4px}
-.later-month-header strong{font-size:14px}
-.review-actions .later-month-header button{min-height:28px;width:28px;padding:0;border:0;font-size:24px;background:none}
-[data-later-grid]{margin:8px 0 12px}
-[data-later-grid]>[role=row]{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px;text-align:center}
-[data-later-grid] [role=columnheader]{font-size:11px;color:var(--ink-3);padding:4px 0}
-.review-actions [data-later-grid] button{width:100%;min-width:0;min-height:30px;padding:0;border:1px solid transparent;border-radius:50%;font-size:13px;background:none}
-.review-actions [data-later-grid] [aria-current=date]{border-color:var(--accent)}
-.review-actions [data-later-grid] [aria-selected=true]{background:var(--accent);color:#fff}
-.review-actions [data-later-grid] button:disabled{opacity:.3}
-.review-actions [data-later-grid] button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
-[data-review-form] .later-time{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400;margin:0 0 10px}
-.review-actions .later-time input{min-height:32px;width:120px;padding:3px 8px;color-scheme:light dark}
-.review-actions .later-time input[aria-invalid=true]{border-color:var(--error);color:var(--error)}
-.later-save [data-later-summary]{font-size:11px;white-space:nowrap;color:var(--ink-3)}
-.review-actions .later-save button{min-height:32px;padding:4px 10px;font-size:12px;flex-shrink:0}
-.review-actions .later-save button:disabled{opacity:.4}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
@@ -447,12 +406,13 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-handoff>span{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 @media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
-.review-panel{grid-template-columns:1fr;padding:0 14px 16px}.review-action-group+.review-action-group{padding-left:0;border:0}}
+.review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
 </style>'''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT + r'''(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + review_legacy.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
 let selectedShow=content.dataset.show,requestedShow=selectedShow;
+let entryJump=new URLSearchParams(location.hash.slice(1)).get('jump');
 const drafts=new Map(),departures=new Map(),bodies=new Map();
 let index=readIndex();
 function readIndex(){
@@ -463,7 +423,7 @@ function matchesOwner(entry,owner){
 }
 function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
  const linked=keys.has(entry.key);
- return (!keys.size || linked) && (linked || entry.hiddenUntil<=Date.now()) &&
+ return (!keys.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
   matchesOwner(entry,owner) &&
   (!type || entry.type===type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
@@ -485,6 +445,8 @@ const view=createRecordTable({content:()=>content,single:true,
   reviewPlace(params);
   if(params.get('show')==='Waiting') params.set('show','all');
  },
+ persistLinkedTarget:true,
+ missingItem:()=> 'This review is no longer on the Review page.',
  resolveOwner:owner=>{
   const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>
    button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
@@ -520,7 +482,10 @@ const view=createRecordTable({content:()=>content,single:true,
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
    button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
   });
-  if(show!==requestedShow){requestedShow=show;queueMicrotask(()=>pageRefresh.refresh(true));}
+  if(show!==requestedShow){
+   requestedShow=show;
+   if(!entryJump) queueMicrotask(()=>pageRefresh.refresh(true));
+  }
  }
 });
 function updateTitleFallback(panel){
@@ -579,7 +544,7 @@ function bind(){
    const buttons=[...form.querySelectorAll('button')];
    buttons.forEach(button=>button.disabled=true);notice.textContent='';
    departures.set(key,{kind:'pending'});
-   view.startAction(row);
+   const submission=view.startAction(row);
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
@@ -589,12 +554,12 @@ function bind(){
      handed,
      state:handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
      hiddenUntil:outcome==='later' ? Date.parse(until) : 0});
-    view.opened.delete(key);
-    view.showActionResult(row,form.elements.row.value,'Saved: '+result.answer);
+    view.closeCard(key);
+    view.showActionResult(row,submission,form.elements.row.value,{kind:'success',message:'Saved: '+result.answer});
     if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
    }catch(error){
     departures.delete(key);
-    view.showActionResult(row,form.elements.row.value,'Not saved: '+error.message);
+    view.showActionResult(row,submission,form.elements.row.value,{kind:'failure',message:'Not saved: '+error.message});
     buttons.forEach(button=>button.disabled=false);
    }
    finally{
@@ -607,11 +572,9 @@ function bind(){
    event.preventDefault();
    const outcome=event.submitter.value;
    if(outcome==='later'){
-    const draft=parseLaterDraft(later.value);
-    if(!draft) return;
-    const at=laterEpoch(draft.date,draft.minutes);
+    const at=dateTimeDraftEpoch(content.dataset.zone,later.value);
     if(!(at>Date.now())) return;
-    closeLater(form.querySelector('[data-later-menu]'),false);
+    closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
     void send(outcome,new Date(at).toISOString());return;
    }
    void send(outcome,later.value);
@@ -619,174 +582,34 @@ function bind(){
   bindLater(form,until=>void send('later',until));
  });
 }
-// The Later menu: presets resolve in the user zone each time the menu opens.
-function zoneParts(epoch){
- const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:content.dataset.zone,hourCycle:'h23',
-  year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric'})
-  .formatToParts(epoch).map(part=>[part.type,Number(part.value)]));
- return parts;
-}
-function zoneEpoch(year,month,day,minutes){
- // Use both offsets near the wall time. Choose the earlier repeat or advance through a skipped hour.
- const wall=Date.UTC(year,month-1,day,0,minutes);
- const shownWall=epoch=>{const shown=zoneParts(epoch);
-  return Date.UTC(shown.year,shown.month-1,shown.day,shown.hour,shown.minute,shown.second);};
- const offsets=new Set([-86400000,0,86400000].map(delta=>shownWall(wall+delta)-(wall+delta)));
- const candidates=[...offsets].map(offset=>wall-offset),exact=candidates.filter(epoch=>shownWall(epoch)===wall);
- return exact.length ? Math.min(...exact) : Math.max(...candidates);
-}
-function parseLaterDraft(wall){
- const match=/^(\d{4}-\d{2}-\d{2})T([^T]+)$/.exec(wall);
- if(!match) return null;
- const [,day,clock]=match,minutes=laterMinutes(clock);
- if(!Number.isFinite(minutes)) return null;
- const date=new Date(day+'T00:00:00Z');
- if(!Number.isFinite(date.getTime()) || date.toISOString().slice(0,10)!==day) return null;
- return {date,minutes};
-}
-function laterEpoch(date,minutes){
- return zoneEpoch(date.getUTCFullYear(),date.getUTCMonth()+1,date.getUTCDate(),minutes);
-}
-function laterMinutes(value){
- const text=value.trim(),match=/^(\d{1,2}):(\d{2})$/.exec(text) || /^(\d{2})(\d{2})$/.exec(text);
- if(!match) return NaN;
- const hour=Number(match[1]),minute=Number(match[2]);
- return hour<24 && minute<60 ? hour*60+minute : NaN;
-}
-function laterClock(minutes){
- return String(Math.floor(minutes/60)).padStart(2,'0')+':'+String(minutes%60).padStart(2,'0');
-}
 function laterTimes(now){
- const settings=JSON.parse(content.dataset.later),today=zoneParts(now);
- const at=(days,minutes)=>zoneEpoch(today.year,today.month,today.day+days,minutes);
+ const settings=JSON.parse(content.dataset.later),today=zoneParts(content.dataset.zone,now);
+ const at=(days,minutes)=>zoneEpoch(content.dataset.zone,today.year,today.month,today.day+days,minutes);
  const weekday=new Date(Date.UTC(today.year,today.month-1,today.day)).getUTCDay();
  return {soon:now+settings.soon*60000,
   evening:today.hour*60+today.minute<settings.eveningUntil ? at(0,settings.evening) : 0,
   morning:at(1,settings.morning),week:at((settings.weekDay-weekday+7)%7 || 7,settings.weekTime)};
 }
-function closeLater(menu,focus){
- menu.hidden=true;menu.querySelector('[data-later-custom]').hidden=true;delete menu.dataset.choosing;
- const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
- if(focus) toggle.focus();
-}
 function bindLater(form,pick){
- const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
- const custom=menu.querySelector('[data-later-custom]'),items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
  const shown=new Intl.DateTimeFormat('en-US',{timeZone:content.dataset.zone,weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
- toggle.addEventListener('click',()=>{
-  if(!menu.hidden){closeLater(menu,true);return;}
+ const prepareMenu=menu=>{
   const times=laterTimes(Date.now());
   menu.querySelectorAll('[data-later-preset]').forEach(item=>{
    const at=times[item.dataset.laterPreset];item.hidden=!at;item.dataset.at=at ? String(at) : '';
    item.querySelector('small').textContent=at ? shown.format(at) : '';
   });
-  menu.hidden=false;toggle.setAttribute('aria-expanded','true');items()[0].focus();
- });
- menu.querySelectorAll('[data-later-preset]').forEach(item=>item.addEventListener('click',()=>{
+ };
+ form.querySelectorAll('[data-later-preset]').forEach(item=>item.addEventListener('click',()=>{
   // Resolve the time again at the click, so a menu left open does not send a stale time.
   const at=laterTimes(Date.now())[item.dataset.laterPreset] || Number(item.dataset.at);
-  closeLater(menu,false);pick(new Date(at).toISOString());
+  closeDateTimePicker(form.querySelector('[data-later-menu]'),false);pick(new Date(at).toISOString());
  }));
- const grid=custom.querySelector('[data-later-grid]'),time=custom.querySelector('[data-later-time]');
- const save=custom.querySelector('[value="later"]'),month=custom.querySelector('[data-later-month]');
- const dayText=date=>date.toISOString().slice(0,10);
- const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
- const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
- const summary=new Intl.DateTimeFormat('en-GB',{timeZone:content.dataset.zone,weekday:'short',day:'numeric',month:'short'});
- let selected=new Date(),display=new Date();
- const today=()=>{const now=zoneParts(Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
- const update=(normalize=false)=>{
-  const minutes=laterMinutes(time.value),valid=Number.isFinite(minutes);
-  const clock=valid ? laterClock(minutes) : '';
-  time.setAttribute('aria-invalid',String(!valid));
-  if(valid && normalize) time.value=clock;
-  form.elements.later.value=valid ? dayText(selected)+'T'+clock : '';
-  form.elements.later.dispatchEvent(new Event('input',{bubbles:true}));
-  const at=valid ? laterEpoch(selected,minutes) : NaN;
-  const resolved=Number.isFinite(at) ? zoneParts(at) : null;
-  custom.querySelector('[data-later-summary]').textContent=resolved ? 'Hides until '+summary.format(at)+' '+
-   laterClock(resolved.hour*60+resolved.minute) : 'Choose a time';
-  save.disabled=!(at>Date.now());
- };
- const draw=()=>{
-  month.textContent=monthText.format(display);grid.replaceChildren();
-  grid.setAttribute('aria-label',month.textContent);
-  const header=document.createElement('div');header.setAttribute('role','row');
-  ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'].forEach(day=>{
-   const cell=document.createElement('span');cell.setAttribute('role','columnheader');cell.setAttribute('aria-label',day);
-   cell.textContent=day[0];header.append(cell);
-  });grid.append(header);
-  const first=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth(),1));
-  const count=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+1,0)).getUTCDate();
-  let row;
-  for(let cell=0;cell<first.getUTCDay()+count;cell++){
-   if(cell%7===0){row=document.createElement('div');row.setAttribute('role','row');grid.append(row);}
-   const day=cell-first.getUTCDay()+1;
-   if(day<1){const blank=document.createElement('span');blank.setAttribute('role','gridcell');row.append(blank);continue;}
-   const date=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth(),day)),button=document.createElement('button');
-   button.type='button';button.setAttribute('role','gridcell');button.textContent=day;
-   button.dataset.date=dayText(date);button.setAttribute('aria-label',dayLabel.format(date));
-   button.setAttribute('aria-selected',String(dayText(date)===dayText(selected)));
-   button.tabIndex=dayText(date)===dayText(selected) ? 0 : -1;button.disabled=date<today();
-   if(dayText(date)===dayText(today())) button.setAttribute('aria-current','date');
-   button.addEventListener('click',()=>{selected=date;draw();grid.querySelector('[tabindex="0"]').focus();});row.append(button);
-  }
-  update();
- };
- menu.querySelector('[data-later-choose]').addEventListener('click',()=>{
-  const draft=parseLaterDraft(form.elements.later.value);
-  if(draft && laterEpoch(draft.date,draft.minutes)>Date.now()){
-   selected=draft.date;time.value=laterClock(draft.minutes);
-  }else{
-   selected=today();selected.setUTCDate(selected.getUTCDate()+1);
-   time.value=laterClock(JSON.parse(content.dataset.later).morning);
-  }
-  display=new Date(selected);
-  custom.hidden=false;menu.dataset.choosing='true';draw();grid.querySelector('[tabindex="0"]').focus();
- });
- custom.querySelectorAll('[data-later-month-step]').forEach(button=>button.addEventListener('click',()=>{
-  display=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+Number(button.dataset.laterMonthStep),1));
-  draw();
- }));
- time.addEventListener('input',()=>update());
- time.addEventListener('blur',()=>update(true));
- time.addEventListener('keydown',event=>{
-  const step={ArrowUp:15,ArrowDown:-15}[event.key];
-  if(step===undefined) return;
-  event.preventDefault();
-  const minutes=laterMinutes(time.value);
-  if(!Number.isFinite(minutes)) return;
-  time.value=laterClock((minutes+step+1440)%1440);update();
- });
- grid.addEventListener('keydown',event=>{
-  const days={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];
-  if(days===undefined) return;
-  event.preventDefault();const date=new Date(selected);date.setUTCDate(date.getUTCDate()+days);
-  if(date<today()) return;
-  selected=date;display=new Date(date);draw();grid.querySelector('[tabindex="0"]').focus();
- });
- menu.addEventListener('keydown',event=>{
-  if(event.key==='Escape'){event.preventDefault();closeLater(menu,true);return;}
-  if(custom.contains(event.target)){
-   if(event.key==='Enter'){
-    event.preventDefault();update(true);if(!save.disabled) form.requestSubmit(save);
-   }
-   return;
-  }
-  const list=items(),index=list.indexOf(document.activeElement);
-  const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
-  if(next===undefined) return;
-  event.preventDefault();list[next%list.length].focus();
- });
+ bindDateTimePicker(form,{zone:content.dataset.zone,defaultMinutes:()=>JSON.parse(content.dataset.later).morning,
+  summaryPrefix:'Hides until ',prepareMenu});
 }
-document.addEventListener('pointerdown',event=>{
- content.querySelectorAll('[data-later-menu]:not([hidden])').forEach(menu=>{
-  if(!menu.parentElement.contains(event.target)) closeLater(menu,false);
- });
-});
 async function refresh(_supersede=false,current=()=>true){
  // An open Later menu holds the page, so a refresh does not close it under the pointer.
- if(saving || [...content.querySelectorAll('[data-later-menu]:not([hidden])')].some(menu=>menu.getClientRects().length)) return;
+ if(saving || dateTimePickerOpen(content)) return;
  const show=selectedShow;
  const response=await fetch(location.pathname+'?'+new URLSearchParams({show}),{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
@@ -815,7 +638,11 @@ async function refresh(_supersede=false,current=()=>true){
  }else restoreFocus();
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
-view.place();bind();view.apply();
+view.place();
+if(entryJump) view.jump(entryJump,{pushPlace:false});
+bind();
+if(entryJump) entryJump=null;
+else view.apply();
 addEventListener('hashchange',()=>{
  const item=new URLSearchParams(location.hash.slice(1)).get('item'),departure=departures.get(item);
  if(departure?.kind==='saved' && departure.outcome==='later') departures.delete(item);

@@ -273,6 +273,26 @@ class ReviewTextTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(change_browser.answer_html(text), expected)
 
+        command = "git log --grep='Choices: <subject>'"
+        command_line = f"On natedev:\n`{command}`"
+        block = ('<div class="code-block"><pre><code>' + html.escape(command)
+                 + '</code></pre>' + page_frame.COPY_BUTTON + '</div>')
+        for section, question in (
+            ("lead", command_line),
+            ("after items", "1. Read the title.\n2. Check the log.\n\n" + command_line),
+            ("choices", "Choices: " + command_line + "\nOr read the log."),
+        ):
+            with self.subTest(section=section):
+                item = update_registration.OutstandingItem(
+                    since="now", text="What does the log show?", question="What does the log show?\n\n" + question)
+                body, _ = change_browser.question_parts(item)
+                self.assertIn(block, body)
+        title = "What does the log show?"
+        item = update_registration.OutstandingItem(since="now", text=title,
+            parts=update_registration.QuestionParts(ask=title, context=command_line, items=[], choices=[], recommend=""))
+        self.assertEqual(change_browser.question_parts(item), ('<h2>Context</h2><p>On natedev:</p>' + block, ""))
+        self.assertIn(block, change_page.review_text_html(command_line, inline=True))
+
     def test_shared_inline_markdown_renders_bold_headings_and_lists(self) -> None:
         text = '## Heading\n**Field:** <script> & ready\n- **Owner:** morty\n1. **Next:** `run`'
         expected = ('<h2>Heading</h2><p><strong>Field:</strong> &lt;script&gt; &amp; ready</p>'
