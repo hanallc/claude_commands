@@ -27,6 +27,7 @@ def write_lifecycle_configuration(path: Path) -> None:
 enabled=on
 region=us-east-2
 instance_type=m7a.2xlarge
+fallback_instance_types=c7a.4xlarge,m7i.4xlarge,m6a.4xlarge
 spot_max_usd_per_hour=0.15
 daily_budget_usd=6
 gp3_usd_per_gib_month=0.08
