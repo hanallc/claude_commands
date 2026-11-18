@@ -293,6 +293,17 @@ class HoldEnforcerTests(unittest.TestCase):
     def table(self) -> dict[int, build_hold.AuditProcess]:
         return hold_enforcer.read_processes(self.proc, self.uid, self.root / "cgroup")
 
+    def write_detached_run(self, path: Path, *, command_started: bool) -> None:
+        record: detached_runs.RunRecord = {
+            "run_id": path.stem, "status": "running", "session_dir": str(self.root),
+            "worker": "gate-owner", "staff_id": "", "label": "fixture gate",
+            "command": ["bash", "verify.sh", "check"], "log": str(path.with_suffix(".log")),
+            "started_at": 100.0, "pid": 100, "director_dir": "", "done_message_file": "",
+        }
+        if command_started:
+            record.update(command_group=10, command_started="11000")
+        _ = path.write_text(json.dumps(record))
+
     def decisions(self, enforcer_pid: int = 999) -> tuple[hold_enforcer.BuildDecision, ...]:
         return hold_enforcer.decide_builds(self.table(), build_hold.natedev_holds(self.holders).in_force,
                                           self.uid, enforcer_pid, self.claimed)
@@ -749,8 +760,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", str(record)))
                 # The command leads its own group; a record without one has not started its command.
-                command = {} if outcome == "no command group" else {"command_group": 10, "command_started": "11000"}
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running", **command}))
+                self.write_detached_run(record, command_started=outcome != "no command group")
                 _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
                 table = self.table()
                 classified = hold_enforcer.classify_drain_runs(table, frozenset(), build_hold.LiveClaims(frozenset()))
@@ -898,8 +908,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", argument))
                 table = self.table()
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running",
-                                                  "command_group": 10, "command_started": "11000"}))
+                self.write_detached_run(record, command_started=True)
                 signals: list[tuple[int, int]] = []
                 inspected: list[int] = []
 

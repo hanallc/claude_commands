@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import IO, Literal, NotRequired, TypedDict, cast, override
+from typing import IO, Literal, NotRequired, TypedDict, TypeGuard, cast, override
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
@@ -185,24 +185,40 @@ def record_lock(path: Path) -> Generator[None]:
 
 def _write_record(path: Path, record: RunRecord) -> RunRecord:
     with record_lock(path):
-        current = worker_lifecycle.read_json_object(path)
+        current = _read_record(path)
+        if current["run_id"] != record["run_id"]:
+            raise SystemExit(f"detached_runs: {path} no longer holds run {record['run_id']}")
         fields: dict[str, object] = {**current, **record}
-        if current.get("status") == "finished" and record["status"] == "running":
+        if current["status"] == "finished" and record["status"] == "running":
             fields.update(current)
-        if current:
-            if "stop_reason" in current:
-                fields["stop_reason"] = current["stop_reason"]
-            else:
-                _ = fields.pop("stop_reason", "")
+        if "stop_reason" in current:
+            fields["stop_reason"] = current["stop_reason"]
+        else:
+            _ = fields.pop("stop_reason", "")
         write_text_atomic(path, json.dumps(fields, indent=2, sort_keys=True))
         return cast(RunRecord, cast(object, fields))
 
 
+def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
+    match raw:
+        case {
+            "run_id": str(run_id), "status": "running" | "finished", "session_dir": str(),
+            "worker": str(), "staff_id": str(), "label": str(), "command": list(),
+            "log": str(), "started_at": int() | float(), "pid": int(),
+            "director_dir": str(), "done_message_file": str(),
+        }:
+            return (bool(run_id) and not isinstance(raw["started_at"], bool)
+                    and not isinstance(raw["pid"], bool)
+                    and all(isinstance(arg, str) for arg in cast(list[object], raw["command"])))
+        case _:
+            return False
+
+
 def _read_record(path: Path) -> RunRecord:
     raw = worker_lifecycle.read_json_object(path)
-    if not raw.get("run_id") or not isinstance(raw.get("command"), list):
+    if not _is_run_record(raw):
         raise SystemExit(f"detached_runs: {path} is not a run record")
-    return cast(RunRecord, cast(object, raw))
+    return raw
 
 
 def stop_with_reason(
@@ -211,7 +227,7 @@ def stop_with_reason(
     """Save the reason and complete the stop decision under one record lock."""
     with record_lock(path):
         record = worker_lifecycle.read_json_object(path)
-        if not record.get("run_id"):
+        if not _is_run_record(record):
             return False
         record["stop_reason"] = reason
         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
@@ -723,7 +739,7 @@ def command_start(args: argparse.Namespace) -> int:
                 "log": str(log_path), "started_at": time.time(), "pid": 0,
                 "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
             }
-            _ = _write_record(record_path, record)
+            write_text_atomic(record_path, json.dumps(record, indent=2, sort_keys=True))
             with log_path.open("ab") as log:
                 supervisor = subprocess.Popen(
                     [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(__file__).resolve()), "supervise", str(record_path)],
@@ -1041,7 +1057,7 @@ def command_supervisor_gone(args: argparse.Namespace) -> int:
     if _group_is_live(command.group):
         with record_lock(path):
             record = worker_lifecycle.read_json_object(path)
-            if record.get("status") != "running":
+            if not _is_run_record(record) or record["status"] != "running":
                 return 0
             _ = record.setdefault("stop_reason", SUPERVISOR_GONE_REASON)
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))

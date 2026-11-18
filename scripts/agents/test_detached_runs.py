@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, current_thread
 from types import SimpleNamespace
-from typing import Literal, cast, override
+from typing import IO, Literal, cast, override
 from unittest.mock import MagicMock, patch
 
 from scripts.build_hold.owning_session import NoOwningSession
@@ -567,6 +567,40 @@ class DetachedRunsTests(unittest.TestCase):
         self.assertEqual(detached_runs.prune_finished(runs), ["in-pass"])
         self.assertEqual(detached_runs.prune_finished(self.session / "absent"), [])
 
+        with self.subTest(held_record_lock=True):
+            path = self.finished_run("locked")
+            lock_inode = path.with_suffix(".record.lock").stat().st_ino
+            guard = LauncherHangGuard("pruning a locked record")
+            checked, blocked = Event(), Event()
+            flock = fcntl.flock
+
+            def observe_flock(descriptor: int | IO[str], operation: int) -> None:
+                fd = descriptor if isinstance(descriptor, int) else descriptor.fileno()
+                if os.fstat(fd).st_ino == lock_inode:
+                    try:
+                        flock(descriptor, operation | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        blocked.set()
+                        checked.set()
+                    else:
+                        return
+                flock(descriptor, operation)
+
+            def prune() -> list[str]:
+                try:
+                    return detached_runs.prune_finished(runs)
+                finally:
+                    checked.set()
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with detached_runs.record_lock(path), patch.object(fcntl, "flock", side_effect=observe_flock):
+                    worker = executor.submit(prune)
+                    guard.event(checked)
+                    self.assertTrue(blocked.is_set())
+                    self.assertTrue(path.is_file())
+                self.assertEqual(guard.result(worker), [path.stem])
+            self.assertFalse(path.exists())
+
     def test_a_start_deletes_the_owners_earlier_finished_runs(self) -> None:
         _ = self.finished_run("director-done", worker="director", staff_id="")
         _ = self.start(["new-check"], to="director")
@@ -1082,13 +1116,43 @@ sys.exit(status)
                 send.assert_not_called()
                 self.assertNotIn("stop_reason", cast(dict[str, object], json.loads(path.read_text())))
 
-    def test_stop_does_not_recreate_a_pruned_record(self) -> None:
-        path = self.finished_run("pruned-before-stop")
-        self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
-        with patch.object(process_group, "send_process_group") as send:
-            self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
-        send.assert_not_called()
-        self.assertFalse(path.exists())
+    def test_updates_do_not_write_missing_or_invalid_records(self) -> None:
+        with self.subTest(update="stop after prune"):
+            path = self.finished_run("pruned-before-stop")
+            self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+            with patch.object(process_group, "send_process_group") as send:
+                self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
+            send.assert_not_called()
+            self.assertFalse(path.exists())
+
+        with self.subTest(update="stop on a partial record"):
+            path = self.record(["true"])
+            partial = json.dumps({"run_id": path.stem})
+            write_text_atomic(path, partial)
+            with (patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
+                  patch.object(process_group, "send_process_group") as send):
+                self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
+            write.assert_not_called()
+            send.assert_not_called()
+            self.assertEqual(path.read_text(), partial)
+
+        with self.subTest(update="delivery after prune"):
+            path = self.finished_run("pruned-before-delivery-write")
+            record_lock = detached_runs.record_lock
+
+            @contextlib.contextmanager
+            def prune_then_lock(path: Path) -> Generator[None]:
+                with patch.object(detached_runs, "record_lock", record_lock):
+                    self.assertEqual(detached_runs.prune_finished(path.parent), [path.stem])
+                with record_lock(path):
+                    yield
+
+            with (patch.object(detached_runs, "record_lock", side_effect=prune_then_lock),
+                  self.assertRaisesRegex(SystemExit, "is not a run record")):
+                _ = deliver_in_fixture(path)
+            self.assertEqual(len(self.sent), 1)
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_suffix(".log").exists())
 
     def test_command_receives_the_recorded_staff_owner_without_a_session_environment(self) -> None:
         command = [sys.executable, "-c", "import os; print(os.environ['BUILDLOG_OWNER_STAFF_ID'])"]
