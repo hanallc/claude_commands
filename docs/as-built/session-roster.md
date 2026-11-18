@@ -334,6 +334,8 @@ The routing fields stay in the wire entry.
 A delivery starts with `<name>: <summary>`. The client removes a leading `send.py in ` from the sender name.
 The next line is `Sender native id: <id>`, followed by `Shown sender: <display name>` when needed.
 The metadata ends with `Tag: <tag8>`. The tag is the first eight characters of the entry ID.
+Line breaks in the name, summary and shown sender become spaces, so each metadata field is one line and the header has a fixed form.
+The recipient's UI still shows `Message from @postmaster:` before the delivery, because the engine send call has no sender field.
 A blank line separates the metadata from the original text.
 Distinct tags prevent the recipient's repeat-text filter from dropping equal messages.
 
@@ -398,6 +400,7 @@ The handler also records and consumes replies to script senders with no destinat
 Other events and handler failures pass to `next(e)`.
 
 A forward has the form `<name> (answer to <answerTo>): <body>`, followed by a blank line and `Tag: <at_ms>-<n>`.
+`progress_history.py` reads the key from the final `Tag:` line and matches the forward against the text that `PostmasterReplyRecord.matches_forward()` rebuilds from the reply record. A sender name can contain `): `, so the reader never splits the forward at that text. The reader does not accept the earlier forward format.
 With several senders, `<answerTo>` has the form `one of <a>, <b>`.
 Each forward has a new tag. The recipient answers the sender named in the text.
 The mod registers the route before the outbox send returns so it can recognize an early reply.
