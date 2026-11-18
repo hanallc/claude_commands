@@ -2766,13 +2766,15 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 147 — Build queue and Mac tests write their own build_targets.conf  · status: done
 
-Builds assigned this on 11-18 (reported by accounts via natedev on main ce7733f59). `scripts/build_queue/test_target_availability.py` and `scripts/mac_test/test_offload_lifecycle.py` fail when the scratch home has no `build_targets.conf`: they read the live config. Rule: a test writes its own fixture config and never reads live or tunable config.
+#### As-built
 
-1. Reproduce first and name the exact condition. Tonight's merge gates passed.
-2. Repair both modules with a fixture config.
-3. Search `scripts/build_queue` and `scripts/mac_test` for other tests that read `build_targets.conf` from the home, and repair them the same way.
+- Cause: with `CONF_DIR` unset, `test_target_availability` and `test_offload_lifecycle` read `build_targets.conf` from the private test home and failed with `conf.Unusable` when it had none. The merge gate passed because `gate_box.py` links the checkout `config` into its home.
+- Each Mac route test and the pending-dispatch lifecycle test write a private target registry and set `CONF_DIR` (and `MAC_TEST_STATE_DIR`) for that test only.
+- `write_mac_target_registry` in `offload_test_support.py` writes the whole Mac registry (`targets`, `kind.mac`, `platform.mac`, `settings.mac`) with no merge of the tunable template. The command fixture and the cleanup-leftovers test use it, so a host override in the template cannot change them.
+- 267 tests pass in 4 layouts (empty home, normal, empty `CONF_DIR`, `~/.claude` only), and with host overrides in a template copy.
+- Checkpoint `410ad2e47`.
 
-**Files:** to be named by the work order.
+**Files:** `scripts/build_queue/test_target_availability.py`, `scripts/mac_test/test_offload_lifecycle.py`, `scripts/mac_test/offload_test_support.py`, `scripts/mac_test/test_offload_cleanup_leftovers.py`.
 
 ### Phase 148 — The warm-seed tests start no real Cargo  · status: done
 
