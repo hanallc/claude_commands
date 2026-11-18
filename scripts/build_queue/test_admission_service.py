@@ -43,6 +43,7 @@ from scripts.build_hold import override_guard
 
 from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
+from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_send
@@ -808,6 +809,36 @@ class EndedPlacementPruneTests(unittest.TestCase):
             self.assertEqual(set(service.read_state(fixture.state_dir).placement_requests), kept)
 
 
+class ProcessTextTests(unittest.TestCase):
+    def test_process_names_with_invalid_utf8_preserve_memory_readings(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            _ = only_admitted(fixture.server.handle_request(request))
+            record = fixture.server.reservations[request.episode]
+            row = service.reservation_row(record)
+            proc = fixture.proc.path
+            pid = request.owner.pid
+            directory = proc / str(pid)
+            write_process(proc, pid, 8 * 1024, start=request.owner.start_time, anonymous=5 * 1024, swap=3 * 1024)
+            status = directory / "status"
+            memory_fields = status.read_bytes()
+            for field in ("status", "comm"):
+                with self.subTest(field=field):
+                    name = b"verify\xff" if field == "status" else b"rustc\xff"
+                    _ = status.write_bytes(b"Name:\t" + (name if field == "status" else b"verify")
+                                           + b"\nUid:\t1234\n" + memory_fields)
+                    _ = (directory / "comm").write_bytes((name if field == "comm" else b"verify") + b"\n")
+                    reading = service.raw_reservation_memory(record, row, gate.LiveOwnerProcess(),
+                                                            gate.process_table(proc), proc)
+                    assert isinstance(reading, records.MeasuredMemory)
+                    self.assertEqual(reading.bytes, 8 * 1024)
+                    self.assertEqual(reading.anonymous, records.AnonymousRunUse(5 * 1024))
+                    self.assertEqual(reading.swap_bytes, 3 * 1024)
+                    self.assertEqual(service.process_uid(pid, proc), 1234)
+                    self.assertEqual(gate.member_programs([pid], proc),
+                                     {pid: "rustc\ufffd" if field == "comm" else "verify"})
+
+
 class ImportTests(unittest.TestCase):
     def test_clean_import_omits_cli_and_reading_alert_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1050,8 +1081,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 read_transport.reset_mock()
                 _ = fixture.run_pass()
                 self.assertEqual((settings_opens(), read_transport.call_count), first_counts)
-                # The transport selector reads the file separately.
-                self.assertEqual(first_counts, (2, 1))
+                self.assertEqual(first_counts, (1, 1))
                 current = fixture.server.placement_host_keys[(request.episode, destination)]
                 self.assertNotEqual(current.configuration_generation, first.configuration_generation)
                 self.assertEqual(fixture.server.host_readers[current].timeout, 4)
@@ -2565,6 +2595,48 @@ class WaitHolderServiceTests(unittest.TestCase):
                 self.assertTrue(waits)
                 self.assertEqual(waits[-1].snapshot.holder, records.SessionHolder("gap-session", "gap-worker"))
 
+    def test_gate_hold_keeps_the_admitted_job_after_restart_and_command_loss(self) -> None:
+        job = StepJob("test-all")
+        for source, expected in (("request", "test-all"), ("process", "test-all"),
+                                 ("process with invalid stat", "test-all"), ("old record", "merge-gate")):
+            with self.subTest(source=source), AdmissionFixture() as fixture:
+                run = fixture.run_owner()
+                request = fixture.request(step="merge-gate", run=run)
+                cmdline = fixture.proc.path / str(request.owner.pid) / "cmdline"
+                argv = ("python3", "copies.py", "run", "--repo", str(fixture.root), "--",
+                        "python3", "merge_gate.py", "--tests-only", "--full")
+                if source == "request":
+                    request = replace(request, identity=replace(request.identity, job=job))
+                else:
+                    _ = cmdline.write_bytes(b"\0".join(map(os.fsencode, argv)) + b"\0")
+                if source == "process with invalid stat":
+                    stat = cmdline.with_name("stat")
+                    name, separator, fields = stat.read_bytes().partition(b") ")
+                    _ = stat.write_bytes(name + b"\xff" + separator + fields)
+                with fixture.loop_turn():
+                    granted = only_admitted(fixture.server.handle_request(request))
+                cmdline.unlink(missing_ok=True)
+                if source == "old record":
+                    path = fixture.state_dir / "state.json"
+                    state = cast(dict[str, object], json.loads(path.read_text()))
+                    reservations = cast(dict[str, dict[str, object]], state["reservations"])
+                    del reservations[request.episode]["gate_job"]
+                    _ = path.write_text(json.dumps(state))
+                fixture.restart()
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                running, = [step for step in reply.reading.view.running if step.pid == request.owner.pid]
+                expected_job = GateJobNotRecorded() if source == "old record" else job
+                self.assertEqual(running.job, expected_job)
+                fixture.release(granted)
+                hold, = fixture.server.slots.values()
+                assert isinstance(hold, records.BetweenStepsSlot)
+                assert isinstance(hold.identity, records.EndedStepFacts)
+                self.assertEqual(hold.identity.step, expected)
+                self.assertEqual(hold.identity.job, expected_job)
+                self.assertEqual(wire.parse_record(wire.encode_record(hold), records.BetweenStepsSlot), hold)
+
     def test_a_released_unit_steps_held_slot_keeps_its_unit_without_a_session(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
@@ -3478,6 +3550,7 @@ class CloudAdmissionTests(unittest.TestCase):
     def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
+            fixture.configure(cloud_gate_slots=9)
             requests = [self.cloud_request(fixture) for _ in range(11)]
             grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:9]]
             for request in requests[9:]:
@@ -7270,6 +7343,17 @@ class RunPlaceTests(unittest.TestCase):
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
+    def test_invalid_remote_start_hold_is_refused_during_configuration_read(self) -> None:
+        for value in (None, "invalid", "86401"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_memory_config(root / "build_admission.conf", remote_start_hold_seconds=value)
+                with AdmissionFixture(root=root) as fixture:
+                    reply, = fixture.connect(wire.ViewRequest()).replies()
+                    self.assertIsInstance(reply, wire.Refused)
+                    assert isinstance(reply, wire.Refused)
+                    self.assertIn("remote_start_hold_seconds", reply.reason)
+
     def test_slow_requests_log_wall_cpu_and_kind_but_fast_requests_do_not(self) -> None:
         for slow_configuration in (False, True):
             with self.subTest(slow_configuration=slow_configuration), AdmissionFixture() as fixture:

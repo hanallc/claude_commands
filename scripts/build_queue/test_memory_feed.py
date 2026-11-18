@@ -31,7 +31,7 @@ from scripts.buildlog import charts, cost_actions, costs, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
-from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
+from scripts.build_queue.slot_wait import NoNamedStep, SlotCaller, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
@@ -42,9 +42,11 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
-from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepJob, command_job, read_step_names
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.production import staff
+from scripts.production.merge_gate import SuiteMode
 from scripts.review_links import staff_names
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
@@ -353,7 +355,8 @@ class MemoryFeedTests(unittest.TestCase):
         self.configuration = self.root / "memory_feed.conf"
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
-            + "names.integrate=integrate\nnames.merge-gate=merge gate\nnames.targeted-test=targeted test\nnames.test=test\n"
+            + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
+            + "names.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
             + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
             + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
             + "owned.showrunner-default=showrunner {step}\nowned.showrunner-merge-gate=showrunner merge\n")
@@ -1303,13 +1306,20 @@ process.stdout.write(JSON.stringify({
         queued = replace(queued, measured=replace(memory, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
         reads: Counter[Path] = Counter()
         original = Path.read_text
+        original_bytes = Path.read_bytes
 
         def read(path: Path) -> str:
             reads[path] += 1
             return original(path)
 
+        def read_bytes(path: Path) -> bytes:
+            if path == self.root / "proc/meminfo":
+                reads[path] += 1
+            return original_bytes(path)
+
         names = read_step_names()
-        with mock.patch.object(Path, "read_text", new=read):
+        with (mock.patch.object(Path, "read_text", new=read),
+              mock.patch.object(Path, "read_bytes", new=read_bytes)):
             swap = memory_feed.read_swap((queued, queued), {}, 6, names)
         assert isinstance(swap, memory_feed.SwapReading)
         rows = {row["name"]: row for row in swap.rows}
@@ -1936,7 +1946,7 @@ process.stdout.write(JSON.stringify({
                 with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(slot,))):
                     page = memory_feed.reading()
                 self.assertEqual([row["name"] for row in page["waiters"]],
-                                 [*names, "fixture-project check", "targeted test"])
+                                 [*names, "fixture-project check", "route-two"])
 
     def test_blank_or_unrelated_configured_name_uses_the_verb(self) -> None:
         for text in ("", "umask"):
@@ -2431,6 +2441,144 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
             return memory_feed.reading()
 
+    def gate_job_page(self, step: str, argv: tuple[str, ...], *,
+                      running_pid: int | admission_records.PidNotRecorded = 700000,
+                      showrunner: bool = False, unit_known: bool = True,
+                      job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+                      ) -> memory_feed.MemoryPage:
+        """Render the same gate mode on both machines and in both tables."""
+        config = Path(__file__).resolve().parents[2] / "config" / "build_steps.conf"
+        _ = shutil.copyfile(config, self.root / "build_steps.conf")
+        base = with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110))
+        running = replace(base.view.running[0], step=step, pid=running_pid, job=job)
+        waiting = replace(base.view.waiting[0], step=step, job=job)
+        reading = cloud_reading(replace(base, view=replace(base.view, running=(running,), waiting=(waiting,)),
+            explanation=replace(base.explanation, running=(replace(base.explanation.running[0], step=running),))))
+        rows = tuple(replace(row, identity=replace(row.identity, step=step, job=job)) for row in reading.cloud)
+        for pid, start in ((running.pid, ""), (waiting.pid, ""), *((row.owner.pid, row.owner.start_time) for row in rows)):
+            if isinstance(pid, int):
+                process = self.root / "proc" / str(pid)
+                cmdline = process / "cmdline"
+                if argv:
+                    write_process(process.parent, pid, start=start or str(pid))
+                    _ = cmdline.write_bytes(("\0".join(argv) + "\0").encode())
+                else:
+                    cmdline.unlink(missing_ok=True)
+        owner = (unit_labels.make_labels("sdlc", unit_labels.RunsProduction("sdlc"), unit_labels.NoDirector())
+                 if showrunner else unit_labels.make_labels("impl", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                                            unit_labels.UnderDirector("devtools", "devtools", "")))
+        labels = {session: owner for session in
+                  (running.session_id, waiting.session_id, *(row.identity.session_id for row in rows))} if unit_known else {}
+        with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+            return memory_feed.reading()
+
+    def test_gate_modes_and_jobs_show_approved_names_on_local_and_cloud_rows(self) -> None:
+        approved = {"integrate", "test all", "test named", "test affected", "test nightly", "fast track",
+                    "promote", "CI", "toolchain trial"}
+        modes = {mode.value for mode in SuiteMode}
+        self.assertEqual(modes, memory_feed.GATE_STEPS)
+        for mode in sorted(modes):
+            program = mode.replace("-", "_") + ".py"
+            cases = ((), ("--full",), ("--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
+                ("--unit", "devtools", "--merge-branch", "sdlc"),
+                ("--tests-only", "--full"), ("--tests-only", "--module", "test_sample"),
+                ("--nightly", "--merge-branch", "sdlc"), ("--promote-only",))
+            for arguments in (*cases, memory_feed.CommandUnreadable("missing cmdline"), admission_records.PidNotRecorded()):
+                with self.subTest(mode=mode, arguments=arguments):
+                    argv = ("python3", program, *arguments) if isinstance(arguments, tuple) else ()
+                    page = self.gate_job_page(mode, argv,
+                        running_pid=arguments if isinstance(arguments, admission_records.PidNotRecorded) else 700000)
+                    job = command_job(argv)
+                    names = read_step_names()
+                    named = names.shown(job.step) if isinstance(job, StepJob) else ""
+                    if argv:
+                        self.assertIn(named, approved)
+                    local_run, = [row for row in page["walk"] if row.get("queued")]
+                    cloud_run, = [row for row in page["walk"] if row.get("kind") == "cloud"]
+                    local_wait, = [row for row in page["waiters"] if not row.get("kind")]
+                    cloud_wait, = [row for row in page["waiters"] if row.get("kind") == "cloud"]
+                    for row in (local_run, cloud_run, local_wait, cloud_wait):
+                        self.assertEqual(row["name"], "devtools " + named if named else "devtools")
+                        self.assertEqual(row["title"]["step"], named or "devtools")
+                        self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
+                        about = names.about(job, "devtools") if isinstance(job, StepJob) else ""
+                        self.assertEqual(row.get("about", ""), about)
+                        self.assertEqual(row.get("changes", ""), names.changes(job) if isinstance(job, StepJob) and about else "")
+
+        copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
+                  "python3", "/repo/scripts/production/merge_gate.py", "--tests-only", "--full")
+        page = self.gate_job_page("merge-gate", copied)
+        local, = [row for row in page["walk"] if row.get("queued")]
+        waiting, = [row for row in page["waiters"] if not row.get("kind")]
+        for row in (local, waiting):
+            self.assertIn(row["title"]["step"], approved)
+            self.assertEqual(row["name"], "devtools test all")
+            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+
+        page = self.gate_job_page("merge-gate", (), job=StepJob("test-all"))
+        local, = [row for row in page["walk"] if row.get("queued")]
+        waiting, = [row for row in page["waiters"] if not row.get("kind")]
+        for row in (local, waiting):
+            self.assertEqual(row["name"], "devtools test all")
+            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+
+        source = Path("/repo/devtools")
+        caller = SlotCaller("director", "sdlc", source, copied[6:], "test-all")
+        self.assertEqual(caller.step, "test-all")
+        for step in ("merge_gate.py", "test-all"):
+            slot, = self.copies_slot_page(" ".join(caller.command), source=str(source),
+                worktree_owner="devtools", recorded_step=step)["waiters"]
+            self.assertIn(slot["title"]["step"], approved)
+            self.assertEqual(slot["name"], "test all")
+
+        base = captured_reading()
+        inputs = base.explanation.decided_from
+        policy = admission_policy_fixture()
+        owner = staff.StaffRow(staff.StaffId("director"), "unit", "devtools", staff.StaffRoot(),
+                               current_session=staff.StaffId("director-session"))
+        for step, expected in (("test-all", "test all"), ("merge-gate", "devtools")):
+            with self.subTest(ended_step=step):
+                run = LiveBuildRun(101, "101", inputs.now - 15)
+                reservation = memory_tests.ProgressKeepAsideTests.reservation(step, need=admission_records.GIB)
+                reservation.update(run_origin=admission_records.CallerRun(run), slot_staff=owner.id)
+                hold = gate.ended_step_slot(reservation, inputs.now, policy)
+                assert isinstance(hold, admission_records.BetweenStepsSlot)
+                reading = gate.queue_read_from(replace(inputs, slots=(hold,)), policy)
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,)))):
+                    held, = memory_feed.reading()["walk"]
+                self.assertEqual(held["name"], expected)
+                self.assertEqual(held["unit"], "devtools")
+
+        from scripts.aws_target.aws_trial import PAIRED_TRIAL_JOB
+
+        for unit_known, name, about in (
+            (True, "devtools test named", "Tests 1 named modules of devtools."),
+            (False, "test named", "Tests 1 named modules."),
+        ):
+            with self.subTest(paired_trial_unit_known=unit_known):
+                trial = self.gate_job_page(PAIRED_TRIAL_JOB.step, (), unit_known=unit_known, job=PAIRED_TRIAL_JOB)
+                for rows in (trial["walk"], trial["waiters"]):
+                    row, = [row for row in rows if row.get("kind") == "cloud"]
+                    self.assertIn(row["title"]["step"], approved)
+                    self.assertEqual(row["name"], name)
+                    self.assertEqual(row.get("about"), about)
+                    self.assertEqual(staff_names.parts_text(row.get("about_parts", [])), about)
+                    self.assertEqual(row.get("changes"), "no branch")
+
+        integration = self.gate_job_page("merge-gate", ("python3", "merge_gate.py"), showrunner=True)
+        for rows in (integration["walk"], integration["waiters"]):
+            row, = [row for row in rows if row.get("kind") == "cloud"]
+            self.assertEqual(row["name"], "showrunner integrate")
+
+    def test_cloud_full_tests_use_the_test_all_name_and_description(self) -> None:
+        page = self.gate_job_page("merge-gate", ("python3", "scripts/production/merge_gate.py", "--tests-only", "--full"))
+        row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
+        self.assertEqual(row["name"], "devtools test all")
+        self.assertEqual(row.get("about"), "Tests every module of devtools.")
+        self.assertEqual(row.get("changes"), "no branch")
+
     def owner_machine_page(self, owner: unit_labels.UnitLabels, *, ci: bool = False) -> memory_feed.MemoryPage:
         """Use the same owner across the local, Mac, and cloud rows."""
         reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission()))
@@ -2562,18 +2710,18 @@ process.stdout.write(JSON.stringify({
                                                 unit_labels.NoDirector())
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
-            ("targeted-test", director, "panes targeted"),
-            ("merge-gate", runner, "showrunner merge"),
-            ("merge-gate", director, "panes merge"),
-            ("merge-gate", merge_staff, "sdlc-merge-gate merge"),
-            ("merge-gate", unit_worker, "panes merge"),
-            ("merge-gate", runner_worker, "showrunner merge"),
-            ("targeted-test", unknown, "targeted test"),
-            ("merge-gate", unknown, "merge gate"),
-            ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "targeted test"),
-            ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "merge gate"),
-            ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "targeted test"),
-            ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "merge gate"),
+            ("targeted-test", director, "panes"),
+            ("merge-gate", runner, "builds"),
+            ("merge-gate", director, "panes"),
+            ("merge-gate", merge_staff, "sdlc-merge-gate"),
+            ("merge-gate", unit_worker, "panes"),
+            ("merge-gate", runner_worker, "builds"),
+            ("targeted-test", unknown, "unknown"),
+            ("merge-gate", unknown, "unknown"),
+            ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
+            ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
+            ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
+            ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
         ):
             with self.subTest(step=step, owner=owner):
                 page = self.cloud_owner_page(step, owner)
@@ -2679,7 +2827,7 @@ process.stdout.write(JSON.stringify({
             ("nextest", "known-project", "/fixture", "known-project nextest"),
             ("nextest", "", "/fixture", "nextest"),
             ("nextest", "", "/absolute/repository", "nextest"),
-            ("merge-gate", "", "/fixture", "merge gate"),
+            ("integrate", "", "/fixture", "integrate"),
         ):
             with self.subTest(step=raw_step, project=project, folder=folder):
                 reading = reservation_reading(project=project)

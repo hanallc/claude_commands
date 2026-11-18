@@ -116,6 +116,7 @@ from scripts.lib.python_startup.sitecustomize import dataclass_code_root, datacl
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
+from scripts.mac_test import nextest_log
 from scripts.direct import phase_reservation, recorder_state
 
 if TYPE_CHECKING:
@@ -575,7 +576,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
     return ProcessUsesKnown(found, tuple(unreadable))
 
 
-def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
+def lsof_paths(prefix: str | tuple[str, ...], *, require_complete: bool = False) -> ProcessUsesKnown | ProcessUsesUnavailable:
     """Process paths from one lsof scan; unavailable when lsof cannot run or prints nothing."""
     try:
         completed = subprocess.run(LSOF, capture_output=True, text=True, errors="replace",
@@ -583,8 +584,10 @@ def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesU
     except (OSError, subprocess.TimeoutExpired):
         return ProcessUsesUnavailable()
     # lsof exits 1 when it cannot read some process; the lines it printed still hold.
+    if completed.returncode != 0 and (require_complete or completed.returncode != 1):
+        return ProcessUsesUnavailable()
     return (ProcessUsesKnown(parse_lsof(completed.stdout, prefix))
-            if completed.returncode in (0, 1) and completed.stdout else ProcessUsesUnavailable())
+            if completed.stdout else ProcessUsesUnavailable())
 
 
 def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
@@ -907,7 +910,7 @@ def checked_git(repo: Path, *arguments: str) -> str:
     """Read git state without optional locks or a network request."""
     result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True,
                             check=False, timeout=GIT_TIMEOUT_SECONDS,
-                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1"})
     if result.returncode:
         raise ValueError(f"{repo}: git {arguments[0]} failed")
     return result.stdout
@@ -949,14 +952,14 @@ def repo_git_work(repo: Path) -> GitWork:
     return GitWork.UNSAVED if remaining.strip() else GitWork.SAVED
 
 
-def git_work(path: Path, depth: int = GIT_DEPTH) -> GitWork:
+def git_work(path: Path, depth: int = GIT_DEPTH, *, verified_repos: tuple[Path, ...] = ()) -> GitWork:
     """Check all worktrees down to a fixed depth. Never follow links."""
     try:
         if path.is_symlink() or not path.is_dir():
             return GitWork.SAVED
         if (path / ".git").is_symlink():
             return GitWork.UNREADABLE
-        if os.path.lexists(path / ".git"):
+        if os.path.lexists(path / ".git") and path not in verified_repos:
             result = repo_git_work(path)
             if result is not GitWork.SAVED:
                 return result
@@ -964,7 +967,7 @@ def git_work(path: Path, depth: int = GIT_DEPTH) -> GitWork:
             for entry in path.iterdir():
                 if entry.name == ".git":
                     continue
-                result = git_work(entry, depth - 1)
+                result = git_work(entry, depth - 1, verified_repos=verified_repos)
                 if result is not GitWork.SAVED:
                     return result
         return GitWork.SAVED
@@ -1051,6 +1054,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
+    inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
     from scripts.production import staff
@@ -1111,9 +1115,11 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
+            landed_remote_check = False
             if root in roots.copies and reason is None:
                 state = scratch.lifetime(Path(entry.path), now, scratch_settings=scratch_settings)
-                if isinstance(state, scratch.Live):
+                landed_remote_check = isinstance(state, scratch.LandedRemoteCheckNeeded) and inspection is scratch.RemoteInspection.ADVERTISE
+                if isinstance(state, scratch.Live) and not landed_remote_check:
                     reason = state.why
                 elif isinstance(state, scratch.Unknown):
                     reason = state.reason
@@ -1149,8 +1155,9 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            # The coordinator checks pending sources against the intent under the removal lock.
-            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
+            # The coordinator checks pending sources and reads remote tips for landed copies under the removal lock.
+            git = (GitWork.SAVED if landed_remote_check or pending or scratch.is_throwaway(Path(entry.path))
+                   else git_work(Path(entry.path)))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
@@ -1225,7 +1232,9 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
                 _ = remove_entry(entry, result, False)
     emptied: set[str] = set()
     removals: list[RemovableEntry] = []
-    for entry in timed_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+    inspection = scratch.RemoteInspection.LOCAL_ONLY if dry_run else scratch.RemoteInspection.ADVERTISE
+    for entry in timed_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
+                               pane_use=pane_use, inspection=inspection):
         if entry.path in resumed:
             continue
         if isinstance(entry, KeptEntry):
@@ -1334,6 +1343,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
+    inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Keep unrecorded work until the configured folder removal age after the other checks pass."""
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -1341,7 +1351,8 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs() if isinstance(pane_use, ReadPaneRuns) else pane_use
-    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
+                               pane_use=pane_use, inspection=inspection):
         if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
             yield entry
             continue
@@ -1386,7 +1397,8 @@ def cleanup_entries(roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs()
     result: list[KeptEntry | CleanupRemoval] = []
-    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
+                               pane_use=pane_use):
         if isinstance(entry, KeptEntry):
             result.append(entry)
             continue
@@ -1563,6 +1575,73 @@ def summary(result: Sweep, dry_run: bool) -> str:
             + f" kept {sum(len(paths) for paths in result.kept.values())}: {kept or 'none'}")
 
 
+def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: Sweep) -> None:
+    """Remove closed Mac nextest logs after their retention period."""
+    try:
+        folder = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        result.failed.append(FailedEntry(path=str(root), error=str(error)))
+        return
+    try:
+        if os.fstat(folder).st_uid != os.getuid():
+            return
+        days = nextest_log.retention_days()
+        cutoff = now - days * 24 * HOUR_SECONDS
+        expired: dict[str, os.stat_result] = {}
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if not nextest_log.LOG_NAME.fullmatch(entry.name):
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                        and info.st_nlink == 1 and info.st_mtime < cutoff):
+                    expired[entry.name] = info
+        if not expired:
+            return
+        resolved = os.path.realpath(root)
+        paths = lsof_paths(resolved + os.sep, require_complete=True)
+        if not os.path.samestat(os.fstat(folder), os.stat(resolved, follow_symlinks=False)):
+            return
+        used = entry_uses(paths.paths, (resolved,)) if isinstance(paths, ProcessUsesKnown) else {}
+        for name, info in expired.items():
+            path = str(root / name)
+            if isinstance(paths, ProcessUsesUnavailable):
+                result.keep(path, NO_PROC)
+                continue
+            if os.path.join(resolved, name) in used:
+                result.keep(path, IN_USE)
+                continue
+            try:
+                with nextest_log.locked_log(folder, name, nextest_log.LogAccess.REMOVE) as descriptor:
+                    current = os.fstat(descriptor)
+                    if current != info or current.st_ctime_ns != info.st_ctime_ns:
+                        result.keep(path, "the nextest log changed during the process scan")
+                        continue
+                    if not dry_run:
+                        os.unlink(name, dir_fd=folder)
+            except BlockingIOError:
+                result.keep(path, IN_USE)
+                continue
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                result.failed.append(FailedEntry(path=path, error=str(error)))
+                continue
+            size = info.st_blocks * 512
+            result.freed += size
+            result.deleted.append(DeletedEntry(path=path, gib=round(size / GIB, 3),
+                last_change=when(info.st_mtime), reason="expired Mac nextest log"))
+    except (OSError, conf.Unusable) as error:
+        result.failed.append(FailedEntry(path=str(root), error=str(error)))
+    finally:
+        os.close(folder)
+
+
 def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, proc: str = PROC_DIR, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -1572,6 +1651,8 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
         lint_settings = conf.read("lint")
     moment = time.time() if now is None else now
     result = sweep(dry_run, roots or default_roots(), moment, proc, lint_settings=lint_settings, scratch_settings=scratch_settings)
+    if sys.platform == "darwin":
+        remove_expired_nextest_logs(Path.home() / nextest_log.DIRECTORY, moment, dry_run, result)
     verb = "would delete" if dry_run else "deleted"
     for entry in result.deleted:
         print(f"tmp sweep: {verb} {entry['path']} ({entry['gib']:.1f} GiB), last changed {entry['last_change']}")

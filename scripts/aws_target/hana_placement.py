@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from scripts.aws_target import hana_box as box
     from scripts.aws_target.hana_box import (HanaLifecycleEvidence as HanaLifecycleEvidence,
         HanaUnprovisioned as HanaUnprovisioned, HanaLifecycleUnavailable as HanaLifecycleUnavailable)
-    from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
+    from scripts.build_queue import admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
     from scripts.lib import conf
 
@@ -90,6 +90,18 @@ class RemoteStepWaiter:
     reference: placement.ProviderClaimReference
 
 
+class HanaEvidenceRequest(Protocol):
+    """The request fields needed to read Hana placement evidence."""
+
+    @property
+    def episode(self) -> str: ...
+
+    @property
+    def profile(self) -> records.StepProfile | records.ProgramProfile: ...
+
+    @property
+    def constraints(self) -> placement.PlacementConstraints: ...
+
 
 class _PlacementAdapter(Protocol):
 
@@ -120,7 +132,8 @@ class _PlacementAdapter(Protocol):
     def fixed_policy(self, transport: HanaControlTransport, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
         ...
 
-    def read_evidence(self, key: placement.HostEvidenceKey, request: wire.PlacementRequest) -> placement.HostEvidence:
+    def read_evidence(self, key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                      transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
         ...
 
 
@@ -182,9 +195,10 @@ def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) ->
     return _adapter().fixed_policy(transport, repository, kind)
 
 
-def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest) -> placement.HostEvidence:
-    """Project existing lifecycle and execution records without provider mutations."""
-    return _adapter().read_evidence(key, request)
+def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                  transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
+    """Use the workload that selected the Hana transport to read evidence."""
+    return _adapter().read_evidence(key, request, transport=transport, workload=workload)
 
 
 def __getattr__(name: str) -> object:

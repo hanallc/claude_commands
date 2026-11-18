@@ -118,13 +118,15 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(observed.pids, (os.getpid(), os.getpid()))
         self.assertEqual(absent, sessions.SessionProcesses(()))
 
-    def test_unreadable_record_does_not_change_a_session_answer(self) -> None:
+    def test_unreadable_record_keeps_a_positive_match_but_cannot_prove_absence(self) -> None:
         self.record("live.json", session_id="attached")
-        _ = (self.sessions / "broken.json").write_text("{broken")
+        path = self.sessions / "broken.json"
+        _ = path.write_text("{broken")
+        unknown = sessions.SessionLivenessUnknown(f"session registry unreadable: {path}")
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
-            self.assertEqual(sessions.session_processes("attached"), sessions.SessionProcesses((os.getpid(),)))
+            self.assertEqual(sessions.session_processes("attached"), unknown)
             self.assertEqual(sessions.session_liveness("attached"), sessions.LiveSessionProcess(os.getpid()))
-            self.assertEqual(sessions.session_liveness("absent"), sessions.SessionNotLive())
+            self.assertEqual(sessions.session_liveness("absent"), unknown)
 
     def test_remote_control_reads_present_missing_empty_and_unreadable_fields(self) -> None:
         self.record(f"{os.getpid()}.json")
@@ -532,7 +534,9 @@ class SessionLookupTests(ShutdownTestCase):
             for error, expected in ((ProcessLookupError(), ()), (PermissionError(), (path,)), (None, (path,))):
                 with self.subTest(error=error), mock.patch.object(os, "kill", side_effect=error):
                     self.assertEqual(sessions.read_registry().unreadable, expected)
-                    self.assertEqual(sessions.session_liveness("stopped"), sessions.SessionNotLive())
+                    liveness = (sessions.SessionLivenessUnknown(f"session registry unreadable: {path}")
+                                if expected else sessions.SessionNotLive())
+                    self.assertEqual(sessions.session_liveness("stopped"), liveness)
 
     def test_record_removed_between_unreadable_read_and_reread_is_dropped(self) -> None:
         path = self.sessions / "4242.json"
