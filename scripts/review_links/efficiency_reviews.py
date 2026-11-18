@@ -7,7 +7,9 @@ It never holds a copy of the ledger line.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +38,26 @@ def path(ledger: Path) -> Path:
     return ledger.with_name(ledger.stem+'.review.json')
 
 
+held_ledger_locks: ContextVar[frozenset[Path]] = ContextVar('held_ledger_locks', default=frozenset())
+
+
+@contextmanager
+def ledger_lock(ledger: Path) -> Generator[None]:
+    """Serialize writes to an efficiency ledger and its Review records."""
+    lock = path(ledger).with_suffix('.lock').resolve()
+    held = held_ledger_locks.get()
+    if lock in held:
+        yield
+        return
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(lock):
+        token = held_ledger_locks.set(held | {lock})
+        try:
+            yield
+        finally:
+            held_ledger_locks.reset(token)
+
+
 def read(ledger: Path, sources: list[Path] | None = None) -> dict[str, EfficiencyReview]:
     target = path(ledger)
     if sources is not None:
@@ -55,7 +77,7 @@ def record(ledger: Path, identity: str, words: str, change: MarkChange, who: str
     """Append one log line and change the mark. Returns False for an exact repeat."""
     reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ''
     target = path(ledger)
-    with file_lock.exclusive(target.with_suffix('.lock')):
+    with ledger_lock(ledger):
         reviews = read(ledger)
         before = reviews.get(identity, EfficiencyReview())
         check_state()

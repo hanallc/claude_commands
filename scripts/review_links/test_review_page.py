@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, tzinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import conf
+from scripts.lib import atomic_file, conf
 from scripts.lib.user_zone import user_zone
 import unittest
 from dataclasses import replace
@@ -22,6 +22,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode
 
 from scripts.agents.remote import local_machine
+from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
@@ -1361,9 +1362,23 @@ window.fetch=async url=>{
         decisions = self.decisions()
         question = self.question()
         ready = self.investigation()
-        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions)
+        failed = investigation.file(ready.owner, 'Why did the report stop?', 'Read the report.',
+                                    waiting_why='The owner must complete the investigation.')
+        failed = investigation.answer(failed.owner, failed.id, 'The report is ready.')
+        failed_key = f'investigation/{failed.owner}/{failed.id}'
+        keys = (question,'page-owner/C1',f'investigation/{ready.owner}/{ready.id}',*decisions,failed_key)
+        write = atomic_file.write_bytes_atomic
+
+        def write_delivery(path: Path, content: bytes, *, mode: int | None = None) -> None:
+            if path.name.startswith(change_page.DELIVERY_PREFIX):
+                fields = cast(change_page.StoredDeliverySlots, json.loads(content))
+                saved = fields.get('review_message')
+                if saved is not None and saved.get('row') == failed.id and saved['saved'] and 'verdict' in fields:
+                    raise OSError('fixture delivery save mark failed')
+            write(path, content, mode=mode)
+
         for key in keys:
-            with self.subTest(key=key):
+            with self.subTest(key=key), patch.object(atomic_file, 'write_bytes_atomic', new=write_delivery):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
                 delivery,result = review_page.submit(self.root,self.body(key,'feedback','Use the second layout.'),self.status)
                 self.assertEqual(result,'feedback sent')
@@ -1371,9 +1386,10 @@ window.fetch=async url=>{
                 self.assertIn(item.owner,delivery.recipients)
                 self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.DONE)
         restarted = change_page.DeliveryStatus(self.root)
-        change_page.recover_pending(restarted)
-        self.assertEqual(sum('Use the second layout.' in message for _,_,message in self.fixture.messages),6,
-                         'One message for each type, and the change sends to two staff rows.')
+        with patch.object(atomic_file, 'write_bytes_atomic', new=write_delivery):
+            change_page.recover_pending(restarted)
+        self.assertEqual(sum('Use the second layout.' in message for _,_,message in self.fixture.messages),7,
+                         'Each request sends one message. The change sends to two staff rows.')
         before = len(self.fixture.messages)
         change_page.recover_pending(change_page.DeliveryStatus(self.root))
         self.assertEqual(len(self.fixture.messages),before)
@@ -1392,6 +1408,13 @@ window.fetch=async url=>{
             with self.subTest(key=key):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
                 body = self.body(key,'later','Read this tomorrow.')+'&'+urlencode({'later':until.isoformat()})
+                if key == question:
+                    with (patch.object(review_later, 'write_text_atomic', side_effect=OSError('fixture deadline write failed')),
+                          self.assertRaisesRegex(OSError, 'fixture deadline write failed')):
+                        _ = review_page.submit(self.root, body, self.status)
+                    current = next(current for current in review_items.read(self.root) if current.key == key)
+                    self.assertEqual(current.log, item.log)
+                    self.assertNotIn(key, review_later.times())
                 _,result = review_page.submit(self.root,body,self.status)
                 self.assertIn('later until',result)
                 hidden = next(item for item in review_items.read(self.root) if item.key == key)
@@ -1508,6 +1531,24 @@ window.fetch=async url=>{
             stored = efficiency_reviews.path(ledger).read_text()
             self.assertEqual(set(efficiency_reviews.read(ledger)), {'E1', 'E2'}, 'The review file is keyed by the E<n> id.')
             self.assertNotIn('Slower checks', stored, 'The review file never copies the ledger line.')
+
+        with self.subTest(action='decline', kind='efficiency', summary='settings unavailable'):
+            nightly_ledger = ledger.with_name('ledger.md')
+            _ = nightly_ledger.write_text('- 2026-11-03 tests: Slow checks — proposed\n'
+                                          +'- 2026-11-04 tests: Faster checks — proposed\n')
+            doc = self.fixture.production
+            _ = doc.write_text(doc.read_text().replace(str(ledger), str(nightly_ledger)))
+            item = next(item for item in review_items.read(self.root) if item.id == 'page-owner/E1')
+            with (patch.object(candidates, 'state_root', return_value=nightly_ledger.parent),
+                  patch.object(candidates, 'table', side_effect=conf.Unusable('fixture title_characters unavailable')) as summary):
+                delivery, result = review_page.submit(self.root, self.body(item.key, 'decline', 'Too slow.'), self.status)
+            summary.assert_called_once()
+            self.assertEqual(result, 'declined')
+            self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+            self.assertTrue(nightly_ledger.read_text().splitlines()[0].endswith(' — declined'))
+            declined = next(record for record in review_items.read(self.root) if record.key == item.key)
+            self.assertEqual(declined.state, review_items.ReviewState.DONE)
+            self.assertEqual(declined.log[-1].words, 'Decline: Too slow.')
 
     def test_question_answer_words_remain_after_the_answer_archive_expires(self) -> None:
         key = self.question()

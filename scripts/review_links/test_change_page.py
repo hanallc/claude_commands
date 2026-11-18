@@ -4146,6 +4146,23 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
         self.assertNotIn("Saved:", reply.body)
 
+    def test_a_git_launch_failure_keeps_the_saved_verdict_and_delivers_it(self) -> None:
+        run = cast(Callable[..., object], subprocess.run)
+
+        def fail_commit_probe(args: list[str], **kwargs: object) -> object:
+            if args[3:] == ["--literal-pathspecs", "rev-parse", "--is-inside-work-tree"]:
+                self.assertIn("works: keep the verdict", self.review_list.read_text())
+                raise FileNotFoundError("fixture Git launch failed")
+            return run(args, **kwargs)
+
+        with patch.object(subprocess, "run", new=fail_commit_probe):
+            reply = self.request(self.page_path, self.answer(feedback="keep the verdict"))
+        self.assertEqual(reply.status, 303)
+        self.assertIn("Saved: works: keep the verdict", self.request(self.page_path, {}).body)
+        self.assertCountEqual([recipient for recipient, _, message in self.messages if "works: keep the verdict" in message],
+                              ["builder-unit", "page-owner"])
+        self.assert_record_cleared()
+
     def test_a_failed_or_interrupted_verdict_write_preserves_validation_ownership_and_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         self.assertEqual(self.request(self.page_path, self.answer(outcome="validate", feedback="Keep these words")).status, 303)

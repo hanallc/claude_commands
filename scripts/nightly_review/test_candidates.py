@@ -21,7 +21,9 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 
 # Importable once candidates has put scripts/lib on the path.
-from scripts.lib import urgency
+from scripts.lib import file_lock, urgency
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.review_links import efficiency_reviews
 from scripts.lib import conf
 
 
@@ -235,6 +237,39 @@ class CandidatesTests(unittest.TestCase):
                               ["outcome", "P2", "declined"], ["outcome", "E0", "declined"], ["outcome", "E2", "kept"]):
                 with self.subTest(arguments=arguments):
                     self.assertEqual(self.run_main(arguments)[0], 2)
+
+    def test_cli_ledger_writes_exclude_a_review_writer_from_the_read_through_the_write(self) -> None:
+        ledger = self.root / "ledger.md"
+        report = self.root / "2026-10-12/report.md"
+        report.parent.mkdir()
+        _ = report.write_text(REPORT)
+        _ = ledger.write_text(LEDGER)
+        lock = efficiency_reviews.path(ledger).with_suffix(".lock")
+        read = candidates.read_lines
+        collisions: list[str] = []
+
+        def contend(step: str) -> None:
+            with file_lock.exclusive(lock, wait=False) as result:
+                if result == file_lock.LockResult.BUSY:
+                    collisions.append(step)
+
+        def read_ledger(path: Path) -> list[str]:
+            if path == ledger:
+                contend("read")
+            return read(path)
+
+        def write_ledger(path: Path, content: str) -> None:
+            if path == ledger:
+                contend("write")
+            write_text_atomic(path, content)
+
+        for args in (["record", str(report)], ["outcome", "E2", "done"]):
+            with self.subTest(command=args[0]), mock.patch.multiple(
+                    candidates, read_lines=read_ledger, write_text_atomic=write_ledger):
+                collisions.clear()
+                code, _, error = self.run_main(args)
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(collisions[:2], ["read", "write"])
 
     def test_a_line_gives_its_night_area_gain_and_state(self) -> None:
         self.assertEqual(

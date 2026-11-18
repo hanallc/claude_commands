@@ -368,6 +368,23 @@ class DeliveryStatus:
         name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
         return self.root / (".review-link-closeout-alert-" + name + ".json")
 
+    def review_save_receipt(self, page: ReviewPage, row: str) -> Path:
+        name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
+        return self.root / (".review-link-saved-" + name)
+
+    def mark_review_saved(self, page: ReviewMessagePage, row: str, slots: DeliverySlots,
+                          intent: DeliveryIntent) -> None:
+        """Keep proof of a saved action while the caller holds the delivery lock."""
+        try:
+            self.write_slots(page, row, slots)
+        except OSError as error:
+            print(f"review-links delivery save mark {row}: {error}", file=sys.stderr)
+            try:
+                atomic_file.write_text_atomic(self.review_save_receipt(page, row), intent.attempt + "\n",
+                                              new_file_mode=0o600)
+            except OSError as failure:
+                print(f"review-links delivery save receipt {row}: {failure}", file=sys.stderr)
+
     def failed_delivery(self, page: ReviewPage, row: str) -> FailedDelivery | NoFailedDelivery:
         """Read a failure unless an earlier send may have reached the owner."""
         try:
@@ -536,6 +553,11 @@ class DeliveryStatus:
                     else:
                         updated = slots.updated(current.kind, NoDelivery())
                     self.write_slots(delivery.page, delivery.row, updated)
+                    if isinstance(page, ReviewMessagePage):
+                        try:
+                            self.review_save_receipt(page, row).unlink(missing_ok=True)
+                        except OSError as error:
+                            print(f"review-links delivery save receipt {row}: {error}", file=sys.stderr)
                     return
 
     def clear(self, page: ReviewPage, row: str, kind: Literal["verdict", "validation", "question"]) -> None:
@@ -1195,6 +1217,8 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
     if isinstance(result, change_review.VerdictRefused):
         status.clear(page, row_id, "verdict")
         raise question_record.AnswerRefused(result.reason)
+    for warning in result.warnings:
+        print(warning, file=sys.stderr)
     message = review_message(message_page, row, verdict, f"Merged: {row.get('Merged', '')}",
                              f"User feedback: {feedback if feedback.strip() else verdict}", "\n".join(result.lines).strip())
     if superseded:
@@ -1405,8 +1429,21 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 page = ReviewMessagePage(source,source.parent,(row,),'',saved)
                 slots = status.slots(page,row)
                 if not saved['saved']:
-                    status.clear_locked(page,row,slots,'verdict')
-                    continue
+                    if row.startswith(IMAGE_QUESTION_ROW_PREFIX):
+                        status.clear_locked(page,row,slots,'verdict')
+                        continue
+                    intent = slots.verdict
+                    if not isinstance(intent, DeliveryIntent):
+                        continue
+                    try:
+                        receipt = status.review_save_receipt(page, row).read_text(encoding="utf-8").strip()
+                    except FileNotFoundError:
+                        receipt = ""
+                    if receipt != intent.attempt:
+                        print(f'review-links recovery {path.name}: review save state unknown; message kept',
+                              file=sys.stderr)
+                        continue
+                    page = replace(page, saved={**saved, 'saved': True})
                 claimed = tuple(intent.attempt for intent in slots.intents())
                 for attempt in claimed:
                     status.request_attempts[attempt] = AttemptOwnership(path,'claimed')

@@ -800,8 +800,10 @@ The test server joins its request handlers before fixture cleanup and gives each
 2. `scripts.buildlog.test_vault_pull` passes.
 3. The new checks fail without the fix.
 
-### Phase 60 — A failed write or Git launch keeps saved review work  · status: todo
+### Phase 60 — A failed write or Git launch keeps saved review work  · status: done
 **Depends on:** none
+
+**Result:** five failure paths keep saved work. A Git launch error after a saved verdict is a commit warning; the verdict and its claim stay. A failed delivery metadata write leaves a private receipt, and startup recovery sends the saved message once or keeps it. Later saves the deadline before its log and restores it if the log fails. The nightly writer and Review share one ledger lock. A saved efficiency Decline stays a success when the nightly summary fails.
 
 #### Work Order
 
@@ -880,6 +882,30 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. One dark desktop shot of an Images card's answer buttons, before and after, clipped to the buttons.
 2. The Images and Review page suites pass. basedpyright: 0 errors, 0 warnings.
+
+### Phase 63 — A command in a question shows in a code block with a copy button  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user (2026-11-17 22:4x EST, Review page question card): "why isn't this in a code block with a copy - that is supposed to work". The sdlc showrunner traced it: `change_browser.question_paragraphs` renders question body paragraphs through `change_page.review_text_html`, which never matches `page_frame.CODE_BLOCK`. Only `answer_html`, `item_html` (numbered steps) and `change_page.review_html` make code blocks.
+
+**Spec:**
+1. A command alone on its line in any question paragraph (lead, context, trailing, choices text) renders as `page_frame.code_block_html`, with the copy button.
+2. One shared function splits text into code blocks and text. `answer_html`, `review_html` and `question_paragraphs` call it; no three copies of the split loop.
+3. Test: question text with "...on natedev:\n`git ...`" renders a code block with the copy button. Add it as a row of the existing code block test if one covers the same behavior.
+
+**Files:**
+- `scripts/review_links/change_browser.py`, `scripts/review_links/change_page.py`, `scripts/review_links/page_frame.py`
+- `scripts/review_links/test_change_page.py`, `scripts/review_links/test_review_page.py`, `scripts/review_links/test_page_frame.py`
+
+**Workers:** 1 writer (`design`).
+
+**Order:** admin-console reviewscroll rewrites these files and merges first (about 23:15 EST). Merge its hash before this phase commits.
+
+**Acceptance gate:**
+1. One dark desktop shot of a question card with a command block and its copy button.
+2. The new check fails without the fix. The Review page, change page and page frame suites pass. basedpyright: 0 errors, 0 warnings.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
