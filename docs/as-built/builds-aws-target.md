@@ -53,22 +53,28 @@ Enter the administrator passphrase when the command asks for it.
 The command creates the `aws-build-plan` IAM user and one managed policy.
 It checks the user with STS, reads EC2 availability zones, and simulates seven denied actions.
 After these checks pass, it saves one access key in `~/.config/aws-build/plan.gpg` with mode `0600`.
-The rename that publishes `plan.gpg` commits setup.
-If setup fails before the rename, it revokes any new key it finds.
+If STS still rejects a new key after retries, setup revokes the unpublished key.
+Run `deploy.py plan-identity --approve-resources` again after one minute.
+If setup fails before it publishes `plan.gpg`, it revokes any new key it finds.
 During setup, `plan.gpg` must be absent before the command revokes a key.
-If directory sync or cleanup fails after the rename, the command warns and reports that the identity is ready.
-Setup keeps the verified file and IAM key after the rename.
+If directory sync or cleanup fails after setup publishes a verified key, the command warns and reports that the identity is ready.
 If IAM lists no key after a failed creation, a key can appear later.
 Run the same approved command again to revoke the late key and create a new key.
 If `plan.gpg` is absent, the command revokes all keys that IAM lists for the plan user before it creates one key.
-The command keeps the local key when it matches the sole key that IAM lists.
-Setup refuses if the local key differs from the sole key that IAM lists.
+Setup keeps the local key when it matches the sole key that IAM lists.
+Setup refuses if IAM lists no key, a different key, or more than one key.
+If STS rejects a saved key, setup preserves the local file and the IAM key.
 Setup also refuses if it cannot read or decrypt `plan.gpg`.
 This refusal preserves the local file and the IAM keys.
 Setup uses GPG without a passphrase prompt for these checks.
-If `plan.gpg` is damaged, delete the file and run the command again.
 The command compares the default policy with the current configuration and sets a new default version when they differ.
-Omit `--approve-resources` to print the plan without contacting AWS.
+Run `deploy.py plan-identity` without flags to print the plan without contacting AWS.
+Run `deploy.py plan-identity --check` to verify the saved plan key with STS without a prompt.
+Setup and the check use the region in the AWS target configuration.
+If AWS does not answer the check, run the check again.
+If AWS rejects the saved key, run the approved removal command below.
+Use the same command if `plan.gpg` is damaged or has invalid fields.
+Then run `deploy.py plan-identity --approve-resources` to create a new key.
 
 The policy allows setup reads, IAM simulation for users in the account, and S3 object listings in account buckets.
 The policy allows reads of applied service quotas and quota request history.
@@ -84,12 +90,42 @@ It denies EC2 instance attribute and Spot request reads because those calls can 
 
 Sessions use `plan_credentials()` to decrypt the key without a prompt.
 If the agent is cold, run `github-warmup` in a terminal on natedev.
-The approved removal command can revoke the key while `plan.gpg` exists.
-Run this command in the same terminal to remove the key, user, and policy.
+The approved removal command removes the IAM resources before it removes `plan.gpg`.
+It removes `plan.gpg` even if it cannot decode the file.
+It refuses if the decoded key belongs to a different AWS account.
 
 ```sh
 deploy.py down --workload plan-identity --approve-destroy
 ```
+
+## AWS test identity
+
+1. Sign in to the AWS console for the management account.
+2. Switch to `OrganizationAccountAccessRole` in the test account.
+3. Create the IAM user `aws-build-test` with the path `/aws-build/` and the `AdministratorAccess` policy in the test account.
+4. Create an access key for that user.
+5. Run `deploy.py test-identity` in a terminal on natedev.
+
+Enter the access key ID and the secret access key at the hidden prompts.
+The command checks the key format before it calls AWS.
+It uses STS with the saved plan key to identify the build account.
+It uses the region in the AWS target configuration for this STS call.
+It refuses a build account key or a test key whose account it cannot confirm.
+It stores the key in `~/.config/aws-build/test.gpg` with mode `0600`.
+The local AWS state folder holds the account ID in `test-identity.json`.
+The command saves the account record before it publishes the encrypted key.
+If setup stops after it saves the record, run the command again with a key from the same account.
+Run `github-warmup` in a terminal on natedev if the GPG agent is cold.
+If GPG cannot identify the encryption recipient, restore `~/.config/gh/token.gpg` with one GPG recipient.
+
+Run `deploy.py test-identity` again with a key from the same account to replace the key.
+The command refuses a key from a different account.
+Run `deploy.py test-identity --check` to verify the saved key and account without a prompt.
+If AWS does not answer, run the same command again.
+If you interrupt the check, run the check again.
+If the test key is locked, run `github-warmup`.
+If the private test key is unreadable, run `deploy.py test-identity` with a key from the recorded test account.
+`test_credentials()` checks the saved test key against the recorded account with one STS call.
 
 ## Run a setup plan
 

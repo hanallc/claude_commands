@@ -19,7 +19,7 @@ from scripts.lib import conf, file_lock
 
 
 OWNER = plan_identity.PlanAccount('aws', '0' * 12)
-CREDENTIAL = plan_identity.PlanCredentials('fixture-plan-key', 'fixture-plan-secret', OWNER)
+CREDENTIAL = plan_identity.PlanCredentials('AKIA' + 'P' * 16, 'p' * 40, OWNER)
 SCALER = OWNER.iam('user/fixture/fixture-scaler')
 POLICY = OWNER.iam('policy/fixture/scaler')
 DEPLOYMENT = 'a' * 32
