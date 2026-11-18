@@ -907,7 +907,7 @@ def checked_git(repo: Path, *arguments: str) -> str:
     """Read git state without optional locks or a network request."""
     result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True,
                             check=False, timeout=GIT_TIMEOUT_SECONDS,
-                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1"})
     if result.returncode:
         raise ValueError(f"{repo}: git {arguments[0]} failed")
     return result.stdout
@@ -949,14 +949,14 @@ def repo_git_work(repo: Path) -> GitWork:
     return GitWork.UNSAVED if remaining.strip() else GitWork.SAVED
 
 
-def git_work(path: Path, depth: int = GIT_DEPTH) -> GitWork:
+def git_work(path: Path, depth: int = GIT_DEPTH, *, verified_repos: tuple[Path, ...] = ()) -> GitWork:
     """Check all worktrees down to a fixed depth. Never follow links."""
     try:
         if path.is_symlink() or not path.is_dir():
             return GitWork.SAVED
         if (path / ".git").is_symlink():
             return GitWork.UNREADABLE
-        if os.path.lexists(path / ".git"):
+        if os.path.lexists(path / ".git") and path not in verified_repos:
             result = repo_git_work(path)
             if result is not GitWork.SAVED:
                 return result
@@ -964,7 +964,7 @@ def git_work(path: Path, depth: int = GIT_DEPTH) -> GitWork:
             for entry in path.iterdir():
                 if entry.name == ".git":
                     continue
-                result = git_work(entry, depth - 1)
+                result = git_work(entry, depth - 1, verified_repos=verified_repos)
                 if result is not GitWork.SAVED:
                     return result
         return GitWork.SAVED
@@ -1051,6 +1051,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
+    inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
     from scripts.production import staff
@@ -1111,9 +1112,11 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
+            landed_remote_check = False
             if root in roots.copies and reason is None:
                 state = scratch.lifetime(Path(entry.path), now, scratch_settings=scratch_settings)
-                if isinstance(state, scratch.Live):
+                landed_remote_check = isinstance(state, scratch.LandedRemoteCheckNeeded) and inspection is scratch.RemoteInspection.ADVERTISE
+                if isinstance(state, scratch.Live) and not landed_remote_check:
                     reason = state.why
                 elif isinstance(state, scratch.Unknown):
                     reason = state.reason
@@ -1149,8 +1152,9 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
-            # The coordinator checks pending sources against the intent under the removal lock.
-            git = GitWork.SAVED if pending or scratch.is_throwaway(Path(entry.path)) else git_work(Path(entry.path))
+            # The coordinator checks pending sources and reads remote tips for landed copies under the removal lock.
+            git = (GitWork.SAVED if landed_remote_check or pending or scratch.is_throwaway(Path(entry.path))
+                   else git_work(Path(entry.path)))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
@@ -1225,7 +1229,9 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
                 _ = remove_entry(entry, result, False)
     emptied: set[str] = set()
     removals: list[RemovableEntry] = []
-    for entry in timed_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+    inspection = scratch.RemoteInspection.LOCAL_ONLY if dry_run else scratch.RemoteInspection.ADVERTISE
+    for entry in timed_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
+                               pane_use=pane_use, inspection=inspection):
         if entry.path in resumed:
             continue
         if isinstance(entry, KeptEntry):
@@ -1334,6 +1340,7 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     pane_use: PaneRunUse | PaneRunsUnreadable | ReadPaneRuns = ReadPaneRuns.CURRENT,
+    inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Keep unrecorded work until the configured folder removal age after the other checks pass."""
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -1341,7 +1348,8 @@ def timed_entries(roots: Roots, now: float, proc: str, *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs() if isinstance(pane_use, ReadPaneRuns) else pane_use
-    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
+                               pane_use=pane_use, inspection=inspection):
         if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
             yield entry
             continue
@@ -1386,7 +1394,8 @@ def cleanup_entries(roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     pane_use = read_pane_runs()
     result: list[KeptEntry | CleanupRemoval] = []
-    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use):
+    for entry in judge_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
+                               pane_use=pane_use):
         if isinstance(entry, KeptEntry):
             result.append(entry)
             continue
