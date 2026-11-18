@@ -12,9 +12,10 @@ argument-hint: "[resume]"
 <MergeIdentity>
 Read your unit's staff row and its showrunner's staff row.
 A merge unit serves its showrunner's production and each production attached below that showrunner.
-Each order names its production.
+The order names the production whose repo holds the checkpoint.
 For each order, read that production's document from its showrunner's staff `doc`.
 Use that production's merge branch, showrunner checkout, merge tests, push, promote, and land-order policy.
+Use the unit's staff parent for the production log and review ledger.
 The merge unit type grants no push authority.
 Apply only the cited contracts from `commands/unit/direct.md`; do not enter its phase loop.
 

@@ -29,6 +29,14 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 __STEP_TIP_STYLE__
+#tip > .tip[data-held-count] { max-width: min(60rem, calc(100vw - 16px)); grid-template-columns: minmax(0, auto) minmax(0, auto); }
+.tip dd.held-folder { text-align: left; opacity: 0.7; }
+@media (width >= 900px) {
+  .tip .held-folder { overflow: hidden; text-overflow: ellipsis; }
+}
+@media (width < 900px) {
+  .tip[data-held-count] :is(dt, dd) { white-space: normal; overflow-wrap: anywhere; }
+}
 :where(.page-status) { position: relative; }
 .page-status { --measure-width: 7.75rem; padding-inline-end: calc(var(--measure-width) + 8px); }
 .page-status > span[data-status-reason] { white-space: normal; overflow-wrap: anywhere; }
@@ -49,6 +57,7 @@ h2 .about { display: inline-flex; margin-left: 6px; color: var(--ink-3); vertica
 h2 .about svg { width: 15px; height: 15px; }
 #sessions .limit { margin: 10px 0 6px; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0 0 16px; align-items: start; }
+#cards { grid-template-columns: minmax(0, 1fr); }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; min-width: 0; }
 .head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
 .free { font-size: 1.05rem; font-weight: 600; }
@@ -88,8 +97,11 @@ tbody tr:not([aria-expanded]):hover td { background: var(--hover); }
 .slots tr.group .folder svg { width: 15px; height: 15px; }
 .slots tbody td:first-child { padding-left: 26px; }
 [aria-expanded]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.sessions col.size { width: 80px; } .sessions col.share { width: 18%; } .sessions col.state { width: 96px; }
-.sessions td.held { white-space: normal; overflow-wrap: anywhere; }
+.sessions col.who { width: 200px; }
+.sessions col.size { width: 80px; } .sessions col.share { width: 14%; } .sessions col.state { width: 96px; }
+.sessions .held .line { display: flex; gap: 10px; }
+.sessions .held .names { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sessions .held .count { flex: none; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .share i { display: block; height: 8px; min-width: 2px; border-radius: 3px; background: var(--accent); opacity: 0.7; }
 .tag { display: inline-block; padding: 0 7px; border-radius: 9px; font-size: 0.76rem; line-height: 18px; border: 1px solid var(--line); color: var(--ink-2); margin-right: 6px; }
 .tag.run { border-color: transparent; background: color-mix(in srgb, var(--room) 22%, transparent); color: var(--ink); }
@@ -116,9 +128,12 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
   .slots td:nth-child(3) { white-space: normal; }
   .slots .wide { display: none; }
   .slots .narrow { display: block; }
+  .sessions col.who { width: 24%; }
   .sessions col.size { width: 64px; } .sessions col.share { width: 0; } .sessions col.state { width: 72px; }
+  .sessions .held .line { gap: 6px; }
   .sessions .share { display: none; }
   .sessions th { white-space: normal; }
+  .sessions :is(th, td):not(:first-child) { padding-left: 6px; }
 }
 </style>
 </head>
@@ -147,6 +162,16 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
+  const placeSharedTip = placeTipAt;
+  placeTipAt = (tip, x, y) => {
+    const list = tip.querySelector(".tip[data-held-count]");
+    if (list) fitSessionTip(tip, list);
+    placeSharedTip(tip, x, y);
+    if (list) {
+      const bottomLimit = innerHeight - tip.offsetHeight - 8;
+      tip.style.top = `${Math.max(8, Math.min(parseFloat(tip.style.top), bottomLimit))}px`;
+    }
+  };
   return {field, staffField, staffTitle, tooltipHtml, tipRowsHtml, hoverTips, roleName, nameParts};
 })();
 
@@ -360,8 +385,13 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
 function sessionRows(report, keepBytes, limit) {
   const folderSize = bytes => esc(measuredSize(bytes, keepBytes));
   const largest = Math.max(0, ...report.sessions.map(row => row.size || 0));
-  const held = row => row.held.length ? row.held.map(folder => esc(folder.name)
-    + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ") : '<span class="dim">—</span>';
+  const held = row => {
+    if (!row.held.length) return '<span class="dim">—</span>';
+    const names = row.held.map(folder => esc(folder.name)
+      + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ");
+    const count = row.held.length > 1 ? `<span class="count">${row.held.length} folders</span>` : "";
+    return `<div class="line"><span class="names">${names}</span>${count}</div>`;
+  };
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
   const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
@@ -559,7 +589,7 @@ function sessionsView(card) {
     card.innerHTML = `<div class="top"></div><div class="limit">Show sessions of at least<span class="range">`
       + `<span class="end low">any</span><input type="range" min="0" max="${SLIDER_STEPS}" value="0" aria-label="Show sessions of at least">`
       + `<span class="end high"></span><output></output></span></div>`
-      + `<table class="sessions"><colgroup><col><col class="size"><col class="share"><col><col class="state"></colgroup>`
+      + `<table class="sessions"><colgroup><col class="who"><col class="size"><col class="share"><col><col class="state"></colgroup>`
       + `<thead><tr><th>Session</th><th class="n">Size</th><th class="share" aria-label="Share of the largest session"></th>`
       + `<th>Held folders</th><th>State</th></tr></thead><tbody></tbody></table>`;
     slider = card.querySelector("input");
@@ -655,7 +685,9 @@ function tipFor(key) {
   }
   if (kind === "session" && sessionReport) {
     const row = sessionReport.sessions.find(row => row.name === name);
-    return row ? stepTip.tipRowsHtml(sessionTip(row, keepBytes)) : "";
+    if (!row) return "";
+    const html = stepTip.tipRowsHtml(sessionTip(row, keepBytes));
+    return row.held.length ? html.replace('<dl class="tip">', `<dl class="tip" data-held-count="${row.held.length}">`) : html;
   }
   if (kind === "smaller" && sessionReport) return stepTip.tipRowsHtml(smallerTip(sessionsAtLeast(sessionReport, sessionLimit).smaller, sessionLimit, keepBytes));
   return "";
@@ -694,12 +726,37 @@ function slotTip(slot, group, keepBytes, now, unusedDays) {
   return rows;
 }
 
+const SESSION_TIP_FOLDER_LIMIT = 30;
+const moreHeldFolders = count => `+${count} more folders`;
+
 function sessionTip(row, keepBytes) {
   const field = stepTip.field;
   const rows = [stepTip.staffTitle(row.name, row.state === "unknown" ? "state unknown" : row.state), field("Size", measuredSize(row.size, keepBytes))];
   if (!row.held.length) return [...rows, field("Held folders", "none")];
-  return [...rows, ...row.held.flatMap((folder, index) =>
-    [field(folder.name, folder.ended ? "unsaved work" : "held", "field", index === 0), field("", "Task " + folder.task, "long")])];
+  const shown = row.held.slice(0, SESSION_TIP_FOLDER_LIMIT);
+  rows.push(...shown.map((folder, index) =>
+    field(folder.name, `${folder.ended ? "unsaved work" : "held"} · Task ${folder.task}`, "held-folder", index === 0)));
+  const omitted = row.held.length - shown.length;
+  if (omitted) rows.push(field("", moreHeldFolders(omitted), "long"));
+  return rows;
+}
+
+function fitSessionTip(tip, list) {
+  const maxHeight = innerHeight - 16;
+  if (tip.offsetHeight <= maxHeight) return;
+  const folders = [...list.querySelectorAll("dt.held-folder")];
+  let summary = list.querySelector("dd.long");
+  if (!summary) {
+    summary = document.createElement("dd");
+    summary.className = "long";
+    list.append(summary);
+  }
+  while (folders.length && tip.offsetHeight > maxHeight) {
+    const folder = folders.pop();
+    folder.nextElementSibling.remove();
+    folder.remove();
+    summary.textContent = moreHeldFolders(Number(list.dataset.heldCount) - folders.length);
+  }
 }
 
 function smallerTip(rows, limit, keepBytes) {

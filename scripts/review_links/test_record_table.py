@@ -40,6 +40,7 @@ window.fetch=(_path,options={})=>{
   sessionStorage.removeItem(reloadKey);
   check(clear(),'reload clears the failure');
  }else try{
+  if(action==='remove') document.getElementById('filter-show-working').click();
   const [first,second,third,older,newer,next,reload,anchor]=document.querySelectorAll('[data-list-item]');
   const liveRow=row=>document.querySelector('[data-list-item][data-key="'+CSS.escape(row.dataset.key)+'"]');
   const open=row=>{
