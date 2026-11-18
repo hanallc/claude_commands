@@ -36,11 +36,8 @@ def _template(name: str) -> Path:
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
-TEST_CLOUD_GATE_SLOTS = 9
 # Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
-TEST_CONFIG_DEFAULTS = {
-    "build_admission.conf": f"min_pass_gap_seconds=0\ncloud_gate_slots={TEST_CLOUD_GATE_SLOTS}\n",
-}
+TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
