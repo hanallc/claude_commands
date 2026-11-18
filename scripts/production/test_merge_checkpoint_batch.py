@@ -9,9 +9,11 @@ import shutil
 import subprocess
 import unittest
 from typing import final
+from unittest.mock import patch
 
 from scripts.production import staff
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
+from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment,
@@ -65,7 +67,7 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
         return merges
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
-        for outcome in ("shared list", "push failure", "separate lists", "second list fails"):
+        for outcome in ("shared list", "push failure", "separate lists", "second list fails", "second directory sync fails"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -76,7 +78,7 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                 self.production_doc(change_review=review)
                 beta_review = review
                 beta_log = self.log
-                if outcome in ("separate lists", "second list fails"):
+                if outcome in ("separate lists", "second list fails", "second directory sync fails"):
                     other_checkout = self.root / "other-production"
                     _ = self.git("init", "-b", "main", str(other_checkout))
                     other_doc = self.root / "other-production.md"
@@ -107,7 +109,20 @@ subprocess.run(["git", "push", origin, "HEAD:refs/heads/production"],
                check=True, timeout=TEST_HANG_GUARD_SECS)
 raise SystemExit(1)
 """)
-                result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second)])
+                sync_folder = atomic_file.sync_folder
+
+                def sync(folder: Path) -> None:
+                    if (folder == beta_review.parent and beta_review.is_file()
+                            and "Beta changes" in beta_review.read_text()):
+                        raise OSError("fixture directory sync failed")
+                    sync_folder(folder)
+
+                batch = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second)]
+                if outcome == "second directory sync fails":
+                    with patch.object(atomic_file, "sync_folder", side_effect=sync):
+                        result = self.land_batch(batch)
+                else:
+                    result = self.land_batch(batch)
                 if outcome == "push failure":
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     tip = self.git("rev-parse", "production", cwd=self.origin)
@@ -142,7 +157,11 @@ raise SystemExit(1)
                         self.assertIn("Beta changes", beta_review.read_text())
                     self.assertIn("alpha phase 2", self.log.read_text())
                     self.assertIn("beta phase 2", beta_log.read_text())
-                    if outcome == "separate lists":
+                    if outcome == "second directory sync fails":
+                        self.assertIn(f"change review: warning — {beta_review}: durability unconfirmed", result.stdout)
+                        self.assertIn("fixture directory sync failed", result.stdout)
+                        self.assertNotIn(f"{beta_review} not written", result.stdout)
+                    if outcome in ("separate lists", "second directory sync fails"):
                         lines = [line for line in result.stdout.splitlines() if "row(s) added to" in line]
                         self.assertEqual(len(lines), 2, result.stdout)
                         for path, change in ((review, "Alpha changes"), (beta_review, "Beta changes")):

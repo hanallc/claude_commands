@@ -30,7 +30,7 @@ from scripts.production import census, live_units
 from scripts.production import session_staff, showrunners, staff, staff_sources, unit_lookup
 from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.agents import remote
-from scripts.lib import conf
+from scripts.lib import conf, git_files
 from scripts.lib.user_zone import user_zone
 from scripts.production import unit_config
 from scripts.message import session_send
@@ -40,7 +40,6 @@ from scripts.lib.process_failure import failure_detail
 from scripts.style import style_config
 from scripts.direct import phase_table, phase_waits
 from scripts.direct import plan_history
-from scripts.worktree import worktrees
 
 from scripts.production import display_cells, land_queue, land_runs
 from scripts.production import unit_queue, waits_on
@@ -458,6 +457,18 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
     return "Merge position not recorded"
 
 
+def checkpoint_result_key(result: land_runs.LandResult) -> tuple[str, str, str]:
+    return result["unit"], result["phase"], result["commit"].lower()
+
+
+def pending_checkpoint_land(land: land_queue.LandView, commit: str) -> land_queue.LandState:
+    """Show merge progress after the checkpoint decision leaves the phase pending."""
+    state = land_queue.land_state(land, commit)
+    if isinstance(state, land_queue.LandEnded) and state.result["landed"]:
+        return land_queue.LineUnused() if isinstance(land.line, land_queue.NoLine) else land_queue.NotInLine()
+    return state
+
+
 def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
                on_main: Callable[[str], bool], unit_waits: Sequence[phase_waits.UnitWait] = (),
                done_ids: tuple[str, ...] = (), phase_titles: tuple[tuple[str, str], ...] = (),
@@ -526,7 +537,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         if (wait.target in queued or wait.target in merging
                 or result is not None and (not isinstance(sent, SentCommit) or result["commit"] == sent.commit)):
             continue
-        if isinstance(sent, SentCommit) and not isinstance(land_queue.land_state(land, sent.commit),
+        if isinstance(sent, SentCommit) and not isinstance(pending_checkpoint_land(land, sent.commit),
                                                           land_queue.NotInLine | land_queue.LineUnused):
             continue
         if isinstance(sent, SentCommit) and on_main(sent.commit):
@@ -554,9 +565,13 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     for phase, sent in open_sent.items():
         if isinstance(sent, NoSentWork) or phase in shown:
             continue
-        state = land_queue.land_state(land, sent.commit) if isinstance(sent, SentCommit) else land_queue.LineUnused()
-        if isinstance(state, land_queue.LandEnded) and state.result["landed"]:
-            continue
+        state: land_queue.LandState = land_queue.LineUnused()
+        if isinstance(sent, SentCommit):
+            state = land_queue.land_state(land, sent.commit)
+            if isinstance(state, land_queue.LandEnded) and state.result["landed"]:
+                if checkpoint_result_key(state.result) == (unit, phase, sent.commit.lower()):
+                    continue
+                state = pending_checkpoint_land(land, sent.commit)
         if phase in holds:
             text = unit_wait_state(holds[phase], now=now, zone=zone)
         elif isinstance(sent, SentCommit) and isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
@@ -1391,23 +1406,7 @@ class RepositoryEvidence:
         self.land: land_queue.LandView = land_queue.land_view(repository)
         self.phase_merges: dict[tuple[str, str], waits_on.PhaseMerge] = waits_on.landed_phases(repository)
         self.identities: frozenset[waits_on.CommitIdentity] = waits_on.main_commit_identities(repository)
-        self.merge_times: dict[tuple[str, str], float] = {
-            key: float(merge.timestamp_epoch) for key, merge in self.phase_merges.items()}
-        self.landed_commits: dict[tuple[str, str], set[str]] = {}
         self.main_states: dict[str, bool] = {}
-        for result in self.land.results.values():
-            if not result["landed"]:
-                continue
-            key = (result["unit"], result["phase"])
-            self.landed_commits.setdefault(key, set()).add(result["commit"].lower())
-            recorded = cast(object, result.get("time"))
-            if not isinstance(recorded, str):
-                continue
-            try:
-                at = datetime.fromisoformat(recorded).timestamp()
-            except ValueError:
-                continue
-            self.merge_times[key] = max(self.merge_times.get(key, at), at)
 
     def on_main(self, commit: str) -> bool:
         """Share the ancestry and copied-checkpoint decision across all board uses."""
@@ -1417,12 +1416,28 @@ class RepositoryEvidence:
                                      or waits_on.copied_on_main(self.repository, commit, self.identities))
         return self.main_states[key]
 
-    def exact_checkpoint(self, unit: str, phase: str, sent: SentCommit) -> bool:
-        """Use exact successful records before additional Git checks."""
-        if sent.commit.lower() in self.landed_commits.get((unit, phase), ()):
-            return True
+    def names_checkpoint(self, unit: str, phase: str, commit: str) -> bool:
         merge = self.phase_merges.get((unit, phase))
-        return merge is not None and sent.commit.lower().startswith(merge.checkpoint_commit.lower())
+        return merge is not None and commit.lower().startswith(merge.checkpoint_commit.lower())
+
+
+def phase_dependency(events: list[dict[str, object]], phase: str) -> waits_on.PhaseSent | waits_on.PhaseOpen | waits_on.PhaseNotStarted:
+    """Read the checkpoint from the latest attempt of the phase."""
+    instance = next((event.get("phase_instance_id") for event in reversed(events)
+                     if event.get("event_type") == "phase_started" and event.get("phase_id") == phase), None)
+    if instance is None:
+        return waits_on.PhaseNotStarted()
+    attempt: list[dict[str, object]] = []
+    for event in events:
+        if event.get("phase_instance_id") == instance:
+            attempt.append(event)
+            if event.get("event_type") == "phase_finished" and event.get("status") == "completed":
+                break
+    sent = phase_sent_work(attempt)
+    if isinstance(sent, SentCommit):
+        hold = next((wait for wait in phase_waits.unit_waits(events) if wait.target == phase), phase_waits.NO_UNIT_WAIT)
+        return waits_on.PhaseSent(sent.commit, hold)
+    return waits_on.PhaseOpen(None)
 
 
 def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
@@ -1443,23 +1458,30 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
 
     current_evidence = repository_evidence(repository)
     recorded_land = current_evidence.land._replace(carried_running=frozenset(), carried_line={})
-    destinations: dict[str, land_runs.LandResult] = {}
-    for result in recorded_land.results.values():
-        previous = destinations.get(result["unit"])
-        if result.get("production") and (previous is None or result["time"] > previous["time"]):
-            destinations[result["unit"]] = result
+    results = {checkpoint_result_key(row): row for row in recorded_land.results.values()}
+    pending_results = {commit: row for commit, row in recorded_land.results.items() if not row["landed"]}
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
     plan_failures: dict[Path, OSError | UnicodeError] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
-    wait_states: dict[tuple[Path | CheckpointRepositoryUnavailable, str], DependencyState] = {}
+    wait_states: dict[tuple[Path | CheckpointRepositoryUnavailable, str], tuple[DependencyState, land_queue.LandView]] = {}
     dependency_members = {row.name: row for row in staff.active(snapshot, "unit")}
     unit_repositories: dict[staff.StaffId, Path | CheckpointRepositoryUnavailable] = {}
     destination_repositories: dict[str, Path | CheckpointRepositoryUnavailable] = {}
+    common_directories: dict[Path, Path] = {}
     try:
-        evidence[worktrees.main_checkout(repository)] = current_evidence
-    except worktrees.Refused:
+        common_directories[git_files.locate(repository).common_dir] = repository
+    except (OSError, ValueError, RuntimeError):
         pass
+
+    def checkout_source(path: Path) -> Path | CheckpointRepositoryUnavailable:
+        if path == repository:
+            return repository
+        try:
+            checkout = git_files.locate(path)
+        except (OSError, ValueError, RuntimeError):
+            return CheckpointRepositoryUnavailable()
+        return common_directories.setdefault(checkout.common_dir, checkout.toplevel)
 
     def read_run(path: Path) -> list[dict[str, object]]:
         if path not in events:
@@ -1480,76 +1502,73 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             queues[identity] = read_work_queue(identity)
         return queues[identity]
 
-    def unit_repository(member: staff.StaffRow) -> Path | CheckpointRepositoryUnavailable:
-        tree = member.worktree
-        if isinstance(tree, staff.PresentWorktree) and local_worktree_exists(tree):
-            try:
-                return worktrees.main_checkout(tree.path)
-            except worktrees.Refused:
-                pass
-        result = destinations.get(member.name)
-        if result is None:
-            return CheckpointRepositoryUnavailable()
-        destination = result["production"]
+    def member_repository(member: staff.StaffRow) -> Path | CheckpointRepositoryUnavailable:
+        if member.id not in unit_repositories:
+            tree = member.worktree
+            unit_repositories[member.id] = (checkout_source(tree.path)
+                                            if isinstance(tree, staff.PresentWorktree) and local_worktree_exists(tree)
+                                            else CheckpointRepositoryUnavailable())
+        return unit_repositories[member.id]
+
+    def checkpoint_source(result: land_runs.LandResult | None,
+                          source: Path | CheckpointRepositoryUnavailable) -> Path | CheckpointRepositoryUnavailable:
+        if isinstance(source, Path) or result is None or not (destination := result.get("production")):
+            return source
         if destination not in destination_repositories:
             try:
-                checkout = read_production(destination, record=snapshot).checkout
-                destination_repositories[destination] = worktrees.main_checkout(checkout)
-            except (OSError, ValueError, Refusal, worktrees.Refused):
+                destination_repositories[destination] = checkout_source(read_production(destination, record=snapshot).checkout)
+            except (OSError, ValueError, Refusal):
                 destination_repositories[destination] = CheckpointRepositoryUnavailable()
         return destination_repositories[destination]
 
-    def repository_for(member: live_units.LiveUnit) -> Path | CheckpointRepositoryUnavailable:
-        return member_repository(member.member) if isinstance(member.member, staff.StaffRow) else repository
-
-    def member_repository(member: staff.StaffRow) -> Path | CheckpointRepositoryUnavailable:
-        if member.id not in unit_repositories:
-            unit_repositories[member.id] = unit_repository(member)
-        return unit_repositories[member.id]
-
-    def dependency_repository(after: str, viewer: live_units.LiveUnit) -> Path | CheckpointRepositoryUnavailable:
-        unit_name, slash, phase = after.partition("/")
-        target = dependency_members.get(unit_name) if slash and phase else None
-        return member_repository(target) if target is not None else repository_for(viewer)
-
-    def wait_state(after: str, source: Path | CheckpointRepositoryUnavailable) -> DependencyState:
-        key = (source, after)
-        if key not in wait_states:
-            found: DependencyState
-            if isinstance(source, Path):
-                target = repository_evidence(source)
-                found = waits_on.state(after, repo=source, snapshot=snapshot, read_run=read_run)
-                if isinstance(found, waits_on.PhaseSent | waits_on.NotOnMain) and target.on_main(found.commit):
-                    found = waits_on.OnMain(found.commit)
-            else:
-                unit_name, slash, phase = after.partition("/")
-                found = source
-                if slash and phase and unit_name in dependency_members:
-                    # The run and named merge can establish facts without the unit's checkout.
-                    observed = waits_on.state(after, repo=repository, snapshot=snapshot, read_run=read_run)
-                    if isinstance(observed, waits_on.PhaseOpen | waits_on.PhaseNotStarted):
-                        found = observed
-                    elif isinstance(observed, waits_on.OnMain):
-                        merge = current_evidence.phase_merges.get((unit_name, phase))
-                        if merge is not None and merge.commit == observed.commit:
-                            found = observed
-                    elif isinstance(observed, waits_on.PhaseSent):
-                        state = land_queue.land_state(recorded_land, observed.commit)
-                        if isinstance(state, land_queue.LandEnded) and state.result["landed"]:
-                            found = waits_on.OnMain(observed.commit)
-                        elif isinstance(observed.wait, phase_waits.UnitWait) or isinstance(
-                                state, land_queue.LandEnded | land_queue.InLine | land_queue.LandRunning):
-                            found = observed
-            wait_states[key] = found
-        return wait_states[key]
-
-    def dependency_land(after: str, viewer: live_units.LiveUnit) -> land_queue.LandView:
-        source = dependency_repository(after, viewer)
-        return repository_evidence(source).land if isinstance(source, Path) else recorded_land
+    def checkpoint_merged(unit: str, phase: str, commit: str, source: Path | CheckpointRepositoryUnavailable) -> bool:
+        result = results.get((unit, phase, commit.lower()))
+        if result is not None and result["landed"]:
+            return True
+        source = checkpoint_source(result, source)
+        target = repository_evidence(source) if isinstance(source, Path) else current_evidence
+        return target.names_checkpoint(unit, phase, commit) or isinstance(source, Path) and target.on_main(commit)
 
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
-    newest = newest_unit_runs(unit_snapshot)
+    newest = newest_unit_runs(snapshot)
     runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
+
+    def dependency(after: str, source: Path | CheckpointRepositoryUnavailable) -> tuple[DependencyState, land_queue.LandView]:
+        unit_name, slash, phase = after.partition("/")
+        member = dependency_members.get(unit_name) if slash and phase else None
+        if member is not None:
+            source = member_repository(member)
+        key = (source, after)
+        if key not in wait_states:
+            land = recorded_land
+            found: DependencyState = source if isinstance(source, CheckpointRepositoryUnavailable) else waits_on.NotFound()
+            if member is not None:
+                run = newest.get(member.id)
+                observed = phase_dependency(read_run(run.path) if run is not None else [], phase)
+                found = observed
+                if isinstance(observed, waits_on.PhaseSent):
+                    commit = observed.commit
+                    if checkpoint_merged(unit_name, phase, commit, source):
+                        found = waits_on.OnMain(commit)
+                    else:
+                        result = results.get((unit_name, phase, commit.lower()))
+                        target = checkpoint_source(result, source)
+                        if isinstance(target, Path):
+                            land = repository_evidence(target).land
+                        land = land._replace(results=pending_results)
+                        if (isinstance(target, CheckpointRepositoryUnavailable)
+                                and isinstance(observed.wait, phase_waits.NoUnitWait)
+                                and isinstance(land_queue.land_state(land, commit), land_queue.NotInLine | land_queue.LineUnused)):
+                            found = target
+            elif isinstance(source, Path):
+                target = repository_evidence(source)
+                land = target.land
+                commit = waits_on.commit_of(source, after)
+                if commit:
+                    found = waits_on.OnMain(commit) if target.on_main(commit) else waits_on.NotOnMain(commit)
+            wait_states[key] = found, land
+        return wait_states[key]
+
     machines = display_cells.machine_column([unit.machine for unit in units])
     no_workers = quota_state.no_worker_mode()
     states: list[UnitBoardState] = []
@@ -1559,7 +1578,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         record = records.get(unit.unit)
         progress_record = record
         member = unit.member
-        source = repository_for(unit)
+        source = member_repository(member) if isinstance(member, staff.StaffRow) else repository
         unit_evidence = repository_evidence(source) if isinstance(source, Path) else current_evidence
         repository_available = isinstance(source, Path)
         land = unit_evidence.land if repository_available else recorded_land
@@ -1618,27 +1637,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                      for phase in phases if phase.phase not in dropped}
         waits = [wait for wait in phase_waits.unit_waits(run_events) if wait.target not in dropped]
         done = {phase: sent for phase, sent in completed_unit_phases(run_events).items() if phase not in dropped}
-        merged_phases = {phase for phase, sent in open_sent.items() if isinstance(sent, SentCommit)
-                         and (unit_evidence.exact_checkpoint(unit.unit, phase, sent) or on_main(sent.commit))}
-        for (owner, phase), at in unit_evidence.merge_times.items():
-            if owner != unit.unit or phase in open_sent:
-                continue
-            sent = done.get(phase, NoSentWork())
-            if not isinstance(sent, SentCommit):
-                merged_phases.add(phase)
-            elif isinstance(sent.timestamp_epoch, CheckpointTimeUnrecorded):
-                subject = unit_evidence.phase_merges.get((owner, phase))
-                if subject is not None and sent.commit.lower().startswith(subject.checkpoint_commit):
-                    merged_phases.add(phase)
-            elif at >= sent.timestamp_epoch:
-                merged_phases.add(phase)
-        for phase, sent in done.items():
-            if phase in open_sent or phase in merged_phases or not isinstance(sent, SentCommit):
-                continue
-            if (unit_evidence.exact_checkpoint(unit.unit, phase, sent) or on_main(sent.commit)):
-                merged_phases.add(phase)
-            else:
-                open_sent[phase] = sent
+        merged_phases = {phase for phase, sent in (done | open_sent).items() if isinstance(sent, SentCommit)
+                         and checkpoint_merged(unit.unit, phase, sent.commit, source)}
+        open_sent.update((phase, sent) for phase, sent in done.items()
+                         if phase not in open_sent and phase not in merged_phases and isinstance(sent, SentCommit))
         waits = [wait for wait in waits if wait.target not in merged_phases]
         for wait in waits:
             if (wait.target in done and wait.target not in open_sent
@@ -1651,8 +1653,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan,
-                              wait_state=lambda after: wait_state(after, dependency_repository(after, unit)),
-                              dependency_land=lambda after: dependency_land(after, unit), now=now, zone=zone,
+                              wait_state=lambda after: dependency(after, source)[0],
+                              dependency_land=lambda after: dependency(after, source)[1], now=now, zone=zone,
                               unit_waits=tuple(wait for wait in waits if wait.target not in merge.wait_targets),
                               unit=unit.unit, events=run_events, facts=facts)
         tasks = tuple(task for phase in phases if isinstance(open_sent[phase.phase], NoSentWork)

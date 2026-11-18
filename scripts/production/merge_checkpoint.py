@@ -554,9 +554,13 @@ def record_publication_changes(production: ProductionDocument, *, report_unchang
             checkpoint_gate.report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
     failure = ""
+    warning = ""
     try:
         rows = change_review.list_ready_rows(production.checkout, production.doc, production.merge_branch, record=record,
                                              known_producer=known_producer)
+    except change_review.ReviewListDurabilityUnconfirmed as error:
+        rows = list(error.written_rows)
+        warning = f"{error.list_path}: durability unconfirmed after replacement ({error})"
     except change_review.ReviewListWriteFailed as error:
         rows = list(error.written_rows)
         failure = f"{error.list_path} not written: {error}; retry after the repair"
@@ -566,11 +570,13 @@ def record_publication_changes(production: ProductionDocument, *, report_unchang
     rows_by_list: dict[Path, list[str]] = {}
     for row in rows:
         rows_by_list.setdefault(row.list_path, []).append(row.markdown)
-    if not rows and not failure and report_unchanged:
+    if not rows and not failure and not warning and report_unchanged:
         rows_by_list[doc] = []
     for path, written in rows_by_list.items():
         checkpoint_gate.report("change review", "ok",
                                f"{len(written)} row(s) added to {path}" + "".join(f"; {row}" for row in written))
+    if warning:
+        checkpoint_gate.report("change review", "warning", warning)
     if failure:
         checkpoint_gate.report("change review", "failed", failure)
 
