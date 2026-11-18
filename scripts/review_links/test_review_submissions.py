@@ -28,7 +28,8 @@ from urllib.parse import urlencode
 
 from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, urgency
+from scripts.lib import atomic_file, conf, urgency
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, investigation, next_item, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
@@ -187,6 +188,75 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
                 _ = submissions.submit(different)
         self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1"])
+
+    def test_concurrent_draft_sends_reuse_each_recipient_item(self) -> None:
+        first = replace(request(), request_id="r2-" + "a" * 32)
+        second = replace(first, recipient_id=PRODUCER)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            saved, other, replay, other_replay = executor.map(submissions.submit, (first, second, first, second))
+        self.assertEqual(saved.key, replay.key)
+        self.assertEqual(other.key, other_replay.key)
+        self.assertNotEqual(saved.key, other.key)
+        self.assertEqual([record.id for record in investigation.records(OWNER)], [saved.id])
+        self.assertEqual([record.id for record in investigation.records(PRODUCER)], [other.id])
+
+    def test_f021_page_send_reuses_standard_item_filed_with_parent(self) -> None:
+        _ = self.wrap_fixture()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={PRODUCER}\n")
+        standard = replace(request(), request_id="r2-" + "c" * 32)
+        saved = submissions.submit(standard)
+        self.assertEqual((saved.recipient_id, saved.owner), (OWNER, PRODUCER))
+
+        page = replace(standard, recipient_id=PRODUCER, page="review")
+        self.assertEqual(submissions.submit(page).key, saved.key)
+        self.assertEqual(submissions.submit(replace(page, page="")).key, saved.key)
+
+        # Remove the index to exercise receipts saved before it existed.
+        index = submissions.image_folder(saved).parent.with_name(f"r4-{saved.payload_hash}")
+        for marker in (".indexed", f"recipient-{PRODUCER}", "page-review"):
+            (index / marker).unlink()
+        self.assertEqual(submissions.submit(page).key, saved.key)
+        self.assertEqual([record.id for record in investigation.records(PRODUCER)], [saved.id])
+        self.assertEqual(investigation.records(OWNER), [])
+
+    def test_f022_page_retry_keeps_reused_standard_item_after_owner_retires(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={OWNER}\n")
+        standard = replace(request(), request_id="r2-" + "d" * 32)
+        saved = submissions.submit(standard)
+        page = replace(standard, page="review")
+        self.assertEqual(submissions.submit(page).key, saved.key)
+
+        _ = self.wrap_fixture()
+        retry = replace(page, recipient_id=PRODUCER)
+        self.assertEqual(submissions.submit(retry).key, saved.key)
+        self.assertEqual([record.id for record in investigation.records(OWNER)], [saved.id])
+        self.assertEqual(investigation.records(PRODUCER), [])
+
+    def test_draft_id_files_changed_content_before_and_after_native_write(self) -> None:
+        original = replace(request(), request_id="r2-" + "b" * 32, images=(IMAGE,))
+        changed_words = replace(original, words="A different report")
+        changes = (replace(original, kind=submissions.SubmissionKind.INVESTIGATION),
+                   replace(original, recipient_id=PRODUCER),
+                   replace(original, images=()))
+        with patch.object(record_store.NumberedRecords, "write", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                _ = submissions.submit(original)
+        self.assertEqual(investigation.records(OWNER), [])
+        changed = submissions.submit(changed_words)
+        saved = submissions.submit(original)
+        self.assertNotEqual(changed.key, saved.key)
+        saved_keys = {changed.key, saved.key}
+        for change in changes:
+            with self.subTest(change=change):
+                item = submissions.submit(change)
+                self.assertNotIn(item.key, saved_keys)
+                saved_keys.add(item.key)
+                self.assertEqual(submissions.submit(change).key, item.key)
+        self.assertEqual(submissions.submit(original).key, saved.key)
+        self.assertEqual(len(investigation.records(OWNER)), 4)
+        self.assertEqual(len(investigation.records(PRODUCER)), 1)
 
     def test_evidence_and_image_survive_each_native_store_round_trip(self) -> None:
         for kind in submissions.SubmissionKind:

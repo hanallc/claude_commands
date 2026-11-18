@@ -11,12 +11,14 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from typing import cast, override
 
-from scripts.review_links import console, page_frame
+from scripts.review_links import console, page_frame, review_submissions, serve
 from scripts.lib import conf
+from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 NO_DATA_FILE: dict[str, object] = {}
@@ -36,6 +38,34 @@ class PageStatusTests(unittest.TestCase):
                 self.assertIn('role="status" aria-live="off"', markup)
                 self.assertEqual(markup.count('data-status-icon='), 5)
                 self.assertIn('aria-live="polite" data-status-announcement', markup)
+
+    def test_page_owner_uses_current_name_and_parent_chain(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = root / "console.conf"
+        _ = config.write_text("page.list.owner=owner\nowner.default=default\n", encoding="utf-8")
+        document = root / "remote" / "production.md"
+        live = staff.LiveDoc("natedev", document)
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "Nearest", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("session-parent"), doc=live)
+        default = replace(parent, id=staff.StaffId("default"), name="Default")
+        owner = replace(parent, id=staff.StaffId("owner"), name="Current & name", parent=staff.ReportsTo(parent.id))
+        rows = staff.StaffSnapshot((parent, default, owner))
+        settings = conf.read(config)
+        self.assertEqual(review_submissions.page_owner("list", settings, rows), owner)
+        self.assertEqual(review_submissions.page_owner("list", settings, replace(rows, pending_retire=(owner.id,))), parent)
+        wrapped = replace(owner, doc=staff.WrappedDoc("natedev", document))
+        self.assertEqual(review_submissions.page_owner("list", settings, replace(rows, rows=(parent, default, wrapped))), parent)
+        self.assertEqual(review_submissions.page_owner("list", settings, replace(rows, rows=(parent, default))), default)
+        self.assertEqual(review_submissions.page_owner("images", settings, rows), default)
+        with (patch.object(staff, "local_snapshot", return_value=rows),
+              patch.dict(os.environ, {"CONF_DIR": str(root)}),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("The owner launched a process."))):
+            page = serve.owned_document(b'<html><head></head><body><main><h1>The List</h1></main></body></html>', "list")
+        self.assertIn(b'data-page-owner="list"', page)
+        self.assertIn(b'class="staff-name" data-color-text="role.showrunner"', page)
+        self.assertIn(b'aria-label="New item for Current &amp; name" title="New item for Current &amp; name"', page)
+        self.assertEqual(page.count(b'<dialog id="review-new-item"'), 1)
+        self.assertEqual(page_frame.with_owner(page, "list", owner, rows, lambda: self.fail("The dialog already exists.")), page)
 
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
         for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):

@@ -1176,8 +1176,8 @@ def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, .
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
             selection: ReviewSelection, *, assign_ids: bool = False) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
-    documents = tuple(dict.fromkeys(member.doc.path for member in members.rows
-                      if member.kind == 'showrunner' and isinstance(member.doc, staff.LiveDoc)))
+    documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
+                                    if (doc := record_store.local_document(member)) is not None))
     items: list[ReviewItem] = []
     if ReviewType.QUESTION in kinds:
         items.extend(question_items(members,documents,states=states,owner_options=owner_options,

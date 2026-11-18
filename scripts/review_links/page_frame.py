@@ -12,9 +12,64 @@ from pathlib import Path
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
+from scripts.production import staff
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
+OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "rebuilds", "review"))
+
+
+def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.StaffSnapshot,
+               dialog: Callable[[], str]) -> bytes:
+    """Add the shared owner control to one served console document."""
+    from scripts.review_links import staff_names
+
+    main = re.search(rb"<main(?=[\s>])[^>]*>", content)
+    if main is None or b'data-page-owner="' in content:
+        return content
+    name = staff_names.StaffNames(members).html(owner.id, owner.name)
+    label = html.escape(f"New item for {owner.name}", quote=True)
+    header = (f'<div class="page-owner" data-page-owner="{page}">{name}'
+              + f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
+              + icon_svg("message-circle-question") + '</button></div>').encode()
+    content = content[:main.end()] + header + content[main.end():]
+    head = re.search(rb"<head(?=[\s>])[^>]*>", content)
+    if head is not None:
+        content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
+    content = content.replace(b'</head>', OWNER_STYLE.encode() + b'</head>', 1)
+    if b'id="review-new-item"' not in content:
+        content = content.replace(b'</body>', dialog().encode() + b'</body>', 1)
+    return content
+
+
+OWNER_STYLE = """<style>
+.page-owner{float:right;display:flex;align-items:center;justify-content:flex-end;gap:8px;
+margin:0 0 6px 12px;max-width:50%;font:600 14px/1.4 system-ui,sans-serif;position:relative;z-index:1}
+.page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
+margin:0;padding:7px;background:var(--card);color:var(--ink-2);border:1px solid var(--line);border-radius:8px;cursor:pointer}
+.page-owner button:hover{color:var(--ink);background:var(--hover)}
+.page-owner svg{width:18px;height:18px}
+</style>"""
+
+
+PAGE_SCRIPT_ERRORS = r"""<script>(() => {
+ const errors = [];
+ window.consoleScriptErrors = errors;
+ const clip = (value, length) => value.match(new RegExp('^.{0,' + length + '}', 'su'))[0];
+ function remember(message, source = '', line = 0, column = 0) {
+  errors.push({message: clip(message.trim() || 'Script error', 512), source: clip(source, 2048),
+               line, column, at: new Date().toISOString()});
+  if (errors.length > 20) errors.shift();
+ }
+ window.addEventListener('error', event => {
+  if (event instanceof ErrorEvent) remember(event.message, event.filename, event.lineno, event.colno);
+ });
+ window.addEventListener('unhandledrejection', event => {
+  const reason = event.reason;
+  remember(reason instanceof Error ? reason.message :
+           typeof reason === 'string' ? reason : 'Unhandled promise rejection');
+ });
+})();</script>"""
 
 
 def icon_svg(name: str) -> str:
@@ -109,10 +164,11 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  async function present(value,began,own,initial=false){
   try{
   if(!Number.isFinite(value.readAt) || !Number.isFinite(value.renderSeconds)) throw new Error('The data has no render time.');
-  if(initial){last=value;failure=value.failure || '';draw();}
+  if(initial){last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;failure=value.failure || '';draw();}
   await frame();if(own!==request) return;
   if(held()){pending={value,began,own};draw();return;}
-  last=value;trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
+  last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;
+  trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
   }catch(error){failed(error,own);}
  }
  async function refresh(supersede=false){

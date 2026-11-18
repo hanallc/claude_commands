@@ -62,19 +62,22 @@ def record_action(item: review_items.ReviewItem, words: str, *, root: Path | Non
         _ = check()
 
 
-def record_superseded(item: review_items.ReviewItem, action: str) -> None:
+def record_superseded(item: review_items.ReviewItem, action: str, *,
+                      scope: update_registration.QuestionScope | None = None) -> None:
     """Keep the displaced wait in the record and the owner's production log."""
     words = superseded_words(action)
     record_action(item, words)
-    log_superseded(item, words)
+    log_superseded(item, words, scope=scope)
 
 
 def superseded_words(action: str) -> str:
     return f'User chose {action} before the answer; superseded the previous wait.'
 
 
-def log_superseded(item: review_items.ReviewItem, words: str) -> None:
-    scope = update_registration.question_scope(item.owner, staff.snapshot())
+def log_superseded(item: review_items.ReviewItem, words: str, *,
+                   scope: update_registration.QuestionScope | None = None) -> None:
+    if scope is None:
+        scope = update_registration.question_scope(item.owner, staff.snapshot())
     if isinstance(scope, Production):
         update_registration.append_log(scope, f'Review {item.id}: '+words, None, False)
 
@@ -132,9 +135,10 @@ def question_action(item: review_items.ReviewItem, action: change_page.QuestionO
     if not words.strip():
         raise question_record.AnswerRefused('enter an answer')
     identities = update_registration.QuestionStaff.read()
-    scope = update_registration.question_scope(item.owner, identities.record)
     if 'review_submission' in source.record.item:
+        scope = review_submissions.sent_question_scope(item.owner, identities.record)
         return sent_question_action(item, source.record, scope, action, words, status)
+    scope = update_registration.question_scope(item.owner, identities.record)
     with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
         current = update_registration.current_open_question(source.record, 'followup')
         pending = current.item.pop('followup', None)
@@ -181,7 +185,7 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
             if verify_revision is not None:
                 _ = verify_revision()
             if item.state == review_items.ReviewState.WAITING:
-                record_superseded(item, action)
+                record_superseded(item, action, scope=scope)
             update_registration.review_sent_question(record, scope, action, words,
                                                     scoped.token if isinstance(scoped, ScopedWait) else '')
 
@@ -245,12 +249,13 @@ def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save
 
 
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
-                                status: change_page.DeliveryStatus
+                                status: change_page.DeliveryStatus, *, evidence_url: str = ""
                                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Claim the first message for a published native request."""
     row = saved.request_id
     path = saved.original_path
-    message = (f'New {saved.kind} {saved.id} from Review.\n\n{words}\n\n'
+    evidence = f"\n\nEvidence in Review\n{evidence_url}" if evidence_url else ""
+    message = (f'New {saved.kind} {saved.id} from Review.\n\n{words}{evidence}\n\n'
                + change_page.reply_command(saved.key, saved.reply_token))
     record: change_page.StoredReviewMessage = {
         'source': str(path), 'row': row, 'saved': True, 'owner': saved.owner,
