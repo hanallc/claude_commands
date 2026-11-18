@@ -3,43 +3,88 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 import json
-from pathlib import Path
 import subprocess
 from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import config, hana_spend, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, instant, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, instant
 from scripts.lib import conf
 
 
-REPOSITORY = Path(__file__).resolve().parents[2]
+HANA_SETTINGS = """\
+enabled=on
+region=us-east-2
+instance_type=m7a.4xlarge
+spot_max_usd_per_hour=0.35
+daily_budget_usd=6
+gp3_usd_per_gib_month=0.08
+# whole: 1..
+root_gib=40
+# whole: 1..
+data_gib=300
+# whole: 1..
+guard_grace_seconds=60
+# whole: 1..
+watchdog_check_seconds=1
+# whole: 1..
+permit_max_seconds=1800
+# whole: 1..
+step_cpu_limit=4
+# whole: 1..
+step_memory_gib=24
+# whole: 1..
+mount_timeout_seconds=15
+"""
+
+ACCOUNT_SETTINGS = """\
+instance_type=m7a.4xlarge
+spot_max_usd_per_hour=0.483
+daily_limit_usd=35
+monthly_limit_usd=400
+limit_reserve_usd=0
+limit_action=drain
+accounting_zone=UTC
+fallback_usd_per_hour=1
+fixed_usd_per_month=0
+retained_storage_usd_per_month=0
+root_storage_usd_per_month=0
+ipv4_usd_per_month=0
+gp3_iops_usd_per_month=0
+gp3_throughput_usd_per_month=0
+box_minimum_seconds=60
+price_refresh_seconds=3600
+price_max_age_seconds=7200
+observation_max_age_seconds=86400
+cost_explorer_read_usd=0
+cost_explorer_interval_seconds=86400
+cost_explorer_lookback_days=1
+cost_explorer_tag_key=Project
+cost_explorer_tag_value=fixture-build
+notification_recipient=fixture-showrunner
+notification_timeout_s=5
+notification_retry_s=60
+"""
 
 
 class HanaSpendTests(CostFixture):
-    book: ledger.CostLedger = ledger.CostLedger(Path())
-    controller: hana_spend.HanaSpending
-    workload: hana_spend.PermitSettings
+    book: ledger.CostLedger  # pyright: ignore[reportUninitializedInstanceVariable]
+    controller: hana_spend.HanaSpending  # pyright: ignore[reportUninitializedInstanceVariable]
+    workload: hana_spend.PermitSettings  # pyright: ignore[reportUninitializedInstanceVariable]
     start: int = instant('2026-01-15T00:00:00+00:00')
-
-    def __init__(self, methodName: str = 'runTest'):
-        super().__init__(methodName)
-        self.workload = hana_spend.read_settings(conf.read(REPOSITORY / 'config/hana_aws.conf'))
-        self.controller = hana_spend.HanaSpending(self.book, Path(), self.workload)
 
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         private = self.root / 'hana_aws.conf'
-        _ = private.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        text_setting(private, 'enabled', 'on')
+        _ = private.write_text(HANA_SETTINGS)
+        _ = self.settings.write_text(ACCOUNT_SETTINGS)
         self.workload = hana_spend.read_settings(conf.read(private))
-        account = conf.read(REPOSITORY / 'config/aws_target.conf')
-        self.costs({'daily_limit_usd': account.text('daily_limit_usd'), 'limit_reserve_usd': '0'})
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'private inventory', builder_removed=True))
         self.book.observe(ledger.InstanceObservation(self.start, 'terminated', 'private account inventory'))
@@ -71,13 +116,41 @@ class HanaSpendTests(CostFixture):
 
     def test_gate_spend_and_hana_share_the_unchanged_account_limit(self) -> None:
         account = config.read_settings(self.settings)
-        self.assertEqual(account.daily_limit_usd, conf.decimal(conf.read(REPOSITORY / 'config/aws_target.conf').text('daily_limit_usd')))
         storage = self.workload.storage_usd_per_month / 30
         gate = ledger.GateReservation('private-gate', self.start, self.start + 3600,
             account.daily_limit_usd - storage / 2, Decimal(0), instance_type=account.instance_type, region=self.workload.region)
         self.assertIsInstance(self.book.reserve_gate(self.settings, gate), ledger.GateReserved)
         self.assertEqual(self.issue(self.start), hana_spend.PermitRefused('daily_limit'))
         self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        self.assertEqual(config.read_settings(self.settings).daily_limit_usd, account.daily_limit_usd)
+
+    def test_check_start_refuses_after_a_gate_launch_appears_during_pricing(self) -> None:
+        self.costs({'daily_limit_usd': '5', 'limit_reserve_usd': '0'})
+        day = self.start - 86400
+        bill = ledger.ChargeRead(datetime.fromtimestamp(day, UTC).date().isoformat(), self.start,
+            day, self.start, Decimal(10), Decimal(0), Decimal(0),
+            (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal(10), Decimal(1), 'Hrs'),))
+        charges = self.state / 'charges'
+        charges.mkdir()
+        _ = (charges / f'{bill.day}.json').write_text(json.dumps(ledger.charge_record(bill)))
+        gate = ledger.GateReservation('private-gate', self.start, self.start + 3600,
+            Decimal(1), Decimal(0), instance_type='m7a.4xlarge', region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, gate), ledger.GateReserved)
+        generation = self.issued(self.start).exposure.generation
+        self.assertIsInstance(self.controller.check_start(self.start, generation), hana_spend.StartReserved)
+        history = self.state / 'cloud-gate-launches.jsonl'
+        launches = self.book.launches
+
+        def read_launches() -> tuple[dict[str, object], ...]:
+            rows = launches()
+            if not rows:
+                _ = history.write_text(json.dumps({'attempt': gate.attempt, 'time': self.start,
+                    'instance_type': 'm7a.8xlarge', 'result': 'launched'}) + '\n')
+            return rows
+
+        with mock.patch.object(self.book, 'launches', side_effect=read_launches) as pricing_reads:
+            self.assertEqual(self.controller.check_start(self.start, generation), hana_spend.PermitRefused('daily_limit'))
+        self.assertEqual(pricing_reads.call_count, 2)
 
     def test_renewal_extends_exposure_then_refusal_preserves_the_old_deadline(self) -> None:
         first = self.issued(self.start)
