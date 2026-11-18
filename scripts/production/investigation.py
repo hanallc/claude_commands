@@ -74,15 +74,19 @@ class Investigations(record_store.NumberedRecords):
 
     @override
     @contextmanager
-    def locked(self) -> Generator[None]:
+    def locked(self, *, check: Callable[[], object] | None = None) -> Generator[None]:
         path = self.lock_path().resolve()
         held = _held_recipients.get()
         if path in held:
+            if check is not None:
+                _ = check()
             yield
             return
         with super().locked():
             token = _held_recipients.set(held | {path})
             try:
+                if check is not None:
+                    _ = check()
                 yield
             finally:
                 _held_recipients.reset(token)
@@ -365,10 +369,11 @@ def _answer(store: Investigations, identity: str, text: str, question_id: str,
         return item, True
 
 
-def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investigation:
+def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
+              check: Callable[[], object] | None = None) -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
     store = _store(owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
         if item.state == InvestigationState.READ:
@@ -381,12 +386,13 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investiga
         return item
 
 
-def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *, reply_token: str = "") -> Investigation:
+def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *, reply_token: str = "",
+                  check: Callable[[], object] | None = None) -> Investigation:
     """Record feedback or a question and keep each previous answer in the log."""
     if not words.strip():
         raise InvestigationError("enter your words")
     store = _store(owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
         replace_wait = (item.state == InvestigationState.OPEN and action == 'question' and bool(reply_token)
@@ -411,19 +417,20 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
         return item
 
 
-def record_review_log(owner: staff.StaffId, identity: str, words: str) -> None:
+def record_review_log(owner: staff.StaffId, identity: str, words: str, *,
+                      check: Callable[[], object] | None = None) -> None:
     store = _store(owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
         event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
         _ = _save(store, replace(item, log=review_events.append(item.log, event)), path)
 
 
-def change_waiting(record: Investigation, action: str, words: str) -> None:
+def change_waiting(record: Investigation, action: str, words: str, *, check: Callable[[], object] | None = None) -> None:
     """Update a waiting investigation selected by its owner and ID."""
     store = _store(record.owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, record.id)
         item = _load(store, record.id, path)
         if item.submission != record.submission or item.state != InvestigationState.OPEN:

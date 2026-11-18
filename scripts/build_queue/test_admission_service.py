@@ -46,6 +46,7 @@ from scripts.lib import inotify, test_hang_guard
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_send
+from scripts.production import staff
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
@@ -3974,6 +3975,50 @@ class RoomAndSlotTests(unittest.TestCase):
                     self.assertIn(expected, output.getvalue())
                 else:
                     self.assertIsInstance(reply.reason.cause, records.MemoryPressure)
+
+    def test_release_keeps_the_hold_and_its_charge_for_all_recorded_step_text(self) -> None:
+        cases = (("", "hana"), (" ", "hana"), ("556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", "hana"),
+                 ("umask", "hana"), ("$UNIT", "hana"), ("unrecognized", "hana"), ("test", "hana"),
+                 ("unrecognized", "local repo"), ("mend", "local repo"))
+        for step, repository in cases:
+            with self.subTest(step=step, repository=repository), AdmissionFixture() as fixture:
+                folder = str(fixture.root / repository)
+                request = fixture.request(run=fixture.run_owner(), step=step, need=GIB)
+                assert isinstance(request.profile, records.StepProfile)
+                request = replace(request, profile=replace(request.profile, repo=repository, worktree=folder),
+                                  identity=replace(request.identity, folder=folder))
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.release(grant)
+                self.assertEqual(len(fixture.server.slots), 1)
+                _ = fixture.run_pass()
+                inputs = fixture.server.last_inputs
+                policy = fixture.server.last_policy
+                assert isinstance(inputs, records.QueueInputs) and isinstance(policy, records.AdmissionPolicy)
+                room = gate.inputs_room(inputs, policy)
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.kept, GIB)
+
+    def test_release_records_ended_step_identity(self) -> None:
+        with AdmissionFixture() as fixture:
+            member = staff.StaffRow(staff.StaffId("fixed-director"), "unit", "startup", staff.StaffRoot(),
+                                    current_session=staff.StaffId("old-session"))
+            first = fixture.request(run=fixture.run_owner(), step="nextest")
+            first = replace(first, argv=("cargo", "nextest", "run", "-E", "package(hana)"),
+                            identity=replace(first.identity, session_id=member.current_session))
+            with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((member,))):
+                grant = only_admitted(fixture.server.handle_request(first))
+            fixture.restart()
+            fixture.release(grant)
+            slot, = fixture.server.slots.values()
+            self.assertEqual(cast(dict[str, object], codec.snapshot_value(slot)).get("identity"),
+                             {"kind": "EndedStepFacts", "step": "nextest", "package": "hana",
+                              "project": "fixture", "folder": str(fixture.root), "staff_id": "fixed-director"})
+            _ = fixture.run_pass()
+            saved = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(saved, queue_snapshot.QueueSnapshot)
+            self.assertEqual(saved.inputs.slots, (slot,))
+            fixture.restart()
+            self.assertEqual(fixture.server.slots, {})
 
     def test_view_release_and_admit_pass_capture_the_same_continuation_slot(self) -> None:
         with AdmissionFixture() as fixture:

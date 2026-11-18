@@ -406,13 +406,14 @@ class ClaudeBackendFixture:
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
     """Use private staff and registry paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
+    if "XDG_CONFIG_HOME" not in environment or environment["XDG_CONFIG_HOME"] == os.environ.get("XDG_CONFIG_HOME"):
+        environment["XDG_CONFIG_HOME"] = str(path.parent / "config")
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
     _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
     for key, folder in (
         ("SHOWRUNNER_STATE_DIR", "showrunners"),
         ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("HERDR_PANE_RECORD_DIR", "panes"),
-        ("XDG_CONFIG_HOME", "config"),
         # Session folders belong to staff members; a fixture member never makes one in the live root.
         ("SESSION_TEMP_ROOT", "session"),
     ):

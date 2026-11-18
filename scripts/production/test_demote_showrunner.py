@@ -67,7 +67,8 @@ class DemoteShowrunnerTests(StaffTestCase):
 
     @cached_property
     def marked(self) -> unit_lookup.LabeledSession:
-        return unit_lookup.LabeledSession(self.child_name, self.claude, herdr.HerdrPlace("fixture", "w1:p1"))
+        return unit_lookup.LabeledSession(self.child_name, self.claude, herdr.HerdrPlace("fixture", "w1:p1"),
+                                          identity=unit_lookup.LiveSession(self.claude.session_id))
 
     @override
     def setUp(self) -> None:
@@ -124,9 +125,9 @@ class DemoteShowrunnerTests(StaffTestCase):
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.checkout), *args], capture_output=True, text=True, check=True).stdout.strip()
 
-    def session_labels(self, *, record: staff.StaffSnapshot) -> tuple[unit_lookup.LabeledSession, ...]:
+    def session_labels(self, *, record: staff.StaffSnapshot) -> session_staff.SessionLabelObservations:
         row = record.by_id(self.child.id)
-        return (self.marked,) if row is not None and row.kind == "showrunner" else ()
+        return session_staff.SessionLabelObservations((self.marked,) if row is not None and row.kind == "showrunner" else ())
 
     def retired_unit(self, name: str, branch: str) -> staff.StaffRow:
         tree = self.root / name
@@ -715,7 +716,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                                                      (True, False, "--attach")), start=2):
             with self.subTest(live=live, opening=opening):
                 write_text_atomic(self.journal(), pending)
-                self.observed.return_value = (self.marked,) if live else ()
+                self.observed.return_value = session_staff.SessionLabelObservations((self.marked,) if live else ())
                 with mock.patch.object(add_unit, "pending_opening", return_value=opening):
                     self.assertEqual(self.run_command()[0], 0)
                 self.assertEqual(self.start.call_count, count)
@@ -725,6 +726,52 @@ class DemoteShowrunnerTests(StaffTestCase):
                 self.assertFalse(self.journal().exists())
         self.stop.assert_called_once()
         self.detach.assert_called_once()
+
+    def test_pending_demotion_defers_when_the_pane_list_is_unreadable(self) -> None:
+        self.start.side_effect = None
+        self.start.return_value = 2
+        self.assertEqual(self.run_command()[0], 1)
+        saved = self.journal().read_text()
+        self.start.reset_mock()
+        self.start.return_value = 0
+        self.observed.side_effect = None
+        self.observed.return_value = session_staff.SessionLabelObservations((), (
+            session_staff.UnreadablePaneList("agents", "pane list denied"),))
+        code, _, errors = self.run_command()
+        self.assertEqual(code, 1, errors)
+        self.assertIn("pane list denied", errors)
+        self.assertEqual(self.journal().read_text(), saved)
+        self.start.assert_not_called()
+
+    def test_pending_demotion_resumes_after_observing_empty_shells(self) -> None:
+        self.start.side_effect = None
+        self.start.return_value = 2
+        self.assertEqual(self.run_command()[0], 1)
+        saved = self.journal().read_text()
+        self.start.return_value = 0
+        self.observed.side_effect = None
+        place = herdr.HerdrPlace("agents", "w1:p2")
+        for marks in ({}, {"CLAUDE_CODE_SESSION_ID": str(self.child.current_session)}):
+            with self.subTest(marks=marks):
+                write_text_atomic(self.journal(), saved)
+                self.start.reset_mock()
+                shell = herdr.HerdrProcess(991001, place, marks, "zsh", str(self.root))
+                with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+                      mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
+                      mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                          "shell_pid": 991001, "foreground_process_group_id": 991001,
+                          "foreground_processes": [{"pid": 991001, "argv": ["zsh"]}],
+                      }})):
+                    labels = tuple(item for item in unit_lookup._herdr_labeled(  # pyright: ignore[reportPrivateUsage]
+                        {}, unit_lookup.ClaudeRegistryEvidence({}, unit_lookup.RecordsRead()), [shell])
+                                   if isinstance(item, unit_lookup.LabeledSession))
+                self.observed.return_value = session_staff.SessionLabelObservations(labels)
+                code, _, errors = self.run_command()
+                self.assertEqual(code, 0, errors)
+                self.start.assert_called_once()
+                args = cast(list[str], self.start.call_args.args[0])
+                self.assertEqual(args[args.index("--resume") + 1], self.child.current_session)
+                self.assertFalse(self.journal().exists())
 
     def test_pending_demotion_restores_the_selected_type(self) -> None:
         self.unit_type = "merge"

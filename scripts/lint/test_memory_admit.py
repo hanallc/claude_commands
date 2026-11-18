@@ -644,7 +644,10 @@ class WaitHolderRulesTests(unittest.TestCase):
         continuation["build_run"] = run
         continuation["order_since"] = run.started_at
         inputs = self.inputs(self.running(1, GIB, session="other"))
-        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10)
+        absent = admission_records.EndedStepFactNotRecorded()
+        identity = admission_records.EndedStepFacts("check", admission_records.PackageNotRecorded(),
+                                                    absent, absent, admission_records.NoEndedStepStaff())
+        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10, identity)
         inputs = replace(inputs, ordered=[(Path("head"), head), (Path("continuation"), continuation)],
             slots=(admission_records.ContinuationSlot(slot, admission_records.waiter_owner(continuation)),))
         result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
@@ -5792,7 +5795,8 @@ class StrictTargetLineTests(unittest.TestCase):
 
     def test_continuation_switch_only_allows_a_step_within_its_claim_to_pass(self) -> None:
         run = LiveBuildRun(90, "90", NOW_EPOCH - 10)
-        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10)
+        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10,
+            identity=admission_records.HoldPredatesStepFacts())
         for bypass in (False, True):
             for need in (2, 3):
                 with self.subTest(bypass=bypass, need=need), patch.object(
@@ -6030,7 +6034,8 @@ class QueueExplanationTests(MemoryQueueFixture):
         busy = placement.CargoFolder(self.root / "busy")
         free = placement.CargoFolder(self.root / "free")
         run = LiveBuildRun(900, "900", NOW_EPOCH - 60)
-        slot = admission_records.BetweenStepsSlot(run, "previous", 4 * GIB, NOW_EPOCH + 10)
+        slot = admission_records.BetweenStepsSlot(run, "previous", 4 * GIB, NOW_EPOCH + 10,
+            identity=admission_records.HoldPredatesStepFacts())
         inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB),
             slots=(admission_records.ContinuationSlot(slot, "400-warmup"),),
             cargo_folders={"300-head": busy, "400-warmup": free}, occupied_cargo_folders=frozenset({busy}))
