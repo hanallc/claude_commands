@@ -4518,6 +4518,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
 
 
 COUNT_COLUMNS = ("busy", "idle", "paused", "exited", "total")
+ACCOUNT_BOARD_DESCENDING_SORTS = (*COUNT_COLUMNS, "credits", "enabled")
 ACCOUNT_ROLE_ORDER = ("units", "showrunners", "workers", "producers", "spare", "")
 BOARD_COLUMNS: tuple[BoardColumn, ...] = (
     BoardColumn(key="dot", heading="", align="left"), BoardColumn(key="label", heading="account", align="left"),
@@ -4689,6 +4690,29 @@ class AccountRowPlacement(TypedDict):
     details: bool
 
 
+@dataclass(frozen=True)
+class BoardNextMoveTarget:
+    """The first target for the group on this row."""
+
+    label: str
+
+
+def account_board_next_move(
+    row: BoardRow, first: FirstNextMoveTargets | NextMovesUnavailable,
+) -> BoardNextMoveTarget | NextMovesUnavailable | Literal["unselected", "none", "auto"]:
+    """Find the next move state shared by rendering and sorting."""
+    editable = row.get("group")
+    role = "".join(span["text"] for span in row["cells"]["roles"])
+    if editable is None and role != "workers ✓":
+        return "unselected"
+    if isinstance(first, NextMovesUnavailable):
+        return first
+    group = editable["group"] if editable else "workers"
+    if target := first.targets.get(group):
+        return BoardNextMoveTarget(target)
+    return "none" if editable else "auto"
+
+
 def account_board_sort_orders(reading: StatusReading, board: Board) -> dict[str, list[AccountRowPlacement]]:
     """Prepare both directions of each page sort from the complete account rows."""
     facts = {row.label: row for row in reading.rows}
@@ -4704,43 +4728,51 @@ def account_board_sort_orders(reading: StatusReading, board: Board) -> dict[str,
         labels.append(label)
         complete.append({**row, "cells": {**cells, **details}})
 
-    def role(index: int) -> str:
-        spans = complete[index]["cells"]["roles"]
-        return spans[0]["text"] if spans else ""
+    roles = [spans[0]["text"] if (spans := row["cells"]["roles"]) else "" for row in complete]
+    ranks = {role: rank for rank, role in enumerate(ACCOUNT_ROLE_ORDER)}
+    account_names = [label.casefold() for label in labels]
 
-    def quota(index: int) -> float:
-        value = facts[labels[index]].weekly_left_percent
-        return value if isinstance(value, (float, int)) else 0
-
-    def busy(index: int) -> int:
-        return int(complete[index]["cells"]["busy"][0]["text"] or "0")
-
-    def key(index: int, column: str) -> tuple[float | str, ...]:
-        account = labels[index].casefold()
-        role_name = role(index)
-        rank = ACCOUNT_ROLE_ORDER.index(role_name) if role_name in ACCOUNT_ROLE_ORDER else len(ACCOUNT_ROLE_ORDER)
+    def value(index: int, column: str) -> float | str | datetime | StatusUnavailable:
+        fact = facts[labels[index]]
         if column == "left":
-            return quota(index), account, rank
+            quota = fact.weekly_left_percent
+            return quota if isinstance(quota, (float, int)) else StatusUnavailable()
         if column == "role":
-            return role_name, account
-        if column == "busy":
-            return -busy(index), account
-        return account, rank
-
-    def missing(index: int, column: str) -> bool:
-        if column == "left":
-            return not isinstance(facts[labels[index]].weekly_left_percent, (float, int))
-        if column == "busy":
-            return not complete[index]["cells"]["busy"][0]["text"]
-        return column == "role" and not role(index)
+            return roles[index] or StatusUnavailable()
+        if column == "next":
+            move = account_board_next_move(complete[index], reading.first_next_moves)
+            return move.label.casefold() if isinstance(move, BoardNextMoveTarget) else StatusUnavailable()
+        if column in COUNT_COLUMNS:
+            count = complete[index]["cells"][column][0]["text"]
+            return -int(count) if count else StatusUnavailable()
+        if column == "resets":
+            reset = fact.resets_at
+            return reset.astimezone(timezone.utc) if isinstance(reset, datetime) else reset
+        if column == "credits":
+            credits = fact.credits
+            if isinstance(credits, StatusUnavailable):
+                return credits
+            return -math.inf if credits == "unlimited" else -credits
+        if column == "enabled":
+            return -1 if fact.use_credits else StatusUnavailable()
+        return account_names[index]
 
     orders: dict[str, list[AccountRowPlacement]] = {}
-    for column in ("account", "left", "role", "busy"):
+    columns = [column["heading"] for column in board["columns"] if column["heading"]]
+    for column in (*columns, "next"):
+        present: dict[int, float | str | datetime] = {}
+        absent: list[int] = []
+        for index in range(len(complete)):
+            sort_value = value(index, column)
+            if isinstance(sort_value, StatusUnavailable):
+                absent.append(index)
+            else:
+                present[index] = sort_value
+        ties = [(account, ranks.get(role, len(ranks)) if column in ("account", "left") else 0)
+                for account, role in zip(account_names, roles)]
         for reverse in (False, True):
-            present = [index for index in range(len(complete)) if not missing(index, column)]
-            absent = [index for index in range(len(complete)) if missing(index, column)]
-            indices = sorted(present, key=lambda index: key(index, column), reverse=reverse)
-            indices += sorted(absent, key=lambda index: key(index, column), reverse=reverse)
+            indices = sorted(present, key=lambda index: (present[index], ties[index]), reverse=reverse)
+            indices += sorted(absent, key=lambda index: ties[index], reverse=reverse)
             ordered = account_details_in_row_order([complete[index] for index in indices])
             orders[column + ("-reverse" if reverse else "")] = [
                 AccountRowPlacement(index=index, details=bool(row["cells"]["label"]))

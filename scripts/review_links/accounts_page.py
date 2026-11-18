@@ -134,26 +134,24 @@ def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: 
     """Render the selected group's target or the reason this line has no target."""
     if row["cells"]["label"] and row["cells"]["label"][0]["text"] == "total":
         return ""
+    move = accounts.account_board_next_move(row, reading.first_next_moves)
     editable = row.get("group")
-    role = "".join(span["text"] for span in row["cells"]["roles"])
-    workers = role == "workers ✓"
-    if not editable and not workers:
+    if move == "unselected":
         return ('<span class="next-muted next-minus" title="Not the selected account for a role">'
                 + page_frame.icon_svg("minus") + '</span>')
-    group = editable["group"] if editable else "workers"
-    first = reading.first_next_moves
-    target = first.targets.get(group, "") if isinstance(first, accounts.FirstNextMoveTargets) else ""
-    if isinstance(first, accounts.NextMovesUnavailable):
-        content = '<span class="next-muted" title="' + html.escape(first.reason, quote=True) + '">unavailable</span>'
-    elif target:
+    target = ""
+    if isinstance(move, accounts.BoardNextMoveTarget):
+        target = move.label
         content = _spans([labels.get(target, accounts.BoardSpan(text=target, tone="default", kind="bold"))])
-    elif editable:
+    elif isinstance(move, accounts.NextMovesUnavailable):
+        content = '<span class="next-muted" title="' + html.escape(move.reason, quote=True) + '">unavailable</span>'
+    elif move == "none":
         content = '<span class="next-muted">none</span>'
     else:
         content = ('<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>')
     if editable:
         content += (f'<button type="button" class="next-button" data-next-button data-next-target="{html.escape(target, quote=True)}" '
-                    + f'aria-label="Choose the next account for {group}" aria-haspopup="menu" aria-expanded="false">'
+                    + f'aria-label="Choose the next account for {editable["group"]}" aria-haspopup="menu" aria-expanded="false">'
                     + page_frame.icon_svg("chevron-down") + '</button>')
     return content
 
@@ -182,17 +180,20 @@ def board(reading: accounts.StatusReading) -> str:
                 + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
     # A headerless swatch column follows each column whose first span can carry a configured color.
     def heading(column: accounts.BoardColumn) -> str:
-        key = {"label": "account", "roles": "role"}.get(column["key"], column["key"])
-        if key not in ("account", "left", "role", "busy"):
-            return f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
+        key = column["heading"]
+        if not key:
+            return f'<th class="{column["align"]}"></th>'
         direction = "ascending" if key == "account" else "none"
-        label = html.escape(column["heading"])
+        descending = " data-sort-descending" if key in accounts.ACCOUNT_BOARD_DESCENDING_SORTS else ""
+        label = html.escape(key)
         arrow = '<span class="sort-arrow" aria-hidden="true">▲</span>'
         content = arrow + label if column["align"] == "right" else label + arrow
-        return f'<th class="{column["align"]}" data-account-sort="{key}" tabindex="0" aria-sort="{direction}">{content}</th>'
+        return (f'<th class="{column["align"]}" data-account-sort="{label}" tabindex="0" aria-sort="{direction}"{descending}>'
+                + f'<span class="sort-label">{content}</span></th>')
+    next_heading = heading(accounts.BoardColumn(key="next", heading="next", align="left"))
     head = "".join(heading(column)
                    + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "")
-                   + ('<th class="left">next</th>' if column["key"] == "roles" else "") for column in table["columns"])
+                   + (next_heading if column["key"] == "roles" else "") for column in table["columns"])
     rows = "".join(
         _row_open(row)
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
@@ -248,13 +249,17 @@ def main() -> int:
 
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
-table{border-collapse:collapse;font-size:.86rem;font-variant-numeric:tabular-nums}
-.card{width:fit-content;max-width:100%}
-th,td{padding:5px 0 5px 18px;white-space:nowrap}th:first-child,td:first-child{padding-left:0}
+.card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
+table{border-collapse:collapse;font-size:var(--table-font-size);font-variant-numeric:tabular-nums}
+/* Let the last sort arrow use the right padding of the card. */
+.card .scroll{margin-right:calc(-1 * var(--column-gap));padding-right:var(--column-gap)}
+th,td{padding:5px 0 5px var(--column-gap);white-space:nowrap}th:first-child,td:first-child{padding-left:0}
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
 th[data-account-sort]{cursor:pointer}th[data-account-sort]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
-.sort-arrow{display:inline-block;width:1em;margin-left:.25em;text-align:center;visibility:hidden}
-th.right .sort-arrow{margin-left:0;margin-right:.25em}
+.sort-label{position:relative}
+.sort-arrow{--sort-arrow-gap:calc(var(--table-font-size) * .25);position:absolute;top:50%;
+left:calc(100% + var(--sort-arrow-gap));transform:translateY(-50%);width:var(--table-font-size);text-align:center;visibility:hidden}
+th.right .sort-arrow{left:auto;right:calc(100% + var(--sort-arrow-gap))}
 th[aria-sort=ascending] .sort-arrow,th[aria-sort=descending] .sort-arrow{visibility:visible}
 .left{text-align:left}.right{text-align:right}
 tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
@@ -410,7 +415,8 @@ let menuRow=null, menuButton=null;
 const pendingMoves=new Set();
 const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
  : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
-const sortColumns=['account','left','role','busy'], sortTables=new WeakMap();
+const sortColumns=[...view.querySelectorAll('[data-account-sort]')].map(header=>header.dataset.accountSort);
+const sortTables=new WeakMap();
 let chosenSort={column:'account',reverse:false};
 try{
  const saved=JSON.parse(localStorage.getItem('accounts-sort'));
@@ -443,7 +449,7 @@ function applySort(){
  }
  for(const header of table.querySelectorAll('[data-account-sort]')){
   const selected=header.dataset.accountSort===chosenSort.column;
-  const descending=(chosenSort.column==='busy')!==chosenSort.reverse;
+  const descending=header.hasAttribute('data-sort-descending')!==(selected && chosenSort.reverse);
   header.setAttribute('aria-sort',selected ? descending ? 'descending' : 'ascending' : 'none');
   header.querySelector('.sort-arrow').textContent=descending ? '▼' : '▲';
  }
