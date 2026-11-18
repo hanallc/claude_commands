@@ -30,6 +30,7 @@ from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_pre
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges, largest_gate_vcpus
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
+from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
@@ -288,7 +289,8 @@ class CloudReservation:
 
 
 @contextmanager
-def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[CloudReservation]:
+def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode, *,
+                      group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP) -> Generator[CloudReservation]:
     """Keep the route's cloud slot until its result or fallback returns."""
     pid = os.getpid()
     start = admission_records.process_start_time(pid)
@@ -300,7 +302,7 @@ def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Genera
     def refresh() -> wire.AdmitRequest:
         request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
-        return replace(request, place=wire.CloudPlace('aws'))
+        return replace(request, place=wire.CloudPlace('aws', group))
     with ExitStack() as held_slot:
         try:
             held = held_slot.enter_context(queue_place.held_reservation(queue_place.RefreshedRequest(refresh)))
@@ -709,7 +711,6 @@ class GateWorker:
             api = self.regional_api(self.box_region)
             self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
             if self.clock() >= ledger.instant(request, 'expires'):
                 reply = api.call('describe-instances', '--filters',
                                       'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
@@ -722,10 +723,14 @@ class GateWorker:
                     self.box_zone = zone
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
+            launch_json = json.dumps(arguments)
             try:
                 for retry in range(settings().whole('launch_reply_tries')):
                     try:
-                        reply = api.call('run-instances', '--cli-input-json', json.dumps(arguments))
+                        if retry == 0:
+                            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
+                                'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
+                        reply = api.call('run-instances', '--cli-input-json', launch_json)
                         self.record_launch(request, size, zone, 'launched')
                         break
                     except AwsUnavailable as error:
@@ -781,7 +786,6 @@ class GateWorker:
         interruption_confirmed = False
         result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED
         try:
-            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, self.clock(), stage='launch'))
             self.reconcile()
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -1193,7 +1197,6 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         request['retry_launch'] = retry_launch
                     save(folder / 'request.json', request)
                     save(folder / 'deployment.json', deployment)
-                    cloud_progress.publish(reservation.sidecar, cloud_progress.CloudProgress('requesting', 0, 0, time.time(), stage='launch'))
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
                 if isinstance(outcome, CloudCompleted):

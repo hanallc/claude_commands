@@ -30,6 +30,7 @@ from unittest import mock
 from scripts.buildlog import charts, cost_actions, costs, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.slot_wait import NoNamedStep, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
@@ -2673,6 +2674,32 @@ process.stdout.write(JSON.stringify({
                 for row in (remote, waiter):
                     for field in ("used", "counted", "reserved", "need"):
                         self.assertNotIn(field, row)
+
+    def test_reserved_cloud_slot_counts_as_used_and_waits_in_the_queue(self) -> None:
+        reading = cloud_reading(reservation_reading())
+        first, waiting = reading.cloud
+        reserved = replace(first, wait=wire.CloudSlotWait(1, 1, ReservedCloudSlot()),
+            progress=cloud_progress.NoCloudProgress(), counter=progress_profile.NoCounter())
+        for active, table in ((reserved, "waiters"), (first, "walk")):
+            with self.subTest(table=table):
+                reply = wire.ViewReply(replace(reading, cloud=(active, waiting)))
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                self.assertEqual(decoded, reply)
+                assert isinstance(decoded, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
+                      mock.patch.object(memory_feed, "host_name", return_value="fixture")):
+                    page = memory_feed.reading()
+                self.assertEqual(page["cloud_slots_used"], 1)
+                queued = [row for row in page["waiters"] if row.get("kind") == "cloud"]
+                running = [row for row in page["walk"] if row.get("kind") == "cloud"]
+                if table == "waiters":
+                    before_launch = next(row for row in queued if row["pid"] == first.owner.pid)
+                    self.assertEqual(before_launch["reason"], "waits for launch")
+                    self.assertEqual(cast(memory_feed.CloudWaitRow, before_launch)["activity"], "waits for launch")
+                    self.assertFalse(running)
+                else:
+                    self.assertEqual([row["pid"] for row in running], [first.owner.pid])
+                    self.assertEqual([row["pid"] for row in queued], [waiting.owner.pid])
 
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
         for raw_step, project, folder, expected in (
