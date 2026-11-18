@@ -18,7 +18,7 @@ from scripts.lib import conf
 
 KINDS = (('gate', 'merge gates'), ('test-affected', 'targeted tests'))
 EVERY_KIND = tuple(mode for mode, _label in KINDS)
-_MODE_ALIASES = {'gate': 'merge-gate', 'test-affected': 'targeted-test'}
+_MODE_ALIASES = {'merge-gate': 'gate', 'targeted-test': 'test-affected'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
 

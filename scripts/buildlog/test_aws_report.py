@@ -319,6 +319,8 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW - 60, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'result': 'launched'},
             {'time': NOW, 'attempt': 'legacy-launch', 'instance_type': 'orphan.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 30},
             {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'test-affected', 'result': 'refused',
+             'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'},
+            {'time': NOW, 'instance_type': 'refused.8xlarge', 'mode': 'targeted-test', 'result': 'refused',
              'error_code': 'InsufficientSpotCapacity', 'region': 'us-east-2'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in reversed(launches)))
         charges = self.state / 'charges'
@@ -351,10 +353,10 @@ class AwsReportTests(MeasurementFixture):
         start = datetime.fromtimestamp(MIDNIGHT - 86400, UTC)
         end = datetime.fromtimestamp(NOW + 1, UTC)
         evidence = run_cost.run_evidence(launches, start, end, 'us-east-2')
-        box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('merge-gate', 'gate'))
+        box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('gate',))
         self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
         self.assertEqual(evidence.refusals_per_launch('m7a.8xlarge', 'us-east-2', ('test-affected',))[1:], (0, 1))
-        self.assertEqual(evidence.refusals_per_launch('refused.8xlarge', 'us-east-2', ('targeted-test',))[1:], (1, 0))
+        self.assertEqual(evidence.refusals_per_launch('refused.8xlarge', 'us-east-2', ('test-affected',))[1:], (2, 0))
 
     def test_billed_allocations_include_new_modes_and_skip_zero_box_time(self) -> None:
         region = 'us-east-2'
