@@ -1239,7 +1239,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** The strict delivery read rejects a pending verdict slot with no attempt id. `end_row_scratch` reports an unusable scratch config and a retry finishes the cleanup. Every browser verdict path keeps a cleanup record, which loads only when private and owned by the current user. Three rare races moved to a follow-up item (F003, F004, F005). On main ebbb81613 (hash 3cfa74c4f).
 
-### Phase 78 — Cross-repo units  · status: todo
+### Phase 78 — Cross-repo units  · status: done
 **Depends on:** phase 74
 
 #### Work Order
@@ -1259,6 +1259,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on the phase 74 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** The unit board reads merge and dependency evidence from each unit's own repo through one landed-evidence rule, and labels a failure by its land destination. An incomplete run history shows "merge evidence unavailable". A legacy land result with no production key no longer crashes the board. A batch review report gives each row its own list path. A same-repo board keeps four Git calls. Multi-run cases (F006, F008, F010, F012, F013) moved to one cross-repo board follow-up after five review rounds. On main f6c11ee64 (hash b5ab8a1e3).
 
 ### Phase 79 — Review-trial rows keyed by checkpoint  · status: todo
 **Depends on:** none
