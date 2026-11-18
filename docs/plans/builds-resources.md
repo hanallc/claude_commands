@@ -2798,3 +2798,14 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Row on main `a66d4f0c8`: `a2fedffde`. Checkpoint `3466c8911`.
 
 **Files:** `scripts/build_queue/test_queue_place.py`.
+
+### Phase 150 — Find why the AWS merge gate wall time doubled  · status: done
+
+Builds 11-18: the merge gate wall time rose from about 204 s to about 432 s. AWS full gates, daily wall mean: 11-11 204 s, 11-14 367 s, 11-18 451 s. CPU per run stayed flat; cost per run fell from $0.051 to about $0.015.
+
+1. Name the cause with measured data: which modules, which stage, natedev or AWS, and since when.
+2. Send builds the cause, the evidence and a proposed fix. Make no config change without builds' go.
+
+**Files:** none (a study; no code change).
+
+Result: sent to builds 11-18. The 11-14 placement switch to 16-vCPU `c7a.4xlarge` halved the gate workers; a second rise on 11-17/18 came from CPU growth in five modules. Builds took the box order to the user and gave the five modules to natest.
