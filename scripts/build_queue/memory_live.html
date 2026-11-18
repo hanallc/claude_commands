@@ -125,6 +125,8 @@ __PAGE_FRAME_STYLE__
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
 #tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
+.tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
+.tip:has(dd.call) :is(dt, dd) { white-space: normal; overflow-wrap: anywhere; }
 /* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
@@ -800,8 +802,13 @@ function stepTooltip(key, data) {
   const waiting = key.startsWith('wait:');
   const duration = tipDuration(key, row, data);
   const state = waiting ? 'waiting' : row.between_steps ? 'between steps' : 'running';
-  if (row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used)))
-    return [stepTitle(row, 'unavailable')];
+  const verify = row.verify;
+  const stepFields = verify ? [field('Step', verify.total > 1
+    ? `${verify.step} (${verify.position} of ${verify.total})` : verify.step)] : [];
+  const callFields = verify ? [field('Call', verify.call, 'call', true)] : [];
+  const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
+    || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
+  if (unavailable) return [stepTitle(row, 'unavailable'), ...stepFields, ...callFields];
   const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
   // A gate job says what it does and what it changes (#109).
   if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts}, field('Changes', row.changes));
@@ -812,14 +819,13 @@ function stepTooltip(key, data) {
       const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
       return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
     }))];
-  rows.push(...ownerFields(row));
+  rows.push(...ownerFields(row), ...stepFields);
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
-      if (row.head_room?.unavailable) return [stepTitle(row, 'unavailable')];
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
         const terms = row.head_room.rows, result = terms.at(-1);
@@ -868,6 +874,7 @@ function stepTooltip(key, data) {
     }
     rows.push(...progressRows(row));
   }
+  rows.push(...callFields);
   return rows.filter(row => row.kind === 'title' || row.kind === 'long' || row.value || row.label === 'Because');
 }
 function stepRow(key, data) {
@@ -1311,11 +1318,11 @@ function renderWalk(d) {
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1326,18 +1333,18 @@ function renderWalk(d) {
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
-    cells("", "Build tools", "", "", null, "", null, "tools", "tools");
+    cells("", "Build tools", "", "", null, "", null, "tools", "", "tools");
     rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
+  const columnClasses = ["place", "done", "step", "duration", "verify", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
   if (d.waiters.length) {
@@ -1353,7 +1360,7 @@ function renderWalk(d) {
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${rowLabel(w.name, rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${w.key}`) : rowMemory(`wait:${w.key}`)) +
       `</div>`);

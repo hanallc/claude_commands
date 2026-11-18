@@ -45,6 +45,25 @@ class SavedPlacementAssignment:
 DEV_HEADROOM = 4.2034275337646125
 
 TestScope = Literal["full", "filtered"]
+VerifyVerb = Literal["check", "test", "lint", "doc", "example", "build", "final"]
+VERIFY_VERBS: tuple[VerifyVerb, ...] = ("check", "test", "lint", "doc", "example", "build", "final")
+
+
+@dataclass(frozen=True)
+class VerifyCall:
+    """The verify call identifies one step in its plan."""
+    verb: VerifyVerb
+    call: str
+    position: int
+    total: int
+
+
+@dataclass(frozen=True)
+class NotVerifyCall:
+    """This step does not belong to a verify call."""
+
+
+VerifyStep = VerifyCall | NotVerifyCall
 
 
 @dataclass(frozen=True)
@@ -599,6 +618,7 @@ class Waiter(TypedDict):
     test_threads: NotRequired[int | None]
     # Requests can record a route. Direct commands without a reason use DIRECT_CARGO.
     route: NotRequired[StepRoute]
+    verify: NotRequired[VerifyCall]
 
 
 @dataclass(frozen=True)
@@ -951,6 +971,7 @@ class WaitingStep:
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -969,8 +990,10 @@ class RunningStep:
     project: str = ""
     execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
     assignment_host: str = ""
+    mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, admission_service
 from scripts.build_queue.test_queue_view import with_converted_executions
 
 import json
@@ -27,7 +27,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
@@ -1824,6 +1824,95 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row.get("mac_text"), "")
                 self.assertEqual(row.get("because"), reason.removeprefix("it ") if reason else "direct cargo command")
 
+    def verify_call_page(self) -> memory_feed.MemoryPage:
+        """Read the verify facts from admissions through the private service socket."""
+        with AdmissionFixture() as fixture:
+            facts = admission_records.VerifyCall("final", "verify final sample --local 'creates a Linux install'", 1, 2)
+            run = fixture.run_owner()
+            first = fixture.request(step="nextest", need=admission_records.GIB, run=run)
+            first = replace(first, sidecar=str(fixture.scope(first.owner)),
+                            identity=replace(first.identity, verify=replace(facts, position=2)))
+            _ = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            fixture.free(0)
+            direct = fixture.request(step="check", need=2 * admission_records.GIB)
+            direct_peer = fixture.connect(direct)
+            direct_reply, = direct_peer.replies()
+            self.assertIsInstance(direct_reply, wire.Wait)
+            fixture.clock.advance(1)
+            second = fixture.request(step="check", need=4 * admission_records.GIB)
+            environment = {"BUILDLOG_VERIFY_VERB": facts.verb, "BUILDLOG_VERIFY_CALL": facts.call,
+                           "BUILDLOG_VERIFY_POSITION": "1", "BUILDLOG_VERIFY_TOTAL": "2",
+                           "BUILD_QUEUE_LOCAL_REASON": "creates a Linux install"}
+            with (mock.patch.dict(os.environ, environment),
+                  mock.patch.object(admission_client, "CLOCK", fixture.clock),
+                  mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                      second.profile, step_estimator.ReusableEstimate()))):
+                second = admission_client.step_request(list(second.argv), second.cwd, second.owner,
+                    second.since, second.sidecar, second.episode)
+            self.assertEqual(second.identity.verify, facts)
+            waiter = fixture.connect(second)
+            reply, = waiter.replies()
+            self.assertIsInstance(reply, wire.Wait)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(snapshot.inputs.running[0].verify, replace(facts, position=2))
+            self.assertNotIn("verify", snapshot.inputs.ordered[0][1])
+            self.assertEqual(snapshot.inputs.ordered[1][1].get("verify"), facts)
+            self.assertEqual(snapshot.inputs.reservations[0].get("queue_waiter", {}).get("verify"),
+                             replace(facts, position=2))
+            state = admission_service.read_state(fixture.state_dir)
+            self.assertEqual(state.reservations[first.episode].queue_waiter.get("verify"), replace(facts, position=2))
+            reply, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(reply, wire.ViewReply)
+            with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                return memory_feed.reading()
+
+    def mac_verify_call_page(self) -> memory_feed.MemoryPage:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            facts = admission_records.VerifyCall("test", "verify test sample --no-cache", 1, 1)
+            request = placement_request(fixture)
+            request = replace(request, identity=replace(request.identity, step="nextest", verify=facts))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            reply, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(reply, wire.ViewReply)
+            now = reply.reading.explanation.now
+            build = queue_view.MacBuild(710001, "/Mac/hana", now - 10, "cargo nextest run", "hana",
+                gate_label=queue_view.MacGateLabel.PLACEMENT,
+                gate_placement=f"{assignment.episode}/{assignment.attempt}")
+            other = replace(build, pid=710002, gate_placement=f"{assignment.episode}/other-attempt")
+            mac = queue_view.MacBuildReading(now, (build, other))
+            with (mock.patch.object(admission_client, "view", return_value=reply.reading),
+                  mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
+                  mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+                return memory_feed.reading()
+
+    def test_placed_mac_build_shows_the_verify_call_without_process_evidence(self) -> None:
+        page = self.mac_verify_call_page()
+        placed, unrelated = [row for row in page["walk"] if row.get("kind") == "mac-build"]
+        self.assertEqual(placed.get("verify"), {
+            "step": "nextest", "verb": "test", "call": "verify test sample --no-cache", "position": 1, "total": 1})
+        self.assertNotIn("verify", unrelated)
+
+    def test_verify_call_reaches_running_and_waiting_feed_rows(self) -> None:
+        page = self.verify_call_page()
+        running, = [row for row in page["walk"] if "verify" in row]
+        direct, waiting = page["waiters"]
+        running_call = running.get("verify")
+        waiting_call = waiting.get("verify")
+        assert running_call is not None and waiting_call is not None
+        self.assertEqual((running_call["step"], running_call["position"]), ("nextest", 2))
+        self.assertEqual((waiting_call["step"], waiting_call["position"]), ("check", 1))
+        self.assertEqual(running_call["call"], "verify final sample --local 'creates a Linux install'")
+        self.assertEqual(waiting_call["call"], running_call["call"])
+        self.assertEqual((running_call["verb"], waiting_call["total"]), ("final", 2))
+        self.assertNotIn("verify", direct)
+
     def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
         page = self.macroute_page()
         self.assertEqual([row.get("mac_text") for row in page["waiters"]], [
@@ -2722,6 +2811,16 @@ def write_browser_fixture(folder: Path) -> None:
         pages["step_ci"] = json.loads(memory_feed.page_json(ci_page))
         pages["step_unknown"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(
             unit_labels.UnitLabels("unknown", "—", "owner not recorded"))))
+        verify_page = fixture.verify_call_page()
+        builder = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
+                                 current_session=staff.StaffId("builder"))
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder,))).registry()
+        verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
+        verified_waiter["unit"] = builder.name
+        verified_waiter["detail"] = builder.name
+        verify_page["walk"].extend(row for row in fixture.mac_verify_call_page()["walk"]
+                                   if row.get("kind") == "mac-build" and "verify" in row)
+        pages["verify_calls"] = json.loads(memory_feed.page_json(verify_page))
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
             local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))

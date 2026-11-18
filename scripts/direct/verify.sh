@@ -829,6 +829,29 @@ run() {
 }
 
 run_step() {
+    local -a command=("$@")
+    local cargo_index=0 BUILDLOG_VERIFY_POSITION=1
+    if [[ "${command[0]:-}" == env ]]; then
+        cargo_index=1
+        while :; do
+            case "${command[cargo_index]:-}" in
+                -u) (( cargo_index += 2 )) ;;
+                *=*) (( cargo_index += 1 )) ;;
+                *) break ;;
+            esac
+        done
+    fi
+    if [[ "${command[cargo_index]:-}" == cargo ]]; then
+        (( cargo_index += 1 ))
+        if [[ "${command[cargo_index]:-}" == +* ]]; then (( cargo_index += 1 )); fi
+        case "${CMD:-}:${command[cargo_index]:-}" in
+            final:nextest) BUILDLOG_VERIFY_POSITION=2 ;;
+            lint:clippy) BUILDLOG_VERIFY_POSITION=${VERIFY_STEP_COUNT:-1} ;;
+        esac
+    fi
+    local -x BUILDLOG_VERIFY_VERB="${CMD:-}" BUILDLOG_VERIFY_CALL="${VERIFY_CALL_TEXT:-}"
+    local -x BUILDLOG_VERIFY_TOTAL="${VERIFY_STEP_COUNT:-1}"
+    export BUILDLOG_VERIFY_POSITION
     if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
         if buildlog_step_compiles "$@"; then
             local STEP_WRITES_TREE=0
@@ -1456,6 +1479,24 @@ if [[ "$CMD" == example-test ]]; then
     exit 2
 fi
 
+
+# Use the same safe characters and single quotes as shlex.join.
+format_verify_call() {
+    local LC_ALL=C arg
+    VERIFY_CALL_TEXT=verify
+    if [[ "${1:-}" == --session-dir ]]; then shift 2; fi
+    for arg in "$@"; do
+        case "$arg" in
+            ''|*[!a-zA-Z0-9_@%+=:,./-]*)
+                arg="'${arg//\'/\'\"\'\"\'}'"
+                ;;
+        esac
+        VERIFY_CALL_TEXT+=" $arg"
+    done
+}
+format_verify_call "${VERIFY_ORIGINAL_ARGS[@]}"
+VERIFY_STEP_COUNT=1
+if [[ "$CMD" == final ]]; then VERIFY_STEP_COUNT=2; fi
 
 parse_routing_arguments "$@"
 parse_command_arguments "${ARGS[@]}"
@@ -4412,6 +4453,10 @@ case "$CMD" in
         [[ $# -eq 0 ]] || { usage; exit 2; }
         if [[ -n "$PKG" ]]; then require_member "$PKG"; fi
         require_taplo
+        # Only mend and clippy take queue steps. Repairs reuse their positions.
+        VERIFY_STEP_COUNT=0
+        if lint_config_enabled mend; then VERIFY_STEP_COUNT=$((VERIFY_STEP_COUNT + 1)); fi
+        if lint_config_enabled clippy; then VERIFY_STEP_COUNT=$((VERIFY_STEP_COUNT + 1)); fi
         run_lint_sequence
         ;;
     doc)
