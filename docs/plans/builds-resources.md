@@ -2738,3 +2738,27 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `73bb35737`.
 
 **Files:** `scripts/lib/cargo_seed.py`, `scripts/lib/test_cargo_seed.py`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `scripts/worktree/worktrees.py`, `scripts/worktree/test_worktrees.py`, `config/build_folders.conf`.
+
+### Phase 145 — A test step with no test history gives back its build reservation once tests run  · status: held
+
+Builds assigned this on 11-18 (List item 78): it is the cause of the one-build natedev line at 00:33 EST. A nextest step with matching test history already falls to its test-phase charge when the sampler sees the test phase. A step with no matching history keeps its full build need until it ends (Nov 17: 11.85 GiB reserved, 0.17 GiB test peak).
+
+- Change: when the sampler has observed the test phase and the row has no test-phase need, charge `max(test-phase peak so far, floor) × test_phase_margin`, the same formula as the history case. The first reservation does not change.
+- No new tunable: the existing `test_phase_margin` and the existing floor.
+- Proof: the 7-day Hana nextest test-phase peak (median, p90, max, and when in the run it comes), and a replay of 00:33 to 00:43 EST that shows builds running at one time before and after, with no moment over the memory cap.
+- Base on main. Functions touched in `memory_admit.py`: `test_phase_history` and the test-phase need record; `admission_records.py` `TestPhaseNeed` form. Queue told.
+
+Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nextest admissions (5 with history, 11 without); the compile (2.5–22 min) holds the reservation, the test phase lasts 0.1–6.4 min. Replay 20:00–00:52 EST: 72 admissions either way, mean wait 5,178 s against 5,132 s. 7-day Hana nextest buildlog peak median 13.59 GiB against promise median 11.50 GiB. Evidence: the unit session folder, `phases/145/` and `phases/diag-promise/`.
+
+**Files:** to be named by the work order.
+
+### Phase 146 — A second cancel of a gone placement request succeeds  · status: done
+
+Builds assigned this on 11-18. On 11-18 at 01:20 EST, the cleanup after a Hana Mac release build failed with "placement coordinator does not match" and exit 2. Cause, proven by test: `verify.sh` cancels the placement on exit, then `FirstStepAdmission.close()` cancels it again; the service found no request and gave the owner-mismatch text.
+
+Repair (builds chose B, an idempotent cancel):
+1. `AdmissionServer._handle_placement` refuses a missing request with `wire.PLACEMENT_REQUEST_MISSING_REASON` ("placement request is missing"). A real owner difference still refuses with "placement coordinator does not match".
+2. `close()` treats that reason on its own cancel as success. Any other refusal still raises.
+3. The fix takes effect after the build-admission service restart.
+
+**Files:** `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/first_step.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_first_step.py`.

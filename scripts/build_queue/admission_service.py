@@ -3469,7 +3469,9 @@ done
             return [self._consume_permission(request)]
         if isinstance(request, (wire.PrerequisiteReport, wire.CancelPlacement)):
             submitted = self.placement_requests.get(request.episode)
-            if submitted is None or submitted.owner != request.owner:
+            if submitted is None:
+                return [wire.Refused(wire.PLACEMENT_REQUEST_MISSING_REASON)]
+            if submitted.owner != request.owner:
                 return [wire.Refused("placement coordinator does not match")]
             if isinstance(request, wire.PrerequisiteReport):
                 if not self._placement_owner_live(request.owner):
