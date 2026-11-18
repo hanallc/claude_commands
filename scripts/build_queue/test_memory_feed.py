@@ -198,7 +198,7 @@ class MemoryFeedTests(unittest.TestCase):
             return [cast(dict[str, object], cast(object, row)) for row in page["walk"]]
 
         def local(row: dict[str, object]) -> bool:
-            return row.get("machine") == "fixture" and not row.get("ci") and isinstance(row.get("pid"), int)
+            return row.get("machine") == "fixture" and isinstance(row.get("pid"), int)
 
         pids = [row["pid"] for row in rows(unknown) if local(row)]
         self.assertTrue(pids)
@@ -360,7 +360,6 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
-        _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
         # The live jobserver and its journal stay out of the tests: 12 GiB floor, 4 free of 31 tokens.
         _ = self.enterContext(mock.patch.object(memory_feed, "stevie_output", return_value="12288\n4\n31\n"))
         _ = self.enterContext(mock.patch.object(memory_feed, "request_token_dump",
@@ -419,7 +418,8 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.configuration,
                                  f"output_folder={self.output}\n# range: 5e-324..\ninterval_seconds={seconds}\n"
                                  + "history_days=7\nswap_rows=6\nreport_refresh_seconds=300\n"
-                                 + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n")
+                                 + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n"
+                                 + "# whole: 1..\nci_service_note_mib=250\n")
 
     def expected_page(self, seconds: float = 0.125) -> str:
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
@@ -456,13 +456,6 @@ class MemoryFeedTests(unittest.TestCase):
             original = row.get("key")
             cast(dict[str, object], cast(object, row))["name"] = "changed owner label"
             self.assertEqual(memory_feed.step_key(row), original)
-        # Two CI rows with no runner differ only by their cgroup.
-        with tempfile.TemporaryDirectory() as folder:
-            ci_keys = set[str]()
-            for name in ("hana-linux-1.slice", "hana-linux-2.slice"):
-                (cgroup := Path(folder) / name).mkdir()
-                ci_keys.add(memory_feed.step_key(memory_feed.build_ci_row(0.0, 0.0, cgroup)))
-        self.assertEqual(len(ci_keys), 2)
         html = self.expected_page()
         functions = html[html.index("function field("):html.index("const tip =")]
         render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
@@ -532,30 +525,41 @@ process.stdout.write(JSON.stringify({
                         if kind == "row":
                             self.assertIn("Runs on  AWS", text)
 
-    def test_ci_memory_stays_in_the_taken_total_with_an_idle_or_running_job(self) -> None:
+    def test_ci_service_memory_moves_to_build_tools_without_a_run_row(self) -> None:
+        gib = admission_records.GIB
         cgroup = self.root / "ci"
         (cgroup / "github-runner-fixture.service").mkdir(parents=True)
-        for busy in (False, True):
-            with self.subTest(busy=busy):
-                runner = {"unit": "github-runner-fixture.service", "name": "fixture",
-                          "state": "busy" if busy else "idle", "used": 0.125, "pid": 701,
-                          "started_at": 199_000, "job": "tests"}
+        for state in (IdleService(), RunningServiceJob(199_000)):
+            with self.subTest(state=state):
                 step = admission_records.RunningStep("", "hana-ci.slice", "service", str(cgroup), 0,
-                    admission_records.UnownedSliceMemory(admission_records.GIB // 8,
-                        anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
-                        cgroup=str(cgroup), owner="hana-ci.slice", pid=701,
-                        job_state=RunningServiceJob(199_000) if busy else IdleService()), pid=701)
+                    admission_records.UnownedSliceMemory(gib,
+                        anonymous=admission_records.AnonymousRunUse(gib // 2),
+                        cgroup=str(cgroup), owner="hana-ci.slice", pid=701, job_state=state), pid=701)
                 reading = captured_reading(running=(step,))
-                with (mock.patch.object(admission_client, "view", return_value=reading),
-                      mock.patch.object(memory_feed, "read_ci_runner", return_value=runner)):
+                with mock.patch.object(admission_client, "view", return_value=reading):
                     page = memory_feed.reading()
-                row, = [row for row in page["walk"] if row.get("ci")]
-                self.assertEqual(cast(memory_feed.RunRow, row).get("ci_runners", [])[0]["state"], "busy" if busy else "idle")
-                self.assertEqual(page["ci_ram"], 0.125)
-                self.assertEqual(page["taken"], page["used"] + page["ci_ram"] + page["reserved"])
-                self.assertEqual(page["taken"], 0.125)
-                self.assertEqual(page["taken"], cast(float, page["cap"]) - page["room"])
-                self.assertEqual(row.get("admitted"), busy)
+                self.assertTrue(all(row.get("queued") for row in page["walk"]))
+                ram = page["ram"]
+                self.assertEqual(ram["build_tools_bytes"], gib // 2)
+                self.assertEqual(page["taken"], 0.5)
+                self.assertEqual(ram["cap_bytes"], ram["build_tools_bytes"] + ram["queued_builds_bytes"]
+                                 + ram["build_covered_bytes"] + ram["room_bytes"])
+
+    def test_ci_service_note_follows_the_configured_limit(self) -> None:
+        mib = 1024 ** 2
+        for used, shown in ((249, False), (250, True), (251, True)):
+            with self.subTest(used=used):
+                service = admission_records.UnownedSliceMemory(used * mib, owner="hana-ci.slice", pid=701,
+                    cgroup=str(self.root / "ci.slice"), job_state=IdleService(),
+                    anonymous=admission_records.AnonymousRunUse(used * mib))
+                step = admission_records.RunningStep("", "hana-ci.slice", "service", "", 0, service, pid=701)
+                with mock.patch.object(admission_client, "view", return_value=captured_reading(running=(step,))):
+                    ram = memory_feed.reading()["ram"]
+                self.assertEqual(ram["build_tools_bytes"], used * mib)
+                self.assertEqual(ram.get("ci_service_note_bytes", 0), used * mib if shown else 0)
+                self.assertEqual(ram["other_build_tools_bytes"], 0 if shown else used * mib)
+                self.assertEqual(ram["build_tools_bytes"], ram["rust_analyzer_bytes"] + ram["sccache_bytes"]
+                                 + ram["other_build_tools_bytes"] + ram.get("ci_service_note_bytes", 0))
 
     def test_the_feed_publishes_configured_colors_for_both_themes(self) -> None:
         original = self.configuration.read_text()
@@ -573,24 +577,6 @@ process.stdout.write(JSON.stringify({
                     palette = page["colors"]["light"] if theme == "light" else page["colors"]["dark"]
                     actual = palette["remote_memory"] if key == "remote_memory" else palette["machines"].get(key.removeprefix("machine_"))
                     self.assertEqual(actual, "#" + value)
-
-    def test_waiting_and_unmatched_ci_jobs_do_not_claim_admission(self) -> None:
-        from scripts.build_queue.scope_activity import WaitingServiceJob, UnmatchedServiceJob
-
-        for state in (WaitingServiceJob(199_000), UnmatchedServiceJob(199_000), RunningServiceJob(199_000)):
-            with self.subTest(state=state):
-                step = admission_records.RunningStep("", "hana-ci.slice", "service", "/ci", 0,
-                    admission_records.UnownedSliceMemory(admission_records.GIB // 8, owner="hana-ci.slice",
-                        anonymous=admission_records.AnonymousRunUse(admission_records.GIB // 8),
-                        job_state=RunningServiceJob(199_000), service_job_state=state, pid=701), pid=701)
-                reading = with_wait_reason(captured_reading(running=(step,)), admission_records.StartSpacingWait(110))
-                with mock.patch.object(admission_client, "view", return_value=reading):
-                    page = memory_feed.reading()
-                ci, = [row for row in page["walk"] if row.get("ci")]
-                self.assertEqual(ci.get("admitted"), isinstance(state, RunningServiceJob))
-                self.assertIn("another step just started; the queue waits a few seconds between starts", page["waiters"][0]["reason"])
-                self.assertEqual(page["taken"], 0.125)
-                self.assertEqual(page["ci_ram"], 0.125)
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
@@ -742,52 +728,58 @@ process.stdout.write(JSON.stringify({
         for field in ("used", "reserved", "taken", "room", "cap", "other", "shown_reserved"):
             self.assertEqual(page.get(field), before.get(field), field)
 
-    def test_cargo_job_reads_cargo_words_after_the_ci_front_options(self) -> None:
-        front = ("python3", "-I", "/store/scripts/build_queue/ci_cargo_front.py", "--front", "/store/bin/cargo",
-                 "--shared-folder", "/run/hana-ci-admission/hana-linux-1", "--")
-        for words, job in ((("build", "--release"), "release build"), (("nextest", "run"), "tests"),
-                           (("+nightly", "doc"), "doc"), ((), "")):
-            with self.subTest(words=words):
-                self.assertEqual(memory_feed.cargo_job((*front, *words)), job)
-                self.assertEqual(memory_feed.cargo_job(("/store/bin/cargo", *words)), job)
+    def test_ci_cargo_waits_then_runs_from_admission(self) -> None:
+        pid = 700001
+        runner = "hana-linux-1"
+        label = f"hana CI · {runner} · tests"
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(pid, "100")
+            cgroup = Path(os.environ["BUILDLOG_CI_CGROUP"])
+            service = cgroup / f"github-runner-{runner}.service"
+            worker = 700002
+            write_process(fixture.proc.path, worker)
+            _ = (fixture.proc.path / str(worker) / "comm").write_text("Runner.Worker\n")
+            cargo_use = 2 * admission_records.GIB
+            overhead = admission_records.GIB // 2
+            write_process(fixture.proc.path, pid, parent=worker, start=owner.start_time)
+            write_scope(service, members=(worker, pid), current=overhead, anonymous=overhead)
+            write_scope(cgroup, current=overhead, anonymous=overhead)
+            since = fixture.clock.now() - 108 * 60
+            request = fixture.request(owner=owner, since=since)
+            request = replace(request, identity=replace(request.identity, name=label, unit=runner))
+            fixture.hold_starts()
+            other_tools = admission_records.GIB
+            write_scope(Path(os.environ["BUILDLOG_BUILDS_CGROUP"]), current=other_tools, anonymous=other_tools)
+            replies = fixture.server.handle_request(request)
+            self.assertTrue(any(isinstance(reply, wire.Wait) for reply in replies), repr(replies))
 
-    def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
-        base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
-        memory = admission_records.UnownedSliceMemory(admission_records.GIB // 8,
-            cgroup=str(self.root / "ci"), owner="hana-ci.slice", pid=701, job_state=IdleService())
-        service = admission_records.RunningStep("", "hana-ci.slice", "service", "/ci", 0, memory, pid=701)
-        (self.root / "ci" / "github-runner-hana-linux-1.service").mkdir(parents=True)
-        (self.root / "ci" / "github-runner-hana-linux-2.service").mkdir()
-        inputs = base.explanation.decided_from
-        original = inputs.running[0]
-        for runner in ("hana-linux-1", "hana-linux-2"):
-            with self.subTest(runner=runner):
-                running = replace(original, unit=runner, session_id="", session_name="unrelated display name")
-                reading = gate.queue_read_from(replace(inputs, running=(running, service)), admission_policy_fixture())
-                waiting = replace(base.view.waiting[0], unit=runner, session_id="", session_name="unrelated display name")
-                reading = replace(reading, view=replace(reading.view, waiting=(waiting,)))
-                def runner_record(path: Path, proc: Path) -> memory_feed.CIRunner:
-                    del proc
-                    return {"unit": path.name, "name": path.name.removeprefix("github-runner-").removesuffix(".service"),
-                            "state": "idle", "used": 0.0625, "pid": 701}
-                with (mock.patch.object(admission_client, "view", return_value=reading),
-                      mock.patch.object(memory_feed, "read_ci_runner", side_effect=runner_record)):
-                    page = memory_feed.reading()
-                run = next(row for row in page["walk"] if row.get("queued"))
-                self.assertEqual(run.get("showrunner"), "")
-                self.assertEqual(run.get("ci_label"), "unrelated display name")
-                self.assertEqual(run["name"], "CI nextest")
-                self.assertEqual(page["waiters"][0]["showrunner"], "")
-                self.assertEqual(page["waiters"][0].get("ci_label"), "unrelated display name")
-                self.assertEqual(run["unit"], "")
-                ci = next(row for row in page["walk"] if row.get("ci"))
-                self.assertEqual(ci["unit"], "")
-                self.assertTrue(ci.get("ci_label"))
-                for row in (run, page["waiters"][0], ci):
-                    self.assertFalse(row.get("mac_text"))
-                    self.assertFalse(row.get("runs_on"))
-        impostor = replace(base.view.waiting[0], unit="other", session_name="hana-linux-1")
-        self.assertNotEqual(memory_feed.feed_step_labels(impostor, {}, frozenset({"hana-linux-1"})).owner_text, "hana CI")
+            def read_page() -> memory_feed.MemoryPage:
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                    return memory_feed.reading()
+
+            waiting = read_page()
+            waiter, = waiting["waiters"]
+            self.assertEqual((waiter["pid"], waiter["name"], waiter["since"]), (pid, "CI nextest", since))
+            self.assertEqual(waiter.get("ci_label"), label)
+            self.assertFalse(any(row.get("queued") for row in waiting["walk"]))
+
+            fixture.clock.advance(1)
+            fixture.free(20 * admission_records.GIB)
+            admitted_at = fixture.clock.now()
+            _ = only_admitted(fixture.server.handle_request(request))
+            write_process(fixture.proc.path, pid, cargo_use, parent=worker, start=owner.start_time)
+            write_scope(service, members=(worker, pid), current=cargo_use + overhead, anonymous=cargo_use + overhead)
+            write_scope(cgroup, current=cargo_use + overhead, anonymous=cargo_use + overhead)
+            _ = fixture.run_pass()
+            running = read_page()
+            self.assertEqual(running["waiters"], [])
+            row, = [row for row in running["walk"] if row.get("queued")]
+            self.assertEqual((row["pid"], row["name"], row["started_at"]), (pid, "CI nextest", admitted_at))
+            self.assertEqual(row.get("ci_label"), label)
+            self.assertEqual(running["ram"]["queued_builds_bytes"], cargo_use)
+            self.assertEqual(running["ram"]["build_tools_bytes"], overhead + other_tools)
 
     def test_mac_unit_requires_a_claim_and_uses_its_staff_record(self) -> None:
         from scripts.copies import copies
@@ -895,7 +887,7 @@ process.stdout.write(JSON.stringify({
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
         self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6, 10,
-                                                                   Path("/run/current-system/sw/bin/stevie")))
+                                                                   Path("/run/current-system/sw/bin/stevie"), 250))
 
     def test_configuration_expands_the_output_folder(self) -> None:
         original = self.configuration.read_text()
@@ -1842,7 +1834,7 @@ process.stdout.write(JSON.stringify({
         tools = memory_feed.BuildToolRam(rust_analyzer=gib, sccache=0, other=0)
         room = admission_records.MemoryRoom(28 * gib, 3 * gib, 2 * gib, 8 * gib, 7 * gib, 20 * gib, (),
                                             ci_use=3 * gib, agent_swap_demand=10 * gib)
-        ram = memory_feed.ram_blocks(room, tools, 100.0, 1)
+        ram = memory_feed.ram_blocks(room, tools, 100.0, 1, 250)
         for ahead in (0, 2):
             with self.subTest(ahead=ahead):
                 check = admission_records.RoomCheck(16 * gib, (7 - ahead) * gib, False, basis=admission_records.DoesNotFit())
@@ -1859,7 +1851,7 @@ process.stdout.write(JSON.stringify({
                 short = replace(room, available=available * gib, signed_room=(available - 21) * gib)
                 check = admission_records.RoomCheck(16 * gib, short.signed_room, False,
                                                    basis=admission_records.DoesNotFit())
-                blocks = memory_feed.ram_blocks(short, tools, 100.0, 1)
+                blocks = memory_feed.ram_blocks(short, tools, 100.0, 1, 250)
                 shown = memory_feed.head_room(check, short, blocks)
                 self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
                                  [("Queue cap", float(6 + build)), ("− Builds", 6.0), ("− Build reserved", float(build)),
@@ -1870,7 +1862,7 @@ process.stdout.write(JSON.stringify({
                 self.assertNotIn("note", shown)
         swap_short = replace(room, available=4 * gib, agent_swap_demand=6 * gib, signed_room=-11 * gib)
         check = admission_records.RoomCheck(16 * gib, -11 * gib, False, basis=admission_records.DoesNotFit())
-        swap_ram = memory_feed.ram_blocks(swap_short, tools, 100.0, 1)
+        swap_ram = memory_feed.ram_blocks(swap_short, tools, 100.0, 1, 250)
         self.assertEqual(swap_ram["swap_covered_bytes"], gib)
         self.assertEqual(swap_ram["swap_target_bytes"], 6 * gib)
         shown = memory_feed.head_room(check, swap_short, swap_ram)
@@ -1879,7 +1871,7 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("note", shown)
         no_swap = replace(room, agent_swap_demand=0, cap=27 * gib, signed_room=17 * gib)
         check = admission_records.RoomCheck(16 * gib, 17 * gib, False, basis=admission_records.DoesNotFit())
-        no_swap_ram = memory_feed.ram_blocks(no_swap, tools, 100.0, 1)
+        no_swap_ram = memory_feed.ram_blocks(no_swap, tools, 100.0, 1, 250)
         self.assertEqual(no_swap_ram["swap_target_bytes"], 0)
         self.assertEqual(no_swap_ram["swap_covered_bytes"], 0)
         shown = memory_feed.head_room(check, no_swap, no_swap_ram)
@@ -2320,16 +2312,16 @@ process.stdout.write(JSON.stringify({
             (3 * gib, (3 * gib, 0, 0), (gib, 2 * gib, 6 * gib), 0, 9 * gib),
         ):
             with self.subTest(available=available):
-                blocks = memory_feed.ram_blocks(self.fixture_room(available), tools, 100.0, 1)
+                blocks = memory_feed.ram_blocks(self.fixture_room(available), tools, 100.0, 1, 250)
                 self.assertEqual((blocks["safety_covered_bytes"], blocks["swap_covered_bytes"],
                                   blocks["build_covered_bytes"]), covered)
                 self.assertEqual((blocks["safety_missing_bytes"], blocks["swap_missing_bytes"],
                                   blocks["build_missing_bytes"]), missing)
                 self.assertEqual((blocks["room_bytes"], blocks["shortfall_bytes"]), (room, shortfall))
                 self.assertEqual(sum(missing), shortfall)
-                self.assertEqual(blocks["build_tools_bytes"], 5 * gib)
+                self.assertEqual(blocks["build_tools_bytes"], 7 * gib)
                 self.assertEqual(blocks["queued_builds_bytes"], gib)
-                self.assertEqual(blocks["ci_bytes"], 2 * gib)
+                self.assertEqual(blocks.get("ci_service_note_bytes"), 2 * gib)
                 self.assertEqual(blocks["cap_bytes"], gib + 5 * gib + 2 * gib + covered[2] + room)
                 self.assertEqual((blocks["agents_bytes"], blocks["desktop_bytes"]), (5 * gib, gib * 3 // 2))
                 self.assertEqual(blocks["desktop_protection_bytes"], 2 * gib)
@@ -2340,7 +2332,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_structures_bytes"],
                                   blocks["kernel_counters_bytes"], blocks["kernel_no_counter_bytes"]),
                                  (3 * gib, 2 * gib, gib, gib))
-                shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"] + blocks["ci_bytes"]
+                shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"]
                          + blocks["build_covered_bytes"] + blocks["room_bytes"]
                          + blocks["safety_covered_bytes"] + gib * 3 // 2 + blocks["swap_covered_bytes"] + 5 * gib
                          + blocks["other_programs_bytes"] + 6 * gib + 4 * gib + blocks["unattributed_bytes"])
@@ -2367,15 +2359,15 @@ process.stdout.write(JSON.stringify({
     def test_ram_blocks_name_a_missing_reading_and_a_disagreement(self) -> None:
         gib = admission_records.GIB
         self.ram_fixture(meminfo=False)
-        blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)
+        blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), 100.0, 6, 250)
         self.assertIsInstance(blocks["kernel_bytes"], admission_records.ReadingUnavailable)
         self.assertIsInstance(blocks["cache_bytes"], admission_records.ReadingUnavailable)
         self.assertEqual([line.split(":")[0] for line in blocks["missing"]], ["Kernel, measured", "File and kernel cache"])
         small = replace(self.fixture_room(20 * gib), total=30 * gib)
         self.ram_fixture()
-        self.assertEqual(memory_feed.ram_blocks(small, memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)["agreement"], "disagree")
+        self.assertEqual(memory_feed.ram_blocks(small, memory_feed.BuildToolRam(0, 0, 0), 100.0, 6, 250)["agreement"], "disagree")
 
-    def test_the_cap_and_ci_block_count_ci_swap_backed_use_and_leave_the_file_cache_to_the_cache_block(self) -> None:
+    def test_the_cap_counts_ci_swap_backed_use_and_leaves_the_file_cache_to_the_cache_block(self) -> None:
         gib = admission_records.GIB
 
         def unowned(working_set: int, anonymous: admission_records.AnonymousRunUse | admission_records.RunUseUnavailable,
@@ -2452,7 +2444,7 @@ process.stdout.write(JSON.stringify({
                     page = memory_feed.reading()
                 self.assertEqual(page["used"], cargo_use / admission_records.GIB)
                 self.assertEqual(page["ram"]["other_build_tools_bytes"], python_use)
-                build_rows = [row for row in page["walk"] if not row.get("ci", False)]
+                build_rows = page["walk"]
                 self.assertEqual(len(build_rows), int(bool(cargo_use)))
                 self.assertEqual(page["leftovers"], [])
                 self.assertTrue(all(row.get("queued", False) for row in build_rows))
@@ -2461,6 +2453,74 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(len(room.runs), int(bool(cargo_use)))
                 self.assertEqual(room.used, cargo_use)
                 self.assertEqual(room.used + room.kept, 8 * admission_records.GIB if cargo_use else 0)
+
+    def test_local_build_and_ci_runner_with_the_same_name_count_once(self) -> None:
+        gib = admission_records.GIB
+        runner = "hana-linux-1"
+        local_use, ci_use, other_tools, ci_service = 3 * gib, 2 * gib, gib, gib // 2
+        with AdmissionFixture() as fixture:
+            local = fixture.fixture_owner(700001, "100")
+            ci = fixture.fixture_owner(700002, "200")
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            ci_slice = Path(os.environ["BUILDLOG_CI_CGROUP"])
+            service = ci_slice / f"github-runner-{runner}.service"
+            write_scope(builds, current=local_use + other_tools, anonymous=local_use + other_tools)
+            write_scope(ci_slice, current=ci_use + ci_service, anonymous=ci_use + ci_service)
+            write_scope(service, current=ci_use + ci_service, anonymous=ci_use + ci_service)
+            for owner, scope, used in ((local, builds / "local.scope", local_use),
+                                       (ci, service / "cargo.scope", ci_use)):
+                sidecar = fixture.scope(owner, folder=str(scope.relative_to(fixture.root)), current=used, anonymous=used)
+                request = fixture.request(owner=owner)
+                request = replace(request, sidecar=str(sidecar), identity=replace(request.identity, unit=runner))
+                fixture.allow_next_start()
+                _ = only_admitted(fixture.server.handle_request(request))
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                page = memory_feed.reading()
+            self.assertEqual(page["ram"]["queued_builds_bytes"], local_use + ci_use)
+            self.assertEqual(page["ram"]["other_build_tools_bytes"], other_tools)
+            self.assertEqual(page["ram"].get("ci_service_note_bytes"), ci_service)
+
+    def test_ci_charge_survives_a_child_exit_between_reads(self) -> None:
+        gib = admission_records.GIB
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(700001, "100")
+            child_pid = 700002
+            proc_dir = fixture.proc.path
+            child = proc_dir / str(child_pid)
+            ci_slice = Path(os.environ["BUILDLOG_CI_CGROUP"])
+            tools = 2 * gib
+            ci_service = gib // 2
+            write_scope(Path(os.environ["BUILDLOG_BUILDS_CGROUP"]), current=tools, anonymous=tools)
+            write_process(proc_dir, owner.pid, 2 * gib, start=owner.start_time)
+            write_process(proc_dir, child_pid, gib, parent=owner.pid)
+            write_scope(ci_slice, members=(owner.pid, child_pid), current=3 * gib + ci_service,
+                        anonymous=3 * gib + ci_service)
+            _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
+
+            process_memory = gate.process_memory
+
+            def read_then_exit(source: set[int] | gate.PopulatedStepScope, proc: Path = proc_dir
+                               ) -> admission_records.MeasuredMemory:
+                memory = process_memory(source, proc)
+                if source == {owner.pid, child_pid} and child.is_dir():
+                    shutil.rmtree(child)
+                    write_scope(ci_slice, members=(owner.pid,), current=2 * gib + ci_service,
+                                anonymous=2 * gib + ci_service)
+                return memory
+
+            with mock.patch.object(gate, "process_memory", side_effect=read_then_exit):
+                _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertFalse(child.exists())
+            with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                page = memory_feed.reading()
+            self.assertEqual(page["ram"]["queued_builds_bytes"], 3 * gib)
+            self.assertEqual(page["ram"]["other_build_tools_bytes"], tools)
+            self.assertEqual(page["ram"].get("ci_service_note_bytes"), ci_service)
 
     def test_registered_and_unregistered_ci_jobs_count_once_without_margin_text(self) -> None:
         for registered, registered_use, unregistered_use, kept in (
@@ -2489,11 +2549,11 @@ process.stdout.write(JSON.stringify({
                 with mock.patch.object(admission_client, "view", return_value=reply.reading):
                     page = memory_feed.reading()
                 self.assertEqual(page["used"], registered_use)
-                self.assertEqual(page["ci_ram"], unregistered_use)
+                self.assertEqual(page["ram"]["build_tools_bytes"], unregistered_use * admission_records.GIB)
                 self.assertEqual(page["cap"], 23)
                 self.assertEqual(page["reserved"], kept)
                 self.assertEqual(page["room"], 17 - kept)
-                self.assertEqual(len(page["walk"]), len(registered) + 1)
+                self.assertEqual(len(page["walk"]), len(registered))
                 self.assertEqual(sum(row.get("queued", False) for row in page["walk"]), len(registered))
                 text = memory_feed.page_json(page)
                 self.assertNotIn("CI builds do not wait in the queue yet.", text)
@@ -2729,6 +2789,14 @@ def write_browser_fixture(folder: Path) -> None:
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
             local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))
+        ci_use = 500 * 1024 ** 2
+        ci_service = admission_records.UnownedSliceMemory(ci_use, owner="hana-ci.slice", pid=701,
+            job_state=IdleService(), anonymous=admission_records.AnonymousRunUse(ci_use))
+        ci_step = admission_records.RunningStep("", "hana-ci.slice", "service", "", 0, ci_service, pid=701)
+        gib = admission_records.GIB
+        with (mock.patch.object(admission_client, "view", return_value=captured_reading(running=(ci_step,))),
+              mock.patch.object(memory_feed, "build_tool_ram", return_value=memory_feed.BuildToolRam(gib, 5 * gib // 2, gib))):
+            pages["ci_service"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))

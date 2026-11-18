@@ -39,18 +39,18 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
+from scripts.buildlog import charts, cost_actions, mac_idle_alert
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import cloud_progress, placement
 from scripts.build_targets import targets
-from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
+from scripts.build_queue.queue_evidence import room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_owner_name, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import OtherCommand, StepJob, StepNames, command_job, read_step_names
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
@@ -124,10 +124,9 @@ LOADED_FEED_CODE_VERSION = loaded_feed_code_version(installed.code_root)
 
 
 GIB = 1024 ** 3
-CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
 PROC = Path("/proc")
 SYS_BLOCK = Path("/sys/block")
-CGROUP = CI_CGROUP.parents[1]
+CGROUP = Path("/sys/fs/cgroup")
 SWAP_NAMES = {
     "agents": "agent sessions ({count})", "apps": "other apps: {app}",
     "desktop": "desktop session", "system": "system services", "ci": "hana CI",
@@ -177,6 +176,7 @@ class FeedConfiguration:
     other_rows: int
     token_dump_seconds: int
     stevie_program: Path
+    ci_service_note_mib: int
 
 
 def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> FeedConfiguration:
@@ -200,7 +200,8 @@ def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = con
                              settings.whole("swap_rows"), settings.whole("report_refresh_seconds"),
                              {"light": theme("light"), "dark": theme("dark")}, settings.whole("other_rows"),
                              settings.whole("token_dump_seconds"),
-                             Path(os.path.expandvars(settings.text("stevie_program"))).expanduser())
+                             Path(os.path.expandvars(settings.text("stevie_program"))).expanduser(),
+                             settings.whole("ci_service_note_mib"))
 
 
 class PageArguments(CodeRootArguments):
@@ -272,42 +273,6 @@ class LeftoverScope(TypedDict):
     age: str
     used: float
     members: list[LeftoverProcess]
-
-
-class CIRunnerMemory(TypedDict):
-    unit: str
-    name: str
-    used: float
-    pid: int | admission_records.PidNotRecorded
-
-
-class BusyCIRunner(CIRunnerMemory):
-    state: Literal["busy"]
-    started_at: float
-    job: str
-
-
-class IdleCIRunner(CIRunnerMemory):
-    state: Literal["idle"]
-
-
-class UnreadableCIRunner(TypedDict):
-    unit: str
-    name: str
-    state: Literal["unreadable"]
-    diagnostic: str
-
-
-CIRunner = BusyCIRunner | IdleCIRunner | UnreadableCIRunner
-
-
-@dataclass(frozen=True)
-class RunnerProcess:
-    pid: int
-    parent: int
-    started_at: float
-    program: str
-    command: tuple[str, ...]
 
 
 class NoProgress(TypedDict):
@@ -480,7 +445,7 @@ def head_room(check: admission_records.RoomCheck,
     earlier = max(0, ram["room_bytes"] - free)
     rows: list[RoomRow] = [
         {"label": "Queue cap", "gib": gib(ram["cap_bytes"])},
-        {"label": "− Builds", "gib": gib(ram["queued_builds_bytes"] + ram["build_tools_bytes"] + ram["ci_bytes"])},
+        {"label": "− Builds", "gib": gib(ram["queued_builds_bytes"] + ram["build_tools_bytes"])},
         {"label": "− Build reserved", "gib": gib(ram["build_covered_bytes"])}]
     if earlier:
         rows.append({"label": "− Earlier waiters", "gib": gib(earlier)})
@@ -516,7 +481,6 @@ class SlotPlace(TypedDict):
 
 
 class RunRow(RowQueueNotes, SlotPlace):
-    admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     slot: NotRequired[int | Literal["—"]]
@@ -537,10 +501,7 @@ class RunRow(RowQueueNotes, SlotPlace):
     queued: bool
     keep_text: str
     group: str
-    ci: bool
     parts: list[GroupPart]
-    ci_runners: NotRequired[list[CIRunner]]
-    ci_cgroup: NotRequired[str]
     need: NotRequired[float]
     need_part: NotRequired[bool]
 
@@ -615,9 +576,9 @@ def step_name_parts(step: admission_records.RunningStep | admission_records.Wait
 
 def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
     """Keep a process identity across changes to memory, labels, and queue order."""
-    # An idle or unreadable CI row has no pid or start time; its cgroup tells two CI rows apart.
+    # Group rows have no process identity. The group name keeps their keys distinct.
     identity = [row.get("machine") or "natedev", row.get("kind", "local"), row["pid"],
-                row.get("started_at", row.get("since", 0)), row.get("group", ""), row.get("ci_cgroup", "")]
+                row.get("started_at", row.get("since", 0)), row.get("group", "")]
     return hashlib.sha256(json.dumps(codec.snapshot_value(identity)).encode()).hexdigest()[:24]
 
 
@@ -828,8 +789,6 @@ class MemoryPage(TypedDict):
     limit: str
     ram: RamBlocks
     memory_status: MemoryStatus
-    ci_name: str
-    ci_ram: float
     waiting: int
     smallest_need: float
     pressure: str
@@ -871,128 +830,35 @@ class PageUnavailable(TypedDict):
     read_at: float
 
 
-def cargo_job(command: tuple[str, ...]) -> str:
-    """Return the job word from a Cargo command or from the CI cargo front's command."""
-    for index, argument in enumerate(command):
-        if Path(argument).name == parse.CI_CARGO_FRONT:
-            return cargo_job(("cargo", *parse.cargo_front_call(command[index + 1:]).arguments))
-        if Path(argument).name not in ("cargo", "cargo-tile-real", "cargo-nextest"):
+def ci_runner_names(readings: Sequence[admission_records.UnownedSliceMemory]) -> frozenset[str]:
+    """Find runner names for the CI Cargo rows."""
+    names: set[str] = set()
+    for memory in readings:
+        if not memory.cgroup:
             continue
-        subcommand = parse.cargo_subcommand(command[index + 1:])
-        if subcommand in ("test", "nextest"):
-            return "tests"
-        if subcommand == "build" and any(flag in command for flag in ("--release", "-r")):
-            return "release build"
-        if subcommand:
-            return subcommand
-    return ""
+        names.update(child.name.removeprefix("github-runner-").removesuffix(".service")
+                     for child in Path(memory.cgroup).glob("github-runner-*.service") if child.is_dir())
+    return frozenset(names)
 
 
-def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
-    name = unit.name.removeprefix("github-runner-").removesuffix(".service")
-    try:
-        used = gib(gate.slice_working_set(unit).bytes)
-        boot = float(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
-                          if line.startswith("btime ")))
-        ticks = int(os.sysconf("SC_CLK_TCK"))
-        members: set[int] = set()
-        pending = [unit]
-        while pending:
-            scope = pending.pop()
-            members.update(int(value) for value in (scope / "cgroup.procs").read_text().split())
-            pending.extend(child for child in scope.iterdir() if child.is_dir())
-        processes: dict[int, RunnerProcess] = {}
-        for pid in sorted(members):
-            try:
-                stat = (proc / str(pid) / "stat").read_text()
-                fields = stat.rsplit(") ", 1)[1].split()
-                if fields[0] in ("Z", "X"):
-                    continue
-                command = tuple(part for part in (proc / str(pid) / "cmdline").read_bytes()
-                                .decode(errors="replace").split("\0") if part)
-                processes[pid] = RunnerProcess(pid, int(fields[1]), boot + int(fields[19]) / ticks,
-                                               stat.split("(", 1)[1].rsplit(") ", 1)[0], command)
-            except FileNotFoundError:
-                continue
-        workers = sorted((p for p in processes.values() if p.program == "Runner.Worker"),
-                         key=lambda p: (p.started_at, p.pid))
-        if workers:
-            worker = workers[0]
-            jobs: list[tuple[float, str]] = []
-            for process in processes.values():
-                job = cargo_job(process.command)
-                if not job:
-                    continue
-                ancestor = process.pid
-                seen: set[int] = set()
-                while ancestor in processes and ancestor not in seen:
-                    if ancestor == worker.pid:
-                        jobs.append((process.started_at, job))
-                        break
-                    seen.add(ancestor)
-                    ancestor = processes[ancestor].parent
-            return {"unit": unit.name, "name": name, "state": "busy", "used": used,
-                    "pid": worker.pid, "started_at": worker.started_at,
-                    "job": min(jobs)[1] if jobs else "CI job"}
-        listeners = sorted(p.pid for p in processes.values() if p.program == "Runner.Listener")
-        return {"unit": unit.name, "name": name, "state": "idle", "used": used,
-                "pid": listeners[0] if listeners else admission_records.PidNotRecorded()}
-    except (OSError, ValueError, IndexError, StopIteration) as error:
-        return {"unit": unit.name, "name": name, "state": "unreadable", "diagnostic": str(error)}
-
-
-def job_age(started_at: float, now: float) -> str:
-    minutes = max(0, int((now - started_at) / 60 + 0.5))
-    if minutes < 1:
-        return "under 1 min"
-    if minutes < 60:
-        return f"{minutes} min"
-    hours = minutes // 60
-    return f"{hours} h {minutes % 60} min" if hours < 48 else f"{hours // 24} days"
-
-
-def ci_amount(value: float) -> str:
-    """Show the shared CI text for an amount in GiB."""
-    return ci_bytes_text(round(value * admission_records.GIB))
-
-
-def build_ci_row(used: float, now: float,
-                 cgroup: Path = CI_CGROUP, proc: Path = PROC, *, admitted: bool = False) -> RunRow:
-    runners: list[CIRunner]
-    try:
-        units = sorted(child for child in cgroup.iterdir()
-                       if child.name.startswith("github-runner-") and child.name.endswith(".service"))
-        runners = [read_ci_runner(unit, proc) for unit in units]
-    except OSError as error:
-        runners = [{"unit": cgroup.name, "name": "hana CI",
-                                    "state": "unreadable", "diagnostic": str(error)}]
-    busy = [runner for runner in runners if runner["state"] == "busy"]
-    busy.sort(key=lambda runner: runner["started_at"])
-    detail = (f"{len(busy)} of {len(runners)} runners busy · {job_age(busy[0]['started_at'], now)}"
-              if busy else "idle")
-    if any(runner["state"] == "unreadable" for runner in runners):
-        detail = detail + " · runner not readable" if busy else "runner not readable"
-    lines: list[str] = []
-    for runner in runners:
-        if runner["state"] == "unreadable":
-            lines.append(f"{runner['name']} · not readable")
-        elif runner["state"] == "busy":
-            lines.append(f"{runner['name']} · {runner['job']} · {job_age(runner['started_at'], now)} · {ci_amount(runner['used'])}")
-        else:
-            lines.append(f"{runner['name']} · idle · {ci_amount(runner['used'])}")
-    lines.append(f"hana CI uses {ci_amount(used)} now. This use is part of the work inside the cap.")
-    idle = [runner for runner in runners if runner["state"] == "idle" and isinstance(runner["pid"], int)]
-    pid = busy[0]["pid"] if busy else idle[0]["pid"] if idle else admission_records.PidNotRecorded()
-    return {"name": read_step_names().for_owner(busy[0]["job"] if busy else "job", "", unit_labels.OwnerRole.UNKNOWN,
-                                               ci=True, current_name="hana CI"),
-            "showrunner": "", "unit": "", "ci_label": ci_step_label(busy[0]["name"] if busy else "",
-                                                                       busy[0]["job"] if busy else ""),
-            "state": detail if not busy else "",
-            "pid": pid, "detail": detail, "used": used,
-            "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
-            "queued": False, "keep_text": "\n".join(lines), "group": "", "ci": True, "parts": [],
-            "ci_runners": runners, "ci_cgroup": str(cgroup), "admitted": admitted,
-            "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
+def ci_memory_owners(readings: Sequence[admission_records.UnownedSliceMemory],
+                     steps: Mapping[str, admission_records.RunningStep]) -> set[str]:
+    """Find queued owners whose memory source is in the recorded CI slice."""
+    scopes = tuple(Path(memory.cgroup) for memory in readings if memory.cgroup)
+    pids = {member.pid for memory in readings if isinstance(memory.activity, ScopeProcesses)
+            for member in memory.activity.members}
+    owners: set[str] = set()
+    for owner, step in steps.items():
+        if not isinstance(step.measured, admission_records.MeasuredMemory):
+            continue
+        source = step.measured.anonymous_source
+        if isinstance(source, admission_records.ScopeSource):
+            if any(source.directory.is_relative_to(scope) for scope in scopes):
+                owners.add(owner)
+        elif isinstance(source, admission_records.ProcessSource) and step.pid in pids:
+            # The reservation owner anchors the measured process tree.
+            owners.add(owner)
+    return owners
 
 
 def row_progress(steps: Sequence[admission_records.RunningStep], token_stage: str) -> RowProgress | TokenWaitProgress | NoProgress:
@@ -1656,9 +1522,8 @@ class RamBlocks(TypedDict):
     rust_analyzer_bytes: int
     sccache_bytes: int
     other_build_tools_bytes: int
-    # The CI use that the queue cap counts: swap-backed use.
-    ci_bytes: int
-    # What builds may use: build tools, queued builds, CI, build reserved and free.
+    ci_service_note_bytes: NotRequired[int]
+    # Build tools, queued builds, build reserved and free add to this cap.
     cap_bytes: int
     agents_bytes: RamReading
     desktop_bytes: RamReading
@@ -1857,13 +1722,13 @@ def slice_program_bytes(reading: admission_records.MeasuredMemory | admission_re
 
 @dataclass(frozen=True)
 class BuildToolRam:
-    """Hold the builds.slice program RAM that no queued build holds."""
+    """Hold the RAM of build tools outside the CI service."""
     rust_analyzer: int
     sccache: int
     other: int
 
 
-def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int) -> BuildToolRam:
+def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_slice_use: int) -> BuildToolRam:
     """Read the builds.slice program RAM that no queued build holds, on the same basis as the queued builds.
 
     rust-analyzer and the compiler cache have their own lines. Other build tools is the rest of builds.slice
@@ -1893,7 +1758,7 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
             sccache += amount
         elif (not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
               or entry.step.step == SWAP_NAMES["between"]):
-            # A CI service counts in hana CI, and a run between steps counts in its queued hold.
+            # The CI service has a separate charge. A queued hold counts the run between steps.
             pass
         elif isinstance(memory.activity, ScopeProcesses) and memory.activity.program == RUST_ANALYZER:
             rust_analyzer += amount
@@ -1906,8 +1771,8 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
     try:
         slice_bytes = swap_backed_bytes(builds)
     except (OSError, ValueError, KeyError):
-        slice_bytes = queued_use + named_inside
-    return BuildToolRam(rust_analyzer, sccache, max(0, slice_bytes - queued_use - named_inside) + outside_tools)
+        slice_bytes = queued_slice_use + named_inside
+    return BuildToolRam(rust_analyzer, sccache, max(0, slice_bytes - queued_slice_use - named_inside) + outside_tools)
 
 
 def known_bytes(value: RamReading) -> int:
@@ -1915,10 +1780,10 @@ def known_bytes(value: RamReading) -> int:
 
 
 def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_time: float,
-               program_rows: int) -> RamBlocks:
+               program_rows: int, ci_service_note_mib: int) -> RamBlocks:
     """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest.
 
-    Build tools, queued builds, CI, reserved memory and free memory add to the queue cap.
+    Build tools, queued builds, reserved memory and free memory add to the queue cap.
     """
     available, safety, swap, build = room.available, room.safety, room.agent_swap_demand, room.kept
     safety_covered = min(safety, available)
@@ -1932,17 +1797,20 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
     other_programs_bytes = sum(amount for _, amount in ranked)
-    build_tools = tools.rust_analyzer + tools.sccache + tools.other
+    # The queue already removes admitted Cargo use from the CI service charge.
+    ci_service_note = room.ci_use if room.ci_use >= ci_service_note_mib * 1024 ** 2 else 0
+    other_build_tools = tools.other + (room.ci_use - ci_service_note)
+    build_tools = tools.rust_analyzer + tools.sccache + other_build_tools + ci_service_note
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
-    named = (room.used + build_tools + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
+    named = (room.used + build_tools + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
              + known_bytes(kernel.total) + known_bytes(cache))
     unattributed = total - available - named if isinstance(total, int) else 0
     readings = ((RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
                 (RAM_NAMES["kernel"], kernel.total), (RAM_NAMES["cache"], cache))
     missing = [f"{name}: {value.reason}" for name, value in readings
                if isinstance(value, admission_records.ReadingUnavailable)]
-    return {
+    blocks: RamBlocks = {
         "capture_time": capture_time, "attribution_read_at": time.time(),
         "total_bytes": total, "available_bytes": available,
         "safety_target_bytes": safety, "swap_target_bytes": swap, "build_target_bytes": build,
@@ -1951,8 +1819,8 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "safety_missing_bytes": safety - safety_covered, "swap_missing_bytes": swap - swap_covered,
         "build_missing_bytes": build - build_covered,
         "queued_builds_bytes": room.used, "build_tools_bytes": build_tools, "rust_analyzer_bytes": tools.rust_analyzer,
-        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
-        "cap_bytes": room.used + build_tools + room.ci_use + build_covered + room.room,
+        "sccache_bytes": tools.sccache, "other_build_tools_bytes": other_build_tools,
+        "cap_bytes": room.used + build_tools + build_covered + room.room,
         "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
         "other_programs_bytes": other_programs_bytes,
@@ -1963,6 +1831,9 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "unattributed_bytes": unattributed, "missing": missing,
         "agreement": "disagree" if unattributed < 0 or known_bytes(cache) < 0 else "agree",
     }
+    if ci_service_note:
+        blocks["ci_service_note_bytes"] = ci_service_note
+    return blocks
 
 
 def memory_status(explanation: admission_records.QueueExplanation, room: admission_records.MemoryRoom,
@@ -2013,14 +1884,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
          *target_availability.holder_sessions(snapshots)], os.environ)
     zone = user_zone()
     routes = target_availability.MacRoutes(snapshots, labels, zone)
-    ci_rows: dict[str, RunRow] = {}
-    for entry in explanation.running:
-        memory = entry.step.measured
-        if isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice):
-            ci_rows[memory.cgroup] = build_ci_row(gib(memory.bytes), explanation.now,
-                Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
-                admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
-    ci_runners = frozenset(runner["name"] for row in ci_rows.values() for runner in row.get("ci_runners", []))
+    ci_readings = gate.ci_readings(entry.step.measured for entry in explanation.running)
+    ci_runners = ci_runner_names(ci_readings)
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
         identity = labels.get(activity.session_id)
@@ -2032,14 +1897,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                           if activity.started_at else "not recorded", "used": gib(memory.bytes), "members": scope_members})
     tokens = token_pool(captured.available, configuration.stevie_program)
     token_stage = token_wait_stage(tokens)
-    ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used),
-                     explanation.now, configuration.other_rows)
-    cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap
-    safety = gib(captured.safety)
-    used = gib(captured.used)
-    total = gib(host.total) if isinstance(host.total, int) else used + gib(captured.available)
-    reserved = gib(sum(run.bytes for run in captured.runs))
-    ci_ram, ci_name = gib(captured.ci_use), "hana CI"
     by_owner: dict[str, admission_records.RunningStep] = {}
     steps_by_owner: dict[str, list[admission_records.RunningStep]] = {}
     reserved_steps = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
@@ -2047,6 +1904,17 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         owner = gate.reservation_owner(reservation, entry.step)
         by_owner[owner] = entry.step
         steps_by_owner.setdefault(owner, []).append(entry.step)
+    ci_owners = ci_memory_owners(ci_readings, by_owner)
+    queued_ci_use = sum(hold.memory.use.bytes for hold in captured.runs
+                        if isinstance(hold.memory.use, admission_records.AnonymousRunUse)
+                        and hold.memory.owner in ci_owners)
+    ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used - queued_ci_use),
+                     explanation.now, configuration.other_rows, configuration.ci_service_note_mib)
+    cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap
+    safety = gib(captured.safety)
+    used = gib(captured.used)
+    total = gib(host.total) if isinstance(host.total, int) else used + gib(captured.available)
+    reserved = gib(sum(run.bytes for run in captured.runs))
     run_steps = {admission_records.run_owner(entry.step.run.pid, entry.step.run.start_time): entry.step
                  for entry in explanation.running if isinstance(entry.step.run, LiveBuildRun)}
     walk: list[RunRow] = []
@@ -2076,7 +1944,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
-                     "queued": True, "keep_text": "", "group": "", "ci": False, "parts": [],
+                     "queued": True, "keep_text": "", "group": "", "parts": [],
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
@@ -2100,43 +1968,31 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
-                "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
+                "queued": False, "keep_text": memory.reason, "group": "", "parts": [],
                 "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
             walk.append(remote_row)
             continue
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
-            service = (isinstance(memory, admission_records.CompilerServiceMemory)
-                       or not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or bool(memory.diagnostic))
-            if service:
-                name = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "compiler cache"
-                activity = service_activity_text(memory, explanation.now)
-                state = activity
-                unit = memory.owner if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service"
-                detail = activity if isinstance(memory, admission_records.UnownedSliceMemory) else "sccache.service · " + activity
-                if isinstance(memory, admission_records.UnownedSliceMemory):
-                    ci_name = "hana CI"
-                    description = memory.diagnostic
-                else:
-                    description = "Memory the compiler cache holds. The queue does not start it."
+            if isinstance(memory, admission_records.CompilerServiceMemory):
+                name, unit = "compiler cache", "sccache.service"
+                state = service_activity_text(memory, explanation.now)
+                detail = f"{unit} · {state}"
+                description = "Memory the compiler cache holds. The queue does not start it."
             else:
+                if not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice) or memory.diagnostic:
+                    continue
                 description = "Memory these processes hold. The queue did not start them."
-                if isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses):
+                if isinstance(memory.activity, ScopeProcesses):
                     name = memory.activity.program
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                            "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
                            "progress": row_progress((step,), token_stage),
-                           "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
-            if service and isinstance(memory, admission_records.UnownedSliceMemory):
-                row = ci_rows[memory.cgroup] if memory.cgroup in ci_rows else build_ci_row(gib(memory.bytes), explanation.now,
-                                   Path(memory.cgroup) if memory.cgroup else CI_CGROUP,
-                                   admitted=isinstance(admission_records.recorded_service_state(memory), RunningServiceJob))
-                if memory.diagnostic:
-                    row["keep_text"] += "\n" + memory.diagnostic
-                name, detail = row["name"], row["detail"]
-            if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
+                           "queued": False, "keep_text": description, "group": "", "parts": []}
+            if (isinstance(memory, admission_records.UnownedSliceMemory)
+                    and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2):
                 program = memory.activity.program
                 group = "Codex servers" if program in ("codex", "codex-real") else "unowned processes"
                 row["detail"] = " · ".join(part for part in (detail, program) if part)
@@ -2153,7 +2009,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
                      "queued": False, "keep_text": "Memory these processes hold. The queue did not start them.",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
-                     "group": name, "ci": False, "parts": [{"who": row["detail"].removeprefix("owner not recorded · "),
+                     "group": name, "parts": [{"who": row["detail"].removeprefix("owner not recorded · "),
                          "who_parts": row.get("detail_parts", staff_names.text_parts(row["detail"])), "pid": row["pid"],
                          "gib": row["used"], "age": row.get("age", ""), "started_at": row["started_at"]}
                          for row in sorted(members, key=lambda row: gib(row["used"]), reverse=True)
@@ -2165,7 +2021,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
     # steve serves natedev builds; CI uses its own pool, and remote rows use no natedev tokens.
     token_rows = {row["pid"]: row for row in walk
-                  if row.get("machine") == machine and not row["ci"] and isinstance(row["pid"], int)}
+                  if row.get("machine") == machine and isinstance(row["pid"], int)}
     if isinstance(holders, TokenHolders):
         counts = tokens_by_run(holders, set(token_rows))
         # steve lists each connected process, including holders of zero tokens.
@@ -2314,7 +2170,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",
         "limit": "room and head protection", "ram": ram,
         "memory_status": memory_status(explanation, captured, len(by_owner)),
-        "ci_name": ci_name, "ci_ram": ci_ram,
         "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,

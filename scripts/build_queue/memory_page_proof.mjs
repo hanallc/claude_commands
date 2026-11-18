@@ -605,7 +605,7 @@ try {
             checkPixel(proof.roomBar.left+5,proof.roomBar.top+4,proof.roomColor,'The room pixels differ at '+theme+' '+width+' px, bar '+JSON.stringify(proof.roomBar)+'.');
             proofs.push({theme,width,metrics:proof});
             const slotReview=structuredClone(base);
-            const running=slotReview.walk.find(row=>row.queued&&!row.ci);
+            const running=slotReview.walk.find(row=>row.queued);
             slotReview.walk=[
               {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2,tokens:6},
               {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51,slot:'—'},
@@ -916,10 +916,10 @@ try {
             assert.ok(disagree.bar>0,'A disagreement hides the memory bar.');
             assert.equal(disagree.scale,false,'A disagreement hides the scale.');
             proof.disagree=disagree;
-            // Build tools and hana CI sit inside the queue cap: more of them leaves less free, and the cap stays.
-            const gib=1024**3, capReading=structuredClone(base), known=value=>typeof value==='number'?value:0;
-            Object.assign(capReading.ram,{build_tools_bytes:capReading.ram.build_tools_bytes+gib,
-              sccache_bytes:capReading.ram.sccache_bytes+gib,ci_bytes:known(capReading.ram.ci_bytes)+gib/2,
+            // More build tools use leaves less free RAM inside the same cap.
+            const gib=1024**3, capReading=structuredClone(base);
+            Object.assign(capReading.ram,{build_tools_bytes:capReading.ram.build_tools_bytes+3*gib/2,
+              sccache_bytes:capReading.ram.sccache_bytes+gib,ci_service_note_bytes:gib/2,
               available_bytes:capReading.ram.available_bytes-3*gib/2,
               room_bytes:capReading.ram.room_bytes-3*gib/2});
             capReading.room-=1.5;
@@ -1014,7 +1014,7 @@ try {
             // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
             const shortReading=structuredClone(base);
             // The running build reserves all of free and 4 GiB more, so its reserve fills the cap.
-            const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
+            const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&typeof row.reserved==='number');
             shortRun.reserved+=shortReading.room+4;
             if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+4;
             Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
@@ -1038,8 +1038,6 @@ try {
                 brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
             })()`);
             assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
-            // A small hana CI part stays visible, so the builds parts add up on screen.
-            assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
             assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
             assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
             assert.equal(overBar.brace,'over cap 4.0');
@@ -1162,36 +1160,6 @@ try {
                 await writeFile(join(folder,'unmatched-priority-1400.png'),Buffer.from(shot.data,'base64'));
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
-            }
-            await show(base);
-
-            for (const state of ['idle','waiting','unmatched','busy']) {
-              const ciReading=structuredClone(base);
-              ciReading.walk.push({name:'hana CI',ci:true,admitted:state==='busy',queued:false,used:0.125,reserved:0,
-                counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
-                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
-              ciReading.ci_ram=0.125;
-              ciReading.ram.ci_bytes=known(ciReading.ram.ci_bytes)+gib/8;
-              ciReading.ram.available_bytes-=gib/8;
-              ciReading.ram.room_bytes-=gib/8;
-              ciReading.room-=0.125;
-              ciReading.taken=ciReading.cap-ciReading.room;
-              await show(ciReading);
-              const ciProof=await evaluate(`(() => {
-                const key=proofTip('row',latest.walk.length-1);
-                const table=document.querySelector('.walk-table tr[data-tip="'+key+'"]');
-                const chart=document.querySelector('.wrow[data-tip="'+key+'"]');
-                return {table:!!table,chart:!!chart,stage:table?.querySelector('.place').textContent,
-                  taken:document.querySelector('#walk-sum').textContent,ci:latest.ci_ram,
-                  builds:document.querySelector('#v-g-builds').textContent,
-                  reserved:document.querySelector('#v-reserved').textContent,cap:document.querySelector('#v-cap').textContent};
-              })()`);
-              assert.equal(ciProof.table,state==='busy');
-              assert.equal(ciProof.chart,state==='busy');
-              if(state==='busy') assert.equal(ciProof.stage,'—');
-              assert.equal(ciProof.ci,0.125);
-              const takenTenths=Math.round(parseFloat(ciProof.builds)*10)+Math.round(parseFloat(ciProof.reserved)*10);
-              assert.equal(ciProof.taken,(takenTenths/10).toFixed(1)+' of '+ciProof.cap.replace(' GiB','')+' GiB taken');
             }
             await show(base);
 
@@ -1979,10 +1947,7 @@ try {
             progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
           const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
           Object.assign(aws, {machine:'aws',used:1.5});
-          const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
-            started_at:now-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
-            progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
-          review.walk = [local, mac, aws, ci];
+          review.walk = [local, mac, aws];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
             why:'only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.',
@@ -1990,7 +1955,6 @@ try {
             head_room:{unavailable:'',
               rows:[{label:'Queue cap',gib:0.0},{label:'− Builds',gib:0.0},{label:'− Build reserved',gib:0.0},
               {label:'= Free for builds',gib:0.0}],note:''}}];
-          review.ci_ram = 0.125;
           review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {
             await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
@@ -2142,8 +2106,8 @@ try {
             await navigate('memory_live.html');
             const review = await evaluate(`(() => {
               const fractional={...latest,read_at:220,cap:5.2,ram:{...latest.ram,
-                build_tools_bytes:1.04*GIB,rust_analyzer_bytes:1.04*GIB,sccache_bytes:0,other_build_tools_bytes:0,
-                queued_builds_bytes:1.04*GIB,ci_bytes:1.04*GIB,
+                build_tools_bytes:2.08*GIB,rust_analyzer_bytes:1.04*GIB,sccache_bytes:0,other_build_tools_bytes:0,
+                queued_builds_bytes:1.04*GIB,ci_service_note_bytes:1.04*GIB,
                 swap_covered_bytes:GIB,swap_target_bytes:2*GIB,swap_missing_bytes:GIB,build_covered_bytes:1.04*GIB,room_bytes:1.04*GIB},
                 unmatched_priority_entries:[{unit:'research'},{unit:'cables'}],
                 walk:[{key:'fractional-run',name:'Codex servers',group:'codex',used:0.4,parts:[
@@ -2206,7 +2170,7 @@ try {
             const leafProof = await evaluate(`(() => {
               const reading={...latest,cap:3.06,taken:2.04,ram:{...latest.ram,
                 rust_analyzer_bytes:1.02*GIB,sccache_bytes:0,other_build_tools_bytes:0,
-                build_tools_bytes:1.02*GIB,queued_builds_bytes:0,ci_bytes:0,
+                build_tools_bytes:1.02*GIB,queued_builds_bytes:0,ci_service_note_bytes:undefined,
                 build_covered_bytes:1.02*GIB,room_bytes:1.02*GIB,
                 desktop_bytes:10*GIB,agents_bytes:0,programs:[],smaller_programs_bytes:0,other_programs_bytes:0,
                 compressed_swap_bytes:0,kernel_structures_bytes:0,kernel_counters_bytes:0,kernel_bytes:0,
@@ -2313,7 +2277,7 @@ try {
         const mockState = structuredClone(legendReading);
         const bytes = gib => gib * 1024**3;
         Object.assign(mockState,{cap:11.3,total:44.4,taken:11.3,used:3.2,reserved:8.1,room:0,shortfall:0});
-        Object.assign(mockState.ram,{queued_builds_bytes:bytes(3.2),build_tools_bytes:0,ci_bytes:0,
+        Object.assign(mockState.ram,{queued_builds_bytes:bytes(3.2),build_tools_bytes:0,ci_service_note_bytes:undefined,
           rust_analyzer_bytes:0,sccache_bytes:0,other_build_tools_bytes:0,
           safety_target_bytes:bytes(4),safety_covered_bytes:bytes(4),safety_missing_bytes:0,
           swap_target_bytes:bytes(2.1),swap_covered_bytes:bytes(2.1),swap_missing_bytes:0,
@@ -2399,9 +2363,19 @@ try {
           comparisons.push({swapShare:version,rows});
         }
 
-        // A gate job's tooltip says what the job does and what it changes, below its title (#109).
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1100,deviceScaleFactor:1,mobile:false});
+        await show(readings.ci_service);
+        assert.equal(await evaluate("getComputedStyle(document.documentElement).colorScheme"), 'dark');
+        await evaluate("showTip('tools',700,420)");
+        const ciNote = await evaluate("tipText('tools',latest)");
+        assert.equal(ciNote[0], 'Build tools  5.0 GiB');
+        assert.deepEqual(ciNote[1].split('\n'), ['RAM that build tools use now', 'rust-analyzer  1.0 GiB',
+          '+ CI runner service  0.5 GiB', '+ sccache  2.5 GiB', '+ Other build tools  1.0 GiB']);
+        assert.equal(await evaluate("document.querySelector('[data-tip=ci]') === null"), true);
+        await capture('ci-runner-service-dark-desktop','#tip');
+
+        // A gate job's tooltip says what the job does and what it changes.
         const gateReading=structuredClone(base);
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
