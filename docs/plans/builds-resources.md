@@ -2759,7 +2759,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Cause, proven by `scripts/build_queue/test_first_step.py`: `verify.sh` cancels the remote placement on exit, then `FirstStepAdmission.close()` cancels it again. The service found no request and refused with the owner-mismatch text; the Mac release build cleanup exited 2.
 - `AdmissionServer._handle_placement` refuses a missing request with `wire.PLACEMENT_REQUEST_MISSING_REASON` ("placement request is missing"), defined in `admission_wire.py`. A real owner difference still refuses with "placement coordinator does not match".
 - `close()` treats that reason on its own cancel as success (an idempotent cancel). Any other refusal still raises.
-- Live after the build-admission service restart.
+- Live with no restart: the build-admission service reloads its own changed source.
 - Checkpoint `31056b27e`.
 
 **Files:** `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/first_step.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_first_step.py`.
@@ -2776,11 +2776,12 @@ Builds assigned this on 11-18 (reported by accounts via natedev on main ce7733f5
 
 ### Phase 148 — The warm-seed tests start no real Cargo  · status: done
 
-Builds 11-18: warmseed (Phase 144 row 2b8823670) failed its merge test. Cause, a branch fault: `test_real_cargo_reuses_a_registry_unit_and_rebuilds_local_inputs` in `scripts/lib/test_cargo_seed.py` starts real rustup and Cargo. The merge gate puts tripwire `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH for each test module (`scripts/production/merge_gate.py` `test_module_environment`, since 10-28); they exit 99 and the gate reports "a test started real rustup". The row check ran the module outside the gate, so it passed.
+#### As-built
 
-1. Remove the real-Cargo test and the helpers only it uses. The copy, lock, stage and recovery tests stay. The Phase 144 Hana measurement keeps the real-Cargo evidence.
-2. Prove the module passes with the gate tripwires first on PATH.
-3. Fold the change into the Phase 144 row, replay on main, run the merge tests, send a new hash.
+- Cause: `test_real_cargo_reuses_a_registry_unit_and_rebuilds_local_inputs` in `scripts/lib/test_cargo_seed.py` started real rustup and Cargo. The merge gate puts tripwire `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH (`merge_gate.py` `test_module_environment`), so the warmseed row failed its merge test.
+- The test and the helpers only it used (`fixture_cargo`, `write_crate`, `build_crate`) are removed. The copy, lock, stage and recovery tests stay. The Phase 144 Hana measurement keeps the real-Cargo evidence.
+- 13 tests pass with the tripwires first on PATH, with 0 tripwire calls.
+- Rows on main `9eff6f1ee`: row 144 `7f9f08a71`, row 144 shrink `85affe59a` (56 tests pass under the tripwires).
+- Checkpoint `6f1e2452b`.
 
 **Files:** `scripts/lib/test_cargo_seed.py`.
-
