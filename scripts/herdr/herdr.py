@@ -1118,18 +1118,25 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment(dict(os.environ))
 
 
+class HerdrLaunchRefused(_CommandNotStarted):
+    """The deadline passed before Herdr started the command."""
+
+
 PROGRAM_TIMEOUT_SECONDS = 10.0
 
 
 def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     prompt_transport = argv[3:5] == ["agent", "prompt"]
+    deadline = worker_lifecycle.effective_deadline(time.monotonic() + timeout)
     try:
-        deadline = worker_lifecycle.effective_deadline(time.monotonic() + timeout)
-        timeout = operation_deadline.remaining(timeout)
+        remaining = operation_deadline.remaining(timeout)
+    except TimeoutError as error:
+        raise HerdrLaunchRefused(f"{argv[0]}: {error}") from error
+    try:
         env = unmarked_environment() if environment is None else child_environment(environment)
         if not prompt_transport:
-            return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout, env=env)
+            return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     except Exception as error:
         if prompt_transport or isinstance(error, OSError):
@@ -1602,7 +1609,7 @@ class Herdr:
         """Run within the caller's monotonic deadline, retaining the usual 10 s cap."""
         deadline = worker_lifecycle.effective_deadline(deadline)
         if deadline <= time.monotonic():
-            raise _CommandNotStarted("deadline passed")
+            raise HerdrLaunchRefused("deadline passed")
         context = f"herdr {' '.join(arguments[:2])}"
         try:
             result = run_program(self.argv(*arguments), timeout=min(PROGRAM_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic())))

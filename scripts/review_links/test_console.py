@@ -465,9 +465,17 @@ try{
   check(badge.hidden,'the next count read removes the last alert');
   const fixture=document.createElement('iframe');
   fixture.style.cssText='position:fixed;left:0;top:0;width:716px;height:800px;border:0';
-  fixture.src='/layout';
+  const bookmark='/console/?page=investigations&at.investigations='+
+   encodeURIComponent('/console/investigations.html?show=all#showrunner=builds&q=shard');
+  fixture.src=bookmark;
   await new Promise(resolve=>{fixture.addEventListener('load',resolve,{once:true});document.body.append(fixture);});
   const layout=fixture.contentDocument;
+  const opened=new URL(fixture.contentWindow.location.href);
+  const reviewFrame=layout.querySelector('iframe[title="Review"]');
+  const filters=new URLSearchParams(new URL(reviewFrame.src).hash.slice(1));
+  check(opened.searchParams.get('page')==='review' && filters.get('type')==='investigations' &&
+   filters.get('show')==='all' && filters.get('source-owner')==='builds' && filters.get('q')==='shard',
+   'the legacy Console bookmark opens the combined filter and preserves its filters');
   const sidebar=layout.querySelector('.shell'),toggle=layout.querySelector('#nav-toggle');
   const box=layout.querySelector('#action-popover');
   const button=layout.querySelector('.for-you-slot button');
@@ -503,7 +511,7 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             self.end_headers()
             if self.path == '/complete':
                 _ = complete.wait(35)
-            elif self.path == '/layout':
+            elif self.path.startswith('/console/?page=investigations'):
                 _ = self.wfile.write(layout.encode())
             elif self.path.startswith('/?'):
                 _ = self.wfile.write(page)

@@ -49,7 +49,7 @@ class HanaTransportPolicyTests(unittest.TestCase):
                         self.fail('unexpected source AWS operation')
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
                 provider = hana_provider.AwsHanaProvider(AwsCli('fixture-profile', 'us-east-2', 999, execute),
-                    root, 'fixture-bucket', 1)
+                    root, 'fixture-bucket', 1, result_transfer_timeout_s=83)
                 transport = hana_transport.AwsSourceObjects(provider, configuration, 'fixture-deployment', clock=lambda: 1)
                 payload = root / 'bundle'
                 _ = payload.write_bytes(b'fixture bundle')

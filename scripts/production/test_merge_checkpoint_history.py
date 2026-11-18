@@ -9,7 +9,7 @@ import os
 import shutil
 import unittest
 from pathlib import Path
-from typing import final
+from typing import cast, final
 from unittest import mock
 
 
@@ -80,7 +80,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     ancestry_calls = [call for call in calls.call_args_list if call.args[1] == "merge-base"]
                     self.assertLessEqual(len(ancestry_calls), 6)
 
-    def test_a_repair_merge_keeps_the_phase_review_row_and_logs_both_merges(self) -> None:
+    def test_a_repair_merge_adds_its_own_review_row_and_logs_both_merges(self) -> None:
         self.env["MERGE_CHECKPOINT_REVIEW_REGIME"] = str(Path(__file__).with_name("review_regime.py"))
         ledger = Path(self.env["HOME"]) / ".claude/data/review_regime.jsonl"
         code = self.checkpoint()
@@ -90,15 +90,15 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         first_row = ledger.read_bytes()
         self.assertEqual(len(first_row.splitlines()), 1)
         first_merge = self.git("rev-parse", "HEAD")
-        first_merged_at = self.git("show", "-s", "--format=%cI", first_merge)
 
         repair = self.checkpoint(content="alpha repaired\n", subject="repair alpha phase two")
         second = self.run_checkpoint(repair)
         self.assertEqual(second.process.returncode, 0, second.process.stderr + second.process.stdout)
-        self.assertIn("record: ok — kept alpha phase 2 of docs/plans/alpha.md: "
-                      + f"a row exists from the merge at {first_merged_at}; nothing added; "
-                      + "review ledger and production log updated\n", second.process.stdout)
-        self.assertEqual(ledger.read_bytes(), first_row)
+        self.assertIn("record: ok — review ledger and production log updated\n", second.process.stdout)
+        both_rows = ledger.read_bytes()
+        self.assertTrue(both_rows.startswith(first_row))
+        self.assertEqual([cast(dict[str, object], json.loads(line))["checkpoint"] for line in both_rows.splitlines()],
+                         [code, repair])
         repair_merge = self.git("rev-parse", "HEAD")
         self.assertNotEqual(repair_merge, first_merge)
         lines = self.log.read_text().splitlines()
@@ -110,7 +110,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(repeated.process.returncode, 0, repeated.process.stderr + repeated.process.stdout)
         self.assertIn("record: ok — checkpoint already recorded\n", repeated.process.stdout)
         self.assertEqual(self.log.read_text().splitlines(), lines)
-        self.assertEqual(ledger.read_bytes(), first_row)
+        self.assertEqual(ledger.read_bytes(), both_rows)
 
     def test_shrink_merges_only_plan_and_next_items_after_code_checkpoint(self) -> None:
         for configured_plan, closing_kind in (("docs/plans/alpha.md", "shrink"),
