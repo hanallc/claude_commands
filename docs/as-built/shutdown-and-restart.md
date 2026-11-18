@@ -321,7 +321,7 @@ The fixed-id lookup supplies their names for closed List items.
 It is separate from an admitted `StaffRow`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` defaults to `~/rust/hanadocs`.
 The first start requires `<root>/<name>/README.md`.
-Dwight uses `~/rust/hanadocs/dwight/README.md`, with role `strategist`.
+Dwight uses `~/rust/hanadocs/dwight/README.md`.
 
 The first-start path uses this order:
 

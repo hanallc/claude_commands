@@ -27,7 +27,7 @@ from unittest import mock
 from scripts.lint import tmp_sweep
 from scripts.direct import recorder_state
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lib import build_folders, copy_record, scratch, test_hang_guard
+from scripts.lib import build_folders, copy_record, scratch, test_hang_guard, time_limit
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
@@ -554,6 +554,40 @@ class CopyTests(TmpSweepCase):
                            check=True, capture_output=True, env=environment)
         _ = self.sweep()
         self.assertFalse(path.exists())
+
+    def test_landed_dry_run_keeps_a_copy_that_needs_a_remote_check(self) -> None:
+        path = self.copy("stale-landed", task="landed:maker-unit/work", land_target="origin/main",
+                         source_path=str(self.tmp / "copies" / "show-maker" / "stale-landed"))
+        remote = self.tmp.parent / "landed-origin.git"
+        trace = self.tmp.parent / "landed.trace"
+        trace.touch()
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+                       "GIT_ALLOW_PROTOCOL": "file"}
+        for arguments in (("init", "-q"),
+                          ("init", "--bare", "-q", str(remote)),
+                          ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "base"),
+                          ("remote", "add", "origin", str(remote)),
+                          ("push", "-q", "origin", "HEAD:refs/heads/work", "HEAD:refs/heads/main"),
+                          ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "published"),
+                          ("push", "-q", str(remote), "HEAD:refs/heads/published")):
+            _ = subprocess.run(["git", "-C", str(path), *arguments], check=True, capture_output=True, env=environment)
+        scratch.exclude_copy_metadata(path)
+        with (mock.patch.dict(os.environ, {**environment, "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            result = self.sweep(True)
+            query.assert_not_called()
+        self.assertTrue(path.is_dir())
+        self.assertNotIn(str(path), [entry["path"] for entry in result.deleted])
+        self.assertTrue(any("a remote check is needed" in reason and str(path) in paths for reason, paths in result.kept.items()))
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
+        self.assertNotIn("built-in: git ls-remote ", trace.read_text())
+        with (mock.patch.dict(os.environ, {**environment, "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            result = self.sweep()
+            query.assert_called_once()
+        self.assertIn(str(path), [entry["path"] for entry in result.deleted])
+        self.assertFalse(path.exists())
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
 
     def test_new_unsaved_work_between_scan_and_remove_keeps_copy(self) -> None:
         path = self.copy("edited")
