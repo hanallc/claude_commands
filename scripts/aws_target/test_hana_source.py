@@ -219,6 +219,12 @@ class HanaSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(source.SourceRefused, 'CredentialOrBuildInput: .* forbidden path .env'):
             _ = self.prepare()
         (self.checkout / '.env').unlink()
+        unreadable = Path(os.fsdecode(os.fsencode(self.checkout) + b'/\xff.key'))
+        _ = unreadable.write_text('fixture secret')
+        with self.assertRaises(source.SourceRefused) as refused:
+            _ = self.prepare()
+        self.assertIn(b'\\xff.key', str(refused.exception).encode())
+        unreadable.unlink()
         (self.checkout / 'build/target').mkdir(parents=True)
         _ = (self.checkout / 'build/target/output').write_text('untracked build output')
         _ = (self.checkout / '.gitignore').write_text('.direnv/\n__pycache__/\n.claude/settings.local.json\nprivate.bin\n')

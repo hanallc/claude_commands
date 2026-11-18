@@ -92,7 +92,9 @@ def check_inputs(source: Path, configuration: conf.ConfigRead) -> None:
             path = os.fsdecode(raw)
             if raw and (build_output and path_matches(path, 'target/')
                         or any(path_matches(path, pattern) for pattern in forbidden)):
-                raise hana_source.SourceRefused('CredentialOrBuildInput: source contains the forbidden path ' + path)
+                # The reason goes into UTF-8 records, so a name that is not UTF-8 shows as escapes.
+                raise hana_source.SourceRefused('CredentialOrBuildInput: source contains the forbidden path '
+                                                + raw.decode('utf-8', 'backslashreplace'))
 
 
 class SourceSender:
