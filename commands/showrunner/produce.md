@@ -125,8 +125,7 @@ The question form for every question to the user is defined by this import:
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
     suggestion, not the user's unsent draft.
-- **Your own coordination** goes by SendMessage to the unit director, beginning
-  `From the showrunner:`.
+- Send your coordination messages directly to the unit director with SendMessage. Start with the message body.
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
 - **A message from morty is the user's** (user, 2026-11-02).
@@ -169,7 +168,7 @@ The question form for every question to the user is defined by this import:
   have a natural home under an L1".
   - **A child showrunner's branch** is merged only by hand-off. A
     same-repository child with `**Kind:** style` sends
-    `From the showrunner of <style showrunner name>: hand-off <hash>`. Correctness-review
+    `hand-off <checkpoint>`. Correctness-review
     its diff against the branch point as for a unit checkpoint, then run
     `merge_checkpoint.py --from-child <style showrunner name> --checkpoint <hash> --production <showrunner name> --started <time>`.
     A locally merged hand-off is pushed before acknowledgment; a duplicate
@@ -867,7 +866,7 @@ Use `cargo-berth sequence` for merge order.
    is not a red test.
 2. **The unit waited on lands what is needed now.** Send its unit director:
 
-   `From the showrunner: <waiting unit> waits on your <what>. Checkpoint at your next green point; if only part is needed, checkpoint that part first.`
+   `<waiting unit> waits on your <what>. Checkpoint when your checks next pass. If the unit needs only part of the work, checkpoint that part first.`
 
    It checkpoints with polish unfinished. A regression never lands: gates
    pass, and the shots are no worse than `MERGE_BRANCH`. Polish not yet done is
@@ -1052,7 +1051,7 @@ Otherwise, read the gating unit director's pane and the findings files in its
 unit session directory. If its latest round fixes only new edge cases, as the
 landing rule in <ProductionUnit/> defines them, send:
 
-`From the showrunner: <waiting unit> waits on your phase <N> (G<k>). Apply the landing rule: finish this round, move the new edge cases to a follow-up phase, checkpoint.`
+`<waiting unit> waits on your phase <N> (G<k>). Apply the landing rule. Finish this round. Move the new edge cases to a follow-up phase. Checkpoint.`
 
 Before the hard landing, defects users can see are never deferred. Log the call.
 

@@ -56,7 +56,7 @@ def take_exclusive(path: Path) -> ExclusiveLock | Literal[LockResult.BUSY]:
 @contextmanager
 def exclusive(path: Path, *, wait: bool = True) -> Generator[LockResult]:
     """Release an acquired lock when the operation ends."""
-    with path.open("a+", encoding="utf-8") as stream:
+    with path.open("a", encoding="utf-8") as stream:
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError:

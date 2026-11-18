@@ -321,8 +321,10 @@ def review_root(*, sources: list[Path] | None = None) -> Path:
         "change_review", "review_links_directory", sources=sources)).expanduser()
 
 
-def delivery_slots(path: Path, *, sources: list[Path] | None = None) -> delivery_state.DeliverySlots:
-    """Read one delivery record. A collector requires valid JSON and complete reads."""
+def delivery_slots(path: Path, *, sources: list[Path] | None = None,
+                   strict: bool = False) -> delivery_state.DeliverySlots:
+    """Read a delivery record. Reject read and parse errors in strict mode and during collection."""
+    require_read = strict or sources is not None
     if sources is not None:
         sources.append(path)
     try:
@@ -330,10 +332,10 @@ def delivery_slots(path: Path, *, sources: list[Path] | None = None) -> delivery
     except FileNotFoundError:
         return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
     except OSError:
-        if sources is not None:
+        if require_read:
             raise
         return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
-    return (delivery_state.decode_value(cast(object, json.loads(text))) if sources is not None
+    return (delivery_state.decode_value(cast(object, json.loads(text))) if require_read
             else delivery_state.decode(text))
 
 
