@@ -13,6 +13,7 @@ from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 ICONS = Path(__file__).with_name("lucide")
+QUESTION_WAITING = "The {owner_role} will answer this"
 
 
 def icon_svg(name: str) -> str:
