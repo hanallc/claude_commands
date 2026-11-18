@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone, user_zone_name
-from scripts.production import change_review, proposal_issue, staff
+from scripts.production import change_review, change_routing, proposal_issue, staff
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import question_record
 from scripts.review_links import review_legacy
@@ -27,7 +27,7 @@ HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap'}
-SHOWS = (('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('all', 'All'))
+SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('Done', 'Done'), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies'}
 # The Later menu's presets, in menu order; the client resolves each time when the menu opens.
@@ -137,6 +137,8 @@ def answer_section(text: str) -> str:
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSettings) -> str:
+    if item.state == ReviewState.VALIDATING:
+        return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key)}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -146,10 +148,12 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSet
               'approve': 'Approve', 'decline': 'Decline'}
     for index, action in enumerate(item.actions):
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 else '')+'>'+labels[action]+'</button>'
-        (returns if action == 'question' else closes).append(button)
+        (returns if action == 'question' or (item.type == ReviewType.CHANGE and action in change_page.CHANGE_HANDOFFS)
+         else closes).append(button)
     groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>' if closes else ''
     if returns:
-        groups += '<div class="review-action-group"><span>The item returns to you</span><div>'+''.join(returns)+'</div></div>'
+        heading = 'Sends to showrunner' if item.type == ReviewType.CHANGE else 'The item returns to you'
+        groups += '<div class="review-action-group"><span>'+heading+'</span><div>'+''.join(returns)+'</div></div>'
     presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
                       +f'<span>{html.escape(label or settings.soon_label)}</span><small></small></button>' for key, label in LATER_PRESETS)
     groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div class="later-menu">'
@@ -230,7 +234,7 @@ def age(filed: datetime, now: datetime) -> str:
 
 def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, now: datetime, index: int,
               title_limit: int, settings: CardSettings,
-              names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
+              names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *, root: Path) -> str:
     names = staff_names.for_page(names, members)
     owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
@@ -238,23 +242,37 @@ def item_rows(item: ReviewItem, browser: change_page.ReviewBrowser, members: sta
              +html.escape(short_title(item.title, title_limit))+'</strong>')
     if item.urgency.level != 'normal':
         title += '<small>'+html.escape({'user': 'Important', 'blocks': 'Blocks work', 'soon': 'Due soon', 'later': 'Later'}[item.urgency.level])+'</small>'
-    values = (item.id, item.type.value, owner, item.title, item.state.value, item.times.filed.timestamp())
+    state_name = item.state
+    values = (item.id, item.type.value, owner, item.title, state_name, item.times.filed.timestamp())
     attrs = {'key':item.key, 'number':item.id.casefold(), 'title':item.title.casefold(), 'owner':str(item.owner),
              'source-owner':str(item.source_unit), 'source-name':source,
-             'state':item.state.value, 'type':item.type.value, 'order':str(index), 'sort-values':json.dumps(values),
+             'state':state_name, 'type':item.type.value, 'order':str(index), 'sort-values':json.dumps(values),
              'parked':str(item.hidden_until(now)).lower(), 'updated':item.times.updated.isoformat()}
     attributes = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attrs.items())
     panel = 'review-detail-'+str(index)
     toggle = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}">'
               +'<span class="list-chevron" aria-hidden="true">›</span>'+html.escape(item.id)+'</button>')
-    state = '<span class="list-state '+('warning' if item.state == ReviewState.OPEN else 'muted')+'">'+item.state+'</span>'
+    state = '<span class="list-state '+('warning' if item.state == ReviewState.OPEN else 'muted')+'">'+state_name+'</span>'
+    detail = ''
+    validating = state_name == ReviewState.VALIDATING
+    if validating and isinstance(item.source, review_items.ChangeSource):
+        path = change_routing.delivery_path(root, item.source.path, item.source.row['#'])
+        requested = change_page.handoff_time(path, item.times.updated).astimezone(user_zone())
+        toggle = '<span class="list-toggle" tabindex="-1">'+html.escape(item.id)+'</span>'
+        showrunner = html.escape(owner, quote=True)
+        title += (f'<span class="review-handoff">With <span title="{showrunner}">{showrunner}</span> since '
+                  +f'<time datetime="{requested.isoformat()}">'
+                  +requested.strftime('%b %d %H:%M %Z')+'</time></span>')
+    else:
+        detail = details(item, browser, members, settings, names)
     cells = (toggle, icon(item.type)+item.type.title(), names.html(item.owner, owner)+('<small>· '+names.html(item.source_unit, source)+'</small>' if source != owner else ''),
              title, state, age(item.times.filed, now))
     row = ''.join(f'<td' + (' class="record-id"' if label == 'Id' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if item.state == ReviewState.DONE or item.hidden_until(now) else ''
-    return ('<tbody data-list-item'+attributes+hidden+'><tr class="list-row">'+row+'</tr>'
-            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+details(item, browser, members, settings, names)+'</td></tr></tbody>')
+    marker = ' data-validating-change' if validating else ''
+    return ('<tbody data-list-item'+attributes+marker+hidden+'><tr class="list-row">'+row+'</tr>'
+            +f'<tr data-detail id="{panel}" hidden><td colspan="6">'+detail+'</td></tr></tbody>')
 
 
 def render(root: Path, *, show: str = 'open') -> bytes:
@@ -263,12 +281,14 @@ def render(root: Path, *, show: str = 'open') -> bytes:
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
     now = datetime.fromtimestamp(read_at, user_zone())
+    if show == 'Waiting':
+        show = 'all'
     if show not in dict(SHOWS):
         show = 'open'
     owners: dict[staff.StaffId, str] = {}
     records = review_items.read(root, members=members, kinds=TYPES, owner_options=owners)
-    items = [item for item in records
-             if show == 'all' or (show == 'open' and item.state == ReviewState.OPEN) or item.state == show]
+    state = ReviewState.OPEN if show == 'open' else show
+    items = [item for item in records if show == 'all' or item.state == state]
     items.sort(key=lambda item: (item.state != ReviewState.OPEN, item.state == ReviewState.DONE))
     token, initial = change_browser.browser_manifest(change_page.console_folder(root))
     browser = change_page.ReviewBrowser(token, initial)
@@ -303,7 +323,7 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
-        +''.join(item_rows(item,browser,members,now,index,title_limit,cards,names) for index,item in enumerate(items))
+        +''.join(item_rows(item,browser,members,now,index,title_limit,cards,names,root=root) for index,item in enumerate(items))
         +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -332,6 +352,12 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
         if item is None:
             raise question_record.AnswerRefused('this item is not on the page')
         if outcome == 'later':
+            if isinstance(item.source, review_items.ChangeSource):
+                source = item.source
+                with status.locked():
+                    path = change_routing.delivery_path(root, source.path, source.row['#'])
+                    change_page.require_user_turn(change_routing.delivery_slots(path))
+                    return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
             return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
         if outcome not in item.actions:
             raise question_record.AnswerRefused('choose an action on this card')
@@ -348,14 +374,14 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
             raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = review_actions.question_action(item, cast(change_page.QuestionOutcome, outcome), words, status)
     else:
-        delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
-                                                   feedback_closes=True)
+        delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status)
     if key.startswith('question/') and outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
         delivery = review_actions.track_question(delivery, key, words, status)
-    words = ('feedback sent' if outcome == 'feedback' else outcome)+(': '+fields['feedback'][0] if fields['feedback'][0] else '')
-    if isinstance(delivery, change_page.MessageDelivery):
-        if not isinstance(delivery.page, change_page.UserQuestionPage):
-            change_review.record_review_log(delivery.page.review_list, delivery.row, words, delivery.page.production)
+    if isinstance(delivery, change_page.MessageDelivery) and not isinstance(delivery.page, change_page.UserQuestionPage):
+        if outcome not in ('validate', 'feedback'):
+            words = fields['feedback'][0]
+            log = outcome + (': ' + words if words else '')
+            change_review.record_review_log(delivery.page.review_list, delivery.row, log, delivery.page.production)
     return delivery, ('feedback sent' if outcome == 'feedback' else answer or
                      {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
@@ -366,6 +392,7 @@ STYLE = '''<style>
 .review-types button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
 .review-types button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+#review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}
@@ -413,6 +440,12 @@ min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;colo
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
 .list-table .list-row td:last-child{text-align:right}.list-table [data-detail]>td{text-align:left}
+[data-validating-change] .list-row{cursor:default}
+[data-validating-change] [data-detail]{display:none}
+.review-handoff{display:block;margin-top:4px;color:var(--ink-2)}
+.review-handoff>:is(span,time){white-space:nowrap}
+.review-handoff>span{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
+@media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}.review-action-group+.review-action-group{padding-left:0;border:0}}
 </style>'''
@@ -436,25 +469,29 @@ function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
-function matching(filters,includePending=false){
+function matching(filters,{forOwnerMenu=false,countValidating=false}={}){
  return [...index.values()].filter(entry=>{
   const departure=departures.get(entry.key);
-  if(departure?.kind==='pending' && !includePending) return false;
+  if(departure?.kind==='pending' && !forOwnerMenu) return false;
   const projected=departure?.kind==='saved'
    ? {...entry,state:departure.state,hiddenUntil:departure.hiddenUntil}
    : entry;
+  if(!forOwnerMenu && !countValidating && projected.state==='Validating') return false;
   return matches(projected,filters);
  });
 }
 const view=createRecordTable({content:()=>content,single:true,
- place:reviewPlace,
+ place:params=>{
+  reviewPlace(params);
+  if(params.get('show')==='Waiting') params.set('show','all');
+ },
  resolveOwner:owner=>{
   const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>
    button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
   return button ? button.dataset.ownerChip : owner;
  },
- selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys},true).length ? owner : '',
- shows:['open','Waiting','Done','all'],
+ selectOwner:({owner,type,query,keys})=>matching({owner,type,query,keys},{forOwnerMenu:true}).length ? owner : '',
+ shows:[...content.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip),
  hasKey:key=>index.has(key),
  visible:(data,filters)=>{
   const entry=index.get(data.key);
@@ -466,7 +503,7 @@ const view=createRecordTable({content:()=>content,single:true,
  },
  applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
   selectedShow=show;loadBodies();
-  const eligibleOwners=matching({type,query,keys},true);
+  const eligibleOwners=matching({type,query,keys},{forOwnerMenu:true});
   const shownOwners=matching({show,type,query,keys});
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{
    const value=button.dataset.ownerChip;
@@ -474,7 +511,10 @@ const view=createRecordTable({content:()=>content,single:true,
    button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,value)).length;
   });
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
-   button.querySelector('b').textContent=matching({type,owner,query,sourceOwner,keys,show:button.dataset.showChip}).length;
+   const show=button.dataset.showChip;
+   const count=matching({type,owner,query,sourceOwner,keys,show},{countValidating:show==='Validating'}).length;
+   button.querySelector('b').textContent=count;
+   button.toggleAttribute('data-empty-count',count===0);
   });
   content.querySelectorAll('[data-type-chip]').forEach(button=>{
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
@@ -514,6 +554,9 @@ function loadBodies(){
  });
 }
 function bind(){
+ content.addEventListener('click',event=>{
+  if(event.target.closest('[data-validating-change] .list-row')) event.stopPropagation();
+ },true);
  content.querySelectorAll('.review-panel').forEach(updateTitleFallback);
  view.replace();
  content.querySelectorAll('[data-review-form]').forEach(form=>{
@@ -541,12 +584,14 @@ function bind(){
     const response=await fetch(location.pathname,{method:'POST',body:data});
     const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     drafts.delete(key);
-    const waits=outcome==='validate' || outcome==='question';
+    const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
     departures.set(key,{kind:'saved',outcome,updated:row.dataset.updated,previousState:row.dataset.state,
-     state:waits ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
+     handed,
+     state:handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
      hiddenUntil:outcome==='later' ? Date.parse(until) : 0});
     view.opened.delete(key);
     view.showActionResult(row,form.elements.row.value,'Saved: '+result.answer);
+    if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
    }catch(error){
     departures.delete(key);
     view.showActionResult(row,form.elements.row.value,'Not saved: '+error.message);
@@ -554,7 +599,8 @@ function bind(){
    }
    finally{
     delete form.dataset.sending;saving--;
-    if(!saving && selectedShow!==content.dataset.show) void pageRefresh.refresh(true);
+    if(!saving && (selectedShow!==content.dataset.show ||
+       ['all','Validating'].includes(selectedShow) && [...departures.values()].some(result=>result.handed))) void pageRefresh.refresh(true);
    }
   };
   form.addEventListener('submit',event=>{
@@ -758,7 +804,7 @@ async function refresh(_supersede=false,current=()=>true){
   if(!entry || (result.outcome==='later' && Date.now()>=result.hiddenUntil)) {departures.delete(key);continue;}
   // The index includes the state and revision of rows outside this Show.
   const submitted=entry.state===result.previousState && entry.updated===result.updated;
-  if(!submitted && (entry.state!==result.state || result.outcome==='validate')){
+  if(!submitted && (result.handed || entry.state!==result.state)){
    departures.delete(key);
   }
  }
@@ -772,7 +818,7 @@ async function refresh(_supersede=false,current=()=>true){
 view.place();bind();view.apply();
 addEventListener('hashchange',()=>{
  const item=new URLSearchParams(location.hash.slice(1)).get('item'),departure=departures.get(item);
- if(departure?.kind==='saved' && ['validate','later'].includes(departure.outcome)) departures.delete(item);
+ if(departure?.kind==='saved' && departure.outcome==='later') departures.delete(item);
  view.place();view.apply(false);
 });
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
