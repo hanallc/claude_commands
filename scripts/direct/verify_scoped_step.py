@@ -166,8 +166,7 @@ def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path, owners: select.
         try:
             _ = os.write(9, os.fsencode(scope) + b"\n")
             remaining = deadline - time.monotonic()
-            ready = owners.poll(max(0, math.ceil(remaining * 1000)))
-            if not ready:
+            if remaining <= 0 or not (ready := owners.poll(math.ceil(remaining * 1000))):
                 raise TimeoutError("the copy owner did not confirm the checkout scope")
             if any(descriptor != 8 for descriptor, _ in ready):
                 raise ValueError("a scope owner exited before launch")
@@ -179,6 +178,8 @@ def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path, owners: select.
         build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner), 9)
     if process_start_time(checkout.lease_owner) != owner_start:
         raise ValueError("the checkout lease owner exited during scope publication")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("the checkout scope publication timed out")
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,

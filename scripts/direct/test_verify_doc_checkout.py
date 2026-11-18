@@ -226,6 +226,37 @@ with patch.object(verify_scoped_step.subprocess, "Popen", start_after_publicatio
         self.assertFalse(self.events.exists())
         self.assertFalse(self.pass_records())
 
+    def test_doc_refuses_checkout_confirmation_after_the_deadline(self) -> None:
+        self.install_scope_interpreter(f'''
+import time
+from types import SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, {str(VERIFY.parents[2])!r})
+from scripts.direct import verify_scoped_step
+
+read = os.read
+elapsed = 0
+
+def receive_reply(descriptor, size):
+    global elapsed
+    reply = read(descriptor, size)
+    if descriptor == 8 and reply == b"bound\\n":
+        elapsed = 60
+    return reply
+
+clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
+with patch.object(os, "read", receive_reply), patch.object(verify_scoped_step, "time", clock):
+    raise SystemExit(verify_scoped_step.main(script_arguments[1:]))
+''')
+        result = self.verify()
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 125, output)
+        self.assertIn("the checkout scope publication timed out", output)
+        self.assertIn("keeping the reservation", output)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.pass_records())
+
     def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
         recorded_failure = self.root / "recorded-scope-failure"
         self.install_scope_interpreter(f'''
@@ -368,38 +399,40 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
         self.assertFalse(self.events.exists())
         self.assertEqual(self.pass_records(), [])
 
-    def test_doc_records_a_pass_while_the_background_sweep_waits(self) -> None:
+    @contextmanager
+    def hold_background_sweep(self, probe: str = "") -> Generator[Path]:
         release = self.root / "sweep-release"
         started = self.root / "sweep-pid"
-        sweep_events = self.root / "sweep-events"
         os.mkfifo(release)
-        wrapper = self.root / "sweep-interpreter"
-        self.executable(wrapper, f'''import os, sys
+        self.install_scope_interpreter(f'''
 from pathlib import Path
-if sys.argv[1].endswith("/sweep.py"):
-    for descriptor in (8, 74):
-        try:
-            os.write(descriptor, f"sweep started on {{descriptor}}\\n".encode())
-        except OSError:
-            pass
+{probe}
+with open({str(release)!r}) as gate:
     Path({str(started)!r}).write_text(str(os.getpid()))
-    with open({str(release)!r}) as gate:
-        gate.read()
-else:
-    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-''')
+    gate.read()
+''', scripts=("/sweep.py",))
         self.executable(self.root / "bin/systemd-cat", "#!/bin/sh\nexec cat\n")
-        self.environment.update({"LINT_SKIP_SWEEP": "0", "CLAUDE_PYTHON": str(wrapper)})
-        process, log, marker = self.start_doc(command=(
-            "bash", "-c", 'exec 8>"$1" 74>&8; shift; exec bash "$@"',
-            "doc-sweep", str(sweep_events), str(VERIFY), "doc",
-        ))
-        sweep_pid = wait_for_pid(started, processes=(process,))
-        self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
-        self.assertIn(sweep_pid, processes_carrying(marker))
-        self.assertEqual(len(self.pass_records()), 1)
-        with release.open("w"):
-            pass
+        self.environment["LINT_SKIP_SWEEP"] = "0"
+        with os.fdopen(os.open(release, os.O_RDWR), "wb"):
+            yield started
+
+    def test_doc_records_a_pass_while_the_background_sweep_waits(self) -> None:
+        sweep_events = self.root / "sweep-events"
+        with self.hold_background_sweep('''
+for descriptor in (8, 74):
+    try:
+        os.write(descriptor, f"sweep started on {descriptor}\\n".encode())
+    except OSError:
+        pass
+''') as started:
+            process, log, marker = self.start_doc(command=(
+                "bash", "-c", 'exec 8>"$1" 74>&8; shift; exec bash "$@"',
+                "doc-sweep", str(sweep_events), str(VERIFY), "doc",
+            ))
+            sweep_pid = wait_for_pid(started, processes=(process,))
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
+            self.assertIn(sweep_pid, processes_carrying(marker))
+            self.assertEqual(len(self.pass_records()), 1)
         self.assertEqual(sweep_events.read_text().splitlines(), ["sweep started on 8", "sweep started on 74"])
 
     def test_doc_waits_for_admission_without_a_slot_or_lease(self) -> None:
@@ -520,7 +553,8 @@ else:
         self.assertEqual(self.pass_records(), [])
         self.assertFalse(admission.caller_reservations())
 
-    def assert_doc_uses_the_prepared_copy(self, command: tuple[str, ...]) -> None:
+    @contextmanager
+    def prepared_doc_slot(self) -> Generator[Path]:
         original = self.repo
         with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
                 original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
@@ -530,12 +564,17 @@ else:
             self.environment["BUILDLOG_PREPARED_COPY_LOCK_FD"] = str(descriptor)
             self.environment["BUILDLOG_RUN"] = f"{os.getpid()}:{admission_records.process_start_time(os.getpid())}"
             self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(slot.path))
+            yield slot.path
+
+    def assert_doc_uses_the_prepared_copy(self, command: tuple[str, ...]) -> None:
+        with self.prepared_doc_slot() as checkout:
+            descriptor = build_folders.build_folder_lock_fd(checkout)
             process, log, _ = self.start_doc(command=command, pass_fds=(descriptor,))
             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
-            self.assertEqual(self.cargo_calls()[0]["cwd"], str(slot.path))
-            self.assertEqual(build_folders.build_folder_state(slot.path), "held")
+            self.assertEqual(self.cargo_calls()[0]["cwd"], str(checkout))
+            self.assertEqual(build_folders.build_folder_state(checkout), "held")
             self.assertEqual(list((self.root / "slots").glob("*-slot*.lease.json")),
-                             [build_slots.lease_path(slot.path)])
+                             [build_slots.lease_path(checkout)])
 
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         self.assert_doc_uses_the_prepared_copy(DOC_COMMAND)
@@ -547,6 +586,19 @@ exec "$@"'''
         self.assert_doc_uses_the_prepared_copy((
             "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
         ))
+
+    def test_prepared_doc_lock_does_not_reach_the_background_sweep(self) -> None:
+        with self.hold_background_sweep() as started:
+            with self.prepared_doc_slot() as checkout:
+                descriptor = build_folders.build_folder_lock_fd(checkout)
+                lock = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+                process, log, marker = self.start_doc(pass_fds=(descriptor,))
+                sweep_pid = wait_for_pid(started, processes=(process,))
+                self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
+                self.assertIn(sweep_pid, processes_carrying(marker))
+                descriptors = Path(f"/proc/{sweep_pid}/fd")
+                self.assertNotIn(lock, [entry.resolve() for entry in descriptors.iterdir()])
+            self.assertEqual(build_folders.build_folder_state(checkout, wait=False), "free")
 
     def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")

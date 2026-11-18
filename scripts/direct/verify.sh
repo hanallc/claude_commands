@@ -2008,6 +2008,9 @@ doc_checkout() {
         local inherited=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
         if [[ "$inherited" =~ ^[0-9]+$ && -e "/dev/fd/$inherited" ]] &&
                 eval "exec $VERIFY_PREPARED_CHECKOUT_FD>&$inherited"; then
+            if [[ "$inherited" != "$VERIFY_PREPARED_CHECKOUT_FD" ]]; then
+                eval "exec $inherited>&-"
+            fi
             BUILDLOG_PREPARED_COPY_LOCK_FD=$VERIFY_PREPARED_CHECKOUT_FD
         else
             BUILDLOG_PREPARED_COPY_LOCK_FD=""

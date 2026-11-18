@@ -260,6 +260,7 @@ If shutdown fails, verify reports the error and keeps the reservation for the se
 Before local Cargo starts, the checkout lock holder writes the scope path to the doc checkout lease record.
 For a private checkout, the supervisor asks the copy owner to write the scope and waits for confirmation.
 For a prepared checkout, the supervisor writes the scope while it holds the inherited slot lock.
+The background sweep closes the checkout lock and the private copy pipes before it starts its scope.
 `VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline for publication and confirmation in `config/direct.conf`.
 If the deadline expires, Verify refuses to launch Cargo and keeps the reservation.
 The allocator, collector, removal command, and status probes check the same lease.

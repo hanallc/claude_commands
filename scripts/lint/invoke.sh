@@ -616,11 +616,12 @@ sweep_after_step() {
     (
         trap '' HUP
         local checkout_fd
-        for checkout_fd in "${DOC_COPY_LEASE_FD:-}" "${DOC_COPY_REPLY_FD:-}"; do
+        for checkout_fd in "${DOC_COPY_LEASE_FD:-}" "${DOC_COPY_REPLY_FD:-}" "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}"; do
             if [[ "$checkout_fd" =~ ^[0-9]+$ ]]; then
                 eval "exec $checkout_fd>&-"
             fi
         done
+        unset BUILDLOG_PREPARED_COPY_LOCK_FD
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
