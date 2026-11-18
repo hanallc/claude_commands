@@ -863,7 +863,11 @@ shared_usd_per_month=1
         elif operation == 'describe-images':
             images = [{'ImageId': 'ami-home' if region == GATE_HOME else 'ami-' + region,
                        'OwnerId': OWNER.account, 'Name': 'fixture-image'}]
-            reply = {'Images': [] if self.failure == 'image' and region == self.failure_region else images}
+            if region != GATE_HOME and '--image-ids' in arguments:
+                self.assertEqual(option('--image-ids'), 'ami-' + region)
+                reply = {'Images': [dict(images[0], State='available')]}
+            else:
+                reply = {'Images': [] if self.failure == 'image' and region == self.failure_region else images}
         elif operation in ('create-change-set', 'describe-change-set', 'delete-change-set'):
             self.assertEqual(option('--stack-name'), self.stack_id(region))
             name = option('--change-set-name')
@@ -1176,6 +1180,15 @@ shared_usd_per_month=1
                         self.assertTrue(subject.gate_up(approve_resources=True))
                 else:
                     self.assertTrue(subject.remove_images(approve_destroy=True))
+
+    def test_plan_reuses_saved_regional_image_by_id(self) -> None:
+        self.failure, self.failure_region = 'image', GATE_REGION
+        _ = (self.state / 'regional-images.json').write_text(json.dumps({
+            f'{GATE_REGION}:ami-home': {'region': GATE_REGION, 'image': 'ami-' + GATE_REGION},
+        }))
+        status, output = self.run_plan()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls_in(GATE_REGION).count(('ec2', 'describe-images')), 2)
 
     def test_missing_home_image_refuses_all_regions(self) -> None:
         self.regions = (GATE_HOME, GATE_REGION, GATE_LAST)
