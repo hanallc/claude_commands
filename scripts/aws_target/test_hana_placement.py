@@ -15,16 +15,15 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger
+from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
-from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY
+from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.build_targets import build_targets, target_config
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
 from scripts.buildlog import store
 from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import OwningSession
 
@@ -57,11 +56,10 @@ class HanaPlacementTests(CostFixture):
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.workload = self.root / 'hana_aws.conf'
         install_hana_spending_settings(self.workload)
-        _ = write_config_fixture(self.workload,
-            f'host=fixture-hana\nexecution_transport=hana-control\nrepository_identity={KEY}\nkinds=check,lint\n'
+        _ = self.workload.write_text(self.workload.read_text()
+            + f'execution_transport=hana-control\nrepository_identity={KEY}\nkinds=check,lint\n'
             + f'# whole: 1..5\npreview_max_age_s={PREVIEW_SECONDS}\n'
-            + 'max_steps=1\nfree_floor_gib=30\nidle_stop_seconds=600\nstart_timeout_seconds=120\n'
-            + 'tick_interval_s=5\ncontroller_tick_timeout_s=45\n')
+            + '# whole: 1..1\nmax_steps=1\n')
         self.clock = TestClock()
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private inventory', True))
@@ -69,6 +67,7 @@ class HanaPlacementTests(CostFixture):
         self.provider = FakeProvider(self.state, self.clock)
         self.controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
         self.controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         self.target = target_config.SshTarget('fixture', 'linux', self.workload)
         targets = (self.target, target_config.LocalTarget('natedev', 'linux'))
         _ = self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=targets))
@@ -104,20 +103,28 @@ class HanaPlacementTests(CostFixture):
     def evidence(self, request: wire.PlacementRequest) -> placement.HostEvidence:
         key = placement.HostEvidenceKey(self.assignment.destination, request.constraints.session,
             request.constraints.command, 'fixture-config', str(self.root), 'hana', request.profile.step, command_kind='check')
+        workload = conf.read(self.target.settings, load=conf.read_bytes)
+        transport = target_config.read_execution_transport(self.target, configuration=workload)
+        assert isinstance(transport, hana.HanaControlTransport), transport
         with mock.patch('time.time', self.clock), mock.patch('time.monotonic', self.clock):
-            return hana.read_evidence(key, request)
+            return hana.read_evidence(key, request, transport=transport, workload=workload)
 
     def eligibility(self) -> placement.HostEligibility:
         evidence = self.evidence(self.request())
         assert isinstance(evidence, placement.FreshHostEvidence)
         return evidence.eligibility
 
+    def test_missing_image_digest_excludes_the_box_before_assignment(self) -> None:
+        (self.state / 'hana/setup.json').unlink()
+        self.assertEqual(self.eligibility(), placement.FixedExclusion(placement.HANA_IMAGE_STALE))
+        self.assertEqual(self.provider.calls, [])
+
     @contextmanager
     def preview_calls(self) -> Generator[list[int]]:
         calls: list[int] = []
-        preview = hana_spend.HanaSpending.preview_start
+        preview = hana_spend.HanaSpending[hana_spend.StartPermitSettings].preview_start
 
-        def count(spending: hana_spend.HanaSpending, now: int, expires: int
+        def count(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings], now: int, expires: int
                   ) -> hana_spend.StartAffordable | hana_spend.PermitRefused:
             calls.append(now)
             return preview(spending, now, expires)
@@ -233,6 +240,46 @@ class HanaPlacementTests(CostFixture):
                 mock.patch.object(self.controller, 'request', side_effect=AssertionError('Do not restart the failed boot'))):
             self.assertEqual(self.claim(), hana.HanaClaimRefused('boot failed'))
 
+    def test_placement_releases_a_dead_claim_after_command_admission_refusal(self) -> None:
+        from scripts.aws_target import hana_execution as execution, test_hana_execution as fixtures
+
+        adopted = self.ready()
+        claim = adopted.reserved.claim.reference
+        template = fixtures.HanaExecutionTests().request
+        key = replace(template.key, claim_id=claim.claim_id, generation=adopted.generation)
+        self.assertEqual((key.episode, key.attempt), (claim.episode, claim.attempt))
+        source = self.assignment.source_key
+        assert isinstance(source, placement.SourceKeyKnown)
+        request = replace(template, key=key, source_key=source)
+        objects = fixtures.FakeExecutionObjects(request, terminated=True, lease_free=True, fail_fence=True)
+        permit = self.provider.published[-1]
+        _ = execution.dispatch_execution(self.state, request, adopted, objects,
+            consume=lambda selected: wire.FirstAuthorization(selected.assignment, selected.claim),
+            current_permission=lambda: self.controller.permission(claim.claim_id, key.generation.boot_id, permit.generation),
+            current_source_key=lambda: source)
+        reason = 'The data mount and a fresh permit are required'
+        observation = replace(objects.observe_execution(key), evidence=placement.ExecutionEvidenceUnavailable(reason, self.clock.now))
+        with mock.patch.object(objects, 'observe_execution', return_value=observation):
+            _ = execution.observe_execution(self.state, request, objects)
+        with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
+            settled = execution.settle_execution(self.state, request, objects,
+                release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
+                fence_window=execution.FenceAcknowledgementWindow(0, 1))
+        self.assertIsInstance(settled, execution.HanaAdmissionRefusalSettled)
+        release.assert_not_called()
+        other = replace(self.request(), episode='other')
+        evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            for state in (box.Lifecycle.STOPPING, box.Lifecycle.STOPPING, box.Lifecycle.IDLE_STOPPED):
+                self.clock.advance(1)
+                self.assertEqual(self.controller.tick(), state)
+            evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.AllowedHost())
+        self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+
     def test_settled_attempt_cannot_commit_another_lifecycle_claim(self) -> None:
         from scripts.aws_target import hana_execution
         with (mock.patch.object(hana_execution, 'execution_command_settled', return_value=True),
@@ -334,18 +381,32 @@ class HanaPlacementTests(CostFixture):
             self.assertEqual(self.eligibility(), placement.TemporaryExclusion('daily_limit'))
             self.assertEqual(len(calls), 3)
 
+    def test_workload_edit_after_routing_keeps_the_probe_budget_and_expires_its_preview(self) -> None:
+        inspect = self.controller.inspect
+
+        def inspect_after_edit() -> box.HanaLifecycleEvidence | box.HanaUnprovisioned | box.HanaLifecycleUnavailable:
+            text_setting(self.workload, 'daily_budget_usd', '0.01')
+            return inspect()
+
+        with self.preview_calls() as calls:
+            with mock.patch.object(self.controller, 'inspect', side_effect=inspect_after_edit):
+                self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
+            self.assertEqual(calls, [self.clock.now] * 2)
+
     def test_preview_does_not_cache_a_budget_recovered_from_git(self) -> None:
         lines = self.workload.read_text().splitlines(keepends=True)
         _ = self.workload.write_text(''.join(line for line in lines if not line.startswith('daily_budget_usd=')))
         recovered = [iter(('daily_budget_usd=0.01\n',)), iter(('daily_budget_usd=6\n',))]
-        with self.preview_calls() as calls, redirect_stderr(StringIO()):
+        with self.preview_calls() as calls, conf.report_key_changes(), redirect_stderr(StringIO()) as warnings:
             with mock.patch.object(conf, '_committed_files', side_effect=recovered) as history:
                 self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
                 self.assertEqual(self.eligibility(), placement.AllowedHost())
         self.assertEqual(history.call_args_list, [mock.call(self.workload)] * 2)
         self.assertEqual(calls, [self.clock.now] * 2)
+        self.assertEqual(warnings.getvalue().count("daily_budget_usd='<missing>'"), 1)
 
-    def test_history_and_lifecycle_writes_refresh_the_preview(self) -> None:
+    def test_history_lifecycle_and_setup_writes_refresh_the_preview(self) -> None:
         history = ledger.CostLedger(self.state).launch_history_path
         with self.preview_calls() as calls:
             self.assertEqual(self.eligibility(), placement.AllowedHost())
@@ -353,7 +414,12 @@ class HanaPlacementTests(CostFixture):
             self.assertEqual(self.eligibility(), placement.AllowedHost())
             write_text_atomic(self.controller.path, self.controller.path.read_text())
             self.assertEqual(self.eligibility(), placement.AllowedHost())
-            self.assertEqual(len(calls), 3)
+            setup = self.controller.path.with_name('setup.json')
+            record = remote.read_record(setup)
+            record['instance_type'] = 'c7a.4xlarge'
+            write_text_atomic(setup, json.dumps(record))
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(len(calls), 4)
 
     def test_bill_creation_and_update_refresh_the_preview(self) -> None:
         end = self.clock.now // 86400 * 86400
@@ -373,10 +439,10 @@ class HanaPlacementTests(CostFixture):
     def test_provider_start_rechecks_spending_after_an_allowed_preview(self) -> None:
         self.assertEqual(self.eligibility(), placement.AllowedHost())
         self.assertIsInstance(self.claim(), hana.HanaClaimPending)
-        check_start = hana_spend.HanaSpending.check_start
+        check_start = hana_spend.HanaSpending[hana_spend.PermitSettings].check_start
         checked: list[hana_spend.StartReserved | hana_spend.PermitRefused] = []
 
-        def check(spending: hana_spend.HanaSpending, now: int, generation: int
+        def check(spending: hana_spend.HanaSpending[hana_spend.PermitSettings], now: int, generation: int
                   ) -> hana_spend.StartReserved | hana_spend.PermitRefused:
             self.assertEqual(spending.book.read_snapshot().hana_compute[0].generation, generation)
             self.costs({'daily_limit_usd': '0.01', 'limit_reserve_usd': '0'})

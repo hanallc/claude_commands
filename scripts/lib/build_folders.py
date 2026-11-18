@@ -839,6 +839,13 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
+def _parent_has_symlink(parent: Path) -> bool:
+    absolute = parent.absolute()
+    # A link before '..' can lead to the same parent as the absolute path.
+    return (Path(os.path.abspath(absolute)) != absolute.resolve()
+            or any(component.is_symlink() for component in (absolute, *absolute.parents)))
+
+
 @dataclass(frozen=True)
 class RefusedRemovalLease:
     """A busy or unreadable lock prevents removal."""
@@ -894,25 +901,36 @@ class HeldFolderRemovalLease:
 
     def unlink_sidecars(self, expected: dict[str, SidecarIdentity]) -> None:
         """Remove the original sidecars after the source and marks are gone."""
+        _ = self.unlink_matching_sidecars(expected)
+
+    def unlink_matching_sidecars(self, expected: dict[str, SidecarIdentity], *,
+                                 reject_parent_links: bool = False) -> set[str]:
+        """Remove sidecars with matching identities and return their names."""
+        removed: set[str] = set()
         lock_name = self.folder.name + ".lock"
         lock_identity = expected.get(lock_name)
         if lock_identity is None:
-            return
+            return removed
         for name in (self.folder.name + ".lease.json", lock_name):
             identity = expected.get(name)
-            if (identity is not None and self._source_removed() and self._sidecar_identity(name) == identity
-                    and (name == lock_name or self._sidecar_identity(lock_name) == lock_identity)):
-                with suppress(OSError):
+            with suppress(OSError):
+                if (identity is not None and self._source_removed()
+                        and (not reject_parent_links or not _parent_has_symlink(self.folder.parent))
+                        and self._sidecar_identity(name) == identity
+                        and (name == lock_name or self._sidecar_identity(lock_name) == lock_identity)):
                     os.unlink(name, dir_fd=self.directory)
+                    removed.add(name)
+        return removed
 
 
 FolderRemovalLease = RefusedRemovalLease | UnreservedRemovalFolder | HeldFolderRemovalLease
 
 
-def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> FolderRemovalLease:
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
+                     create: bool = False) -> FolderRemovalLease:
     """Hold the lock if it is free. The stack owns the descriptor."""
     try:
-        descriptor = _open_lock(path, directory, create=False)
+        descriptor = _open_lock(path, directory, create=create)
     except FileNotFoundError:
         descriptor = MissingFolderLock.ABSENT
     if isinstance(descriptor, int):
@@ -1047,6 +1065,47 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
             return True
         finally:
             os.close(descriptor)
+
+
+class FolderPairRelease(Enum):
+    RELEASED = "released the build folder pair"
+    PAIR_ABSENT = "the build folder pair is absent"
+    PARTIAL = "only part of the build folder pair was released"
+    PAIR_KEPT = "the lease record and lock could not be removed"
+    FOLDER_PRESENT = "the folder path still exists"
+    LOCK_HELD = "the build folder lock is held or changed"
+    PARENT_ABSENT = "the parent folder is absent"
+    PARENT_LINK = "the parent path contains a symbolic link"
+
+
+def release_removed_folder(path: Path) -> FolderPairRelease:
+    """Release the lease and lock after another operation removes the folder."""
+    path = path.absolute()
+    if _parent_has_symlink(path.parent):
+        return FolderPairRelease.PARENT_LINK
+    with ExitStack() as stack:
+        try:
+            directory = stack.enter_context(_folder_parent(path, Path(path.anchor), create=False))
+        except FileNotFoundError:
+            return FolderPairRelease.PARENT_ABSENT
+        if _folder_exists(path, directory):
+            return FolderPairRelease.FOLDER_PRESENT
+        lock_name = path.name + ".lock"
+        names = (path.name + ".lease.json", lock_name)
+        present = {name for name in names if _folder_exists(path.with_name(name), directory)}
+        if not present:
+            return FolderPairRelease.PAIR_ABSENT
+        lease = _hold_free_lease(path, directory, stack, wait=False, create=True)
+        if not isinstance(lease, HeldFolderRemovalLease):
+            return FolderPairRelease.LOCK_HELD
+        removed = lease.unlink_matching_sidecars(lease.sidecar_identities(), reject_parent_links=True)
+        if present <= removed and lock_name in removed:
+            return FolderPairRelease.RELEASED
+        if removed:
+            return FolderPairRelease.PARTIAL
+        if _folder_exists(path, directory):
+            return FolderPairRelease.FOLDER_PRESENT
+        return FolderPairRelease.PAIR_KEPT
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,

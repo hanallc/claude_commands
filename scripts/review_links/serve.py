@@ -12,10 +12,12 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from functools import partial
 import html
+import gzip
 import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -36,14 +38,16 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf, scratch
-from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_page
-from scripts.review_links import question_record
+from scripts.production import change_routing, change_review, staff
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
+from scripts.review_links import new_item_dialog, question_record, review_actions, review_submissions
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
+MAX_NEW_ITEM_BODY = 4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
+ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
 
 
 @dataclass
@@ -135,11 +139,21 @@ class ModuleStampUnavailable(Enum):
 def loaded_module_stamps() -> dict[Path, tuple[int, int] | ModuleStampUnavailable]:
     checkout = Path(__file__).resolve().parents[2]
     stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = {}
+    resolved_directories: dict[Path, Path] = {}
     for module in list(sys.modules.values()):
         filename = getattr(module, "__file__", None)
         if not isinstance(filename, str):
             continue
-        path = Path(filename).resolve()
+        module_path = Path(filename)
+        directory = module_path.parent
+        if directory not in resolved_directories:
+            resolved_directories[directory] = directory.resolve()
+        path = resolved_directories[directory] / module_path.name
+        try:
+            if module_path.name == ".." or path.is_symlink():
+                path = path.resolve()
+        except OSError:
+            path = module_path.resolve()
         if path.is_relative_to(checkout):
             try:
                 stat = path.stat()
@@ -256,6 +270,20 @@ def old_console_link(root: Path, path: str) -> str:
     return f"/{change_page.CONSOLE_FOLDER}/{page}" + (f"?{parts.query}" if parts.query else "")
 
 
+def accepts_gzip(header: str) -> bool:
+    """Accept gzip when its encoding token has a positive quality."""
+    for part in header.split(','):
+        encoding, *parameters = part.split(';')
+        if encoding.strip().lower() != 'gzip':
+            continue
+        for parameter in parameters:
+            key, _, value = parameter.partition('=')
+            if key.strip().lower() == 'q':
+                return re.fullmatch(r'(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)', value.strip()) is not None and float(value) > 0
+        return True
+    return False
+
+
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
     """Serve regular files within the snapshot root, without directory indexes."""
 
@@ -310,31 +338,45 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
             return None
-        if route.path == review_page.PAGE_PATH and 'body' in parse_qs(route.query):
-            try:
-                content = review_page.proposal_body(root, parse_qs(route.query)['body'][0])
-            except LookupError as error:
-                self.html_response(404, html.escape(str(error)).encode())
-                return None
-            except (OSError, ValueError) as error:
-                print(f"review-links proposal body: {error}", file=sys.stderr)
-                self.html_response(503, b"The proposal text is not available.")
-                return None
-            self.html_response(200, content)
+        if route.path == review_page.NEW_ITEM_PATH:
+            self.new_item_options()
             return None
+        if route.path == review_page.ATTACHMENT_PATH:
+            return self.review_attachment(route.query)
         if route.path == review_page.PAGE_PATH:
             try:
-                content = review_page.render(root, show=parse_qs(route.query).get('show', ['open'])[0])
+                snapshot = cast(ReviewLinksServer,self.server).review_cache.get()
+                fields = parse_qs(route.query)
+                if 'body' in fields:
+                    try:
+                        content = snapshot.body(fields['body'][0])
+                    except LookupError as error:
+                        self.review_response(html.escape(str(error)).encode(), 'text/html; charset=utf-8',
+                                             version=snapshot.version, status=404)
+                    else:
+                        self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
+                    return None
+                elif 'version' in fields and 'index' not in fields:
+                    self.json_response(200, {'version':snapshot.version, 'facts':snapshot.facts()})
+                    return None
+                elif 'index' in fields:
+                    content = snapshot.index_response()
+                    self.review_response(content, 'application/json; charset=utf-8',snapshot.payload_gzip)
+                    return None
+                else:
+                    content = snapshot.render(show=fields.get('show',['open'])[0])
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
                 return None
-            self.html_response(200, content)
+            prepared = snapshot.page_gzip if fields.get('show',['open'])[0]=='open' else b''
+            self.review_response(content, 'text/html; charset=utf-8',prepared)
             return None
         if route.path == list_page.PAGE_PATH:
             try:
                 with server.list_store_access():
-                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE)
+                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE,
+                                               status=server.delivery_status)
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
@@ -464,6 +506,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         _ = self.wfile.write(content)
 
+    def review_response(self, content: bytes, content_type: str, prepared: bytes = b'', *,
+                        version: str = '', status: int = 200) -> None:
+        """Compress the retained Review index and shell for transfer."""
+        accepts = self.headers.get('Accept-Encoding','')
+        compressed = accepts_gzip(accepts)
+        if compressed:
+            content = prepared or gzip.compress(content,compresslevel=1,mtime=0)
+        self.send_response(status)
+        self.send_header('Content-Type',content_type)
+        self.send_header('Content-Length',str(len(content)))
+        self.send_header('Cache-Control','no-store')
+        self.send_header('Vary','Accept-Encoding')
+        self.send_header('X-Content-Type-Options','nosniff')
+        if version:
+            self.send_header('X-Review-Version', version)
+        if compressed:
+            self.send_header('Content-Encoding','gzip')
+        self.end_headers()
+        _ = self.wfile.write(content)
+
     def failed_answer(self, page: change_page.ReviewPage, body: str, status: int, reason: str,
                       error: Exception) -> None:
         print(f"review-links answer: {error}", file=sys.stderr)
@@ -484,18 +546,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
-        if server.mode is ServerMode.LIST_FIXTURE and urlsplit(self.path).path != list_page.PAGE_PATH:
+        route = urlsplit(self.path)
+        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
             self.send_error(404)
             return
-        try:
-            if server.bound_address != tailscale_ip():
-                self.html_response(403, change_page.document("<p>Open this page through this machine's Tailscale address.</p>"))
-                return
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            print(f"review-links address: {error}", file=sys.stderr)
-            self.html_response(403, change_page.document("<p>The Tailscale address is not available.</p>"))
+        refusal = self.tailscale_refusal()
+        if refusal:
+            if route.path == review_page.NEW_ITEM_PATH:
+                self.json_response(403, {"error": refusal})
+            else:
+                self.html_response(403, change_page.document(f"<p>{html.escape(refusal)}</p>"))
             return
-        if urlsplit(self.path).query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+        if route.path == review_page.NEW_ITEM_PATH:
+            self.new_item_post()
+            return
+        if route.path == review_page.ATTACHMENT_PATH:
+            self.send_error(405)
+            return
+        if route.query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
         if urlsplit(self.path).path == review_page.PAGE_PATH:
@@ -561,6 +629,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.redirect(location)
                 return
             delivery = change_page.submit(page, body, server.delivery_status)
+        except change_review.VerdictDurabilityUnconfirmed as error:
+            try:
+                self.failed_answer(page, body, 503, "The verdict was written. Durability is unconfirmed.", error)
+            finally:
+                change_page.recover_pending(server.delivery_status, only=error.cleanup)
+            return
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
             self.failed_answer(page, body, 400, "Check the answer and submit it again.", error)
             return
@@ -575,7 +649,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         finally:
             # The request thread sends messages after it flushes the response.
             try:
-                change_page.deliver(delivery, server.delivery_status)
+                change_page.deliver(change_page.finish_verdict_cleanup(delivery, server.delivery_status), server.delivery_status)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
@@ -628,6 +702,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise ValueError("empty answer")
             body = self.rfile.read(length).decode("utf-8")
             delivery, answer = change_browser.submit(browser, body, server.delivery_status)
+        except change_review.VerdictDurabilityUnconfirmed as error:
+            try:
+                self.browser_failure(503, "The verdict was written. Durability is unconfirmed.", error)
+            finally:
+                change_page.recover_pending(server.delivery_status, only=error.cleanup)
+            return
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
             self.browser_failure(400, str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again.", error)
             return
@@ -641,26 +721,193 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(200, {"answer": answer})
         finally:
             try:
-                change_page.deliver(delivery, server.delivery_status)
+                change_page.deliver(change_page.finish_verdict_cleanup(delivery, server.delivery_status), server.delivery_status)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def tailscale_refusal(self) -> str:
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            if server.bound_address != server.request_tailscale_address():
+                return "Open this page through this machine's Tailscale address."
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"review-links address: {error}", file=sys.stderr)
+            return "The Tailscale address is not available."
+        return ""
+
+    def same_origin(self) -> bool:
+        origins = self.headers.get_all("Origin", [])
+        host = self.headers.get("Host", "")
+        return not origins or bool(host and origins == [f"http://{host}"])
+
+    def new_item_options(self) -> None:
+        """Return a New item token and current recipients."""
+        server = cast(ReviewLinksServer, self.server)
+        if self.command != "GET":
+            self.send_error(405)
+            return
+        if self.path != review_page.NEW_ITEM_PATH:
+            self.json_response(400, {"error": "Open the New item dialog from Review."})
+            return
+        refusal = self.tailscale_refusal()
+        if refusal or not self.same_origin():
+            self.json_response(403, {"error": refusal or "Open the New item dialog from Review."})
+            return
+        try:
+            recipients = review_submissions.recipient_options(staff.snapshot())
+        except (OSError, ValueError) as error:
+            print(f"review-links New item recipients: {error}", file=sys.stderr)
+            self.json_response(503, {"error": "The recipients are unavailable."})
+            return
+        self.json_response(200, {"token": server.new_item_token, "recipients": recipients})
+
+    def new_item_post(self) -> None:
+        """File and publish a native record before sending its message."""
+        server = cast(ReviewLinksServer, self.server)
+        if self.path != review_page.NEW_ITEM_PATH or self.headers.get_content_type() != "application/json":
+            self.json_response(400, {"error": "Use the New item dialog on Review."})
+            return
+        if not self.same_origin():
+            self.json_response(403, {"error": "Use the New item dialog on Review."})
+            return
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1 or self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+                raise new_item_dialog.SubmissionError("Invalid New item request size.")
+            size = int(lengths[0])
+            if not 0 < size <= MAX_NEW_ITEM_BODY:
+                raise new_item_dialog.SubmissionError("Invalid New item request size.")
+            body = self.rfile.read(size)
+            if len(body) != size:
+                raise new_item_dialog.SubmissionError("Incomplete New item request.")
+            payload = cast(object, json.loads(body.decode("utf-8")))
+            if not isinstance(payload, dict):
+                raise new_item_dialog.SubmissionError("Invalid New item request.")
+            fields = cast(dict[str, object], payload)
+            token = fields.get("token")
+            if not isinstance(token, str) or not token.isascii() or not secrets.compare_digest(token, server.new_item_token):
+                self.json_response(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
+                return
+            request = new_item_dialog.read_request(fields)
+        except (ValueError, RecursionError) as error:
+            reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
+            self.json_response(400, {"error": reason})
+            return
+        except OSError:
+            self.json_response(400, {"error": "Could not read the New item request."})
+            return
+        try:
+            created = server.review_cache.create_submission(request)
+            delivery = review_actions.prepare_submission_delivery(created.saved, request.words, server.delivery_status)
+        except new_item_dialog.SubmissionConflict as error:
+            self.json_response(409, {"error": str(error)})
+            return
+        except new_item_dialog.SubmissionError as error:
+            self.json_response(400, {"error": str(error)})
+            return
+        except (OSError, ValueError, RuntimeError, TypeError) as error:
+            print(f"review-links New item Send: {error}", file=sys.stderr)
+            self.json_response(503, {"error": "Could not publish the item. Try Send again."})
+            return
+        try:
+            self.json_response(200, {"id": created.saved.id, "key": created.key, "version": created.version})
+        finally:
+            self.deliver_review(server, delivery)
+
+    def review_attachment(self, query: str) -> BinaryIO | None:
+        """Serve an image named by a retained Review record."""
+        server = cast(ReviewLinksServer, self.server)
+        if self.tailscale_refusal() or not self.same_origin():
+            self.send_error(403)
+            return None
+        fields = parse_qs(query, keep_blank_values=True)
+        if set(fields) != {"key", "id"} or any(len(values) != 1 for values in fields.values()):
+            self.send_error(404)
+            return None
+        try:
+            item = server.review_cache.get().records[fields["key"][0]]
+            origin = review_items.submission_origin(item)
+            if not isinstance(origin, new_item_dialog.ReviewSubmission):
+                raise FileNotFoundError()
+            image = next((image for image in origin.images if image.id == fields["id"][0]), None)
+            if image is None:
+                raise FileNotFoundError()
+            folder = review_submissions.image_folder(origin)
+            path = folder / image.id / image.file
+            media = ATTACHMENT_MEDIA[image.file]
+            if path.resolve() != path:
+                raise FileNotFoundError()
+            with path.open("rb") as stream:
+                content = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
+            if not 0 < len(content) <= new_item_dialog.MAX_IMAGE_BYTES:
+                raise FileNotFoundError()
+        except (KeyError, OSError, ValueError):
+            self.send_error(404)
+            return None
+        self.send_response(200)
+        self.send_header("Content-Type", media)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.end_headers()
+        return BytesIO(content)
 
     def review_post(self) -> None:
         """Save the review answer before its shared message delivery."""
         server = cast(ReviewLinksServer, self.server)
         try:
             body = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8")
-            delivery, answer = review_page.submit(server.root, body, server.delivery_status)
+            saved = server.review_cache.save(body, server.delivery_status)
+        except review_items.ReviewRecordChanged as error:
+            self.browser_failure(409, str(error), error)
+            return
+        except change_review.VerdictDurabilityUnconfirmed as error:
+            server.review_cache.invalidate()
+            try:
+                self.browser_failure(503, "The verdict was written. Durability is unconfirmed. Refresh Review.", error)
+            finally:
+                change_page.recover_pending(server.delivery_status, only=error.cleanup)
+                server.review_cache.invalidate()
+            return
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
         except (OSError, RuntimeError, change_page.Refusal) as error:
             self.browser_failure(503, "The answer could not be saved.", error)
             return
+        result: dict[str, object] = {'answer':saved.answer, 'version':saved.version}
+        if isinstance(saved.item, review_items.ReviewItem):
+            later = saved.item.times.later
+            result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
         try:
-            self.json_response(200, {"answer": answer})
+            self.json_response(200, result)
         finally:
-            change_page.deliver(delivery, server.delivery_status)
+            self.deliver_review(server, change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status))
+
+    def deliver_review(self, server: ReviewLinksServer,
+                       delivery: change_page.MessageDelivery | change_page.NoMessageDelivery) -> None:
+        """Retry a failure before sending and leave the saved intent available to recovery."""
+        status = server.delivery_status
+        try:
+            try:
+                change_page.deliver(delivery, status)
+            except Exception as error:
+                print(f"review-links review delivery: {error}", file=sys.stderr)
+                if isinstance(delivery, change_page.MessageDelivery):
+                    ownership = status.request_attempts.get(delivery.attempt)
+                    if ownership is not None and ownership.state == "claimed":
+                        change_page.deliver(delivery, status)
+        except Exception as error:
+            print(f"review-links review delivery retry: {error}", file=sys.stderr)
+        finally:
+            if isinstance(delivery, change_page.MessageDelivery):
+                try:
+                    with status.locked():
+                        _ = status.request_attempts.pop(delivery.attempt, None)
+                except Exception as error:
+                    print(f"review-links review delivery release: {error}", file=sys.stderr)
+                server.review_cache.invalidate()
 
     def accounts_post(self) -> None:
         """Validate and save one account color or one next move from the Accounts page."""
@@ -699,9 +946,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if server.mode is ServerMode.LIST_FIXTURE and fields.get("action") != ["remove"]:
                 raise ValueError("Only Remove is available in this demo.")
             with server.list_store_access():
-                delivery = list_page.submit(server.root, body, server.delivery_status)
+                submission = list_page.submit(server.root, body, server.delivery_status)
                 fixture_reply = ({"state": "saved",
-                    **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
+                    **list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)}
                     if server.mode is ServerMode.LIST_FIXTURE else None)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
@@ -713,12 +960,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(200, fixture_reply)
             return
         try:
-            state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
-            self.json_response(200, {"state": state,
-                **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])})
+            action = fields["action"][0]
+            state = "saved" if action.startswith("resend-") else {"read": "read", "question": "saved"}.get(action, "sent")
+            current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)
+            reply = {"state": state, **current}
+            if isinstance(submission, list_page.ListUnparkSubmission):
+                reply["unpark_outcome"] = submission.response_outcome(current).value
+            self.json_response(200, reply)
         finally:
             try:
-                list_page.deliver(delivery)
+                list_page.deliver(submission)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
@@ -767,16 +1018,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def news_post(self) -> None:
         """Record the page the console shows, and name the other pages that hold new items."""
         server = cast(ReviewLinksServer, self.server)
+
+        def waiting_review(request: console.NewsRequest) -> frozenset[str]:
+            return review_page.waiting_items(request, snapshot=server.review_cache.get())
+
         try:
             length = int(self.headers.get("Content-Length", "0"))
             opened = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True).get("open", [])
-            pages = console.read_pages()
+            pages: list[console.ConsolePage] = []
+            for page in console.read_pages():
+                if page.items is review_page.waiting_items:
+                    page = replace(page, items=waiting_review)
+                elif page.items is images.waiting_images:
+                    page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
+                pages.append(page)
             # An empty name means the open page is not a navigation entry, such as the Rebuilds page.
             if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
                 raise ValueError("name one console page or none")
-            pages = tuple(replace(page, items=partial(images.waiting_images, status=server.delivery_status))
-                          if page.items is images.waiting_images else page for page in pages)
-            fresh = console.news(server.root, pages, opened[0])
+            fresh = console.news(server.root, tuple(pages), opened[0])
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return
@@ -851,10 +1110,14 @@ class ReviewLinksServer(ThreadingHTTPServer):
         # Use relative paths in the fixture process so a request cannot recreate the store after removal.
         self.root: Path = Path(".") if mode is ServerMode.LIST_FIXTURE else self.store_folder
         self.bound_address: str = address[0]
+        self.verified_tailscale_address: str = ""
+        self._tailscale_address_lock: threading.Lock = threading.Lock()
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
+        self.review_cache: review_page.ReviewSnapshotCache = review_page.ReviewSnapshotCache(self.root,start_worker=False)
+        self.new_item_token: str = secrets.token_urlsafe()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
@@ -867,6 +1130,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
         self.delivery_status.startup_recovery_pending.set()
+
         def recover_pending() -> None:
             try:
                 recover_changes(self.delivery_status)
@@ -874,6 +1138,22 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 self.delivery_status.startup_recovery_pending.clear()
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
+        self.review_cache.start()
+
+    def request_tailscale_address(self) -> str:
+        """Reuse the startup address for the request guard."""
+        with self._tailscale_address_lock:
+            if self.verified_tailscale_address:
+                return self.verified_tailscale_address
+            address = tailscale_ip()
+            if address == self.bound_address:
+                self.verified_tailscale_address = address
+            return address
+
+    @override
+    def server_close(self) -> None:
+        self.review_cache.close()
+        super().server_close()
 
     @contextmanager
     def list_store_access(self) -> Generator[None]:
@@ -937,7 +1217,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 if (stamp is ModuleStampUnavailable.UNREADABLE or stamp[0] >= STARTED_NS
                         or (path in self.module_stamps and self.module_stamps[path] != stamp)):
                     with self.delivery_status.locked():
-                        if self.delivery_status.request_attempts:
+                        if self.delivery_status.request_attempts or self.delivery_status.question_jobs:
                             return
                     with self.branch_deletions_lock:
                         if self.branch_deletions:
@@ -970,6 +1250,7 @@ def main(arguments: list[str]) -> int:
                               CHANGE_REVIEW_DIR="reviews", REBUILD_NEEDS_DIR="rebuild-needs")
             service = ReviewLinksServer(address, root, mode=ServerMode.LIST_FIXTURE)
         with service as server:
+            server.verified_tailscale_address = address[0]
             print(f"review-links: serving {root} on {address[0]}:{server.server_port}", flush=True)
             try:
                 server.serve_forever()

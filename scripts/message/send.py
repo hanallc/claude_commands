@@ -132,14 +132,14 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Generator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, get_args
 
 from scripts.herdr.place import HerdrPlace
 from scripts.agents import remote as machine_routes
@@ -586,6 +586,14 @@ class PaneTextDelivered(Result):
     """The observed worker pane accepted the text input."""
 
 
+class WorkerResultNotSubmitted(Result):
+    """The prompt failed before it could send input."""
+
+
+class WorkerResultUnconfirmed(Result):
+    """The prompt may have sent input, and the transcript receipt is missing."""
+
+
 class RecordedDeliveryAcceptance(Result):
     """This keyed send has durable acceptance; later bookkeeping must not repeat it."""
 
@@ -760,7 +768,42 @@ class RosterLookup:
     to: str
 
 
-RecipientSelection = RosterLookup
+@dataclass(frozen=True)
+class FixedStaffLookup:
+    to: staff.StaffId
+    kind: staff.Kind
+
+    def member(self, membership: staff.StaffSnapshot) -> staff.StaffRow | RecipientLookupFailed:
+        for row in staff.active(membership, self.kind):
+            if row.id == self.to:
+                return row
+        return RecipientLookupFailed(f"staff ID {self.to} has no current {self.kind} row")
+
+
+RecipientSelection = RosterLookup | FixedStaffLookup
+
+
+@dataclass(frozen=True)
+class NoFixedStaffLookup:
+    """Allow delivery without a fixed staff requirement."""
+
+
+NO_FIXED_STAFF_LOOKUP = NoFixedStaffLookup()
+
+
+@dataclass(frozen=True)
+class CurrentStaffSocket:
+    """Select the current socket for the required staff row."""
+
+
+@dataclass(frozen=True)
+class ExpectedStaffSession:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class VerifiedStaffDestination:
+    address: str
 
 
 @dataclass(frozen=True)
@@ -1454,17 +1497,32 @@ def reserve_postmaster_claim(message: Message, at: datetime, limit: float, entry
         return result
 
 
-def publish_postmaster_entry(message: Message, entry_id: str, source: Path, target: Path) -> bool:
+def publish_postmaster_entry(message: Message, entry_id: str, source: Path, target: Path, *,
+                             selection: RecipientSelection, session: sessions.SessionRecord) -> bool:
     """Persist publishing before exposing the entry through replacement."""
+    def recipient_allows_publication() -> bool:
+        if not isinstance(selection, FixedStaffLookup):
+            return True
+        try:
+            current = _current_staff_session(selection, postmaster.RegisteredClaudeRecipient(session))
+        except BaseException:
+            with suppress(OSError):
+                source.unlink(missing_ok=True)
+            raise
+        return not isinstance(current, RecipientLookupFailed)
+
     if message.key is None:
-        return postmaster.publish_entry(source, target)
+        return recipient_allows_publication() and postmaster.publish_entry(source, target)
     with key_states() as states:
         marker = pending_deliveries(states.get(message.key, {"last": {}})).get(message.to)
         if marker is None or "postmaster" not in marker:
             raise ValueError("a later send took the key before publication")
         reservation = marker["postmaster"]
-        if reservation["entry_id"] != entry_id or not _owns_attempt(reservation):
+        if (reservation["stage"] != "reserved" or reservation["entry_id"] != entry_id
+                or not _owns_attempt(reservation)):
             raise ValueError("a later send took the key before publication")
+        if not recipient_allows_publication():
+            return False
         marker["postmaster"] = PublishingPostmaster(stage="publishing", entry_id=entry_id,
             owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
     os.replace(source, target)
@@ -1806,14 +1864,54 @@ def socket_recipient(address: str, records: list[sessions.SessionRecord], metada
     return RecipientLookupFailed(dead_socket_reason(address, name))
 
 
+def _current_staff_session(
+    selection: FixedStaffLookup,
+    target: CurrentStaffSocket | ExpectedStaffSession | postmaster.RegisteredClaudeRecipient,
+) -> VerifiedStaffDestination | RecipientLookupFailed:
+    """Check the current staff row after any Claude registry read."""
+    try:
+        records = [] if isinstance(target, ExpectedStaffSession) else sessions.live_sessions()
+        member = selection.member(staff.snapshot())
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        return RecipientLookupFailed(f"could not check the current session for staff ID {selection.to}: {error}")
+    if isinstance(member, RecipientLookupFailed):
+        return member
+    if isinstance(target, ExpectedStaffSession):
+        if member.current_session != target.session_id:
+            return RecipientLookupFailed(f"the session changed for staff ID {selection.to}")
+        return VerifiedStaffDestination(target.session_id)
+    session = sessions.addressed(f"session:{member.current_session}", records)
+    if session is None:
+        return RecipientLookupFailed(f"no live Claude session answers to staff ID {selection.to}")
+    address = f"uds:{session['messagingSocketPath']}"
+    if sessions.addressed(address, records) != session:
+        return RecipientLookupFailed(f"the socket no longer belongs to staff ID {selection.to}")
+    if isinstance(target, postmaster.RegisteredClaudeRecipient) and (
+        session["sessionId"] != target.session["sessionId"]
+        or session["messagingSocketPath"] != target.session["messagingSocketPath"]
+    ):
+        return RecipientLookupFailed(f"the session or socket changed for staff ID {selection.to}")
+    return VerifiedStaffDestination(address)
+
+
 def relay_socket(message: Message, timeout: float, records: list[sessions.SessionRecord],
-                 metadata: dict[str, object], *, membership: staff.StaffSnapshot | None = None) -> Result:
-    """Reuse the delivery connect: only a definite missing/refused socket permits a name retry."""
+                 metadata: dict[str, object], *, selection: RecipientSelection, membership: staff.StaffSnapshot) -> Result:
+    """Retry after a definite missing or refused socket."""
     started = time.monotonic()
+    if isinstance(selection, FixedStaffLookup):
+        recipient = _current_staff_session(selection, CurrentStaffSocket())
+        if isinstance(recipient, RecipientLookupFailed):
+            return Result("failed", recipient.reason)
+        message = replace(message, to=recipient.address)
     result = relay(message, timeout)
     if message.to.startswith("uds:") and result.outcome == "queued" and re.search(
             r"\b(?:ENOENT|ECONNREFUSED)\b", result.detail):
-        recipient = socket_recipient(message.to, records, metadata, disconnected=True, membership=membership)
+        if isinstance(selection, FixedStaffLookup):
+            recipient = _current_staff_session(selection, CurrentStaffSocket())
+            if isinstance(recipient, VerifiedStaffDestination) and recipient.address == message.to:
+                return Result("failed", f"{result.detail}; no replacement socket for staff ID {selection.to}")
+        else:
+            recipient = socket_recipient(message.to, records, metadata, disconnected=True, membership=membership)
         if isinstance(recipient, RecipientLookupFailed):
             return Result("failed", f"{result.detail}; {recipient.reason}")
         return relay(replace(message, to=recipient.address), max(1.0, timeout - (time.monotonic() - started)))
@@ -1942,7 +2040,8 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
             if not saved:
                 _rewrite_queue(path, remaining)
                 saved = True
-            result = relay_socket(message, delivery_timeout(), records, metadata, membership=membership)
+            result = relay_socket(message, delivery_timeout(), records, metadata,
+                                  selection=RosterLookup(message.to), membership=membership)
             log(message, result, started)
             if result.outcome != "sent":
                 lines.append(f"FAILED: socket queue {path}: {result.detail}; kept for retry")
@@ -2212,6 +2311,8 @@ def _staff_recipient_match(
         reference = target.split(":", 1)[1]
     member = membership.by_id(staff.StaffId(reference)) or membership.by_current_session(reference)
     if member is not None:
+        if isinstance(member.retirement, staff.RetiredProducer):
+            return RecipientLookupFailed(f"{target}: {member.name} is a retired producer")
         return member
     if target.startswith(("session:", "codex:", "worker:")) or not reference:
         return NoStaffRecipient()
@@ -2380,19 +2481,24 @@ def matching_recipients(
 
 
 def resolve_recipient(
-    to: str, scope: RecipientResolutionScope, observed: roster.Roster, *,
+    target: str | FixedStaffLookup, scope: RecipientResolutionScope, observed: roster.Roster, *,
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
 ) -> DeliveryRoute:
-    """Resolve locally first; a remote row supplies the address sent to its machine."""
+    """Resolve locally first and require a current staff row for a fixed staff lookup."""
     from scripts.message import roster
 
     membership = staff.snapshot() if membership is None else membership
+    to = target.to if isinstance(target, FixedStaffLookup) else target
+    fixed_member = target.member(membership) if isinstance(target, FixedStaffLookup) else NoStaffRecipient()
+    if isinstance(fixed_member, RecipientLookupFailed):
+        usage_error(fixed_member.reason)
     problems = observed.diagnostics
 
     def lookup() -> DeliveryRoute:
         nonlocal problems
         socket_records = (sessions.live_sessions() if records is None else records) if to.startswith("uds:") else []
-        member = _staff_recipient_match(to, membership, observed=observed.entries, records=socket_records)
+        member = (fixed_member if isinstance(fixed_member, staff.StaffRow)
+                  else _staff_recipient_match(to, membership, observed=observed.entries, records=socket_records))
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
         if (not isinstance(scope, NamedMachine)
@@ -2445,6 +2551,8 @@ def resolve_recipient(
             address = f"session:{member.current_session}"
             if sessions.addressed(address, records or [], membership=membership) is not None:
                 return ClaudeRecipient(address)
+            if isinstance(target, FixedStaffLookup):
+                usage_error(f"no live session answers to staff ID {to}")
             return QueuedStaffRecipient(address, member.name, str(member.current_session))
         if to.startswith("session:"):
             return ClaudeRecipient(to)
@@ -2635,12 +2743,25 @@ def relay_plan(message: Message) -> RelayPlan:
     )
 
 
-def codex_session(
+def deliver_codex(
     message: Message,
-    recipient: CodexSessionRecipient,
+    recipient: CodexSessionRecipient | CodexPaneRecipient,
     timeout: float,
+    *,
+    selection: RecipientSelection,
 ) -> Result:
-    queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, agent_text(message), timeout=timeout)
+    text = agent_text(message)
+    if isinstance(selection, FixedStaffLookup):
+        current = _current_staff_session(selection, ExpectedStaffSession(recipient.thread_id))
+        if isinstance(current, RecipientLookupFailed):
+            return Result("failed", current.reason)
+    if isinstance(recipient, CodexPaneRecipient):
+        try:
+            _prompt_pane(recipient.place, text, target=recipient.thread_id, timeout=timeout)
+            return Result("sent", f"{recipient.address} at {recipient.place.session}:{recipient.place.pane}")
+        except (herdr_types.HerdrFailure, OSError) as error:
+            return Result("failed", str(error))
+    queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout)
     if isinstance(queued, codex_daemon.Queued):
         return Result("sent", f"queued on Codex session {recipient.name}")
     if isinstance(queued, codex_daemon.QueueTimedOut):
@@ -2813,8 +2934,12 @@ def recipient_report(errors: str) -> tuple[str, str]:
 
 def remote(message: Message, host: str, options: Options) -> Result:
     """Forward delivery and queue ownership; this invocation owns its accounting."""
-    forwarded = ["--no-accounting", "--report-recipient", "--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
+    selection = options.selection
+    target = selection.to if isinstance(selection, FixedStaffLookup) else message.to
+    forwarded = ["--no-accounting", "--report-recipient", "--here", "--to", target, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
+    if isinstance(selection, FixedStaffLookup):
+        forwarded += ["--recipient-kind", selection.kind]
     forwarded += ["--forwarded-sender-stamp", sender_native_id(message.stamp)]
     if message.to != USER:
         forwarded += ["--forwarded-shown-sender", message.shown_sender]
@@ -3059,6 +3184,8 @@ def parse(argv: list[str]) -> Options:
             "Use worker:<unit>/<worker> for a pane worker. "
         ),
     )
+    _ = parser.add_argument("--recipient-kind", choices=get_args(staff.Kind),
+                            help="require a current staff row of this kind at the fixed staff ID in --to")
     _ = parser.add_argument("--text-id", default="", help="registered script push")
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
@@ -3190,7 +3317,12 @@ def parse(argv: list[str]) -> Options:
         if isinstance(parsed_action, ActionUnstated):
             parser.error(FIX)
         action = parsed_action
-    selection = RosterLookup(to)
+    kind = optional_str(attr(args, "recipient_kind"))
+    selection: RecipientSelection = RosterLookup(to)
+    if kind is not None:
+        if to == USER:
+            parser.error("--recipient-kind requires a fixed staff ID in --to")
+        selection = FixedStaffLookup(staff.StaffId(to), cast(staff.Kind, kind))
     host = optional_str(attr(args, "machine"))
     if host is not None:
         mapped = machine_routes.machine_alias(host)
@@ -3325,9 +3457,12 @@ def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
+MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+
+
 def quote_sender_lines(text: str) -> str:
     """Separate caller text from generated sender metadata."""
-    normalized = re.sub(r"\r\n|[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", "\n", text)
+    normalized = MESSAGE_LINE_BREAK.sub("\n", text)
     return re.sub(r"(?m)^([^\S\n]*Sender native id:)", r"> \1", normalized)
 
 
@@ -3345,9 +3480,12 @@ def agent_text(message: Message, *, via_relay: bool = False) -> str:
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
-    return stamped_text(
-        f"Message from {message.sender} via postmaster: {quote_sender_lines(message.summary)} [{entry_id[:8]}]"
-        + shown_sender_line(message.sender, message.shown_sender), "\n\n" + message.text, message.stamp)
+    name = MESSAGE_LINE_BREAK.sub(" ", message.sender.removeprefix("send.py in "))
+    summary = MESSAGE_LINE_BREAK.sub(" ", message.summary)
+    shown = shown_sender_line(message.sender, message.shown_sender)
+    if shown:
+        shown = "\n" + MESSAGE_LINE_BREAK.sub(" ", shown.removeprefix("\n"))
+    return stamped_text(f"{name}: {summary}{shown}\nTag: {entry_id[:8]}", "\n\n" + message.text, message.stamp)
 
 
 def send(options: Options) -> Result:
@@ -3374,8 +3512,31 @@ def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -
         place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)))
 
 
+@dataclass(frozen=True)
+class WorkerResultReceipt:
+    marker: str
+    wait_for_idle: bool = False
+    before_input: Callable[[], object] = lambda: None
+
+    def received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
+        from scripts.production import worker_admission
+
+        backend = membership.backends.get(worker.id, staff.BACKEND_UNAVAILABLE)
+        if isinstance(backend, staff.BackendUnavailable):
+            raise ValueError("worker transcript backend is unavailable")
+        source = worker_admission.transcript_source(worker, backend)
+        return any(isinstance(entry, str) and entry.startswith("user:\n") and self.marker in entry.splitlines()[1:]
+                   for entry in worker_admission.transcript_entries(source, set()))
+
+
+class OrdinaryWorkerMessage(Enum):
+    SEND = "send a message without a detached run receipt"
+
+
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
-                        sender: str, timeout: float, reason: str = "") -> Result:
+                        sender: str, timeout: float, reason: str = "",
+                        receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
+                        selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP) -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -3385,23 +3546,61 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         return Result("failed", f"{worker.name}: worker holder is unavailable")
     if not reason:
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
-        if isinstance(state, worker_panes.OpenWorker) and state.status != herdr.AgentStatus.BLOCKED:
+        wait_for_idle = (isinstance(receipt, WorkerResultReceipt) and receipt.wait_for_idle
+                         and isinstance(state, worker_panes.OpenWorker) and state.status == herdr.AgentStatus.WORKING)
+        if isinstance(state, worker_panes.OpenWorker) and (state.status.idle or wait_for_idle):
+            client = herdr.Herdr(herdr.shared_session())
+            attempting_input = False
+
+            def require_idle() -> None:
+                nonlocal attempting_input
+                readiness = client.readiness(state.pane)
+                if not (readiness["agent_status"].idle and readiness["interactive_ready"]):
+                    raise herdr_types.HerdrFailure("worker is not ready for input")
+                if isinstance(receipt, WorkerResultReceipt):
+                    _ = receipt.before_input()
+                attempting_input = True
+
             try:
-                _prompt_pane(HerdrPlace(herdr.shared_session(), state.pane), text,
-                             target=str(worker.current_session), timeout=timeout)
-                return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
+                if wait_for_idle:
+                    _ = client.wait_turn_end(state.pane, int(timeout * 1000))
+                if isinstance(selection, FixedStaffLookup):
+                    current = _current_staff_session(selection, ExpectedStaffSession(worker.current_session))
+                    if isinstance(current, RecipientLookupFailed):
+                        return Result("failed", current.reason)
+                client.prompt(state.pane, text, target=str(worker.current_session),
+                              proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=require_idle)
+                if isinstance(receipt, OrdinaryWorkerMessage):
+                    return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
             except (herdr_types.HerdrFailure, OSError) as error:
                 reason = str(error)
+                # Herdr wraps a failure to launch its prompt command in HerdrFailure.
+                launch_error = error.__cause__ if isinstance(error, herdr_types.HerdrFailure) else error
+                if isinstance(receipt, WorkerResultReceipt) and (
+                        not attempting_input or isinstance(error, herdr.HerdrLaunchRefused)
+                        or isinstance(launch_error, OSError) and cast(object, launch_error.filename) == client.binary):
+                    return WorkerResultNotSubmitted("retry", reason)
+            if isinstance(receipt, WorkerResultReceipt):
+                try:
+                    if receipt.received(worker, membership):
+                        return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
+                except (OSError, ValueError) as error:
+                    reason = f"worker transcript is unavailable: {error}"
+                return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
         elif state is None:
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
             reason = state.reason
         elif isinstance(state, worker_panes.OpenWorker):
-            reason = "worker is blocked"
+            reason = f"worker is {state.status.value}"
+            if isinstance(receipt, WorkerResultReceipt) and state.status != herdr.AgentStatus.BLOCKED:
+                return Result("retry", reason)
         elif isinstance(state, worker_panes.StoppedWorker):
             reason = "worker is stopped"
         else:
             reason = "worker pane is closed"
+    if isinstance(selection, FixedStaffLookup):
+        return Result("failed", reason)
     options = parse(["--here", "--to", f"session:{holder.current_session}", "--from", sender,
                      "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
     return _send(options, membership=membership)
@@ -3453,7 +3652,8 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                  else UserDelivery())
     else:
         try:
-            route = resolve_recipient(options.to, options.scope, observed, membership=membership, records=records)
+            target = options.selection if isinstance(options.selection, FixedStaffLookup) else options.to
+            route = resolve_recipient(target, options.scope, observed, membership=membership, records=records)
         except RecipientNameMissing as error:
             from scripts.message import failed_lookup
 
@@ -3544,14 +3744,8 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender), silence_policy=options.silence_policy)
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
-    elif isinstance(route, CodexSessionRecipient):
-        result = codex_session(message, route, options.timeout)
-    elif isinstance(route, CodexPaneRecipient):
-        try:
-            _prompt_pane(route.place, agent_text(message), target=route.thread_id, timeout=options.timeout)
-            result = Result("sent", f"{route.address} at {route.place.session}:{route.place.pane}")
-        except (herdr_types.HerdrFailure, OSError) as error:
-            result = Result("failed", str(error))
+    elif isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)):
+        result = deliver_codex(message, route, options.timeout, selection=options.selection)
     elif isinstance(route, QueuedStaffRecipient):
         result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
                         + " so it is kept for it")
@@ -3559,12 +3753,16 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         enqueue(replace(message, to=queued_to), result.detail, started, recipient=stable, order=order, membership=membership)
     elif isinstance(route, PaneWorkerRecipient):
         result = deliver_worker_text(route.row, membership, agent_text(message),
-                                     sender=message.sender, timeout=options.timeout)
+                                     sender=message.sender, timeout=options.timeout, selection=options.selection)
     else:
         claude_started = time.monotonic()
         def relay_and_queue(relay_message: Message, timeout: float) -> Result:
-            relayed_result = relay_socket(relay_message, timeout, sessions.live_sessions(), {}, membership=membership)
+            retry_records = [] if isinstance(options.selection, FixedStaffLookup) else sessions.live_sessions()
+            relayed_result = relay_socket(relay_message, timeout, retry_records, {},
+                                         selection=options.selection, membership=membership)
             if relayed_result.outcome == "queued":
+                if isinstance(options.selection, FixedStaffLookup):
+                    return Result("failed", relayed_result.detail)
                 recipient = sessions.addressed(message.to, sessions.live_sessions(), membership=membership)
                 if message.to.startswith("uds:") and recipient is None:
                     return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
@@ -3576,14 +3774,12 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                                   + " so it is kept under that name")
             return relayed_result
 
-        plan = relay_plan(message)
+        plan = RelayAttempt(message) if isinstance(options.selection, FixedStaffLookup) else relay_plan(message)
         if isinstance(plan, SessionIdWithoutLiveRecipient):
-            result = Result(
-                "queued",
-                f"no live session answers to {plan.address}, so it is kept under that name",
-            )
+            result = Result("queued", f"no live session answers to {plan.address}, so it is kept under that name")
             queued_to = str(member.id) if isinstance(member, staff.StaffRow) and not options.to.startswith("session:") else message.to
-            enqueue(replace(message, to=queued_to), result.detail, started, recipient=attempt_recipient, order=order, membership=membership)
+            enqueue(replace(message, to=queued_to), result.detail, started, recipient=attempt_recipient, order=order,
+                    membership=membership)
             log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
             live = sessions.live_sessions()
@@ -3613,7 +3809,8 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                                                       delivered_text(message, entry_id), live,
                                                       reply_identity=sender_native_id(message.stamp), membership=membership,
                                                       deadline=claude_started + options.timeout,
-                                                      publish=partial(publish_postmaster_entry, postmaster_identity, entry_id),
+                                                      publish=partial(publish_postmaster_entry, postmaster_identity, entry_id,
+                                                                      selection=options.selection, session=postmaster_recipient.session),
                                                       resolve=partial(record_postmaster_result, postmaster_identity, entry_id))
                     except BaseException:
                         cancel_unpublished_postmaster_claim(postmaster_identity, entry_id)

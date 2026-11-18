@@ -110,6 +110,8 @@ trap observe_admission DEBUG
     def test_no_token_records_zero(self) -> None:
         environment = {name: value for name, value in self.environment.items()
                        if name != "UNIT_SESSION_DIR"}
+        # Use a warm build directory so Cargo seeding stays outside this test.
+        environment["CARGO_BUILD_BUILD_DIR"] = environment["CARGO_TARGET_DIR"]
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)

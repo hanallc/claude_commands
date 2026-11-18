@@ -102,6 +102,15 @@ class AttemptDeclined:
 
 
 @dataclass(frozen=True)
+class HanaCommandAdmissionRefused:
+    """The Hana command admission check refused the command."""
+    reason: str
+
+
+HANA_IMAGE_STALE = "The Hana image is stale. Run deploy.py hana-setup --plan to review replacement."
+
+
+@dataclass(frozen=True)
 class AttemptCancelled:
     """The reason explains why the attempt was cancelled."""
     reason: str
@@ -113,8 +122,8 @@ class AttemptOutcomeUnavailable:
     reason: str
 
 
-AttemptOutcome = AttemptRunning | AttemptCompleted | PrelaunchRefused | AttemptDeclined | AttemptCancelled | AttemptOutcomeUnavailable
-TerminalAttemptOutcome = AttemptCompleted | PrelaunchRefused | AttemptDeclined | AttemptCancelled
+TerminalAttemptOutcome = AttemptCompleted | PrelaunchRefused | AttemptDeclined | HanaCommandAdmissionRefused | AttemptCancelled
+AttemptOutcome = AttemptRunning | TerminalAttemptOutcome | AttemptOutcomeUnavailable
 
 
 @dataclass(frozen=True)
@@ -573,8 +582,17 @@ def assigned_claim_id(episode: str, attempt: str) -> str:
     return uuid.uuid5(uuid.NAMESPACE_URL, attempt_key(episode, attempt)).hex
 
 
-def retry_decision(destination: PlacementDestination, reason: str, now: float) -> RetryDecision:
+def assigned_claim_reference(assignment: PlacementAssignment) -> ProviderClaimReference:
+    """Identify the provider claim whose key derives from the assignment."""
+    destination = assignment.destination
+    return ProviderClaimReference(destination.provider, destination.target, destination.scope,
+        assigned_claim_id(assignment.episode, assignment.attempt), assignment.episode, assignment.attempt)
+
+
+def retry_decision(destination: PlacementDestination, reason: str | HanaCommandAdmissionRefused, now: float) -> RetryDecision:
     """Keep the existing remote decline delays separate from evidence age."""
+    if isinstance(reason, HanaCommandAdmissionRefused):
+        return DoNotRetry(reason.reason)
     if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
     delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0

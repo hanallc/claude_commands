@@ -39,12 +39,116 @@ Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
 
+## AWS plan identity
+
+Run this command in a terminal on natedev.
+
+```sh
+deploy.py plan-identity --approve-resources
+```
+
+For a new key, the command checks encryption to the GPG key that protects the GitHub token.
+Run `github-warmup` in a terminal on natedev if the GPG agent is cold.
+Enter the administrator passphrase when the command asks for it.
+The command creates the `aws-build-plan` IAM user and one managed policy.
+It checks the user with STS, reads EC2 availability zones, and simulates seven denied actions.
+After these checks pass, it saves one access key in `~/.config/aws-build/plan.gpg` with mode `0600`.
+The rename that publishes `plan.gpg` commits setup.
+If setup fails before the rename, it revokes any new key it finds.
+During setup, `plan.gpg` must be absent before the command revokes a key.
+If directory sync or cleanup fails after the rename, the command warns and reports that the identity is ready.
+Setup keeps the verified file and IAM key after the rename.
+If IAM lists no key after a failed creation, a key can appear later.
+Run the same approved command again to revoke the late key and create a new key.
+If `plan.gpg` is absent, the command revokes all keys that IAM lists for the plan user before it creates one key.
+The command keeps the local key when it matches the sole key that IAM lists.
+Setup refuses if the local key differs from the sole key that IAM lists.
+Setup also refuses if it cannot read or decrypt `plan.gpg`.
+This refusal preserves the local file and the IAM keys.
+Setup uses GPG without a passphrase prompt for these checks.
+If `plan.gpg` is damaged, delete the file and run the command again.
+The command compares the default policy with the current configuration and sets a new default version when they differ.
+Omit `--approve-resources` to print the plan without contacting AWS.
+
+The policy allows setup reads, IAM simulation for users in the account, and S3 object listings in account buckets.
+The policy allows reads of applied service quotas and quota request history.
+The command prints the configured names and regions of the home, regional gate, and Hana stacks.
+The policy limits CloudFormation stack details and templates to those stacks.
+It allows creation and deletion of change sets named `aws-build-plan-*` on those stacks.
+The policy blocks the `TemplateURL` request parameter.
+CloudFormation accepts an inline template body or `UsePreviousTemplate` when the stack has a template.
+A `CREATE` change set for an absent stack leaves an empty stack in `REVIEW_IN_PROGRESS`.
+The policy denies deletion of every stack.
+It denies change set execution, role passing, EC2, IAM and S3 writes, and S3 object reads.
+It denies EC2 instance attribute and Spot request reads because those calls can return user data.
+
+Sessions use `plan_credentials()` to decrypt the key without a prompt.
+If the agent is cold, run `github-warmup` in a terminal on natedev.
+The approved removal command can revoke the key while `plan.gpg` exists.
+Run this command in the same terminal to remove the key, user, and policy.
+
+```sh
+deploy.py down --workload plan-identity --approve-destroy
+```
+
+## Run a setup plan
+
+Run this command in a terminal on natedev.
+
+```sh
+deploy.py hana-setup --plan
+```
+
+The plan reports whether the deployed Hana image is current or stale.
+It refuses first-time Hana setup and setup with pending instance or volume work.
+It can preview one policy update for an idle, stopped, stack-owned Hana box.
+
+The policy preview checks the local credential file and reads the scaler identity with STS.
+It uses the same stack, instance, disk, and parameter checks as approved setup.
+It previews one modification to `ScalerPolicy` without resource replacement.
+The plan deletes the change set and confirms its removal with CloudFormation.
+If removal stays unconfirmed, the plan prints the change set name and refuses.
+
+The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
+The plan simulates the EC2 probes without reading user data or starting the box.
+The S3 simulation uses the control bucket policy from the stack template.
+If the template has no policy or the plan cannot resolve it, the plan prints a note.
+The plan then simulates S3 without a bucket policy.
+Bucket policies added outside the stack are out of scope.
+
+To plan a merge gate update, run this command in a terminal on natedev.
+
+```sh
+deploy.py up --workload merge-gates --plan
+```
+
+The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
+It holds the same controller lock as approved gate setup and image removal.
+If the controller lock is busy, the plan refuses before it contacts AWS.
+It builds the same template and parameter values as approved gate setup.
+The plan previews updates in the home region and in each configured gate region.
+It removes each change set and confirms removal before it checks scaler permissions.
+Each removal has one deadline for all deletion and confirmation calls.
+An absent stack refuses because a CREATE change set can leave a stack in `REVIEW_IN_PROGRESS`.
+The plan identity has no permission to delete a stack.
+An existing stack in `REVIEW_IN_PROGRESS` also refuses.
+In a region with a rolled-back first create, the plan checks scaler permissions.
+Approved setup must delete and recreate that regional stack.
+
+The plan reads the change sets for managed policies that the updates remove or replace.
+If a preview fails or its removal is unconfirmed, all regions that share the scaler policies refuse.
+The simulations exclude those policies and the live versions of the proposed gate scaler policies.
+If the plan cannot identify a policy to exclude, it names the policy and refuses.
+The simulations include the proposed gate policies and the proposed S3 bucket policy.
+The simulations use the regional VPC, image, and Spot request conditions.
+The plan simulates `ec2:GetSpotPlacementScores` in each gate region.
+The plan reports each region in configuration order.
+It passes when every region passes.
+
 ## Hana guest safety files
 
-`scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
-These files do not provision a machine or add a deployment command.
-Phase D must install and enable the units before the box accepts work.
-`config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
+`scripts/aws_target/hana_guest.py` renders safety files for the kept Hana box.
+`config/hana_aws.conf` supplies the image's admission setting, safety timing, and resource values.
 
 `scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
 It writes nine files by base name and applies each `GuestFile` mode.
@@ -52,9 +156,15 @@ Without `tool_setup`, `hana_guest.render_files()` omits `hana-tools.service`.
 Phase F2 supplies the tool setup service.
 
 The NixOS build uses the renderer from its pinned `claude-commands` input.
+`hana_render` puts the guest transfer limit in `receiver.json` and copies the receiver code into the image.
+Update that NixOS input and build the Hana image to install a guest transfer change.
+The box must boot from that image to use the change.
 `scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
 The filter excludes unrelated repository changes from the image inputs.
 The NixOS integration replaces the manually copied guest files.
+The image installs the rendered settings and guest code.
+User data supplies the boot descriptor and signed control access.
+A change to guest admission requires a rebuilt image and a box provisioned from that image.
 
 Run this command from the repository root:
 
@@ -86,6 +196,10 @@ An unchanged permit retains that deadline across later reads and service restart
 A renewal with a changed expiry records a new bounded deadline when safety next reads it.
 The watchdog stops at the earlier of wall-clock expiry and the boot-clock deadline.
 A backward wall-clock change cannot extend the boot-clock deadline.
+Command admission reports disabled guest settings, a missing data mount, or an invalid permit separately.
+The receiver sends a refusal code with the diagnostic text.
+The permit refusal names the failed identity, expiry, or deadline check.
+An invalid or missing expiry field in a permit with valid identity fields gets a specific expiry refusal.
 
 Safety, permit renewal, and command admission share `/run/hana-aws/permit.lock` through `fcntl.flock`.
 Safety holds the lock from the permit read through the shutdown decision.
@@ -157,8 +271,10 @@ Ledger estimates include accrued Hana compute and storage.
 | New setting | Value | Reason |
 | --- | --- | --- |
 | `region` | `us-east-2` | Use Ohio for the box and retained storage. |
-| `instance_type` | `m7a.2xlarge` | Provide 32 GiB of memory. |
-| `spot_max_usd_per_hour` | `0.15` | Bound reserved compute exposure. |
+| `instance_type` | `m7a.4xlarge` | Provide 64 GiB of memory. |
+| `fallback_instance_types` | `c7a.4xlarge,m7i.4xlarge,m6a.4xlarge` | Try these types when the first choice cannot launch. |
+| `spot_max_usd_per_hour` | `0.35` | Bound the compute reservation and skip higher Spot prices during setup. |
+| `spot_ceiling_margin` | `0.25` | Add this positive fraction of the current Spot price when setup suggests a new ceiling. |
 | `root_gib` | `40` | Reserve the retained root volume. |
 | `data_gib` | `300` | Reserve the retained data volume. |
 | `daily_budget_usd` | `6` | Bound Hana spending within the account limit. |
@@ -245,22 +361,56 @@ The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
 Without approval, `hana-setup` prints only its local plan.
 The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
-It creates a retained data volume, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
-Its Spot interruption behavior is `stop`.
-Setup uses Hana sizes and prices from `config/hana_aws.conf`.
+The stack creates the launch template, security group, private control bucket, and scaler policy.
+The launch template uses persistent Spot and stops the instance when AWS interrupts it.
+Before a launch, setup reads Spot prices for the configured type and its fallback types.
+If the instance is already recorded, setup resumes without a Spot price check.
+It checks the registered subnet and each available default subnet in another zone of the same VPC.
+Setup prints one reason for each candidate with no price or a price above the ceiling.
+If the price read fails or no candidate qualifies, setup exits before it changes the stack.
+If all priced candidates exceed the ceiling, setup shows the cheapest candidate.
+Setup shows a `/tune` command when the effective ceiling key is editable.
+If the configuration rejects the command, setup reports the error and the suggested ceiling.
+The suggested ceiling includes `spot_ceiling_margin` and rounds up to a cent.
 It reserves setup costs within both account and workload limits before the stack request.
 `reserve_setup()` permits only approved resource setup while placement remains disabled.
 It does not permit demand starts or guest command admission.
-Setup resumes an existing stack through reads before another mutation.
-It refuses changed resource inputs or an expired reservation before another stack request.
-If AWS confirms that the stack is missing, setup checks the local record for resource identities.
-If the record names an instance, data disk, or bucket, setup asks the user to run `down --workload hana --approve-destroy`.
-If the record names none of these resources, setup searches the deleted stack history for the saved stack name.
+Setup uses the existing stack after a launch failure.
+After all launch requests receive a refusal, prepared setup can change the ceiling on that stack.
+Setup reserves compute at the new ceiling and saves the launch template version before it attempts the next launch.
+It tries the configured type and registered subnet first if their price qualifies.
+It tries the other candidates in order of price, starting with the lowest.
+Setup prints the type, zone, price, and ceiling for each launch attempt.
+A capacity or price refusal moves setup to the next candidate.
+If all attempts fail, setup reports each reason and keeps the stack for the next run.
+An unexpected error stops setup.
+Setup saves a client token before each launch and reuses it if the outcome is unknown.
+It refuses changed resource inputs or an expired reservation for a pending launch.
+Setup saves the returned instance identity, Spot request identity, and zone in `hana/setup.json` before it waits.
+Setup saves a client token before it creates an encrypted gp3 data disk in the launch zone.
+The AWS CLI makes one attempt per launch or disk creation command.
+Setup clears a new intent when EC2 confirms that it rejected the first request.
+Setup keeps the intent when the outcome of an earlier attempt is unknown.
+Setup saves the disk ID before it waits for the disk to become available.
+Setup reads the instance state again before it attaches the disk at `/dev/sdf`.
+Setup permits attachment when the instance is running or stopped.
+If AWS confirms that the stack is missing, setup checks the record for resources or pending requests.
+If the record names either, setup asks the user to run `down --workload hana --approve-destroy`.
+Otherwise, setup searches the deleted stack history for the saved stack name.
 It uses stacks that AWS created at or after the saved reservation time.
 Setup reads the events of each matching stack by ID to find retained disks and buckets.
 It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
 If it cannot verify cleanup, setup keeps the record and asks the user to run `down --workload hana --approve-destroy`.
-It registers the deployment only after the Spot request and stopped state match.
+Setup verifies the persistent Spot request before it requests the idle stop.
+It checks the instance state every `stop_poll_seconds` (10 seconds by default).
+Each check reports the state and elapsed time and uses the `aws_timeout_s` command limit.
+Setup starts each check within `stop_wait_timeout_s` (600 seconds by default).
+A check can finish after the wait limit.
+If the wait expires, run `deploy.py hana-setup --approve-resources` again to resume the stop.
+Setup makes no further AWS calls after the stop wait fails.
+Setup keeps the pending stop and accepts expired preparation if the inputs still match.
+It registers the deployment after it confirms the stopped state.
+
 Setup then probes the scaler path with the same credential file and profile as `aws-target.service`.
 It checks credential export and reads the instance, Spot request, and user data.
 It uses EC2 `--dry-run` for the user data change, start, and stop commands.
@@ -269,18 +419,24 @@ The user data dry run uses the value from the user data read, or an empty value 
 Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` and compares the bytes it reads back.
 It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
 When AWS supplies an error code, the failure line includes it in parentheses.
-For a pending policy update, setup labels the probe runs `before the policy update` and `after the policy update`.
-Setup requires an idle-stopped lifecycle with no claims or pending start.
-It confirms that EC2 reports the instance as stopped.
-Setup compares the effective change set parameters with the approved parameters before execution.
+For a policy-only change, setup probes before and after the update.
+Setup requires an idle-stopped lifecycle with no claims or pending start for this change.
+It checks the saved stack outputs and confirms the instance is stopped and the disk is attached.
+Setup verifies the live and effective change set parameters against the approved stack parameters.
 The second run starts after CloudFormation confirms the update.
 Setup continues the update if the first probe run fails.
 Setup returns exit status 1 if any operation in the last probe run fails.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
-It refuses changes that replace or remove an instance, volume, or volume attachment.
-When a policy update fails, setup prints the failed progress step and the update error.
-When an ordinary setup change fails, setup reads failed stack events from the current change before cleanup.
+For a registered version-1 box, setup reads the original stack template and replaces only `ScalerPolicy`.
+The change set uses the previous value of every live parameter.
+The instance, data disk, and attachment stay in the stack.
+Setup saves the updated template hash and keeps the version-1 record.
+If the policy is current, setup runs the probe without executing a change set.
+Setup refuses a stack-owned box if it cannot confirm the saved resource identities.
+Setup refuses a change set that replaces or removes an instance, volume, or attachment.
+When a policy update fails, setup prints the failed step and the update error.
+When an ordinary stack change fails, setup reads failed stack events from the current change before cleanup.
 The error gives the name, type, status, and AWS reason for each failed resource.
 If setup cannot read the events, it reports that they are unavailable and continues cleanup.
 Setup ends the Spot boxes other than the box in `hana/setup.json`.
@@ -294,6 +450,73 @@ After a failed ordinary setup update, setup deletes resources retained during ro
 Run `prepare --workload hana` again before retrying with changed inputs.
 The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 
+### Hana image freshness
+
+`hana_render` hashes the paths, modes, and bytes of the rendered guest files.
+It adds this digest to the rendered `safety.json` that the image installs during activation.
+The digest excludes its own field.
+The renderer copies only the Hana settings used by the guest.
+
+- Safety reads `enabled`, `guard_grace_seconds`, `watchdog_check_seconds`, and `permit_max_seconds`.
+- The guest also reads `step_cpu_limit`, `step_memory_gib`, and `mount_timeout_seconds`.
+- The receiver reads `aws_timeout_s` and `control_poll_seconds`.
+- The runner reads `execution_shell` and `free_floor_gib`.
+- Source materialization reads `source_max_bytes`, `source_download_timeout_s`, `source_git_timeout_s`, and `source_allowed_environment`.
+
+The renderer writes the resolved values under plain keys.
+The renderer selects overrides by the Hana target alias in `hana_aws.conf`.
+The renderer and runner use one list of timeout keys from `build_targets.conf`.
+The digest covers the guest files that this repository renders.
+NixOS sets the slot settings, compiler version, and runner environment outside those files.
+Changes to those NixOS settings take effect when a new image uses them.
+
+The guest uses `enabled` as an independent admission switch in addition to the live permit.
+Removing the guest switch would avoid an image rebuild for this setting.
+That change would leave an already issued permit usable until the guest revokes it or it expires.
+
+`hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
+Registration requires the build derivation and the renderer output to be present in the local store.
+The registered image description and the local registration record carry the same digest.
+Setup records the digest for the instance after EC2 confirms its image identity.
+Registering another image does not refresh the digest of an existing instance.
+A missing or mismatched digest makes the deployed image stale.
+
+The queue excludes a stale Hana box before assignment.
+The controller checks the image before accepting a claim, starting the box, or granting command permission.
+A stale image detected after assignment records `HanaCommandAdmissionRefused` with `DoNotRetry`.
+The queue can place that build on another eligible target after it settles the Hana attempt.
+The build and target status report this message.
+
+> The Hana image is stale. Run deploy.py hana-setup --plan to review replacement.
+
+After it saves an effective guest setting, `tune.py` reports this message.
+
+> The Hana image is now stale. Build and register a current Hana image.
+
+### Replace a Hana image
+
+The NixOS configuration builds the guest files from its pinned `claude-commands` input.
+Use a reviewed pin that contains the current rendered guest files.
+Use the following sequence only when deletion of the Hana data disk is approved.
+
+1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
+2. Register it with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
+3. Delete the saved deployment with `scripts/aws_target/deploy.py down --workload hana --approve-destroy`.
+4. Prepare the new deployment with `scripts/aws_target/deploy.py prepare --workload hana`.
+5. Provision the new box with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
+
+The third command deletes the data disk and its data.
+Direct setup refuses changed image parameters on a saved box.
+The stack update also refuses replacement of an instance, volume, or attachment.
+
+A replacement that keeps the disk requires a separate setup procedure.
+It must hold the box idle, journal the replacement intent, and launch the replacement in the disk's zone.
+It must detach the same disk, attach it to the replacement, then verify the attachment and stopped state.
+It must persist the new lifecycle identity before it ends the old Spot request.
+Each rerun must confirm the saved intent and resume its last unfinished step.
+Stack-owned boxes also need a separate change that retains the disk and replaces the attachment.
+A combined build and registration command needs an explicit source pin and the local build evidence that registration checks.
+
 ## Ending persistent Spot boxes
 
 AWS opens a persistent Spot request again when its box is terminated.
@@ -305,9 +528,13 @@ The request then launches a new box with no tags.
 4. Terminate the boxes and wait until they are terminated.
 5. Read again. `SpotEndIncomplete` names any request or box that stays live.
 A failed cancel raises before any terminate.
-`deploy.py down --workload hana --approve-destroy` ends Hana boxes before and after it deletes the Hana stack.
-The second check ends any box that CloudFormation kept during deletion.
-The command then deletes the data disk and the control bucket.
+`deploy.py down --workload hana --approve-destroy` cancels the Spot request and confirms that the instance terminates.
+Before deletion, teardown searches for a pending launch by client token and a pending disk creation by tag.
+Teardown repeats each search for up to `intent_lookup_timeout_s` (120 seconds by default).
+If a search expires, teardown preserves the stack, charges, and setup record.
+It deletes the data disk before it deletes the stack.
+It then deletes the retained control bucket.
+For a legacy stack, it deletes the stack first to remove the managed disk attachment.
 It closes the compute and storage charges before it removes the local Hana records.
 The `--approve-destroy` flag authorizes deletion of the disk and bucket data.
 `test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
@@ -323,7 +550,8 @@ User-data changes also require `ec2:Attribute=userData`.
 EC2 describe actions use the required wildcard resource.
 Object reads and writes apply only to this deployment's control prefix.
 No guest instance role or SSH key is created.
-Every provider AWS request uses the configured `aws_timeout_s` bound.
+Small provider requests use `aws_timeout_s`.
+Source uploads and result downloads have separate limits.
 Provider errors expose safe action names rather than cloud identifiers or signed URLs.
 
 The provider persists its operation before dispatch and holds a separate mutation lock.
@@ -623,11 +851,13 @@ The AWS CLI reads all pages, and the reader selects the latest price for each ty
 The reader also reads applied Standard Spot and G and VT Spot quotas.
 It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
 It removes inherited administrator keys and profiles from the AWS process environment.
-The only API actions are `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
+The snapshot calls `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
 The CLI service name is `service-quotas`; the IAM prefix is `servicequotas`.
 See the [AWS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_service-quotas.html).
 The snapshot test derives IAM actions from every request in the real snapshot path.
 It checks the scaler policy for each action, all resources, and no regional condition.
+The scaler policy also allows `ec2:GetSpotPlacementScores` on all resources.
+The grant has no regional condition because a score request can name several target regions.
 A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
 The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.
@@ -1027,6 +1257,29 @@ It uses the regional gate template and its NixOS image.
 A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.
 The CPU gate statement remains unchanged.
 
+After deployment, `deploy.py up --workload merge-gates --approve-resources` checks GPU access with the trial scaler profile.
+Setup compares the profile's caller ARN with the stack's scaler user ARN. A mismatch fails setup.
+It reads instances, offerings, Spot prices, and quota in the home region.
+It uses the trial's Cost Explorer reader and probes local credential export.
+It sends a tagged `RunInstances` DryRun with the trial launch template when a saved subnet offers the type.
+If no saved subnet offers a type, setup reports the launch as unverified for that type.
+Setup reports each wait before it retries a denied launch DryRun.
+The `gpu_setup_dry_run_retry_timeout_s` and `gpu_setup_dry_run_retry_interval_s` keys in `cloud_gate.conf` set the deadline and interval.
+The template supplies the instance profile.
+The launch request checks tagging at creation. [EC2 tag permissions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html)
+If a matching GPU Spot instance exists, setup checks termination with DryRun.
+The administrator simulates the scaler user's termination grant in each saved Spot candidate region with subnets.
+Each simulation uses a sample instance ARN, the required tags, and `aws:RequestedRegion`.
+A simulated denial fails setup.
+If the administrator lacks `iam:SimulatePrincipalPolicy`, setup reports termination as unverified.
+Setup writes one fixed probe object under each GPU trial prefix and checks the contents through GET.
+Setup lists the exact result key. The trial lists result keys only.
+Setup creates and aborts a multipart upload on the input probe key.
+A failed required probe makes setup exit with status 1.
+Setup prints one result per operation and one advice line per error kind.
+Setup directs the user to check the grant for authorization failures or repeat setup for transient failures.
+The probe creates no EC2 instance. The pilot still checks capacity and guest boot.
+
 Each box imports the signed closure download and reboots once.
 The prepared system enables NVIDIA Vulkan and starts the trial runner.
 The runner uploads each run's report and memory rows separately.
@@ -1064,12 +1317,13 @@ Existing configuration values remain unchanged.
 | New key | Value | Reason |
 | --- | --- | --- |
 | `stack_name` | `hana-build` | Keep Hana resources separate from gate resources. |
-| `availability_zone` | `us-east-2b` | Keep the retained disk in one zone. |
+| `availability_zone` | `us-east-2c` | Use this zone for the first launch candidate. |
 | `ami_id` | Empty | Require the reviewed Hana safety image. |
 | `ami_owner_id` | Empty | Require the reviewed image owner. |
 | `vpc_id` | Empty | Require an explicit network. |
 | `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
-| `aws_timeout_s` | `10` | Bound each provider and receiver request. |
+| `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
+| `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
 
@@ -1096,11 +1350,13 @@ A typed `MissingBasis` answer clears that repository's basis before a complete b
 `AwsSourceObjects` implements the typed object boundary through the existing provider.
 It uses conditional `PutObject` and signed `GetObject` access under `source/<deployment>/`.
 The scaler policy grants only `s3:PutObject` and `s3:GetObject` for that deployment's source prefix.
-Each AWS call uses `aws_timeout_s`.
+The sender bounds the 1 GiB source bundle upload with `source_upload_timeout_s` (300 seconds).
+Credential export uses `aws_timeout_s` (10 seconds).
 The guest receives no AWS credentials.
 
 `hana_source.materialize` bounds the download, verifies sha256 and Git prerequisites, checks the advertised commit, and fetches verified objects.
 Curl enforces the total download timeout and maximum file size.
+The guest bounds the source bundle download with `source_download_timeout_s` (120 seconds).
 The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
 The shared maker allocates mirror metadata and temporary bundle files.
 `build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
@@ -1112,6 +1368,36 @@ Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots
 Those values remain unset until the user approves them.
 The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
 Phase F2 will deliver manifests and execute commands with inherited slot locks.
+
+## Hana result transport
+
+The guest sends `result.json` with both compiler output streams and the command status.
+The JSON limit is 32 MiB.
+The guest and sender use `result_transfer_timeout_s` for the upload and download.
+The guest uses curl for the upload and keeps the signed URL out of process arguments.
+The receiver starts curl as a child process with `--max-time`.
+It checks the child once per pass while it continues to read permits and fences.
+The controller starts permit renewal with 105 seconds left under the default settings.
+The separate watchdog can stop the guest before a 120-second upload ends.
+The receiver reads and processes the fence before the permit in every pass.
+A control step can fail during a read, a write, decoding, or validation.
+The receiver continues to process the other control requests in the same pass.
+A fence sends SIGKILL to the upload process and reaps it before the receiver acknowledges the fence.
+The receiver records an upload attempt before the PUT and records its result before it publishes the observation.
+After a restart, the receiver records an unconfirmed upload as `HanaResultUploadFailed` and reports the loss.
+Command and fence documents and execution observations have a 64 KiB protocol limit.
+They use `aws_timeout_s` (10 seconds).
+The guest publishes the terminal observation after the result upload completes or the receiver records a loss.
+The guest checks the expiry of the boot URLs and the attempt URLs before starting an upload.
+The sender reads the boot expiry from the saved bootstrap record.
+The guest and sender reserve 161 seconds under the default settings for fence settlement.
+The sender polls for the exact fence acknowledgement at the control poll interval.
+It polls after every fence PUT attempt, including when S3 returns an error status.
+The sender retains the claim if the window ends before it confirms the fence, command termination, and lease release.
+The offload reports a loss if the transfer cannot fit, times out, or the guest cannot confirm its PUT.
+The offload requires an accepted result before it reports a build verdict.
+The sender also works with older guests.
+Older guests upload results with the 10-second control timeout.
 
 ## Hana placement adapter
 
@@ -1141,6 +1427,21 @@ Permit renewals retain that generation.
 F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
 Only an adopted claim can request the queue's first launch authorization.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
+An exact guest observation can settle an accepted execution that ended without a compiler result.
+The observation must confirm termination and lease release, and the sender must have issued no source update.
+The sender uses the guest cause when it is available and keeps a specific sender rejection if the guest reports a pending result.
+For other confirmed departures, the sender attempts to release the claim without another fence observation.
+The sender requires a fence acknowledgement after a result transfer loss or when it resumes an unsettled fence.
+The sender uses the refusal code from a new image to report `HanaCommandAdmissionRefused`.
+For the old image, the sender recognizes only the exact reason `The data mount and a fresh permit are required`.
+The refusal proves the command did not start.
+The sender reports the refusal before claim cleanup.
+The controller checks whether the holder exited in every lifecycle state, including after a Spot interruption.
+An unresolved start still requires provider recovery.
+The next Hana evidence read can remove the detached target claim.
+The queue excludes Hana for the refused build and continues in the configured candidate order.
+For a different build, the queue needs provider evidence at or after the refusal report before it can assign the same scope.
+For a pinned build, `verify.sh` prints one line with the refusal cause and exits with status 2.
 An ended local holder cannot settle an unresolved Hana dispatch.
 A failed boot needs a terminal `ExecutionReport`; pending settlement retains capacity and the live retry deadline.
 The queue permits fallback only after settlement.

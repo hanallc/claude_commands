@@ -18,7 +18,7 @@ import hashlib
 import shlex
 import math
 import os
-from pathlib import Path, PurePath
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -41,7 +41,7 @@ from scripts.buildlog.store import host_name
 from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
-from scripts.build_queue import first_step
+from scripts.build_queue import first_step, slot_wait
 from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -1081,7 +1081,7 @@ def requested_source(source: Path, policy: SourcePolicy, merge: MergePolicy) -> 
 
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
-             merge: MergePolicy = NO_MERGE, step: str = "run",
+             merge: MergePolicy = NO_MERGE, step: str = "", command: Sequence[str] = (),
              queue_position: SlotQueuePosition | NewSlotQueuePosition = NEW_SLOT_QUEUE_POSITION) -> Generator[Path]:
     """Hold one repository slot through preparation and the caller's use.
 
@@ -1102,22 +1102,25 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         canonical = slot_source(source)
         if main_checkout(source) != canonical:
             _ = git(canonical, "fetch", "-q", "--", str(source), base)
-    purpose = read_step_names().shown(step)
+    work = step or "build"
+    purpose = read_step_names().shown(work)
     unit = owner
-    showrunner = owner_name(copy_owner(owner))
-    try:
-        rows = staff.local_snapshot()
-        member = rows.by_id(staff.StaffId(owner)) if isinstance(copy_owner(owner), StaffOwner) else None
-        if member is not None and isinstance(member.parent, staff.ReportsTo):
-            parent = rows.by_id(member.parent.id)
-            if parent is not None:
-                showrunner = parent.name
-    except staff.StaffUnreadable:
-        pass
+    caller = copy_owner(owner)
+    showrunner = owner
+    if isinstance(caller, StaffOwner):
+        try:
+            rows = staff.local_snapshot()
+            member = rows.by_id(staff.StaffId(caller.row_id))
+            if member is not None:
+                parent = rows.parent_of(member)
+                showrunner = parent.name if parent is not None else member.name
+        except staff.StaffUnreadable:
+            pass
     with ExitStack() as held_slot:
-        with _slot_preparation():
+        staff_id = caller.row_id if isinstance(caller, StaffOwner) else ""
+        with _slot_preparation(), slot_wait.slot_caller(staff_id, showrunner, source, command, step):
             slot = held_slot.enter_context(build_slots.take_slot(canonical, base, showrunner=showrunner, unit=unit,
-                work=step, purpose=purpose, report=lambda line: print(line, file=sys.stderr), queue_position=queue_position))
+                work=work, purpose=purpose, report=lambda line: print(line, file=sys.stderr), queue_position=queue_position))
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
@@ -1158,7 +1161,7 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                  merge: MergePolicy = NO_MERGE, step: str = "") -> Generator[Path]:
     """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
     job = command_job(command)
-    label = step or (job.step if isinstance(job, StepJob) else PurePath(command[0]).name if command else "run")
+    label = step or (job.step if isinstance(job, StepJob) else "")
     try:
         with ExitStack() as scope:
             if isinstance(job, StepJob):
@@ -1168,7 +1171,7 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                     policy = CommittedSource(commit_at(source, "HEAD"))
                     merge = NO_MERGE
                 admitted = scope.enter_context(first_step.admitted_run(command, source))
-                tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label,
+                tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command,
                     queue_position=admitted.queue_position))
                 admitted.handoff(tree)
                 key = "BUILDLOG_PREPARED_COPY_LOCK_FD"
@@ -1179,7 +1182,7 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                 os.environ[key] = str(build_folders.build_folder_lock_fd(tree))
             else:
                 # OtherCommand has no first queue step to admit.
-                tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label))
+                tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
             yield tree
     except first_step.FirstStepRefused as error:
         failure = CopyError(str(error))

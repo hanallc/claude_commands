@@ -66,6 +66,9 @@ Its native address still accepts messages.
 The roster reads one staff snapshot and passes it to each entry reader.
 Codex thread titles and herdr labels do not become recipient names.
 The native registry helpers live in `scripts/message/session_records.py`.
+A missing registry folder or an unreadable record leaves unmatched liveness unknown.
+The roster reports each unreadable path and keeps entries that it can read.
+A process count needs a complete registry read.
 `sessions.py` exports those helpers and adds staff recipient lookup.
 Staff imports the native helpers directly, so neither module imports the other.
 
@@ -325,7 +328,19 @@ Each record is one JSON file. The engine refuses reads and writes over 4 MiB, so
 | `forwards/<at_ms>-<n>.json` | `{forwarded}`; confirmed forward destination ids for the reply of the same name. Written once, after the last forward; it exists only when forwarding is done |
 | `errors/<at_ms>-<n>.json` | `{at_ms, error}`; file/start/poll errors, including failed durable route withdrawal |
 
-The client resolves the original sender by its current name: exactly one live session gives `ReplyToSession(session_id)`, otherwise `ReplyUnroutable()`. Only the wire entry uses `reply_to_session_id: ""` for that state. The mod converts it into `ReplyDestination` (`session` or `unroutable`) when registering or restoring a route; it reads no session registry. The recipient gets `Message from <sender> via postmaster: <summary> [<first eight id characters>]`, a blank line and the original text. Distinct tags prevent the recipient's repeat-text filter from dropping equal messages. The mod adds neither entry routing field to the text itself.
+The client resolves the original sender by its current name.
+One live match gives `ReplyToSession(session_id)`. All other results give `ReplyUnroutable()`.
+The wire entry uses `reply_to_session_id: ""` for an unroutable reply.
+The mod uses that field to select the `session` or `unroutable` variant of `ReplyDestination` when it registers or restores a route.
+The routing fields stay in the wire entry.
+
+A delivery starts with `<name>: <summary>`. The client removes a leading `send.py in ` from the sender name.
+The next line is `Sender native id: <id>`, followed by `Shown sender: <display name>` when needed.
+The metadata ends with `Tag: <tag8>`. The tag is the first eight characters of the entry ID.
+Line breaks in the name, summary and shown sender become spaces, so each metadata field is one line and the header has a fixed form.
+The recipient's UI still shows `Message from @postmaster:` before the delivery, because the engine send call has no sender field.
+A blank line separates the metadata from the original text.
+Distinct tags prevent the recipient's repeat-text filter from dropping equal messages.
 
 **Worker, claim and fallback**
 
@@ -376,9 +391,25 @@ The client saves and syncs `resolved` before it removes a definite receipt. A fa
 
 **Replies**
 
-Only a `peer` event with a complete cross-session wrapper and a `from` socket having a route inside the 30-minute window is a reply. The handler reads the first line's `from` and `from-name` and the body between the opening and closing lines. It writes one reply file that names the socket, body and intended destinations, forwards to each distinct session destination registered for that socket, writes the confirmed forwards to a `forwards/` file of the same name, and returns `{consumed: "postmaster reply"}`, starting no turn in the postmaster session. Script senders with no destination still have their replies consumed and logged. Unknown sockets, other origins, ordinary prompts, relay messages and broadcasts pass to `next(e)` unchanged; a failed handler also passes the event on.
+A reply is a `peer` event with a complete cross-session wrapper and a route for the `from` socket within the 30-minute window.
+The handler reads `from` and `from-name` from the opening line and extracts the body from the wrapper.
+If the body starts with `postmaster:`, the handler passes it to the postmaster session before it reads the route.
+It ignores leading whitespace and letter case for this check.
+For a reply, the handler writes one reply file with the socket, body, and intended destinations.
+It forwards the body to each distinct session destination for that socket.
+It writes the confirmed destinations to a `forwards/` file of the same name.
+It returns `{ kind: "consumed", reason: "postmaster reply" }` and starts no turn in the postmaster session.
+The handler also records and consumes replies to script senders with no destination.
+Other events and handler failures pass to `next(e)`.
 
-A forward begins `Message from <name> (their answer to <sender>, passed on by postmaster) [<at_ms>-<n>]:`, then a blank line and the body. Several sender names produce `their answer to one of <a>, <b>` and each distinct session destination gets it. Each forward has a new tag. The Claude receiving rule answers the real sender named on the first line, never the wrapper's `postmaster` name. Routes are registered before the outbox send returns, so a quick reply is recognized; refusing a later delivery removes only that delivery's route. A throwing send keeps its route because delivery is unknown. A replaced worker restores valid `open` route files inside the window; malformed, invalid and withdrawn files are skipped.
+A forward has the form `<name> (answer to <answerTo>): <body>`, followed by a blank line and `Tag: <at_ms>-<n>`.
+`progress_history.py` reads the key from the final `Tag:` line and matches the forward against the text that `PostmasterReplyRecord.matches_forward()` rebuilds from the reply record. A sender name can contain `): `, so the reader never splits the forward at that text. The reader does not accept the earlier forward format.
+With several senders, `<answerTo>` has the form `one of <a>, <b>`.
+Each forward has a new tag. The recipient answers the sender named in the text.
+The mod registers the route before the outbox send returns so it can recognize an early reply.
+A refused delivery removes only its own route.
+If a send throws an error, the mod keeps its route because the delivery result is unknown.
+A replacement worker restores valid `open` routes within the 30-minute window.
 
 **Start, check and stop procedure**
 
