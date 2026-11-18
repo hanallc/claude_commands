@@ -806,7 +806,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         added = f"{day.isoformat()} {added_at:%H:%M}" if added_at is not None else day.isoformat()
         when = f"{added} · {_cell(merged)}" if merged else added
-        rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
+        rows = [_row(path, columns, {**dict.fromkeys(columns, ""),
+                                     "#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(items[index].how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[index]) if isinstance(row_producers[index], str) else "",
                                      PRODUCTION: _cell(identities[index]),
@@ -1890,15 +1891,14 @@ class VerdictRefused:
 
 def _require_verdict_exchange(slots: delivery_state.DeliverySlots, verdict: str, validation_id: str) -> None:
     """Apply the same exchange checks to a single verdict and a batch verdict."""
-    from scripts.production import update_registration
     try:
         if isinstance(slots.question, delivery_state.OpenQuestion):
-            _ = update_registration.question_exchange_for_reply(slots.question, '', verdict)
+            _ = delivery_state.question_exchange_for_reply(slots.question, '', verdict)
         if validation_id or slots.validation_requested:
-            update_registration.require_exchange_id(
+            delivery_state.require_exchange_id(
                 slots.validation if isinstance(slots.validation, delivery_state.NoDelivery) else slots.validation.attempt,
                 validation_id)
-    except update_registration.StaleQuestionExchange as error:
+    except delivery_state.StaleQuestionExchange as error:
         raise ChangeReviewError(str(error)) from error
 
 

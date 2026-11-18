@@ -583,7 +583,7 @@ An explicit number must name an unused path.
 Exact repeated operations change nothing.
 Other updates append a log line and mark the item unread; mark-read clears the unread time without sending a message.
 Update and park refuse Closed items until reopen restores them.
-The table uses `# | Owner | Item | State | Next step | ETA | Update`.
+The table uses `# | Owner | Producer | Item | State | Next step | ETA | Update`; Producer shows the producer's name.
 It sorts Waiting for nate first, unread items second, and next check times third.
 State cells include the check time and identify overdue checks.
 Future parked items and Closed items remain hidden by default.
@@ -628,7 +628,7 @@ The answer returns the record to For you.
 An exact repeat of an answer-ready or read operation changes nothing.
 Other state changes receive one refusal line.
 
-1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>"`.
+1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>" --waiting-why "<reason>"`.
 2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
 3. Mark its answer read with `investigation.py read --id I<n>`.
 4. List waiting investigations with `investigation.py list`.
@@ -707,6 +707,7 @@ A missing folder uses its nearest existing parent until the folder appears.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  The Python `followup` API requires `waiting_why`; the Review action uses the user's question text automatically.
   It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
