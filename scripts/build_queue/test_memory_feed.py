@@ -2507,6 +2507,93 @@ process.stdout.write(JSON.stringify({
             with self.subTest(gpu_slot=code):
                 self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
+    def tool_process(self, pid: int, command: str, kib: int, *, parent: int = 1,
+                     children: tuple[int, ...] = (), shared_kib: int = 0) -> Path:
+        proc = self.root / "proc"
+        write_process(proc, pid, kib * 1024, parent=parent)
+        process = proc / str(pid)
+        _ = (process / "cmdline").write_bytes(command.encode().replace(b" ", b"\0") + b"\0")
+        _ = (process / "status").write_text(
+            f"VmRSS: {kib + 2 * shared_kib} kB\nRssAnon: {kib} kB\nRssShmem: {2 * shared_kib} kB\n")
+        _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {kib} kB\nPss_Shmem: {shared_kib} kB\n")
+        task = process / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        _ = (task / "children").write_text(" ".join(map(str, children)))
+        return process
+
+    def tool_split(self, *waiting: int) -> memory_feed.BuildToolRam:
+        waiters: list[admission_records.RankedWaiter] = [
+            {"pid": pid, "start_time": str(pid), "need": 1024, "since": 0, "order": admission_records.NormalOrder()}
+            for pid in waiting]
+        with (mock.patch.object(memory_feed, "PROC", self.root / "proc"),
+              mock.patch.object(memory_feed, "CGROUP", self.root),
+              mock.patch.object(gate, "builds_slice_cgroup", return_value=self.root / "builds.slice")):
+            return memory_feed.build_tool_ram((), 0, waiters)
+
+    def test_detached_test_scope_counts_children_and_mixed_groups_follow_ancestry(self) -> None:
+        _ = self.tool_process(101, "python3 -m unittest", 10, children=(102,))
+        _ = self.tool_process(102, "python3 -c child", 20, parent=101, children=(103,))
+        _ = self.tool_process(103, "sleep 10", 10, parent=102)
+        _ = self.tool_process(104, "other", 50)
+        builds = self.root / "builds.slice"
+        scope = builds / "builds-detached.slice" / "tests.scope"
+        for members, expected in (((101, 102, 103), 100), ((101, 102, 103, 104), 40)):
+            with self.subTest(members=members):
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(scope.parent, anonymous=100 * 1024)
+                write_scope(scope, members=members, anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, (100 - expected) * 1024,
+                                                                           python_tests=expected * 1024))
+
+    def test_shared_pages_in_mixed_group_count_once_for_waiting_wrappers(self) -> None:
+        builds = self.root / "builds.slice"
+        for pid, command, parent, children, shared in (
+            (101, "bash /fixture/verify.sh test", 1, (102,), 15),
+            (102, "python3 local_release_wait.py", 101, (), 15),
+            (103, "other", 1, (), 0),
+        ):
+            process = self.tool_process(pid, command, 10 if shared else 50,
+                                        parent=parent, children=children, shared_kib=shared)
+            _ = (process / "cgroup").write_text("0::/builds.slice/mixed.scope\n")
+        write_scope(builds, anonymous=100 * 1024)
+        write_scope(builds / "mixed.scope", members=(101, 102, 103), anonymous=100 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 50 * 1024, waiting_runs=50 * 1024))
+
+    def test_waiting_verify_shell_with_options_counts_as_a_wrapper(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash -e /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        write_scope(builds, anonymous=20 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=20 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 0, waiting_runs=20 * 1024))
+
+    def test_waiting_tools_skip_unrelated_processes_and_cgroup_subtrees(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        thread = owner / "task" / "104"
+        thread.mkdir()
+        _ = (thread / "children").write_text("103")
+        helper = self.tool_process(103, "python3 verify_helper.py", 10, parent=102)
+        _ = self.tool_process(199, "other", 20)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        _ = (helper / "cgroup").write_text("0::/builds.slice/verify.scope/helper.scope\n")
+        write_scope(builds, anonymous=50 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=30 * 1024)
+        write_scope(builds / "verify.scope" / "helper.scope", members=(103,), anonymous=10 * 1024)
+        unrelated = builds / "unrelated.scope" / "child.scope"
+        write_scope(unrelated.parent, anonymous=20 * 1024)
+        write_scope(unrelated, members=(199,), anonymous=20 * 1024)
+        with (mock.patch.object(gate, "process_table", wraps=gate.process_table) as table,
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read):
+            tools = self.tool_split(102)
+        table.assert_not_called()
+        self.assertNotIn(mock.call(unrelated / "cgroup.procs"), read.call_args_list)
+        self.assertEqual(tools, memory_feed.BuildToolRam(0, 0, 20 * 1024, waiting_runs=30 * 1024))
+
     def test_python_tests_and_waiting_wrappers_split_tools_without_counting_cargo_twice(self) -> None:
         gib = admission_records.GIB
         for cargo_use in (0, 2 * admission_records.GIB):
@@ -2520,11 +2607,17 @@ process.stdout.write(JSON.stringify({
                 for pid, parent, use, command in (
                     (shell, 1, gib // 4, b"bash\0/fixture/verify.sh\0test\0"),
                     (waiter_pid, shell, gib // 4, b"python3\0local_release_wait.py\0"),
-                    (helper, shell, gib // 2, b"python3\0verify_helper.py\0"),
+                    (helper, waiter_pid, gib // 2, b"python3\0verify_helper.py\0"),
                     (unknown, 1, gib, b"python3\0tree_watch.py\0"),
                 ):
                     write_process(proc, pid, use, parent=parent)
-                    _ = (proc / str(pid) / "cmdline").write_bytes(command)
+                    process = proc / str(pid)
+                    _ = (process / "cmdline").write_bytes(command)
+                    _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {use // 1024} kB\nPss_Shmem: 0 kB\n")
+                    task = process / "task" / str(pid)
+                    task.mkdir(parents=True)
+                    children = {shell: str(waiter_pid), waiter_pid: str(helper)}
+                    _ = (task / "children").write_text(children.get(pid, ""))
                 python_use = 4 * gib
                 builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
                 detached = builds / "builds-detached.slice"
