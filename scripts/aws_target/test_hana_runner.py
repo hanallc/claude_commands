@@ -1,7 +1,8 @@
 """Test leased guest commands and root fences with private source and process state."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
+from http.client import IncompleteRead
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from typing import NamedTuple, cast, override
+from typing import BinaryIO, NamedTuple, cast, override
 import unittest
 from unittest import mock
 from urllib.request import Request
@@ -31,6 +32,27 @@ class DiskReading(NamedTuple):
     total: int
     used: int
     free: int
+
+
+@dataclass
+class FixtureCurl:
+    returncode: int | None
+    polls: int = 0
+    kills: int = 0
+    reaps: int = 0
+
+    def poll(self) -> int | None:
+        self.polls += 1
+        return self.returncode
+
+    def kill(self) -> None:
+        self.kills += 1
+        self.returncode = -9
+
+    def wait(self) -> int:
+        self.reaps += 1
+        assert self.returncode is not None
+        return self.returncode
 
 
 class PrivateSupervisor:
@@ -470,34 +492,228 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
     def test_result_publication_precedes_terminal_observation_and_idle_objects_do_nothing(self) -> None:
         outcome = self.run_request(self.request)
         assert isinstance(outcome, runner.HanaCommandFinished)
-        self.supervisor.outcome_value = outcome
         self.supervisor.departure_value = receiver.CommandDeparture(True, True)
         prefix = 'https://fixture.s3.us-east-2.amazonaws.com/'
-        descriptor = {**self.descriptor, 'control_url': prefix + 'control', 'report_url': prefix + 'report',
-                      'command_url': prefix + 'command', 'fence_url': prefix + 'fence'}
-        published: list[str] = []
+        transport = receiver.ReceiverSettings(7, 1, 83)
+        for case, boot_deadline, access_deadline, cause in (
+                ('uploaded', 1400, 1400, 'The command result is pending'),
+                ('timeout', 1400, 1400, 'HanaResultUploadTimedOut: The result upload exceeded 83 s '
+                                       + '(result_transfer_timeout_s)'),
+                ('http-error', 1400, 1400, 'HanaResultUploadFailed: curl exited with status 22'),
+                ('restart', 1400, 1400, 'HanaResultUploadFailed: The receiver restarted before it confirmed '
+                                        + 'the result upload'),
+                ('short-boot', 1195, 1400, 'HanaResultUploadFailed: The signed access window cannot fit a result '
+                                           + 'upload of 83 s and settlement'),
+                ('short-attempt', 1400, 1195, 'HanaResultUploadFailed: The signed access window cannot fit a result '
+                                              + 'upload of 83 s and settlement')):
+            with self.subTest(case=case):
+                key = replace(self.request.key, attempt=case, claim_id=placement.assigned_claim_id('episode', case))
+                result = replace(outcome.result, key=key)
+                self.supervisor.outcome_value = runner.HanaCommandFinished(result)
+                envelope = replace(self.envelope, request=replace(self.request, key=key),
+                                   access=replace(self.access, expires_at=access_deadline))
+                descriptor = {**self.descriptor, 'expires': boot_deadline, 'control_url': prefix + 'control',
+                              'report_url': prefix + 'report', 'command_url': prefix + 'command',
+                              'fence_url': prefix + 'fence'}
+                published: list[str] = []
+                observations: list[execution.HanaCommandObservation] = []
+
+                def fetch(request: Request, timeout: int) -> bytes:
+                    self.assertEqual(timeout, 7)
+                    url = request.full_url
+                    if request.get_method() == 'PUT':
+                        published.append(url)
+                        if url == self.access.observation_url:
+                            assert request.data is not None
+                            observations.append(execution.decode_observation(cast(bytes, request.data)))
+                        return b'' if url.startswith('https:') else b'imds-token'
+                    if url.endswith('/user-data'):
+                        return json.dumps(descriptor).encode()
+                    if url.endswith('/command'):
+                        return execution.encode_envelope(envelope)
+                    if url.endswith('/fence'):
+                        return b'{"version":1,"action":"idle"}'
+                    return b'{}'
+
+                directory = receiver.command_directory(self.paths, key)
+                if case == 'restart':
+                    _ = self.receive(envelope)
+                    guest.atomic_record(directory / 'result-upload.json', {'state': 'started'})
+                status = {'timeout': 28, 'http-error': 22}.get(case, 0)
+                curl = FixtureCurl(status)
+
+                def launch(arguments: list[str], *, stdin: BinaryIO, pass_fds: tuple[int, ...],
+                           **_options: int) -> FixtureCurl:
+                    self.assertNotIn(self.access.result_url, arguments)
+                    self.assertIn(self.access.result_url.encode(), stdin.read())
+                    self.assertEqual(arguments[arguments.index('--max-time') + 1], '83')
+                    upload_path = Path(arguments[arguments.index('--upload-file') + 1])
+                    self.assertEqual(upload_path, Path(f'/proc/self/fd/{pass_fds[0]}'))
+                    self.assertEqual(hana_result.decode_result(upload_path.read_bytes()), result)
+                    self.assertEqual(receiver.read_document((directory / 'result-upload.json').read_bytes()),
+                                     {'state': 'started'})
+                    published.append(self.access.result_url)
+                    return curl
+
+                with (mock.patch.object(receiver, 'GuestCommandSupervisor', return_value=self.supervisor),
+                      mock.patch.object(subprocess, 'Popen', side_effect=launch) as popen):
+                    for passes in (2, 1):
+                        running = iter([True] * passes + [False])
+                        receiver.run_receiver(self.settings, transport, paths=self.paths, fetch=fetch,
+                            pause=lambda _seconds: None, clock=lambda: 1000, keep_running=lambda: next(running))
+                if case.startswith('short-') or case == 'restart':
+                    popen.assert_not_called()
+                    self.assertEqual(receiver.read_document((directory / 'result-upload.json').read_bytes()),
+                                     {'state': 'lost', 'reason': cause})
+                else:
+                    popen.assert_called_once()
+                    self.assertLess(published.index(self.access.result_url), published.index(self.access.observation_url))
+                    self.assertEqual(curl.polls, 1)
+                    self.assertEqual(curl.kills, 0)
+                self.assertGreaterEqual(len(observations), 2)
+                for observation in observations:
+                    self.assertTrue(observation.terminated and observation.lease_free)
+                    self.assertEqual(observation.evidence, placement.ExecutionEvidenceUnavailable(cause, 1000))
+        self.assertEqual(len(self.supervisor.starts), 6)
+
+    def test_receiver_renews_and_fences_during_an_upload_despite_failed_control_reads(self) -> None:
+        outcome = self.run_request(self.request)
+        assert isinstance(outcome, runner.HanaCommandFinished)
+        self.supervisor.departure_value = receiver.CommandDeparture(True, True)
+        prefix = 'https://fixture.s3.us-east-2.amazonaws.com/'
+        descriptor = {**self.descriptor, 'expires': 1400, 'control_url': prefix + 'control',
+                      'report_url': prefix + 'report', 'command_url': prefix + 'command', 'fence_url': prefix + 'fence'}
+        first = replace(self.envelope, access=replace(self.access, expires_at=1400))
+        renewal = guest.WorkPermit(1150, '2', 'boot')
+        next_key = replace(self.request.key, attempt='next', claim_id=placement.assigned_claim_id('episode', 'next'))
+        next_access = execution.HanaExecutionAccess(prefix + 'next-observation', prefix + 'next-result', 1400)
+        second = execution.HanaCommandEnvelope(replace(self.request, key=next_key), renewal, next_access)
+        fence = execution.HanaFenceEnvelope(self.request.key, 1, first.access)
+        first_curl, second_curl = FixtureCurl(None), FixtureCurl(0)
+        observations: list[execution.HanaCommandObservation] = []
+        fence_reads: list[int] = []
+        acknowledged: list[object] = []
+        turn = 0
 
         def fetch(request: Request, timeout: int) -> bytes:
-            _ = timeout
+            self.assertEqual(timeout, 7)
             url = request.full_url
-            if request.get_method() == 'PUT':
-                published.append(url)
-                return b'' if url.startswith('https:') else b'imds-token'
+            if url.endswith('/api/token'):
+                return b'imds-token'
             if url.endswith('/user-data'):
                 return json.dumps(descriptor).encode()
-            if url.endswith('/command'):
-                return execution.encode_envelope(self.envelope)
+            if url.endswith('/control'):
+                if turn == 1:
+                    raise TimeoutError('fixture permit read timed out')
+                if turn == 3:
+                    return b'{"permit":'
+                permit = renewal if turn >= 2 else self.permit
+                control = {'deployment': 'deployment', 'start_token': 'start', 'token': 'permit-operation',
+                           'execution': self.request.key.claim_id, 'permit': asdict(permit),
+                           'expected_generation': 1}
+                return json.dumps(control).encode()
+            if url.endswith('/report'):
+                assert request.data is not None
+                report = receiver.read_document(cast(bytes, request.data))
+                if turn == 2:
+                    self.assertEqual(report['generation'], 2)
+                    raise TimeoutError('fixture report write timed out')
+                acknowledged.append(report['generation'])
+                return b''
             if url.endswith('/fence'):
-                return b'{"version":1,"action":"idle"}'
-            return b'{}'
+                fence_reads.append(turn)
+                return (execution.encode_envelope(fence) if turn == 3 else b'{"version":1,"action":"idle"}')
+            if url.endswith('/command'):
+                self.supervisor.outcome_value = (runner.HanaCommandFinished(replace(outcome.result, key=next_key))
+                                                 if turn >= 3 else outcome)
+                return execution.encode_envelope(second if turn >= 3 else first)
+            assert request.data is not None
+            observation = execution.decode_observation(cast(bytes, request.data))
+            if observation.fenced:
+                self.assertEqual(first_curl.kills, 1)
+                self.assertEqual(first_curl.reaps, 1)
+            observations.append(observation)
+            return b''
 
-        running = iter((True, False))
-        with mock.patch.object(receiver, 'GuestCommandSupervisor', return_value=self.supervisor):
-            receiver.run_receiver(self.settings, receiver.ReceiverSettings(10, 1), paths=self.paths,
-                fetch=fetch, pause=lambda _seconds: None, clock=lambda: 1000,
-                keep_running=lambda: next(running))
-        self.assertLess(published.index(self.access.result_url), published.index(self.access.observation_url))
-        self.assertEqual(len(self.supervisor.starts), 1)
+        def pause(_seconds: float) -> None:
+            nonlocal turn
+            if turn < 3:
+                self.assertEqual(first_curl.polls, turn)
+                self.assertEqual(first_curl.kills, 0)
+                self.assertEqual(observations, [])
+            turn += 1
+
+        with (mock.patch.object(receiver, 'GuestCommandSupervisor', return_value=self.supervisor),
+              mock.patch.object(subprocess, 'run', side_effect=AssertionError('Unexpected subprocess')),
+              mock.patch.object(subprocess, 'Popen', side_effect=[first_curl, second_curl]) as launch):
+            receiver.run_receiver(self.settings, receiver.ReceiverSettings(7, 1, 83), paths=self.paths,
+                fetch=fetch, pause=pause, clock=lambda: 1000, keep_running=lambda: turn < 5)
+        self.assertEqual(fence_reads, [0, 1, 2, 3, 4])
+        self.assertEqual(guest.read_permit(self.paths.permit), renewal)
+        self.assertEqual(acknowledged, [1, 2])
+        self.assertEqual(self.supervisor.stops, [receiver.command_directory(self.paths, self.request.key)])
+        self.assertEqual(len(self.supervisor.starts), 2)
+        self.assertEqual(launch.call_count, 2)
+        self.assertEqual(first_curl.polls, 2)
+        self.assertEqual(second_curl.polls, 1)
+        fenced = observations[0]
+        self.assertEqual(fenced.key, self.request.key)
+        self.assertTrue(fenced.fenced and fenced.terminated and fenced.lease_free)
+
+    def test_receiver_processes_fence_before_failing_permit_steps(self) -> None:
+        prefix = 'https://fixture.s3.us-east-2.amazonaws.com/'
+        descriptor = {**self.descriptor, 'expires': 1400, 'control_url': prefix + 'control',
+                      'report_url': prefix + 'report', 'command_url': prefix + 'command', 'fence_url': prefix + 'fence'}
+        self.supervisor.departure_value = receiver.CommandDeparture(True, True)
+        for case in ('truncated-report', 'restart-with-invalid-permit'):
+            with self.subTest(case=case):
+                key = replace(self.request.key, attempt=case, claim_id=placement.assigned_claim_id('episode', case))
+                access = replace(self.access, expires_at=1400)
+                fence = execution.HanaFenceEnvelope(key, self.request.slot, access)
+                permit = self.permit if case == 'truncated-report' else replace(self.permit, generation='invalid')
+                control = {'deployment': 'deployment', 'start_token': 'start', 'token': 'permit-operation',
+                           'execution': key.claim_id, 'permit': asdict(permit), 'expected_generation': 1}
+                if case == 'restart-with-invalid-permit':
+                    command = replace(self.envelope, request=replace(self.request, key=key), access=access)
+                    self.assertTrue(self.receive(command).accepted)
+                steps: list[str] = []
+
+                def fetch(request: Request, _timeout: int) -> bytes:
+                    url = request.full_url
+                    if url.endswith('/api/token'):
+                        return b'imds-token'
+                    if url.endswith('/user-data'):
+                        return json.dumps(descriptor).encode()
+                    if url == access.observation_url:
+                        assert request.data is not None
+                        observation = execution.decode_observation(cast(bytes, request.data))
+                        self.assertEqual(observation.key, key)
+                        self.assertEqual(observation.accepted, case == 'restart-with-invalid-permit')
+                        self.assertTrue(observation.fenced and observation.terminated and observation.lease_free)
+                        steps.append('acknowledge fence')
+                        return b''
+                    if url == prefix + 'fence':
+                        steps.append('read fence')
+                        return execution.encode_envelope(fence)
+                    if url == prefix + 'control':
+                        steps.append('read permit')
+                        return json.dumps(control).encode()
+                    if url == prefix + 'report':
+                        steps.append('acknowledge permit')
+                        raise IncompleteRead(b'{', 1)
+                    self.assertEqual(url, prefix + 'command')
+                    steps.append('read command')
+                    return b'{"version":1,"action":"idle"}'
+
+                passes = iter((True, False))
+                with (mock.patch.object(receiver, 'GuestCommandSupervisor', return_value=self.supervisor),
+                      mock.patch.object(subprocess, 'Popen', side_effect=AssertionError('Unexpected upload'))):
+                    receiver.run_receiver(self.settings, receiver.ReceiverSettings(7, 1, 83), paths=self.paths,
+                        fetch=fetch, pause=lambda _seconds: None, clock=lambda: 1000, keep_running=lambda: next(passes))
+                expected = ['read fence', 'acknowledge fence', 'read permit']
+                if case == 'truncated-report':
+                    expected.append('acknowledge permit')
+                self.assertEqual(steps, [*expected, 'read command'])
 
     def test_root_keeps_publication_urls_outside_the_runner_input(self) -> None:
         directory = self.paths.directory / ('a' * 64)

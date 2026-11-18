@@ -260,7 +260,8 @@ class HanaPlacementTests(CostFixture):
             _ = execution.observe_execution(self.state, request, objects)
         with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
             settled = execution.settle_execution(self.state, request, objects,
-                release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost')
+                release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
+                fence_window=execution.FenceAcknowledgementWindow(0, 1))
         self.assertIsInstance(settled, execution.HanaAdmissionRefusalSettled)
         release.assert_not_called()
         other = replace(self.request(), episode='other')
