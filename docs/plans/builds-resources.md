@@ -2754,11 +2754,12 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 146 — A second cancel of a gone placement request succeeds  · status: done
 
-Builds assigned this on 11-18. On 11-18 at 01:20 EST, the cleanup after a Hana Mac release build failed with "placement coordinator does not match" and exit 2. Cause, proven by test: `verify.sh` cancels the placement on exit, then `FirstStepAdmission.close()` cancels it again; the service found no request and gave the owner-mismatch text.
+#### As-built
 
-Repair (builds chose B, an idempotent cancel):
-1. `AdmissionServer._handle_placement` refuses a missing request with `wire.PLACEMENT_REQUEST_MISSING_REASON` ("placement request is missing"). A real owner difference still refuses with "placement coordinator does not match".
-2. `close()` treats that reason on its own cancel as success. Any other refusal still raises.
-3. The fix takes effect after the build-admission service restart.
+- Cause, proven by `scripts/build_queue/test_first_step.py`: `verify.sh` cancels the remote placement on exit, then `FirstStepAdmission.close()` cancels it again. The service found no request and refused with the owner-mismatch text; the Mac release build cleanup exited 2.
+- `AdmissionServer._handle_placement` refuses a missing request with `wire.PLACEMENT_REQUEST_MISSING_REASON` ("placement request is missing"), defined in `admission_wire.py`. A real owner difference still refuses with "placement coordinator does not match".
+- `close()` treats that reason on its own cancel as success (an idempotent cancel). Any other refusal still raises.
+- Live after the build-admission service restart.
+- Checkpoint `31056b27e`.
 
 **Files:** `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/first_step.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_first_step.py`.
