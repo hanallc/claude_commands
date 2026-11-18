@@ -173,11 +173,10 @@ class CloudGateTests(CostFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
         _ = write_config_fixture(self.root / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
         _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
-        repository = Path(__file__).resolve().parents[2]
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        shipped = (repository / 'config/cloud_gate.conf').read_text()
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
+            + 'attempt_allowance_usd=0.02\nlaunch_reply_tries=2\n')
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(int(self.now) - 1,
@@ -2126,9 +2125,9 @@ class CloudRouteTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
-        repository = Path(__file__).resolve().parents[2]
-        for name in ('gate', 'cloud_gate'):
-            _ = (self.root / (name + '.conf')).write_bytes((repository / 'config' / (name + '.conf')).read_bytes())
+        _ = write_config_fixture(self.root / 'gate.conf')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'credential_file=~/.config/aws-build/credentials\n')
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
         folder.mkdir(parents=True)
@@ -2408,13 +2407,15 @@ class CloudRouteTests(CostFixture):
         self.assertFalse((pending / 'launch.json').exists())
 
     def test_main_commit_needs_no_bundle(self) -> None:
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'clone_url=https://example.invalid/fixture-source.git\n')
         folder = self.root / 'attempt'
         request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
         self.assertEqual(request['tree'], gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         self.assertEqual(request['commit'], gate.checked_git(self.repo, 'rev-parse', 'HEAD'))
         self.assertEqual(request['head'], request['commit'])
         self.assertEqual(request['origin_main'], request['commit'])
-        self.assertEqual(request['clone_url'], 'https://github.com/natepiano/claude_commands.git')
+        self.assertEqual(request['clone_url'], 'https://example.invalid/fixture-source.git')
         self.assertEqual(request['source_key'], '')
         self.assertFalse((folder / 'source.bundle').exists())
         self.assertEqual(request['modules'], ['scripts/fixture/test_one.py', 'scripts/fixture/test_two.py'])
@@ -2657,6 +2658,7 @@ class CloudRouteTests(CostFixture):
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
+        _ = write_config_fixture(self.root / 'build_steps.conf', 'owned.gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):

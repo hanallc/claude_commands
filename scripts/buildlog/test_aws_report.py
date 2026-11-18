@@ -1,5 +1,6 @@
 """Render AWS costs, wait estimates, and peer exchange evidence."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 from contextlib import closing
 from datetime import UTC, date, datetime
@@ -165,8 +166,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertEqual([row[0] for row in token.waits], [60.0])
 
     def test_mixed_host_report_uses_the_required_lead_and_preserves_negative_run_savings(self) -> None:
-        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
-        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'sync.hosts.aws=aws-build\n')
         self.comparison_rows()
         self.write_records(self.attempt(), self.call("fallback-call"), self.remote_step(target=""))
         output = self.render()
@@ -445,8 +445,7 @@ class AwsReportTests(MeasurementFixture):
                 self.assertIn('$22.00 of the $20.00 daily limit', output)
 
     def test_daily_charge_reconciliation_changes_cost_once_and_shows_its_difference(self) -> None:
-        shipped = Path(__file__).resolve().parents[2] / 'config/build_targets.conf'
-        _ = (self.root / 'build_targets.conf').write_bytes(shipped.read_bytes())
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'sync.hosts.aws=aws-build\n')
         at = NOW + 86400
         result = measurement.read_charges(self.settings, self.state, at, self.charge_fetch(Decimal(3)))
         reading = narrow(self, result, measurement.ChargeRead)

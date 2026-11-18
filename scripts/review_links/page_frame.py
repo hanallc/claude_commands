@@ -60,12 +60,23 @@ REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
  return {readAt:Number(line.dataset.readAt),renderSeconds:Number(line.dataset.renderSeconds),
   renderMedian:line.dataset.renderMedian,renderCount:line.dataset.renderCount,failure:line.dataset.readError};
 }
+function restoreFocusAfterRefresh(){
+ const {id,selectionStart,selectionEnd,selectionDirection}=document.activeElement || {};
+ return ()=>{
+  if(!id) return;
+  const field=document.getElementById(id);
+  field?.focus({preventScroll:true});
+  if(typeof field?.setSelectionRange==='function' && typeof selectionStart==='number' && typeof selectionEnd==='number'){
+   field.setSelectionRange(selectionStart,selectionEnd,selectionDirection);
+  }
+ };
+}
 function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const line=document.querySelector('[data-page-status]');
  const options=line ? JSON.parse(line.dataset.statusOptions) : {};
  const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
  const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- let last=null,failure='',reading=false;
+ let last=null,failure='',reading=false,busy='';
  let request=0,active=false,started=0,pending=null,timer,clock,delay;
  let trip=null,state='',nextAt=0;
  const duration=value=>Number(value)<10 ? Number(value).toFixed(2) : Number(value).toFixed(0);
@@ -75,14 +86,14 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
   // An on-demand page can report a server answer separately from the data time.
   const unanswered=last ? Math.max(0,Math.floor(Date.now()/1000-(last.answeredAt ?? last.readAt))) : 0;
-  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : busy || last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
   line.dataset.state=next;
   line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
   line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;
   if(next!==state){line.querySelector('[data-status-announcement]').textContent=next;state=next;}
   const part=(key,text)=>{const node=line.querySelector('[data-status-'+key+']');node.hidden=!text;node.textContent=text;return node;};
   part('age',last ? age<60 ? age+' s ago' : Math.floor(age/60)+' min ago' : '');
-  const why=next==='Paused' ? reason || last.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
+  const why=next==='Paused' ? reason || busy || last?.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
   part('reason',why);
   const timings=last && !why;
   const round=part('trip',timings && trip!==null ? 'round trip '+duration(trip)+' s' : '');
@@ -117,6 +128,11 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function abandon(){
   request++;active=false;clearTimeout(delay);reading=false;pending=null;draw();
  }
+ function setStatus(text,reason=''){
+  busy=text;failure=reason;
+  if(last) last={...last,busy:text,answeredAt:Date.now()/1000};
+  draw();
+ }
  function changed(){
   if(pending && !held()){const value=pending;pending=null;void present(value.value,value.began,value.own);}
   draw();
@@ -140,7 +156,7 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const first=initial || (line?.dataset.readAt ? pageRefreshFacts() : null);
  if(first){const navigation=performance.getEntriesByType('navigation')[0];
   void present(first,navigation?.requestStart || started,request,true);}
- return {restart,refresh,changed,abandon};
+ return {restart,refresh,changed,abandon,setStatus};
 }
 '''
 

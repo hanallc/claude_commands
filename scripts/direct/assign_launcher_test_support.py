@@ -122,6 +122,8 @@ class AssignLauncherFixture(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.native.setUp()
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf",
+                                 "patterns.legacy-stable={purpose}\n")
         config = Path(os.environ["CONF_DIR"]) / "direct.conf"
         _ = config.write_text((ROOT / "config/direct.conf").read_text())
         _ = config.with_name("shutdown.conf").write_text((ROOT / "config/shutdown.conf").read_text())

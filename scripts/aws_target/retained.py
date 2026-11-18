@@ -43,18 +43,35 @@ def in_stack(api: AwsCli, stack: str) -> Retained:
                 for row in ledger.rows(reply, 'StackResources')])
 
 
-def skipped_since(api: AwsCli, stack: str, started: float) -> Retained:
-    """The disks and buckets that a rollback at or after started kept (DELETE_SKIPPED); none when the stack does not exist."""
+def _timestamp(row: dict[str, object], key: str) -> float:
+    return datetime.fromisoformat(ledger.text(row, key).replace('Z', '+00:00')).timestamp()
+
+
+def skipped_since(api: AwsCli, stack: str, started: float, *, missing_ok: bool = False) -> Retained:
+    """Read disks and buckets that CloudFormation retained since the change started."""
     try:
         reply = api.call('describe-stack-events', '--stack-name', stack, service='cloudformation')
     except AwsUnavailable as error:
-        if 'does not exist' in str(error):
+        if missing_ok and 'does not exist' in str(error):
             return Retained()
         raise
-    return _of([(ledger.text(row, 'ResourceType'), str(row.get('PhysicalResourceId', '')))
+    return _of([(ledger.text(row, 'ResourceType'), ledger.text(row, 'PhysicalResourceId'))
                 for row in ledger.rows(reply, 'StackEvents')
                 if row.get('ResourceStatus') == 'DELETE_SKIPPED'
-                and datetime.fromisoformat(ledger.text(row, 'Timestamp').replace('Z', '+00:00')).timestamp() >= started])
+                and row.get('ResourceType') in (VOLUME, BUCKET) and _timestamp(row, 'Timestamp') >= started])
+
+
+def deleted_since(api: AwsCli, stack: str, started: float) -> Retained | None:
+    """Read retained resources from every matching deleted stack."""
+    reply = api.call('list-stacks', '--stack-status-filter', 'DELETE_COMPLETE', service='cloudformation')
+    stack_ids = {ledger.text(row, 'StackId') for row in ledger.rows(reply, 'StackSummaries')
+                 if row.get('StackName') == stack and _timestamp(row, 'CreationTime') >= started}
+    if not stack_ids:
+        return None
+    kept = Retained()
+    for stack_id in sorted(stack_ids):
+        kept |= skipped_since(api, stack_id, started)
+    return kept
 
 
 def delete(api: AwsCli, retained: Retained, *, wait_s: float) -> None:

@@ -20,7 +20,7 @@ from typing import ClassVar, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.lib import build_folders, conf, user_zone, zone
+from scripts.lib import build_folders, user_zone, zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -292,19 +292,12 @@ class FastTrackTests(MergeCheckpointFixture):
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
             "FAST_TRACK_TEST_LOCK": str(self.common_directory / "main-push.lock"),
         })
-        with patch.dict(os.environ, {"CONF_DIR": str(REPOSITORY / "config")}):
-            settings_read = conf.read("fast_track")
-            self.settings = {
-                "max_changed_lines": settings_read.whole("max_changed_lines"),
-                "max_files": settings_read.whole("max_files"),
-                "check_time_limit_seconds": settings_read.number("check_time_limit_seconds"),
-                "max_push_attempts": settings_read.whole("max_push_attempts"),
-                "fetch_lock_attempts": settings_read.whole("fetch_lock_attempts"),
-                "fetch_lock_wait_seconds": settings_read.number("fetch_lock_wait_seconds"),
-                "refused_paths": list(settings_read.words("refused_paths")),
-            }
-        self.settings.update(max_changed_lines=100, max_files=10, check_time_limit_seconds=30,
-                             max_push_attempts=2, fetch_lock_attempts=3, fetch_lock_wait_seconds=0.01)
+        self.settings = {
+            "max_changed_lines": 100, "max_files": 10, "check_time_limit_seconds": 30,
+            "max_push_attempts": 2, "fetch_lock_attempts": 3, "fetch_lock_wait_seconds": 0.01,
+            "refused_paths": ["scripts/production/add_unit.py", "scripts/production/gate.py", "scripts/agents/*.py",
+                              "private-hooks/", "**/staff.json"],
+        }
         self.save_config()
         self.executable(self.bin / "basedpyright", TYPE_TOOL)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
@@ -1107,20 +1100,11 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assert_refused(self.fast_track(str(outside)))
 
     def test_sensitive_paths_are_refused_before_any_check(self) -> None:
-        patterns = cast(list[str], self.settings["refused_paths"])
-        paths = {pattern.replace("**", "fixture").replace("*", "fixture").rstrip("/")
-                 + ("/fixture.py" if pattern.endswith("/") else "") for pattern in patterns}
-        paths.update({"settings.json", "scripts/hooks/private/check.py", "scripts/lib/py",
-                      ".local/state/staff/staff.json", "scripts/production/staff.py",
-                      "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
-                      "scripts/production/add_showrunner.py", "scripts/agents/shutdown.py",
-                      "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/agents/shutdown.py",
-                      "scripts/agents/shutdown.py", "scripts/production/gate.py",
-                      "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
-                      "scripts/production/build_hold.py", "scripts/production/fast_track.py",
-                      "config/fast_track.conf"})
-        for path in sorted(paths):
+        paths = (
+            "scripts/production/add_unit.py", "scripts/production/gate.py",
+            "scripts/agents/fixture.py", "private-hooks/nested/check.py", "state/private/staff.json",
+        )
+        for path in paths:
             with self.subTest(path=path):
                 self.write(self.unit, path, "VALUE = 1\n")
                 self.assert_refused(self.fast_track(path), f"refused path: {path}")

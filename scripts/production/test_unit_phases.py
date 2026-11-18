@@ -1,5 +1,8 @@
 """Tests for each unit's staff name, phase and task."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import copy_config_fixture
+
+from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.agents import remote
 
@@ -9,7 +12,6 @@ import json
 import os
 import re
 import sqlite3
-import shutil
 import subprocess
 import tempfile
 import time
@@ -147,7 +149,7 @@ class UnitPhasesTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         config = self.root / "table-conf"
-        _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
+        _ = cast(object, copy_config_fixture(Path(__file__).resolve().parents[2] / 'config', config))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(patch("socket.gethostname", return_value="natedev"))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -193,7 +195,7 @@ class UnitPhasesTests(unittest.TestCase):
         with (patch.dict(os.environ, environment),
               patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources(()))):
             cache = counts_row.write_unit(member.id)
-            self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 efficiency", ""])
+            self.assertEqual(cache.read_text().splitlines()[:2], ["Review: 1 efficiency", ""])
             with patch.object(Path, "read_text", read), patch.object(time, "time", return_value=1000):
                 cache = counts_row.write_unit(member.id)
             line, due, *sources = cache.read_text().splitlines()
@@ -202,7 +204,7 @@ class UnitPhasesTests(unittest.TestCase):
             self.assertIn(str(doc), sources)
             self.assertIn(f"source=unit:{member.id}", sources)
             cache = counts_row.write_unit(member.id)
-            self.assertEqual(cache.read_text().splitlines()[:2], ["For you: 1 efficiency", ""])
+            self.assertEqual(cache.read_text().splitlines()[:2], ["Review: 1 efficiency", ""])
 
     def member(self, name: str) -> staff.StaffRow:
         owner = fixture_member("showrunner", name="sdlc")
@@ -2129,8 +2131,7 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_anomaly_keys_follow_the_joined_text_and_use_the_configured_window(self) -> None:
         config = self.root / "table-conf/production.conf"
-        _ = config.write_text(config.read_text().replace("units_anomaly_repeat_minutes=60",
-                                                       "units_anomaly_repeat_minutes=2.5"))
+        _ = write_config_fixture(config, "units_anomaly_repeat_minutes=2.5\n")
         messages = (("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
                     ("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
                     ("anomaly: census took longer than 11 s", "anomaly: café unreadable"))
@@ -2169,8 +2170,8 @@ class UnitPhasesTests(unittest.TestCase):
         member = fixture_member("unit", name="member", parent=owner.id)
         config = self.root / "config"
         config.mkdir()
-        config_source = Path(__file__).resolve().parents[2] / "config/production.conf"
-        _ = (config / "production.conf").write_text(re.sub(r"(?m)^UNIT_ANOMALIES_TO=.*$", "UNIT_ANOMALIES_TO=fixture-director", config_source.read_text()))
+        _ = write_config_fixture(config / "production.conf",
+                                 "UNIT_ANOMALIES_TO=fixture-director\nunits_anomaly_repeat_minutes=60\n")
         def observed(*, record: staff.StaffSnapshot, running: object = None) -> tuple[session_staff.LabeledSession, ...]:
             self.assertEqual(record.by_id(member.id), member)
             self.assertIsNone(running)

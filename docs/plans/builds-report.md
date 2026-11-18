@@ -1747,7 +1747,7 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 
 - `scripts/disks/disks.html`:
   - The page shows the old data at once. It posts to `measure` beside it when `disks.json` is missing or older than `cache_seconds`.
-  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until `measured_at` changes.
+  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until the data's `generation` reaches the measure's target. (Phase 45 of `docs/plans/sdlc-phases.md` changed the end test from a `measured_at` change and added the refresh button.)
   - After the wait limit (`measure.timeout_seconds` for each drive), the line adds "The measure did not finish."
   - With no data, the line reads "Measuring the drives. The first measure takes some minutes."
   - With current data, the line adds "The page measures again when you open it and the sizes are more than N minutes old."

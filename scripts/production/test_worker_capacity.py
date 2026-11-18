@@ -203,6 +203,36 @@ class WorkerCapacityTests(StaffTestCase):
             (FAULTS_TO, worker_capacity.SENDER, "\n".join([
                 FAULT_HEADING, "capacity-unit: implementer: pass not canceled: unit state is unreadable"]))])
 
+    def test_a_stopped_pane_that_does_not_close_is_in_the_report_and_the_fault_lines(self) -> None:
+        opened, stopped = self.open_worker(), worker_panes.StoppedWorker(self.codex, "p1", "t1")
+        run = f"run-7: result {self.run_dir / detached_runs.DETACHED_RUNS_DIR / 'run-7.json'}; log /logs/run-7.log"
+        cases: tuple[tuple[object, bool, str], ...] = (
+            (worker_panes.Kept("a detached run is live"), True,
+             "Pane stays open: implementer: a detached run is live; it closes when its detached run ends"),
+            (worker_panes.Kept("a launcher is live"), False, "Pane stays open: implementer: a launcher is live"),
+            (worker_panes.UncertainWorker(self.codex, "pane close is incomplete"), False,
+             "Pane close is uncertain: implementer: pane close is incomplete"),
+            (herdr_types.HerdrFailure("pane read failed", "unreadable"), False,
+             "Pane close is uncertain: implementer: pane read failed"),
+        )
+        for closed, held, line in cases:
+            with self.subTest(line=line):
+                self.sent.clear()
+                self.close.reset_mock(side_effect=True, return_value=True)
+                if isinstance(closed, Exception):
+                    self.close.side_effect = closed
+                else:
+                    self.close.return_value = closed
+                self.live_runs.return_value = [{"run_id": "run-7", "log": "/logs/run-7.log"}] if held else []
+                self.assertEqual(self.stop([opened], opened, stopped), 1)
+                self.close.assert_called_once_with(self.parent.id, staff.WorkerName("implementer"), lock=self.lock)
+                self.assertEqual(self.sent, [
+                    (str(self.parent.id), worker_capacity.SENDER, "\n".join([
+                        HEADING, "Stopped: implementer.",
+                        "Passes ended as canceled: implementer. Continue that work yourself from the worktree.",
+                        *([f"Detached run of implementer continues: {run}."] if held else []), line + "."])),
+                    (FAULTS_TO, worker_capacity.SENDER, "\n".join([FAULT_HEADING, f"capacity-unit: {line}"]))])
+
     def test_a_report_that_is_not_delivered_fails_the_command(self) -> None:
         opened = self.open_worker()
         with mock.patch.object(broadcast, "send", return_value="no such session"):

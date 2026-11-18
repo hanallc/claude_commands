@@ -248,6 +248,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/fake_unit_host.py` | read | by_path |
 | `scripts/production/footer_counts.py` | read | snapshot |
 | `scripts/production/investigation.py` | read | snapshot, by_current_session and by_id find the caller and the owner of an investigation |
+| `scripts/production/waiting_why.py` | read | snapshot supplies the filer name for missing Waiting reasons |
 | `scripts/production/live_units.py` | read | snapshot |
 | `scripts/production/log_backup.py` | read | none (StaffRefused, StaffUnreadable exceptions) |
 | `scripts/production/checkpoint_gate.py` | read | snapshot |
@@ -308,10 +309,13 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
+| `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
+| `scripts/review_links/page_question.py` | read | StaffId (type) identifies the question recipient. |
 | `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
+| `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
 | `scripts/agents/inventory.py` | read | local_snapshot |

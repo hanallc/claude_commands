@@ -31,7 +31,7 @@ from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, ga
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -352,8 +352,7 @@ class Sample(unittest.TestCase):
         self.origin = self.root / 'origin.git'
         _ = subprocess.run(['git', 'clone', '--bare', str(self.repo), str(self.origin)], check=True, capture_output=True)
         path = self.root / 'cloud_gate.conf'
-        _ = path.write_text(path.read_text().replace('clone_url=https://github.com/natepiano/claude_commands.git',
-                                                   'clone_url=' + str(self.origin)))
+        _ = write_config_fixture(path, f'clone_url={self.origin}\n')
 
     def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
         now = 1700000000
@@ -537,8 +536,8 @@ class Sample(unittest.TestCase):
         now = 1700000000
         before = self.remote_branches()
         config = self.root / 'cloud_gate.conf'
-        lifetime = cloud_gate.settings().whole('lifetime_minutes')
-        self.assertGreater(lifetime, 2)
+        lifetime = 5
+        _ = write_config_fixture(config, f'lifetime_minutes={lifetime}\n')
 
         def first_service(_command: Sequence[str], _unit: str) -> int:
             live = self.remote_branches()
@@ -546,7 +545,7 @@ class Sample(unittest.TestCase):
             folder = next((self.state / 'paired-trials').iterdir())
             request = cloud_gate.read(next(folder.glob('*/request.json')))
             self.assertEqual(request['expires'], now + lifetime * 60)
-            _ = config.write_text(config.read_text().replace(f'lifetime_minutes={lifetime}', 'lifetime_minutes=1'))
+            _ = write_config_fixture(config, 'lifetime_minutes=1\n')
 
             def second_service(_command: Sequence[str], _unit: str) -> int:
                 remote = self.remote_branches()
@@ -703,7 +702,7 @@ os.execv({git!r}, [{git!r}, *arguments])
 ''')
         fake.chmod(0o700)
         config = self.root / 'cloud_gate.conf'
-        _ = config.write_text(config.read_text().replace('git_network_timeout_s=60', 'git_network_timeout_s=2'))
+        _ = write_config_fixture(config, 'git_network_timeout_s=2\n')
         cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture'})
         branches = self.remote_branches()
         script = '''import ctypes, json, os, signal, sys

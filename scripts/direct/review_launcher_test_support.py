@@ -131,6 +131,7 @@ class ReviewLauncherFixture(LauncherFixture):
         )
         _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
         _ = config_environment(self.root)
+        _ = write_config_fixture(self.root / "lint.conf", "style_review=on\n")
         reviewed = self.working_dir / "reviewed.txt"
         _ = reviewed.write_text("original\n", encoding="utf-8")
         _ = subprocess.run(

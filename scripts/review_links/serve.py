@@ -35,7 +35,8 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page, review_page
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_page
+from scripts.review_links import question_record
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -270,6 +271,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                              + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
             return BytesIO(content)
+        if route.path == "/console/for-you.json":
+            try:
+                if route.query == "view=count":
+                    payload = console.for_you_count(for_you.read())
+                else:
+                    payload = console.for_you_payload()
+            except (OSError, ValueError) as error:
+                print(f"review-links actions: {error}", file=sys.stderr)
+                self.json_response(503, {"available": False})
+            else:
+                self.json_response(200, payload)
+            return None
         if route.path == accounts_page.PAGE_PATH:
             try:
                 content = cast(ReviewLinksServer, self.server).accounts_cache.get()
@@ -314,7 +327,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == images.PAGE_PATH:
             try:
-                content = images.render(root)
+                content = images.render(cast(ReviewLinksServer, self.server).delivery_status)
             except (OSError, ValueError) as error:
                 print(f"review-links images: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Images page is not available.</p>"))
@@ -637,13 +650,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"})
-                    or any(len(values) != 1 for values in fields.values())):
-                raise ValueError("Use one color key and one color value, or one group and one account.")
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"})
+                    or any(len(values) != 1 for values in fields.values())
+                    or ("clear" in fields and fields["clear"] != ["first"])):
+                raise ValueError("Use one color key and one color value, one group and one account, or one group and clear=first.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
         result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+                  else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
                   else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):
             self.json_response(400, {"reason": result.reason})
@@ -661,7 +676,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 100000:
                 raise ValueError("invalid List request size")
             body = self.rfile.read(length).decode("utf-8")
-            delivery = list_page.submit(server.root, body)
+            delivery = list_page.submit(server.root, body, server.delivery_status)
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
@@ -670,7 +685,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             fields = parse_qs(body)
-            self.json_response(200, {"state": "read" if fields["action"] == ["read"] else "sent",
+            state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
+            self.json_response(200, {"state": state,
                 **list_page.fresh_request(server.root, fields["keeper"][0], fields["id"][0])})
         finally:
             try:
@@ -695,14 +711,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         self.json_response(200, {"state": "read"})
 
     def image_post(self) -> None:
-        """Delete an image or send its feedback; the page shows the reason of a failure on the card."""
-        root = cast(ReviewLinksServer, self.server).root
+        """Answer the browser before the shared sender delivers an image question."""
+        server = cast(ReviewLinksServer, self.server)
+        root = server.root
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 raise ValueError("empty image request")
-            images.submit(root, self.rfile.read(length).decode("utf-8"))
-        except change_page.AnswerRefused as error:
+            delivery = images.submit(root, self.rfile.read(length).decode("utf-8"), server.delivery_status)
+        except question_record.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
         except images.AnswerNotSent as error:
@@ -714,7 +731,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError as error:
             self.browser_failure(503, "The image could not be changed. Try again.", error)
             return
-        self.json_response(200, {"state": "done"})
+        try:
+            self.json_response(200, {"state": "done"})
+        finally:
+            change_page.deliver(delivery, server.delivery_status)
 
     def news_post(self) -> None:
         """Record the page the console shows, and name the other pages that hold new items."""
@@ -750,7 +770,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         """Start a Disks page measure in the background and answer at once with the slots and sessions in use now."""
         now = time.time()
         try:
-            started = disks_page.start_measure(now)
+            length = int(self.headers.get("Content-Length", "0"))
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"))
+            started = disks_page.start_measure(now, force=fields.get("force") == ["1"])
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.browser_failure(503, "The measure could not start.", error)
             return
@@ -764,7 +786,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError) as error:
             print(f"review-links disks sessions: {error}", file=sys.stderr)
             folders = None
-        self.json_response(200, {"state": started.value, "slots": report, "sessions": folders})
+        self.json_response(200, {"state": started.state.value, "target": started.target, "slots": report, "sessions": folders})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
@@ -808,8 +830,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
         super().__init__(address, ReviewLinksHandler)
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
+        self.delivery_status.startup_recovery_pending.set()
         def recover_pending() -> None:
-            recover_changes(self.delivery_status)
+            try:
+                recover_changes(self.delivery_status)
+            finally:
+                self.delivery_status.startup_recovery_pending.clear()
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
 
