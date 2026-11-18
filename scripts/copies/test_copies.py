@@ -34,7 +34,7 @@ from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import write_config_fixture
 from textwrap import dedent
-from scripts.mac_test import floor_claims
+from scripts.mac_test import floor_claims, offload
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.message import sessions
@@ -210,14 +210,17 @@ class StandingTests(unittest.TestCase):
                 location = self.base / "command-location"
                 result = self.run_cli(command=(
                     sys.executable, "-c",
-                    "import sys; from pathlib import Path; Path(sys.argv[1]).write_text(str(Path.cwd()))",
+                    "import json,os,sys; from pathlib import Path; "
+                    + "Path(sys.argv[1]).write_text(json.dumps([str(Path.cwd()), os.environ['COPIES_STEP_OWNER']]))",
                     str(location),
                 ))
                 self.assertEqual(result.returncode, 0, result.stderr)
-                tree = Path(location.read_text())
-                self.assertTrue(tree.exists())
-                tree = self.gates / "origin-slot1"
-                self.assertEqual(self.lease(tree)["unit"], self.owner_id)
+                folder, owner = cast(list[str], json.loads(location.read_text()))
+                self.assertEqual(owner, str(unit.id))
+                self.assertFalse(Path(folder).exists())
+                self.assertFalse(self.gates.exists())
+                with copies.standing(owner, self.source, copies.CommittedSource(self.head)) as tree:
+                    self.assertEqual(self.lease(tree)["unit"], self.owner_id)
                 removed = self.cli("remove")
                 self.assertEqual(removed.returncode, 0, removed.stderr)
                 self.assertTrue(tree.exists())
@@ -297,6 +300,8 @@ class StandingTests(unittest.TestCase):
         _ = write_config_fixture(self.base / "config/build_folders.conf",
             f"# whole: 1..\nslots.{self.lease_machine()}.origin.max=1\n")
         marker = self.base / "not-started"
+        gate = self.base / "merge_gate.py"
+        _ = gate.write_text("import sys; from pathlib import Path; Path(sys.argv[1]).touch()")
         with self.queue_service() as fixture:
             def expire_after_wait(reply: wire.Reply) -> wire.Reply:
                 if isinstance(reply, wire.RepositorySlotWaiting):
@@ -305,8 +310,7 @@ class StandingTests(unittest.TestCase):
 
             with mock.patch.object(fixture.server, "reply_filter", side_effect=expire_after_wait):
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
-                    result = self.run_cli(command=(sys.executable, "-c",
-                        "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)))
+                    result = self.run_cli(command=(sys.executable, str(gate), str(marker)))
         self.assertEqual(result.returncode, 75, result.stderr)
         self.assertIn("wait ended for origin", result.stderr)
         self.assertIn("slots.", result.stderr)
@@ -592,6 +596,209 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:camera"), [checkout])
         self.assertFalse(checkout.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+    def test_task_end_during_clone_setup_keeps_completion_fields(self) -> None:
+        task = "gate:clone-setup"
+        ended = time.time()
+        initialize = copies.initialize_git
+
+        def end_during_setup(path: Path, source: Path) -> None:
+            self.assertEqual(scratch.end(task, now=ended), [])
+            self.assertTrue(path.is_dir())
+            initialize(path, source)
+
+        with mock.patch.object(copies, "initialize_git", side_effect=end_during_setup):
+            checkout = copies.clone(self.source, task)
+        record = scratch.task_of(checkout)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields.get("ended"), ended)
+        self.assertEqual(record.fields.get("ended_task"), task)
+        self.assertIs(record.fields["test_hana_clone"], True)
+        self.assertEqual(record.fields["source_path"], str(self.source))
+        self.assertEqual(record.fields["source_commit"], self.head)
+
+    def test_ssh_copy_preserves_the_validated_caller_anchor(self) -> None:
+        trusted = Path.home() / "rust"
+        trusted.mkdir()
+        config = Path(os.environ["CONF_DIR"]) / "nix_env.conf"
+        _ = write_config_fixture(config, "trusted_home_folders=rust\n")
+        binaries = self.base / "bin"
+        binaries.mkdir()
+        direnv = binaries / "direnv"
+        _ = direnv.write_text("#!/bin/sh\nexit 1\n")
+        direnv.chmod(0o755)
+        fixture_path = str(binaries) + os.pathsep + os.environ["PATH"]
+
+        plain = trusted / "plain"
+        _ = self.git(self.source, "clone", "-q", str(self.source), str(plain))
+        repository = trusted / "repository"
+        _ = self.git(plain, "clone", "-q", str(plain), str(repository))
+        for checkout in (repository, self.source):
+            _ = (checkout / ".envrc").write_text("export FIXTURE_ENVRC=1\n")
+            _ = self.git(checkout, "add", ".envrc")
+            _ = self.git(checkout, "commit", "-qm", "Add the approved envrc")
+        approved_commit = self.git(repository, "rev-parse", "HEAD")
+
+        outside = self.base / "linked-outside"
+        _ = self.git(repository, "worktree", "add", "-q", "--detach", str(outside))
+        inside = trusted / "linked-inside"
+        _ = self.git(self.source, "worktree", "add", "-q", "--detach", str(inside))
+        task_clone = copies.clone(repository, "gate:ssh-envrc")
+        _ = self.git(task_clone, "commit", "--allow-empty", "-qm", "Advance the task clone")
+        self.assertNotEqual(self.git(task_clone, "rev-parse", "HEAD"), approved_commit)
+        readable = copies.clone(plain, "gate:ssh-readable")
+        invalid = copies.clone(plain, "gate:ssh-invalid-anchor")
+        _ = scratch.update_record(invalid, lambda record: {
+            **(record.fields if isinstance(record, copy_record.Registered) else {}),
+            "generated_source": True, "source_commit": "f" * len(self.head),
+        })
+        for caller in (readable, invalid):
+            record_path = copy_record.record_path(caller)
+            assert record_path is not None
+            self.assertIsInstance(copy_record.read_record(record_path), copy_record.Registered)
+
+        cases = (
+            ("trusted-envrc", repository, True, str(repository), approved_commit),
+            ("linked-outside", outside, True, str(repository), approved_commit),
+            ("linked-inside", inside, True, str(inside), self.git(inside, "rev-parse", "HEAD")),
+            ("task-clone", task_clone, True, str(repository), approved_commit),
+            ("trusted-no-envrc", plain, True, str(plain), self.head),
+            ("untrusted-readable-record", readable, False, None, None),
+            ("approved-with-invalid-anchor", invalid, True, None, None),
+        )
+        for name, caller, caller_approved, anchor_path, anchor_commit in cases:
+            with self.subTest(caller=name), mock.patch.dict(os.environ, {"PATH": fixture_path}):
+                self.assertEqual(offload.trusted_linux_source(caller), caller_approved)
+                with copies.requested_source(caller, copies.CommittedSource("HEAD"), copies.NO_MERGE) as source:
+                    _ = (source / "tracked.txt").write_text("the admitted change\n")
+                    tree = copies.staged_tree(source, include_worktree=True)
+                    with copies.remote_step_source(source, tree, caller, offload.trusted_linux_source) as checkout:
+                        self.assertEqual((checkout / "tracked.txt").read_text(), "the admitted change\n")
+                        approved = anchor_path is not None
+                        self.assertEqual(offload.trusted_linux_source(checkout), approved,
+                                         "SSH copy approval differs from its validated anchor")
+                        record = copy_record.read_record(checkout / copy_record.RECORD)
+                        assert isinstance(record, copy_record.Registered)
+                        self.assertEqual(record.fields.get("source_path"), anchor_path)
+                        self.assertEqual(record.fields.get("source_commit"), anchor_commit)
+                        self.assertEqual("generated_source" in record.fields, approved)
+
+    def test_ssh_copy_checks_envrc_against_the_prepared_merge(self) -> None:
+        trusted = Path.home() / "rust"
+        trusted.mkdir()
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "nix_env.conf", "trusted_home_folders=rust\n")
+        binaries = self.base / "bin"
+        binaries.mkdir()
+        direnv = binaries / "direnv"
+        _ = direnv.write_text("#!/bin/sh\nexit 1\n")
+        direnv.chmod(0o755)
+        fixture_path = str(binaries) + os.pathsep + os.environ["PATH"]
+        initial = "export FIRST=0\n# Keep the two edits separate.\n\n# More settings.\n\nexport LAST=0\n"
+        incoming_envrc = initial.replace("LAST=0", "LAST=1")
+
+        for name in ("incoming-envrc", "three-way-envrc", "stale-origin-envrc", "task-clone-envrc",
+                     "worktree-envrc", "staged-envrc", "worktree-with-committed-envrc"):
+            with self.subTest(merge=name), mock.patch.dict(os.environ, {"PATH": fixture_path}):
+                repository = trusted / name
+                _ = self.git(self.source, "clone", "-q", str(self.source), str(repository))
+                _ = (repository / ".envrc").write_text(initial)
+                _ = self.git(repository, "add", ".envrc")
+                _ = self.git(repository, "commit", "-qm", "Add the envrc")
+                base = self.git(repository, "rev-parse", "HEAD")
+                stale = name == "stale-origin-envrc"
+                publisher = repository
+                if stale:
+                    upstream = self.base / "upstream.git"
+                    publisher = self.base / "publisher"
+                    _ = self.git(repository, "clone", "-q", "--bare", str(repository), str(upstream))
+                    _ = self.git(repository, "remote", "set-url", "origin", str(upstream))
+                    _ = self.git(repository, "clone", "-q", str(upstream), str(publisher))
+                    _ = self.git(repository, "update-ref", "refs/remotes/origin/incoming", base)
+
+                _ = self.git(publisher, "switch", "-qc", "incoming")
+                staged = name == "staged-envrc"
+                worktree = name == "worktree-with-committed-envrc"
+                edited = name == "worktree-envrc" or staged
+                expected = incoming_envrc
+                if edited:
+                    _ = (publisher / "merged.txt").write_text("merge without an envrc change\n")
+                    _ = self.git(publisher, "add", "merged.txt")
+                    expected = initial.replace("LAST=0", "LAST=2")
+                else:
+                    _ = (publisher / ".envrc").write_text(incoming_envrc)
+                    _ = self.git(publisher, "add", ".envrc")
+                _ = self.git(publisher, "commit", "-qm", "Prepare the incoming change")
+                incoming = self.git(publisher, "rev-parse", "HEAD")
+                _ = self.git(publisher, "switch", "-q", "main")
+                revision = "incoming"
+                if stale:
+                    _ = self.git(publisher, "push", "-q", "origin", "incoming")
+                    with self.assertRaises(copies.GitExit):
+                        _ = copies.commit_at(repository, incoming)
+                    revision = "origin/incoming"
+                if name == "three-way-envrc":
+                    local_envrc = initial.replace("FIRST=0", "FIRST=1")
+                    _ = (repository / ".envrc").write_text(local_envrc)
+                    _ = self.git(repository, "commit", "-qam", "Change the first setting")
+                    expected = incoming_envrc.replace("FIRST=0", "FIRST=1")
+
+                caller = repository
+                if name == "task-clone-envrc":
+                    caller = copies.clone(repository, "gate:ssh-merge-envrc")
+                    _ = self.git(caller, "commit", "--allow-empty", "-qm", "Advance the task clone")
+                    _ = self.git(caller, "update-ref", "refs/heads/incoming", incoming)
+                policy: copies.SourcePolicy = copies.CommittedSource("HEAD")
+                merge: copies.MergePolicy = copies.MergeRevision(revision)
+                if edited:
+                    _ = (caller / ".envrc").write_text(expected)
+                    if staged:
+                        _ = self.git(caller, "add", ".envrc")
+                        policy = copies.StagedSource(copies.staged_tree(caller))
+                        merge = copies.NO_MERGE
+                    else:
+                        policy = copies.WorktreeSource("HEAD", caller)
+                if worktree:
+                    _ = (caller / "tracked.txt").write_text("uncommitted worktree bytes\n")
+                    policy = copies.WorktreeSource("HEAD", caller)
+                self.assertTrue(offload.trusted_linux_source(caller))
+
+                before: dict[Path, tuple[str, bytes]] = {}
+                for watched in dict.fromkeys((caller, repository)):
+                    fetch_head = Path(self.git(watched, "rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"))
+                    _ = fetch_head.write_bytes(b"keep the existing FETCH_HEAD\n")
+                    before[fetch_head] = self.git(watched, "for-each-ref"), fetch_head.read_bytes()
+                with copies.requested_source(caller, policy, merge) as source:
+                    prepared = self.git(source, "rev-parse", "HEAD")
+                    if not staged:
+                        self.assertEqual(self.git(source, "rev-parse", "HEAD^2"), incoming)
+                    self.assertEqual((source / ".envrc").read_text(), expected)
+                    _ = (source / "tracked.txt").write_text("change after snapshot preparation\n")
+                    tree = copies.staged_tree(source, include_worktree=True)
+                    with copies.remote_step_source(source, tree, caller, offload.trusted_linux_source) as checkout:
+                        self.assertEqual((checkout / ".envrc").read_text(), expected)
+                        self.assertEqual(offload.trusted_linux_source(checkout), not edited,
+                                         "SSH envrc approval differs from the prepared merge")
+                        record = copy_record.read_record(checkout / copy_record.RECORD)
+                        assert isinstance(record, copy_record.Registered)
+                        self.assertIs(record.fields.get("generated_source"), True)
+                        if edited:
+                            self.assertNotIn("source_commit", record.fields)
+                            self.assertNotIn("source_path", record.fields)
+                        else:
+                            self.assertEqual(record.fields["source_path"], str(repository))
+                            reference = record.fields["source_commit"]
+                            assert isinstance(reference, str)
+                            self.assertEqual(copies.commit_at(repository, reference), reference)
+                            if worktree:
+                                self.assertNotEqual(reference, prepared)
+                                self.assertEqual(self.git(repository, "show", f"{reference}:tracked.txt"),
+                                                 self.git(repository, "show", "HEAD:tracked.txt"))
+                                self.assertEqual(self.git(repository, "rev-parse", f"{reference}^2"), incoming)
+                            else:
+                                self.assertEqual(reference, prepared)
+                for watched in dict.fromkeys((caller, repository)):
+                    fetch_head = Path(self.git(watched, "rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"))
+                    self.assertEqual((self.git(watched, "for-each-ref"), fetch_head.read_bytes()), before[fetch_head])
 
     def test_clone_git_child_keeps_both_destination_locks_after_parent_death(self) -> None:
         task = "gate:orphan-clone"
@@ -1222,7 +1429,7 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.symlink_scratch_root()
         checkout = copies.clone(self.source, task="gate:apply-link")
         _ = (self.source / "untracked.txt").write_text("new file\n")
-        copies.apply_changes(checkout, self.source, self.head)
+        _ = copies.apply_changes(checkout, self.source, self.head)
         self.assertEqual((checkout / "untracked.txt").read_text(), "new file\n")
 
     def test_borrower_order_resolves_stored_git_directory(self) -> None:
@@ -1519,7 +1726,7 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.write_config(settings)
                 result = self.run_cli()
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertTrue((self.gates / "origin-slot1").is_dir())
+                self.assertFalse(self.gates.exists())
 
     def test_linked_source_uses_canonical_repository_folder_name(self) -> None:
         linked = self.base / "linked-worktree"
@@ -1861,7 +2068,7 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.git(nested, "commit", "-qm", "nested source")
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             with self.assertRaisesRegex(copies.PreparationError, "NestedRepository: nested"):
-                copies.apply_changes(tree, self.source, self.head)
+                _ = copies.apply_changes(tree, self.source, self.head)
             self.assertFalse((tree / "nested").exists())
 
     def test_apply_changes_error_names_untracked_files(self) -> None:
@@ -1869,7 +2076,7 @@ with patch.object(subprocess, 'run', pause_clone):
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             with mock.patch.object(copies, "staged_tree", side_effect=copies.PreparationError("fixture failure")):
                 with self.assertRaisesRegex(copies.PreparationError, "files: untracked.txt; fixture failure"):
-                    copies.apply_changes(tree, self.source, self.head)
+                    _ = copies.apply_changes(tree, self.source, self.head)
 
     def test_private_capture_timeout_exits_three_and_names_changed_files(self) -> None:
         _ = (self.source / "tracked.txt").write_text("changed source\n")
@@ -1948,6 +2155,16 @@ with patch.object(subprocess, 'run', pause_clone):
             + "str(Path('target').resolve())]))",
             "sys.exit(int(sys.argv[4]))",
         ])
+        slot_program = "\n".join((
+            "import os, subprocess, sys",
+            "root = os.environ['COPIES_STEP_SOURCE']",
+            "tree = subprocess.check_output(['git', 'write-tree'], text=True).strip()",
+            "command = ['hold', '--repo', root, '--tree', tree, '--capacity-file', sys.argv[1], '--']",
+            f"raise SystemExit(subprocess.call([sys.executable, {str(Path(copies.__file__).resolve())!r}, *command,",
+            "                                  sys.executable, '-c', sys.argv[2], *sys.argv[3:]]))",
+        ))
+        slot_write = program.replace("Path(relative)", "Path(os.environ['CARGO_TARGET_DIR']) / Path(relative).relative_to('target')").replace(
+            "Path('target/debug/broken')", "(Path(os.environ['CARGO_TARGET_DIR']) / 'debug/broken')")
         cases = (
             ("plain", (), 7, False),
             ("published", ("target/debug/x", "target/release/y"), 0, False),
@@ -1958,6 +2175,13 @@ with patch.object(subprocess, 'run', pause_clone):
             ("not-built-command-failed", ("target/debug/missing",), 7, False),
             ("copy-failed", ("target/debug/x", "target/debug/broken"), 0, False),
             ("copy-and-command-failed", ("target/debug/x", "target/debug/broken"), 7, False),
+            ("retained-slot-file", ("target/debug/x",), 0, False),
+            ("touched-slot-file", ("target/debug/x",), 0, False),
+            ("explicit-target-dir", ("target/debug/x",), 0, False),
+            ("two-changed-target-dirs", ("target/debug/x",), 0, False),
+            ("metadata-only", ("target/debug/x",), 0, False),
+            ("slot-symlink-loop", ("target/debug/loop", "report.txt"), 0, False),
+            ("replaced-slot-symlink-loop", ("target/debug/loop",), 0, False),
         )
         for label, requested, command_exit, apply in cases:
             with self.subTest(case=label):
@@ -1966,21 +2190,88 @@ with patch.object(subprocess, 'run', pause_clone):
                     _ = (self.source / "untracked.txt").write_text("gate publication\n")
                     options.extend(("--apply-uncommitted", str(self.source)))
                 folders_before = {folder.path for folder in scratch.folders()}
-                result = self.run_cli(*options, command=(
-                    sys.executable, "-c", program, str(output), "checkout={tree}/tracked.txt",
-                    str(evidence), str(command_exit),
-                ))
+                arguments = (str(output), "checkout={tree}/tracked.txt", str(evidence), str(command_exit))
+                if label in ("retained-slot-file", "touched-slot-file", "metadata-only", "slot-symlink-loop",
+                             "replaced-slot-symlink-loop"):
+                    with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as slot:
+                        old = slot / "target/debug/x"
+                        old.parent.mkdir(parents=True, exist_ok=True)
+                        _ = old.write_bytes(b"old binary")
+                        if label in ("slot-symlink-loop", "replaced-slot-symlink-loop"):
+                            loop = old.with_name("loop")
+                            loop.unlink(missing_ok=True)
+                            loop.symlink_to(loop.name)
+                    touch = "from pathlib import Path\nPath('target/debug/x').touch()\n"
+                    slot_command = slot_write
+                    if label == "touched-slot-file":
+                        slot_command = touch + slot_write
+                    elif label == "metadata-only":
+                        slot_command = touch
+                    elif label == "slot-symlink-loop":
+                        slot_command = "from pathlib import Path\nPath('report.txt').write_text('step report\\n')"
+                    elif label == "replaced-slot-symlink-loop":
+                        slot_command = dedent("""
+                            from pathlib import Path
+                            path = Path("target/debug/loop")
+                            path.unlink()
+                            path.write_bytes(b"replacement")
+                            """)
+                    result = self.run_cli(*options, command=(
+                        sys.executable, "-c", slot_program, str(self.base / "capacity"), slot_command, *arguments,
+                    ))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    published = [Path(line.removeprefix("published: ").rsplit(" ", 1)[0])
+                                 for line in result.stdout.splitlines() if line.startswith("published: ")]
+                    if label == "metadata-only":
+                        self.assertEqual(published, [])
+                    elif label == "slot-symlink-loop":
+                        self.assertEqual([path.name for path in published], ["report.txt"], result.stderr)
+                        self.assertEqual(published[0].read_text(), "step report\n")
+                    elif label == "replaced-slot-symlink-loop":
+                        self.assertEqual([path.name for path in published], ["loop"], result.stderr)
+                        self.assertEqual(published[0].read_bytes(), b"replacement")
+                    else:
+                        self.assertEqual(len(published), 1, result.stderr)
+                        self.assertEqual(published[0].read_bytes(), b"binary\x00x")
+                    self.assertEqual(old.read_bytes(), b"old binary")
+                    continue
+                if label in ("explicit-target-dir", "two-changed-target-dirs"):
+                    inherited = self.base / label
+                    stale = inherited / "debug/x"
+                    stale.parent.mkdir(parents=True)
+                    _ = stale.write_bytes(b"stale inherited binary")
+                    target_program = program.replace(
+                        "Path(relative)", "Path(sys.argv[-1]) / Path(relative).relative_to('target')",
+                    ).replace("Path('target/debug/broken')", "(Path(sys.argv[-1]) / 'debug/broken')")
+                    target_directory = "target"
+                    inherited_bytes = b"stale inherited binary"
+                    if label == "two-changed-target-dirs":
+                        target_directory = "override"
+                        inherited_bytes = b"new inherited binary"
+                        target_program = ("import os; from pathlib import Path\n"
+                            + "Path(os.environ['CARGO_TARGET_DIR'], 'debug/x').write_bytes(b'new inherited binary')\n"
+                            + target_program)
+                    with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": str(inherited)}):
+                        result = self.run_cli(*options, command=(
+                            sys.executable, "-c", target_program, *arguments, "--target-dir", target_directory,
+                        ))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    published = [Path(line.removeprefix("published: ").rsplit(" ", 1)[0])
+                                 for line in result.stdout.splitlines() if line.startswith("published: ")]
+                    self.assertEqual(len(published), 1, result.stderr)
+                    self.assertEqual(published[0].read_bytes(), b"binary\x00x")
+                    self.assertEqual(stale.read_bytes(), inherited_bytes)
+                    continue
+                result = self.run_cli(*options, command=(sys.executable, "-c", program, *arguments))
                 self.assertEqual(result.returncode, command_exit, result.stderr)
                 row = cast(list[str], json.loads(output.read_text()))
                 checkout = Path(row[0])
                 self.assertEqual(row, [str(checkout), f"checkout={checkout}/tracked.txt"])
-                self.assertTrue(checkout.is_relative_to(self.gates))
-                self.assertTrue(checkout.exists())
-                tree = self.gates / "origin-slot1"
-                with scratch.busy_locks(tree, create=False) as idle:
-                    self.assertTrue(idle)
+                self.assertEqual(checkout.name, "source")
+                self.assertFalse(checkout.exists())
+                self.assertFalse(self.gates.exists())
                 commit, target = cast(list[str], json.loads(evidence.read_text()))
-                self.assertEqual(Path(target).resolve(), tree / "target")
+                self.assertEqual(Path(target), checkout / "target")
                 if apply:
                     self.assertNotEqual(commit, self.head)
                 else:
@@ -2018,8 +2309,8 @@ with patch.object(subprocess, 'run', pause_clone):
                     "repository": self.source.name, "commit": commit, "command_exit": command_exit,
                     "files": [path.name for path in published],
                 })
-                expected = [(path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                            for relative in built for path in (tree / relative,)]
+                files = {"target/debug/x": (b"binary\x00x", 0o751), "target/release/y": (b"binary\x00y", 0o705)}
+                expected = [files[relative] for relative in built]
                 copies.remove_trees(self.owner_id)
                 for path, (content, mode) in zip(published, expected, strict=True):
                     self.assertTrue(path.is_absolute())
@@ -2480,13 +2771,21 @@ with patch.object(subprocess, 'run', pause_clone):
                     self.fail("invalid owner started a tree")
                 self.assertFalse(self.gates.exists())
 
-    def test_underscore_owner_succeeds_and_creates_the_checkout(self) -> None:
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": fixture_member("unit", name="unit_name",
-                parent=next(row.id for row in staff.local_snapshot().rows if row.kind == "showrunner")).current_session,
-                                          "CODEX_THREAD_ID": ""}):
-            result = self.run_cli()
+    def test_underscore_owner_succeeds_in_a_private_checkout(self) -> None:
+        member = fixture_member("unit", name="unit_name",
+            parent=next(row.id for row in staff.local_snapshot().rows if row.kind == "showrunner"))
+        result_file = self.base / "command-owner"
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": member.current_session, "CODEX_THREAD_ID": ""}):
+            result = self.run_cli(command=(sys.executable, "-c",
+                "import json,os,sys; from pathlib import Path; " +
+                "Path(sys.argv[1]).write_text(json.dumps([os.environ['COPIES_STEP_OWNER'], os.getcwd()]))",
+                str(result_file)))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.gates / "origin-slot1").exists())
+        owner, checkout = cast(list[str], json.loads(result_file.read_text()))
+        self.assertEqual(owner, str(member.id))
+        self.assertEqual(Path(checkout).name, "source")
+        self.assertFalse(Path(checkout).exists())
+        self.assertFalse(self.gates.exists())
 
     def test_record_is_local_metadata_and_repeated_use_preserves_tree(self) -> None:
         with copies.standing(self.owner_id, str(self.source), copies.CommittedSource(self.head)) as tree:
@@ -2779,14 +3078,7 @@ from scripts.production import checkpoint_gate
 with copies.standing(copies.caller_owner(), pathlib.Path(sys.argv[1]), copies.CommittedSource('HEAD')) as tree:
     checkpoint_gate.run_test_command([sys.executable, '-c', sys.argv[2]], tree)
 """
-        for launcher in ("cli", "checkpoint"):
-            with self.subTest(launcher=launcher):
-                self.check_surviving_command_lock(command, wrapper, launcher)
-
-    def check_surviving_command_lock(self, command: str, wrapper: str, launcher: str) -> None:
-        arguments = ([sys.executable, str(Path(copies.__file__)), "run", "--repo", str(self.source),
-                      "--commit", "HEAD", "--", sys.executable, "-c", command] if launcher == "cli"
-                     else [sys.executable, "-c", wrapper, str(self.source), command])
+        arguments = [sys.executable, "-c", wrapper, str(self.source), command]
         process = subprocess.Popen(
             arguments,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
