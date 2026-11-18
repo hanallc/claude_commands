@@ -16,6 +16,17 @@ GPU trial boxes then import the prepared GPU system and reboot.
 The ledger reserves spending before launch and records confirmed termination.
 The configuration files remain the source for cap values.
 
+The spending guard reads `notification_recipient` and `notification_timeout_s` for each limit notice it attempts to send.
+The ledger keeps the recipient and timeout from when the guard created the notice.
+Each notice names the day or month that reached the limit.
+The guard retries a failed notice after its saved retry deadline if the accounting period is still open.
+The guard rounds the saved retry deadline up to a whole second for older readers.
+When a notice's period ends in `accounting_zone`, the guard marks the pending notice as expired on its next check.
+The ledger records an expired notice as `"delivery": "delivered"` with `"expired": true`.
+Older readers treat the record as delivered.
+A retry after a recipient change can send the same notice to both recipients. A duplicate notice is safer than a lost notice.
+Code older than this change still sends a pending notice after its period ends. That ends when every branch has this change.
+
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
 `sync.hosts.aws=aws-build` identifies historical steps.

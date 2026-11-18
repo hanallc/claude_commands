@@ -126,10 +126,17 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
 
 
+def gpu_price_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
+    """Include Hana GPU types when the price configuration has the new key."""
+    hana = values.origin('hana_gpu_instance_types', str.split)
+    return tuple(dict.fromkeys((*values.words('gpu_instance_types'),
+                                *(hana.value if not isinstance(hana, conf.UnavailableValue) else ()))))
+
+
 def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
     """Every type a cloud gate can launch or compare."""
     return tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
-                                *values.words('gpu_instance_types'))))
+                                *gpu_price_sizes(values))))
 
 
 def hours_gap_push(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> push_texts.RenderedPush:

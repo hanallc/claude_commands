@@ -2688,3 +2688,53 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `a081dcdb8`. Blind review: APPROVE, no findings.
 
 **Files:** `scripts/buildlog/test_record.py`, `scripts/buildlog/test_test_phase_peak.py`.
+
+### Phase 141 — Helper copies include scripts/aws_target  · status: done
+
+#### As-built
+
+- `COPY_HELPERS` (`scripts/lib/helper_tree_test_support.py`) copies `scripts/aws_target`; `VERIFY_HELPERS` inherits it. Since Hana E-G, `build_targets.py` imports `scripts.aws_target.hana_placement`, and 197 tests in the 8–140 set failed without it. Row 140 of that set (`cc1002178`) carries the same line.
+- The copy adds 48 files (about 1 MB) per fixture; `hana_placement` loads other package modules on demand, so a smaller copy fails.
+- Checkpoint `5b376a860`: 30 importer modules, 399 tests pass; basedpyright 0. Blind review: APPROVE, no findings.
+
+**Files:** `scripts/lib/helper_tree_test_support.py`.
+
+### Phase 142 — Name what holds natedev memory outside the build and CI slices  · status: done
+
+#### As-built
+
+- Read-only probe at 13:58 EST on 2026-11-17, under `MemoryMax=2G`. It excluded `builds.slice` (with `builds-detached.slice` and `sccache.service`) and `/hana.slice`. It rebuilt 33.9 of the 34.65 GiB.
+- Main holders: 46 Claude sessions 11.5 GiB PSS, zram compressed swap 8.2 GiB, kernel 3.1, file cache 3.5, services and desktop 2.9 (KDE Baloo 1.48), other 2.1, Codex 1.7.
+- Two orphan headless Chrome trees (0.05 GiB) from report's screenshot scripts were stopped by pid. Cause: `timeout` stops node before its `chrome.kill()`, and Chrome runs in its own scope. Builds has the owner and the defect.
+- Checkpoint `0d39e750f`. No repository code changed.
+
+**Files:** none.
+
+### Phase 143 — Measure what a slot-for-every-build model gains  · status: done
+
+#### As-built
+
+- Read-only analysis of buildlog records for 2026-11-10 to 11-17; no build, code or config change. Report: `phases/143/slot_report.md` in the unit session folder.
+- First runs in a new Cargo folder: Hana 5.2% of worker calls, matched nextest 634 s against 113 s for a repeat; cargo-liner 3.6%, 101 s against 12 s.
+- No gate record measures a slot revision change. From slot steps, a Hana nextest after a different revision took 367 s at the median (21 steps).
+- Disk: `/build/cargo` 2201 GiB (Hana 1948); 877 GiB free. The 7-day peak with last-slot preference needs Hana 6 slots, cargo-liner 4.
+- Recommendation sent to builds: keep the worktree Cargo folders. At 46–59% own-slot reuse, a typical Hana nextest gets about 1.8 min slower on slots. Seeding a new folder from a warm sibling takes the first-run gain instead.
+- Checkpoint `989f9049e`.
+
+**Files:** none.
+
+### Phase 144 — A new worktree's Cargo folder starts from a warm sibling  · status: done
+
+#### As-built
+
+- `scripts/lib/cargo_seed.py`: before the first Cargo build of a worktree's own managed folder on natedev, copy `deps`, `build` and `.fingerprint` of the profile from the warm sibling of the same repository with the nearest revision (`git rev-list --count`).
+- The copy holds the donor's Cargo locks without a wait, skips a donor with an admission reservation, runs one at a time, stages in a unique folder inside the seeder-private `.cargo-seed` folder and publishes by rename. Recovery clears `.cargo-seed` under the disk lock.
+- Only registry crates are copied. Workspace and Git units, build-script run records and `OUT_DIR` stay out, because they can hold donor paths.
+- An override build folder (`build.build-dir` or a target) gets no seed. A seed failure never fails the build. `scripts/lint/invoke.sh` skips the helper for a known warm folder of the same workspace.
+- Worktree removal (`scripts/worktree/worktrees.py`) takes the seed's checkout guard and removes the managed folder through the guarded Cargo cleanup.
+- Settings: new `seed.*` keys in `config/build_folders.conf`; the Mac is off.
+- Hana first nextest: cold Cargo 1188.65 s (639 crates); seeded copy 6.43 GiB in 18.31 s, Cargo 956.68 s (409 crates); gain 213.66 s. The 409: 25 workspace, 76 registry crates with a build script, 305 registry crates above one, 3 path crates.
+- Known limit: `~/rust/X` and `~/worktrees/X` share `/build/cargo/X` in the live mirror; reported to builds.
+- Checkpoint `73bb35737`.
+
+**Files:** `scripts/lib/cargo_seed.py`, `scripts/lib/test_cargo_seed.py`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `scripts/worktree/worktrees.py`, `scripts/worktree/test_worktrees.py`, `config/build_folders.conf`.
