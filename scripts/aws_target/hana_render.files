@@ -14,6 +14,8 @@ scripts/aws_target/hana_result.py
 scripts/aws_target/hana_runner.py
 scripts/aws_target/hana_source.py
 scripts/build_hold/owning_session.py
+scripts/build_hold/override_guard.py
+scripts/build_hold/shared_state_defaults.py
 scripts/build_queue/__init__.py
 scripts/build_queue/admission_client.py
 scripts/build_queue/admission_code.py
