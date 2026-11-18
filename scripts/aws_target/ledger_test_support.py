@@ -85,6 +85,7 @@ def write_hana_config(path: Path | None = None) -> Path:
         path = conf.path('hana_aws')
     _ = path.write_text("""\
 enabled=off
+host=fixture-hana
 region=us-east-2
 availability_zone=us-east-2b
 instance_type=m7a.2xlarge
