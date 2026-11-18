@@ -1237,7 +1237,7 @@ sys.exit(status)
 
             def same_supervisor(_pid: int, _record_path: Path) -> bool:
                 self.assertEqual(cast(object, json.loads(path.read_text())), saved)
-                return not path.with_suffix(".stop-pending").exists()
+                return not path.with_suffix(".stop-staged").exists()
 
             with (patch.object(detached_run_process, "supervisor_match", side_effect=same_supervisor) as observe,
                   patch.object(process_group, "send_process_group") as send):
@@ -1341,7 +1341,7 @@ sys.exit(status)
                         path, "fixture stop", verify_group=lambda: detached_runs.CommandGroup(DEAD_PID, "fixture start"),
                         signal_group=signal_fixture))
                 self.assertTrue(signaled)
-                self.assertFalse(path.with_suffix(".stop-pending").exists())
+                self.assertFalse(path.with_suffix(".stop-staged").exists())
                 if failure == "none":
                     self.assertEqual(errors.getvalue(), "")
                 else:
@@ -1854,7 +1854,7 @@ send.deliver_worker_text = fake_sender
                             flock(descriptor, operation)
 
                     def reuse_at_recheck(pid: int, proc_root: Path = build_hold.PROC_ROOT) -> str:
-                        if pid == 10 and path.with_suffix(".stop-pending").exists():
+                        if pid == 10 and path.with_suffix(".stop-staged").exists():
                             rechecking.set()
                             self.assertTrue(write_attempted.wait(timeout=guard.remaining()))
                             self.assertTrue(supervisor_blocked.is_set(), "the drain must hold the record lock")

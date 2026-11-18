@@ -249,7 +249,7 @@ def stop_with_reason(
             return False
         if isinstance(verify_group(), CommandGroupUnverified):
             return False
-        pending = path.with_suffix(".stop-pending")
+        pending = path.with_suffix(".stop-staged")
         confirmed = path.with_suffix(CONFIRMED_STOP_SUFFIX)
         stopping = {**record, "stop_reason": reason}
         signaled = False
@@ -541,7 +541,7 @@ def _complete_worker_dispatch(record: RunRecord) -> None:
 
 
 # Keep the record lock at its path until the record is gone.
-_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-pending",
+_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-staged",
               "{}" + CONFIRMED_STOP_SUFFIX,
               "{}.json", "{}.record.lock")
 
