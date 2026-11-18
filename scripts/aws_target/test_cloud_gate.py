@@ -1645,6 +1645,76 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertNotIn('result', cloud_gate.read(self.folder / 'imported.json'))
         reported.assert_called_once()
 
+    def test_first_import_skips_existing_rows(self) -> None:
+        destination = store.host_file('aws', self.now)
+        destination.parent.mkdir(parents=True)
+        prefix = b'{"id":"older-record"}\n' * 10000 + b'invalid JSON\n'
+        _ = destination.write_bytes(prefix)
+
+        cloud_gate.import_record(self.folder, self.result())
+
+        saved = cloud_gate.read(self.folder / 'import-boundary.json')
+        self.assertEqual(saved, {'id': 'gate-attempt', 'destination': str(destination), 'offset': len(prefix)})
+        contents = destination.read_bytes()
+        self.assertEqual(contents[:len(prefix)], prefix)
+        self.assertEqual(len(contents[len(prefix):].splitlines()), 1)
+        self.assertEqual(ledger.mapping(cast(object, json.loads(contents[len(prefix):])))['id'], 'gate-attempt')
+
+    def test_import_retries_after_append_without_appending_again(self) -> None:
+        destination = store.host_file('aws', self.now)
+        result_path = self.folder / cloud_gate.RESULT_FILE
+        imported = self.folder / 'imported.json'
+        result = self.result()
+        cloud_gate.save(result_path, result)
+        save = cloud_gate.save
+
+        def interrupt_imported_save(path: Path, row: dict[str, object]) -> None:
+            if path == imported:
+                raise OSError('fixture interrupted the import')
+            save(path, row)
+
+        with mock.patch('scripts.test_times.gate_record.keep_failure_logs') as keep_failure_logs:
+            with mock.patch.object(cloud_gate, 'save', side_effect=interrupt_imported_save):
+                with self.assertRaisesRegex(OSError, 'fixture interrupted'):
+                    cloud_gate.import_record(self.folder, result)
+            self.assertFalse(imported.exists())
+            store.append_line(destination, {'id': 'another-record'})
+            contents = destination.read_bytes()
+            cloud_gate.import_record(self.folder, cloud_gate.read(result_path))
+
+        keep_failure_logs.assert_called_once()
+        self.assertEqual(destination.read_bytes(), contents)
+        self.assertEqual(cloud_gate.read(imported)['id'], 'gate-attempt')
+        self.assertFalse(result_path.exists())
+
+    def test_reused_import_folder_ignores_the_previous_record_marker(self) -> None:
+        destination = store.host_file('aws', self.now)
+        cloud_gate.import_record(self.folder, self.result())
+        first_end = destination.stat().st_size
+        result = self.result()
+        result['attempt'] = 'next-attempt'
+        ledger.mapping(result['record'])['id'] = 'gate-next-attempt'
+
+        cloud_gate.import_record(self.folder, result)
+
+        self.assertEqual([row['id'] for row in store.locked_rows(destination)], ['gate-attempt', 'gate-next-attempt'])
+        self.assertEqual(cloud_gate.read(self.folder / 'import-boundary.json'),
+                         {'id': 'gate-next-attempt', 'destination': str(destination), 'offset': first_end})
+
+    def test_import_saves_the_offset_after_tail_repair(self) -> None:
+        destination = store.host_file('aws', self.now)
+        store.append_line(destination, {'id': 'older-record'})
+        whole_end = destination.stat().st_size
+        with destination.open('ab') as handle:
+            _ = handle.write(b'{"id":"unfinished')
+
+        cloud_gate.import_record(self.folder, self.result())
+        cloud_gate.import_record(self.folder, self.result())
+
+        self.assertEqual(cloud_gate.read(self.folder / 'import-boundary.json')['offset'], whole_end)
+        rows = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_bytes().splitlines()]
+        self.assertEqual([row['id'] for row in rows], ['older-record', 'gate-attempt'])
+
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
         for mode, full in ((gate.SuiteMode.MERGE_GATE, False), (gate.SuiteMode.TARGETED_TEST, True)):
