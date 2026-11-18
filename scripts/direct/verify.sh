@@ -2859,7 +2859,7 @@ placement_once() {
     # Use the queue's first pass to give routed work a remote placement probe.
     # The next pass permits local admission. Neither pass takes a board token.
     PLACEMENT_REMOTE_PROBE=0
-    if [[ "$STEP_RUNS_ON" == any_target && "${LOCAL_ONLY:-0}" == 0 \
+    if [[ "${STEP_RUNS_ON:-natedev_only}" == any_target && "${LOCAL_ONLY:-0}" == 0 \
             && -z "${PINNED_TARGET:-}" && "${MAC_ONLY:-0}" == 0 \
             && "${STEP_FORCE_MAC:-0}" == 0 && -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
         prerequisite=after-grant
@@ -2870,8 +2870,8 @@ placement_once() {
         --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$prerequisite"
-        --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE"
-        --cargo-folder "$PLACEMENT_CARGO_FOLDER")
+        --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
+    [[ -z "${PLACEMENT_CARGO_FOLDER:-}" ]] || placement_args+=(--cargo-folder "$PLACEMENT_CARGO_FOLDER")
     [[ -z "${BUILDLOG_RUN:-}" ]] || placement_args+=(--run "$BUILDLOG_RUN")
     [[ -z "$target" ]] || placement_args+=(--target "$target")
     [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
