@@ -1,7 +1,4 @@
-"""Delete the disks and buckets that a Hana stack retains.
-
-The Hana template retains its data disk and control bucket, so CloudFormation never deletes them.
-A Hana down and a failed Hana change delete them here, so neither leaves a paid resource behind."""
+"""Delete Hana data disks and control buckets outside CloudFormation."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -83,6 +80,7 @@ def delete(api: AwsCli, retained: Retained, *, wait_s: float) -> None:
         except AwsUnavailable as error:
             if 'InvalidVolume.NotFound' not in str(error):
                 raise
+            print(f'The Hana data disk {volume} is already gone.')
     if volumes:
         _ = api.call('wait', 'volume-deleted', '--volume-ids', *volumes, timeout_s=wait_s)
     for bucket in sorted(retained.buckets):

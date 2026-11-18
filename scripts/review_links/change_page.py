@@ -20,8 +20,9 @@ import threading
 import time
 import unicodedata
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
@@ -37,9 +38,14 @@ from scripts.production.delivery_state import (
     ValidationRequested as ValidationRequested,
 )
 from scripts.lib import atomic_file, conf, file_lock, urgency
+from scripts.lib.user_zone import user_zone
 from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.feature_log import feature_log
-from scripts.review_links import console_theme, page_frame, question_record, review_link
+from scripts.review_links import console_theme, page_frame, question_record, review_events, review_link
+from scripts.review_links.review_items import (
+    CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
+    decode_change_delivery, read_change_delivery,
+)
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
@@ -105,36 +111,38 @@ class StoredAnsweredQuestion(TypedDict):
     kind: NotRequired[Literal["feedback"]]
 
 
-@dataclass(frozen=True)
-class OpenFeedback(OpenQuestion):
-    """The showrunner must act before this change returns to the user."""
-
-
-@dataclass(frozen=True)
-class CompletedFeedback(AnsweredQuestion):
-    """The showrunner's note returns this change to the user."""
-
-
-def _decode_slots(value: object) -> DeliverySlots:
-    slots = delivery_state.decode_value(value)
-    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
-    saved = fields.get("question")
-    question = slots.question
-    if isinstance(saved, dict) and cast(dict[str, object], saved).get("kind") == "feedback":
-        if isinstance(question, OpenQuestion):
-            return replace(slots, question=OpenFeedback(question.question_id, question.text, question.delivery))
-        if isinstance(question, AnsweredQuestion):
-            return replace(slots, question=CompletedFeedback(question.question_id, question.text, question.answer))
-    return slots
-
-
 class StoredDeliverySlots(TypedDict, total=False):
+    handed_at: str
     waiting_why: str
     validation: StoredValidationIntent | StoredValidationRequested
     verdict: StoredDeliveryIntent
     question: StoredOpenQuestion | StoredAnsweredQuestion
     user_answer: StoredUserAnswer
     review_message: StoredReviewMessage
+
+
+WITH_SHOWRUNNER = "This change is already with the showrunner."
+CHANGE_HANDOFFS = frozenset(("validate", "question", "feedback"))
+
+
+def handoff_time(path: Path, fallback: datetime) -> datetime:
+    """Read the request time, or use the file time for an older request."""
+    try:
+        with path.open(encoding="utf-8") as stream:
+            fields = cast(object, json.load(stream))
+            if isinstance(fields, dict):
+                saved = cast(dict[str, object], fields).get("handed_at")
+                if isinstance(saved, str):
+                    parsed = datetime.fromisoformat(saved)
+                    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=user_zone())
+            return datetime.fromtimestamp(os.fstat(stream.fileno()).st_mtime, user_zone())
+    except (OSError, ValueError):
+        return fallback
+
+
+def require_user_turn(slots: DeliverySlots) -> None:
+    if not slots.waits_for_user(False):
+        raise ChangeHandoffRefused(WITH_SHOWRUNNER)
 
 
 ImageQuestionDispatchState = Literal["started", "started_after_unconfirmed", "accepted"]
@@ -260,7 +268,11 @@ class ReviewMessagePage(ReviewPage):
 
 
 class QuestionAnswerRefused(question_record.AnswerRefused):
-    """Another session already answered this user question."""
+    """The browser can show this refusal to the user."""
+
+
+class ChangeHandoffRefused(QuestionAnswerRefused):
+    """A showrunner already owns the next action for the change."""
 
 
 class FeatureLogFailed(RuntimeError):
@@ -420,15 +432,7 @@ class DeliveryStatus:
             atomic_file.write_bytes_atomic(path, (json.dumps(sent) + "\n").encode("utf-8"), mode=0o600)
 
     def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
-        try:
-            content = self.path(page, row).read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return DeliverySlots(NoDelivery(), NoDelivery())
-        try:
-            value = cast(object, json.loads(content))
-        except ValueError:
-            return DeliverySlots(NoDelivery(), NoDelivery())
-        return _decode_slots(value)
+        return read_change_delivery(self.path(page, row))
 
     def metadata_page(self, page: ReviewPage) -> ReviewPage:
         """Preserve the saved message when an answer changes its delivery slots."""
@@ -443,7 +447,7 @@ class DeliveryStatus:
             return ReviewMessagePage(page.review_list, page.production, page.rows, page.token, fields['review_message'])
         return page
 
-    def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots) -> None:
+    def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots, *, new_handoff: bool = False) -> None:
         """Write both slots while the caller holds the delivery lock."""
         fields: StoredDeliverySlots = {}
         if slots.waiting_why:
@@ -473,14 +477,20 @@ class DeliveryStatus:
         if saved_question is not None and isinstance(question, (OpenFeedback, CompletedFeedback)):
             saved_question["kind"] = "feedback"
         path = self.path(page, row)
+        if re.fullmatch(r"C\d+", row) and not slots.waits_for_user(False):
+            now = datetime.fromtimestamp(time.time(), user_zone())
+            fields["handed_at"] = (now if new_handoff else handoff_time(path, now)).isoformat()
         published = False
         try:
             if fields:
-                try:
-                    atomic_file.write_bytes_atomic(path, (json.dumps(fields) + "\n").encode("utf-8"), mode=0o600)
-                except atomic_file.AtomicDurabilityUnconfirmed:
-                    published = True
-                    raise
+                resume = (change_review.clear_change_later(page.review_list, row)
+                          if new_handoff and "handed_at" in fields else nullcontext())
+                with resume:
+                    try:
+                        atomic_file.write_bytes_atomic(path, (json.dumps(fields) + "\n").encode("utf-8"), mode=0o600)
+                    except atomic_file.AtomicDurabilityUnconfirmed:
+                        published = True
+                        raise
             else:
                 path.unlink(missing_ok=True)
             published = True
@@ -492,25 +502,22 @@ class DeliveryStatus:
                 for attempt in stale:
                     del self.request_attempts[attempt]
 
-    def set_waiting_why(self, page: ReviewPage, row: str, text: str) -> None:
-        """Store the reason with the change's delivery state under its lock."""
-        reason = delivery_state.require_waiting_why(text)
-        with self.locked():
-            current = next((value for value in change_review.review_rows(page.review_list) if value["#"] == row), None)
-            slots = self.slots(page, row)
-            if current is None or current.get("Verdict") or slots.waits_for_user(False):
-                raise question_record.AnswerRefused("The item is not Waiting.")
-            self.write_slots(page, row, replace(slots, waiting_why=reason))
-
     def begin(self, page: ReviewPage, row: str, kind: Literal["verdict", "validation"], feedback: str = "", *,
-              recipients: tuple[staff.StaffId, ...] = (), waiting_why: str = "") -> str:
+              recipients: tuple[staff.StaffId, ...] = (), waiting_why: str = "", user_verdict: bool = False) -> str:
+        with self.locked():
+            slots = self.slots(page, row)
+            if user_verdict:
+                require_user_turn(slots)
+            return self.begin_locked(page, row, slots, kind, feedback, recipients=recipients, waiting_why=waiting_why)
+
+    def begin_locked(self, page: ReviewPage, row: str, slots: DeliverySlots, kind: Literal["verdict", "validation"],
+                     feedback: str = "", *, recipients: tuple[staff.StaffId, ...] = (), waiting_why: str = "") -> str:
         reason = delivery_state.require_waiting_why(waiting_why or feedback) if kind == "validation" else ""
         attempt = secrets.token_hex()
         intent = DeliveryIntent(attempt, kind, feedback if kind == "validation" else "", recipients)
-        with self.locked():
-            slots = self.slots(page, row).updated(kind, intent)
-            self.write_slots(page, row, replace(slots, waiting_why=reason) if reason else slots)
-            self.request_attempts[attempt] = AttemptOwnership(self.path(page, row), "claimed")
+        slots = slots.updated(kind, intent)
+        self.write_slots(page, row, replace(slots, waiting_why=reason) if reason else slots, new_handoff=kind == "validation")
+        self.request_attempts[attempt] = AttemptOwnership(self.path(page, row), "claimed")
         return attempt
 
     def record(self, delivery: MessageDelivery, result: FailedDelivery | NoFailedDelivery = NO_FAILED_DELIVERY) -> None:
@@ -549,7 +556,6 @@ class DeliveryStatus:
     def ask(self, page: ReviewPage, row: str, text: str, *, recipients: tuple[staff.StaffId, ...] = (),
             kind: Literal["question", "feedback"] = "question") -> QuestionDelivery | NoDelivery:
         """Save a new question without changing an existing open question."""
-        reason = delivery_state.require_waiting_why(text)
         with self.locked():
             slots = self.slots(page, row)
             question = slots.question
@@ -557,13 +563,18 @@ class DeliveryStatus:
                 if question.text != text or isinstance(question, OpenFeedback) != (kind == "feedback"):
                     raise question_record.AnswerRefused("this row already has an open question")
                 return NoDelivery()
-            intent = DeliveryIntent(secrets.token_hex(), "question", recipients=recipients)
-            question_id = secrets.token_hex(4)
-            request = OpenFeedback if kind == "feedback" else OpenQuestion
-            self.write_slots(page, row, replace(slots, validation=NoDelivery(), question=request(question_id, text, intent),
-                                                waiting_why=reason))
-            self.request_attempts[intent.attempt] = AttemptOwnership(self.path(page, row), "claimed")
-            return QuestionDelivery(question_id, text, intent.attempt)
+            return self.ask_locked(page, row, slots, text, recipients, kind)
+
+    def ask_locked(self, page: ReviewPage, row: str, slots: DeliverySlots, text: str,
+                   recipients: tuple[staff.StaffId, ...], kind: Literal["question", "feedback"]) -> QuestionDelivery:
+        reason = delivery_state.require_waiting_why(text)
+        intent = DeliveryIntent(secrets.token_hex(), "question", recipients=recipients)
+        question_id = secrets.token_hex(4)
+        request = OpenFeedback if kind == "feedback" else OpenQuestion
+        self.write_slots(page, row, replace(slots, validation=NoDelivery(), question=request(question_id, text, intent),
+                                            waiting_why=reason), new_handoff=True)
+        self.request_attempts[intent.attempt] = AttemptOwnership(self.path(page, row), "claimed")
+        return QuestionDelivery(question_id, text, intent.attempt)
 
     def answer_question(self, page: ReviewPage, row: str, question_id: str, text: str) -> bool:
         """Save an answer once and preserve the delivery record's other slots."""
@@ -580,9 +591,16 @@ class DeliveryStatus:
             record = answer_row(page, row)
             if record.get("Verdict"):
                 raise question_record.AnswerRefused("this row already has a saved answer")
-            _ = row_production(page, record)
-            completed = CompletedFeedback if isinstance(question, OpenFeedback) else AnsweredQuestion
-            self.write_slots(page, row, replace(slots, question=completed(question_id, question.text, text)))
+            production = row_production(page, record)
+            completed = AnsweredQuestion
+            if isinstance(question, OpenFeedback):
+                completed = CompletedFeedback
+                words = "feedback: " + question.text
+                events = review_events.decode(record.get("Review log", ""))
+                if not any(event.words.rstrip().splitlines() == words.rstrip().splitlines() for event in events):
+                    change_review.record_review_log(page.review_list, row, words, production)
+            with change_review.clear_change_later(page.review_list, row):
+                self.write_slots(page, row, replace(slots, question=completed(question_id, question.text, text)))
             return True
 
     def question_for_reply(self, page: ReviewPage, row: str, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
@@ -592,23 +610,6 @@ class DeliveryStatus:
             return delivery_state.question_exchange_for_reply(question, question_id, text)
         except delivery_state.StaleQuestionExchange as error:
             raise question_record.AnswerRefused(str(error)) from error
-
-    def supersede_wait(self, page: ReviewPage, row: dict[str, str], outcome: str) -> str:
-        """Remove the old Change wait before the new Review action saves."""
-        from scripts.production.production_doc import read_production
-        with self.locked():
-            slots = self.slots(page, row['#'])
-            if not slots.validation_requested and not isinstance(slots.question, OpenQuestion):
-                return ''
-            previous = ('question '+slots.question.question_id if isinstance(slots.question, OpenQuestion)
-                        else 'showrunner check')
-            shown = change_review.display_id(row, route_owner(page, row).tab)
-            event = f'Review {shown}: {outcome} superseded the {previous} before the answer arrived.'
-            change_review.record_review_log(page.review_list, row['#'], event, page.production)
-            update_registration.append_log(read_production(route_owner(page, row).tab, staff.snapshot()), event, None, False)
-            self.write_slots(page, row['#'], replace(slots, validation=NoDelivery(), question=NoQuestion()))
-            return event
-
 
 @dataclass(frozen=True)
 class DeliveryReadView:
@@ -940,11 +941,14 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         saved = saved or bool(verdict)
         slots = delivery.slots(page, row["#"])
         question = slots.question
-        warning = "Not saved: " + notice.reason if notice.reason and notice.row == row["#"] else ""
+        warning = ""
+        if notice.reason and notice.row == row["#"]:
+            reason = WITH_SHOWRUNNER if not verdict and not slots.waits_for_user(False) else notice.reason
+            warning = "Not saved: " + reason
         alert = f'<p role="alert">{html.escape(warning)}</p>' if warning else ""
         form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"])
         status_text = answer_status(verdict, slots)
-        answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text and (verdict or not warning) else
+        answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text else
                   "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice, feedback_rows))
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
@@ -1099,6 +1103,8 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str,
 def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
            prepared: change_review.ChangeQueue | next_item.ReadChangeLists = next_item.READ_CHANGE_LISTS,
            feedback_closes: bool = False) -> MessageDelivery | NoMessageDelivery:
+    # Older browser callers still pass this keyword.
+    del feedback_closes
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(values) != 1 for values in fields.values()):
         raise question_record.AnswerRefused("expected only row, token, outcome and feedback")
@@ -1108,8 +1114,6 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         raise question_record.AnswerRefused("row or page token does not match this page")
     if outcome not in ("works", "not works", "validate", "feedback", "question"):
         raise question_record.AnswerRefused("choose an answer")
-    if outcome in ("feedback", "question") and not feedback.strip():
-        raise question_record.AnswerRefused("enter a question" if outcome == "question" else "enter feedback")
     one_line = " ".join(line.strip() for line in feedback.split("\n") if line.strip())
     verdict = one_line or outcome
     if outcome in ("works", "not works") and one_line:
@@ -1126,63 +1130,56 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         raise question_record.AnswerRefused("the production document is not available")
     message_page = replace(page, production=assignment.production)
     recipients = owner.showrunner_recipients
-    request_feedback = outcome == "feedback" and not feedback_closes and not change_review.lands(one_line)
-    if outcome == "feedback" and feedback_closes:
-        verdict = "feedback: " + one_line
-    if (outcome == "question" or request_feedback) and isinstance(owner, change_routing.UnroutedChange):
-        raise question_record.AnswerRefused("this row has no showrunner to answer a question")
-    if outcome == "question" or request_feedback:
-        if row.get("Verdict"):
-            raise question_record.AnswerRefused("this row already has a saved answer")
-        _ = row_production(page, row)
-        superseded = status.supersede_wait(message_page, row, outcome) if feedback_closes else ''
-        intent = status.ask(page, row_id, feedback, recipients=recipients, kind="feedback" if request_feedback else "question")
-        if isinstance(intent, NoDelivery):
-            return NoMessageDelivery()
-        message = _request_message(message_page, row, intent.question_id, intent.text, request_feedback)
-        if superseded:
-            message += '\n'+superseded
-        return MessageDelivery(message_page, row_id, recipients, message, intent.attempt, owner.showrunner_recipients)
-    superseded = ''
-    closeout_done = False
-    if feedback_closes and not row.get('Verdict'):
-        doc = row_production(page, row)
-        if outcome != 'validate':
-            closeout_before_save(page, doc, row_id, verdict, status)
-            closeout_done = True
-        superseded = status.supersede_wait(message_page, row, outcome)
-    if isinstance(status.slots(page, row_id).question, OpenQuestion):
-        raise question_record.AnswerRefused("this row has an open question")
-    if outcome == "validate":
-        if row.get("Verdict"):
-            raise question_record.AnswerRefused("this row already has a saved answer")
-        _ = row_production(page, row)
-        if status.slots(page, row_id).validation_requested:
-            return NoMessageDelivery()
-        _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id),
-                                  prepared=next_item.READ_CHANGE_LISTS if superseded else prepared)
-        attempt = status.begin(page, row_id, "validation", feedback, recipients=recipients,
-                               waiting_why=feedback.strip() or "The user asked the showrunner to validate this change.")
-        message = validation_message(message_page, row, attempt, feedback)
-        if superseded:
-            message += '\n'+superseded
+    if outcome in CHANGE_HANDOFFS:
+        with status.locked():
+            if answer_row(page, row_id).get("Verdict"):
+                raise question_record.AnswerRefused("this row already has a saved answer")
+            slots = status.slots(page, row_id)
+            require_user_turn(slots)
+            if outcome in ("feedback", "question") and not feedback.strip():
+                raise question_record.AnswerRefused("enter a question" if outcome == "question" else "enter feedback")
+            if isinstance(slots.verdict, DeliveryIntent):
+                raise question_record.AnswerRefused("A verdict for this change is being saved.")
+            if isinstance(owner, change_routing.UnroutedChange):
+                raise question_record.AnswerRefused("this row has no showrunner to receive the request")
+            _ = row_production(page, row)
+            if outcome == "validate":
+                _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id), prepared=prepared)
+                change_review.record_review_log(page.review_list, row_id,
+                    "validate" + (": " + feedback if feedback else ""), message_page.production)
+                attempt = status.begin_locked(page, row_id, slots, "validation", feedback, recipients=recipients,
+                    waiting_why=feedback.strip() or "The user asked the showrunner to validate this change.")
+                message = validation_message(message_page, row, attempt, feedback)
+            else:
+                request_feedback = outcome == "feedback"
+                if request_feedback:
+                    change_review.record_review_log(page.review_list, row_id, "feedback: " + feedback, message_page.production)
+                intent = status.ask_locked(page, row_id, slots, feedback, recipients,
+                                            "feedback" if request_feedback else "question")
+                attempt = intent.attempt
+                message = _request_message(message_page, row, intent.question_id, intent.text, request_feedback)
         return MessageDelivery(message_page, row_id, recipients, message, attempt, owner.showrunner_recipients)
+
     if row.get("Verdict"):
         if row["Verdict"] != verdict:
             raise question_record.AnswerRefused("this row already has a different saved answer")
         return NoMessageDelivery()
     doc = row_production(page, row)
     recipients = verdict_recipients(owner, verdict)
-    if not closeout_done:
+    if recipients:
+        attempt = status.begin(page, row_id, "verdict", recipients=recipients, user_verdict=True)
+    else:
+        require_user_turn(status.slots(page, row_id))
+        attempt = ""
+    try:
         closeout_before_save(page, doc, row_id, verdict, status)
-    attempt = status.begin(page, row_id, "verdict", recipients=recipients) if recipients else ""
+    except FeatureLogFailed:
+        if attempt:
+            status.clear(page, row_id, "verdict")
+        raise
     try:
         production = change_review.production_doc(unit_lookup.doc_owner(page.production, staff.snapshot()).name)
-        validation = status.slots(page, row_id).validation
-        if isinstance(validation, NoDelivery):
-            result = change_review.save_verdict(page.review_list, row_id, verdict, production)
-        else:
-            result = change_review.save_verdict(page.review_list, row_id, verdict, production, validation_id=validation.attempt)
+        result = change_review.save_verdict(page.review_list, row_id, verdict, production)
     except (change_review.ChangeReviewError, OSError) as error:
         status.clear(page, row_id, "verdict")
         raise question_record.AnswerRefused(str(error).strip()) from error
@@ -1191,8 +1188,6 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         raise question_record.AnswerRefused(result.reason)
     message = review_message(message_page, row, verdict, f"Merged: {row.get('Merged', '')}",
                              f"User feedback: {feedback if feedback.strip() else verdict}", "\n".join(result.lines).strip())
-    if superseded:
-        message += '\n'+superseded
     return MessageDelivery(message_page, row_id, recipients, message, attempt, owner.showrunner_recipients) if recipients else NoMessageDelivery()
 
 
@@ -1339,7 +1334,7 @@ def recover_pending(status: DeliveryStatus) -> None:
                     if any(ownership.row_file == path for ownership in status.request_attempts.values()):
                         continue
                     fields = cast(object, json.loads(path.read_text(encoding="utf-8")))
-                    decoded = _decode_slots(fields)
+                    decoded = decode_change_delivery(fields)
                     intents = decoded.intents()
                     if not intents or any(intent.attempt in status.request_attempts for intent in intents):
                         continue
@@ -1510,9 +1505,14 @@ def reply_command(key: str, question: str = '') -> str:
 
 
 def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) -> bool:
-    from scripts.review_links import decision_store, efficiency_reviews, review_items
+    from scripts.review_links import decision_store, efficiency_reviews, review_items, review_submissions
+    if key.startswith(review_submissions.KEY_PREFIX):
+        try:
+            return review_submissions.answer(key, words, question_id)
+        except review_submissions.SubmissionError as error:
+            raise question_record.AnswerRefused(str(error)) from error
     from scripts.production import investigation
-    item = next((item for item in review_items.read(status.root) if key in (item.key,item.id)),None)
+    item = next((item for item in review_items.read(status.root) if key and key in (item.key,item.id)),None)
     if item is None:
         raise question_record.AnswerRefused('the Review item does not exist')
     source = item.source

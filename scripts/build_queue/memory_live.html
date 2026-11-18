@@ -239,6 +239,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label .owner { overflow-wrap: anywhere; color: var(--ink-2); }
 .wrow.wait .row-label .name { white-space: normal; }
 .row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
+.row-label .wait-note { font-size: 0.75rem; color: var(--ink-2); }
 .row-memory { min-width: 0; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
@@ -974,9 +975,10 @@ function rowOwner(row, waiting = false) {
   const owner = publicText(row.showrunner || "");
   return owner;
 }
-function rowLabel(name, owner = "") {
+function rowLabel(name, owner = "", note = "") {
   return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
-    `<span class="owner">${roleName(owner)}</span></span>`;
+    `<span class="owner">${roleName(owner)}</span>` +
+    (note ? `<span class="wait-note">${esc(note)}</span>` : "") + '</span>';
 }
 function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
@@ -1354,7 +1356,9 @@ function renderWalk(d) {
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${rowLabel(w.name, rowOwner(w, true))}` +
+    const tip = `wait:${w.key}`;
+    const note = w.why === "the build in the same Cargo folder" ? w.reason : "";
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${w.key}`) : rowMemory(`wait:${w.key}`)) +
       `</div>`);
   });
