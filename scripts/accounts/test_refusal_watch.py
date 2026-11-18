@@ -32,9 +32,11 @@ from unittest.mock import ANY, Mock, call, patch
 from scripts.lib import conf, transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.agents import stop_resume
+from scripts.agents.test_support import write_machine_config
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -76,6 +78,9 @@ def observe_whole_reads() -> Generator[Mock]:
 
     with patch.object(conf.ConfigRead, "whole", new=record):
         yield observed
+
+
+REAL_SESSION_MOVES = stop_resume.move_sessions
 
 
 NOW = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
@@ -124,6 +129,7 @@ class RefusalWatchTests(unittest.TestCase):
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         for name in ("send", "postmaster", "codex_daemon"):
             _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf",
                              Path(os.environ["CONF_DIR"]) / f"{name}.conf")
@@ -179,7 +185,8 @@ class RefusalWatchTests(unittest.TestCase):
             return record
         return staff.StaffSnapshot(tuple(staff.StaffRow(
             staff.StaffId(owner["session_id"]), owner["kind"], owner["name"], staff.StaffRoot(),
-            current_session=staff.StaffId(owner["session_id"]))
+            current_session=staff.StaffId(owner["session_id"]),
+            unit_type=staff.UnitDetails("direct") if owner["kind"] == "unit" else staff.NotUnit())
             for owner in self.owners if owner["kind"] in ("unit", "showrunner")))
 
     def process_dir(self, pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
@@ -1842,6 +1849,21 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(len(self.moves.calls), 1)
 
+    def test_automatic_producer_move_uses_the_inherited_source_and_saves_its_own_selection(self) -> None:
+        path = self.groups(showrunners="claude1")
+        owner = self.owner("producer")
+        self.reading(SOURCE_LOGIN, 1)
+        self.next_entries(self.low_rule("producers-low", group="producers"))
+        member = accounts.LiveGroupMember(owner["session_id"], owner["name"], "producers", accounts.account_dir("claude1"))
+        with patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": [], "producers": [member]}):
+            _ = self.cli()
+        self.assertEqual(stored_group_labels(path),
+                         {"units": "claude1", "showrunners": "claude1", "producers": "claude2"})
+        self.assertEqual(self.moves.calls, [MoveCall("producer", "claude2", "auto: producers-low")])
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(role_map.recorded_auto_moves(accounts.roles_history_file()),
+                         role_map.RecordedAutoMoves(frozenset({"producers-low"})))
+
     def test_automatic_low_rule_requires_a_fresh_source_reading(self) -> None:
         path = self.groups()
         _ = self.owner("unit", host="unit")
@@ -1991,6 +2013,20 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertNotEqual(self.moves.calls[0].target, "claude1")
         self.assertIsInstance(refusal_watch.session_refusal("probe"), refusal_watch.NoSessionRefusal)
         self.assertIsInstance(refusal_watch.session_refusal("other"), refusal_watch.NoSessionRefusal)
+        with staff_test_support.isolated_staff_file(self.home / "proof-staff.json", {}):
+            member = staff_test_support.fixture_member("producer", name="old-probe")
+            owner = self.owner(str(member.current_session))
+            owner["name"] = "old-probe"
+            _ = staff.rename(member.id, "renamed-probe")
+            current = staff.native_id(staff_test_support.fixture_runtime_id("renamed-proof-current"))
+            _ = staff.update_current_session(member.current_session, current)
+            _ = self.owner(str(current))
+            with patch.object(refusal_watch, "run", return_value=[]) as run:
+                code, _, _ = self.cli("--assume-refused", "renamed-probe", "weekly")
+                self.assertEqual(code, 0)
+                run.assert_called_once()
+            with self.assertRaises(SystemExit):
+                _ = self.cli("--assume-refused", "old-probe", "weekly")
 
     def test_proof_without_room_does_not_suppress_a_real_refusals_notice_on_the_same_login(self) -> None:
         _ = self.owner("probe")
@@ -2140,6 +2176,33 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertFalse(accounts.roles_history_file().exists())
         self.assertEqual(len(self.moves.calls), 2)
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
+
+    def test_deferred_build_move_keeps_its_destination_until_a_later_check(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+        _ = self.groups()
+        _ = self.owner("unit", host="unit")
+        _ = accounts.set_group_account("units", "claude3", why="auto: build", now=NOW, origin=accounts.AutoOrigin())
+        before = accounts.groups_file().read_bytes()
+        held = {"unit": ("verify.sh build in /w",)}
+
+        def move_now(selected: list[str], target: str, *, why: str, **_options: object) -> list[stop_resume.MoveResult]:
+            return self.moves(selected, target, why=why)
+
+        token = stop_resume._batch_process.set(True)  # pyright: ignore[reportPrivateUsage]
+        self.addCleanup(stop_resume._batch_process.reset, token)  # pyright: ignore[reportPrivateUsage]
+        with patch.object(stop_resume, "move_sessions", new=REAL_SESSION_MOVES), \
+                patch.object(stop_resume, "_build_holders", side_effect=[held, held, {}]), \
+                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
+                patch("time.sleep"), \
+                patch.object(stop_resume, "_move_now", side_effect=move_now) as moved:
+            _ = self.cli()
+            self.assertEqual(moved.call_count, 0)
+            self.assertEqual(accounts.groups_file().read_bytes(), before)
+            self.assertEqual(self.moves.calls, [])
+            _ = self.cli()
+        self.assertEqual(len(self.moves.calls), 1)
+        self.assertEqual(self.moves.calls[0].target, "claude3")
+        self.assertEqual(accounts.groups_file().read_bytes(), before)
 
     def test_hand_group_selection_without_live_members_is_reused_for_a_later_member(self) -> None:
         _ = self.groups()
@@ -3398,7 +3461,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("assumed", host="ghostty")
         _ = self.owner("unrelated", host="terminal")
         before = usage_store.store_file().read_bytes()
-        _, output, error = self.cli("--assume-refused", "owner assumed", "five-hour", "--reset-in", "19")
+        _, output, error = self.cli("--assume-refused", "assumed", "five-hour", "--reset-in", "19")
         self.assertEqual(error, "")
         self.assertIn("wait", output)
         self.assertNotIn("unrelated", output)

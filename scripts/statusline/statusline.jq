@@ -6,21 +6,29 @@ def trim: gsub("^\\s+|\\s+$"; "");
 
 # Parse once per render. Values remain text until their field validates them.
 def color_config:
-  reduce (split("\n")[] | (split("#")[0] // "") | trim
+  reduce (split("\n")[] | sub("(^|\\s)#.*$"; "") | trim
           | select(. != "") | index("=") as $equals
           | select($equals != null)
           | {key: (.[:$equals] | trim), value: (.[$equals + 1:] | trim)}) as $entry
     ({}; .[$entry.key] = $entry.value);
 
+# Convert the six validated hex digits to three decimal channels.
+def rgb_code:
+  ascii_downcase | .[1:] | explode
+  | map(if . >= 97 then . - 87 else . - 48 end)
+  | "38;2;\(.[0] * 16 + .[1]);\(.[2] * 16 + .[3]);\(.[4] * 16 + .[5])";
+
 def color($config; $key):
   . as $text
-  | ({black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35,
+  | ($config[$key] // "") as $value
+  | (if ($value | test("^#[0-9a-fA-F]{6}$")) then ($value | rgb_code)
+     else {black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35,
       cyan: 36, white: 37, "bright-black": 90, "bright-red": 91,
       "bright-green": 92, "bright-yellow": 93, "bright-blue": 94,
       "bright-magenta": 95, "bright-cyan": 96, "bright-white": 97,
       orange: "38;5;208", purple: "38;5;141", pink: "38;5;211",
       teal: "38;5;30", brown: "38;5;137", mauve: "38;5;139"}
-     [($config[$key] // "")]) as $code
+     [$value] end) as $code
   | if $code == null then $text else "\u001b[\($code)m\($text)\u001b[0m" end;
 
 def level_color($config; $family; $value):
@@ -113,7 +121,8 @@ def usage($config; $label; $window; $fmt):
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
      ($ARGS.named.assignment // "" | select(. != "") | color($colors; "role." + $ARGS.named.role)),
-     $path
+     $path,
+     ($ARGS.named.branch // "" | select(. != ""))
    ] | join(" | ")) as $first_line
 | ([
      # A label is a note name; an address never reaches the line.
@@ -135,16 +144,16 @@ def usage($config; $label; $window; $fmt):
       | usage($colors; "5-hour"; $five_hour; "%H:%M")),
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
+# assignment.py associates each unit cache with its current session before this selection.
 | ((.session_id // "") as $id
    | ([$ARGS.named.counts // "" | split("\n")[]
        | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
-       | sub("^For you: "; "") | split(", ")[]] ) as $parts
-   | ($ARGS.named.rebuild // "") as $rebuild
+       # Older caches can still use the former heading.
+       | ltrimstr("Review: ") | ltrimstr("For you: ") | split(", ")[]] ) as $parts
    | ((if ($ARGS.named.adhoc // "") == "" then [] else [$ARGS.named.adhoc] end)
       + ($parts | map(select(test("^[0-9]+ (question|change)s?$"))))
-      + (if $rebuild == "" then [] else [$rebuild] end)
       + ($parts | map(select(test("^[0-9]+ (question|change)s?$") | not))))
-   | if length == 0 then "" else "For you: " + join(", ") end
+   | if length == 0 then "" else "Review: " + join(", ") end
       # Use the plural key with underscores: counts.adhoc_items; efficiency stays singular.
       | gsub("(?<count>[0-9]+)(?: (?<word>adhoc item|question|change|efficiency|proposal|project)(?<s>s?))?";
              . as $part | "\u001b[1m\($part.count)\u001b[22m"
@@ -152,4 +161,9 @@ def usage($config; $label; $window; $fmt):
                else (. + " " + $part.word + $part.s)
                  | color($colors; "counts." + ($part.word | gsub(" "; "_")) + (if $part.word == "efficiency" then "" else "s" end))
                end)) as $counts_row
-| [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")
+| ($ARGS.named.for_you // "") as $actions
+| (if $actions == "unavailable" then "For you: Unavailable"
+   elif ($actions | test("^[1-9][0-9]*$")) then
+     "For you: " + "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
+   else "" end) as $action_row
+| [$first_line, $second_line, $action_row, $counts_row] | map(select(. != "")) | join("\n")

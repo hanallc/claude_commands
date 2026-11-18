@@ -30,8 +30,7 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 Read `~/.claude/docs/direct/held_astra_roles.md` in full when the run holds an Astra role.
 </HeldAstraRoles>
 
-At startup or restart, a header `**Standing:** style_plan.py` runs
-<StandingPlanRefill/> before choosing a phase; repeat after compaction.
+After restart, compaction, move, or rename, apply <RestartTakeover/> before new dispatches.
 
 State:
 
@@ -82,6 +81,7 @@ it:
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/phase_report.md` | `/unit:phase_report` |
 | <CheckpointCommit/>, <ShrinkCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/add_ons.md` | `/unit:add_ons` |
+| <RestartTakeover/> | `docs/direct/restart_takeover.md` | — |
 | <PhaseChecks/> | `docs/direct/phase_checks.md` | — |
 | <StyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
@@ -102,7 +102,6 @@ it:
 | <WorkerLaunchFailure/> | `docs/direct/launch_failure.md` | — |
 | <AuthorizationContract/> | `docs/direct/authorization.md` | — |
 | <HeldAstraRoles/> | `docs/direct/held_astra_roles.md` | — |
-| <StandingPlanRefill/> | `docs/direct/standing_plan_refill.md` | — |
 | <BerthDecisions/> | `docs/direct/berth_decisions.md` | — |
 | <CodexDispatchWait/> | `docs/direct/codex_dispatch_wait.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
@@ -138,8 +137,7 @@ Read that reply before the next workflow step.
 A completed pass closes its pane and keeps its staff row and native conversation.
 A live detached run keeps the pass active. Its completion uses the same receipt rule.
 A finished run with an absent transcript result permits DONE completion and adds one anomaly line.
-A pending friend reply keeps the same pass and saved launcher arguments.
-Send no recovery prompt while either result remains pending.
+Send no recovery prompt while a run result remains pending.
 For `no DONE`, request a complete result with the saved dispatch id. The next turn hook records it.
 Exit 2 means refused. Exit 4 reports a Codex question and its visible pane lines.
 Answer with `worker.py answer <name> --text "<answer>"`. Keep the same pass.
@@ -161,7 +159,8 @@ An idle worker's next assign opens its conversation on the current role account.
 A closed worker with no active dispatch has nothing to move. A worker that changes family opens a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
-A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
+A completed restore or move rerun prints `unchanged` and exits 0 without a restart notice.
+Restore also lists completed results under <RestartTakeover/>.
 An interrupted split rebuild can leave panes in the source workspace and lose the split ratio.
 Inspect the tab and panes named by the anomaly line. A retry does not rebuild that split.
 
@@ -202,6 +201,8 @@ A no-capacity broadcast turns this mode on until the workers-back notice arrives
 A real worker launch or turn failure containing `hit your usage limit` also turns this mode on.
 That self-on mode lasts through the current phase; try a normal assign at the next phase start.
 A broadcast-on mode keeps its longer lifetime if both triggers occur.
+The no-capacity broadcast also stops every Codex worker and ends each of their open passes as canceled.
+A stop report names your stopped workers, your canceled passes, and each worker that is not proved stopped.
 Send no assign while this mode is on.
 Read `~/.claude/docs/direct/no_worker_mode.md` in full when this mode turns on.
 </NoWorkerMode>
@@ -349,12 +350,11 @@ This applies when a phase is parked, a round fails, a newer tree replaces the
 run's tree, or a result already in hand answers the question. No run finishes
 only to complete a report.
 
-- For a `detached_runs.py` run, read `pid` from its record in
-  `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). Signal only while
-  its `status` is `running` and `ps -p <pid> -o args=` shows
-  `detached_runs.py supervise` with that record's path, so a reused pid is never
-  hit; then run `kill -TERM -- -<pid>`. A start that found the same run live
-  prints no pid: read it from that run's record.
+- For a `detached_runs.py` run, run
+  `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>` with its record in
+  `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). It checks the
+  supervisor and the command identity, so a reused pid is never hit, and stops
+  the command's process group. The supervisor delivers the stopped result.
 - A detached `verify.sh` run uses the same record and command: `verify.sh`
   detaches through `detached_runs.py` and handles TERM to stop its step.
 - For a run in the memory queue, cancel its owning run as above. The queue
@@ -481,6 +481,20 @@ short outcome that row should show: `pass`, `clean`, `no change`. Without one
 the row can only say `done`, which reports that the window closed rather than
 what it found. Activities sit beside passes and are invisible to `findings.py`,
 which is why <PassOwnership/> forbids faking a pass for the same purpose.
+
+<WaitRecord>
+Record each wait and hold, so the units board names the reason. User, 2026-11-15.
+
+- **Wait.** When work you could start waits for a person or for other work, record it:
+  `progress_history.py start-wait --session-dir "${SESSION_DIR}" --kind <kind> --target <work> --by <who> --reason "<what lets it continue>"`.
+  `<work>` is a plan phase id or a queue item's leading id. `<who>` is who keeps it waiting: `the user`, a showrunner, a unit.
+  `<kind>` is `WaitingForUser` for a person's answer and `WaitingForSupplier` for other work.
+- **Hold.** When done work is kept from the merge, record the same command with the done phase id as `--target`.
+  `--reason` says until what: `the user checks the review page`. Use the `--kind` of whoever keeps it.
+- Close the record with `progress_history.py finish-wait --session-dir "${SESSION_DIR}" --wait-id <id>` when the reason ends.
+  `start-phase` of the target and the end of the run close it.
+- A wait for a worker, a gate, a build slot or build memory needs no record here; its own tools record it.
+</WaitRecord>
 
 A requested status check — `/unit:report`, or a user or showrunner asking —
 emits <ProgressReport/> immediately, which `~/.claude/commands/unit/report.md`
@@ -695,9 +709,6 @@ fails the checkpoint.
 </CheckpointCommit>
 
 <ShrinkCommit>
-Standing plans skip this tag entirely: their excluded plan and pinned files
-are never staged, and no shrink commit or notice is sent.
-
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
 <PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
 `${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
@@ -767,10 +778,8 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-At <PhaseEnd/>'s next boundary, a plan whose header carries
-`**Standing:** style_plan.py` runs <StandingPlanRefill/> first. Otherwise choose
-the next phase or close the plan. If no
-todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
+At <PhaseEnd/>'s next boundary, choose the next phase or close the plan.
+If no todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
 point and <CICleanup/>, then <RunSummary/>.
 
 For `next N`, decrement after completion and clear at zero. For `through X`,
@@ -786,10 +795,6 @@ dispatching. Announce the next phase, run
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
-
-<StandingPlanRefill>
-Read `~/.claude/docs/direct/standing_plan_refill.md` in full when the plan header has `**Standing:**`.
-</StandingPlanRefill>
 
 <FinalGateCommit>
 Read `~/.claude/docs/direct/final_gate_commit.md` in full at the final gate or when a `single` task finishes.

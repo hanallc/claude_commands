@@ -180,6 +180,16 @@ class StyleConfigTests(unittest.TestCase):
                     self.assertEqual(len([row for row in staff.initial_snapshot().find(kind="unit", parent=parent.id)
                                           if row.name == assignment.unit]), 1)
 
+    def test_refill_reader_configuration(self) -> None:
+        config = self.root / "style_reader.conf"
+        for reader in style_config.ReaderSource:
+            with self.subTest(reader=reader), mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
+                _ = config.write_text(
+                    f"# one of: python, rust\nreader={reader.value}\n"
+                    + "# text:\ninstall_folder=~/.local/state/style/reader\n")
+                self.assertEqual(style_config.refill_reader(), reader)
+                self.assertEqual(style_config.reader_install_folder(), self.root / ".local/state/style/reader")
+
 
 if __name__ == "__main__":
     _ = unittest.main()

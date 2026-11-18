@@ -51,7 +51,7 @@ from scripts.buildlog.mac_outcome import (
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.aws_target import config as aws_config, ledger, measurement
+from scripts.aws_target import config as aws_config, ledger, measurement, spend as aws_spend
 from scripts.build_targets.target_config import ssh_target_state_directory
 
 
@@ -2271,13 +2271,20 @@ def disk_section() -> list[str]:
         rows.append([free_label, gib(snapshot["free"])])
     rows.extend([f"Cargo outputs unavailable: {reason}", "unavailable"]
                 for reason in snapshot.get("output_unavailable", []))
-    measured = sync.sync_time(snapshot["measured_at"], datetime.now())
+    now = datetime.now()
+    measured = sync.sync_time(snapshot["measured_at"], now)
+    capacity_measured_at = snapshot.get("capacity_measured_at", snapshot["measured_at"])
+    if capacity_measured_at != snapshot["measured_at"]:
+        capacity = sync.sync_time(capacity_measured_at, now)
+        measurement = f"Folder sizes measured by the buildlog disk job at {measured}; free and used space at {capacity}"
+    else:
+        measurement = f"Measured by the buildlog disk job at {measured}"
     return [
         f"### Disk: {snapshot['host']}",
         "",
         *table(["Where", "Size"], rows),
         "",
-        f"Measured by the buildlog disk job at {measured}: allocated blocks, each hard-linked file once.",
+        f"{measurement}: allocated blocks, each hard-linked file once.",
         "",
     ]
 
@@ -2308,32 +2315,43 @@ def peer_sync_lines() -> list[str]:
     return lines
 
 
+def spend_analysis(spends: Sequence[ledger.DailySpend], monthly_limit: Decimal, today: date, pace_days: int) -> list[str]:
+    """Month to date, the month forecast from recent billed days, and the gate compute share."""
+    month = aws_spend.month_spend(spends, today, pace_days)
+    if month is None:
+        return []
+    return [f'**Month to date (UTC {today:%Y-%m}): ${month.to_date:.2f} of the ${monthly_limit:.2f} monthly limit. '
+            + f'Month forecast: ${month.forecast:.2f} at ${month.pace:.2f} a day, the average of the last {month.billed_days} billed days.**',
+            '', f'32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.', '']
+
+
 def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
     settings = conf.path('aws_target')
     directory = ssh_target_state_directory('aws')
     instant = int(time.time())
-    spends: tuple[ledger.DailySpend, ...] = ()
-    daily_limit = Decimal(0)
+    today = datetime.fromtimestamp(instant, UTC).date().isoformat()
+    current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
+    last_estimate_day = today if current_report else day
+    spend: aws_spend.Spend | measurement.MeasurementUnavailable = aws_spend.NO_SPEND
     try:
         inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
         snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
         usage = measurement.daily_usage(settings, directory, day, instant, inputs=inputs)
-        if isinstance(snapshot, measurement.AwsMeasurement) and isinstance(snapshot.costs, ledger.CostEstimate) and not isinstance(inputs.settings, measurement.MeasurementUnavailable):
-            spends = ledger.CostLedger(directory).spend_days(inputs.settings, instant)
-            daily_limit = inputs.settings.daily_limit_usd
+        spend = aws_spend.spend_from(inputs, snapshot, directory, instant, last_estimate_day)
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
+    if isinstance(spend, measurement.MeasurementUnavailable):
+        spend = aws_spend.NO_SPEND
+    shown = list(spend.days)
     saving = aws_report.estimate_wait_saved(connection, day, 'aws', bounds=day_range(day))
-    today = datetime.fromtimestamp(instant, UTC).date().isoformat()
-    current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
-    last_estimate_day = today if current_report else day
-    newest_bill_day = max((spend.day for spend in spends if spend.source == 'AWS bill'), default='')
-    shown = sorted((spend for spend in spends if spend.source == 'AWS bill'
-                    or newest_bill_day < spend.day <= last_estimate_day),
-                   key=lambda spend: spend.day, reverse=True)
-    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, daily_limit, today)]
+    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
+    try:
+        pace_days = conf.read(settings).whole('spend_pace_days')
+        lines.extend(spend_analysis(shown, spend.monthly_limit, date.fromisoformat(today), pace_days))
+    except (OSError, ValueError, KeyError) as error:
+        lines.extend((f'Month forecast unavailable: {error}.', ''))
     notes: list[str] = []
     if saving.steps > 0:
         dollars = uptime = 'unavailable'
@@ -2474,6 +2492,26 @@ def recorder_health_lines(day: str) -> list[str]:
     return lines
 
 
+def linked_steps_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Count selected logical results while retaining every execution host."""
+    start, end = day_range(day)
+    rows = fetch(connection,
+        'SELECT host, count(*), count(DISTINCT CASE WHEN is_final_result=1 THEN step_link END),'
+        + ' sum(CASE WHEN is_final_result=0 THEN duration_s ELSE 0 END), sum(duration_s), max(peak_mem_bytes)'
+        + ' FROM steps WHERE step_link IS NOT NULL AND started_at>=? AND started_at<? GROUP BY host ORDER BY host',
+        start, end)
+    if not rows:
+        return []
+    total = fetch(connection,
+        'SELECT count(DISTINCT step_link) FROM steps WHERE step_link IS NOT NULL'
+        + ' AND is_final_result=1 AND started_at>=? AND started_at<?',
+        start, end)[0][0]
+    body = [[str(host), count(attempts), count(finals), seconds(lost), seconds(elapsed), gib(peak)]
+            for host, attempts, finals, lost, elapsed, peak in rows]
+    return ['### Linked placement steps', '', f'{total} logical results. Lost attempts retain their execution time.', '',
+            *table(['Execution host', 'Attempts', 'Final results', 'Lost time', 'Execution time', 'Peak GiB'], body), '']
+
+
 @target_predicate_scope()
 def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = None) -> str:
     found = kinds(connection, day)
@@ -2494,6 +2532,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += lead_block(connection, day, test_calls, waits, copies)
     lines += waiting_lines(waits)
     lines += rebuilds_section(connection, day)
+    lines += linked_steps_section(connection, day)
     lines += launches_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
@@ -2522,7 +2561,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += [calls_line, *port_lint_line, ci_line, *rust_release.report_line()]
     notes = [
         *peer_sync_lines(),
-        "Peak memory is measured on natedev only. It counts files the step read or wrote that stayed in RAM, so it runs above what the step's processes used.",
+        "Peak memory belongs to the execution host. It includes files that remain in RAM after the step reads or writes them.",
     ]
     lines += ["", *(f"- {note}" for note in notes)]
     return "\n".join(lines)

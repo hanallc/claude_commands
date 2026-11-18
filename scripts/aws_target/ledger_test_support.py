@@ -60,7 +60,8 @@ def text_setting(path: Path, key: str, value: str) -> None:
 
 def install_cost_settings(path: Path, overrides: str = "") -> None:
     """Install complete settings with exact, private test prices."""
-    _ = write_config_fixture(path, "offload=on\nregion=us-east-1\ninstance_id=i-fixture\n" + overrides)
+    _ = write_config_fixture(path, "region=us-east-1\ninstance_type=m7a.4xlarge\nlimit_action=drain\n"
+        + "spot_max_usd_per_hour=0.483\nbox_minimum_seconds=60\n" + overrides)
     numeric_settings(path, {
         "daily_limit_usd": "20", "monthly_limit_usd": "400", "limit_reserve_usd": "3",
         "fallback_usd_per_hour": "1", "fixed_usd_per_month": "0",
@@ -75,6 +76,16 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
     text_setting(path, "cost_explorer_tag_value", "fixture-build")
     text_setting(path, "accounting_zone", "UTC")
     text_setting(path, "notification_recipient", "fixture-showrunner")
+
+
+def install_hana_spending_settings(path: Path) -> None:
+    """Set the private Hana prices, budget, and permit window."""
+    _ = write_config_fixture(path,
+        "enabled=on\nregion=us-east-2\ninstance_type=m7a.2xlarge\n"
+        + "spot_max_usd_per_hour=0.15\nroot_gib=40\ndata_gib=300\n"
+        + "daily_budget_usd=6\ngp3_usd_per_gib_month=0.08\npermit_max_seconds=1800\n"
+        + "guard_grace_seconds=60\nwatchdog_check_seconds=1\nstep_cpu_limit=4\n"
+        + "step_memory_gib=24\nmount_timeout_seconds=15\n")
 
 
 def account_reply(arguments: Sequence[str], amount: str = '0') -> dict[str, object]:
@@ -119,6 +130,10 @@ class CostFixture(unittest.TestCase):
             "AWS_TARGET_CONFIG": str(self.settings),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })))
+        # Login shells set AWS_SHARED_CREDENTIALS_FILE to the real home; the fixture home must decide every AWS path.
+        # The patch above restores the removed names when the test ends.
+        for name in [name for name in os.environ if name.startswith("AWS_") and name != "AWS_TARGET_CONFIG"]:
+            del os.environ[name]
         install_cost_settings(self.settings)
 
     def configure(self, overrides: str) -> None:

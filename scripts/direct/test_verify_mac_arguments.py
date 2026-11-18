@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import final
 
 from scripts.build_hold import build_hold
-from scripts.direct.verify_mac_offload_test_support import BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
+from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP, BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -21,11 +21,10 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 @final
 class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
     def test_decline_runs_same_nextest_words_locally_after_runner(self) -> None:
+        # NextestArgumentTests checks the nextest words of each argument shape. These complete runs keep
+        # a filter run with a package and an ignored-only run with no package and no filter.
         cases = (
-            ("sample", "--filter", "alpha", "--filter", "beta", "--features", "extra"),
             ("sample", "--filter", "alpha", "--features", "extra", "--run-ignored", "only"),
-            ("--run-ignored", "only", "--filter", "alpha", "--features", "extra"),
-            ("sample", "--run-ignored", "only"),
             ("--run-ignored", "only"),
         )
         for arguments in cases:
@@ -65,7 +64,7 @@ class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
                         self.assertNotIn("package(sample)", " ".join(nextest_arguments))
                 self.assertNotIn("--no-cache", runner_arguments)
                 self.assertFalse(runners[0]["token_held"])
-                self.assertTrue(local[0]["token_held"])
+                self.assertTrue(local[0]["token_held"], json.dumps(local[0]) + result.stdout + result.stderr)
                 record = self.last_call()
                 self.assertEqual(record["mac"], "declined")
                 self.assertEqual(record["mac_reason"], "busy")
@@ -99,6 +98,14 @@ from pathlib import Path
 
 from scripts.mac_test import offload
 
+arguments = sys.argv[1:]
+root = Path(os.environ["TEST_RUNNER_STATE"])
+result = Path(arguments[arguments.index("--result") + 1])
+''' + ASSIGNED_RUNNER_SETUP + '''
+if "--assignment-file" in arguments:
+    fixture_outcome = placement.AttemptDeclined("no_tests")
+    fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+    fixture_cleanup_confirmed = True
 with (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-events.jsonl").open("a") as output:
     output.write(json.dumps({"args": sys.argv[1:], "token_held": False, "at": time.time()}) + "\\n")
 result = offload.NoTestMatchedOnMac(4.5)
@@ -106,7 +113,7 @@ destination = offload.ResultFile(Path(sys.argv[sys.argv.index("--result") + 1]))
 raise SystemExit(offload.write_result(result, destination))
 ''')
         result = self.verify("test", "sample", "--no-cache", extra={
-            "VERIFY_MAC_RUNNER": str(runner), "PYTHONPATH": str(VERIFY.parents[2]),
+            "VERIFY_MAC_RUNNER": str(runner), "PYTHONPATH": str(VERIFY.parents[1] / "lib/python_startup"),
         })
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
@@ -131,27 +138,67 @@ raise SystemExit(offload.write_result(result, destination))
 
 @final
 class NextestArgumentTests(unittest.TestCase):
-    def test_only_plain_package_runs_allow_no_tests_on_both_machines(self) -> None:
+    @staticmethod
+    def compose_script(root: Path, *extra: str) -> str:
+        """Return the verify.sh functions that compose nextest words, with fixture metadata for one package."""
         functions = shell_functions(VERIFY, "verify_helper", "read_metadata", "set_gate_metadata", "load_metadata",
                                     "require_member", "qualify_features", "merge_dev_features",
-                                    "take_features", "take_test_targets", "compose_nextest_args")
+                                    "take_features", "take_test_targets", "compose_nextest_args", *extra)
+        metadata: dict[str, object] = {
+            "workspace_root": str(root), "workspace_members": ["sample-id"],
+            "packages": [{"name": "sample", "id": "sample-id", "features": {},
+                          "manifest_path": str(root / "Cargo.toml"), "dependencies": [],
+                          "targets": [{"name": "sample", "kind": ["lib"], "test": True,
+                                       "src_path": str(root / "src/lib.rs")},
+                                      {"name": "integration_suite", "kind": ["test"], "test": True,
+                                       "src_path": str(root / "tests/integration_suite.rs")}]}],
+        }
+        return functions + "\n" + "\n".join((
+            "PY=" + shlex.quote(sys.executable),
+            "VERIFY_METADATA_SCRIPT=" + shlex.quote(str(VERIFY.with_name("verify_metadata.py"))),
+            "GATE_METADATA=" + shlex.quote(json.dumps(metadata)),
+            "CMD=test", "DEV_FEATURES=", "METADATA_READY=0",
+        )) + "\n"
+
+    def test_each_argument_shape_gives_its_ignored_and_package_words(self) -> None:
+        cases = (
+            ("sample", "--filter", "alpha", "--filter", "beta", "--features", "extra"),
+            ("sample", "--filter", "alpha", "--features", "extra", "--run-ignored", "only"),
+            ("--run-ignored", "only", "--filter", "alpha", "--features", "extra"),
+            ("sample", "--run-ignored", "only"),
+            ("--run-ignored", "only"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            script = self.compose_script(Path(directory), "parse_command_arguments") + r'''
+for arguments in "$@"; do
+    FEATURE_FLAGS=() TEST_SELECTION=() NEXTEST_ARGS=()
+    eval "words=($arguments)"
+    parse_command_arguments "${words[@]}"
+    compose_nextest_args
+    printf '%s\0' "${NEXTEST_ARGS[@]}"
+    printf '\0'
+done
+'''
+            result = subprocess.run(["bash", "-e", "-c", script, "compose-test", *(shlex.join(case) for case in cases)],
+                                    cwd=directory, text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        answers = result.stdout.split("\0\0")[:-1]
+        self.assertEqual(len(answers), len(cases))
+        for arguments, answer in zip(cases, answers, strict=True):
+            with self.subTest(arguments=arguments):
+                nextest_arguments = answer.split("\0")
+                if "--run-ignored" in arguments:
+                    ignored = nextest_arguments.index("--run-ignored")
+                    self.assertEqual(nextest_arguments[ignored:ignored + 2], ["--run-ignored", "only"])
+                    self.assertNotIn("--no-tests=warn", nextest_arguments)
+                    self.assertIn("--workspace", nextest_arguments)
+                    if "sample" not in arguments:
+                        self.assertNotIn("package(sample)", " ".join(nextest_arguments))
+
+    def test_only_plain_package_runs_allow_no_tests_on_both_machines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            metadata: dict[str, object] = {
-                "workspace_root": str(root), "workspace_members": ["sample-id"],
-                "packages": [{"name": "sample", "id": "sample-id", "features": {},
-                              "manifest_path": str(root / "Cargo.toml"), "dependencies": [],
-                              "targets": [{"name": "sample", "kind": ["lib"], "test": True,
-                                           "src_path": str(root / "src/lib.rs")},
-                                          {"name": "integration_suite", "kind": ["test"], "test": True,
-                                           "src_path": str(root / "tests/integration_suite.rs")}]}],
-            }
-            script = functions + "\n" + "\n".join((
-                "PY=" + shlex.quote(sys.executable),
-                "VERIFY_METADATA_SCRIPT=" + shlex.quote(str(VERIFY.with_name("verify_metadata.py"))),
-                "GATE_METADATA=" + shlex.quote(json.dumps(metadata)),
-                "CMD=test", "DEV_FEATURES=", "METADATA_READY=0",
-            )) + r'''
+            script = self.compose_script(root) + r'''
 for selection in plain filter target; do
     FEATURE_FLAGS=() TEST_SELECTION=() NEXTEST_ARGS=()
     case "$selection" in

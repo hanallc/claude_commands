@@ -15,7 +15,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 class VerifyMacLocalReleaseTests(VerifyMacOffloadFixture):
     def test_renewer_cleanup_keeps_inherited_jobs(self) -> None:
         functions = shell_functions(Path(__file__).with_name("verify.sh"),
-                                    "start_token_renewer", "stop_token_renewer")
+                                    "collect_child", "start_token_renewer", "stop_token_renewer")
         for renewal_side_job in (False, True):
             with self.subTest(renewal_side_job=renewal_side_job):
                 ready, announce = os.pipe()

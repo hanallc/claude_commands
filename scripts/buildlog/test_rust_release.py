@@ -18,8 +18,9 @@ from scripts.message import send_budget, session_send
 from unittest import mock
 
 from scripts.buildlog import rust_release
-from scripts.lib import cargo_output, scratch
+from scripts.lib import build_folders, cargo_output, scratch
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush, render, user_send_argv
 from scripts.notify.user_action import ActionRequired
@@ -94,6 +95,8 @@ class RustReleaseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
+        private = private_slot_config(Path(temporary), repository="hana")
+        self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"
         self.scratch.mkdir()
@@ -392,7 +395,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertTrue(trial["mend_builds"])
         self.assertGreater(trial["target_gib"], 0)
         self.assertGreater(trial["mend_target_gib"], 0)
-        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.clone.exists())
+        self.assertEqual(build_folders.build_folder_state(runner.clone), "free")
         self.assertTrue(runner.cache.is_dir())
         self.assertEqual(["rustup", "git", "nix", "cargo"], [args[0] for args, _, _, _ in runner.calls])
         clippy = next(call for call in runner.calls if call[0][0] == "nix")
@@ -418,7 +422,8 @@ class RustReleaseTests(unittest.TestCase):
                 mend = runner.calls[-1]
                 root = Path(mend[0][mend[0].index("--root") + 1])
                 self.assertTrue(root.is_relative_to(runner.clone / "target"))
-                self.assertFalse(runner.clone.exists())
+                self.assertTrue(runner.clone.exists())
+                self.assertEqual(build_folders.build_folder_state(runner.clone), "free")
                 self.assertTrue((runner.cache / "mend-root/bin/cargo-mend").is_file())
                 for cache in (runner.cache, runner.cache / "mend-target"):
                     self.assertIn(scratch.CARGO_TAG_LINE, (cache / scratch.CACHE_TAG).read_text())
@@ -429,13 +434,15 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(0, self.invoke(runner=fake))
         first = fake.clone
         cache = fake.cache
-        self.assertFalse(first.exists())
+        self.assertTrue(first.exists())
+        self.assertEqual(build_folders.build_folder_state(first), "free")
         _ = (cache / "warm").write_text("retained")
         rust_release.state_path().unlink()
         self.assertEqual(0, self.invoke(runner=fake))
-        self.assertNotEqual(fake.clone, first)
+        self.assertEqual(fake.clone, first)
         self.assertEqual(fake.stale_outputs, [False, False])
-        self.assertFalse(fake.clone.exists())
+        self.assertTrue(fake.clone.exists())
+        self.assertEqual(build_folders.build_folder_state(fake.clone), "free")
         self.assertEqual(fake.cache, cache)
         self.assertEqual((cache / "warm").read_text(), "retained")
         state = rust_release.read_state()
@@ -452,7 +459,8 @@ class RustReleaseTests(unittest.TestCase):
         trial = state["trial"]
         assert trial["status"] == "finished"
         self.assertFalse(trial["mend_builds"])
-        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.clone.exists())
+        self.assertEqual(build_folders.build_folder_state(runner.clone), "free")
         self.assertTrue(runner.cache.is_dir())
         self.assertIn("The tool that repairs Rust build errors fails to compile", texts[0][1])
 
@@ -465,7 +473,8 @@ class RustReleaseTests(unittest.TestCase):
         trial = state["trial"]
         assert trial["status"] == "failed"
         self.assertEqual(("clippy", "error: clippy broke"), (trial["step"], trial["reason"]))
-        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.clone.exists())
+        self.assertEqual(build_folders.build_folder_state(runner.clone), "free")
         self.assertTrue(runner.cache.is_dir())
         calls = len(runner.calls)
         self.assertEqual(0, self.invoke(runner=runner))
@@ -481,7 +490,8 @@ class RustReleaseTests(unittest.TestCase):
                 state = rust_release.read_state()
                 assert state is not None
                 self.assertEqual("waiting", state["trial"]["status"])
-                self.assertFalse(killed.clone.exists())
+                self.assertTrue(killed.clone.exists())
+                self.assertEqual(build_folders.build_folder_state(killed.clone), "free")
                 self.assertTrue(killed.cache.is_dir())
                 retry = FakeRunner(clone)
                 self.assertEqual(0, self.invoke(at=datetime(2026, 11, 13, 3), runner=retry))
@@ -519,7 +529,8 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "failed"
         self.assertEqual("clippy", trial["step"])
         self.assertGreater(trial["target_gib"], 0)
-        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.clone.exists())
+        self.assertEqual(build_folders.build_folder_state(runner.clone), "free")
         self.assertTrue(runner.cache.is_dir())
 
     def test_waiting_text_is_not_repeated_after_later_trial_or_new_day(self) -> None:
@@ -600,7 +611,8 @@ class RustReleaseTests(unittest.TestCase):
         state = rust_release.read_state()
         assert state is not None
         self.assertEqual({"status": "waiting", "version": "1.100.0", "reason": "build hold active"}, state["trial"])
-        self.assertFalse(runner.clone.exists())
+        self.assertTrue(runner.clone.exists())
+        self.assertEqual(build_folders.build_folder_state(runner.clone), "free")
         self.assertTrue(runner.cache.is_dir())
         self.assertEqual("nix", runner.calls[-1][0][0])
 

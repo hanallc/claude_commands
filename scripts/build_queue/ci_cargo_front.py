@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from functools import partial
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,14 +27,11 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
+from scripts.buildlog import parse
+from scripts.lib import cancellation
 from scripts.lib.descendants import adopt_descendants
 
 
-BUILDING = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
-                      "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "miri", "mend"})
-GLOBAL_VALUES = frozenset({"-C", "--config", "-Z", "--color", "--manifest-path", "--lockfile-path",
-                          "--target-dir", "--target", "-j", "--jobs", "-p", "--package", "--exclude",
-                          "-F", "--features", "--profile", "--message-format", "--artifact-dir", "--out-dir"})
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
 
@@ -44,31 +42,40 @@ class JobTemporaryFolder:
 
 
 def building_call(arguments: Sequence[str]) -> bool:
-    values = iter(arguments)
-    for value in values:
-        if value in GLOBAL_VALUES:
-            _ = next(values, "")
-        elif not value.startswith(("-", "+")):
-            return value in BUILDING
-    return False
+    index = parse.cargo_subcommand_index(arguments)
+    if index is None:
+        return False
+    value = arguments[index]
+    for argument in arguments[index + 1:]:
+        if argument == "--":
+            break
+        if argument in ("-h", "--help") or (value != "install" and argument in ("-V", "--version")):
+            return False
+    return value in parse.CARGO_BUILD_VERBS
 
 
 def cargo_path(explicit: str, front: Path) -> tuple[str, str]:
-    """Keep the admission front before cargo-tile without recursive calls."""
+    """Keep job tools on PATH and remove folders that would call the front again."""
     front = front.resolve()
-    entries = [entry for entry in os.get_exec_path() if Path(entry or ".").resolve() != front.parent]
+    entries: list[str] = []
+    command = ""
+    for entry in os.get_exec_path():
+        folder = Path(entry or ".")
+        if folder.resolve() == front.parent:
+            continue
+        candidate = folder / "cargo"
+        executable = candidate.is_file() and os.access(candidate, os.X_OK)
+        if executable and candidate.resolve() == front:
+            continue
+        entries.append(entry)
+        if not command and executable:
+            command = str(candidate.absolute())
     if explicit:
         command = str(Path(explicit).absolute())
         directory = str(Path(command).parent)
-        if directory in entries:
-            entries = entries[entries.index(directory):]
-        else:
-            entries = [directory, *entries]
+        entries = [directory, *(entry for entry in entries if entry != directory)]
+    if command:
         return command, os.pathsep.join(entries)
-    for index, directory in enumerate(entries):
-        candidate = Path(directory or ".") / "cargo"
-        if candidate.is_file() and os.access(candidate, os.X_OK) and candidate.resolve() != front:
-            return str(candidate.absolute()), os.pathsep.join(entries[index:])
     raise FileNotFoundError("cargo: no cargo executable after the admission front")
 
 
@@ -96,6 +103,26 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
+def remove_abandoned_folders(shared_folder: Path) -> None:
+    """Remove this user's shared admission folders when their owners are not live."""
+    uid = os.getuid()
+    prefix = f"build-admission-ci-{uid}-"
+    with os.scandir(shared_folder) as entries:
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            try:
+                if not entry.is_dir(follow_symlinks=False) or entry.stat(follow_symlinks=False).st_uid != uid:
+                    continue
+                owner = entry.name[len(prefix):].split("-", 2)
+                if (len(owner) == 3 and owner[0].isdecimal() and owner[1].isdecimal()
+                        and records.process_start_time(int(owner[0])) == owner[1]):
+                    continue
+                shutil.rmtree(entry.path)
+            except FileNotFoundError:
+                pass
+
+
 def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_folder: Path | JobTemporaryFolder) -> int:
     pid = os.getpid()
     start = records.process_start_time(pid)
@@ -105,7 +132,11 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     repository, worktree = step_estimator.git_identity(argv, os.getcwd())
     width = records.test_threads(argv)
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
-    with tempfile.TemporaryDirectory(prefix=f"build-admission-ci-{os.getuid()}-",
+    prefix = f"build-admission-ci-{os.getuid()}-"
+    if isinstance(shared_folder, Path):
+        remove_abandoned_folders(shared_folder)
+        prefix += f"{pid}-{start}-"
+    with tempfile.TemporaryDirectory(prefix=prefix,
                                      dir=shared_folder if isinstance(shared_folder, Path) else None) as folder:
         directory = Path(folder)
         directory.chmod(0o755)
@@ -114,67 +145,64 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         sidecar.chmod(0o644)
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
             client.CLOCK.now(), str(sidecar), repository, worktree,
-            os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width)
-        output = client.WaitOutput(configuration=wire.PROTOCOL_ACQUISITION_TIMING)
-        grant = client.service_admit(request, output)
-        if not isinstance(grant, wire.RunnerAdmitted):
-            if isinstance(grant, wire.Refused):
-                print(grant.reason, file=sys.stderr)
-            return 1
-        output.finished()
-        place = queue_place.QueuePlace(sidecar, sidecar, configuration=grant.execution,
-            purpose=queue_place.ProgramPurpose.RUNNER, arguments=tuple(argv))
-        environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
-        status = 1
-        cleanup = ExitStack()
-        try:
-            _ = adopt_descendants()
-            # The main thread forks because the death signal follows the thread that forks.
-            process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
-                                  preexec_fn=partial(end_with_front, pid))
-            stream = process.stderr
-            if stream is None:
-                raise RuntimeError("cargo progress pipe is unavailable")
-            reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
-            reader.start()
-            _ = cleanup.callback(stream.close)
-            _ = cleanup.callback(reader.join)
-            status = process.wait()
-        except SystemExit as error:
-            status = error.code if isinstance(error.code, int) else 1
-            raise
-        finally:
-            with queue_place.defer_cleanup_signals():
-                try:
-                    place.finish(failed=status != 0)
-                finally:
+            os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
+            route=records.direct_cargo_route())
+        with ExitStack() as reservation:
+            try:
+                held = reservation.enter_context(queue_place.held_reservation(request))
+            except queue_place.QueuePlaceRefused as error:
+                print(error, file=sys.stderr)
+                return 1
+            grant = held.grant
+            if not isinstance(grant, wire.RunnerAdmitted):
+                print("the service estimate grant has no runner timing", file=sys.stderr)
+                return 1
+            place = queue_place.QueuePlace(sidecar, sidecar, configuration=grant.execution,
+                purpose=queue_place.ProgramPurpose.RUNNER, arguments=tuple(argv))
+            environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
+            status = 1
+            cleanup = ExitStack()
+            try:
+                _ = adopt_descendants()
+                # The main thread forks because the death signal follows the thread that forks.
+                process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
+                                      preexec_fn=partial(end_with_front, pid))
+                stream = process.stderr
+                if stream is None:
+                    raise RuntimeError("cargo progress pipe is unavailable")
+                reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
+                reader.start()
+                _ = cleanup.callback(stream.close)
+                _ = cleanup.callback(reader.join)
+                status = process.wait()
+            except SystemExit as error:
+                status = error.code if isinstance(error.code, int) else 1
+                raise
+            finally:
+                with cancellation.defer_cleanup_signals():
                     try:
-                        cleanup.close()
+                        place.finish(failed=status != 0)
                     finally:
                         try:
-                            while os.waitpid(-1, os.WNOHANG)[0]:
-                                pass
-                        except ChildProcessError:
-                            pass
+                            cleanup.close()
                         finally:
-                            _ = client.release(grant.reservation, status, grant.cleanup_timing)
+                            try:
+                                while os.waitpid(-1, os.WNOHANG)[0]:
+                                    pass
+                            except ChildProcessError:
+                                pass
+                            finally:
+                                held.status = status
         return status if status >= 0 else 128 - status
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    explicit = ""
-    shared_folder: Path | JobTemporaryFolder = JobTemporaryFolder()
-    front = Path(__file__)
-    if arguments[:1] == ["--front"]:
-        front, arguments = Path(arguments[1]), arguments[2:]
+    call = parse.cargo_front_call(sys.argv[1:] if argv is None else argv)
+    arguments = list(call.arguments)
+    explicit = call.cargo
+    front = Path(call.front) if call.front else Path(__file__)
     # The admission service must read the counter files, and `nix develop` makes TMPDIR private.
-    if arguments[:1] == ["--shared-folder"]:
-        shared_folder, arguments = Path(arguments[1]), arguments[2:]
-    if arguments[:1] == ["--cargo"]:
-        explicit, arguments = arguments[1], arguments[2:]
-    if arguments[:1] == ["--"]:
-        arguments = arguments[1:]
+    shared_folder: Path | JobTemporaryFolder = Path(call.shared_folder) if call.shared_folder else JobTemporaryFolder()
     command, child_path = cargo_path(explicit, front)
     if not building_call(arguments):
         os.execve(command, [command, *arguments], dict(os.environ, PATH=child_path))

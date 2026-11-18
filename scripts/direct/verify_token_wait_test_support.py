@@ -1,15 +1,16 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
-from scripts.build_queue import admission_records
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
+from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from dataclasses import replace
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
-from scripts.lint.memory_test_support import config_environment, write_pressure_reading
+from scripts.lint.memory_test_support import config_environment, write_pressure_reading, write_config_fixture
 
-from collections.abc import Callable
 
 import json
 import os
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import ClassVar, cast, override
 from scripts.lib.process_group import send_process_group
@@ -81,14 +83,17 @@ class VerifyTokenWaitFixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
         self.environment = self.fixture_environment.copy()
-        _ = caller_admission(self, self.root, self.environment)
+        admission = caller_admission(self, self.root, self.environment)
+        admission.configure(waiting_pass_seconds=0.05)
+        admission.server.host_probe = lambda key: private_caller_provider(admission, self.environment, key)
+        _ = caller_provider_controls(self, admission)
 
     def build_fixture(self) -> None:
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         home = self.root / "home"
         home.mkdir()
-        (home / ".claude").symlink_to(VERIFY.parent.parent.parent, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         stubs = self.root / "stubs"
         stubs.mkdir()
         cargo = stubs / "cargo"
@@ -170,6 +175,7 @@ esac
         source = self.root / "src" / "lib.rs"
         source.parent.mkdir()
         _ = source.write_text("pub fn value() -> u8 { 1 }\n")
+        (self.root / ".git").mkdir()
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         # Admission must use this test's memory state, including pressure.
@@ -198,7 +204,7 @@ esac
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
-               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_"))},
+               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_", "UNIT_DETACHED_"))},
             "PATH": stub_build_tool_path(stubs),
             "HOME": str(home),
             # These tests supply the complete build toolchain; nix discovery is
@@ -232,6 +238,7 @@ esac
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
+            "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog/record.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
             "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
@@ -247,7 +254,9 @@ esac
             "TEST_WAIT_HELPER": str(VERIFY.parent / "wait_for_test_state.py"),
             "TEST_CARGO_PID": str(self.root / "cargo-pid"),
             "TEST_MEMORY_EVENT": str(memory_event),
+            "TEST_RUNNER_STATE": str(self.root / "runner-state"),
         }
+        (self.root / "runner-state").mkdir()
 
     def write_wait_sleep(self, body: str) -> None:
         """Fake queue delays. Keep renewal and other delays on the real clock."""
@@ -255,9 +264,12 @@ esac
         if real_sleep is None:
             self.fail("the token fixture requires sleep on PATH")
         path = self.root / "stubs" / "sleep"
+        # A board.sh acquire waits for a held token with sleep 3 in a loop.
+        # A short real pause keeps that loop from spinning on ps, date and cat.
         _ = path.write_text(
             '#!/bin/sh\n'
-            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}"|3) ;;\n'
+            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}") ;;\n'
+            + f'    3) {shlex.quote(real_sleep)} 0.1 ;;\n'
             + f'    *) exec {shlex.quote(real_sleep)} "$@" ;;\nesac\n'
             + body)
         path.chmod(0o755)
@@ -361,32 +373,17 @@ esac
                 if (record := cast(Record, json.loads(line))).get("kind") == "call"]
 
     def verify(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+        script = (Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"
+                  if environment["HOME"] != self.environment["HOME"] else VERIFY)
+        return subprocess.run(["bash", str(script), "check", "sample"], cwd=self.root,
                               env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def wait_for_running(self, path: Path, process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
         self.assertTrue(path.exists(), "verify never reached its expected state")
 
-    def defer_memory_waiter_for_peer(self) -> Callable[[], None]:
-        """Keep the first waiter held while a peer uses the same host reading."""
-        admission = caller_admission(self, self.root, self.environment)
-        with admission.loop_turn():
-            waiting, = admission.server.waiters.values()
-            need = waiting.row["need"]
-            waiting.row["need"] = 60 * admission_records.GIB
-            admission.free(48 * admission_records.GIB)
-
-        def resume() -> None:
-            with admission.loop_turn():
-                waiting.row["need"] = need
-                admission.free(48 * admission_records.GIB)
-
-        self.addCleanup(resume)
-        return resume
-
     def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> subprocess.Popen[bytes]:
-        """Start a verify that takes the token and then waits on the held meminfo.
+        """Start a verify that waits on the held meminfo without the token.
 
         verify.sh tees its step output to stdout, so both streams go to `errors`.
         """
@@ -433,38 +430,60 @@ esac
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
-        """A held natedev for the step's hold wait only.
-
-        verify.sh's first wait-local, before it takes the token, returns at once;
-        the step's wait-local marks `hold-waiting`, then waits for `hold-release`
-        and exits with `wait_status`. Every other verb succeeds.
-        """
+        """Add a private hold at the first placement request."""
+        admission = caller_admission(self, self.root, self.environment)
         holds = self.root / "build-hold"
         holds.mkdir(exist_ok=True)
-        _ = (holds / "holder.json").write_text("{}")
-        stub = self.root / "build_targets_stub.py"
-        _ = stub.write_text(r"""import os, sys
-from pathlib import Path
-with open(Path(os.environ["TEST_REPO"]) / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.direct.wait_for_test_state import wait_until
-root = Path(os.environ["TEST_HOLD_ROOT"])
-if sys.argv[1] == "eligible":
-    print("natedev_only test target")
-    print("natedev\teligible\t-\t-\t-")
-if sys.argv[1] == "wait-local":
-    calls = root / "wait-local-calls"
-    count = len(calls.read_text().splitlines()) if calls.exists() else 0
-    with calls.open("a") as stream:
-        _ = stream.write("wait-local\n")
-    if count >= 1:
-        (root / "hold-waiting").touch()
-        wait_until((root / "hold-release").exists, root)
-        raise SystemExit(int(os.environ["TEST_HOLD_STATUS"]))
-""")
-        return {**self.environment, "UNIT_RUN_DIR": str(board),
-                "UNIT_TEAM_ROLE": "impl", "BUILD_TARGETS_SCRIPT": str(stub),
-                "TEST_HOLD_ROOT": str(self.root), "TEST_HOLD_STATUS": str(wait_status),
-                "TEST_REPO": str(VERIFY.parents[2])}
+        hold = holds / fixture_runtime_id("fixture-hold-owner")
+        released = self.root / "hold-release"
+        held_episode = ""
+        previous = admission.server.handle_request
+        original_provider = admission.server.host_probe
+        if wait_status == 75:
+            _ = (self.root / "build_targets.conf").write_text(
+                "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+                + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
+            _ = write_config_fixture(self.root / "mac-settings",
+                f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+            from scripts.direct.verify_step_routes_test_support import RUNNER
+
+            runner = self.root / "held-mac-runner.py"
+            _ = runner.write_text(RUNNER)
+            self.environment.update({"MAC_TEST_CONFIG": str(self.root / "mac-settings"),
+                "VERIFY_MAC_RUNNER": str(runner), "TEST_MAC_EVENTS": str(self.root / "mac-events")})
+
+        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            # In the Mac case the natedev hold stays, so only the freed Mac can take the step.
+            if released.exists() and wait_status != 75:
+                hold.unlink(missing_ok=True)
+            evidence = original_provider(key)
+            if key.destination.provider == "mac":
+                eligibility = placement.AllowedHost() if released.exists() else placement.TemporaryExclusion("busy")
+                if isinstance(evidence, placement.FreshHostEvidence):
+                    evidence = replace(evidence, eligibility=eligibility)
+            return evidence
+
+        def handle(request: wire.Request,
+                   connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            nonlocal held_episode
+            if isinstance(request, (wire.PlacementRequest, wire.PrerequisiteReport)):
+                if not held_episode:
+                    held_episode = request.episode
+                    _ = hold.write_text("private hold")
+                    for reader in admission.server.host_readers.values():
+                        if reader.key.destination.provider == "local" and isinstance(reader.latest, placement.FreshHostEvidence):
+                            admission.server.publish_host_evidence(replace(reader.latest,
+                                eligibility=placement.TemporaryExclusion("blocked")))
+                if held_episode == request.episode and hold.exists() and not (board / "locks/cargo.d").exists():
+                    (self.root / "hold-waiting").touch()
+            return previous(request, connection)
+
+        admission.server.host_probe = provider
+        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
+        # The provider ends the hold at the next host probe, which comes with the next routing pass.
+        # A short pass interval keeps the waiter from sleeping the default 15 seconds before that probe.
+        return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
+                "BUILD_TARGETS_POLL_S": "0.5"}
 
     def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
         with output.open("wb") as stream:
@@ -509,7 +528,7 @@ exit "$status"
         return process
 
     def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
-        process = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root, env=environment,
+        process = subprocess.Popen(["bash", str(Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"), "check", "sample"], cwd=self.root, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
         self.started_groups.add(process.pid)

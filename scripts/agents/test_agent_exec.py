@@ -1,6 +1,8 @@
 """Shell launchers select the caller's Claude account or the mapped Codex workers home."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
 from scripts.direct.assign_launcher_test_support import backend_fixture_command
 from scripts.direct import test_claude_worker
@@ -21,7 +23,7 @@ from scripts.message import sessions
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id, source_environment
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
-from scripts.whoami.account_test_support import write_codex_auth
+from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -58,7 +60,7 @@ class CodexCliLauncherTests(NixFixture):
         _ = selection.write_text('{"workers": "codex1"}')
         registry = write_registry(self.root / "models.conf", {
             "assignments": {"cli": "codex"},
-            "cli.codex": {"interactive": "gpt-test:high", "commit_prep": "gpt-test:high"},
+            "cli.codex": {"interactive": "gpt-test:high", "merge_branch": "gpt-test:high"},
             "cli.options": {"codex_service_tier": "default"},
             "codex.agents": {"gpt-test": "high"},
         })
@@ -75,7 +77,7 @@ _ = Path(os.environ["CODEX_START_LOG"]).write_text(json.dumps({
 ''')
 
     def test_cli_repl_and_skill_use_the_workers_home_over_a_callers_home(self) -> None:
-        for arguments in ([], ["commit_prep", "noclippy"]):
+        for arguments in ([], ["merge_branch", "feature"]):
             for caller_home in ("", str(self.root / "other-codex-home")):
                 with self.subTest(arguments=arguments, caller_home=caller_home):
                     environment = dict(self.env)
@@ -90,7 +92,7 @@ _ = Path(os.environ["CODEX_START_LOG"]).write_text(json.dumps({
                     expected = ["-m", "gpt-test", "-c", 'model_reasoning_effort="high"',
                                 "-c", 'service_tier="default"']
                     if arguments:
-                        expected.append("commit_prep noclippy")
+                        expected.append("merge_branch feature")
                     self.assertEqual(launched["arguments"], expected)
 
     def test_a_launch_inside_a_worker_reads_the_changed_registry(self) -> None:
@@ -146,7 +148,7 @@ if "NESTED_LAUNCH" not in os.environ:
 
     def test_unavailable_workers_account_refuses_before_codex_starts(self) -> None:
         (self.workers / "auth.json").unlink()
-        for arguments in ([], ["commit_prep", "noclippy"]):
+        for arguments in ([], ["merge_branch", "feature"]):
             with self.subTest(arguments=arguments):
                 result = subprocess.run(["bash", str(SCRIPTS / "cli_agent/cli_agent.sh"), *arguments],
                                         env={**self.env, "CODEX_HOME": str(self.workers)}, cwd=self.work,
@@ -170,15 +172,10 @@ class ClaudeLauncherTests(unittest.TestCase):
             "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
             "CONF_DIR": str(SCRIPTS.parent / "config"),
             **source_environment(self.home / "sources")}, clear=True)))
-        shim = self.home / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True)
-        shim.symlink_to(SCRIPTS / "lib/py")
+        _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text("{}")
         for label in ("claude1", "claude3"):
-            _ = (notes / f"{label}.md").write_text(f"---\nlogin: {label}@example.invalid\n---\n")
-            self.assertEqual(accounts.setup(label), [])
-            _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
-                "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+            create_claude_account(label, f"{label}@example.invalid")
         groups = accounts.groups_file()
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
@@ -225,8 +222,10 @@ class ClaudeLauncherTests(unittest.TestCase):
             with self.subTest(family=family):
                 _ = write_registry(Path(self.environment["MODELS_CONFIG_FILE"]), {"assignments": {"cli": family}})
                 with patch.dict(os.environ, {**self.environment, "MODELS_CONFIG_TIER_ONLY": "1"}):
-                    environment = models_registry.launch_configuration({}).environment(
-                        models_registry.edit_base({}).environment(self.environment))
+                    environment = models_registry.launch_configuration({
+                        **os.environ, models_registry.OPERATION_ENVIRONMENT[0]: ""}).environment(
+                        models_registry.edit_base({
+                            **os.environ, models_registry.OPERATION_ENVIRONMENT[1]: ""}).environment(self.environment))
                 environment.update(TEST_AGENT_ENV=str(recorded), MODELS_CONFIG_TIER_ONLY="1",
                                    CLAUDE_CONFIG_DIR=str(accounts.account_dir("claude1")))
                 result = subprocess.run(["bash", str(SCRIPTS / "cli_agent/cli_agent.sh")],
@@ -278,8 +277,9 @@ class ClaudeLauncherTests(unittest.TestCase):
                         command = ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
                                    str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                                    str(self.home), str(prompt), str(self.home / "result"), str(log)]
-                    result = subprocess.run(command, capture_output=True, text=True, check=True,
+                    result = subprocess.run(command, capture_output=True, text=True, check=False,
                                             env=environment, cwd=self.home)
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     output = log.read_text() if launcher == "exec" else result.stdout
                     launched = cast(LaunchedClaude, json.loads(output.splitlines()[0]))
                     self.assertEqual(launched, {"config": str(accounts.account_dir(expected)),
@@ -299,8 +299,9 @@ class ClaudeLauncherTests(unittest.TestCase):
                            ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
                                    str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                             str(self.home), str(prompt), str(self.home / "result"), str(log)])
-                result = subprocess.run(command, capture_output=True, text=True, check=True,
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
                                         env=self.environment, cwd=self.home)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 output = log.read_text() if launcher == "exec" else result.stdout
                 self.assertEqual(json.loads(output.splitlines()[0]), {"config": "", "memory": "", "token": ""})
 

@@ -16,7 +16,11 @@ class SessionSendTests(unittest.TestCase):
                 continue
             if path == scripts / "message/test_send.py":
                 continue
-            module = ast.parse(path.read_text(), filename=str(path))
+            source = path.read_text()
+            # A sender caller names a target: a parse of each other file only costs time.
+            if not any(target in source for target in targets):
+                continue
+            module = ast.parse(source, filename=str(path))
             if not any((isinstance(node, ast.Name) and node.id in targets)
                        or (isinstance(node, ast.Attribute) and node.attr in targets)
                        for node in ast.walk(module)):

@@ -1,6 +1,6 @@
 ---
 description: Show, pause, exit, retire, rename, move, resume, stop, or restart sessions.
-argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION'
+argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
 ---
 
 Use the `agents` program.
@@ -12,7 +12,7 @@ Use the `agents` program.
 - Add `--finish-step` to pause or exit after the workers finish their current tasks.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
-- `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a name, staff id, session id, or exact Codex thread name.
+- `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
 - `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]`: rename a unit, showrunner, or worker.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
@@ -22,6 +22,7 @@ Use the `agents` program.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
+- `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
 It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
@@ -57,7 +58,7 @@ A stop dry run prints the selected session and workers without stopping them.
 An exited director starts through the shared resume path.
 Stop does not save or restore composer drafts.
 Resume restores the saved folder and environment.
-Codex uses the configured `workers` account; Claude units and showrunners use their configured role accounts.
+Codex uses the `workers` account. Claude units, showrunners, and producers use their group accounts.
 Other Claude sessions use the units account; `--to ACCOUNT` overrides the account.
 The default reason is `resumed by name`.
 Retired units do not appear in active status or the board.
@@ -66,6 +67,9 @@ A running session prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
 Resume restores retained workers with their native conversations.
+In no-worker mode, resume brings back the director alone and keeps every Codex worker stopped.
+The director's resume message then carries the no-worker notice and no worker lines.
+Resume of a Codex worker row is refused in no-worker mode.
 The short form `resume NAME [--retired] [--why TEXT] [--to ACCOUNT]` stays available from any directory.
 
 Use a staff id, a staff path, or a unique name for rename.
@@ -73,22 +77,44 @@ A bare name first selects the calling showrunner or unit and its direct children
 A unit rename changes matching folder and branch suffixes.
 A unit or showrunner rename updates its worker agent names and pane labels to `<new>-<worker>`.
 Use `--to-branch NAME` for an explicit unit branch.
-Keep OLD and NEW equal to change only that branch.
+Keep OLD and NEW equal to change that branch and migrate old qualified worker names.
 A showrunner document move requires both `--to-doc PATH` and `--to-branch NAME`.
 A worker rename changes proved pane titles and keeps shared tab and workspace names.
+Use `agents rename OWNER OWNER` once per owner at deploy to migrate old qualified worker names.
+A qualified prefix must equal the owner name or end with `-<owner name>`.
+A dashed role from staff.WORKER_ROLES keeps its full name and optional trailing digits.
+Other names use the last name component as the bare worker name.
+Without a bare twin, the migration sets the agent name and pane label before the staff name.
+Only OpenWorker, StoppedWorker, or ClosedWorker evidence permits the staff rename.
+Other evidence keeps the row and prints its name and evidence reason.
+Repeat the command after the evidence recovers.
+It ends an old row only when a bare twin exists, its pane is closed, and no dispatch is active.
+It keeps other clashes and prints both rows with the reason.
+A retirement refusal keeps both rows and prints the refusal text.
+The migration then continues with the next worker.
+An undecided prefix prints `/agents rename <id> <bare>`.
+A repeated run keeps completed changes and reports only unresolved rows.
 Repeat an interrupted rename to complete its saved move.
 Show each anomaly and the final output.
 See `docs/as-built/production-rename.md` and `docs/as-built/unit-rename.md`.
 
-Move selects a session id, an exact session name, `units`, or `showrunners`.
+Move selects a session ID, an exact session name, or a group: `units`, `showrunners`, or `producers`.
 It stops each selected session and resumes the same conversation in its local herdr pane on ACCOUNT.
 One resume message explains the move and the retained Codex workers. Workers keep their threads.
 A group move selects the group's account and moves every live member on another account.
+The `producers` move also resumes eligible stopped Claude producers.
 `--dry-run` previews the move. `--why` supplies the resume reason.
 Each member prints one result line. Show the output unchanged.
 Run the command on the machine that holds the session.
 For stop or resume alone, use `agents stop SESSION` or `agents resume SESSION --why TEXT`.
 See `docs/accounts.md` for account checks and refusals.
+
+Transfer runs in a session that has no staff row, on the producer's machine.
+It stops the old conversation and closes its tab. It keeps the row id, the document, and the message queue.
+It sets the row's session, account home, and launch folder, then restarts the caller as the producer.
+`--model` and `--effort` replace `[producers].NAME`; the caller supplies the family.
+A Claude caller must use the producers account. The refusal gives the `agents move` command.
+After a failure, run the same command again.
 
 Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.

@@ -19,7 +19,7 @@
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
   buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
-  buildlog hourly                   sync, vault pull, ci, screenshot scan, then Rust release check
+  buildlog hourly                   sync, vault pull, ci, screenshot scan, Rust release check, then AWS snapshot
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -210,6 +210,20 @@ def screenshot_hourly() -> int:
     ).returncode
 
 
+def aws_snapshot() -> int:
+    from scripts.aws_target.aws_target import hourly
+    from scripts.build_targets.target_config import ssh_target_state_directory
+    from scripts.lib import conf
+
+    return hourly(conf.path('aws_target'), ssh_target_state_directory('aws'))
+
+
+def aws_page() -> int:
+    from scripts.aws_target import aws_page
+
+    return aws_page.publish_configured()
+
+
 def hourly() -> int:
     from scripts.buildlog import ci
     from scripts.buildlog import index
@@ -220,7 +234,8 @@ def hourly() -> int:
 
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
-                      ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release)):
+                      ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
+                      ("AWS snapshot", aws_snapshot), ("AWS page", aws_page)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run
@@ -341,9 +356,15 @@ def main(argv: list[str]) -> int:
         taken = sample.sample()
         if taken.host == "natedev":
             try:
-                mac_idle.watch_once(mac_idle.watch_paths(), taken.at, time.monotonic())
+                mac_idle.watch_once(mac_idle.watch_paths(), taken.at)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
+            from scripts.build_queue import head_stall
+
+            try:
+                _ = head_stall.watch_once(head_stall.default_paths(), taken.at)
+            except (OSError, ValueError) as error:
+                print(f"buildlog sample: head-stall check failed: {error}", file=sys.stderr)
         return 0
     if command == "snapshot":
         from scripts.buildlog import memory

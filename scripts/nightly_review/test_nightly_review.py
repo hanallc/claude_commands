@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+
 from scripts.agents import remote
 
 import json
@@ -41,7 +45,7 @@ UNIT = LiveClaude("nightly-review", "aaaaaaaa-0000-0000-0000-000000000001", "/ru
 PRODUCTION = nightly_review.NightlyProduction(DOC, "build-followups", nightly_review.NightlyUnit(
     staff.StaffRow(staff.StaffId(UNIT.session_id), "unit", SESSION, staff.StaffRoot(),
                    current_session=staff.StaffId(UNIT.session_id),
-                   worktree=staff.PresentWorktree(remote.local_machine(), DOC.parents[1])),
+                   worktree=staff.PresentWorktree(remote.local_machine(), DOC.parents[1]), unit_type=staff.UnitDetails("direct")),
     unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ("nightly-review",)),
 ))
 
@@ -71,7 +75,11 @@ class NightlyReviewTests(unittest.TestCase):
         configuration = self.root / "config"
         configuration.mkdir()
         for stem in ("nightly_review", "accounts", "nix_env"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+            _ = write_config_fixture(configuration / f'{stem}.conf')
+        _ = write_config_fixture(configuration / "nightly_review.conf",
+                                 "review_modes=config rust messages\ncommand_path=~/.claude/commands/nightly_review.md\n"
+                                 + "title_characters=90\nmessage_sample_rows=20\nstate_folder=nightly-review\n"
+                                 + "sample_timeout_overhead_seconds=15\nprimary_showrunner_name=natedev\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)
@@ -102,8 +110,10 @@ class NightlyReviewTests(unittest.TestCase):
         _ = shutil.copyfile(nightly_review.__file__, copied)
         library = copied.parents[1] / "lib"
         library.mkdir()
-        for name in ("process_failure.py", "package_root.py", "transcripts.py"):
-            _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib" / name, library / name)
+        for relative in (*STARTUP_FILES, "scripts/lib/process_failure.py", "scripts/lib/transcripts.py"):
+            destination = copied.parents[2] / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[2] / relative, destination)
         whoami = copied.parents[1] / "whoami"
         whoami.mkdir()
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")

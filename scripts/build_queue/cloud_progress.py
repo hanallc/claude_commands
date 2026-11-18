@@ -16,14 +16,19 @@ CloudState = Literal["requesting", "setup", "running", "uploading"]
 
 @dataclass(frozen=True)
 class CloudProgress:
+    """The cloud progress holds state, instance size, failures, time, and location."""
     state: CloudState
     size_vcpus: int
     failed_modules: int
     updated_at: float
+    stage: str = ""
+    region: str = ""
+    zone: str = ""
 
 
 @dataclass(frozen=True)
 class NoCloudProgress:
+    """The reason identifies missing or unreadable cloud progress."""
     reason: Literal["missing", "unreadable"] = "missing"
 
 

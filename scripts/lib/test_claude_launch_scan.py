@@ -26,6 +26,7 @@ class UnguardedLaunch:
 
 PROCESS_CALLS = {"Popen", "run", "call", "check_call", "check_output", "execvp", "execvpe", "execv", "execve", "execl", "execlp", "system"}
 NO_ARGV_REFERENCES: frozenset[str] = frozenset()
+PYTHON_START_WORDS = re.compile(r"""(?:claude|codex)/*["']""")
 NON_START_COMMANDS = {"agents", "logs", "queue", "stop", "auth", "login", "--version", "--help"}
 
 
@@ -148,7 +149,11 @@ def unguarded_launches(scripts: Path) -> list[UnguardedLaunch]:
             continue
         relative = path.relative_to(scripts).as_posix()
         source = path.read_text(encoding="utf-8")
-        found.extend(python_launches(path, source, relative) if path.suffix == ".py" else shell_launches(source, relative))
+        if path.suffix == ".sh":
+            found.extend(shell_launches(source, relative))
+        # A Python start needs a literal that ends in claude or codex, or the words agent and start.
+        elif PYTHON_START_WORDS.search(source) or ("agent" in source and "start" in source):
+            found.extend(python_launches(path, source, relative))
     return found
 
 
@@ -174,7 +179,8 @@ class ClaudeLaunchScanTests(unittest.TestCase):
                      "codex.py": 'import subprocess\ndef start():\n    argv = ["codex", "exec", "prompt"]\n    subprocess.Popen(argv)\n',
                      "exec.py": 'import os\nos.execvpe("claude", ["claude", "-p", "prompt"], {})\n',
                      "launch.sh": '#!/bin/sh\nexec claude --bg prompt\n',
-                     "herdr.py": 'import subprocess\nsubprocess.run(["herdr", "agent", "start", "worker", "--kind", "claude"])\n'}
+                     "herdr.py": 'import subprocess\nsubprocess.run(["herdr", "agent", "start", "worker", "--kind", "claude"])\n',
+                     "env.py": 'import subprocess\nsubprocess.run(["env", "-u", "--package", "claude", "--print", "prompt"])\n'}
             for name, source in cases.items():
                 _ = (root / name).write_text(source)
             for name in ("test_launch.py", "fake_launch.py", "launch_test_support.py"):
@@ -279,4 +285,5 @@ class ClaudeLaunchScanTests(unittest.TestCase):
             root = Path(temporary)
             _ = (root / "guard.sh").write_text('exec python3 nix_env.py exec /absolute/claude --print prompt\n')
             _ = (root / "query.py").write_text('import subprocess\nsubprocess.run(["claude", "agents", "--json"])\n')
+            _ = (root / "package.py").write_text('import subprocess\nsubprocess.run(["mac_queue_run.py", "--package=claude", "--", "zsh"])\n')
             self.assertEqual(unguarded_launches(root), [])

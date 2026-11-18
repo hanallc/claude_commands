@@ -83,9 +83,9 @@ Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refus
   - members of the server's own `herdr-<n>.service` cgroup;
   - in a shared scope, the pane shell pids the server reports (`pane list` plus `pane process-info`) with their descendants;
   - processes in a pane scope under `app-agents.slice`. A pane scope belongs to the session of a matched process in it, as the unit cgroup did before pane scopes. Only when a pane scope has no matched process (after a handoff) do the unit servers also report their pane shell pids. Without a handoff the parent walk explains each scope, and herdr is not asked. A scope with two sessions (a server started inside a pane) gives its other processes neither.
-- `herdr_place_of(pid)` reads the pane location. `herdr_processes()` returns process evidence with native runtime ids.
+- `herdr_place_of(pid)` reads the pane location. `herdr_processes()` returns process evidence with native runtime ids. Each scan uses an observation snapshot to share pane reads and read process information through the existing socket batch.
 - A process with a non-empty `TMUX_PANE` (a tmux the user runs by hand) is never a herdr place, even when it inherited herdr variables. An empty `TMUX_PANE` excludes nothing.
-- Darwin: processes come from `ps -U <uid>` (`HERDR_PS`), and each row's uid is checked again. Arguments come from a separate `command=` column split after the `comm=` executable; unreadable arguments are `UnreadableProcessArguments`. Listeners come from `lsof -n -P -a -U -u <uid> -F pfn` (`HERDR_LSOF`). `darwin_process_environment(pid)` reads `ps -o command=`, then `ps eww`, then the command again, and parses only the text after a stable argv prefix. cwd comes from `lsof -d cwd`; an unreadable one is `UnreadableCwd` and keeps placement and marks. A failed `ps` with empty output whose pid `os.kill(pid, 0)` confirms gone raises the private `_DarwinProcessGone`, and that process is skipped. `darwin_process_identity(pid)` (`lstart`, `tty`) and `darwin_open_files(pid)` serve the shutdown snapshot.
+- Darwin: processes come from `ps -U <uid>` (`HERDR_PS`), and each row's uid is checked again. Arguments come from a separate `command=` column split after the `comm=` executable; unreadable arguments are `UnreadableProcessArguments`. Listeners come from `lsof -n -P -a -U -u <uid> -F pfn` (`HERDR_LSOF`). `darwin_process_environment(pid)` reads `ps -o command=`, then `ps eww`, then the command again, and parses only the text after a stable argv prefix. One `lsof -a -p <pids> -d cwd -Fpn` call reads candidate working directories by PID. An unreadable directory remains `UnreadableCwd` and keeps placement and marks. A failed `ps` with empty output whose pid `os.kill(pid, 0)` confirms gone raises the private `_DarwinProcessGone`, and that process is skipped. `darwin_process_identity(pid)` (`lstart`, `tty`) and `darwin_open_files(pid)` serve the shutdown snapshot.
 - `_PLATFORM = sys.platform` is read once at import.
 
 **Clients and server environment.** `attached_clients(name) -> ClientsAttached(count) | NoClientAttached | ClientsUnreadable(detail)` counts this user's `herdr session attach <name>` clients and bare `herdr` TUI clients for that session. The session comes from argv `--session` first, then the client's `HERDR_SESSION`, else `default`. A client that exits mid-read counts as gone. `server_environment(name)` returns the environment of the single process holding the session's listening socket. Callers refuse when it holds a variable that must be unset, since panes inherit the server's environment.
@@ -160,7 +160,17 @@ Every Claude launch writes trust before starting Claude. The target account does
 
 The CLI takes `read|type|keys|where` and either `unit <showrunner name> <unit>` or `session <id>` (`read` also takes `--lines N --joined --ansi`). A trust, permission or question prompt refuses typing with exit 4 and `blocked at a prompt; nothing typed`. A missing target exits 1, usage 2 and host failure 3.
 
-These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`restart_support._screen`, 60 lines), and the Remote Control fixer. `restart_support._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
+These consumers use this path:
+
+1. Effort changes through `unit_effort.py`, showrunner promotion, and relays.
+2. The stall watch and `unit_status.sh`, each with 400 joined lines.
+3. Shutdown screen checks through `restart_support._screen`, with 60 lines, and the Remote Control fixer.
+
+`restart_support._screen` checks the registry session identity at the unit's pid before resolving its pane.
+A mismatch returns `ScreenUnreadable("session registry identity changed")`.
+`remote_control.py` finds the newly registered pid's pane through `record_place`.
+It confirms process identity and idle state.
+It then types `/remote-control` unless the pane already shows `/remote-control is active`.
 
 ### Worker questions
 
@@ -179,6 +189,11 @@ Exit 6 means busy before submission.
 A blocked Codex worker receives `shift+left`, the answer through `pane send-text`, and two `enter` keys.
 Herdr checks the target before each key.
 Idle workers and blocked Claude workers use `agent prompt`.
+For an active pass, that prompt includes the saved DONE instruction without changing the pass or saved delivery.
+Use `answer` to resubmit work when compaction consumed the assignment prompt.
+A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
+The pass stays active, and the pane stays open, including a managed worker with `end_worker` set.
+The matching DONE reply then uses the normal completion hook.
 The command refuses workers held by another parent.
 A repeated saved launcher reads the transcript and returns without another submission.
 For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
@@ -307,6 +322,31 @@ An idle worker remains closed until assignment.
 A live session stays unchanged.
 A failed start retains the row on the restart list.
 Restart sends no work prompt.
+
+Restart starts a session in its own pane, as `docs/as-built/shutdown-and-restart.md` describes.
+It waits within `OWN_PANE_SHELL_SECONDS` for that pane to reach the shell.
+When the wait ends first, the start is refused with one line, and the row stays on the restart list.
+A new tab opens only for a session with no own pane; a restart never splits a pane beside a worker.
+For the pane in the saved launch record, restart also waits within `START_SECONDS` for an exiting agent.
+It reuses that pane when fresh reads prove a shell with no native agent.
+The existing resume-check loop closes the old shell through the restore path when its agent exits.
+The loop uses `RESUME_CHECK_SECONDS` and `RESUME_CHECK_INTERVAL_SECONDS`.
+A caller without shared resume checks runs the same cleanup loop before `start_row` returns.
+Failed destination cleanup uses the destination session.
+Source cleanup uses the source session and its original terminal.
+If the old agent outlives that check, one anomaly names the pane, which stays for retire.
+A pane with a live agent, another native owner, or a changed terminal stays open.
+The source record stays until closure, absence, or another native owner is proved.
+Producer publication also keeps a prior binding while its pane remains open.
+It removes a prior binding when a read proves absence or another native owner.
+Consumers select a proved native pane before retained bindings.
+When no native pane exists, consumers select the newest retained publication and keep the older records.
+
+Retirement stops the unit and its workers before it closes their panes.
+It closes each owned retained shell across tabs, even when the director pane is absent.
+It keeps foreign panes and live agents.
+herdr removes a tab when its last pane closes.
+Retirement cannot find an idle shell whose launch record was lost before this fix.
 
 Producers use their current `[producers]` model and effort through the shared launch code.
 Codex producers select the workers account; Claude producers select the showrunners account.

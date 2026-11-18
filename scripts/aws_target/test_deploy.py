@@ -1,14 +1,14 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
-import base64
 from datetime import UTC, datetime
 from decimal import Decimal
-from functools import lru_cache, partial
-import gzip
-from io import BytesIO, StringIO
+from functools import lru_cache
+from hashlib import sha256
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -21,19 +21,19 @@ import sys
 import threading
 import time
 from types import CodeType, SimpleNamespace
-from typing import ClassVar, cast, override
+from typing import ClassVar, Literal, cast, override
 from unittest import mock
-from urllib.request import Request
+from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, ledger, measurement, remote
-from scripts.aws_target.config import read_control_settings
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_spend, ledger, remote
+from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
-from scripts.aws_target.test_box import FAKE as BOX_FAKE, SYSTEM, FakeMonotonicClock, FakeTailnet, write_aws_claim
-from scripts.buildlog import sync
+from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
+from scripts.aws_target.test_spot_end import FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf, conf_reads
+from scripts.lib import conf
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -153,14 +153,6 @@ elif service == 'cloudformation' and operation == 'describe-stacks':
     reply({'Stacks': [{'StackId': state.get('stack_id'), 'StackStatus': state.get('status', 'UPDATE_COMPLETE'),
         'Parameters': [{'ParameterKey': k, 'ParameterValue': v} for k, v in state.get('parameters', {}).items()], 'Outputs': [
         {'OutputKey': key, 'OutputValue': value} for key, value in state['outputs'].items()]}]})
-elif service == 'cloudformation' and operation == 'update-stack':
-    parameters = json.loads(args[args.index('--parameters') + 1])
-    assert all(p.get('UsePreviousValue') is True for p in parameters if p['ParameterKey'] != 'EnableCompute')
-    assert next(p for p in parameters if p['ParameterKey'] == 'EnableCompute')['ParameterValue'] == 'false'
-    state['outputs'].update(ComputeEnabled='false')
-    state['outputs'].pop('InstanceId', None); state['outputs'].pop('DataVolumeId', None)
-    state['instance_state'] = 'terminated'
-    state_path.write_text(json.dumps(state)); reply({})
 elif service == 'cloudformation' and operation == 'delete-stack':
     state_path.unlink(); (root / 'deleted-stack').touch(); reply({})
 elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set'):
@@ -171,34 +163,24 @@ elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set
     else:
         start = args.index('--parameter-overrides') + 1
         params = dict(word.split('=', 1) for word in args[start:] if '=' in word)
-    if params['EnableCompute'] == 'true' and (root / 'fail-compute').exists():
-        print('Compute deploy failed', file=sys.stderr)
-        sys.exit(1)
     owner = json.loads((root / 'state/deployment.json').read_text())
-    outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': params['BudgetName'] or owner['stack'] + '-monthly-' + params['DeploymentId'],
-               'ExistingDataInput': params['ExistingDataVolumeId']}
+    outputs = {'BudgetName': params['BudgetName'] or owner['stack'] + '-monthly-' + params['DeploymentId']}
     outputs.update({key: value for key, value in state.get('outputs', {}).items() if key.startswith('Gate')})
     if operation == 'execute-change-set':
         (root / 'live-template.json').write_text(json.dumps(change['Template']))
-    if params['EnableCompute'] == 'true':
-        outputs.update(InstanceId='i-fixture', DataVolumeId=params['ExistingDataVolumeId'] or 'vol-created')
     owner = json.loads((root / 'state/deployment.json').read_text())
     assert owner['account_id'] == ('210987654321' if owner['stack'] == 'aws-build' else '123456789012')
     assert owner['stack_id'] == (root / 'reserved-stack').read_text()
     assert owner['deployment_id'] == params['DeploymentId']
-    if params['EnableCompute'] == 'true' and state.get('outputs', {}).get('InstanceId'):
-        outputs.update({key: state['outputs'][key] for key in ('InstanceId', 'DataVolumeId')})
     state = {'outputs': outputs, 'stack_name': owner['stack'], 'stack_id': owner['stack_id'], 'parameters': params,
-             'instance_state': 'terminated' if params['EnableCompute'] == 'false' else 'stopped'}
+             'instance_state': 'terminated'}
     (root / 'deleted-stack').unlink(missing_ok=True)
     (root / 'deleted-volume').unlink(missing_ok=True)
     (root / 'deleted-budget').unlink(missing_ok=True)
     state_path.write_text(json.dumps(state))
     (root / 'change-set.json').unlink(missing_ok=True)
     (root / 'update-change-set.json').unlink(missing_ok=True)
-    if params['EnableCompute'] == 'true' and not params['ExistingDataVolumeId']:
-        (root / 'volume-owner').write_text(params['DeploymentId'])
-    if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
+    if (root / 'slow-foundation').exists():
         (root / 'clock').write_text(str(clock + 301))
     reply({})
 elif operation == 'create-image':
@@ -383,7 +365,7 @@ class GateImageAws:
         elif operation == 'describe-stacks':
             reply = {'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'StackId': 'fixture-stack',
                 'Parameters': [{'ParameterKey': 'GateImage', 'ParameterValue': self.image_parameter},
-                               {'ParameterKey': 'EnableCompute', 'ParameterValue': 'false'}],
+                               {'ParameterKey': 'VpcId', 'ParameterValue': 'vpc-fixture'}],
                 'Outputs': [{'OutputKey': 'GateLaunchVersion', 'OutputValue': str(self.version)}]}]}
         elif operation == 'get-template':
             reply = {'TemplateBody': self.live_template}
@@ -442,6 +424,844 @@ class GateImageAws:
                                       for row in transition]}
 
 
+class HanaSetupFailureTests(CostFixture):
+    PROBE_OPERATIONS: ClassVar[tuple[str, ...]] = ('export-credentials', 'describe-instances',
+        'describe-spot-instance-requests', 'describe-instance-attribute', 'modify-instance-attribute',
+        'start-instances', 'stop-instances', 'put-object', 'get-object')
+    clock: TestClock = TestClock()
+    workload: Path = Path()
+    setup_path: Path = Path()
+    book: ledger.CostLedger = ledger.CostLedger(Path())
+    calls: list[list[str]] = []
+    scaler_calls: list[tuple[str, str]] = []
+    instance_reads: list[list[str]] = []
+    deleted_stacks: dict[str, tuple[int, list[dict[str, str]]]] = {}
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.clock = TestClock()
+        self.workload = self.root / 'hana_aws.conf'
+        self.setup_path = self.state / 'hana/setup.json'
+        self.book = ledger.CostLedger(self.state)
+        self.calls = []
+        self.scaler_calls = []
+        self.instance_reads = []
+        self.deleted_stacks = {}
+        _ = write_config_fixture(self.workload, 'ami_id=fixture-image\nami_owner_id=fixture-owner\n'
+            + 'vpc_id=fixture-vpc\nsubnet_id=fixture-subnet\nregion=us-east-2\navailability_zone=us-east-2b\n')
+        self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
+        self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
+        original = conf.read_or_repository
+
+        def configuration(name: str) -> conf.ConfigRead:
+            return conf.read(self.workload) if name == 'hana_aws' else original(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
+        original_path = conf.path
+
+        def configuration_path(name: str | Path) -> Path:
+            return self.workload if name == 'hana_aws' else original_path(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=configuration_path))
+        settings = aws_config.DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gate', 'image',
+            'owner', 'fixture-release', 'us-east-2b', 'vpc', 'subnet', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
+        _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=settings))
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_check_credentials'))
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_validate_inputs'))
+
+    def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False) -> deploy.Deployment:
+        status = 'CREATE_IN_PROGRESS'
+        created = self.clock.now
+        stack_id = 'active-stack'
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal status, created, stack_id
+            self.calls.append(list(arguments))
+            offset = arguments.index('--region') + 2
+            operation = arguments[offset + 1]
+            if operation == 'create-change-set':
+                created = self.clock.now
+                stack_id = f'active-stack-{len(self.deleted_stacks)}'
+                status = 'CREATE_IN_PROGRESS'
+            if operation == 'describe-stacks' and fake.stack:
+                fake.operations.append(operation)
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [
+                    {'StackStatus': status, 'StackId': stack_id}]}), '')
+            if operation == 'list-stacks':
+                self.assertIn('DELETE_COMPLETE', arguments)
+                fake.operations.append(operation)
+                stack_name = conf.read(self.workload).text('stack_name')
+                summaries = [{'StackName': stack_name, 'StackId': identity, 'StackStatus': 'DELETE_COMPLETE',
+                              'CreationTime': datetime.fromtimestamp(at, UTC).isoformat()}
+                             for identity, (at, _) in self.deleted_stacks.items()]
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'StackSummaries': summaries}), '')
+            if operation == 'describe-stack-events':
+                identity = arguments[arguments.index('--stack-name') + 1]
+                if identity in self.deleted_stacks:
+                    fake.operations.append(operation)
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps({
+                        'StackEvents': self.deleted_stacks[identity][1]}), '')
+            if 'stack-create-complete' in arguments:
+                self.clock.advance(1)
+                if waiter_timeout:
+                    raise subprocess.TimeoutExpired('fixture stack create waiter', timeout)
+                status = 'ROLLBACK_COMPLETE'
+                fake.events.append({'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
+                    'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'No capacity in this zone',
+                    'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat()})
+            if operation == 'delete-stack' and fake.stack:
+                if retain_on_delete:
+                    fake.create_retained()
+                fake.roll_back()
+                self.deleted_stacks[stack_id] = (created, fake.events.copy())
+            return fake(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+
+        def api(settings: aws_config.DeploymentSettings) -> aws_cli.AwsCli:
+            return aws_cli.AwsCli(settings.profile, settings.region, settings.timeout_s, execute)
+
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_api', side_effect=api))
+        return deploy.Deployment(self.settings, self.state, self.root / 'output', clock=self.clock, notify=lambda _event: True)
+
+    def write_leftover(self, subject: deploy.Deployment, *, instance: str = '') -> int:
+        limits = hana_spend.read_settings(conf.read(self.workload))
+        reservation = hana_spend.HanaSpending(self.book, self.settings, limits).reserve_setup(
+            self.clock.now, self.clock.now + limits.permit_max_seconds)
+        assert isinstance(reservation, hana_spend.StartReserved)
+        generation = reservation.exposure.generation
+        self.setup_path.parent.mkdir()
+        saved = {'version': 1, 'deployment': HANA_TAG[1], 'stack': conf.read(self.workload).text('stack_name'),
+                 'region': limits.region, 'requested': True, 'generation': generation,
+                 'template_sha256': 'old-template', 'parameters_sha256': 'old-parameters'}
+        if instance:
+            saved['instance'] = instance
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        self.clock.advance(limits.permit_max_seconds + 1)
+        _ = subject.prepare_hana()
+        return generation
+
+    def policy_update_fixture(self, changes: list[dict[str, object]], *, fail_update: bool = False,
+                              change_status: str = 'CREATE_COMPLETE', next_token: str = '',
+                              execution: Literal['accepted', 'refused', 'timeout', 'unknown'] = 'accepted',
+                              stack_disappears: bool = False, changed_scaler_user: str = '',
+                              live_state: ledger.InstanceState = 'stopped', execution_error: str = '',
+                              admin_spot_error: str = '',
+                              scaler_faults: Mapping[tuple[str, str], str] | None = None,
+                              bad_readback: bool = False) -> tuple[deploy.Deployment, dict[str, str]]:
+        scaler_faults = scaler_faults or {}
+        credentials = self.root / '.config/aws-build/credentials'
+        service_settings = self.root / 'service-aws-target.conf'
+        _ = service_settings.write_text('credentials_profile=fixture-service-scaler\n')
+        original_path = conf.path
+
+        def configuration_path(name: str | Path) -> Path:
+            return service_settings if name == 'aws_target' else original_path(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=configuration_path))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'caller-credentials'), 'AWS_ACCESS_KEY_ID': 'fixture-admin-key',
+            'AWS_SECRET_ACCESS_KEY': 'fixture-admin-secret', 'AWS_SESSION_TOKEN': 'fixture-admin-token',
+            'AWS_PROFILE': 'fixture-admin', 'AWS_MAX_ATTEMPTS': '5', 'AWS_CLI_ERROR_FORMAT': 'json'})))
+
+        updated = False
+        object_body = b''
+
+        def scaler(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                   check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal object_body
+            _ = capture_output, text, timeout, check
+            self.assertEqual({key: value for key, value in (env or {}).items() if key.startswith('AWS_')}, {
+                'AWS_SHARED_CREDENTIALS_FILE': str(credentials), 'AWS_CONFIG_FILE': os.devnull,
+                'AWS_EC2_METADATA_DISABLED': 'true'})
+            self.assertEqual(arguments[:5], ['aws', '--profile', 'fixture-service-scaler', '--region', 'us-east-2'])
+            service, operation = arguments[5:7]
+            phase = 'after' if updated else 'before'
+            self.scaler_calls.append((phase, operation))
+            reply: dict[str, object] = {}
+            dry_run = operation in ('modify-instance-attribute', 'start-instances', 'stop-instances')
+            self.assertEqual('--dry-run' in arguments, dry_run)
+            if operation == 'export-credentials':
+                self.assertEqual(service, 'configure')
+                reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret'}
+            elif operation in ('put-object', 'get-object'):
+                self.assertEqual(service, 's3api')
+                self.assertEqual(arguments[7:11], ['--bucket', 'fixture-bucket',
+                    '--key', f"control/{saved['deployment']}/setup-probe.json"])
+                if operation == 'put-object':
+                    object_body = Path(arguments[arguments.index('--body') + 1]).read_bytes()
+                    self.assertTrue(object_body)
+                else:
+                    _ = Path(arguments[-3]).write_bytes(b'wrong' if bad_readback else object_body)
+            else:
+                self.assertEqual(service, 'ec2')
+                if operation == 'describe-spot-instance-requests':
+                    self.assertEqual(arguments[7:9], ['--spot-instance-request-ids', 'fixture-spot-request'])
+                elif operation in ('describe-instance-attribute', 'modify-instance-attribute'):
+                    self.assertEqual(arguments[7:11], ['--instance-id', 'fixture-box', '--attribute', 'userData'])
+                    if operation == 'describe-instance-attribute':
+                        reply = {'UserData': {'Value': 'Zml4dHVyZQ=='}}
+                    else:
+                        value = arguments[arguments.index('--value') + 1]
+                        self.assertTrue(value.startswith('file://'))
+                        original = Path(value.removeprefix('file://')).read_text()
+                        self.assertEqual(original, '' if (phase, 'describe-instance-attribute') in scaler_faults else 'Zml4dHVyZQ==')
+                else:
+                    self.assertEqual(arguments[7:9], ['--instance-ids', 'fixture-box'])
+            code = scaler_faults.get((phase, operation), 'DryRunOperation' if dry_run else '')
+            if code:
+                action = ''.join(word.title() for word in operation.split('-'))
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    f'aws: [ERROR]: An error occurred ({code}) when calling the {action} operation: private diagnostic')
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output',
+                                    execute=scaler, clock=self.clock, notify=lambda _event: True)
+        prepared = subject.prepare_hana()
+        outputs = {'Instance': 'fixture-box', 'DataVolume': 'fixture-volume', 'ControlBucket': 'fixture-bucket'}
+        saved = remote.read_record(self.setup_path)
+        saved.update(requested=True, generation=1, instance=outputs['Instance'], data_volume=outputs['DataVolume'],
+                     bucket=outputs['ControlBucket'], spot_request='fixture-spot-request',
+                     template_sha256=sha256(b'previous fixture template').hexdigest(),
+                     parameters_sha256=sha256(json.dumps(prepared.parameters, sort_keys=True).encode()).hexdigest())
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
+            clock=self.clock).register(hana_box.DeploymentIdentity(ledger.text(saved, 'deployment'), outputs['Instance'],
+                ledger.text(saved, 'spot_request'), ledger.text(saved, 'region')))
+        stack_reads = 0
+        _ = self.enterContext(mock.patch.object(subject.admin, 'environment', side_effect=lambda: dict(os.environ)))
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal stack_reads, updated
+            _ = capture_output, text, check
+            offset = arguments.index('--region') + 2
+            service, operation = arguments[offset:offset + 2]
+            if service == 'ec2' and operation == 'describe-instances':
+                self.instance_reads.append(list(arguments))
+                self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', outputs['Instance']])
+                reply = {'Reservations': [{'Instances': [{'InstanceId': outputs['Instance'],
+                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state},
+                    'SpotInstanceRequestId': 'sir-0123456789abcdef0'}]}]}
+                return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+            if service == 'ec2' and operation == 'describe-spot-instance-requests' and admin_spot_error:
+                self.assertIn('sir-0123456789abcdef0', arguments)
+                assert env is not None
+                self.assertEqual(env['AWS_CLI_ERROR_FORMAT'], 'json')
+                error_format = env['AWS_CLI_ERROR_FORMAT']
+                if '--cli-error-format' in arguments:
+                    error_format = arguments[arguments.index('--cli-error-format') + 1]
+                stderr = (admin_spot_error if error_format == 'legacy' else
+                          json.dumps({'Code': 'InvalidSpotInstanceRequestID.NotFound', 'Message': admin_spot_error}))
+                return subprocess.CompletedProcess(arguments, 1, '', stderr)
+            self.assertEqual(service, 'cloudformation')
+            self.calls.append(list(arguments))
+            reply = {}
+            if operation == 'describe-stacks':
+                stack_reads += 1
+                if stack_disappears and stack_reads == 2:
+                    return subprocess.CompletedProcess(arguments, 1, '', 'ValidationError: stack does not exist')
+                reply = {'Stacks': [{'StackId': 'fixture-stack-id', 'StackStatus': 'CREATE_COMPLETE',
+                    'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()],
+                    'Parameters': [{'ParameterKey': key, 'ParameterValue': value} for key, value in prepared.parameters.items()]}]}
+            elif operation == 'describe-change-set':
+                effective = dict(prepared.parameters)
+                if changed_scaler_user:
+                    effective['ScalerUser'] = changed_scaler_user
+                reply = {'Status': change_status, 'Changes': [{'ResourceChange': change} for change in changes],
+                         'Parameters': [{'ParameterKey': key, 'ParameterValue': value} for key, value in effective.items()]}
+                if change_status == 'FAILED':
+                    reply['StatusReason'] = "The submitted information didn't contain changes."
+                if next_token:
+                    reply['NextToken'] = next_token
+            elif operation == 'execute-change-set':
+                self.assertIsNotNone(env)
+                assert env is not None
+                self.assertEqual(env['AWS_MAX_ATTEMPTS'], '1')
+                if execution_error:
+                    return subprocess.CompletedProcess(arguments, 1, '', execution_error)
+                if execution == 'refused':
+                    return subprocess.CompletedProcess(arguments, 1, '',
+                        'An error occurred (AccessDenied) when calling the ExecuteChangeSet operation '
+                        + '(reached max retries: 0): Fixture refusal')
+                if execution == 'timeout':
+                    raise subprocess.TimeoutExpired('fixture execution', timeout)
+                if execution == 'unknown':
+                    return subprocess.CompletedProcess(arguments, 0, '[]', '')
+            elif operation == 'wait' and arguments[offset + 2] == 'stack-update-complete':
+                self.assertEqual(remote.read_record(self.setup_path), saved)
+                self.assertEqual(self.scaler_calls, [('before', action) for action in self.PROBE_OPERATIONS])
+                if fail_update:
+                    return subprocess.CompletedProcess(arguments, 1, '', 'fixture update failed')
+                updated = True
+            elif operation not in ('create-change-set', 'execute-change-set', 'delete-change-set', 'wait'):
+                raise AssertionError('Unexpected CloudFormation operation: ' + operation)
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        if admin_spot_error:
+            _ = self.enterContext(mock.patch.object(aws_cli, 'subprocess', SimpleNamespace(run=execute)))
+
+        def admin_api(settings: aws_config.DeploymentSettings, *, single_attempt: bool = False) -> aws_cli.AwsCli:
+            executor = subject.admin.executor(aws_cli.execute_command if admin_spot_error else execute,
+                                              single_attempt=single_attempt)
+            return aws_cli.AwsCli(settings.profile, settings.region, settings.timeout_s, executor)
+
+        _ = self.enterContext(mock.patch.object(deploy.Deployment, '_api', side_effect=admin_api))
+        return subject, prepared.parameters
+
+    def run_hana_setup_cli(self, subject: deploy.Deployment) -> tuple[int, str, str]:
+        argv = ['deploy.py', 'hana-setup', '--approve-resources']
+        output, errors = StringIO(), StringIO()
+        child = deploy.Deployment(self.settings, self.state, subject.output / 'hana', clock=self.clock)
+        with mock.patch.object(sys, 'argv', argv), redirect_stdout(output), redirect_stderr(errors), \
+                mock.patch.object(deploy, 'Deployment', side_effect=(subject, child)):
+            status = deploy.main()
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_scaler_policy_limits_instance_attribute_changes_to_hana_tags(self) -> None:
+        template = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_text())))
+        policy = ledger.mapping(ledger.mapping(ledger.mapping(template['Resources'])['ScalerPolicy'])['Properties'])
+        statements = ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+        action = 'ec2:ModifyInstanceAttribute'
+        attribute_statements: list[dict[str, object]] = []
+        for row in statements:
+            actions = row.get('Action')
+            if actions == action or (isinstance(actions, list) and action in cast(list[object], actions)):
+                attribute_statements.append(row)
+        statement, = attribute_statements
+        self.assertEqual(statement['Action'], [action])
+        self.assertEqual(statement['Condition'], {
+            'StringEquals': {'ec2:ResourceTag/HanaDeployment': {'Ref': 'DeploymentId'},
+                             'ec2:ResourceTag/Workload': 'hana'},
+        })
+
+    def test_hana_setup_updates_only_iam_policies_and_saves_the_template_hash(self) -> None:
+        subject, parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }])
+        saved = remote.read_record(self.setup_path)
+        evidence = self.book.read_snapshot()
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertFalse(subject.hana_setup())
+            self.assertEqual(self.calls, [])
+            self.assertEqual(self.scaler_calls, [])
+            self.assertEqual(remote.read_record(self.setup_path), saved)
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+
+        lines = [line for line in output.getvalue().splitlines() if line.startswith('hana-setup probe:')]
+        passed = [f'hana-setup probe: {action}: pass' for action in self.PROBE_OPERATIONS]
+        self.assertEqual(lines, ['hana-setup probe: before the policy update', *passed,
+                                 'hana-setup probe: after the policy update', *passed])
+        self.assertEqual(self.scaler_calls,
+                         [(phase, action) for phase in ('before', 'after') for action in self.PROBE_OPERATIONS])
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertEqual(operations, ['describe-stacks', 'describe-stacks', 'create-change-set', 'wait',
+                                     'describe-change-set', 'execute-change-set', 'wait'])
+        for call in self.calls[2:]:
+            self.assertEqual(call[call.index('--stack-name') + 1], 'fixture-stack-id')
+        create = self.calls[operations.index('create-change-set')]
+        self.assertEqual(create[create.index('--change-set-type') + 1], 'UPDATE')
+        values = cast(object, json.loads(create[create.index('--parameters') + 1]))
+        self.assertEqual(values, [{'ParameterKey': key, 'UsePreviousValue': True} for key in parameters])
+        self.assertEqual(remote.read_record(self.setup_path),
+                         {**saved, 'template_sha256': sha256(deploy.HANA_TEMPLATE.read_bytes()).hexdigest()})
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_probe_reports_all_calls_after_a_failed_user_data_read(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], scaler_faults={('before', 'describe-instance-attribute'): 'UnauthorizedOperation'})
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+
+        lines = [line for line in output.getvalue().splitlines() if line.startswith('hana-setup probe:')]
+        passed = [f'hana-setup probe: {action}: pass' for action in self.PROBE_OPERATIONS]
+        before = [line if action != 'describe-instance-attribute' else
+                  'hana-setup probe: describe-instance-attribute: fail (UnauthorizedOperation)'
+                  for action, line in zip(self.PROBE_OPERATIONS, passed, strict=True)]
+        self.assertEqual(lines, ['hana-setup probe: before the policy update', *before,
+                                 'hana-setup probe: after the policy update', *passed])
+        self.assertNotIn('private diagnostic', output.getvalue())
+
+    def test_hana_setup_exits_one_when_the_last_probe_run_has_a_failure(self) -> None:
+        for operation, code, bad_readback in (
+            ('start-instances', 'UnauthorizedOperation', False),
+            ('stop-instances', 'IncorrectInstanceState', False),
+            ('start-instances', '', False),
+            ('get-object', '', True),
+        ):
+            with self.subTest(operation=operation, code=code, bad_readback=bad_readback):
+                self.scaler_calls.clear()
+                subject, _ = self.policy_update_fixture([{
+                    'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                    'Action': 'Modify', 'Replacement': 'False',
+                }], scaler_faults={('after', operation): code}, bad_readback=bad_readback)
+                status, output, errors = self.run_hana_setup_cli(subject)
+                self.assertEqual(status, 1)
+                self.assertEqual(errors, '')
+                after = output.split('hana-setup probe: after the policy update\n')[1]
+                detail = f' ({code})' if code else ''
+                self.assertEqual(after.splitlines(), [f'hana-setup probe: {action}: '
+                    + (f'fail{detail}' if action == operation else 'pass') for action in self.PROBE_OPERATIONS])
+                self.assertEqual(remote.read_record(self.setup_path)['template_sha256'],
+                                 sha256(deploy.HANA_TEMPLATE.read_bytes()).hexdigest())
+
+    def test_hana_setup_discards_non_policy_changes_and_replacements(self) -> None:
+        changes: list[dict[str, object]] = []
+        subject, _parameters = self.policy_update_fixture(changes)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+        kinds = {'Instance': 'AWS::EC2::Instance', 'DataVolume': 'AWS::EC2::Volume', 'ControlBucket': 'AWS::S3::Bucket'}
+        unsafe = [(name, kind, 'Modify', replacement) for name, kind in kinds.items() for replacement in ('False', 'True')]
+        unsafe.extend(('ScalerPolicy', 'AWS::IAM::ManagedPolicy', action, replacement) for action, replacement in (
+            ('Add', 'False'), ('Remove', 'False'), ('Modify', 'True'), ('Modify', 'Conditional'), ('Modify', '')))
+
+        for name, kind, action, replacement in unsafe:
+            with self.subTest(name=name, action=action, replacement=replacement):
+                change: dict[str, object] = {'LogicalResourceId': name, 'ResourceType': kind, 'Action': action}
+                if replacement:
+                    change['Replacement'] = replacement
+                changes[:] = [
+                    {'LogicalResourceId': 'FixturePolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                     'Action': 'Modify', 'Replacement': 'False'},
+                    change,
+                ]
+                self.calls.clear()
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'IAM policy|replacement'):
+                    _ = subject.hana_setup(approve_resources=True)
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertNotIn('execute-change-set', operations)
+                self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+                create = self.calls[operations.index('create-change-set')]
+                delete = self.calls[-1]
+                self.assertEqual(delete[delete.index('--change-set-name') + 1], create[create.index('--change-set-name') + 1])
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+                self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_setup_policy_update_refuses_changed_parameters(self) -> None:
+        subject, parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        text_setting(self.workload, 'spot_max_usd_per_hour', str(Decimal(parameters['SpotMaxPrice']) / 2))
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'parameters or region changed'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_changed_live_parameters(self) -> None:
+        subject, live_parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        live_parameters['ScalerUser'] = 'fixture-other-scaler'
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'live Hana stack parameters differ'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks', 'describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_changed_effective_parameters(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], changed_scaler_user='fixture-new-scaler')
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'change set parameters differ'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+        self.assertNotIn('execute-change-set', operations)
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_a_busy_lifecycle(self) -> None:
+        subject, _ = self.policy_update_fixture([])
+        path = self.setup_path.with_name('lifecycle.json')
+        lifecycle = remote.read_record(path)
+        busy_values: tuple[dict[str, object], ...] = (
+            {'state': 'ready'}, {'claims': [{'execution': 'fixture-claim'}]},
+            {'start': {'token': 'fixture-start'}}, {'operation': {'action': 'start'}},
+        )
+        for values in busy_values:
+            with self.subTest(values=values):
+                self.calls.clear()
+                write_text_atomic(path, json.dumps({**lifecycle, **values}))
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'again when the box is idle'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(self.instance_reads, [])
+                self.assertEqual(self.scaler_calls, [])
+                self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+
+    def test_hana_policy_update_requires_the_live_instance_to_be_stopped(self) -> None:
+        subject, _ = self.policy_update_fixture([], live_state='running')
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'stopped.*again when the box is idle'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual(len(self.instance_reads), 1)
+        self.assertEqual(self.scaler_calls, [])
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+
+    def test_hana_policy_update_requires_saved_identities_and_lifecycle_registration(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = remote.read_record(self.setup_path)
+
+        for key in ('instance', 'data_volume', 'bucket'):
+            with self.subTest(key=key):
+                write_text_atomic(self.setup_path, json.dumps({name: value for name, value in saved.items() if name != key}))
+                self.calls.clear()
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, f'lacks {key}'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        self.setup_path.with_name('lifecycle.json').unlink()
+        self.calls.clear()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'no lifecycle registration'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(remote.read_record(self.setup_path), saved)
+
+    def test_hana_policy_update_refuses_changed_resource_identities(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = remote.read_record(self.setup_path)
+        saved['bucket'] = 'fixture-other-bucket'
+        write_text_atomic(self.setup_path, json.dumps(saved))
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'resource identities changed'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(remote.read_record(self.setup_path), saved)
+
+    def test_hana_policy_update_refuses_stale_preparation(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        self.clock.advance(301)
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'preparation expired'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_changed_region(self) -> None:
+        subject, _parameters = self.policy_update_fixture([])
+        saved = self.setup_path.read_bytes()
+        text_setting(self.workload, 'region', 'us-east-1')
+        text_setting(self.workload, 'availability_zone', 'us-east-1b')
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'parameters or region changed'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_refuses_a_stack_that_disappears(self) -> None:
+        subject, _parameters = self.policy_update_fixture([], stack_disappears=True)
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'stack is absent'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks', 'describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_a_paginated_change_set(self) -> None:
+        subject, _parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], next_token='fixture-next-page')
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'more than one page'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertIn('--no-paginate', self.calls[operations.index('describe-change-set')])
+        self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+        self.assertNotIn('execute-change-set', operations)
+        create, delete = self.calls[operations.index('create-change-set')], self.calls[-1]
+        self.assertEqual(delete[delete.index('--change-set-name') + 1], create[create.index('--change-set-name') + 1])
+        self.assertEqual(delete[delete.index('--stack-name') + 1], 'fixture-stack-id')
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_empty_and_failed_change_sets(self) -> None:
+        for status in ('CREATE_COMPLETE', 'FAILED'):
+            with self.subTest(status=status):
+                subject, _parameters = self.policy_update_fixture([], change_status=status)
+                saved = self.setup_path.read_bytes()
+                self.calls.clear()
+
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'no changes|failed to create'):
+                    _ = subject.hana_setup(approve_resources=True)
+
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertEqual(operations[-2:], ['describe-change-set', 'delete-change-set'])
+                self.assertNotIn('execute-change-set', operations)
+                self.assertFalse(any('stack-update-complete' in call for call in self.calls))
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_discards_a_definitely_refused_execution(self) -> None:
+        subject, _parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], execution='refused')
+        saved = self.setup_path.read_bytes()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'AccessDenied'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+        self.assertEqual(operations[-2:], ['execute-change-set', 'delete-change-set'])
+        execute, delete = self.calls[-2:]
+        self.assertEqual(delete[delete.index('--change-set-name') + 1], execute[execute.index('--change-set-name') + 1])
+        self.assertEqual(delete[delete.index('--stack-name') + 1], 'fixture-stack-id')
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_keeps_a_change_set_with_an_uncertain_execution(self) -> None:
+        for execution in ('timeout', 'unknown'):
+            with self.subTest(execution=execution):
+                subject, _parameters = self.policy_update_fixture([{
+                    'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                    'Action': 'Modify', 'Replacement': 'False',
+                }], execution=execution)
+                saved = self.setup_path.read_bytes()
+                self.calls.clear()
+
+                with redirect_stdout(StringIO()), self.assertRaises(aws_cli.AwsUnavailable):
+                    _ = subject.hana_setup(approve_resources=True)
+
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertEqual(operations[-1], 'execute-change-set')
+                self.assertNotIn('delete-change-set', operations)
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_policy_update_keeps_the_change_set_without_a_definite_first_attempt_refusal(self) -> None:
+        for error in (
+            'An error occurred (InvalidChangeSetStatus) when calling the ExecuteChangeSet operation (reached max retries: 2)',
+            'An error occurred (AccessDenied) when calling the DescribeChangeSet operation',
+            'An error occurred (InternalFailure) when calling the ExecuteChangeSet operation',
+        ):
+            with self.subTest(error=error):
+                self.calls.clear()
+                subject, _ = self.policy_update_fixture([{
+                    'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+                    'Action': 'Modify', 'Replacement': 'False',
+                }], execution_error=error)
+                saved = self.setup_path.read_bytes()
+                with redirect_stdout(StringIO()), self.assertRaises(aws_cli.AwsUnavailable):
+                    _ = subject.hana_setup(approve_resources=True)
+                operations = [call[call.index('cloudformation') + 1] for call in self.calls]
+                self.assertEqual(operations[-1], 'execute-change-set')
+                self.assertNotIn('delete-change-set', operations)
+                self.assertEqual(self.setup_path.read_bytes(), saved)
+
+    def test_hana_setup_policy_update_failure_prints_the_update_error_and_keeps_the_old_hash(self) -> None:
+        subject, _parameters = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], fail_update=True)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        status, output, errors = self.run_hana_setup_cli(subject)
+
+        self.assertEqual(status, 1)
+        self.assertIn('hana-setup: updating the Hana IAM policy failed after', output)
+        self.assertEqual(errors, 'aws_deploy: fixture update failed\n')
+        self.assertEqual(self.scaler_calls, [('before', action) for action in self.PROBE_OPERATIONS])
+        self.assertEqual(self.calls[-1][self.calls[-1].index('cloudformation') + 1:][:2], ['wait', 'stack-update-complete'])
+        self.assertFalse(any('describe-stack-events' in call or 'delete-stack' in call for call in self.calls))
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_setup_spot_lookup_reports_the_code_with_a_json_error_format_override(self) -> None:
+        subject, _ = self.policy_update_fixture([], admin_spot_error=
+            'An error occurred (InvalidSpotInstanceRequestID.NotFound) when calling the DescribeSpotInstanceRequests operation: '
+            + 'The request sir-0123456789abcdef0 was not found')
+        saved = remote.read_record(self.setup_path)
+        saved['template_sha256'] = sha256(deploy.HANA_TEMPLATE.read_bytes()).hexdigest()
+        write_text_atomic(self.setup_path, json.dumps(saved))
+
+        status, output, errors = self.run_hana_setup_cli(subject)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(errors, 'aws_deploy: describe-spot-instance-requests: fail (InvalidSpotInstanceRequestID.NotFound)\n')
+        self.assertNotIn('sir-0123456789abcdef0', output)
+        self.assertEqual(self.scaler_calls, [])
+
+    def test_failed_hana_create_reports_resource_failure_and_retries_with_changed_ceiling(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
+        subject = self.subject(fake)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaises(aws_cli.AwsUnavailable) as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('Instance (AWS::EC2::Instance): CREATE_FAILED: No capacity in this zone', str(failure.exception))
+        self.assertLess(fake.operations.index('describe-stack-events'), fake.operations.index('delete-stack'))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+
+        ceiling = str(state.hana_compute[0].usd_per_hour / 2)
+        text_setting(self.workload, 'spot_max_usd_per_hour', ceiling)
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'fixture rollback'):
+            _ = subject.hana_setup(approve_resources=True)
+        first, second = [call for call in self.calls if 'create-change-set' in call]
+        self.assertIn('CREATE', first)
+        self.assertIn('CREATE', second)
+        parameters = cast(object, json.loads(second[second.index('--parameters') + 1]))
+        self.assertIn({'ParameterKey': 'SpotMaxPrice', 'ParameterValue': ceiling},
+                      ledger.rows({'parameters': parameters}, 'parameters'))
+
+    def test_failed_hana_cleanup_keeps_the_setup_and_reservation(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete', fail='delete-volume')
+        subject = self.subject(fake)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'did not remove what it made'):
+            _ = subject.hana_setup(approve_resources=True)
+        saved = remote.read_record(self.setup_path)
+        exposure, = self.book.read_snapshot().hana_compute
+        self.assertEqual(saved['generation'], exposure.generation)
+        self.assertIs(saved['requested'], True)
+        self.assertIsInstance(exposure.state, ledger.HanaExposureOpen)
+        self.assertFalse(fake.stack)
+        self.assertTrue(fake.disks)
+        fake.fail = ''
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        storage, = state.hana_storage
+        self.assertEqual(storage.state, ledger.HanaExposureClosed(self.clock.now))
+        charges = ledger.hana_intervals(state, self.clock.now, 0)
+        self.assertEqual(ledger.hana_intervals(state, self.clock.now + 3600, 0), charges)
+
+    def test_hana_create_timeout_before_rollback_keeps_the_setup_and_reservation(self) -> None:
+        fake = FakeEc2(launch_on_execute=True)
+        subject = self.subject(fake, waiter_timeout=True)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'terminal rollback') as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertNotIsInstance(failure.exception, deploy.HanaCreateRolledBack)
+        self.assertTrue(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureOpen)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureOpen)
+        self.assertTrue(fake.stack)
+        self.assertNotIn('delete-stack', fake.operations)
+
+    def test_failed_hana_create_deletes_resources_retained_by_stack_delete(self) -> None:
+        fake = FakeEc2(fail_wait='stack-create-complete')
+        subject = self.subject(fake, retain_on_delete=True)
+        _ = subject.prepare_hana()
+
+        with redirect_stdout(StringIO()), self.assertRaises(deploy.HanaCreateRolledBack):
+            _ = subject.hana_setup(approve_resources=True)
+
+        waited = fake.operations.index('wait stack-delete-complete')
+        self.assertGreater(fake.operations.index('delete-volume'), waited)
+        self.assertGreater(fake.operations.index('delete-bucket'), waited)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_setup_clears_a_missing_stack_record_before_creating_again(self) -> None:
+        fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
+        _ = fake.launch(tagged=True)
+        created = self.clock.now
+        fake.create_retained()
+        fake.roll_back()
+        self.deleted_stacks['previous-stack'] = (created, fake.events.copy())
+        fake.events.clear()
+        subject = self.subject(fake)
+        previous_generation = self.write_leftover(subject)
+
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'fixture rollback'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('hana-setup: cleared the saved setup for the missing stack', output.getvalue())
+        create = fake.operations.index('create-change-set')
+        self.assertLess(fake.operations.index('wait instance-terminated'), create)
+        self.assertLess(fake.operations.index('delete-volume'), create)
+        self.assertLess(fake.operations.index('delete-bucket'), create)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        evidence = self.book.read_snapshot()
+        first, second = evidence.hana_compute
+        self.assertEqual(first.generation, previous_generation)
+        self.assertIsInstance(first.state, ledger.HanaExposureClosed)
+        self.assertGreater(second.generation, previous_generation)
+        self.assertIsInstance(evidence.hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_setup_refuses_to_clear_a_record_without_deleted_stack_evidence(self) -> None:
+        fake = FakeEc2()
+        self.deleted_stacks['older-stack'] = (self.clock.now - 1, [])
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks', 'list-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_down_clears_the_record_and_charges_without_deleted_stack_history(self) -> None:
+        fake = FakeEc2()
+        subject = self.subject(fake)
+        generation = self.write_leftover(subject)
+        self.assertIs(remote.read_record(self.setup_path)['requested'], True)
+        before = self.book.read_snapshot()
+        self.assertIsInstance(before.hana_compute[0].state, ledger.HanaExposureOpen)
+        self.assertIsInstance(before.hana_storage[0].state, ledger.HanaExposureOpen)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+
+        self.assertIn('down --workload hana: no deleted Hana stack since setup started', output.getvalue())
+        self.assertFalse(self.setup_path.exists())
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        after = self.book.read_snapshot()
+        compute, = after.hana_compute
+        storage, = after.hana_storage
+        self.assertEqual(compute.generation, generation)
+        closed = ledger.HanaExposureClosed(self.clock.now)
+        self.assertEqual(compute.state, closed)
+        self.assertEqual(storage.state, closed)
+
+    def test_hana_setup_refuses_a_missing_stack_record_that_names_an_instance(self) -> None:
+        fake = FakeEc2()
+        instance = fake.launch(tagged=True)
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject, instance=instance)
+        saved = self.setup_path.read_bytes()
+        evidence = self.book.read_snapshot()
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks'])
+        self.assertEqual(self.setup_path.read_bytes(), saved)
+        self.assertEqual(self.book.read_snapshot(), evidence)
+
+
 class DeploymentTests(CostFixture):
     now: int = 0
     bundle: Path = Path()
@@ -454,7 +1274,7 @@ class DeploymentTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(box, 'urlopen', side_effect=AssertionError('tests require a fake tailnet transport'))))
-        _ = self.settings.write_text((deploy.TEMPLATE.parents[3] / 'config/aws_target.conf').read_text())
+        _ = write_config_fixture(self.settings)
         self.now = int(datetime.fromisoformat(DAY + "T23:59:00+00:00").timestamp())
         self.bundle = self.root / 'bundle'
         self.bundle.mkdir()
@@ -481,10 +1301,8 @@ class DeploymentTests(CostFixture):
         _ = self.notification_file.write_text('build@example.invalid\n')
         self.text_setting('notification_email_file', str(self.notification_file))
         self.price_file = self.root / 'deployment-price'
-        self.text_setting('deployment_price_file', str(self.price_file))
-        self.write_price()
         values = {
-            'admin_secret_file': str(self.root / 'admin.gpg'), 'offload': 'off', 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
+            'admin_secret_file': str(self.root / 'admin.gpg'), 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
             'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
@@ -506,8 +1324,11 @@ class DeploymentTests(CostFixture):
         for key, value in values.items():
             self.replace(key, value)
         gates = self.root / 'cloud_gate.conf'
-        _ = gates.write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
-        text_setting(gates, 'regions', 'us-east-1')
+        _ = write_config_fixture(gates,
+            "regions=us-east-1\nroot_gib=40\nspot_max_usd_per_hour=0.8\nshared_usd_per_month=1\n")
+        # Quota cases assume these targets; pin them in place so a /tune of the shipped values never breaks a test.
+        _ = gates.write_text(re.sub(r'^(gpu_spot_quota_request_vcpus)=.*$', r'\1=4',
+                                    re.sub(r'^(spot_quota_request_vcpus)=.*$', r'\1=128', gates.read_text(), flags=re.M), flags=re.M))
         _ = cast(object, self.enterContext(mock.patch.object(admin_secrets.AdminSecretSession, 'get', return_value=
             admin_secrets.AdminCredentials('fixture-admin-id', 'fixture-admin-secret', 'fixture-client', 'fixture-oauth-secret'))))
         self.credentials = self.root / 'credentials'
@@ -529,7 +1350,7 @@ class DeploymentTests(CostFixture):
         self.set_clock(self.now)
         if self._testMethodName not in self.process_tests:
             process = SimpleNamespace(**{**cast(Mapping[str, object], vars(subprocess)), 'run': FixtureExecutor(self.root).run})
-            _ = self.enterContext(mock.patch.object(aws_target, 'subprocess', process))
+            _ = self.enterContext(mock.patch.object(aws_cli, 'subprocess', process))
 
     # These tests retain child processes for environment, timeout, exit, and redaction checks.
     process_tests: ClassVar[frozenset[str]] = frozenset({
@@ -631,9 +1452,6 @@ sys.exit(7)
         self.now = at
         _ = (self.root / 'clock').write_text(str(at))
 
-    def write_price(self, price: str = '0.1') -> None:
-        _ = self.price_file.write_text(f'deployment_price_usd_per_hour={price}\n'
-                                       + f'deployment_price_at={self.now}\n')
 
     def deployment(self) -> deploy.Deployment:
         return deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
@@ -662,11 +1480,21 @@ sys.exit(7)
     def test_deployment_step_prints_start_and_elapsed_time(self) -> None:
         output = StringIO()
         with redirect_stdout(output), mock.patch.object(time, 'monotonic', side_effect=[10.0, 12.0]):
-            with deploy.step('remove-builder', 'updating the stack', self.settings, hint='can take several minutes'):
+            with deploy.step('up', 'updating the stack', self.settings, hint='can take several minutes'):
                 pass
         self.assertEqual(output.getvalue().splitlines(), [
-            'remove-builder: updating the stack (can take several minutes)',
-            'remove-builder: updating the stack done in 2 s'])
+            'up: updating the stack (can take several minutes)',
+            'up: updating the stack done in 2 s'])
+
+    def test_deployment_step_reports_failure_and_reraises(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), mock.patch.object(time, 'monotonic', side_effect=[10.0, 12.0]):
+            with self.assertRaises(KeyboardInterrupt):
+                with deploy.step('up', 'updating the stack', self.settings):
+                    raise KeyboardInterrupt
+        self.assertEqual(output.getvalue().splitlines(), [
+            'up: updating the stack',
+            'up: updating the stack failed after 2 s'])
 
     def test_deployment_step_prints_heartbeat_until_completion(self) -> None:
         self.replace('deploy_progress_interval_s', '0.001')
@@ -676,19 +1504,19 @@ sys.exit(7)
             @override
             def write(self, text: str) -> int:
                 count = super().write(text)
-                if 'remove-builder: still updating the stack,' in text:
+                if 'up: still updating the stack,' in text:
                     heartbeat.set()
                 return count
 
         output = ProgressOutput()
         with redirect_stdout(output):
-            with deploy.step('remove-builder', 'updating the stack', self.settings, hint='can take several minutes'):
+            with deploy.step('up', 'updating the stack', self.settings, hint='can take several minutes'):
                 self.assertTrue(heartbeat.wait(TEST_HANG_GUARD_SECS))
-        self.assertRegex(output.getvalue(), r'remove-builder: still updating the stack, \d+ min\n')
+        self.assertRegex(output.getvalue(), r'up: still updating the stack, \d+ min\n')
         self.assertEqual(output.getvalue().splitlines()[0],
-                         'remove-builder: updating the stack (can take several minutes)')
-        self.assertRegex(output.getvalue().splitlines()[-1], r'^remove-builder: updating the stack done in \d+ s$')
-        self.assertEqual(self.previous_output(output.getvalue(), 'remove-builder'), '')
+                         'up: updating the stack (can take several minutes)')
+        self.assertRegex(output.getvalue().splitlines()[-1], r'^up: updating the stack done in \d+ s$')
+        self.assertEqual(self.previous_output(output.getvalue(), 'up'), '')
         self.assertFalse(any(worker.name == 'deployment-progress' for worker in threading.enumerate()))
 
     def test_stack_wait_uses_its_own_timeout_through_the_admin_executor(self) -> None:
@@ -722,14 +1550,14 @@ sys.exit(7)
         self.assertEqual(output.getvalue().splitlines()[0], 'secrets: saving encrypted credentials')
         self.assertEqual(self.previous_output(output.getvalue(), 'secrets'), '')
 
-    def test_gate_trial_command_prints_progress_around_the_trial(self) -> None:
-        arguments = ['deploy.py', 'gate-trial', '--base', 'base', '--changed', 'changed', '--modules', 'fixture/test_ok.py']
-        with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(gate_trial, 'main', return_value=0) as trial,
+    def test_aws_trial_command_prints_progress_around_the_trial(self) -> None:
+        arguments = ['deploy.py', 'aws-trial', '--base', 'base', '--changed', 'changed', '--modules', 'fixture/test_ok.py']
+        with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(aws_trial, 'main', return_value=0) as trial,
               redirect_stdout(StringIO()) as output):
             self.assertEqual(deploy.main(), 0)
         trial.assert_called_once_with(arguments[2:], conf.path('aws_target'), self.state)
-        self.assertEqual(output.getvalue().splitlines()[0], 'gate-trial: running the trial')
-        self.assertEqual(self.previous_output(output.getvalue(), 'gate-trial'), '')
+        self.assertEqual(output.getvalue().splitlines()[0], 'aws-trial: running the trial')
+        self.assertEqual(self.previous_output(output.getvalue(), 'aws-trial'), '')
 
     def commands(self, operation: str = '') -> list[dict[str, object]]:
         path = self.root / 'commands.jsonl'
@@ -752,16 +1580,6 @@ sys.exit(7)
             return result
         return [row for row in rows if not operation or operation in cast(list[str], row['args'])]
 
-    def prepare_stopped_instance(self) -> int:
-        self.set_clock(int(datetime(2026, 1, 15, 12, tzinfo=UTC).timestamp()))
-        self.write_price()
-        for key, value in (('fallback_usd_per_hour', '1'),
-                           ('price_max_age_seconds', '86400'), ('observation_max_age_seconds', '86400'),
-                           ('cost_explorer_read_usd', '0')):
-            self.replace(key, value)
-        ledger.CostLedger(self.state).observe(ledger.InstanceObservation(self.now, 'stopped', 'prior stopped evidence'))
-        _ = self.deployment().prepare()
-        return self.now
 
     def failing_compute(self, failure: str) -> deploy.Deployment:
         compute_returned = False
@@ -788,41 +1606,6 @@ sys.exit(7)
                                            aws_config.read_settings(self.settings), at, current_window=False)
         return [(r.start, r.end, r.usd, r.confirmed_uptime_s) for r in costs.intervals if r.kind == 'instance']
 
-    def assert_compute_failure_accounting(self, failure: str, recovery: str) -> None:
-        start = self.prepare_stopped_instance()
-        subject = self.failing_compute(failure)
-        with self.assertRaises((subprocess.TimeoutExpired, aws_target.AwsUnavailable)):
-            _ = subject.apply(approve_resources=True)
-        book = ledger.CostLedger(self.state)
-        self.assertEqual(len(book.pending_compute_requests()), 1)
-        self.assertEqual(bool(ledger.mapping(remote.read_record(self.state / 'deployment.json').get('outputs', {}))), failure == 'instance')
-        self.set_clock(start + 7200)
-        self.assertEqual(self.instance_intervals(self.now), [(start, self.now, Decimal('2'), 0)])
-        self.write_price()
-        with self.assertRaises(aws_target.AwsUnavailable):
-            _ = subject.prepare()
-        self.assertEqual(len(book.pending_compute_requests()), 1)
-        self.assertEqual(self.instance_intervals(self.now), [(start, self.now, Decimal('2'), 0)])
-        _ = (self.root / 'describe-instances.json').write_text(json.dumps({
-            'Reservations': [{'Instances': [{'InstanceId': 'i-fixture', 'LaunchTime': 'recovered-boot',
-                                            'State': {'Name': 'running'}}]}]}))
-        recovered = self.deployment()
-        if recovery != 'prepare':
-            with self.assertRaisesRegex(deploy.DeploymentRefused, 'expired'):
-                if recovery == 'apply':
-                    _ = recovered.apply(approve_resources=True)
-                else:
-                    _ = recovered.setup_start(approve_resources=True)
-            self.assertEqual(book.pending_compute_requests(), ())
-        _ = recovered.prepare()
-        self.assertEqual(book.pending_compute_requests(), ())
-        decision = ledger.mapping(remote.read_record(self.bundle / 'preflight.json')['decision'])
-        self.assertEqual([(ledger.instant(r, 'start'), ledger.instant(r, 'end'), Decimal(ledger.text(r, 'usd')))
-                          for r in ledger.rows(decision, 'intervals') if r.get('kind') == 'instance'],
-                         [(start, self.now, Decimal('2'))])
-        self.assertEqual(self.instance_intervals(self.now + 3600),
-                         [(self.now, self.now + 3600, Decimal('0.1'), 3600),
-                          (start, self.now, Decimal('2'), 0)])
 
     def update_fixture(self) -> deploy.Deployment:
         subject = self.deployment()
@@ -880,8 +1663,8 @@ sys.exit(7)
                 ledger.mapping(template['Resources'])['GateScalerPolicy'])['Properties'])['PolicyDocument'])
             statements = ledger.rows(image_policy, 'Statement')
             rows = ledger.rows(change, 'Parameters')
-            self.assertEqual(next(row for row in rows if row['ParameterKey'] == 'EnableCompute'),
-                             {'ParameterKey': 'EnableCompute', 'UsePreviousValue': True})
+            self.assertEqual(next(row for row in rows if row['ParameterKey'] == 'VpcId'),
+                             {'ParameterKey': 'VpcId', 'UsePreviousValue': True})
             image_parameter = next(row for row in rows if row['ParameterKey'] == 'GateImage')
             if index == 0:
                 self.assertEqual(statements[-1], {'Sid': 'GateImageTransition', 'Effect': 'Allow',
@@ -954,9 +1737,7 @@ sys.exit(7)
         subject = self.update_fixture()
         self.set_clock(self.now + 1)
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        shipped = (deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_text()
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            re.sub(r'(?m)^instance_types=.*$', 'instance_types=m7a.8xlarge m7a.4xlarge', shipped))
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'instance_types=m7a.8xlarge m7a.4xlarge\n')
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
@@ -971,7 +1752,7 @@ sys.exit(7)
             reply: dict[str, object] = {}
             if operation == 'describe-stacks':
                 reply = {'Stacks': [{'Parameters': [{'ParameterKey': key} for key in
-                    ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail')]}]}
+                    ('VpcId', 'NotificationEmail')]}]}
             elif operation == 'describe-route-tables':
                 reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
                     {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
@@ -989,50 +1770,236 @@ sys.exit(7)
         _ = self.enterContext(mock.patch.object(subject, '_api', return_value=aws_target.AwsCli(
             'build-admin', 'us-east-1', 1, execute=execute)))
         _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
-        _ = self.enterContext(mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+        _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+        # A gate deploy reads prices at its end; the fixture keeps that read local.
+        _ = self.enterContext(mock.patch.object(deploy, 'read_price_snapshot', return_value=0))
         return subject, commands
+
+    def test_gate_up_reads_prices_at_once_after_the_stack_update(self) -> None:
+        subject, _commands = self.gate_fixture()
+        output = StringIO()
+        with mock.patch.object(deploy, 'read_price_snapshot', return_value=0) as fill, redirect_stdout(output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        fill.assert_called_once()
+        self.assertEqual(fill.call_args.args, (self.settings, self.state))
+        self.assertIs(cast(bool, fill.call_args.kwargs['force']), True)
+        # The deploy shows the reasons, so it sends no alert; the hourly refresh still can.
+        notify = cast(Callable[[str, object, float], bool], fill.call_args.kwargs['notify'])
+        self.assertFalse(notify('fixture-key', object(), 1.0))
+        self.assertIn('cloud-gate: Spot prices and quotas read', output.getvalue())
+
+    def test_failed_price_read_retries_and_keeps_the_deploy(self) -> None:
+        subject, _commands = self.gate_fixture()
+        pauses: list[float] = []
+        subject.pause = pauses.append
+        output = StringIO()
+        with mock.patch.object(deploy, 'read_price_snapshot', return_value=1) as fill, redirect_stdout(output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        configuration = conf.read(self.settings)
+        attempts = configuration.whole('deploy_price_fill_attempts')
+        self.assertEqual(fill.call_count, attempts)
+        self.assertEqual(pauses, [configuration.number('deploy_price_fill_pause_s')] * (attempts - 1))
+        self.assertIn('the Spot price read failed', output.getvalue())
+
+    def test_price_read_error_names_its_reason_and_keeps_the_deploy(self) -> None:
+        subject, _commands = self.gate_fixture()
+        output = StringIO()
+        with mock.patch.object(deploy, 'read_price_snapshot', side_effect=OSError('fixture lock refusal')), redirect_stdout(output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        self.assertIn('the Spot price read did not run: OSError: fixture lock refusal', output.getvalue())
+        self.assertIn('the Spot price read failed', output.getvalue())
 
     def test_gate_up_records_regional_stack_after_home_stack(self) -> None:
         subject, commands = self.gate_fixture()
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
         west: dict[str, object] = {'region': 'us-west-2', 'image': 'ami-west', 'subnets': [],
             'template': 'lt-west', 'version': '1', 'security_group': 'sg-west', 'stack': 'fixture-west'}
+        network = deploy.RegionalNetwork('us-west-2', 'vpc-fixture-west', [], 'ami-west')
         def regional(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
-                     _parameters: dict[str, str], region: str) -> dict[str, object]:
+                     _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
             self.assertTrue(any('execute-change-set' in command for command in commands))
-            self.assertEqual(region, 'us-west-2')
+            self.assertEqual(given, network)
             return west
-        with mock.patch.object(subject, 'regional_gate_stack', side_effect=regional):
+        with mock.patch.object(subject, 'regional_network', return_value=network), \
+                mock.patch.object(subject, 'regional_gate_stack', side_effect=regional):
             self.assertTrue(subject.gate_up(approve_resources=True))
+        change_set = next(command for command in commands if 'create-change-set' in command)
+        passed = {ledger.text(row, 'ParameterKey'): row for row in
+                  ledger.rows({'rows': json.loads(change_set[change_set.index('--parameters') + 1])}, 'rows')}
+        known = ledger.mapping(ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))['Parameters'])
+        self.assertEqual(set(passed) - set(known), set())
+        self.assertNotIn('GateSubnets', passed)
+        vpcs = ledger.text(passed['GateVpcs'], 'ParameterValue').split(',')
+        self.assertEqual([vpc.split(':')[3] for vpc in vpcs], ['us-east-2', 'us-west-2'])
+        self.assertTrue(vpcs[1].endswith(':vpc/vpc-fixture-west'))
+        self.assertTrue(ledger.text(passed['GateRegionImages'], 'ParameterValue').endswith(':ec2:us-west-2::image/ami-west'))
         saved = remote.read_record(self.state / 'gate-deployment.json')
         self.assertEqual([row['region'] for row in ledger.rows(saved, 'regions')], ['us-east-2', 'us-west-2'])
         self.assertEqual(ledger.rows(saved, 'regions')[1], west)
+        self.assertEqual(saved['instance_types'], ['m7a.8xlarge', 'm7a.4xlarge'])
+
+    def test_gate_up_prints_regional_progress_and_uses_saved_times(self) -> None:
+        subject, _commands = self.gate_fixture()
+        regions = ('us-west-2', 'eu-north-1')
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 ' + ' '.join(regions))
+        clock = [0.0]
+        path = self.state / 'gate-region-times.json'
+        network_action = 'preparing the network and image'
+        stack_action = 'updating the gate stack'
+        network_seconds = (2, 4)
+        stack_seconds = (160, 170)
+        output = StringIO()
+
+        def completed(key: str, action: str, region: str, durations: tuple[int, int]) -> None:
+            index = regions.index(region)
+            self.assertIn(f'cloud-gate: {region}: {action} ({index + 1} of 2)', output.getvalue())
+            if index:
+                saved = ledger.mapping(remote.read_record(path)['seconds'])
+                self.assertEqual(ledger.mapping(saved[key])[regions[0]], durations[0])
+            clock[0] += durations[index]
+
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            completed('network', network_action, region, network_seconds)
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+
+        def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+            completed('stack', stack_action, given.region, stack_seconds)
+            return {'region': given.region}
+
+        for run in range(2):
+            output = StringIO()
+            with (mock.patch.object(subject, 'regional_network', side_effect=network),
+                    mock.patch.object(subject, 'regional_gate_stack', side_effect=stack),
+                    mock.patch.object(time, 'monotonic', side_effect=lambda: clock[0]), redirect_stdout(output)):
+                self.assertTrue(subject.gate_up(approve_resources=True))
+            lines = output.getvalue().splitlines()
+            previous = -1
+            for action, durations, total in ((network_action, network_seconds, 6), (stack_action, stack_seconds, 330)):
+                estimate = f'expected total {total} s from saved regional times' if run else 'expected total is not yet measured'
+                expected = [f'cloud-gate: {action} in 2 regions: {estimate}']
+                for index, region in enumerate(regions):
+                    expected.extend((f'cloud-gate: {region}: {action} ({index + 1} of 2)',
+                                     f'cloud-gate: {region}: {action} done in {durations[index]} s'))
+                for line in expected:
+                    position = lines.index(line)
+                    self.assertGreater(position, previous)
+                    previous = position
+            self.assertEqual(remote.read_record(path), {'version': 1, 'seconds': {
+                'network': dict(zip(regions, network_seconds)), 'stack': dict(zip(regions, stack_seconds))}})
+            network_seconds = (3, 5)
+            stack_seconds = (150, 180)
+
+    def test_regional_time_estimate_uses_the_median_for_an_unmeasured_region(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        _ = path.write_text('{"version": 1, "seconds": {"stack": {"us-west-2": 120, "eu-north-1": 180}}}')
+        timings = deploy.GateRegionTimings.read(self.state)
+        output = StringIO()
+        with redirect_stdout(output):
+            timings.announce(deploy.GateRegionOperation.STACK, ('us-west-2', 'eu-north-1', 'us-east-1'))
+        self.assertEqual(output.getvalue(),
+                         'cloud-gate: updating the gate stack in 3 regions: expected total 450 s from saved regional times\n')
+
+    def test_invalid_regional_times_do_not_supply_an_estimate(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        for contents in ('{', '{}', '{"version": 2}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": -1}}}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": true}}}',
+                         '{"version": 1, "seconds": {"stack": {"us-west-2": NaN}}}'):
+            with self.subTest(contents=contents):
+                _ = path.write_text(contents)
+                with redirect_stdout(StringIO()) as output:
+                    deploy.GateRegionTimings.read(self.state).announce(deploy.GateRegionOperation.STACK, ('us-west-2',))
+                self.assertEqual(output.getvalue(),
+                    'cloud-gate: updating the gate stack in 1 regions: expected total is not yet measured\n')
+
+    def test_regional_time_overflow_does_not_supply_an_estimate(self) -> None:
+        path = self.state / 'gate-region-times.json'
+        _ = path.write_text(json.dumps({'version': 1, 'seconds': {'stack': {'us-west-2': 10**400}}}))
+        with redirect_stdout(StringIO()) as output:
+            deploy.GateRegionTimings.read(self.state).announce(deploy.GateRegionOperation.STACK, ('us-west-2',))
+        self.assertEqual(output.getvalue(),
+            'cloud-gate: updating the gate stack in 1 regions: expected total is not yet measured\n')
+
+    def test_gate_up_warns_and_continues_when_it_cannot_write_regional_times(self) -> None:
+        subject, _commands = self.gate_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
+        (self.state / 'gate-region-times.json').mkdir()
+        network = deploy.RegionalNetwork('us-west-2', 'fixture-vpc', [], 'fixture-image')
+        with (mock.patch.object(subject, 'regional_network', return_value=network),
+                mock.patch.object(subject, 'regional_gate_stack', return_value={'region': network.region}),
+                redirect_stdout(StringIO()) as output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        warnings = [line for line in output.getvalue().splitlines() if 'warning:' in line]
+        self.assertEqual(warnings, ['cloud-gate: warning: could not write gate-region-times.json'] * 2)
+        manifest = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual([row['region'] for row in ledger.rows(manifest, 'regions')], ['us-east-2', 'us-west-2'])
+
+    def test_gate_up_saves_each_successful_region_before_a_later_region_fails(self) -> None:
+        subject, _commands = self.gate_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2 eu-north-1')
+        def network(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, region: str) -> deploy.RegionalNetwork:
+            return deploy.RegionalNetwork(region, 'fixture-vpc', [], 'fixture-image')
+        def stack(_api: aws_target.AwsCli, _settings: aws_config.DeploymentSettings, _home: dict[str, str],
+                  _parameters: dict[str, str], given: deploy.RegionalNetwork) -> dict[str, object]:
+            if given.region == 'eu-north-1':
+                raise aws_target.AwsUnavailable('fixture regional failure')
+            return {'region': given.region}
+        with (mock.patch.object(subject, 'regional_network', side_effect=network),
+                mock.patch.object(subject, 'regional_gate_stack', side_effect=stack), redirect_stdout(StringIO())):
+            with self.assertRaisesRegex(aws_target.AwsUnavailable, 'fixture regional failure'):
+                _ = subject.gate_up(approve_resources=True)
+        saved = ledger.mapping(remote.read_record(self.state / 'gate-region-times.json')['seconds'])
+        self.assertEqual(set(ledger.mapping(saved['network'])), {'us-west-2', 'eu-north-1'})
+        self.assertEqual(set(ledger.mapping(saved['stack'])), {'us-west-2'})
+        manifest = remote.read_record(self.state / 'gate-deployment.json')
+        self.assertEqual([row['region'] for row in ledger.rows(manifest, 'regions')], ['us-east-2', 'us-west-2'])
 
     def test_prices_lists_all_region_type_zone_combinations_without_ids(self) -> None:
         subject = self.deployment()
         text_setting(self.settings, 'region', 'us-east-2')
         text_setting(self.settings, 'availability_zone', 'us-east-2a')
-        _ = (self.root / 'cloud_gate.conf').write_bytes((deploy.TEMPLATE.parents[3] / 'config/cloud_gate.conf').read_bytes())
+        _ = write_config_fixture(self.root / 'cloud_gate.conf')
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
+        gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
+        # The fixture names its own types, so a tuned live value never changes this test.
+        text_setting(self.root / 'cloud_gate.conf', 'instance_types', 'm7a.8xlarge')
+        text_setting(self.root / 'cloud_gate.conf', 'gpu_instance_types', ' '.join(gpu_types))
+        price_regions: list[str] = []
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
             region = args[args.index('--region') + 1]
             if 'get-service-quota' in args:
-                reply: dict[str, object] = {'Quota': {'Value': 128}}
+                code = args[args.index('--quota-code') + 1]
+                self.assertIn(code, ('L-34B43A08', 'L-3819A6DF'))
+                reply: dict[str, object] = {'Quota': {'Value': 48 if code == 'L-3819A6DF' else 128}}
             elif 'describe-availability-zones' in args:
                 reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
             else:
-                reply = {'SpotPriceHistory': [{'InstanceType': 'm7a.8xlarge', 'AvailabilityZone': region + 'a',
-                                              'SpotPrice': '.25', 'Timestamp': 'fixture'}]}
+                self.assertIn('describe-spot-price-history', args)
+                price_regions.append(region)
+                sizes = args[args.index('--instance-types') + 1:args.index('--product-descriptions')]
+                self.assertTrue(set(gpu_types).issubset(sizes))
+                self.assertEqual(len(sizes), len(set(sizes)))
+                reply = {'SpotPriceHistory': [
+                    {'InstanceType': size, 'AvailabilityZone': region + 'a', 'SpotPrice': '.25', 'Timestamp': '2026-01-15T00:00:00Z'}
+                    for size in ('m7a.8xlarge', *gpu_types)]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         with (mock.patch.object(subject, '_api', return_value=aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)),
               redirect_stdout(StringIO()) as output):
             subject.prices()
         lines = output.getvalue().splitlines()
-        self.assertIn('us-east-2 m7a.8xlarge us-east-2a .25', lines)
-        for region in ('us-east-2', 'us-west-2'):
+        self.assertEqual(price_regions, ['us-east-2', 'us-west-2', 'us-east-1'])
+        self.assertIn('us-east-2 m7a.8xlarge us-east-2a 0.25', lines)
+        for region in ('us-east-2', 'us-west-2', 'us-east-1'):
             self.assertIn(f'{region}: Spot quota 128 vCPUs', lines)
+            self.assertEqual(lines[lines.index(f'{region}: Spot quota 128 vCPUs') + 1],
+                             f'{region}: G and VT Spot quota 48 vCPUs')
             for size in ('r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge'):
                 self.assertIn(f'{region} {size} {region}a unavailable', lines)
+            for size in gpu_types:
+                self.assertIn(f'{region} {size} {region}a 0.25', lines)
         self.assertTrue(all('ami-' not in line and 'arn:' not in line for line in lines))
 
     def test_prices_and_up_report_regional_quotas_through_the_admin_executor(self) -> None:
@@ -1049,15 +2016,16 @@ sys.exit(7)
             ('m7a.metal', {'us-east-1': 1, 'us-west-2': 32}, 0),
             ('m7a.unknown', {'us-east-1': 1, 'us-west-2': 32}, 0),
             ('m7a m7a.metal m7a.large m7a.8xlarge m7a.xlarge', {'us-east-1': 16, 'us-west-2': 32}, 32))
-        for command in ('prices', 'up'):
+        for command in ('prices',):
             for instance_types, quotas, largest in cases:
                 with self.subTest(command=command, quotas=quotas, instance_types=instance_types):
                     gates = self.root / 'cloud_gate.conf'
                     text_setting(gates, 'regions', ' '.join(quotas))
+                    text_setting(gates, 'spot_candidate_regions', ' '.join(quotas))
                     text_setting(gates, 'instance_types', instance_types)
                     subject = self.deployment()
                     subject.admin.credentials = subject.admin.get()
-                    calls: list[str] = []
+                    calls: list[tuple[str, str]] = []
                     execute = subject.execute
 
                     def quota_execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
@@ -1065,14 +2033,18 @@ sys.exit(7)
                                       env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                         region = arguments[arguments.index('--region') + 1] if '--region' in arguments else ''
                         if 'get-service-quota' in arguments:
+                            code = arguments[arguments.index('--quota-code') + 1]
                             self.assertNotIn('--profile', arguments)
                             self.assertIsNotNone(env)
                             self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
                             self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
                             self.assertEqual(list(arguments[arguments.index('service-quotas'):]),
                                 ['service-quotas', 'get-service-quota', '--service-code', 'ec2',
-                                 '--quota-code', 'L-34B43A08', '--output', 'json'])
-                            calls.append(region)
+                                 '--quota-code', code, '--output', 'json'])
+                            calls.append((region, code))
+                            if code == 'L-3819A6DF':
+                                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 48}}), '')
+                            self.assertEqual(code, 'L-34B43A08')
                             quota = quotas[region]
                             if quota == 'timeout':
                                 raise subprocess.TimeoutExpired('fixture-admin-secret', timeout)
@@ -1090,17 +2062,16 @@ sys.exit(7)
 
                     subject.execute = quota_execute
                     with mock.patch.object(deploy, 'largest_gate_vcpus', wraps=deploy.largest_gate_vcpus) as count_vcpus:
-                        if command == 'up':
-                            success, output = self.up_output(subject)
-                            self.assertTrue(success, output)
-                            self.assertIn('scaler-key:', output)
-                        else:
-                            with redirect_stdout(StringIO()) as captured:
-                                subject.prices()
-                            output = captured.getvalue()
-                            self.assertIn('us-east-1 r7a.8xlarge us-east-1a unavailable', output)
+                        with redirect_stdout(StringIO()) as captured:
+                            subject.prices()
+                        output = captured.getvalue()
+                        self.assertIn('us-east-1 r7a.8xlarge us-east-1a unavailable', output)
                         count_vcpus.assert_called_once_with(tuple(instance_types.split()))
-                    self.assertEqual(calls, list(quotas))
+                    codes = ('L-34B43A08', 'L-3819A6DF') if command == 'prices' else ('L-34B43A08',)
+                    self.assertEqual(calls, [(region, code) for region in quotas for code in codes])
+                    self.assertEqual([line for line in output.splitlines() if ': G and VT' in line],
+                                     [f'{region}: G and VT Spot quota 48 vCPUs' for region in quotas]
+                                     if command == 'prices' else [])
                     lines = [line for line in output.splitlines()
                              if ': Spot' in line or ': cannot run' in line or ': gate vCPU' in line]
                     expected: list[str] = []
@@ -1122,6 +2093,7 @@ sys.exit(7)
                     self.assertNotIn('fixture-admin-secret', output)
 
     def test_prices_prints_whole_quotas_and_the_header_after_the_passphrase_prompt(self) -> None:
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-east-1')
         subject = self.deployment()
         credentials = subject.admin.get()
         prompted = False
@@ -1146,7 +2118,312 @@ sys.exit(7)
         with mock.patch.object(subject.admin, 'get', side_effect=unlock), redirect_stdout(StringIO()) as captured:
             subject.prices()
         lines = captured.getvalue().splitlines()
-        self.assertEqual(lines, ['Admin passphrase: ', 'region type zone price', 'us-east-1: Spot quota 300 vCPUs'])
+        self.assertEqual(lines, ['Admin passphrase: ', 'region type zone price', 'us-east-1: Spot quota 300 vCPUs',
+                                'us-east-1: G and VT Spot quota 300 vCPUs'])
+
+    def test_prices_continues_after_a_failed_g_quota_read_without_error_details(self) -> None:
+        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-1 us-west-2')
+        for failure, reason in (('denied', 'AccessDeniedException'), ('timeout', 'TimeoutExpired'), ('malformed', 'KeyError')):
+            with self.subTest(failure=failure):
+                subject = self.deployment()
+
+                def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    args = list(arguments)
+                    region = args[args.index('--region') + 1]
+                    reply: dict[str, object]
+                    if 'get-service-quota' in args:
+                        code = args[args.index('--quota-code') + 1]
+                        if code == 'L-3819A6DF' and region == 'us-east-1':
+                            if failure == 'denied':
+                                return subprocess.CompletedProcess(args, 1, '',
+                                    'An error occurred (AccessDeniedException) when calling GetServiceQuota: '
+                                    + 'fixture-admin-secret arn:aws:iam::123456789012:user/private')
+                            if failure == 'timeout':
+                                raise subprocess.TimeoutExpired('fixture-admin-secret', 1)
+                            reply = {}
+                        else:
+                            reply = {'Quota': {'Value': 48 if code == 'L-3819A6DF' else 128}}
+                    elif 'describe-availability-zones' in args:
+                        reply = {'AvailabilityZones': [{'ZoneName': region + 'a'}]}
+                    else:
+                        self.assertIn('describe-spot-price-history', args)
+                        reply = {'SpotPriceHistory': []}
+                    return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+
+                subject.execute = execute
+                with redirect_stdout(StringIO()) as output:
+                    subject.prices()
+                lines = output.getvalue().splitlines()
+                self.assertIn(f'us-east-1: G and VT Spot quota unknown: {reason}', lines)
+                self.assertIn('us-west-2: G and VT Spot quota 48 vCPUs', lines)
+                self.assertIn('us-west-2 r7a.8xlarge us-west-2a unavailable', lines)
+                self.assertNotIn('fixture-admin-secret', output.getvalue())
+                self.assertNotIn('arn:', output.getvalue())
+                self.assertNotIn('123456789012', output.getvalue())
+
+    def test_quota_status_prints_aligned_regional_blocks_without_writes(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        home = conf.read(self.settings).text('region')
+        other, candidate = 'us-west-2', 'eu-north-1'
+        text_setting(gates, 'regions', home + ' ' + other)
+        text_setting(gates, 'spot_candidate_regions', other + ' ' + candidate)
+        text_setting(gates, 'credential_file', str(self.credentials))
+        values = conf.read(gates)
+        desired = {'L-34B43A08': values.whole('spot_quota_request_vcpus'),
+                   'L-3819A6DF': values.whole('gpu_spot_quota_request_vcpus')}
+        zone = 'Pacific/Honolulu'
+        updated = datetime.fromtimestamp(self.now, UTC)
+        created = datetime.fromtimestamp(self.now - 86400, UTC)
+        date = updated.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+        created_date = created.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+        history = 'list-requested-service-quota-change-history-by-quota'
+        calls: list[tuple[str, str, str]] = []
+        subject = self.deployment()
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(capture_output and text)
+            self.assertFalse(check)
+            self.assertGreater(timeout, 0)
+            self.assertNotIn('--profile', arguments)
+            assert env is not None
+            self.assertEqual(env['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+            self.assertEqual(env['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
+            self.assertEqual(env['AWS_SHARED_CREDENTIALS_FILE'], str(self.credentials))
+            region = arguments[arguments.index('--region') + 1]
+            operation = arguments[arguments.index('service-quotas') + 1]
+            code = arguments[arguments.index('--quota-code') + 1]
+            self.assertIn(operation, ('get-service-quota', history))
+            self.assertNotIn('--no-paginate', arguments)
+            self.assertNotIn('--max-items', arguments)
+            calls.append((region, code, operation))
+            reply: dict[str, object]
+            if operation == 'get-service-quota':
+                reply = {'Quota': {'Value': desired[code], 'QuotaName': 'private-name', 'QuotaArn': 'arn:private-quota'}}
+            else:
+                rows: list[dict[str, object]] = []
+                if (region, code) == (home, 'L-34B43A08'):
+                    rows = [{'DesiredValue': desired[code], 'Status': 'APPROVED', 'Created': created.timestamp(),
+                             'LastUpdated': created.timestamp()},
+                            {'DesiredValue': desired[code] + 1, 'Status': 'CASE_OPENED', 'CaseId': 'case-fixture',
+                             'Created': created.isoformat(), 'LastUpdated': updated.isoformat(),
+                             'Id': 'private-request', 'Requester': 'private-account', 'QuotaArn': 'arn:private-quota'}]
+                elif (region, code) == (other, 'L-3819A6DF'):
+                    rows = [{'DesiredValue': desired[code], 'Status': 'PENDING',
+                             'Created': created.isoformat().replace('+00:00', 'Z')}]
+                reply = {'RequestedQuotas': rows}
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        subject.execute = execute
+        before = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
+                  for path in self.root.rglob('*')}
+        with (mock.patch.dict(os.environ, {'USER_ZONE': zone}),
+              mock.patch.object(deploy, 'Deployment', return_value=subject),
+              mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
+              mock.patch.object(deploy, 'write_text_atomic', side_effect=AssertionError('The report must not write')),
+              mock.patch.object(deploy, 'write_bytes_atomic', side_effect=AssertionError('The report must not write')),
+              mock.patch.object(subject, '_guard', side_effect=AssertionError('The report must not change the ledger')),
+              redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+            self.assertEqual(deploy.main(), 0, errors.getvalue())
+        after = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
+                 for path in self.root.rglob('*')}
+        self.assertEqual(before, after)
+        # The candidate region has only a price read, so the report reads no quota there.
+        self.assertEqual(calls, [(region, code, operation) for region, code in (
+            (home, 'L-34B43A08'), (home, 'L-3819A6DF'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'))
+            for operation in ('get-service-quota', history)])
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line for line in lines if line and not line.startswith((' ', 'Summary:'))],
+                         [home, other])
+        self.assertEqual([line.strip() for line in lines if line.startswith('  ') and not line.startswith('    ')], [
+            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
+            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied',
+            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
+            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied'])
+        headers = [line for line in lines if 'Asked vCPUs' in line]
+        requests = [line for line in lines if line.startswith('    ') and any(
+            status in line for status in ('CASE_OPENED', 'APPROVED', 'PENDING'))]
+        self.assertEqual([re.split(r' {2,}', line.strip()) for line in requests], [
+            [str(desired['L-34B43A08'] + 1), 'CASE_OPENED', 'case-fixture', date],
+            [str(desired['L-34B43A08']), 'APPROVED', '-', created_date],
+            [str(desired['L-3819A6DF']), 'PENDING', '-', created_date]])
+        for line, status in zip(requests[:2], ('CASE_OPENED', 'APPROVED')):
+            self.assertEqual(line.index(status), headers[0].index('Status'))
+            self.assertEqual(line.index(date if status == 'CASE_OPENED' else created_date), headers[0].index('Updated'))
+        self.assertEqual(lines.count('    No requests.'), 2)
+        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
+        fits = f'{home}, {other}' if desired['L-3819A6DF'] >= needed else 'no region has enough applied quota'
+        self.assertEqual(lines[-1], f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
+            + f'open requests: {home} Standard Spot {desired["L-34B43A08"] + 1} vCPUs (CASE_OPENED), '
+            + f'{other} G and VT Spot {desired["L-3819A6DF"]} vCPUs (PENDING)')
+        for private in ('private-name', 'private-request', 'private-account', 'arn:', 'fixture-admin-id', 'fixture-admin-secret'):
+            self.assertNotIn(private, output.getvalue() + errors.getvalue())
+
+    def test_quota_status_continues_after_regional_failures_and_exits_one(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        home = conf.read(self.settings).text('region')
+        other = 'us-west-2'
+        text_setting(gates, 'regions', home + ' ' + other)
+        text_setting(gates, 'spot_candidate_regions', home + ' ' + other)
+        history = 'list-requested-service-quota-change-history-by-quota'
+        for failure in ('get-service-quota', history, 'timeout', 'uncoded'):
+            with self.subTest(failure=failure):
+                subject = self.deployment()
+                calls: list[tuple[str, str, str]] = []
+
+                def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                            timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    _ = capture_output, text, check, env
+                    region = arguments[arguments.index('--region') + 1]
+                    operation = arguments[arguments.index('service-quotas') + 1]
+                    code = arguments[arguments.index('--quota-code') + 1]
+                    self.assertIn(operation, ('get-service-quota', history))
+                    calls.append((region, code, operation))
+                    if region == home and code == 'L-34B43A08':
+                        if failure == 'timeout':
+                            raise subprocess.TimeoutExpired('private-timeout', timeout)
+                        if failure == 'uncoded' or operation == failure:
+                            reason = 'private-error' if failure == 'uncoded' else (
+                                'An error occurred (AccessDeniedException) when calling quota operation: private-error arn:private')
+                            return subprocess.CompletedProcess(arguments, 1, '', reason)
+                    reply: dict[str, object] = {'Quota': {'Value': conf.read(gates).whole('spot_quota_request_vcpus')}}
+                    if operation == history:
+                        reply = {'RequestedQuotas': []}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+                subject.execute = execute
+                with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(deploy.main(), 1)
+                expected = 'TimeoutExpired' if failure == 'timeout' else 'AwsUnavailable' if failure == 'uncoded' else 'AccessDeniedException'
+                self.assertIn(f'    Quota status failed: {expected}', output.getvalue())
+                self.assertIn((other, 'L-34B43A08', history), calls)
+                self.assertIn((other, 'L-3819A6DF', history), calls)
+                self.assertIn((home, 'L-3819A6DF', history), calls)
+                summary = output.getvalue().splitlines()[-1]
+                self.assertTrue(summary.startswith('Summary: GPU trial needs '))
+                self.assertIn('request history unavailable: ' + home + ' Standard Spot', summary)
+                self.assertIn('open requests: unknown', summary)
+                for private in ('private-error', 'private-timeout', 'arn:'):
+                    self.assertNotIn(private, output.getvalue() + errors.getvalue())
+
+    def test_quota_status_summary_uses_the_trial_types_and_ignores_closed_requests(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        home = conf.read(self.settings).text('region')
+        text_setting(gates, 'regions', home)
+        text_setting(gates, 'spot_candidate_regions', home)
+        prices = gpu_size_trial.settings().spot_max_usd_per_hour
+        sizes = sorted(prices, key=lambda name: aws_target.largest_gate_vcpus((name,)))
+        applied = aws_target.largest_gate_vcpus((sizes[0],))
+        asked = conf.read(gates).whole('gpu_spot_quota_request_vcpus')
+        for size in (sizes[0], sizes[-1]):
+            with self.subTest(size=size):
+                text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', json.dumps({size: str(prices[size])}))
+                needed = aws_target.largest_gate_vcpus(tuple(gpu_size_trial.settings().spot_max_usd_per_hour))
+                subject = self.deployment()
+                def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    operation = arguments[arguments.index('service-quotas') + 1]
+                    if operation == 'get-service-quota':
+                        reply: dict[str, object] = {'Quota': {'Value': applied}}
+                    else:
+                        self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
+                        reply = {'RequestedQuotas': [{'DesiredValue': asked, 'Status': status}
+                            for status in ('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST')]}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+                subject.execute = execute
+                with redirect_stdout(StringIO()) as output:
+                    self.assertTrue(subject.quota_status())
+                fits = home if applied >= needed else 'no region has enough applied quota'
+                self.assertEqual(output.getvalue().splitlines()[-1],
+                    f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; open requests: none')
+
+    def test_quota_status_summary_separates_unread_quotas_and_unread_history(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        home = conf.read(self.settings).text('region')
+        other = 'us-west-2'
+        text_setting(gates, 'regions', home + ' ' + other)
+        text_setting(gates, 'spot_candidate_regions', home + ' ' + other)
+        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
+        history = 'list-requested-service-quota-change-history-by-quota'
+        for failure in ('get-service-quota', history):
+            with self.subTest(failure=failure):
+                subject = self.deployment()
+                def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    region = arguments[arguments.index('--region') + 1]
+                    operation = arguments[arguments.index('service-quotas') + 1]
+                    code = arguments[arguments.index('--quota-code') + 1]
+                    self.assertIn(operation, ('get-service-quota', history))
+                    if region == home and code == 'L-3819A6DF' and operation == failure:
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            'An error occurred (AccessDeniedException) when calling quota operation: fixture refusal')
+                    reply: dict[str, object] = {'Quota': {'Value': needed}}
+                    if operation == history:
+                        reply = {'RequestedQuotas': [{'DesiredValue': needed, 'Status': 'PENDING'}]}
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+                subject.execute = execute
+                with redirect_stdout(StringIO()) as output:
+                    self.assertFalse(subject.quota_status())
+                fits = f'{other}, unknown for {home}' if failure == 'get-service-quota' else f'{home}, {other}'
+                self.assertEqual(output.getvalue().splitlines()[-1],
+                    f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; open requests: unknown; '
+                    + f'request history unavailable: {home} G and VT Spot')
+                self.assertIn('PENDING', output.getvalue())
+
+    def test_quota_status_credential_refusal_stops_before_aws(self) -> None:
+        subject = self.deployment()
+        message = 'Run deploy.py secrets in a terminal'
+        with (mock.patch.object(subject.admin, 'get', side_effect=admin_secrets.SecretsRefused(message)),
+              mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')),
+              mock.patch.object(deploy, 'Deployment', return_value=subject),
+              mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
+              redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+            self.assertEqual(deploy.main(), 1)
+        self.assertEqual(output.getvalue(), '')
+        self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
+
+    def test_quota_request_without_an_environment_override_reaches_aws_with_the_configured_file(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        text_setting(gates, 'credential_file', str(self.credentials))
+        expected = str(Path(conf.read(gates).text('credential_file')).expanduser())
+        subject = self.deployment()
+        calls: list[str] = []
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(capture_output and text)
+            self.assertFalse(check)
+            self.assertGreater(timeout, 0)
+            self.assertIsNotNone(env)
+            self.assertEqual(cast(dict[str, str], env)['AWS_SHARED_CREDENTIALS_FILE'], expected)
+            self.assertIn('get-service-quota', arguments)
+            calls.append(arguments[arguments.index('--region') + 1])
+            return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 300}}), '')
+
+        subject.execute = execute
+        with (mock.patch.dict(os.environ), mock.patch.object(deploy, 'Deployment', return_value=subject),
+              mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors):
+            _ = os.environ.pop('AWS_SHARED_CREDENTIALS_FILE', None)
+            self.assertEqual(deploy.main(), 0, errors.getvalue())
+            self.assertEqual(os.environ['AWS_SHARED_CREDENTIALS_FILE'], expected)
+        self.assertTrue(calls)
+
+    def test_quota_request_prints_one_credential_refusal_and_stops_before_aws(self) -> None:
+        message = 'Run deploy.py secrets in a terminal to restore the encrypted credentials'
+        for error in (admin_secrets.SecretsRefused(message), deploy.DeploymentRefused(message)):
+            with self.subTest(error=type(error).__name__):
+                subject = self.deployment()
+                with (mock.patch.object(subject.admin, 'get', side_effect=error) as get,
+                      mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')) as execute,
+                      mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(deploy.main(), 1)
+                get.assert_called_once_with()
+                execute.assert_not_called()
+                self.assertEqual(output.getvalue(), '')
+                self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
 
     def test_quota_request_uses_admin_credentials_and_continues_after_regional_failures(self) -> None:
         get_quota = 'get-service-quota'
@@ -1170,7 +2447,10 @@ sys.exit(7)
             (5, '', '', 'timeout', False),
             (5, '', '', 'uncoded', False),
             (5, '', 'NOT_APPROVED', '', False))
-        text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-1 us-west-2')
+        path = self.root / 'cloud_gate.conf'
+        _ = path.write_text(re.sub(r'(?m)^regions=.*$', 'regions=us-east-1 us-west-2',
+                                  re.sub(r'(?m)^spot_candidate_regions=.*$',
+                                         'spot_candidate_regions=us-east-2 us-west-2', path.read_text())))
         request_id = 'req-ab12cd34ef56'
         case_id = '9876543210'
         account_id = '123456789012'
@@ -1179,6 +2459,7 @@ sys.exit(7)
                 subject = self.deployment()
                 subject.admin.credentials = subject.admin.get()
                 calls: list[tuple[str, str]] = []
+                gpu_regions: list[str] = []
 
                 def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
                             timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -1191,6 +2472,10 @@ sys.exit(7)
                     self.assertIsNotNone(env)
                     self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
                     self.assertEqual(cast(dict[str, str], env)['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
+                    if arguments[arguments.index('--quota-code') + 1] == 'L-3819A6DF':
+                        self.assertEqual(operation, get_quota)
+                        gpu_regions.append(region)
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps({'Quota': {'Value': 4}}), '')
                     expected = ['service-quotas', operation, '--service-code', 'ec2', '--quota-code', 'L-34B43A08']
                     if operation == request:
                         expected.extend(['--desired-value', '128'])
@@ -1224,7 +2509,11 @@ sys.exit(7)
                       mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
                       redirect_stdout(StringIO()) as captured):
                     self.assertEqual(deploy.main(), 0 if success else 1)
-                lines = captured.getvalue().splitlines()
+                lines = [line for line in captured.getvalue().splitlines() if 'G and VT' not in line]
+                # us-east-2 has only a price read, so it gets no quota call.
+                self.assertEqual(gpu_regions, ['us-east-1', 'us-west-2'])
+                self.assertEqual([line for line in captured.getvalue().splitlines() if 'G and VT' in line],
+                    [f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gpu_regions])
                 self.assertEqual(lines[-1], 'us-west-2: Spot quota 300 vCPUs; no request is needed for 128 vCPUs')
                 expected_operations = [get_quota]
                 if quota < 128 and failure != get_quota:
@@ -1245,9 +2534,123 @@ sys.exit(7)
                 for private in ('fixture-admin-id', 'fixture-admin-secret', request_id, case_id, account_id):
                     self.assertNotIn(private, captured.getvalue())
 
+    def test_gpu_quota_request_cases_and_failures_in_each_gate_region(self) -> None:
+        get_quota = 'get-service-quota'
+        history = 'list-requested-service-quota-change-history-by-quota'
+        request = 'request-service-quota-increase'
+        candidates = ('us-west-2', 'us-east-2')
+        gates = ('us-east-1', *candidates)
+        text_setting(self.root / 'cloud_gate.conf', 'regions', ' '.join(gates))
+        # eu-north-1 has only a price read, so it gets no quota call.
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', ' '.join((*candidates, 'eu-north-1')))
+        cases = (
+            (8, '', '', '', True),
+            (4, '', '', '', True),
+            (0, 'PENDING', '', '', True),
+            (0, 'CASE_OPENED', '', '', True),
+            (0, 'IN_PROGRESS', '', '', True),
+            (0, '', 'PENDING', '', True),
+            (0, 'APPROVED', 'CASE_OPENED', '', True),
+            (0, 'DENIED', 'PENDING', '', True),
+            (0, 'CASE_CLOSED', 'PENDING', '', True),
+            (0, 'NOT_APPROVED', 'PENDING', '', True),
+            (0, 'INVALID_REQUEST', 'PENDING', '', True),
+            (0, '', 'DENIED', '', False),
+            (0, '', 'NOT_APPROVED', '', False),
+            (0, '', 'INVALID_REQUEST', '', False),
+            (0, '', '', get_quota, False),
+            (0, '', '', history, False),
+            (0, '', '', request, False),
+            (0, '', '', 'timeout', False),
+            (0, '', '', 'uncoded', False),
+            (0, '', '', 'malformed', False),
+        )
+        for selected_region in candidates:
+            for quota, history_status, request_status, failure, success in cases:
+                with self.subTest(region=selected_region, quota=quota, history=history_status,
+                                  request=request_status, failure=failure):
+                    subject = self.deployment()
+                    calls: list[tuple[str, str, str]] = []
+
+                    def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                                timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                        self.assertTrue(capture_output)
+                        self.assertTrue(text)
+                        self.assertFalse(check)
+                        self.assertNotIn('--profile', arguments)
+                        self.assertIsNotNone(env)
+                        self.assertEqual(cast(dict[str, str], env)['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
+                        region = arguments[arguments.index('--region') + 1]
+                        code = arguments[arguments.index('--quota-code') + 1]
+                        operation = arguments[arguments.index('service-quotas') + 1]
+                        calls.append((region, code, operation))
+                        expected = ['service-quotas', operation, '--service-code', 'ec2', '--quota-code', code]
+                        if operation == request:
+                            expected.extend(['--desired-value', '4'])
+                        self.assertEqual(list(arguments[arguments.index('service-quotas'):]), [*expected, '--output', 'json'])
+                        if code == 'L-34B43A08':
+                            self.assertIn(region, gates)
+                            self.assertEqual(operation, get_quota)
+                            reply: dict[str, object] = {'Quota': {'Value': 128}}
+                        elif region != selected_region:
+                            self.assertEqual(code, 'L-3819A6DF')
+                            self.assertEqual(operation, get_quota)
+                            reply = {'Quota': {'Value': 4}}
+                        elif operation == failure:
+                            return subprocess.CompletedProcess(arguments, 1, '',
+                                'An error occurred (AccessDeniedException) when calling the quota operation: '
+                                + 'private-request private-case private-account fixture-admin-secret')
+                        elif operation == request and failure == 'timeout':
+                            raise subprocess.TimeoutExpired('private-request', timeout)
+                        elif operation == request and failure == 'uncoded':
+                            return subprocess.CompletedProcess(arguments, 1, '', 'private-request private-case private-account')
+                        elif operation == get_quota:
+                            reply = {'Quota': {'Value': quota}}
+                        elif operation == history:
+                            reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 8,
+                                'Id': 'private-request', 'CaseId': 'private-case', 'Requester': 'private-account'}]
+                                if history_status else []}
+                        else:
+                            self.assertEqual(operation, request)
+                            reply = {} if failure == 'malformed' else {'RequestedQuota': {'Status': request_status,
+                                'Id': 'private-request', 'CaseId': 'private-case', 'Requester': 'private-account'}}
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+                    subject.execute = execute
+                    with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                          mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
+                          redirect_stdout(StringIO()) as captured):
+                        self.assertEqual(deploy.main(), 0 if success else 1)
+                    expected_calls = [(region, 'L-34B43A08', get_quota) for region in gates]
+                    for region in gates:
+                        expected_calls.append((region, 'L-3819A6DF', get_quota))
+                        if region == selected_region and quota < 4 and failure != get_quota:
+                            expected_calls.append((region, 'L-3819A6DF', history))
+                            if failure != history and history_status not in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                                expected_calls.append((region, 'L-3819A6DF', request))
+                    self.assertEqual(calls, expected_calls)
+                    lines = captured.getvalue().splitlines()
+                    standard = [f'{region}: Spot quota 128 vCPUs; no request is needed for 128 vCPUs' for region in gates]
+                    self.assertEqual(lines[:len(gates)], standard)
+                    if failure:
+                        reason = {'timeout': 'TimeoutExpired', 'uncoded': 'AwsUnavailable', 'malformed': 'KeyError'}.get(
+                            failure, 'AccessDeniedException')
+                        expected_line = f'{selected_region}: G and VT Spot quota request failed: {reason}'
+                    elif quota >= 4:
+                        expected_line = f'{selected_region}: G and VT Spot quota {quota} vCPUs; no request is needed for 4 vCPUs'
+                    elif history_status in {'PENDING', 'CASE_OPENED', 'IN_PROGRESS'}:
+                        expected_line = f'{selected_region}: open G and VT Spot quota request 8 vCPUs; status {history_status}'
+                    else:
+                        expected_line = f'{selected_region}: G and VT Spot quota request 4 vCPUs; status {request_status}'
+                    self.assertEqual(lines, [*standard, *[
+                        expected_line if region == selected_region else
+                        f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gates]])
+                    for private in ('private-request', 'private-case', 'private-account', 'fixture-admin-id', 'fixture-admin-secret'):
+                        self.assertNotIn(private, captured.getvalue())
+
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()
-        home_api = subject._api(aws_config.read_deployment_settings(self.settings, self.state))  # pyright: ignore[reportPrivateUsage]
+        home_api = subject._api(aws_config.read_deployment_settings(self.settings))  # pyright: ignore[reportPrivateUsage]
         original = home_api.execute
         copied = False
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
@@ -1272,26 +2675,164 @@ sys.exit(7)
             commands.append(args)
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
-        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        settings = aws_config.read_deployment_settings(self.settings)
         home = {'GateProfileArn': 'fixture-profile', 'GateRoleArn': 'fixture-role'}
-        result = subject.regional_gate_stack(api, settings, home, {}, 'us-west-2')
+        result = subject.regional_gate_stack(api, settings, home, {}, subject.regional_network(api, settings, 'us-west-2'))
         self.assertTrue(copied)
         self.assertEqual(result['image'], 'ami-fixture-west')
         self.assertEqual(result['region'], 'us-west-2')
-        self.assertEqual(subject.regional_gate_stack(api, settings, home, {}, 'us-west-2'), result)
+        self.assertEqual(subject.regional_gate_stack(api, settings, home, {}, subject.regional_network(api, settings, 'us-west-2')), result)
         self.assertEqual(sum('copy-image' in command for command in commands), 1)
         self.assertTrue(any('deploy' in command and settings.stack_name + '-gates-us-west-2' in command for command in commands))
         query = next(command for command in commands if 'describe-images' in command and '--owners' in command)
         self.assertIn('fixture-owner', query)
         self.assertIn('Name=name,Values=fixture-nixos', query)
         resources = ledger.mapping(deploy.region_gate_template()['Resources'])
-        self.assertEqual(len(resources), 8)
+        self.assertEqual(len(resources), 7)
+        self.assertFalse(any(ledger.text(ledger.mapping(row), 'Type').startswith('AWS::IAM::') and name != 'GateExpiryRole'
+                             for name, row in resources.items()))
         self.assertNotIn('GateBucket', resources)
         self.assertNotIn('GateProfile', resources)
-        for name, key in (('GateExpiryRole', 'RoleName'), ('GateExpiryFunction', 'FunctionName')):
+        gate = conf.read_or_repository('cloud_gate')
+        regions = {*gate.words('regions'), *gate.words('spot_candidate_regions')}
+        limits = (('GateSecurityGroup', 'GroupName', 255), ('GateLaunchTemplate', 'LaunchTemplateName', 128),
+                  ('GateExpiryRole', 'RoleName', 64), ('GateExpiryFunction', 'FunctionName', 64),
+                  ('GateExpiryLog', 'LogGroupName', 512), ('GateExpirySchedule', 'Name', 64))
+        for name, key, limit in limits:
             properties = ledger.mapping(ledger.mapping(resources[name])['Properties'])
             value = ledger.text(ledger.mapping(properties[key]), 'Fn::Sub')
-            self.assertLessEqual(len(value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', 'us-west-2')), 64)
+            for region in regions:
+                with self.subTest(name=name, region=region):
+                    named = value.replace('${DeploymentId}', 'f' * 32).replace('${AWS::Region}', region)
+                    self.assertLessEqual(len(named), limit)
+
+    def regional_stack_fixture(self, stack: dict[str, str]) -> tuple[deploy.Deployment, list[list[str]], aws_target.AwsCli]:
+        """A regional stack in the state stack['status']; an empty status means the stack does not exist yet.
+
+        stack['deploy'] is 'fails' or 'passes', and the fixture sets it to 'done' after a passing deploy."""
+        subject, commands = self.gate_fixture()
+        original = subject._api(aws_config.read_deployment_settings(self.settings)).execute  # pyright: ignore[reportPrivateUsage]
+        def stamp(at: int) -> str:
+            return datetime.fromtimestamp(at, UTC).isoformat()
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            args = list(arguments)
+            region = args[args.index('--region') + 1]
+            operation = args[args.index('--region') + 3]
+            reply: dict[str, object] = {}
+            if operation == 'describe-vpcs':
+                reply = {'Vpcs': [{'VpcId': 'vpc-fixture-west'}]}
+            elif operation == 'describe-images':
+                reply = {'Images': [{'ImageId': 'ami-fixture', 'Name': 'fixture-nixos', 'OwnerId': 'fixture-owner'}]}
+            elif operation == 'describe-stacks' and region == 'us-west-1' and stack['deploy'] != 'done':
+                if not stack['status']:
+                    return subprocess.CompletedProcess(args, 255, '', 'An error occurred (ValidationError): Stack with id x does not exist')
+                reply = {'Stacks': [{'StackStatus': stack['status']}]}
+            elif operation == 'describe-stacks' and region == 'us-west-1':
+                reply = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Outputs': [
+                    {'OutputKey': key, 'OutputValue': value} for key, value in
+                    {'GateLaunchTemplate': 'lt-west', 'GateLaunchVersion': '1', 'GateSecurityGroup': 'sg-west'}.items()]}]}
+            elif operation == 'deploy':
+                commands.append(args)
+                if stack['deploy'] == 'fails':
+                    return subprocess.CompletedProcess(args, 255, '', 'aws: [ERROR]: Failed to create/update the stack.')
+                stack['deploy'] = 'done'
+                return subprocess.CompletedProcess(args, 0, '', '')
+            elif operation == 'describe-stack-events':
+                reply = {'StackEvents': [
+                    {'Timestamp': stamp(self.now), 'LogicalResourceId': 'GateExpiryFunction',
+                     'ResourceType': 'AWS::Lambda::Function', 'ResourceStatus': 'CREATE_FAILED',
+                     'ResourceStatusReason': 'fixture runtime is not offered here'},
+                    {'Timestamp': stamp(self.now - 600), 'LogicalResourceId': 'GateSecurityGroup',
+                     'ResourceType': 'AWS::EC2::SecurityGroup', 'ResourceStatus': 'CREATE_FAILED',
+                     'ResourceStatusReason': 'fixture failure of an earlier run'}]}
+            elif operation not in ('delete-stack', 'wait'):
+                return original(arguments, capture_output=True, text=True, timeout=1, check=False)
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
+        return subject, commands, aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
+
+    def test_regional_stack_failure_names_the_region_and_the_failed_resources_of_this_run(self) -> None:
+        subject, _commands, api = self.regional_stack_fixture({'status': '', 'deploy': 'fails'})
+        settings = aws_config.read_deployment_settings(self.settings)
+        with self.assertRaises(aws_target.AwsUnavailable) as raised:
+            _ = subject.regional_gate_stack(api, settings, {'GateProfileArn': 'p', 'GateRoleArn': 'r'}, {},
+                                            subject.regional_network(api, settings, 'us-west-1'))
+        lines = str(raised.exception).splitlines()
+        self.assertEqual(lines[0], 'us-west-1: aws: [ERROR]: Failed to create/update the stack.')
+        self.assertEqual(lines[1:], ['GateExpiryFunction (AWS::Lambda::Function): CREATE_FAILED: fixture runtime is not offered here'])
+
+    def test_regional_stack_whose_first_create_failed_is_removed_before_the_new_deploy(self) -> None:
+        stack = {'status': '', 'deploy': 'passes'}
+        subject, commands, api = self.regional_stack_fixture(stack)
+        settings = aws_config.read_deployment_settings(self.settings)
+        for status, removed in (('ROLLBACK_COMPLETE', True), ('', False), ('UPDATE_COMPLETE', False)):
+            with self.subTest(status=status or 'no stack'):
+                stack.update(status=status, deploy='passes')
+                commands.clear()
+                with redirect_stdout(StringIO()) as output:
+                    result = subject.regional_gate_stack(api, settings, {'GateProfileArn': 'p', 'GateRoleArn': 'r'}, {},
+                                            subject.regional_network(api, settings, 'us-west-1'))
+                self.assertEqual(result['template'], 'lt-west')
+                operations = [command[command.index('--region') + 3] for command in commands
+                              if command[command.index('--region') + 1] == 'us-west-1'
+                              and command[command.index('--region') + 3] in ('delete-stack', 'wait', 'deploy')]
+                self.assertEqual(operations, ['delete-stack', 'wait', 'deploy'] if removed else ['deploy'])
+                self.assertEqual('removing the gate stack whose first create failed' in output.getvalue(), removed)
+
+    def scaler_policy_count(self, regions: int) -> int:
+        """The managed policies attached to the scaler user when gates run in this many regions."""
+        home = ledger.mapping(ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))['Resources'])
+        def users(row: object) -> list[object]:
+            return list(cast(list[object], ledger.mapping(row).get('Users', [])))
+        attached = [name for name, row in home.items() if ledger.text(ledger.mapping(row), 'Type') == 'AWS::IAM::ManagedPolicy'
+                    and {'Ref': 'ScalerUser'} in users(ledger.mapping(row)['Properties'])]
+        self.assertEqual(sorted(attached), ['GateGpuTrialScalerPolicy', 'GateScalerPolicy'])
+        def block_users(row: object) -> list[object]:
+            definition = ledger.mapping(ledger.mapping(ledger.mapping(row)['Properties'])['Definition'])
+            return users(definition.get('IamActionDefinition', {}))
+        blocks = [row for row in home.values() if ledger.text(ledger.mapping(row), 'Type') == 'AWS::Budgets::BudgetsAction'
+                  and {'Ref': 'ScalerUser'} in block_users(row)]
+        regional = [row for row in ledger.mapping(deploy.region_gate_template()['Resources']).values()
+                    if ledger.text(ledger.mapping(row), 'Type') in ('AWS::IAM::ManagedPolicy', 'AWS::IAM::Policy')]
+        return len(attached) + len(blocks) + len(regional) * (regions - 1)
+
+    def test_scaler_user_keeps_two_gate_policies_and_the_budget_block_in_every_region_count(self) -> None:
+        gates = conf.read(self.root / 'cloud_gate.conf')
+        for key in ('regions', 'spot_candidate_regions'):
+            with self.subTest(regions=len(gates.words(key))):
+                # AWS attaches at most 10 managed policies to one IAM user; the budget block needs a free slot.
+                self.assertEqual(self.scaler_policy_count(len(gates.words(key))), 3)
+
+    def test_gate_scaler_policy_for_every_candidate_region_fits_the_managed_policy_size(self) -> None:
+        gates = conf.read(self.root / 'cloud_gate.conf')
+        regions = gates.words('spot_candidate_regions')
+        partition, account = 'aws', '1' * 12
+        values: dict[str, object] = {
+            'GateVpcs': [f'arn:{partition}:ec2:{region}:{account}:vpc/vpc-{"f" * 17}' for region in regions],
+            'GateRegionImages': [f'arn:{partition}:ec2:{region}::image/ami-{"f" * 17}' for region in regions[1:]],
+            'GateInstanceTypes': gates.words('instance_types'), 'GateGpuInstanceTypes': gates.words('gpu_instance_types')}
+        names = {'AWS::Partition': partition, 'AWS::AccountId': account, 'AWS::Region': regions[0]}
+        def render(value: object) -> object:
+            if isinstance(value, str):
+                return re.sub(r'\$\{([^}]+)\}', lambda found: names.get(found.group(1), 'x' * 64), value)
+            if isinstance(value, list):
+                return [render(item) for item in cast(list[object], value)]
+            if isinstance(value, dict):
+                row = cast(dict[str, object], value)
+                if 'Ref' in row:
+                    return values.get(ledger.text(row, 'Ref'), 'x' * 64)
+                if 'Fn::Sub' in row or 'Fn::GetAtt' in row:
+                    return render(row.get('Fn::Sub', 'x' * 128))
+                if 'Fn::If' in row:
+                    return render(cast(list[object], row['Fn::If'])[1])
+                return {key: render(item) for key, item in row.items()}
+            return value
+        home = ledger.mapping(ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))['Resources'])
+        for name in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy'):
+            with self.subTest(policy=name):
+                document = render(ledger.mapping(ledger.mapping(home[name])['Properties'])['PolicyDocument'])
+                # AWS counts a managed policy document without white space, to at most 6144 characters.
+                self.assertLessEqual(len(json.dumps(document, separators=(',', ':'))), 6144)
 
     def test_regional_image_uses_matching_name_without_copy(self) -> None:
         subject = self.deployment()
@@ -1306,15 +2847,15 @@ sys.exit(7)
         self.assertEqual(subject.regional_image(api, aws_config.read_deployment_settings(self.settings), 'us-west-2'), 'ami-west')
         self.assertFalse(any('copy-image' in command for command in calls))
 
-    def test_regional_gate_stack_refuses_missing_default_vpc(self) -> None:
+    def test_regional_network_refuses_missing_default_vpc(self) -> None:
         subject = self.deployment()
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(arguments, 0, '{"Vpcs": []}', '')
         with self.assertRaisesRegex(deploy.DeploymentRefused, 'us-west-2: no default VPC'):
-            _ = subject.regional_gate_stack(aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute),
-                aws_config.read_deployment_settings(self.settings), {}, {}, 'us-west-2')
+            _ = subject.regional_network(aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute),
+                aws_config.read_deployment_settings(self.settings), 'us-west-2')
 
-    def test_regional_gate_stack_refuses_no_public_subnet(self) -> None:
+    def test_regional_network_refuses_no_public_subnet(self) -> None:
         subject = self.deployment()
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
@@ -1325,8 +2866,8 @@ sys.exit(7)
                 reply = {'Subnets': [{'SubnetId': 'subnet-fixture', 'AvailabilityZone': 'us-west-2a', 'State': 'available'}]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         with self.assertRaisesRegex(deploy.DeploymentRefused, 'no available public subnet'):
-            _ = subject.regional_gate_stack(aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute),
-                aws_config.read_deployment_settings(self.settings), {}, {}, 'us-west-2')
+            _ = subject.regional_network(aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute),
+                aws_config.read_deployment_settings(self.settings), 'us-west-2')
 
     def test_regional_image_cleanup_recovers_after_deregistration_record_failure(self) -> None:
         from scripts.aws_target import teardown
@@ -1387,30 +2928,6 @@ sys.exit(7)
         self.assertTrue(all(command[command.index('--region') + 1] == 'us-west-2' for command in calls if command not in sweeps))
         self.assertFalse(teardown.remove_regional_gates(api, self.state))
 
-    def test_down_sweeps_regions_removed_from_configuration(self) -> None:
-        from scripts.aws_target import teardown
-        _ = (self.root / 'cloud_gate.conf').write_text('regions=us-east-2\n')
-        manifest = {'deployment_id': 'fixture', 'regions': [{'region': 'us-east-2'},
-                    {'region': 'us-west-2', 'stack': 'fixture-west'}]}
-        _ = (self.state / 'gate-deployment.json').write_text(json.dumps(manifest))
-        _ = (self.state / 'regional-stacks.json').write_text(json.dumps({'us-west-1': 'fixture-west-1'}))
-        calls: list[tuple[str, str]] = []
-        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            args = list(arguments)
-            index = args.index('--region')
-            region, operation = args[index + 1], args[index + 3]
-            calls.append((region, operation))
-            reply: dict[str, object] = {}
-            if operation == 'describe-instances':
-                reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-' + region}]}]}
-            return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
-        api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
-        self.assertTrue(teardown.remove_regional_gates(api, self.state, include_home=True))
-        self.assertEqual({region for region, operation in calls if operation == 'describe-instances'},
-                         {'us-east-2', 'us-west-1', 'us-west-2'})
-        for region in ('us-west-1', 'us-west-2'):
-            self.assertLess(calls.index((region, 'terminate-instances')), calls.index((region, 'delete-stack')))
-            self.assertLess(calls.index((region, 'wait')), calls.index((region, 'delete-stack')))
 
     def test_gate_stack_updates_print_named_start_and_done_lines(self) -> None:
         image_titles = ('switching gates to the official image', 'removing the old image permission')
@@ -1438,9 +2955,11 @@ sys.exit(7)
         arguments = next(args for args in commands if 'create-change-set' in args)
         parameters = ledger.rows({'rows': cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))}, 'rows')
         by_name = {ledger.text(row, 'ParameterKey'): row for row in parameters}
-        for key in ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail'):
+        for key in ('VpcId', 'NotificationEmail'):
             self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
         self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
+        self.assertEqual(by_name['GateGpuInstanceTypes']['ParameterValue'],
+                         ','.join(gpu_size_trial.settings().spot_max_usd_per_hour))
         self.assertEqual(by_name['GateRootGiB']['ParameterValue'], '40')
         self.assertEqual(by_name['GateSpotMaxPrice']['ParameterValue'], '0.8')
         saved = remote.read_record(self.state / 'gate-deployment.json')
@@ -1451,6 +2970,53 @@ sys.exit(7)
         self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
         self.assertTrue(any('execute-change-set' in args for args in commands))
 
+    def test_gpu_trial_command_requires_approval_and_checks_credentials(self) -> None:
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output')
+        folder = self.root / 'trial-alias'
+        folder.symlink_to(self.root, target_is_directory=True)
+        with mock.patch.object(gpu_size_trial, 'start_service', return_value=0) as service:
+            with self.assertRaisesRegex(deploy.DeploymentRefused, '--approve-resources'):
+                _ = subject.gpu_size_trial(self.root / 'trial')
+            service.assert_not_called()
+            with mock.patch.object(subject, '_check_credentials') as credentials:
+                self.assertTrue(subject.gpu_size_trial(folder, approve_resources=True))
+            credentials.assert_called_once_with()
+        service.assert_called_once()
+        assert service.call_args is not None
+        self.assertEqual(service.call_args.args[0], folder)
+
+    def test_gpu_trial_cli_routes_the_approved_run(self) -> None:
+        folder = self.root / 'trial'
+        argv = ['deploy.py', 'gpu-size-trial', 'run', '--trial-folder', str(folder),
+                '--settings', str(self.settings), '--directory', str(self.state), '--approve-resources']
+        with (mock.patch.object(sys, 'argv', argv),
+              mock.patch.object(deploy.Deployment, 'gpu_size_trial', return_value=True) as run):
+            self.assertEqual(deploy.main(), 0)
+        run.assert_called_once_with(folder, approve_resources=True)
+
+    def test_gpu_trial_permission_preserves_normal_gate_scope(self) -> None:
+        source = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
+        resources = ledger.mapping(source['Resources'])
+        properties = [ledger.mapping(ledger.mapping(resources[name])['Properties'])
+                      for name in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy')]
+        statements = tuple(row for policy in properties for row in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+                           if 'Fn::If' not in row)
+        scopes = [ledger.mapping(ledger.mapping(row['Condition'])['StringEquals'])
+                  for row in statements if row.get('Condition')
+                  and 'ec2:InstanceType' in ledger.mapping(ledger.mapping(row['Condition']).get('StringEquals', {}))]
+        self.assertEqual([row['ec2:InstanceType'] for row in scopes],
+                         [{'Ref': 'GateInstanceTypes'}, {'Ref': 'GateGpuInstanceTypes'}])
+        for row in scopes:
+            self.assertEqual(row['aws:RequestTag/Workload'], 'cloud-claude-gate')
+            self.assertEqual(row['ec2:InstanceMarketType'], 'spot')
+        regional = ledger.mapping(deploy.region_gate_template()['Resources'])
+        self.assertNotIn('GateScalerPolicy', regional)
+        self.assertNotIn('GateGpuTrialScalerPolicy', regional)
+        gpu_statements = ledger.rows(ledger.mapping(properties[1]['PolicyDocument']), 'Statement')
+        gpu_instance = gpu_statements[0]
+        self.assertEqual(ledger.mapping(ledger.mapping(gpu_instance['Condition'])['Null'])['aws:RequestTag/GpuSizeTrial'], 'false')
+        self.assertIn('ec2:InstanceProfile', ledger.mapping(ledger.mapping(gpu_instance['Condition'])['ArnEquals']))
+
     def test_gate_deployment_rejects_a_change_to_a_rust_resource(self) -> None:
         subject, commands = self.gate_fixture('Instance')
         with self.assertRaisesRegex(deploy.DeploymentRefused, 'Rust resource'):
@@ -1459,23 +3025,6 @@ sys.exit(7)
         self.assertTrue(any('delete-change-set' in args for args in commands))
         self.assertFalse((self.state / 'gate-deployment.json').exists())
 
-    def test_live_update_without_fingerprint_preserves_first_boot_and_saves_fingerprint(self) -> None:
-        subject = self.update_fixture()
-        path = self.state / 'deployment.json'
-        saved = remote.read_record(path)
-        _ = saved.pop('fingerprint')
-        _ = path.write_text(json.dumps(saved))
-        template = Path(conf.read(self.settings).text('bootstrap_template_path'))
-        _ = template.write_text(template.read_text() + '# changed first boot input\n')
-        success, output = self.up_output(subject)
-        self.assertTrue(success, output)
-        self.assertIn('stacks: done', output)
-        args = cast(list[str], self.commands('create-change-set')[-1]['args'])
-        values = ledger.rows({'values': cast(object, json.loads(args[args.index('--parameters') + 1]))}, 'values')
-        self.assertEqual(next(row for row in values if row['ParameterKey'] == 'Bootstrap'),
-                         {'ParameterKey': 'Bootstrap', 'UsePreviousValue': True})
-        self.assertIn('fingerprint', remote.read_record(path))
-        self.assertEqual(aws_config.deployment_outputs(self.state)['InstanceId'], 'i-fixture')
 
     def test_update_refuses_replacement_for_each_protected_resource_type(self) -> None:
         subject = self.update_fixture()
@@ -1525,12 +3074,12 @@ sys.exit(7)
                         (self.root / 'fail-wait-change-set-create-complete').touch()
                     if delete_fails:
                         (self.root / 'fail-down-delete-change-set').touch()
-                    settings = aws_config.read_deployment_settings(self.settings, self.state)
+                    settings = aws_config.read_deployment_settings(self.settings)
                     prepared = subject.prepare()
                     before = len(self.commands('execute-change-set'))
                     with mock.patch.object(subject, '_before_request', side_effect=deploy.DeploymentRefused(cause)):
                         with self.assertRaises((deploy.DeploymentRefused, aws_target.AwsUnavailable)) as failure:
-                            subject._update_stack(settings, prepared.parameters, compute=True)  # pyright: ignore[reportPrivateUsage]
+                            subject._update_stack(settings, prepared.parameters)  # pyright: ignore[reportPrivateUsage]
                     expected = {'create wait failed': 'fixture wait failed', 'protected removal': 'Protected'}.get(cause, cause)
                     self.assertIn(expected, str(failure.exception))
                     args = cast(list[str], self.commands('create-change-set')[-1]['args'])
@@ -1562,7 +3111,7 @@ sys.exit(7)
 
     def test_cleanup_value_and_os_errors_preserve_the_original_refusal(self) -> None:
         subject = self.update_fixture()
-        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        settings = aws_config.read_deployment_settings(self.settings)
         prepared = subject.prepare()
         api = subject._api(settings)  # pyright: ignore[reportPrivateUsage]
         call = api.call
@@ -1577,7 +3126,7 @@ sys.exit(7)
                       mock.patch.object(api, 'call', side_effect=fail_delete),
                       mock.patch.object(subject, '_before_request', side_effect=deploy.DeploymentRefused('original spending refusal'))):
                     with self.assertRaisesRegex(deploy.DeploymentRefused, 'original spending refusal') as failure:
-                        subject._update_stack(settings, prepared.parameters, compute=True)  # pyright: ignore[reportPrivateUsage]
+                        subject._update_stack(settings, prepared.parameters)  # pyright: ignore[reportPrivateUsage]
                 args = cast(list[str], self.commands('create-change-set')[-1]['args'])
                 name = args[args.index('--change-set-name') + 1]
                 self.assertIn('unexecuted change set remains: ' + name, str(failure.exception))
@@ -1585,29 +3134,6 @@ sys.exit(7)
                 self.assertTrue((self.root / 'update-change-set.json').exists())
                 (self.root / 'update-change-set.json').unlink()
 
-    def test_reconciliation_os_error_preserves_update_failure_diagnostics(self) -> None:
-        subject = self.update_fixture()
-        execute = subject.execute
-        _ = (self.root / 'describe-stack-events.json').write_text(json.dumps({'StackEvents': [{
-            'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat(), 'LogicalResourceId': 'DataAttachment',
-            'ResourceType': 'AWS::EC2::VolumeAttachment', 'ResourceStatus': 'UPDATE_FAILED',
-            'ResourceStatusReason': 'fixture attachment failure'}]}))
-        def fail_update(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
-                        check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            if 'execute-change-set' in arguments:
-                return subprocess.CompletedProcess(arguments, 1, '', 'original update failure')
-            return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
-        subject.execute = fail_update
-        with mock.patch.object(subject, '_reconcile_compute_request', side_effect=OSError('fixture disk full')) as reconcile:
-            with self.assertRaisesRegex(aws_target.AwsUnavailable, 'original update failure') as failure:
-                _ = subject.apply(approve_resources=True)
-        reconcile.assert_called_once()
-        reason = str(failure.exception)
-        self.assertIn('DataAttachment (AWS::EC2::VolumeAttachment): UPDATE_FAILED: fixture attachment failure', reason)
-        self.assertIn('stack status: UPDATE_COMPLETE', reason)
-        self.assertIn('compute request reconciliation is unavailable', reason)
-        self.assertNotIn('fixture disk full', reason)
-        self.assertTrue(ledger.CostLedger(self.state).pending_compute_requests())
 
     def test_foundation_preparation_refusal_discards_the_reservation(self) -> None:
         subject = self.deployment()
@@ -1663,7 +3189,8 @@ sys.exit(7)
                         return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [{'StackStatus': 'CREATE_FAILED'}]}), '')
                     if operation == 'create-change-set' and operation in arguments:
                         failed = True
-                        return subprocess.CompletedProcess(arguments, 1, '', 'reservation refused ' + notification)
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            'reservation refused ' + notification + ' AWS_SESSION_TOKEN=fixture-token')
                     result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
                     if 'describe-change-set' in arguments and result.returncode == 0:
                         reply = ledger.mapping(cast(object, json.loads(result.stdout)))
@@ -1671,7 +3198,8 @@ sys.exit(7)
                         return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
                     if operation == 'wait' and 'wait' in arguments:
                         failed = True
-                        return subprocess.CompletedProcess(arguments, 1, '', 'reservation refused ' + notification)
+                        return subprocess.CompletedProcess(arguments, 1, '',
+                            'reservation refused ' + notification + ' AWS_SESSION_TOKEN=fixture-token')
                     return result
                 _ = (self.root / 'describe-stack-events.json').write_text(json.dumps({'StackEvents': [{
                     'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat(), 'LogicalResourceId': 'Foundation',
@@ -1681,8 +3209,10 @@ sys.exit(7)
                 try:
                     with self.assertRaises(aws_target.AwsUnavailable) as failure:
                         _ = subject.apply(approve_resources=True)
-                    reason = str(failure.exception)
+                    reason = subject.admin.redact(str(failure.exception))
                     self.assertIn('reservation refused <notification address>', reason)
+                    self.assertIn('AWS_SESSION_TOKEN=[redacted]', reason)
+                    self.assertNotIn('fixture-token', reason)
                     self.assertIn('Foundation (AWS::CloudFormation::Stack): CREATE_FAILED: event reason <notification address>', reason)
                     self.assertIn('stack status: CREATE_FAILED', reason)
                     self.assertNotIn(notification, reason)
@@ -1696,38 +3226,17 @@ sys.exit(7)
                 finally:
                     subject.execute = execute
 
-    def test_terminal_update_failure_reconciles_compute_but_uncertain_failure_keeps_it_pending(self) -> None:
+
+    def test_foundation_apply_never_requests_builder_compute(self) -> None:
         subject = self.update_fixture()
-        execute = subject.execute
-        for status, timeout in (('UPDATE_COMPLETE', False), ('UPDATE_ROLLBACK_COMPLETE', False),
-                                ('UPDATE_IN_PROGRESS', False), ('UPDATE_ROLLBACK_FAILED', False), ('UPDATE_COMPLETE', True)):
-            with self.subTest(status=status, timeout=timeout):
-                path = self.root / 'fake-stack.json'
-                row = remote.read_record(path)
-                row.update(status='UPDATE_COMPLETE', instance_state='stopped')
-                _ = path.write_text(json.dumps(row))
-                _ = subject.prepare()
-                def fail(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
-                         check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-                    if 'execute-change-set' in arguments:
-                        row['status'] = status
-                        _ = path.write_text(json.dumps(row))
-                        if uncertain_timeout:
-                            raise subprocess.TimeoutExpired(arguments, timeout)
-                        return subprocess.CompletedProcess(arguments, 1, '', 'execution failed')
-                    return execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
-                uncertain_timeout = timeout
-                subject.execute = fail
-                try:
-                    with self.assertRaises(aws_target.AwsUnavailable):
-                        _ = subject.apply(approve_resources=True)
-                    requests = ledger.CostLedger(self.state).pending_compute_requests()
-                    self.assertEqual(bool(requests), timeout or not status.endswith('_COMPLETE'))
-                finally:
-                    subject.execute = execute
-                    row['status'] = 'UPDATE_COMPLETE'
-                    _ = path.write_text(json.dumps(row))
-                    _ = subject.prepare()
+        outputs = subject.apply(approve_resources=True)
+        self.assertNotIn('ComputeEnabled', outputs)
+        self.assertNotIn('InstanceId', outputs)
+        self.assertTrue(outputs['BudgetName'])
+        self.assertFalse(self.commands('start-instances'))
+        self.assertFalse(self.commands('run-instances'))
+        self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
+        self.assertTrue(ledger.CostLedger(self.state).read_snapshot().inventories[-1].builder_removed)
 
     def test_empty_update_is_success_without_execution_or_compute_request(self) -> None:
         subject = self.update_fixture()
@@ -1736,46 +3245,11 @@ sys.exit(7)
         (self.root / 'fail-wait-change-set-create-complete').touch()
         before = len(self.commands('execute-change-set'))
         outputs = subject.apply(approve_resources=True)
-        self.assertEqual(outputs['InstanceId'], 'i-fixture')
+        self.assertNotIn('ComputeEnabled', outputs)
         self.assertEqual(len(self.commands('execute-change-set')), before)
         self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
         self.assertTrue(self.commands('delete-change-set'))
 
-    def test_update_failure_reports_current_events_and_rollback_without_the_address(self) -> None:
-        subject = self.update_fixture()
-        (self.root / 'fail-wait-stack-update-complete').touch()
-        notification = self.notification_file.read_text().strip()
-        _ = (self.root / 'describe-stack-events.json').write_text(json.dumps({'StackEvents': [
-            {'Timestamp': datetime.fromtimestamp(self.now - 1, UTC).isoformat(), 'ResourceStatus': 'UPDATE_FAILED',
-             'LogicalResourceId': 'OldFailure', 'ResourceType': 'AWS::EC2::Instance', 'ResourceStatusReason': 'old'},
-            *[{'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat(), 'ResourceStatus': 'UPDATE_FAILED',
-               'LogicalResourceId': name, 'ResourceType': kind, 'ResourceStatusReason': 'rejected ' + notification}
-              for name, kind in (('DataAttachment', 'AWS::EC2::VolumeAttachment'), ('Instance', 'AWS::EC2::Instance'))]]}))
-        execute = subject.execute
-        def failure(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
-                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
-            if 'execute-change-set' in arguments:
-                path = self.root / 'fake-stack.json'
-                row = remote.read_record(path)
-                row['status'] = 'UPDATE_ROLLBACK_COMPLETE'
-                _ = path.write_text(json.dumps(row))
-            return result
-        subject.execute = failure
-        saved = remote.read_record(self.state / 'deployment.json')
-        _ = saved.pop('fingerprint')
-        _ = (self.state / 'deployment.json').write_text(json.dumps(saved))
-        success, output = self.up_output(subject)
-        self.assertFalse(success, output)
-        self.assertNotIn(notification, output)
-        self.assertNotIn('OldFailure', output)
-        for name, kind in (('DataAttachment', 'AWS::EC2::VolumeAttachment'), ('Instance', 'AWS::EC2::Instance')):
-            self.assertIn(f'{name} ({kind}): UPDATE_FAILED: rejected <notification address>', output)
-        self.assertIn('stack status: UPDATE_ROLLBACK_COMPLETE', output)
-        self.assertIn('the stack rolled back; the box and the volume did not change', output)
-        reason = ledger.text(ledger.mapping(remote.read_record(self.state / 'up.json')['stacks']), 'reason')
-        self.assertIn('<notification address>', reason)
-        self.assertNotIn(notification, reason)
 
     def test_change_set_creation_and_execution_failures_report_the_cause(self) -> None:
         subject = self.update_fixture()
@@ -1804,53 +3278,13 @@ sys.exit(7)
                 # Reconcile any execution request before the next case.
                 _ = subject.prepare()
 
-    def test_pending_request_reconciles_rollback_before_update_and_refuses_rollback_failed(self) -> None:
-        subject = self.update_fixture()
-        book = ledger.CostLedger(self.state)
-        request = ledger.ComputeRequest(self.now, 'fixture-build', 'us-east-1', Decimal('0.5'))
-        book.record_compute_request(request)
-        path = self.root / 'fake-stack.json'
-        row = remote.read_record(path)
-        row['status'] = 'UPDATE_ROLLBACK_COMPLETE'
-        _ = path.write_text(json.dumps(row))
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        resolved = next(item for item in book.read_snapshot().compute_requests if item.request_id == request.request_id)
-        self.assertIsInstance(resolved.resolution, ledger.ComputeInstanceConfirmed)
-        self.assertFalse(book.pending_compute_requests())
-        row = remote.read_record(path)
-        row['status'] = 'UPDATE_ROLLBACK_FAILED'
-        _ = path.write_text(json.dumps(row))
-        book.record_compute_request(ledger.ComputeRequest(self.now, 'fixture-build', 'us-east-1', Decimal('0.5')))
-        before = len(self.commands('create-change-set'))
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'UPDATE_ROLLBACK_FAILED'):
-            _ = subject.prepare()
-        self.assertEqual(len(self.commands('create-change-set')), before)
 
-    def test_parameters_choose_only_an_available_saved_image(self) -> None:
+    def test_saved_image_is_empty_when_its_image_is_gone(self) -> None:
         subject = self.deployment()
-        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
         _ = (self.state / 'image.json').write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM}))
-        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-cache')
-        with mock.patch.object(box, 'saved_image', return_value={}):
-            self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
         with mock.patch.object(aws_target.AwsCli, 'call', side_effect=aws_target.AwsUnavailable('InvalidAMIID.NotFound')):
-            self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings, self.state)), self.state), {})  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings)), self.state), {})  # pyright: ignore[reportPrivateUsage]
 
-    def test_image_stage_runs_between_checks_and_idle_stop(self) -> None:
-        stages = [stage.name for stage in self.deployment()._box_stages()]  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(stages[stages.index('checks'):stages.index('idle-stop') + 1], ['checks', 'image', 'idle-stop'])
-
-    def test_update_preserves_ami_only_with_a_live_instance(self) -> None:
-        subject = self.update_fixture()
-        prepared = subject.prepare()
-        for live in ({'InstanceId': 'i-fixture'}, {}):
-            with mock.patch.object(subject, '_stack', return_value=live):
-                subject._update_stack(aws_config.read_deployment_settings(self.settings, self.state), prepared.parameters, compute=False)  # pyright: ignore[reportPrivateUsage]
-            args = cast(list[str], self.commands('create-change-set')[-1]['args'])
-            values = ledger.rows({'values': cast(object, json.loads(args[args.index('--parameters') + 1]))}, 'values')
-            ami = next(row for row in values if row['ParameterKey'] == 'AmiId')
-            self.assertEqual(ami, {'ParameterKey': 'AmiId', **({'UsePreviousValue': True} if live else {'ParameterValue': 'ami-fixture'})})
 
     def test_down_keeps_and_reports_the_saved_image(self) -> None:
         _ = self.removal_fixture()
@@ -1869,126 +3303,6 @@ sys.exit(7)
         self.assertIn('down: image kept: ami-cache; next up starts from it', output)
         self.assertEqual(path.read_bytes(), before)
 
-    def test_new_stack_gets_current_bootstrap(self) -> None:
-        subject = self.deployment()
-        prepared = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        args = cast(list[str], self.commands('deploy')[0]['args'])
-        self.assertIn('Bootstrap=' + prepared.parameters['Bootstrap'], args)
-        self.assertIn('CREATE', cast(list[str], self.commands('create-change-set')[0]['args']))
-
-    def test_recorded_rollback_reconciles_the_real_request_and_finishes_stacks(self) -> None:
-        source = Path(__file__).parent / 'test_data/stack_update'
-        for name in ('deployment.json', 'cost-ledger.json', 'up.json'):
-            _ = shutil.copyfile(source / name, self.state / name)
-        saved = remote.read_record(self.state / 'deployment.json')
-        outputs = ledger.mapping(saved['outputs'])
-        self.replace('stack_name', 'aws-build')
-        self.replace('region', 'us-east-2')
-        self.replace('availability_zone', 'us-east-2a')
-        _ = (self.root / 'describe-subnets.json').write_text(json.dumps({'Subnets': [
-            {'VpcId': 'vpc-fixture', 'AvailabilityZone': 'us-east-2a'}]}))
-        self.replace('cost_explorer_tag_value', 'aws-build')
-        book = ledger.CostLedger(self.state)
-        evidence = book.read_snapshot()
-        self.set_clock(max(row.at for row in evidence.observations) + 1)
-        self.write_price()
-        _ = (self.root / 'reserved-stack').write_text(ledger.text(saved, 'stack_id'))
-        _ = (self.root / 'fake-stack.json').write_text(json.dumps({
-            'outputs': outputs, 'stack_name': 'aws-build', 'stack_id': saved['stack_id'], 'status': 'UPDATE_ROLLBACK_COMPLETE'}))
-        _ = (self.root / 'get-caller-identity.json').write_text(json.dumps({'Account': saved['account_id']}))
-        _ = (self.root / 'get-user.json').write_text(json.dumps({'User': {
-            'Arn': ledger.mapping(saved['scaler_user'])['arn'], 'UserId': ledger.mapping(saved['scaler_user'])['user_id']}}))
-        _ = (self.root / 'describe-instances.json').write_text(json.dumps({'Reservations': [{'Instances': [{
-            'InstanceId': outputs['InstanceId'], 'LaunchTime': 'recorded-boot', 'State': {'Name': 'stopped'}}]}]}))
-        subject = self.deployment()
-        subject._apply_stacks()  # pyright: ignore[reportPrivateUsage]
-        request = next(item for item in book.read_snapshot().compute_requests
-                       if item.request_id == 'b91c2c8572ba4e6f802bdaac9eee0227')
-        self.assertIsInstance(request.resolution, ledger.ComputeInstanceConfirmed)
-        if isinstance(request.resolution, ledger.ComputeInstanceConfirmed):
-            self.assertEqual(request.resolution.instance_id, 'i-0216cf933a26bd1ea')
-        self.assertEqual(aws_config.deployment_outputs(self.state)['DataVolumeId'], 'vol-067914014134c5036')
-        self.assertFalse(book.pending_compute_requests())
-        self.assertTrue(self.commands('execute-change-set'))
-
-    def test_compute_command_starts_with_durable_unconfirmed_accounting(self) -> None:
-        start = self.prepare_stopped_instance()
-        _ = self.deployment().apply(approve_resources=True)
-        compute = self.commands('deploy')[-1]
-        requests = ledger.rows(compute, 'compute_requests')
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0]['at'], start)
-        self.assertEqual(requests[0]['stack'], conf.read(self.settings).text('stack_name'))
-        self.assertEqual(requests[0]['region'], conf.read(self.settings).text('region'))
-        self.assertEqual(ledger.mapping(requests[0]['resolution'])['outcome'], 'unconfirmed')
-
-    def test_compute_timeout_keeps_exact_instance_costs_until_preparation_recovers(self) -> None:
-        self.assert_compute_failure_accounting('timeout', 'prepare')
-
-    def test_stack_lookup_failure_keeps_exact_instance_costs_until_apply_recovers(self) -> None:
-        self.assert_compute_failure_accounting('stack', 'apply')
-
-    def test_instance_lookup_failure_saves_identity_and_costs_until_setup_recovers(self) -> None:
-        self.assert_compute_failure_accounting('instance', 'setup')
-
-    def test_old_terminated_instance_cannot_end_a_replacement_request(self) -> None:
-        start = self.prepare_stopped_instance()
-        subject = self.deployment()
-        outputs = subject.apply(approve_resources=True)
-        (self.root / 'fake-stack.json').unlink()
-        _ = (self.state / 'down-complete.json').write_text((self.state / 'deployment.json').read_text())
-        self.replace('stack_name', 'replacement-build')
-        self.replace('existing_data_volume_id', outputs['DataVolumeId'])
-        _ = subject.prepare()
-        with self.assertRaisesRegex(aws_target.AwsUnavailable, 'timed out'):
-            _ = self.failing_compute('timeout').apply(approve_resources=True)
-        book = ledger.CostLedger(self.state)
-        book.observe(ledger.InstanceObservation(start + 60, 'terminated', 'old instance deletion'))
-        self.assertEqual(self.instance_intervals(start + 3600), [(start, start + 3600, Decimal('1'), 0)])
-        self.set_clock(start + 3600)
-        self.write_price()
-        _ = (self.root / 'describe-instances.json').write_text(json.dumps({
-            'Reservations': [{'Instances': [{'InstanceId': outputs['InstanceId'], 'LaunchTime': 'old-boot',
-                                            'State': {'Name': 'terminated'}}]}]}))
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'previous instance'):
-            _ = subject.prepare()
-        self.assertEqual(len(book.pending_compute_requests()), 1)
-        self.assertEqual(self.instance_intervals(self.now), [(start, self.now, Decimal('1'), 0)])
-        stack_path = self.root / 'fake-stack.json'
-        stack = remote.read_record(stack_path)
-        ledger.mapping(stack['outputs'])['InstanceId'] = 'i-new'
-        _ = stack_path.write_text(json.dumps(stack))
-        _ = (self.root / 'describe-instances.json').write_text(json.dumps({
-            'Reservations': [{'Instances': [{'InstanceId': 'i-new', 'LaunchTime': 'replacement-boot',
-                                            'State': {'Name': 'running'}}]}]}))
-        self.set_clock(start + 7200)
-        self.write_price()
-        _ = subject.prepare()
-        self.assertEqual(ledger.mapping(remote.read_record(self.state / 'deployment.json')['outputs'])['InstanceId'], 'i-new')
-        self.assertEqual(book.pending_compute_requests(), ())
-        self.assertEqual(self.instance_intervals(self.now + 3600),
-                         [(self.now, self.now + 3600, Decimal('0.1'), 3600), (start, self.now, Decimal('2'), 0)])
-
-    def test_confirmed_absence_ends_only_the_unconfirmed_request_interval(self) -> None:
-        start = self.prepare_stopped_instance()
-        with self.assertRaisesRegex(aws_target.AwsUnavailable, 'timed out'):
-            _ = self.failing_compute('timeout').apply(approve_resources=True)
-        (self.root / 'fake-stack.json').unlink()
-        self.set_clock(start + 3600)
-        self.write_price()
-        _ = self.deployment().prepare()
-        self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
-        self.assertEqual(self.instance_intervals(self.now + 3600), [(start, self.now, Decimal('1'), 0)])
-
-    def test_compute_request_preserves_conflict_checks_for_confirmed_observations(self) -> None:
-        start = self.prepare_stopped_instance()
-        book = ledger.CostLedger(self.state)
-        book.record_compute_request(ledger.ComputeRequest(start, 'fixture-build', 'us-east-1', Decimal('0.5')))
-        with self.assertRaisesRegex(ledger.LedgerUnavailable, 'conflicting instance observations'):
-            book.observe(ledger.InstanceObservation(start, 'running', 'contradictory confirmed state'))
-        self.assertEqual(book.read_snapshot().observations[-1].state, 'stopped')
-        self.assertEqual(self.instance_intervals(start + 3600), [(start, start + 3600, Decimal('1'), 0)])
 
     def prepare_running_costs(self) -> tuple[int, ledger.CostLedger]:
         start = int(datetime(2026, 1, 15, tzinfo=UTC).timestamp())
@@ -2032,96 +3346,22 @@ sys.exit(7)
         self.assertEqual(sum(r[3] for r in after), sum(r[3] for r in before))
         self.assertEqual(after, [*before, (start, self.now, Decimal('11.5'), 0)])
 
-    def test_request_price_keeps_the_submitted_cap_after_live_cap_changes(self) -> None:
-        start = self.prepare_stopped_instance()
-        self.replace('fallback_usd_per_hour', '0.10')
-        _ = self.deployment().prepare()
-        with self.assertRaisesRegex(aws_target.AwsUnavailable, 'timed out'):
-            _ = self.failing_compute('timeout').apply(approve_resources=True)
-        compute = self.commands('deploy')[-1]
-        arguments = cast(list[str], compute['args'])
-        submitted_cap = Decimal(next(word.partition('=')[2] for word in arguments if word.startswith('SpotMaxPrice=')))
-        self.assertEqual(submitted_cap, Decimal('0.5'))
-        self.assertEqual(ledger.CostLedger(self.state).pending_compute_requests()[0].spot_max_usd_per_hour, submitted_cap)
-        self.set_clock(start + 25 * 3600)
-        midnight = int(datetime(2026, 1, 16, tzinfo=UTC).timestamp())
-        for live_cap in ('0.05', '2'):
-            with self.subTest(live_cap=live_cap):
-                self.replace('spot_max_usd_per_hour', live_cap)
-                costs = ledger.costs_from_evidence(ledger.CostLedger(self.state).read_snapshot(),
-                                                   aws_config.read_settings(self.settings), self.now,
-                                                   current_window=False)
-                requests = [r for r in costs.intervals if r.source == 'unconfirmed compute request']
-                self.assertEqual([(r.start, r.end, r.usd, r.confirmed_uptime_s) for r in requests],
-                                 [(start, midnight, Decimal('6'), 0), (midnight, self.now, Decimal('6.5'), 0)])
-
-    def up_output(self, subject: deploy.Deployment, *, include_box: bool = False) -> tuple[bool, str]:
-        output = StringIO()
-        with redirect_stdout(output):
-            if include_box:
-                success = subject.up(approve_resources=True)
-            else:
-                # Resource tests exclude box stages unless the test supplies box fakes.
-                with mock.patch.object(deploy.Deployment, '_box_stages', return_value=()):
-                    success = subject.up(approve_resources=True)
-        return success, output.getvalue()
-
-    def test_up_refuses_bad_policy_devices_before_price_or_admin_access(self) -> None:
-        status = {'Self': {'HostName': 'natedev', 'DNSName': 'natedev.tail21e383.ts.net.', 'TailscaleIPs': ['100.64.0.1']}, 'Peer': {}}
-        self.fake_commands(f'#!{sys.executable}\nprint({json.dumps(status)!r})\n', 'tailscale')
-        with mock.patch.object(deploy.Deployment, '_price_present', side_effect=AssertionError('price must not run')) as price, \
-             mock.patch.object(admin_secrets, 'read_hidden', side_effect=AssertionError('no passphrase')) as prompt, \
-             mock.patch.object(box, 'tailnet_request', side_effect=AssertionError('no API')) as tailnet, \
-             mock.patch.object(admin_secrets.AdminSecretSession, 'get', side_effect=AssertionError('no admin access')) as credentials:
-            success, output = self.up_output(self.deployment())
-        self.assertFalse(success)
-        self.assertIn('nates-macbook-pro-2023: no match', output)
-        self.assertIn('machine names present: natedev', output)
-        price.assert_not_called()
-        prompt.assert_not_called()
-        tailnet.assert_not_called()
-        credentials.assert_not_called()
-        self.assertEqual(self.commands(), [])
-        result = ledger.mapping(remote.read_record(self.state / 'up.json')['up'])
-        self.assertEqual(result['status'], 'refused')
-        self.assertEqual(self.previous_output(output, 'up'), 'up: refused: ' + str(result['reason']) + '\n')
-
-    def test_up_creates_each_stage_and_the_second_run_only_checks_live_state(self) -> None:
-        _ = self.credentials.write_text('[unrelated]\naws_access_key_id=other-key\naws_secret_access_key=other-value\n')
-        self.price_file.unlink()
-        settings = self.settings.read_bytes()
-        success, output = self.up_output(self.deployment())
-        self.assertTrue(success, output)
-        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['us-east-1: Spot quota 128 vCPUs',
-            'price: done', 'bootstrap: done', 'stacks: done', 'scaler-key: done'])
-        commands = self.commands()
-        operations = [cast(list[str], row['args'])[5] for row in commands]
-        self.assertLess(operations.index('describe-spot-price-history'), operations.index('deploy'))
-        self.assertLess(operations.index('execute-change-set'), operations.index('create-access-key'))
-        self.assertEqual(self.credentials.stat().st_mode & 0o777, 0o600)
-        self.assertIn('other-key', self.credentials.read_text())
-        self.assertIn('[build-scaler]', self.credentials.read_text())
-        self.assertEqual(json.loads((self.root / 'fake-keys.json').read_text()), ['new-key'])
-        before = len(self.commands())
-        success, output = self.up_output(self.deployment())
-        self.assertTrue(success, output)
-        self.assertEqual(self.previous_output(output, 'up').splitlines(), ['us-east-1: Spot quota 128 vCPUs',
-            'price: present', 'bootstrap: present', 'stacks: present', 'scaler-key: present'])
-        later = self.commands()[before:]
-        self.assertEqual(sum('describe-spot-price-history' in cast(list[str], row['args']) for row in later), 1)
-        for row in later:
-            self.assertFalse({'deploy', 'create-access-key', 'delete-access-key', 'list-access-keys'} & set(cast(list[str], row['args'])))
-        self.assertEqual(self.settings.read_bytes(), settings)
-        self.assertNotIn('fixture-secret-only-in-credentials', output)
-        for file in self.state.rglob('*.json'):
-            self.assertNotIn('fixture-secret-only-in-credentials', file.read_text())
-        results = remote.read_record(self.state / 'up.json')
-        self.assertEqual(set(results), {'price', 'bootstrap', 'stacks', 'scaler-key'})
-        self.assertTrue(all(ledger.mapping(result)['status'] == 'present' for result in results.values()))
 
     def removal_fixture(self, *, save_node: bool = True) -> dict[str, object]:
-        success, output = self.up_output(self.deployment())
-        self.assertTrue(success, output)
+        _ = self.update_fixture()
+        state = remote.read_record(self.root / 'fake-stack.json')
+        outputs = ledger.mapping(state['outputs'])
+        outputs.update(InstanceId='i-fixture', DataVolumeId='vol-created', ComputeEnabled='true')
+        state['instance_state'] = 'stopped'
+        write_text_atomic(self.root / 'fake-stack.json', json.dumps(state))
+        saved = deployment_record = remote.read_record(self.state / 'deployment.json')
+        saved.update(outputs={**outputs, 'DataVolumeId': ''}, data_volume_id='vol-created')
+        write_text_atomic(self.state / 'deployment.json', json.dumps(saved))
+        _ = (self.root / 'volume-owner').write_text(str(deployment_record['deployment_id']))
+        write_text_atomic(self.state / 'up.json', json.dumps({'box-join': {}} if save_node else {}))
+        (self.state / 'up').mkdir(exist_ok=True)
+        (self.state / 'up/controller.lock').touch()
+        ledger.CostLedger(self.state).observe(ledger.InstanceObservation(self.now, 'terminated', 'historical builder fixture'), confirms_transition=True)
         self.fake_commands(f'#!{sys.executable}\n' + r'''import json, os, pathlib, sys
 root = pathlib.Path(os.environ['DEPLOY_FIXTURE'])
 p = root / 'controller-enabled'
@@ -2165,20 +3405,6 @@ else: raise AssertionError(args)
         _ = cast(object, self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state)))
         return devices
 
-    def join_fixture(self, devices: dict[str, object], arguments: Sequence[str], key: str,
-                     timeout: float, *, env: dict[str, str]) -> None:
-        box.join_session(arguments, key, timeout, env=env)
-        # Register the node after the join succeeds, using the node ID returned by the SSM fake.
-        existing = ledger.rows(devices, 'devices')
-        if any(row.get('nodeId', row.get('id')) == 'node-box' for row in existing):
-            return
-        name = 'aws-build-1' if any(row['hostname'] == 'aws-build' for row in existing) else 'aws-build'
-        devices['devices'] = [*existing, {'id': 'new-device', 'nodeId': 'node-box',
-                                         'hostname': name, 'tags': ['tag:build-aws']}]
-
-    def start_box_after_tick(self, start: Callable[[], object]) -> object:
-        self.set_clock(self.now + 1)
-        return start()
 
     def down_output(self) -> tuple[bool, str]:
         output = StringIO()
@@ -2186,58 +3412,6 @@ else: raise AssertionError(args)
             success = self.deployment().down(approve_destroy=True)
         return success, output.getvalue()
 
-    def test_down_missing_node_refuses_without_changes_then_up_and_down_complete(self) -> None:
-        devices = self.removal_fixture(save_node=False)
-        ledger.rows(devices, 'devices')[0]['nodeId'] = 'node-box'
-        self.set_clock(self.now + 1)
-        fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
-        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'cargo-nextest', 'cargo-mend', 'bash')
-        _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
-        _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': False, 'active': True,
-            'system': SYSTEM, 'desired': SYSTEM, 'ec2': 'running', 'stop_after': 5}))
-        for key, value in (('box_check_delay_s', '0.001'), ('idle_stop_minutes', '0.001'), ('idle_stop_margin_s', '0')):
-            self.replace(key, value)
-        # Advance the fixture clock so a self-stop follows the earlier running observation.
-        def clock() -> int:
-            self.set_clock(self.now + 1)
-            return self.now
-        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=clock, notify=lambda _event: True)
-        original_setup = box.BoxSetup
-        def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
-                  admin: admin_secrets.AdminSecretSession, tailnet: box.TailnetTransport) -> box.BoxSetup:
-            monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=tailnet,
-                                  session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
-        with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
-             mock.patch.object(box, 'BoxSetup', side_effect=setup), \
-             mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),)):
-            with mock.patch.object(original_setup, 'join', side_effect=box.BoxRefused('fixture join failure')):
-                success, output = self.up_output(subject, include_box=True)
-            self.assertFalse(success, output)
-            self.assertIn('box-join: refused: fixture join failure', output)
-            self.assertNotIn('tailscale_node_id', remote.read_record(self.state / 'deployment.json'))
-            before = {path: path.read_bytes() for path in self.state.rglob('*') if path.is_file()}
-            commands = len(self.commands())
-            with mock.patch.object(box.Tailnet, 'delete_device') as delete:
-                success, output = self.down_output()
-            self.assertFalse(success, output)
-            self.assertIn('identity: refused: missing saved Tailscale node id; run deploy.py up', output)
-            delete.assert_not_called()
-            self.assertEqual({path: path.read_bytes() for path in self.state.rglob('*') if path.is_file()}, before)
-            self.assertFalse((self.state / 'down.json').exists())
-            self.assertFalse((self.root / 'systemctl-commands').exists())
-            self.assertTrue((self.root / 'controller-enabled').exists())
-            self.assertFalse(any(cast(list[str], row['args'])[5].startswith(('delete-', 'update-'))
-                                 for row in self.commands()[commands:]))
-            success, output = self.up_output(subject, include_box=True)
-            self.assertTrue(success, output)
-            self.assertIn('routing-proof: done', output)
-            self.assertEqual(self.commands('stop-instances'), [])
-            self.assertEqual(remote.read_record(self.state / 'deployment.json')['tailscale_node_id'], 'node-box')
-            self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-box', 'device-other'])
-            success, output = self.down_output()
-            self.assertTrue(success, output)
-        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
 
     def test_down_never_joined_box_reports_no_device_without_deleting_one(self) -> None:
         devices = self.removal_fixture(save_node=False)
@@ -2252,6 +3426,31 @@ else: raise AssertionError(args)
         delete.assert_not_called()
         self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
         self.assertFalse((self.state / 'deployment.json').exists())
+
+    def test_down_removes_rebuilt_foundation_without_a_data_volume(self) -> None:
+        _ = self.removal_fixture()
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        subject = self.deployment()
+        _ = subject.prepare()
+        outputs = subject.apply(approve_resources=True)
+        self.assertNotIn('ComputeEnabled', outputs)
+        self.assertNotIn('InstanceId', outputs)
+        self.assertNotIn('DataVolumeId', outputs)
+        saved = remote.read_record(self.state / 'deployment.json')
+        self.assertFalse(saved.get('data_volume_id'))
+        before = len(self.commands())
+        success, output = self.down_output()
+        self.assertTrue(success, output)
+        operations = [cast(list[str], row['args'])[5] for row in self.commands()[before:]]
+        self.assertIn('delete-stack', operations)
+        self.assertIn('delete-budget', operations)
+        self.assertNotIn('describe-volumes', operations)
+        self.assertNotIn('delete-volume', operations)
+        self.assertNotIn('update-stack', operations)
+        self.assertFalse((self.root / 'fake-stack.json').exists())
+        self.assertFalse((self.state / 'deployment.json').exists())
+        self.assertTrue((self.state / 'down-complete.json').exists())
 
     def test_down_second_node_identity_check_refuses_without_a_journal(self) -> None:
         devices = self.removal_fixture(save_node=False)
@@ -2290,160 +3489,17 @@ else: raise AssertionError(args)
         _ = path.write_text(original)
 
     def test_down_dry_run_changes_nothing_and_needs_no_credentials(self) -> None:
-        for action in (self.deployment().down, self.deployment().remove_builder):
-            before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
-            with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
-                self.assertTrue(action())
-            self.assertIn('/home build cache is lost', output.getvalue())
-            self.assertIn('admin.gpg, and the box image', output.getvalue())
-            self.assertIn('--approve-destroy', output.getvalue())
-            self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
-
-    def builder_removal_fixture(self) -> dict[str, object]:
-        devices = self.removal_fixture()
-        stack_path = self.root / 'fake-stack.json'
-        stack = remote.read_record(stack_path)
-        ledger.mapping(stack['outputs']).update(GateBucket='fixture-bucket', GateLaunchTemplate='fixture-template')
-        ledger.mapping(stack['parameters']).update(EnableGates='true', GateImage='ami-gate', GateRootGiB='40')
-        _ = stack_path.write_text(json.dumps(stack))
-        template = remote.read_record(deploy.TEMPLATE)
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            _ = ledger.mapping(ledger.mapping(template['Resources'])[name]).pop('Condition')
-        _ = (self.root / 'live-template.json').write_text(json.dumps(template))
-        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({
-            'bucket': 'fixture-bucket', 'template': 'fixture-template',
-            'deployment_id': aws_config.deployment_record(self.state)['deployment_id']}))
-        self.set_clock(self.now + 1)
-        book = ledger.CostLedger(self.state)
-        book.record_inventory(ledger.ResourceInventory(self.now, book.read_snapshot().inventories[-1].resources + (
-            ledger.PricedResource('gate-shared', Decimal(1)),), 'fixture gate deployment'))
-        book.record_compute_request(ledger.ComputeRequest(self.now, 'fixture-build', 'us-east-1', Decimal('0.5')))
-        self.set_clock(self.now + 1)
-        self.replace('fixed_usd_per_month', '100')
-        return devices
-
-    def test_remove_builder_preserves_gates_and_removes_storage_before_resolving_costs(self) -> None:
-        devices = self.builder_removal_fixture()
-        settings, credentials = self.settings.read_bytes(), self.credentials.read_bytes()
-        gate_manifest = (self.state / 'gate-deployment.json').read_bytes()
-        template = remote.read_record(self.root / 'live-template.json')
-        before_commands = len(self.commands())
-        with redirect_stdout(StringIO()) as output:
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        labels = ['checking the deployment', 'disabling builder routing', 'removing the builder from Tailscale',
-                  'updating the stack', 'deleting builder storage',
-                  'deleting local builder records']
-        plain = ['remove-builder: ' + label for label in labels]
-        starts = [line + ' (can take several minutes)' if label == 'updating the stack' else line
-                  for label, line in zip(labels, plain)]
-        self.assertEqual([line for line in output.getvalue().splitlines() if line in starts], starts)
-        progress = [line for line in output.getvalue().splitlines()
-                    if line in starts or any(line.startswith(start + ' done in ') for start in plain)]
-        self.assertEqual(len(progress), len(starts) * 2)
-        self.assertEqual([line for line in output.getvalue().splitlines()
-                          if line.startswith('remove-builder: ') and not line.startswith('remove-builder: done;')], progress)
-        self.assertEqual(self.previous_output('\n'.join(progress), 'remove-builder'), '')
-        print('\n'.join(progress))
-        private = ('i-fixture', 'vol-', '123456789012', 'arn:', 'device-', 'fixture-bucket',
-                   '100.64.', 'fixture-admin-secret', 'fixture-oauth-secret')
-        for value in private:
-            self.assertNotIn(value, '\n'.join(line for line in output.getvalue().splitlines()
-                                               if line.startswith('remove-builder: ')))
-        self.assertIn('gate-deployment.json kept', output.getvalue())
-        self.assertEqual(self.settings.read_bytes(), settings)
-        self.assertEqual(self.credentials.read_bytes(), credentials)
-        self.assertEqual((self.state / 'gate-deployment.json').read_bytes(), gate_manifest)
-        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
-        operations = [cast(list[str], row['args'])[5] for row in self.commands()[before_commands:]]
-        self.assertLess(operations.index('execute-change-set'), operations.index('delete-volume'))
-        self.assertFalse({'delete-stack', 'delete-budget', 'delete-access-key'} & set(operations))
-        command = cast(list[str], self.commands('create-change-set')[-1]['args'])
-        parameters = ledger.rows({'rows': cast(object, json.loads(command[command.index('--parameters') + 1]))}, 'rows')
-        for row in parameters:
-            if row['ParameterKey'] == 'EnableCompute':
-                self.assertEqual(row['ParameterValue'], 'false')
-            else:
-                self.assertIs(row['UsePreviousValue'], True)
-        after_template = remote.read_record(self.root / 'live-template.json')
-        expected = ledger.mapping(template['Resources'])
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            ledger.mapping(expected[name])['Condition'] = 'Compute'
-        self.assertEqual(after_template, template)
-        self.assertEqual(after_template, remote.read_record(deploy.TEMPLATE))
-        saved = aws_config.deployment_outputs(self.state)
-        self.assertEqual(saved['GateBucket'], 'fixture-bucket')
-        self.assertNotIn('InstanceId', saved)
-        self.assertNotIn('DataVolumeId', saved)
-        self.assertFalse((self.state / 'up.json').exists())
-        book = ledger.CostLedger(self.state)
-        state = book.read_snapshot()
-        self.assertEqual(state.observations[-1].state, 'terminated')
-        self.assertEqual(book.pending_compute_requests(), ())
-        self.assertTrue(state.inventories[-1].builder_removed)
-        self.assertEqual(state.inventories[-1].resources, (ledger.PricedResource('gate-shared', Decimal(1)),))
-        costs = book.estimate(aws_config.read_settings(self.settings), self.now + 3600)
-        later = [row for row in costs.intervals if row.start >= self.now]
-        self.assertFalse(any(row.kind == 'instance' for row in later))
-        self.assertEqual(sum((row.usd for row in later if row.kind == 'fixed'), Decimal(0)), Decimal(1) / Decimal(744))
-        self.assertEqual(ledger.text(remote.read_record(self.state / 'builder-removal.json'), 'stack'), 'fixture-build')
-
-    def test_remove_builder_preserves_a_live_gate_definition_that_differs_from_repository(self) -> None:
-        _ = self.builder_removal_fixture()
-        path = self.root / 'live-template.json'
-        template = remote.read_record(path)
-        resources = ledger.mapping(template['Resources'])
-        gate = ledger.mapping(resources['GateExpiryFunction'])
-        ledger.mapping(gate['Properties'])['Timeout'] = 17
-        _ = path.write_text(json.dumps(template))
-        with redirect_stdout(StringIO()):
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        command = cast(list[str], self.commands('create-change-set')[-1]['args'])
-        submitted = remote.read_record(Path(command[command.index('--template-body') + 1].removeprefix('file://')))
-        self.assertEqual(ledger.mapping(submitted['Resources'])['GateExpiryFunction'], gate)
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            ledger.mapping(resources[name])['Condition'] = 'Compute'
-        self.assertEqual(submitted, template)
-
-    def test_remove_builder_resumes_after_partial_removal_and_repeats_without_deletion(self) -> None:
-        _ = self.builder_removal_fixture()
-        saved = remote.read_record(self.state / 'deployment.json')
-        stale = {**saved, 'data_volume_id': 'vol-old',
-                 'outputs': {**ledger.mapping(saved['outputs']), 'InstanceId': 'i-old', 'DataVolumeId': 'vol-old'}}
-        _ = (self.state / 'builder-removal.json').write_text(json.dumps(stale))
-        manifest = (self.state / 'gate-deployment.json').read_bytes()
-        executed_before = len(self.commands('execute-change-set'))
-        for operation in ('execute-change-set', 'delete-volume'):
-            with self.subTest(operation=operation):
-                failure = self.root / ('fail-down-' + operation)
-                failure.touch()
-                with self.assertRaises(aws_target.AwsUnavailable), redirect_stdout(StringIO()):
-                    _ = self.deployment().remove_builder(approve_destroy=True)
-                failure.unlink()
-                self.assertFalse(ledger.CostLedger(self.state).read_snapshot().inventories[-1].builder_removed)
-        with (mock.patch.object(ledger.CostLedger, 'record_inventory', side_effect=OSError('fixture ledger failure')),
-              self.assertRaisesRegex(OSError, 'fixture ledger failure'), redirect_stdout(StringIO())):
-            _ = self.deployment().remove_builder(approve_destroy=True)
-        with redirect_stdout(StringIO()):
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        self.assertEqual(len(self.commands('execute-change-set')), executed_before + 1)
-        self.assertEqual(len(self.commands('delete-volume')), 1)
-        receipt = remote.read_record(self.state / 'builder-removal.json')
-        self.assertEqual(receipt['data_volume_id'], saved['data_volume_id'])
-        self.assertEqual(ledger.mapping(receipt['outputs'])['InstanceId'], ledger.mapping(saved['outputs'])['InstanceId'])
-        before = len(self.commands())
-        with redirect_stdout(StringIO()):
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        operations = [cast(list[str], row['args'])[5] for row in self.commands()[before:]]
-        self.assertFalse(any(operation.startswith(('delete-', 'execute-', 'create-', 'update-')) for operation in operations))
-        self.assertEqual((self.state / 'gate-deployment.json').read_bytes(), manifest)
-        self.assertFalse((self.root / 'deleted-stack').exists())
-        self.assertFalse((self.root / 'deleted-budget').exists())
-        success, output = self.down_output()
-        self.assertTrue(success, output)
-        self.assertFalse((self.root / 'fake-stack.json').exists())
+        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
+            self.assertTrue(self.deployment().down())
+        self.assertIn('/home build cache is lost', output.getvalue())
+        self.assertIn('admin.gpg, and the box image', output.getvalue())
+        self.assertIn('--approve-destroy', output.getvalue())
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
+        _ = write_config_fixture(self.root / 'build_targets.conf', 'targets=mac,natedev\n')
         self.assertEqual([target.name for target in target_config.read_targets()], ['mac', 'natedev'])
         original = self.settings.read_bytes()
         before = ledger.CostLedger(self.state).read_snapshot()
@@ -2475,7 +3531,7 @@ else: raise AssertionError(args)
         self.assertFalse((self.state / 'up.json').exists())
         self.assertTrue((self.root / 'admin.gpg').exists())
         operations = [cast(list[str], row['args'])[5] for row in self.commands()]
-        self.assertLess(operations.index('update-stack'), operations.index('delete-stack'))
+        self.assertNotIn('update-stack', operations)
         self.assertLess(operations.index('delete-stack'), operations.index('delete-volume'))
         before_commands = len(self.commands())
         before_service = (self.root / 'systemctl-commands').read_text()
@@ -2492,7 +3548,7 @@ else: raise AssertionError(args)
         devices = self.removal_fixture()
         self.assertIn('devices', devices)
         failures = (('fail-service', 'routing-off'), ('fail-tailnet', 'tailscale-device'),
-                    ('fail-down-delete-access-key', 'scaler-keys'), ('fail-down-update-stack', 'compute'),
+                    ('fail-down-delete-access-key', 'scaler-keys'),
                     ('fail-down-delete-stack', 'foundation'), ('fail-down-delete-volume', 'retained-resources'),
                     ('fail-down-delete-budget', 'retained-resources'))
         for filename, stage in failures:
@@ -2506,7 +3562,7 @@ else: raise AssertionError(args)
                 (self.root / filename).unlink()
         success, output = self.down_output()
         self.assertTrue(success, output)
-        self.assertEqual(len(self.commands('update-stack')), 1)
+        self.assertEqual(len(self.commands('update-stack')), 0)
         self.assertEqual(len(self.commands('delete-stack')), 1)
         self.assertEqual(len(self.commands('delete-volume')), 1)
 
@@ -2565,64 +3621,6 @@ else: raise AssertionError(args)
         self.assertEqual(len(ledger.rows(devices, 'devices')), 2)
         self.assertTrue((self.state / 'claims/job.json').exists())
 
-    def test_up_after_down_recreates_foundation_compute_and_scaler_key(self) -> None:
-        devices = self.removal_fixture()
-        success, output = self.down_output()
-        self.assertTrue(success, output)
-        before = len(self.commands())
-        fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
-        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'cargo-nextest', 'cargo-mend', 'bash')
-        _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
-        _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': False, 'active': True,
-            'system': '/nix/store/old', 'desired': SYSTEM, 'ec2': 'stopped'}))
-        for key, value in (('box_check_delay_s', '0.001'), ('idle_stop_minutes', '0.001'), ('idle_stop_margin_s', '0')):
-            self.replace(key, value)
-        original_setup = box.BoxSetup
-        def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
-                  admin: admin_secrets.AdminSecretSession, tailnet: box.TailnetTransport) -> box.BoxSetup:
-            monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=tailnet,
-                                  session=partial(self.join_fixture, devices), monotonic=monotonic, pause=monotonic.advance)
-        with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
-             mock.patch.object(box, 'BoxSetup', side_effect=setup), \
-             mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),)):
-            success, output = self.up_output(self.deployment(), include_box=True)
-        self.assertTrue(success, output)
-        results = remote.read_record(self.state / 'up.json')
-        self.assertEqual(list(results), sorted(('price', 'bootstrap', 'stacks', 'scaler-key', 'tailscale-policy', 'box-join',
-                                              'box-configuration', 'checks', 'image', 'idle-stop', 'activation', 'routing-proof')))
-        self.assertTrue(all(ledger.mapping(row)['status'] == 'done' for name, row in results.items() if name != 'price'), output)
-        later = [cast(list[str], row['args']) for row in self.commands()[before:]]
-        self.assertEqual(sum('EnableCompute=false' in args for args in later), 1)
-        self.assertEqual(sum('execute-change-set' in args for args in later), 1)
-        self.assertEqual(sum('create-access-key' in args for args in later), 1)
-        self.assertEqual([row['hostname'] for row in ledger.rows(devices, 'devices')], ['other', 'aws-build'])
-        self.assertEqual(remote.read_record(self.state / 'deployment.json')['tailscale_node_id'], 'node-box')
-        success, output = self.down_output()
-        self.assertTrue(success, output)
-        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
-
-    def test_down_resumes_local_cleanup_without_removing_spending_history(self) -> None:
-        devices = self.removal_fixture()
-        self.assertEqual(len(ledger.rows(devices, 'devices')), 2)
-        proof = self.state / 'box-tools.json'
-        _ = proof.write_text('{}')
-        unlink = Path.unlink
-        def remove(path: Path, missing_ok: bool = False) -> None:
-            if path == proof:
-                raise OSError('fixture proof removal failure')
-            unlink(path, missing_ok=missing_ok)
-        with mock.patch.object(Path, 'unlink', new=remove):
-            success, output = self.down_output()
-        self.assertFalse(success, output)
-        self.assertIn('local-state: refused: fixture proof removal failure', output)
-        before = len(self.commands())
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'removal is incomplete'):
-            _ = self.deployment().up(approve_resources=True)
-        success, output = self.down_output()
-        self.assertTrue(success, output)
-        self.assertFalse(any(cast(list[str], row['args'])[5].startswith(('delete-', 'update-')) for row in self.commands()[before:]))
-        self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'terminated')
 
     def test_down_verifies_immutable_account_region_and_stack_before_any_change(self) -> None:
         devices = self.removal_fixture()
@@ -2713,272 +3711,23 @@ else: raise AssertionError(args)
         args = cast(list[str], self.commands('delete-budget')[-1]['args'])
         self.assertEqual(args[args.index('--budget-name') + 1], 'fixture-build-monthly-' + str(saved['deployment_id']))
 
-    def test_legacy_up_preserves_the_volume_and_budget_then_down_uses_saved_identities(self) -> None:
-        devices = self.removal_fixture()
-        stack_path = self.root / 'fake-stack.json'
-        stack = remote.read_record(stack_path)
-        outputs = ledger.mapping(stack['outputs'])
-        outputs['BudgetName'] = 'fixture-build-monthly'
-        _ = stack_path.write_text(json.dumps(stack))
-        path = self.state / 'deployment.json'
-        _ = path.write_text(json.dumps({'stack': 'fixture-build', 'region': 'us-east-1', 'outputs': outputs}))
-        (self.root / 'volume-owner').unlink()
-        self.set_clock(self.now + 1)
-        before = len(self.commands('deploy'))
-        fake = BOX_FAKE.replace('i-box', 'i-fixture').replace('volbox', 'volcreated')
-        self.fake_commands(f'#!{sys.executable}\n' + fake, 'ssh', 'nix', 'git', 'tailscale', 'rustc', 'cargo', 'cargo-nextest', 'cargo-mend', 'bash')
-        _ = (self.root / 'box-aws').write_text(fake.replace("name = pathlib.Path(sys.argv[0]).name", "name = 'aws'"))
-        _ = (self.root / 'live.json').write_text(json.dumps({'online': True, 'joined': True, 'active': True,
-            'system': SYSTEM, 'desired': SYSTEM, 'ec2': 'running', 'stop_after': 5}))
-        for key, value in (('box_check_delay_s', '0.001'), ('idle_stop_minutes', '0.001'), ('idle_stop_margin_s', '0')):
-            self.replace(key, value)
-        original_setup = box.BoxSetup
-        def setup(settings: Path, directory: Path, start: Callable[[], object], *, execute: aws_target.AwsExecutor,
-                  admin: admin_secrets.AdminSecretSession, tailnet: box.TailnetTransport) -> box.BoxSetup:
-            monotonic = FakeMonotonicClock()
-            return original_setup(settings, directory, partial(self.start_box_after_tick, start), execute=execute, admin=admin, tailnet=tailnet,
-                                  monotonic=monotonic, pause=monotonic.advance)
-        with mock.patch.dict(os.environ, {'BOX_FIXTURE': str(self.root), 'BUILDLOG_DIR': str(self.root / 'buildlog')}), \
-             mock.patch.object(box, 'BoxSetup', side_effect=setup), \
-             mock.patch.object(target_config, 'read_targets', return_value=(target_config.SshTarget('aws', 'linux', self.settings),)):
-            success, output = self.up_output(self.deployment(), include_box=True)
-        self.assertTrue(success, output)
-        saved = remote.read_record(path)
-        self.assertEqual(saved['data_volume_id'], 'vol-created')
-        self.assertEqual(saved['budget_name'], 'fixture-build-monthly')
-        self.assertEqual((self.root / 'volume-owner').read_text(), saved['deployment_id'])
-        updates = self.commands('deploy')[before:]
-        self.assertEqual(len(updates), 1)
-        arguments = cast(list[str], updates[0]['args'])
-        self.assertIn('BudgetName=fixture-build-monthly', arguments)
-        self.assertIn('ExistingDataVolumeId=', arguments)
-        self.assertNotIn('ExistingDataVolumeId=vol-created', arguments)
-        self.assertIn('EnableCompute=true', arguments)
-        self.assertIn('routing-proof: done', output)
-        node = ledger.text(remote.read_record(path), 'tailscale_node_id')
-        ledger.rows(devices, 'devices')[0]['nodeId'] = node
-        success, output = self.down_output()
-        self.assertTrue(success, output)
-        arguments = cast(list[str], self.commands('delete-budget')[-1]['args'])
-        self.assertEqual(arguments[arguments.index('--budget-name') + 1], 'fixture-build-monthly')
-        self.assertEqual([device['id'] for device in ledger.rows(devices, 'devices')], ['device-other'])
-
-    def test_legacy_migration_refuses_a_different_live_instance_without_changes(self) -> None:
-        devices = self.removal_fixture()
-        self.assertIn('devices', devices)
-        path = self.state / 'deployment.json'
-        saved = remote.read_record(path)
-        del saved['stack_id']
-        ledger.mapping(saved['outputs'])['InstanceId'] = 'i-foreign'
-        _ = path.write_text(json.dumps(saved))
-        before = path.read_bytes()
-        requests = len(self.commands())
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'legacy InstanceId differs'):
-            _ = self.deployment().prepare()
-        self.assertEqual(path.read_bytes(), before)
-        self.assertFalse(any(cast(list[str], row['args'])[5] in ('create-tags', 'deploy') for row in self.commands()[requests:]))
-
-    def test_lost_create_reply_recovers_the_reserved_change_set_without_a_duplicate(self) -> None:
-        failure = self.root / 'lose-create-reply'
-        failure.touch()
-        success, output = self.up_output(self.deployment())
-        self.assertFalse(success, output)
-        self.assertIn('stacks: refused:', output)
-        self.assertNotIn('stack_id', remote.read_record(self.state / 'deployment.json'))
-        failure.unlink()
-        success, output = self.up_output(self.deployment())
-        self.assertTrue(success, output)
-        self.assertEqual(len([row for row in self.commands('create-change-set') if 'CREATE' in cast(list[str], row['args'])]), 1)
-        saved = remote.read_record(self.state / 'deployment.json')
-        self.assertEqual(saved['stack_id'], (self.root / 'reserved-stack').read_text())
-
-    def test_reserved_change_set_recovery_refuses_foreign_parameters_or_account(self) -> None:
-        failure = self.root / 'lose-create-reply'
-        failure.touch()
-        success, output = self.up_output(self.deployment())
-        self.assertFalse(success, output)
-        failure.unlink()
-        path = self.root / 'change-set.json'
-        original = remote.read_record(path)
-        for changes in ({'Parameters': [{'ParameterKey': 'DeploymentId', 'ParameterValue': 'f' * 32}]},
-                        {'StackId': str(original['StackId']).replace('123456789012', '999999999999')}):
-            with self.subTest(changes=changes):
-                _ = path.write_text(json.dumps({**original, **changes}))
-                success, output = self.up_output(self.deployment())
-                self.assertFalse(success, output)
-                self.assertIn('reserved change set differs', output)
-                self.assertEqual(len([row for row in self.commands('create-change-set') if 'CREATE' in cast(list[str], row['args'])]), 1)
-                self.assertEqual(self.commands('deploy'), [])
-
-    def test_reused_volume_requires_a_completed_owner_and_transfers_the_tag(self) -> None:
-        self.replace('existing_data_volume_id', 'vol-retained')
-        _ = (self.root / 'volume-owner').write_text('a' * 32)
-        success, output = self.up_output(self.deployment())
-        self.assertFalse(success, output)
-        self.assertIn('no matching down-complete receipt', output)
-        self.assertEqual(self.commands('create-tags'), [])
-        self.assertEqual(self.commands('create-change-set'), [])
-        _ = (self.state / 'down-complete.json').write_text(json.dumps({
-            'deployment_id': 'a' * 32, 'data_volume_id': 'vol-retained'}))
-        success, output = self.up_output(self.deployment())
-        self.assertTrue(success, output)
-        saved = remote.read_record(self.state / 'deployment.json')
-        self.assertEqual((self.root / 'volume-owner').read_text(), saved['deployment_id'])
-        self.assertEqual(saved['data_volume_id'], 'vol-retained')
-        self.assertEqual(len(self.commands('create-tags')), 1)
-        self.assertIn('ExistingDataVolumeId=vol-retained', cast(list[str], self.commands('deploy')[-1]['args']))
-
-    def test_up_retries_failed_compute_without_a_second_foundation(self) -> None:
-        failure = self.root / 'fail-compute'
-        _ = failure.write_text('fail')
-        success, output = self.up_output(self.deployment())
-        self.assertFalse(success)
-        self.assertIn('stacks: refused:', output)
-        self.assertNotIn('scaler-key:', output)
-        failure.unlink()
-        success, output = self.up_output(self.deployment())
-        self.assertTrue(success, output)
-        foundations = [row for row in self.commands('deploy') if 'EnableCompute=false' in cast(list[str], row['args'])]
-        self.assertEqual(len(foundations), 1)
-        self.assertEqual(len(self.commands('create-access-key')), 1)
-        self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
 
     def test_review_in_progress_stack_has_no_resources_to_reconcile(self) -> None:
         _ = (self.root / 'review-stack').write_text('empty change set')
-        success, output = self.up_output(self.deployment())
-        self.assertTrue(success, output)
+        _ = self.update_fixture()
+        state = remote.read_record(self.root / 'fake-stack.json')
+        outputs = ledger.mapping(state['outputs'])
+        outputs.update(InstanceId='i-fixture', DataVolumeId='vol-created', ComputeEnabled='true')
+        state['instance_state'] = 'stopped'
+        write_text_atomic(self.root / 'fake-stack.json', json.dumps(state))
+        saved = deployment_record = remote.read_record(self.state / 'deployment.json')
+        saved.update(outputs={**outputs, 'DataVolumeId': ''}, data_volume_id='vol-created')
+        write_text_atomic(self.state / 'deployment.json', json.dumps(saved))
+        _ = (self.root / 'volume-owner').write_text(str(deployment_record['deployment_id']))
+        write_text_atomic(self.state / 'up.json', json.dumps({'box-join': {}}))
+        ledger.CostLedger(self.state).observe(ledger.InstanceObservation(self.now, 'terminated', 'historical builder fixture'), confirms_transition=True)
         self.assertEqual(len(self.commands('deploy')), 2)
 
-    def test_foundation_wait_does_not_expire_unchanged_compute_preparation(self) -> None:
-        _ = (self.root / 'slow-foundation').write_text('slow')
-        subject = deploy.Deployment(self.settings, self.state, self.bundle,
-            clock=lambda: float((self.root / 'clock').read_text()), notify=lambda _event: True)
-        success, output = self.up_output(subject)
-        self.assertTrue(success, output)
-        self.assertEqual(len(self.commands('deploy')), 2)
-        self.assertEqual(int((self.root / 'clock').read_text()), self.now + 301)
-
-    def test_unconfirmed_scaler_key_is_deleted_and_never_printed(self) -> None:
-        self.replace('scaler_key_check_attempts', '2')
-        self.replace('scaler_key_check_delay_s', '0.001')
-        before = self.credentials.read_bytes()
-        _ = (self.root / 'fail-scaler').write_text('fail')
-        success, output = self.up_output(self.deployment())
-        self.assertFalse(success)
-        self.assertIn('scaler-key: refused:', output)
-        self.assertNotIn('fixture-secret-only-in-credentials', output)
-        self.assertEqual(self.credentials.read_bytes(), before)
-        self.assertEqual(json.loads((self.root / 'fake-keys.json').read_text()), ['old-key'])
-        self.assertEqual(sum(cast(list[str], row['args'])[1] == 'build-scaler' for row in self.commands('get-caller-identity')), 3)
-        self.assertEqual(len(self.commands('delete-access-key')), 1)
-
-    def test_up_refuses_without_approval_before_any_price_or_resource_read(self) -> None:
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'approve-resources'):
-            _ = self.deployment().up()
-        self.assertEqual(self.commands(), [])
-
-    def test_price_command_writes_private_state_for_the_selected_zone_and_admin_environment(self) -> None:
-        path = self.root / '.config/aws-build/deployment-price'
-        self.replace('deployment_price_file', '~/.config/aws-build/deployment-price')
-        settings = self.settings.read_bytes()
-        for existing in (False, True):
-            with self.subTest(existing=existing):
-                if existing:
-                    path.chmod(0o644)
-                output = StringIO()
-                before = int(time.time())
-                with (mock.patch.object(sys, 'argv', ['deploy.py', 'price', '--settings', str(self.settings)]),
-                      redirect_stdout(output)):
-                    self.assertEqual(deploy.main(), 0)
-                after = int(time.time())
-                result = ledger.mapping(cast(object, json.loads(output.getvalue())))
-                at = ledger.instant(result, 'deployment_price_at')
-                self.assertGreaterEqual(at, before)
-                self.assertLessEqual(at, after)
-                self.assertEqual(result['deployment_price_usd_per_hour'], '0.1')
-                self.assertEqual(result['file'], str(path))
-                self.assertEqual(aws_config.deployment_price(self.settings, at), (at, Decimal('0.1')))
-                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
-                self.assertEqual(self.settings.read_bytes(), settings)
-        calls = self.commands()
-        self.assertEqual(len(calls), 2)
-        for call in calls:
-            args = cast(list[str], call['args'])
-            self.assertEqual(args[args.index('--profile') + 1], 'environment')
-            self.assertEqual(args[args.index('--region') + 1], 'us-east-1')
-            self.assertIn('describe-spot-price-history', args)
-            self.assertEqual(args[args.index('--instance-types') + 1], 'm7a.4xlarge')
-            self.assertEqual(args[args.index('--availability-zone') + 1], 'us-east-1a')
-            self.assertEqual(args[args.index('--product-descriptions') + 1], 'Linux/UNIX')
-            self.assertIn('--start-time', args)
-
-    def test_price_command_requires_private_credentials_before_any_aws_read(self) -> None:
-        self.credentials.chmod(0o644)
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'AWS_SHARED_CREDENTIALS_FILE'):
-            _ = self.deployment().price()
-        self.assertEqual(self.commands(), [])
-
-    def test_price_command_preserves_saved_price_after_an_invalid_reply(self) -> None:
-        saved = self.price_file.read_bytes()
-        for prices in ([], [{'SpotPrice': '0'}], [{'SpotPrice': '-1'}], [{'SpotPrice': 'NaN'}]):
-            with self.subTest(prices=prices):
-                _ = (self.root / 'describe-spot-price-history.json').write_text(json.dumps({'SpotPriceHistory': prices}))
-                with self.assertRaises(ValueError):
-                    _ = self.deployment().price()
-                self.assertEqual(self.price_file.read_bytes(), saved)
-
-    def test_prepare_refuses_a_missing_price_file_with_the_refresh_command(self) -> None:
-        self.price_file.unlink()
-        with self.assertRaisesRegex(ValueError, 'deploy.py price') as failure:
-            _ = self.deployment().prepare()
-        self.assertIn('deployment_price_file', str(failure.exception))
-        self.assertIn(str(self.price_file), str(failure.exception))
-        self.assertEqual(self.commands(), [])
-
-    def test_prepare_refuses_price_paths_inside_the_public_repository(self) -> None:
-        tracked_path = Path(__file__).resolve()
-        self.price_file.unlink()
-        self.price_file.symlink_to(tracked_path)
-        for path in (tracked_path, self.price_file):
-            with self.subTest(path=path):
-                self.replace('deployment_price_file', str(path))
-                with self.assertRaisesRegex(ValueError, 'outside the public repository') as failure:
-                    _ = self.deployment().prepare()
-                self.assertIn('deployment_price_file', str(failure.exception))
-                self.assertIn(str(tracked_path), str(failure.exception))
-        self.assertEqual(self.commands(), [])
-
-    def test_prepare_refuses_a_stale_price_file(self) -> None:
-        self.set_clock(self.now + aws_config.read_settings(self.settings).price_max_age_seconds + 1)
-        with self.assertRaisesRegex(ValueError, 'fresh positive public price'):
-            _ = self.deployment().prepare()
-        self.assertEqual(self.commands(), [])
-
-    def test_bootstrap_renders_without_a_price_file(self) -> None:
-        self.price_file.unlink()
-        rendered = self.reviewed_bundle()
-        self.assertIn('aws-build-first-boot-stop', rendered)
-        self.assertIn('/etc/aws-build/remote.conf', rendered)
-        self.assertEqual(self.commands(), [])
-
-    def test_apply_and_setup_start_require_the_saved_price_after_preparation(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        self.price_file.unlink()
-        for action in (subject.apply, subject.setup_start):
-            with self.subTest(action=action.__name__):
-                with self.assertRaisesRegex(ValueError, 'deploy.py price'):
-                    _ = action(approve_resources=True)
-        self.assertEqual(len(self.commands('deploy')), 2)
-        self.assertEqual(self.commands('start-instances'), [])
-
-    def test_bootstrap_renders_without_a_notification_address_file(self) -> None:
-        self.notification_file.unlink()
-        rendered = self.reviewed_bundle()
-        self.assertIn('aws-build-first-boot-stop', rendered)
-        self.assertIn('/etc/aws-build/remote.conf', rendered)
 
     def test_prepare_refuses_missing_or_unreadable_notification_files(self) -> None:
         self.notification_file.unlink()
@@ -3039,47 +3788,6 @@ else: raise AssertionError(args)
         self.assertIn(str(self.notification_file), str(failure.exception))
         self.assertEqual(self.commands('deploy'), [])
 
-    def test_prepare_is_local_and_first_boot_needs_no_observation(self) -> None:
-        prepared = self.deployment().prepare()
-        self.assertEqual(self.commands(), [])
-        self.assertEqual(prepared.parameters['MonthlyLimitUsd'], '400')
-        self.assertNotIn('EnableCompute', prepared.parameters)
-        book = ledger.CostLedger(self.state).read_snapshot()
-        self.assertEqual(book.observations, [])
-        self.assertEqual(book.decision['status'], 'allowed')
-        self.assertTrue(book.inventories)
-        self.assertNotIn('credentials', (self.bundle / 'parameters.json').read_text())
-        self.assertEqual(gzip.decompress(base64.b64decode(prepared.parameters['Bootstrap'])).decode(),
-                         (self.bundle / 'bootstrap.sh').read_text())
-        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
-
-    def test_apply_guards_foundation_before_compute_and_preserves_identity_on_rerun(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        before = ledger.CostLedger(self.state).read_snapshot().inventories
-        paths = ('claims/job.json', 'affinity.json', 'mirror/warm', 'peers/aws.json')
-        for name in paths:
-            path = self.state / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _ = path.write_text('keep')
-        outputs = subject.apply(approve_resources=True)
-        self.assertEqual(outputs['InstanceId'], 'i-fixture')
-        calls = self.commands('deploy')
-        self.assertEqual(len(calls), 2)
-        self.assertIn('EnableCompute=false', cast(list[str], calls[0]['args']))
-        self.assertIn('EnableCompute=true', cast(list[str], calls[1]['args']))
-        for row in calls:
-            decision = cast(dict[str, object], row['decision'])
-            self.assertEqual(decision['status'], 'allowed')
-            self.assertEqual(decision['purpose'], 'deployment')
-        _ = subject.prepare()
-        self.assertEqual(subject.apply(approve_resources=True), outputs)
-        calls = self.commands('deploy')
-        self.assertEqual(len(calls), 3)
-        self.assertIn('EnableCompute=true', cast(list[str], calls[-1]['args']))
-        self.assertEqual(ledger.CostLedger(self.state).read_snapshot().inventories, before)
-        for name in paths:
-            self.assertEqual((self.state / name).read_text(), 'keep')
 
     def test_a_live_limit_change_after_preparation_refuses_every_resource(self) -> None:
         subject = self.deployment()
@@ -3089,7 +3797,7 @@ else: raise AssertionError(args)
             _ = subject.apply(approve_resources=True)
         self.assertEqual(self.commands(), [])
 
-    def test_a_limit_change_during_foundation_refuses_compute(self) -> None:
+    def test_a_limit_change_during_the_foundation_deploy_refuses_the_next_change(self) -> None:
         subject = self.deployment()
         _ = subject.prepare()
         execute = subject.execute
@@ -3097,7 +3805,7 @@ else: raise AssertionError(args)
         def change_limit(arguments: Sequence[str], *, capture_output: bool, text: bool,
                          timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
-            if 'EnableCompute=false' in arguments:
+            if 'deploy' in arguments:
                 self.replace('monthly_limit_usd', '1')
             return result
 
@@ -3106,7 +3814,6 @@ else: raise AssertionError(args)
             _ = subject.apply(approve_resources=True)
         calls = self.commands('deploy')
         self.assertEqual(len(calls), 1)
-        self.assertIn('EnableCompute=false', cast(list[str], calls[0]['args']))
 
     def test_apply_requires_explicit_user_gate_and_private_credentials(self) -> None:
         subject = self.deployment()
@@ -3118,82 +3825,6 @@ else: raise AssertionError(args)
             _ = subject.apply(approve_resources=True)
         self.assertEqual(self.commands(), [])
 
-    def test_setup_restart_uses_the_guard_without_enabling_offload_or_duplicate_starts(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        _ = box.close_routing(self.settings)
-        self.set_clock(self.now + 1)
-        self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
-        self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
-        starts = self.commands('start-instances')
-        self.assertEqual(len(starts), 1)
-        self.assertEqual(cast(dict[str, object], starts[0]['decision'])['purpose'], 'deployment')
-        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
-        self.assertFalse((self.state / 'admission.json').exists())
-        self.assertFalse(remote.read_record(self.state / 'routing.json')['enabled'])
-        self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'pending')
-
-    def test_setup_restart_uses_prepared_parameters_without_the_private_address_file(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        self.notification_file.unlink()
-        self.assertEqual(subject.setup_start(approve_resources=True), {'InstanceId': 'i-fixture', 'State': 'pending'})
-        self.assertEqual(len(self.commands('start-instances')), 1)
-
-    def test_box_start_waits_for_spot_capacity_until_accepted(self) -> None:
-        waits: list[float] = []
-
-        def pause(seconds: float) -> None:
-            waits.append(seconds)
-            self.set_clock(self.now + int(seconds))
-
-        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
-                                    pause=pause, notify=lambda _event: True)
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        started = self.now
-        _ = (self.root / 'capacity-refusals').write_text('2')
-        accepted = {'InstanceId': 'i-fixture', 'State': 'pending'}
-        output = StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(subject._start_box(), accepted)  # pyright: ignore[reportPrivateUsage]
-        delay = read_control_settings(self.settings).capacity_backoff_s
-        self.assertEqual(len(self.commands('start-instances')), 3)
-        self.assertEqual((self.root / 'capacity-refusals').read_text(), '0')
-        self.assertEqual(waits, [delay] * 2)
-        self.assertEqual(self.now, started + int(delay) * 2)
-        self.assertEqual(remote.read_record(self.bundle / 'preflight.json')['at'], self.now)
-        self.assertEqual(output.getvalue().splitlines(), [
-            f'AWS has no Spot capacity for the box now; next try in {delay:g} seconds.'] * 2)
-
-    def test_box_start_raises_other_aws_errors_without_waiting(self) -> None:
-        pause = mock.Mock()
-        subject = deploy.Deployment(self.settings, self.state, self.bundle, clock=lambda: self.now,
-                                    pause=pause, notify=lambda _event: True)
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        error = aws_target.AwsUnavailable('UnauthorizedOperation: start refused')
-        output = StringIO()
-        with (mock.patch.object(subject, 'setup_start', side_effect=error) as start,
-              redirect_stdout(output), self.assertRaises(aws_target.AwsUnavailable) as failure):
-            _ = subject._start_box()  # pyright: ignore[reportPrivateUsage]
-        self.assertIs(failure.exception, error)
-        start.assert_called_once_with(approve_resources=True)
-        pause.assert_not_called()
-        self.assertEqual(output.getvalue(), '')
-
-    def test_setup_restart_refuses_a_changed_limit_before_any_resource_request(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        count = len(self.commands())
-        self.replace('daily_limit_usd', '1')
-        with self.assertRaises(deploy.DeploymentRefused):
-            _ = subject.setup_start(approve_resources=True)
-        self.assertTrue(all('describe-instances' in cast(list[str], row['args']) for row in self.commands()[count:]))
-        self.assertEqual(self.commands('start-instances'), [])
 
     def test_prepare_preserves_existing_cost_and_claim_evidence(self) -> None:
         subject = self.deployment()
@@ -3204,67 +3835,32 @@ else: raise AssertionError(args)
         _ = subject.prepare()
         self.assertEqual(book.read_snapshot().observations, [ledger.InstanceObservation(self.now - 1, 'stopped', 'fixture')])
 
-    def test_retained_volume_reuse_keeps_the_volume_tag_and_creates_no_new_identity(self) -> None:
-        self.replace('existing_data_volume_id', 'vol-retained')
-        subject = self.deployment()
-        _ = subject.prepare()
-        result = subject.apply(approve_resources=True)
-        self.assertEqual(result['DataVolumeId'], 'vol-retained')
-        calls = self.commands()
-        self.assertTrue(any('describe-volumes' in cast(list[str], row['args']) for row in calls))
-        self.assertEqual(subject.apply(approve_resources=True)['DataVolumeId'], 'vol-retained')
 
-    def test_template_enforces_budget_tags_retention_network_and_single_instance_policy(self) -> None:
+    def test_template_enforces_budget_retention_and_one_time_gate_boxes(self) -> None:
         template = remote.read_record(deploy.TEMPLATE)
         resources = cast(dict[str, dict[str, object]], template['Resources'])
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            with self.subTest(compute_resource=name):
-                self.assertEqual(resources[name].get('Condition'), 'Compute')
-        cost_tag = {'Key': {'Ref': 'CostTagKey'}, 'Value': {'Ref': 'CostTagValue'}}
-        for name in ('DataVolume', 'MonthlyBudget'):
-            resource = resources[name]
-            self.assertEqual(resource['DeletionPolicy'], 'Retain')
-            self.assertEqual(resource['UpdateReplacePolicy'], 'Retain')
-        self.assertNotIn('DeletionPolicy', resources['Instance'])
-        self.assertNotIn('UpdateReplacePolicy', resources['Instance'])
-        self.assertNotIn('Tags', cast(dict[str, object], resources['Instance']['Properties']))
-        for name in ('Instance', 'DataVolume', 'LaunchTemplate'):
-            self.assertEqual(resources[name]['DependsOn'], ['BudgetEnforcement'])
-        properties = cast(dict[str, object], resources['DataVolume']['Properties'])
-        self.assertIn(cost_tag, cast(list[object], properties['Tags']))
-        launch = cast(dict[str, object], resources['LaunchTemplate']['Properties'])
+        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup', 'LaunchTemplate', 'Instance', 'DataVolume',
+                     'DataAttachment', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy'):
+            with self.subTest(retired_builder_resource=name):
+                self.assertNotIn(name, resources)
+        budget_resource = resources['MonthlyBudget']
+        self.assertEqual(budget_resource['DeletionPolicy'], 'Retain')
+        self.assertEqual(budget_resource['UpdateReplacePolicy'], 'Retain')
+        budget = cast(dict[str, object], budget_resource['Properties'])
+        budget_data = cast(dict[str, object], budget['Budget'])
+        self.assertEqual(budget_data['BudgetLimit'], {'Amount': {'Ref': 'MonthlyLimitUsd'}, 'Unit': 'USD'})
+        launch = cast(dict[str, object], resources['GateLaunchTemplate']['Properties'])
         data = cast(dict[str, object], launch['LaunchTemplateData'])
         self.assertEqual(data['InstanceMarketOptions'], {
-            'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'persistent',
-            'InstanceInterruptionBehavior': 'stop', 'MaxPrice': {'Ref': 'SpotMaxPrice'}}})
-        self.assertEqual(data['InstanceInitiatedShutdownBehavior'], 'stop')
+            'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time',
+            'InstanceInterruptionBehavior': 'terminate', 'MaxPrice': {'Ref': 'GateSpotMaxPrice'}}})
+        self.assertEqual(data['InstanceInitiatedShutdownBehavior'], 'terminate')
         mappings = cast(list[dict[str, object]], data['BlockDeviceMappings'])
         self.assertIs(cast(dict[str, object], mappings[0]['Ebs'])['DeleteOnTermination'], True)
         self.assertEqual(cast(dict[str, object], data['MetadataOptions'])['HttpTokens'], 'required')
-        tag_specs = cast(list[dict[str, object]], data['TagSpecifications'])
-        self.assertEqual({row['ResourceType'] for row in tag_specs}, {'instance', 'volume', 'spot-instances-request'})
-        for spec in tag_specs:
-            self.assertIn(cost_tag, cast(list[object], spec['Tags']))
-        budget = cast(dict[str, object], resources['MonthlyBudget']['Properties'])
-        budget_data = cast(dict[str, object], budget['Budget'])
-        self.assertEqual(budget_data['BudgetLimit'], {'Amount': {'Ref': 'MonthlyLimitUsd'}, 'Unit': 'USD'})
-        self.assertIn('AWS_BUILD_DATA_VOLUME_ID', str(data['UserData']))
-        self.assertIn("'Ref': 'DataVolume'", str(data['UserData']))
-        ingress = cast(dict[str, object], resources['SecurityGroup']['Properties'])['SecurityGroupIngress']
-        self.assertEqual(ingress, [{'IpProtocol': 'udp', 'FromPort': 41641, 'ToPort': 41641, 'CidrIp': '0.0.0.0/0'}])
-        policy = cast(dict[str, object], resources['ScalerPolicy']['Properties'])
-        statements = cast(list[dict[str, object]], cast(dict[str, object], policy['PolicyDocument'])['Statement'])
-        self.assertEqual(statements[0]['Action'], ['ec2:StartInstances', 'ec2:StopInstances'])
-        self.assertIn('${Instance}', str(statements[0]['Resource']))
-        self.assertIn('ec2:DescribeSpotInstanceRequests', cast(list[str], statements[1]['Action']))
         self.assertNotIn('AccessKey', json.dumps(template))
         self.assertNotIn('mkfs', json.dumps(template))
 
-    def test_repository_configuration_keeps_aws_settings_without_registering_the_builder(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'on')
-        self.assertEqual(conf.read(root / 'config/build_targets.conf').text('targets').split(','),
-                         ['mac', 'natedev'])
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -3272,214 +3868,6 @@ else: raise AssertionError(args)
         _ = (capture_output, text, timeout, check)
         raise AssertionError(f'disabled tick called AWS: {arguments}')
 
-    def test_scheduled_exchange_includes_aws_while_control_stays_off(self) -> None:
-        registry = self.root / 'build_targets.conf'
-        _ = registry.write_text('\n'.join((
-            'targets=aws,natedev', 'kind.aws=ssh', 'platform.aws=linux', 'settings.aws=aws_target.conf',
-            'kind.natedev=local', 'platform.natedev=linux', 'sync.hosts.aws=aws-build',
-            'sync.connect_timeout_s=5', 'sync.reach_timeout_s=5', 'sync.rsync_timeout_s=5', '',
-        )))
-        commands: list[list[str]] = []
-        logs = self.root / 'buildlog'
-
-        def exchange(arguments: list[str], _timeout: float) -> subprocess.CompletedProcess[str]:
-            self.assertIn(arguments[0], ('ssh', 'rsync'))
-            commands.append(arguments)
-            return subprocess.CompletedProcess(arguments, 0, 'rc=0\n' if arguments[0] == 'ssh' else '', '')
-
-        with (mock.patch.dict(os.environ, {'BUILDLOG_PEER': ''}),
-              mock.patch('scripts.buildlog.sync.store.root', return_value=logs),
-              mock.patch('scripts.buildlog.sync.store.host_name', return_value='natedev'),
-              mock.patch('scripts.buildlog.sync.health.write_snapshot'),
-              mock.patch.object(sync, 'run', exchange)):
-            self.assertEqual(sync.sync(), 0)
-            status = sync.read_target_status('aws')
-            self.assertIsInstance(status, sync.SyncStatus)
-            if isinstance(status, sync.SyncStatus):
-                self.assertTrue(status.ok)
-        self.assertTrue(commands)
-        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
-        self.assertEqual(self.commands(), [])
-
-    def test_service_command_and_repeated_ticks_share_charge_recovery_across_utc_midnight(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        self.replace('offload', 'on')
-        registry = self.root / 'build_targets.conf'
-        _ = registry.write_text('targets=aws,natedev\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws_target.conf\nkind.natedev=local\nplatform.natedev=linux\n')
-        controller = aws_target.Controller(self.settings, self.state, self.root / 'queue', clock=lambda: self.now,
-                                           notify=lambda _event: True, publish=lambda _envelope: True)
-        result = controller.tick()
-        self.assertEqual(result.state, 'stopped', result.reason)
-        result = controller.tick()
-        self.assertEqual(result.state, 'stopped', result.reason)
-        self.set_clock(self.now + 86400 + 120)
-        save = cast(Callable[[ledger.CostLedger, ledger.LedgerEvidence], None], getattr(ledger.CostLedger, '_save'))
-
-        def fail_reconciliation(book: ledger.CostLedger, state: ledger.LedgerEvidence) -> None:
-            if any(row.at == self.now for row in state.reconciliations):
-                raise OSError('the reconciliation write failed')
-            save(book, state)
-
-        with mock.patch.object(ledger.CostLedger, '_save', fail_reconciliation):
-            result = controller.tick()
-        self.assertEqual(result.state, 'stopped', result.reason)
-        book = ledger.CostLedger(self.state)
-        self.assertEqual(len(book.read_snapshot().reconciliations), 1)
-        result = controller.tick()
-        self.assertEqual(result.state, 'stopped', result.reason)
-        queries = self.commands('get-cost-and-usage')
-        self.assertEqual(len(queries), 2)
-        self.assertEqual(len(book.read_snapshot().reconciliations), 2)
-        self.assertNotIn('charge_error', (self.state / 'controller.json').read_text())
-        settings = read_control_settings(self.settings)
-        api = aws_target.AwsCli(settings.credentials_profile, settings.region, settings.aws_timeout_s)
-        self.assertIsInstance(controller.refresh_charges(api, self.now), ledger.ChargeRead)
-        self.assertEqual(len(self.commands('get-cost-and-usage')), 2)
-
-    def test_bootstrap_remote_idle_stop_requires_no_published_permission(self) -> None:
-        configuration = deploy.bootstrap_configuration(self.settings, deploy.remote_configuration(self.settings))
-        self.assertIn('services.amazon-ssm-agent.enable = true', configuration)
-        self.assertIn('aws-build-first-boot-stop', configuration)
-        self.assertNotIn('@IDLE_STOP_SECONDS@', configuration)
-        self.assertNotIn('mkfs', configuration)
-        remote_settings = self.root / 'remote.conf'
-        _ = remote_settings.write_text(deploy.remote_configuration(self.settings))
-        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
-        self.assertTrue(read_control_settings(remote_settings).enabled)
-        stops: list[int] = []
-        directory = self.root / 'remote'
-        agent = remote.RemoteAgent(remote_settings, directory, clock=lambda: self.now, imds=lambda: False,
-                                   process_groups=lambda: (), shutdown=lambda: stops.append(self.now), boot=lambda: 'new-boot')
-        self.assertEqual(agent.tick(), 'running')
-        self.assertIsInstance(remote.execution_permission(directory, 'aws', now=self.now, boot_id='new-boot'), ledger.PermissionUnavailable)
-        self.set_clock(self.now + int(read_control_settings(remote_settings).idle_stop_minutes * 60))
-        self.assertEqual(agent.tick(), 'stopping')
-        self.assertEqual(stops, [self.now])
-        self.assertIsInstance(remote.execution_permission(directory, 'aws', now=self.now, boot_id='new-boot'), ledger.PermissionUnavailable)
-
-    def test_reviewed_bootstrap_template_renders_and_fits_the_deployment_parameter(self) -> None:
-        patch = (deploy.TEMPLATE.parent / 'nixos.patch').read_text()
-        for statement in (r'^\+install -d -m ([0-7]{3,4}) /var/lib/aws-build$',
-                          r'^\+\s+\$\{pkgs.coreutils\}/bin/install -d -m ([0-7]{3,4}) /var/lib/aws-build$'):
-            modes = list(re.finditer(statement, patch, re.MULTILINE))
-            self.assertEqual(len(modes), 1, statement)
-            self.assertEqual(int(modes[0].group(1), 8) & 0o005, 0o005)
-        file_modes = list(re.finditer(r'^\+\s+\$\{pkgs.coreutils\}/bin/chmod ([0-7]{3,4}) /var/lib/aws-build/remote.conf$',
-                                     patch, re.MULTILINE))
-        self.assertEqual(len(file_modes), 1)
-        self.assertEqual(int(file_modes[0].group(1), 8) & 0o004, 0o004)
-        self.install_reviewed_template()
-        for volume in ('', 'vol-0123456789abcdef0'):
-            with self.subTest(volume=volume):
-                self.replace('existing_data_volume_id', volume)
-                rendered = deploy.bootstrap_configuration(self.settings, deploy.remote_configuration(self.settings))
-                self.assertTrue(rendered.startswith('#!'))
-                self.assertNotRegex(rendered, r'@[A-Z_]+@')
-                self.assertIn('nvme-Amazon_Elastic_Block_Store_', rendered)
-                self.assertIn('/etc/aws-build/remote.conf', rendered)
-                self.assertNotIn('../modules/linux/tailscale.nix', rendered)
-                self.assertIn('extraSetFlags = [ "--ssh" ];', rendered)
-                self.assertNotIn('# The module enables Tailscale SSH.', rendered)
-                bootstrap = self.bundle / 'bootstrap.sh'
-                _ = bootstrap.write_text(rendered)
-                parameters = self.deployment().prepare().parameters
-                self.assertLessEqual(len(parameters['Bootstrap']), 4096)
-                self.assertEqual(gzip.decompress(base64.b64decode(parameters['Bootstrap'])).decode(), rendered)
-
-    def test_controller_service_uses_the_tick_command_and_reads_each_interval(self) -> None:
-        self.replace('offload', 'on')
-        calls: list[list[str]] = []
-        pauses: list[float] = []
-
-        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
-                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            self.assertFalse(capture_output)
-            self.assertTrue(text)
-            self.assertFalse(check)
-            self.assertEqual(timeout, conf.read(self.settings).number('controller_tick_timeout_s'))
-            self.assertIsNone(env)
-            self.assertEqual(os.environ['AWS_SHARED_CREDENTIALS_FILE'], str(self.credentials))
-            calls.append(list(arguments))
-            self.replace('tick_interval_s', str(7 * len(calls)))
-            return subprocess.CompletedProcess(arguments, 0, '', '')
-
-        def pause(seconds: float) -> None:
-            pauses.append(seconds)
-            if len(pauses) == 2:
-                self.replace('offload', 'off')
-
-        aws_target.serve(self.settings, self.state, execute=execute, pause=pause)
-        expected = [sys.executable, str(Path(aws_target.__file__)), 'tick',
-                    '--settings', str(self.settings), '--directory', str(self.state)]
-        self.assertEqual(calls, [expected, expected])
-        self.assertEqual(pauses, [7, 14])
-        aws_target.serve(self.settings, self.state, execute=self.refuse_command, pause=pause)
-
-
-    def test_replacement_reuses_the_saved_volume_and_preserves_cost_evidence(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        outputs = subject.apply(approve_resources=True)
-        before = ledger.CostLedger(self.state).read_snapshot()
-        claim = self.state / 'retained-claim.json'
-        _ = claim.write_text('keep')
-        (self.root / 'fake-stack.json').unlink()
-        _ = (self.state / 'down-complete.json').write_text((self.state / 'deployment.json').read_text())
-        self.replace('stack_name', 'replacement-build')
-        self.replace('existing_data_volume_id', outputs['DataVolumeId'])
-        _ = subject.prepare()
-        replacement = subject.apply(approve_resources=True)
-        self.assertEqual(replacement['DataVolumeId'], outputs['DataVolumeId'])
-        self.assertEqual(claim.read_text(), 'keep')
-        after = ledger.CostLedger(self.state).read_snapshot()
-        self.assertEqual(after.inventories, before.inventories)
-        self.assertEqual(after.prices, before.prices)
-        self.assertTrue(all(row in after.observations for row in before.observations))
-        self.assertEqual(len(self.commands('deploy')), 4)
-
-    def test_missing_stack_refuses_new_resources_without_the_saved_volume(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        saved = (self.state / 'deployment.json').read_bytes()
-        (self.root / 'fake-stack.json').unlink()
-        _ = subject.prepare()
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'saved DataVolumeId'):
-            _ = subject.apply(approve_resources=True)
-        self.assertEqual(len(self.commands('deploy')), 2)
-        self.assertEqual((self.state / 'deployment.json').read_bytes(), saved)
-
-    def test_volume_selection_change_requires_deleting_the_old_stack(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        outputs = subject.apply(approve_resources=True)
-        self.replace('existing_data_volume_id', outputs['DataVolumeId'])
-        _ = subject.prepare()
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'delete the old stack'):
-            _ = subject.apply(approve_resources=True)
-        self.replace('stack_name', 'replacement-build')
-        _ = subject.prepare()
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'delete the old stack'):
-            _ = subject.apply(approve_resources=True)
-        self.assertEqual(len(self.commands('deploy')), 2)
-
-    def test_setup_after_idle_stop_refreshes_stale_state_before_the_guard(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        self.set_clock(self.now + 1)
-        _ = subject.setup_start(approve_resources=True)
-        stack_path = self.root / 'fake-stack.json'
-        stack = remote.read_record(stack_path)
-        stack['instance_state'] = 'stopped'
-        _ = stack_path.write_text(json.dumps(stack))
-        self.set_clock(self.now + 901)
-        _ = subject.prepare()
-        self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'stopped')
-        self.assertEqual(subject.setup_start(approve_resources=True)['State'], 'pending')
-        self.assertEqual(len(self.commands('start-instances')), 2)
 
     def test_compute_update_revalidates_the_selected_image(self) -> None:
         subject = self.deployment()
@@ -3492,94 +3880,6 @@ else: raise AssertionError(args)
         self.assertEqual(len(self.commands('describe-images')), 2)
         self.assertEqual(len(self.commands('deploy')), 2)
 
-    def test_retained_volume_update_accepts_only_its_current_attachment(self) -> None:
-        self.replace('existing_data_volume_id', 'vol-retained')
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        volume = {'VolumeId': 'vol-retained', 'AvailabilityZone': 'us-east-1a', 'Encrypted': True, 'State': 'in-use',
-                  'Size': 500, 'VolumeType': 'gp3', 'Iops': 6000, 'Throughput': 500,
-                  'Tags': [{'Key': 'Project', 'Value': 'fixture-build'},
-                                 {'Key': 'DeploymentId', 'Value': ledger.text(remote.read_record(self.state / 'deployment.json'), 'deployment_id')}],
-                  'Attachments': [{'InstanceId': 'i-fixture'}]}
-        override_path = self.root / 'describe-volumes.json'
-        _ = override_path.write_text(json.dumps({'Volumes': [volume]}))
-        _ = subject.prepare()
-        self.assertEqual(subject.apply(approve_resources=True)['DataVolumeId'], 'vol-retained')
-        volume['Attachments'] = [{'InstanceId': 'i-other'}]
-        _ = override_path.write_text(json.dumps({'Volumes': [volume]}))
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'retained volume'):
-            _ = subject.apply(approve_resources=True)
-        self.assertEqual(len(self.commands('deploy')), 3)
-
-    def test_compute_deployment_records_runtime_before_controller_activation(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = (self.root / 'describe-instances.json').write_text(json.dumps({
-            'Reservations': [{'Instances': [{'InstanceId': 'i-fixture', 'LaunchTime': 'boot',
-                                            'State': {'Name': 'running'}}]}]}))
-        _ = subject.apply(approve_resources=True)
-        book = ledger.CostLedger(self.state)
-        self.assertEqual(book.read_snapshot().observations[-1].state, 'running')
-        self.set_clock(self.now + 600)
-        _ = subject.prepare()
-        decision = ledger.mapping(remote.read_record(self.bundle / 'preflight.json')['decision'])
-        self.assertGreater(float(ledger.text(decision, 'daily_usd')), 0.01)
-        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
-
-    def test_resource_requests_write_no_unused_intent_record(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        _ = subject.apply(approve_resources=True)
-        self.set_clock(self.now + 1)
-        _ = subject.setup_start(approve_resources=True)
-        self.assertFalse((self.state / 'deployment-intent.json').exists())
-
-    def test_remote_settings_omit_an_absent_instance_identity(self) -> None:
-        self.replace('instance_id', '')
-        rendered = deploy.remote_configuration(self.settings)
-        self.assertNotIn('instance_id=', rendered)
-        self.assertNotIn('unpublished', rendered)
-        self.assertEqual(rendered.count('offload='), 1)
-        self.assertEqual(rendered.count('ci_repo='), 1)
-
-    def test_bootstrap_settings_bind_imds_identity_without_admission(self) -> None:
-        self.replace('instance_id', '')
-        source = self.root / 'bootstrap.conf'
-        _ = source.write_text(deploy.remote_configuration(self.settings))
-        destination = self.root / 'lifecycle/remote.conf'
-        requests: list[str] = []
-
-        def reply(request: Request, *, timeout: float) -> BytesIO:
-            self.assertEqual(timeout, conf.read(source).number('imds_timeout_s'))
-            requests.append(request.full_url)
-            if request.get_method() == 'PUT':
-                return BytesIO(b'fixture-token')
-            self.assertEqual(request.get_header('X-aws-ec2-metadata-token'), 'fixture-token')
-            return BytesIO(b'{"instanceId":"i-abcdef","region":"us-east-2"}')
-
-        with mock.patch.object(remote, 'urlopen', reply):
-            remote.write_bootstrap_settings(source, destination)
-            first = destination.read_bytes()
-            remote.write_bootstrap_settings(source, destination)
-        self.assertEqual(destination.read_bytes(), first)
-        settings = read_control_settings(destination, remote_identity=True)
-        self.assertEqual(settings.instance_id, 'i-abcdef')
-        self.assertEqual(settings.region, 'us-east-2')
-        self.assertTrue(settings.enabled)
-        self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
-        self.assertEqual(len(requests), 4)
-        self.assertFalse((destination.parent / 'admission.json').exists())
-
-    def test_remote_settings_preserve_the_source_limit_lines(self) -> None:
-        source = self.settings.read_text().replace('# range: 0.001..\nidle_stop_minutes=',
-                                                   '# range: 10..20\nidle_stop_minutes=')
-        _ = self.settings.write_text(source)
-        reads = self.root / 'config-reads'
-        _ = reads.write_text('')
-        with conf_reads.record_reads(reads):
-            self.assertIn('# range: 10..20\nidle_stop_minutes=15', deploy.remote_configuration(self.settings))
-        self.assertEqual(reads.read_text().splitlines(), [self.settings.stem] * 2)
 
     def fake_commands(self, source: str, *names: str) -> None:
         for name in names:
@@ -3613,44 +3913,6 @@ else: raise AssertionError(args)
             self.assertEqual(deploy.main(), 0)
         return (self.bundle / 'bootstrap.sh').read_text()
 
-    def test_bootstrap_retry_keeps_the_existing_watchdog_deadline(self) -> None:
-        rendered = self.reviewed_bundle()
-        watchdog = rendered.split('# Bound the first boot', 1)[1].split('\ncat > ', 1)[0]
-        watchdog = watchdog[watchdog.index('\n') + 1:]
-        script = self.root / 'watchdog.sh'
-        _ = script.write_text('set -euo pipefail\n' + watchdog)
-        fake = r'''import json, os, pathlib, sys
-root = pathlib.Path(os.environ['DEPLOY_FIXTURE'])
-state = root / 'watchdog-deadline.json'
-if pathlib.Path(sys.argv[0]).name == 'systemctl':
-    assert sys.argv[1:] == ['show', '--property=LoadState', '--value', 'aws-build-first-boot-stop.timer']
-    print('loaded' if state.exists() else 'not-found')
-else:
-    with (root / 'watchdog-calls.jsonl').open('a') as output:
-        output.write(json.dumps(sys.argv[1:]) + '\n')
-    seconds = next(arg.split('=')[1].removesuffix('s') for arg in sys.argv[1:] if arg.startswith('--on-active='))
-    state.write_text(json.dumps(int((root / 'clock').read_text()) + int(seconds)))
-'''
-        self.fake_commands(f'#!{sys.executable}\n' + fake, 'systemctl', 'systemd-run')
-        first = self.run_bash(script)
-        self.assertEqual(first.returncode, 0, first.stderr)
-        deadline = (self.root / 'watchdog-deadline.json').read_bytes()
-        self.assertEqual(json.loads(deadline), self.now + int(read_control_settings(self.settings).idle_stop_minutes * 60))
-        self.set_clock(self.now + 60)
-        second = self.run_bash(script)
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual((self.root / 'watchdog-deadline.json').read_bytes(), deadline)
-        self.assertEqual(len((self.root / 'watchdog-calls.jsonl').read_text().splitlines()), 1)
-
-    def test_controller_service_restarts_after_a_failed_interval_read(self) -> None:
-        module = self.patch_source('modules/linux/aws-build.nix')
-        unit = module.split('systemd.user.services.aws-target = {', 1)[1]
-        service = unit.split('serviceConfig = {', 1)[1].split('};', 1)[0]
-        self.assertRegex(service, r'Restart\s*=\s*"on-failure"\s*;')
-        delay = re.search(r'RestartSec\s*=\s*"([0-9]+(?:\.[0-9]+)?)s"\s*;', service)
-        if delay is None:
-            self.fail('the controller needs a restart delay')
-        self.assertGreater(Decimal(delay.group(1)), 0)
 
     def install_volume_fakes(self) -> None:
         state = self.root / 'volume-state'
@@ -3733,37 +3995,6 @@ esac
         _ = path.write_text(script)
         return path
 
-    def test_both_volume_modes_refuse_wrong_serials_and_preserve_existing_filesystems(self) -> None:
-        self.install_volume_fakes()
-        for bootstrap in (True, False):
-            script = self.volume_script(bootstrap=bootstrap, existing='vol-0123456789abcdef0')
-            for serial, expected_status in (('vol-wrong', 1), ('vol0123456789abcdef0', 0)):
-                with self.subTest(bootstrap=bootstrap, serial=serial):
-                    _ = (self.root / 'serial').write_text(serial)
-                    original = {'TYPE': b'ext4\n', 'LABEL': b'aws-home\n', 'evidence': b'keep'}
-                    for key, value in original.items():
-                        _ = (self.root / key).write_bytes(value)
-                    result = self.run_bash(script)
-                    self.assertEqual(result.returncode, expected_status, result.stderr)
-                    self.assertEqual({key: (self.root / key).read_bytes() for key in original}, original)
-                    self.assertFalse((self.root / 'formats').exists())
-
-    def test_bootstrap_formats_matching_blank_media_once_and_full_host_refuses_it(self) -> None:
-        self.install_volume_fakes()
-        _ = (self.root / 'serial').write_text('vol0123456789abcdef0')
-        full = self.volume_script(bootstrap=False)
-        refused = self.run_bash(full)
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertFalse((self.root / 'formats').exists())
-        bootstrap = self.volume_script(bootstrap=True)
-        for attempt in range(2):
-            with self.subTest(attempt=attempt):
-                result = self.run_bash(bootstrap)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((self.root / 'formats').read_text(), 'format\n')
-        kept = self.run_bash(full)
-        self.assertEqual(kept.returncode, 0, kept.stderr)
-        self.assertEqual((self.root / 'formats').read_text(), 'format\n')
 
     def test_earlier_day_request_costs_do_not_reduce_the_next_days_reconciled_guard_totals(self) -> None:
         self.text_setting('accounting_zone', 'America/New_York')
@@ -3823,7 +4054,6 @@ esac
         self.assertEqual(snapshot, reopened.read_snapshot())
         self.assertEqual(readonly.daily, after_costs.daily)
 
-        self.replace('offload', 'on')
         charges = self.state / 'charges'
         charges.mkdir()
         reading = ledger.ChargeRead('2026-02-01', self.now + 1, start, end, Decimal(24), Decimal(0), Decimal(0))
@@ -3883,22 +4113,11 @@ esac
         self.assertEqual(costs.daily.usd, Decimal(2))
         self.assertEqual(tuple(ledger.CostLedger(self.state).read_snapshot().reconciliations), readings)
 
-    def test_money_and_measurement_use_the_configuration_finite_number_rule(self) -> None:
-        for value in ('1e400', 'nan', 'inf'):
-            for parser in (aws_config.money, measurement.number):
-                with self.subTest(value=value, parser=parser.__name__):
-                    with self.assertRaises(ValueError):
-                        _ = parser(value)
 
-    def test_fixed_deployment_values_use_the_source_limits(self) -> None:
-        for key, value, normal in (('data_volume_gib', '501', '500'), ('data_volume_iops', '6001', '6000'),
-                                   ('data_volume_throughput', '501', '500'), ('budget_stop_percent', '99', '100'),
-                                   ('instance_type', 'm7a.8xlarge', 'm7a.4xlarge')):
-            with self.subTest(key=key):
-                self.replace(key, value)
-                with self.assertRaises(ValueError):
-                    _ = aws_config.read_deployment_settings(self.settings)
-                self.replace(key, normal)
+    def test_budget_stop_percent_uses_its_source_limit(self) -> None:
+        self.replace('budget_stop_percent', '99')
+        with self.assertRaises(ValueError):
+            _ = aws_config.read_deployment_settings(self.settings)
 
     def test_durable_decision_check_rejects_a_superseded_decision(self) -> None:
         subject = self.deployment()
@@ -3911,45 +4130,6 @@ esac
         self.assertFalse(book.decision_is_current(allowed))
         self.assertIsInstance(book.permission_for_decision(allowed), ledger.PermissionUnavailable)
 
-    def test_service_retains_its_interval_after_a_bad_live_read(self) -> None:
-        self.replace('offload', 'on')
-        calls: list[int] = []
-        delays: list[float] = []
-        number = conf.ConfigRead.number
-        def action() -> None:
-            calls.append(len(calls))
-            if len(calls) == 3:
-                self.replace('offload', 'off')
-        def interval(settings: conf.ConfigRead, key: str) -> float:
-            if len(calls) == 2:
-                raise ValueError('bad live interval')
-            return number(settings, key)
-        with mock.patch.object(conf.ConfigRead, 'number', interval):
-            deploy_service_loop = aws_config.service_loop
-            deploy_service_loop(self.settings, 'tick_interval_s', action, pause=delays.append)
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(delays, [30, 30])
-
-    def test_service_refuses_work_when_the_first_interval_read_fails(self) -> None:
-        self.replace('offload', 'on')
-        calls: list[str] = []
-        delays: list[float] = []
-        with mock.patch.object(conf.ConfigRead, 'number', side_effect=ValueError('bad initial interval')):
-            with self.assertRaisesRegex(ValueError, 'bad initial interval'):
-                aws_config.service_loop(self.settings, 'tick_interval_s', lambda: calls.append('tick'), pause=delays.append)
-        self.assertEqual(calls, [])
-        self.assertEqual(delays, [])
-
-    def test_remote_serve_uses_the_configured_state_directory(self) -> None:
-        self.replace('offload', 'on')
-        directory = Path.home() / read_control_settings(self.settings).remote_state_directory
-        agent = remote.RemoteAgent(self.settings, directory)
-        with (mock.patch.object(sys, 'argv', ['remote.py', 'serve', '--settings', str(self.settings)]),
-              mock.patch.object(remote, 'RemoteAgent', return_value=agent) as factory,
-              mock.patch.object(remote, 'service_loop') as loop):
-            self.assertEqual(remote.main(), 0)
-            factory.assert_called_once_with(self.settings, directory)
-            loop.assert_called_once_with(self.settings, 'interruption_poll_s', agent.tick)
 
     def test_prepare_reads_the_template_once_and_uses_its_guard_decision(self) -> None:
         original = Path.read_bytes
@@ -3963,16 +4143,6 @@ esac
         self.assertEqual(reads, [deploy.TEMPLATE])
         self.assertEqual(ledger.mapping(remote.read_record(self.bundle / 'preflight.json')['decision'])['purpose'], 'deployment')
 
-    def test_deployment_settings_validate_the_public_source_inputs(self) -> None:
-        for key, value in (('scripts_source_url', 'https://user:secret@example.invalid/a'),
-                           ('scripts_source_commit', 'main'), ('scripts_source_sha256', 'unverified')):
-            with self.subTest(key=key):
-                settings = aws_config.read_deployment_settings(self.settings)
-                self.replace(key, value)
-                with self.assertRaises(ValueError):
-                    _ = aws_config.read_deployment_settings(self.settings)
-                self.replace(key, str(cast(object, getattr(settings, key))))
-
     def test_shared_aws_cli_rejects_a_malformed_stack_reply(self) -> None:
         subject = self.deployment()
         _ = subject.prepare()
@@ -3980,18 +4150,3 @@ esac
         with self.assertRaisesRegex(aws_target.AwsUnavailable, 'invalid reply'):
             _ = subject.apply(approve_resources=True)
         self.assertEqual(self.commands('deploy'), [])
-
-
-    def test_replacement_preparation_accepts_a_confirmed_deleted_instance(self) -> None:
-        subject = self.deployment()
-        _ = subject.prepare()
-        outputs = subject.apply(approve_resources=True)
-        (self.root / 'fake-stack.json').unlink()
-        _ = (self.root / 'missing-instance').write_text('deleted')
-        _ = (self.state / 'down-complete.json').write_text((self.state / 'deployment.json').read_text())
-        self.replace('stack_name', 'replacement-build')
-        self.replace('existing_data_volume_id', outputs['DataVolumeId'])
-        self.set_clock(self.now + 600)
-        _ = subject.prepare()
-        self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'terminated')
-        self.assertEqual(len(self.commands('deploy')), 2)

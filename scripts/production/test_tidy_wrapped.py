@@ -25,6 +25,7 @@ from scripts.production.staff_test_support import (
 from scripts.production import staff
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.copies import copies
+from scripts.lib import build_folders
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 
@@ -74,7 +75,7 @@ class TidyWrappedTests(unittest.TestCase):
     def state_files(self, production_name: str) -> tuple[Path, ...]:
         owner = self.owner(production_name)
         return tuple(self.write(path, "[]\n") for path in (
-            self.state / "footers-off" / owner.id, self.state / "review-paused" / f"{owner.id}.json",
+            self.state / "footers-off" / owner.id,
             self.state / "outstanding" / f"{owner.id}.json",
             self.state / owner.id / "log-backups" / "log-1.md"))
 
@@ -107,14 +108,17 @@ class TidyWrappedTests(unittest.TestCase):
                 retired_tree_cache = (retired_tree / "target").resolve().parent
             with copies.standing("live", source, copies.CommittedSource("HEAD")) as unrelated:
                 unrelated_cache = (unrelated / "target").resolve().parent
-            refused = self.run_tidy(doc)
-            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
-            self.assertTrue(all(path.exists() for path in state))
+            during_use = self.run_tidy(doc)
+            self.assertEqual(during_use.returncode, 0, during_use.stdout + during_use.stderr)
+            self.assertFalse(any(path.exists() for path in state))
+            self.assertEqual(build_folders.build_folder_state(unit_tree), "held")
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for tree in (unit_tree, production_tree, retired_tree, unit_tree_cache, production_tree_cache, retired_tree_cache):
-            self.assertFalse(tree.exists())
-        self.assertFalse(unrelated.exists())
+            self.assertTrue(tree.exists())
+            self.assertEqual(build_folders.build_folder_state(tree), "free")
+        self.assertTrue(unrelated.exists())
+        self.assertEqual(build_folders.build_folder_state(unrelated), "free")
         self.assertTrue(unrelated_cache.is_dir())
         self.assertFalse(any(path.exists() for path in state))
         self.assertEqual(self.run_tidy(doc).returncode, 0)
@@ -136,12 +140,17 @@ class TidyWrappedTests(unittest.TestCase):
             unrelated_cache = (unrelated / "target").resolve().parent
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(unit_tree.exists())
-        self.assertFalse(retired_tree.exists())
-        self.assertFalse(unrelated.exists())
+        self.assertTrue(unit_tree.exists())
+        self.assertEqual(build_folders.build_folder_state(unit_tree), "free")
+        self.assertTrue(retired_tree.exists())
+        self.assertEqual(build_folders.build_folder_state(retired_tree), "free")
+        self.assertTrue(unrelated.exists())
+        self.assertEqual(build_folders.build_folder_state(unrelated), "free")
         self.assertTrue(unrelated_cache.is_dir())
-        self.assertFalse(unit_tree_cache.exists())
-        self.assertFalse(retired_tree_cache.exists())
+        self.assertTrue(unit_tree_cache.exists())
+        self.assertEqual(build_folders.build_folder_state(unit_tree_cache), "free")
+        self.assertTrue(retired_tree_cache.exists())
+        self.assertEqual(build_folders.build_folder_state(retired_tree_cache), "free")
 
     def test_wrap_keeps_state_until_a_damaged_copy_record_is_repaired(self) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Cleanup Test",
@@ -176,7 +185,7 @@ class TidyWrappedTests(unittest.TestCase):
         other = self.state_files("live")
         result = self.run_tidy(self.doc("done", "wrapped"))
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertEqual(result.stdout, "done: removed 4 state files\n")
+        self.assertEqual(result.stdout, "done: removed 3 state files\n")
         self.assertFalse(any(path.exists() for path in own))
         self.assertFalse((self.state / self.owner("done").id).exists())
         self.assertTrue(all(path.exists() for path in other))
@@ -332,7 +341,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     def test_a_staff_name_matching_a_shared_folder_removes_only_its_owned_state(self) -> None:
         shared = [self.write(self.state / name / "keep", "shared state\n")
-                  for name in ("footers-off", "review-paused", "outstanding", "counts", "reports")]
+                  for name in ("footers-off", "outstanding", "counts", "reports")]
         other = self.state_files("live")
         for path in shared:
             with self.subTest(name=path.parent.name):
@@ -356,7 +365,7 @@ class TidyWrappedTests(unittest.TestCase):
         removed = self.state_files("done")
         result = self.run_tidy(self.doc("live", "running"), self.doc("done", "wrapped"))
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, "done: removed 4 state files\n")
+        self.assertEqual(result.stdout, "done: removed 3 state files\n")
         self.assertTrue(all(path.exists() for path in kept))
         self.assertFalse(any(path.exists() for path in removed))
 

@@ -8,10 +8,13 @@ a list either inline as `[a, b]` or as `- item` lines below its key. Obsidian wr
 """
 from __future__ import annotations
 
+import fnmatch
+from collections.abc import Callable
 import re
 from pathlib import Path
 from typing import NamedTuple
 
+ALL_FIELDS: frozenset[str] = frozenset()
 FENCE = "---"
 # The tag every proposal issue carries.
 PROPOSAL_TAG = "proposal"
@@ -49,28 +52,70 @@ def values(raw: str) -> list[str]:
     return [one] if one else []
 
 
-def frontmatter(path: Path) -> dict[str, list[str]]:
-    """The file's frontmatter fields, or none when it has no closed frontmatter or cannot be read."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return {}
-    if not lines or lines[0].strip() != FENCE or FENCE not in (line.strip() for line in lines[1:]):
-        return {}
+def header_fields(lines: list[str], keys: frozenset[str] = ALL_FIELDS) -> dict[str, list[str]]:
+    """Decode only the requested fields from one header."""
     fields: dict[str, list[str]] = {}
     key = ""
-    for line in lines[1:]:
-        if line.strip() == FENCE:
-            break
+    for line in lines:
         if (item := ITEM.match(line)) and key:
             fields[key].extend(values(item["value"]))
         elif found := FIELD.match(line):
-            key = found["key"]
-            fields[key] = values(found["value"])
+            key = found["key"] if not keys or found["key"] in keys else ""
+            if key:
+                fields[key] = values(found["value"])
     return fields
 
 
-def open_issues(folder: Path, tag: str) -> list[Issue]:
+def frontmatter(path: Path, *, sources: list[Path] | None = None,
+                keys: frozenset[str] = ALL_FIELDS,
+                select: Callable[[Issue], bool] | None = None) -> dict[str, list[str]]:
+    """Select from cheap header fields before decoding the complete header."""
+    if sources is not None:
+        sources.append(path)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            if stream.readline().strip() == FENCE:
+                lines: list[str] = []
+                for line in stream:
+                    if line.strip() == FENCE:
+                        fields = header_fields(lines, keys)
+                        if select is None:
+                            return fields
+                        return header_fields(lines) if select(Issue(path, fields)) else {}
+                    lines.append(line)
+    except (OSError, UnicodeError):
+        if sources is not None:
+            raise
+        return {}
+    if sources is not None:
+        raise ValueError(f"{path}: missing or unclosed frontmatter")
+    return {}
+
+
+def source_paths(folder: Path, pattern: str, *, sources: list[Path] | None = None) -> list[Path]:
+    """List source paths. A collector requires readable folders; missing folders are empty."""
+    if sources is None:
+        return list(folder.glob(pattern))
+    sources.append(folder)
+    try:
+        # fnmatch on the name: Path.match costs about 15 µs a path, and an issues folder holds 1600.
+        return sorted(path for path in folder.iterdir() if fnmatch.fnmatchcase(path.name, pattern))
+    except FileNotFoundError:
+        return []
+
+
+def open_issues(folder: Path, tag: str, *, sources: list[Path] | None = None,
+                select: Callable[[Issue], bool] | None = None, keys: frozenset[str] = ALL_FIELDS) -> list[Issue]:
     """The issues directly in the folder whose status is open and whose tags hold the tag, by name."""
-    issues = (Issue(path, frontmatter(path)) for path in sorted(folder.glob("*.md")) if path.is_file())
-    return [issue for issue in issues if issue.value("status") == "open" and tag in issue.fields.get("tags", [])]
+    def wanted(issue: Issue) -> bool:
+        return (issue.value("status") == "open" and tag in issue.fields.get("tags", [])
+                and (select is None or select(issue)))
+
+    found: list[Issue] = []
+    for path in sorted(source_paths(folder, "*.md", sources=sources)):
+        if not path.is_file():
+            continue
+        fields = frontmatter(path, sources=sources, keys=keys | {"status", "tags"}, select=wanted)
+        if fields:
+            found.append(Issue(path, fields))
+    return found

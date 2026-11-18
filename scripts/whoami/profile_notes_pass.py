@@ -24,7 +24,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import Counter
@@ -37,6 +36,8 @@ from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Literal, cast, override
 from unittest.mock import patch
+
+from scripts.lib import build_folders
 
 
 
@@ -503,7 +504,8 @@ def ps_read(args: tuple[str, ...]) -> bool:
 
 def lsof_read(args: tuple[str, ...]) -> bool:
     return ((len(args) == 4 and args[:2] == ("-a", "-p") and args[2].isdecimal() and args[3] == "-Fn")
-        or (len(args) == 6 and args[:2] == ("-a", "-p") and args[2].isdecimal() and args[3:] == ("-d", "cwd", "-Fn"))
+        or (len(args) == 6 and args[:2] == ("-a", "-p") and all(pid.isdecimal() for pid in args[2].split(","))
+            and args[3:] == ("-d", "cwd", "-Fpn"))
         or args == ("-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"))
 
 
@@ -619,7 +621,7 @@ def profile_pass(stats: Path, peer_python: Mapping[str, str] = NO_PEER_PYTHON) -
     profiler = cProfile.Profile(timer=time.process_time)
     with ExitStack() as stack:
         # Each pass gets fresh state copies, removed when the pass ends.
-        private = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="notes-pass-")))
+        private = Path(stack.enter_context(build_folders.tool_folder("notes-pass")))
         _ = stack.enter_context(patch.object(sys, "dont_write_bytecode", True))
         pass_ = load_pass()
         redirect_state(pass_, private, stack)

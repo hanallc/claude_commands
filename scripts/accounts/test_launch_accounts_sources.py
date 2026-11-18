@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
-from scripts.accounts.test_launch_accounts import launch_account_violations, shell_launch_account_violations
+from scripts.accounts.test_launch_accounts import EXCEPTIONS, launch_account_violations, shell_launch_account_violations
 from scripts.lib.code_kind import is_test_code
 
 ROOT = Path(__file__).resolve().parents[1]
+EXCEPTION_FILES = frozenset(file for file, _ in EXCEPTIONS)
+# starts_claude needs the literal "claude" or a "command claude" or "exec claude" string.
+CLAUDE_START_WORDS = re.compile(r"""["']claude["']|(?:command|exec) claude""")
 
 
 class LaunchAccountTests(unittest.TestCase):
@@ -16,7 +20,12 @@ class LaunchAccountTests(unittest.TestCase):
         for path in sorted(ROOT.rglob("*.py")):
             if is_test_code(path):
                 continue
-            violations.extend(launch_account_violations(path.read_text(encoding="utf-8"), str(path.relative_to(ROOT))))
+            source = path.read_text(encoding="utf-8")
+            relative = str(path.relative_to(ROOT))
+            # A finding needs a Claude start or an exception entry: a parse of each other file only costs time.
+            if relative not in EXCEPTION_FILES and not CLAUDE_START_WORDS.search(source):
+                continue
+            violations.extend(launch_account_violations(source, relative))
         self.assertEqual(violations, [], "\n".join(violations))
 
     def test_shell_launchers_do_not_pick_or_set_an_unresolved_account(self) -> None:

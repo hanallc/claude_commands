@@ -18,7 +18,11 @@ class PushTextTests(unittest.TestCase):
             relative = path.relative_to(ROOT).as_posix()
             if relative in EXEMPT or is_test_code(path):
                 continue
-            findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(path.read_text()))
+            source = path.read_text()
+            # Each phone send names pushover, or user with --to or broadcast: a parse of each other file only costs time.
+            if "pushover" not in source and not ("user" in source and ("--to" in source or "broadcast" in source)):
+                continue
+            findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(source))
         for folder in ("commands", "codex"):
             for path in (ROOT / folder).rglob("*.md"):
                 findings.extend(f"{path.relative_to(ROOT)}:{line}: unregistered phone instruction"

@@ -30,6 +30,7 @@ class DemoteShowrunnerTests(StaffTestCase):
     plan_relative: Path = Path("plan.md")
     port: unit_config.AppPort | unit_config.NoAppPort = unit_config.NoAppPort()
     style: bool = True
+    unit_type: staff.UnitType = "direct"
     checkout: Path = Path()
     child_tree: Path = Path()
     doc: Path = Path()
@@ -94,6 +95,8 @@ class DemoteShowrunnerTests(StaffTestCase):
         _ = self.git("init", "--bare", "-q", str(self.root / "origin.git"))
         _ = self.git("remote", "add", "origin", str(self.root / "origin.git"))
         _ = self.worker
+        from scripts.production.staff_test_support import fixture_session
+        fixture_session(self.child.current_session, staff.ClaudeBackend())
         self.events = []
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "state"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "__ETC_ZSHENV_SOURCED": "1"})))
@@ -131,9 +134,9 @@ class DemoteShowrunnerTests(StaffTestCase):
         row = fixture_member("unit", name=name, parent=self.child.id,
                              worktree=staff.PresentWorktree(remote.local_machine(), tree))
         _ = unit_config.write(tree, unit_config.UnitConfig(unit_config.PlanFile(Path("old.md")), unit_config.AppPort(9000), ()))
-        _ = unit_config.park(row.id, tree, unit_config.RetiredSession("2026-11-09", row.current_session, unit_config.Branch(branch)))
+        _ = unit_config.park(row.id, tree, unit_config.RetiredSession("2026-11-09", row.current_session))
         _ = self.git("worktree", "remove", "--force", str(tree))
-        return staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), tree), expected=row.worktree)
+        return staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), tree, staff.ParkedBranch(branch)), expected=row.worktree)
 
     def question_staff(self) -> update_registration.QuestionStaff:
         return update_registration.QuestionStaff.for_record(staff.snapshot(), session_staff.MemberSources(()))
@@ -159,10 +162,12 @@ class DemoteShowrunnerTests(StaffTestCase):
     def start_unit(self, args: list[str]) -> int:
         self.events.append("start")
         self.assertEqual(args, ["--production", self.parent_name, self.child_name, "--plan", str(self.plan_relative),
+                               "--unit-type", self.unit_type,
                                "--resume", self.child.current_session, "--cwd", str(self.child_tree),
                                "--config-dir", str(self.root / "units-account"),
                                *(["--port", str(self.port.number)] if isinstance(self.port, unit_config.AppPort) else [])])
         self.assertEqual(staff.by_id(self.child.id), replace(self.child, kind="unit", parent=staff.ReportsTo(self.parent.id),
+                         unit_type=staff.UnitDetails(self.unit_type),
                          doc=staff.DOC_UNFILLED, worktree=staff.PresentWorktree(remote.local_machine(), self.child_tree)))
         config = unit_config.read(self.child_tree)
         assert isinstance(config, unit_config.UnitConfig)
@@ -192,14 +197,14 @@ class DemoteShowrunnerTests(StaffTestCase):
 
     def cleanup_files(self) -> tuple[Path, ...]:
         state = self.root / "state"
-        files = (state / self.child.id / "prompt.txt", state / "counts" / self.child.id,
+        files = (state / "counts" / self.child.id,
                  state / "outstanding" / f"{self.child.id}.json",
                  state / "outstanding" / f"{self.child.id}.history.jsonl",
-                 state / self.child.id / "history.txt", state / self.parent.id / "prompt.txt",
+                 state / self.child.id / "history.txt",
                  state / "counts" / self.parent.id)
         for path in files:
             write_text_atomic(path, "retained fixture content\n")
-        write_text_atomic(files[2], "[]\n")
+        write_text_atomic(files[1], "[]\n")
         update_registration.write_open_entries(read_production(self.child), [
             {"since": "2026-11-09T10:01", "text": "Keep this reminder"}], self.question_staff())
         return files
@@ -218,12 +223,12 @@ class DemoteShowrunnerTests(StaffTestCase):
         other_doc = self.checkout / "other-production.md"
         write_text_atomic(other_doc, self.document(self.checkout))
         other = self.root / "notifier" / f"showrunner-{self.parent.id}"
-        unchanged = {path: path.read_bytes() for path in (*files[2:], other_doc, *other.iterdir())}
+        unchanged = {path: path.read_bytes() for path in (*files[1:], other_doc, *other.iterdir())}
         before = int(self.git("-C", str(self.child_tree), "rev-list", "--count", "HEAD"))
         code, _, errors = self.run_command()
         self.assertEqual(code, 0, errors)
         self.assertFalse((self.root / "notifier" / f"showrunner-{self.child.id}").exists())
-        for path in files[:2]:
+        for path in files[:1]:
             self.assertFalse(path.exists(), str(path))
         for path, content in unchanged.items():
             self.assertEqual(path.read_bytes(), content)
@@ -237,7 +242,7 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(self.git("-C", str(self.child_tree), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "child.md")
         self.assertEqual(self.git("-C", str(self.child_tree), "branch", "--show-current"), self.child_branch)
 
-    def test_pending_demotion_keeps_its_schedule_and_restore_starts_it(self) -> None:
+    def test_pending_demotion_keeps_its_registration_and_restore_leaves_it_stopped(self) -> None:
         files = self.cleanup_files()
         self.timer.side_effect = self.fixture_notifier
         _ = self.fixture_notifier(["new", f"showrunner-{self.child.id}", "--every", "15",
@@ -256,7 +261,7 @@ class DemoteShowrunnerTests(StaffTestCase):
               mock.patch.object(herdr, "shared_session", return_value="fixture"),
               mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched("w1:p2", herdr.PromptSubmissionNotRequired()))):
             self.assertEqual(demote.restore(self.journal()), 0)
-        self.assertIn("ENABLED=1", (instance / "state").read_text())
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
         self.start.side_effect = self.start_unit
         self.assertEqual(self.run_command()[0], 0)
         self.assertFalse(instance.exists())
@@ -285,7 +290,7 @@ class DemoteShowrunnerTests(StaffTestCase):
               mock.patch.object(herdr, "shared_session", return_value="fixture"),
               mock.patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched("w1:p2", herdr.PromptSubmissionNotRequired()))):
             self.assertEqual(demote.restore(self.journal()), 0)
-        self.assertIn("ENABLED=1", (instance / "state").read_text())
+        self.assertIn("ENABLED=0", (instance / "state").read_text())
         self.assertEqual(staff.by_id(self.child.id), self.child)
         self.assertTrue(all(path.exists() for path in files))
 
@@ -329,7 +334,7 @@ class DemoteShowrunnerTests(StaffTestCase):
             self.assertEqual(self.child_doc.read_bytes(), document)
         self.start.assert_called_once()
         self.place.assert_called_once()
-        self.assertTrue(all(path.exists() for path in files[2:]))
+        self.assertTrue(all(path.exists() for path in files[1:]))
 
     def test_name_only_uses_the_child_plan_and_keeps_explicit_values(self) -> None:
         original_doc = self.child_doc
@@ -347,8 +352,9 @@ class DemoteShowrunnerTests(StaffTestCase):
                 requests: list[demote.Demotion] = []
                 checked = demote.checked
                 def capture(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
-                            record: staff.StaffSnapshot, port: unit_config.AppPort | unit_config.NoAppPort) -> demote.Demotion:
-                    request = checked(parent, name, plan, record, port)
+                            record: staff.StaffSnapshot, port: unit_config.AppPort | unit_config.NoAppPort,
+                            unit_type: staff.UnitType = "direct") -> demote.Demotion:
+                    request = checked(parent, name, plan, record, port, unit_type)
                     requests.append(request)
                     return request
                 with (self.subTest(source=source, flags=flags),
@@ -667,7 +673,7 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.assertEqual(self.run_command()[0], 1)
         self.assertEqual(update_registration.open_entries(child, identities), [reminder])
         moved = update_registration.open_entries(parent, identities)
-        self.assertEqual(moved, [question])
+        self.assertEqual(moved, [question | {"review_id": "Q1"}])
         self.assertEqual(self.run_command()[0], 1)
         self.assertEqual(update_registration.open_entries(parent, identities), moved)
         self.detach.assert_called_once()
@@ -720,6 +726,21 @@ class DemoteShowrunnerTests(StaffTestCase):
         self.stop.assert_called_once()
         self.detach.assert_called_once()
 
+    def test_pending_demotion_restores_the_selected_type(self) -> None:
+        self.unit_type = "merge"
+        self.start.side_effect = None
+        self.start.return_value = 2
+        self.assertEqual(self.run_command("--unit-type", "merge")[0], 1)
+        fields = cast(dict[str, object], json.loads(self.journal().read_text()))
+        self.assertEqual(fields["unit_type"], "merge")
+        converted = staff.by_id(self.child.id)
+        assert converted is not None
+        self.assertEqual(converted.to_json()["unit_type"], "merge")
+        self.assertEqual(self.run_command("--unit-type", "style")[0], 2)
+        self.start.side_effect = self.start_unit
+        self.assertEqual(self.run_command()[0], 0)
+        self.stop.assert_called_once()
+
     def test_pane_placement_failure_does_not_repeat_the_restart(self) -> None:
         self.place.side_effect = OSError("fixture placement failed")
         self.assertEqual(self.run_command()[0], 1)
@@ -741,7 +762,7 @@ class DemoteShowrunnerTests(StaffTestCase):
                 stop.assert_called_once_with(self.child.current_session)
                 self.assertEqual(staff.by_id(self.child.id), self.child)
                 args = start.call_args.args
-                self.assertEqual(args[:4], ("fixture", self.child_name, "child-session", str(self.child_tree)))
+                self.assertEqual(args[:4], ("fixture", self.child_name, self.child_name, str(self.child_tree)))
                 self.assertEqual(cast(dict[str, str], args[4])["CLAUDE_CONFIG_DIR"], str(self.root / "showrunner-account"))
                 self.assertIn(self.child.current_session, cast(list[str], args[6]))
                 if isinstance(outcome, herdr.AgentNotStarted):

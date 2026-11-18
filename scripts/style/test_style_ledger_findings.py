@@ -11,6 +11,8 @@ import sqlite3
 import unittest
 from collections.abc import Callable
 from contextlib import closing
+from dataclasses import replace
+from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.style import style_ledger
@@ -1255,8 +1257,29 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         _ = self.cli("held", "replace", "--id", finding_id, "--after", "corrected")
         self.assertEqual(ledger.named_held((finding_id,))[0].after, "corrected")
 
+    def legacy_test_file_findings(
+        self, ledger: style_ledger.Ledger, rule: str, path: str,
+        items: tuple[tuple[int, str, str, str], ...], anchor: str,
+    ) -> tuple[style_ledger.HeldFinding, ...]:
+        """Seed item rows that predate folding during held add."""
+        blob = self.blob(rule)
+        rows = tuple(
+            (style_ledger._finding_id((rule, path, line, text, blob)),  # pyright: ignore[reportPrivateUsage]
+             rule, path, line, text, before, after, blob, anchor)
+            for line, text, before, after in items
+        )
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.executemany(
+                "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,"
+                + "state,proposal,created_at,updated_at,anchor_commit) "
+                + "VALUES (?,?,?,?,?,'restructure',?,?,?,'outside','unfiled','',"
+                + "'2026-11-12T00:00:00+00:00','2026-11-12T00:00:00+00:00',?)",
+                rows,
+            )
+        return ledger.named_held(row[0] for row in rows)
+
     def test_sibling_test_file_moves_fold_at_filing_and_through_the_cli(self) -> None:
-        for mode in ("filing", "fold"):
+        for mode in ("filing", "fold", "add"):
             with self.subTest(mode=mode):
                 rule = self.rule("test-moves-" + mode, "tier: D\nfamily: modules\ninput_scope: file\n")
                 ledger = self.ledger()
@@ -1272,24 +1295,29 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 anchor = self.commit("Declare the sibling test modules")
                 originals: list[style_ledger.HeldFinding] = []
                 for path in paths:
-                    for line in range(1, 4):
-                        module = "other_tests" if path == paths[2] and line == 3 else "tests"
-                        originals.append(ledger.hold(
-                            rule, path, line, f"fn item_{line}() {{}}", "restructure", f"item_{line} lives in {path}.",
-                            f"Move item_{line} into the inline {module} module in {parent}.",
-                            self.blob(rule), "outside"))
+                    items = tuple(
+                        (line, f"fn item_{line}() {{}}", f"item_{line} lives in {path}.",
+                         f"Move item_{line} into the inline {'other_tests' if path == paths[2] and line == 3 else 'tests'} module in {parent}.")
+                        for line in range(1, 4)
+                    )
+                    if mode == "add":
+                        for line, text, before, after in items:
+                            finding = ledger.hold(rule, path, line, text, "restructure", before, after,
+                                                  self.blob(rule), "outside")
+                            originals.append(finding)
+                            if path in paths[:3]:
+                                self.assertIsInstance(finding.state, style_ledger.Withdrawn)
+                    else:
+                        originals.extend(self.legacy_test_file_findings(ledger, rule, path, items, anchor))
                 issue = self.root / (mode + ".md")
                 if mode == "filing":
-                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
-                        _ = connection.executemany("UPDATE held_findings SET anchor_commit=? WHERE finding_id=?",
-                                                   [(anchor, finding.finding_id) for finding in originals])
                     self.write(parent, "")
                     _ = self.commit("Remove the current declarations after judgment")
                     for finding in originals:
                         ledger.file_held(finding.finding_id, issue)
                     live = tuple(finding for finding in ledger.proposal_findings(issue)
                                  if isinstance(finding.state, style_ledger.Filed))
-                else:
+                elif mode == "fold":
                     result = self.cli("held", "fold-test-files")
                     self.assertIn("folded 3 files: 9 -> 3 findings\n", result.stdout)
                     self.assertEqual(len(result.stdout.splitlines()), 4)
@@ -1298,6 +1326,23 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     before = self.held_rows(ledger.database)
                     self.assertEqual(self.cli("held", "fold-test-files").stdout, "folded 0 files: 0 -> 0 findings\n")
                     self.assertEqual(self.held_rows(ledger.database), before)
+                else:
+                    original = originals[0]
+                    result = self.cli("held", "add", "--rule", rule, "--path", original.path,
+                                      "--line", str(original.line), "--text", original.text, "--kind", original.kind,
+                                      "--before", original.before, "--after", original.after,
+                                      "--rule-blob", original.rule_blob, "--ticket", original.ticket)
+                    self.assertEqual(result.stdout, original.finding_id + "\n")
+                    ledger.file_held(original.finding_id, issue)
+                    added = ledger.hold(rule, original.path, 4, "fn item_4() {}", "restructure", "Separate test item.",
+                                        f"Move item_4 into the inline tests module in {parent}.", self.blob(rule), "outside")
+                    originals.append(added)
+                    self.assertIsInstance(added.state, style_ledger.Withdrawn)
+                    filed, = ledger.proposal_findings(issue)
+                    self.assertIsInstance(filed.state, style_ledger.Filed)
+                    live = tuple(finding for state in ("unfiled", "filed")
+                                 for finding in ledger.held_findings(style_ledger.HeldFindingsInState(state))
+                                 if finding.rule == rule)
                 self.assertEqual(len(live), 12)
                 for path in paths[:3]:
                     whole, = tuple(finding for finding in live if finding.path == path)
@@ -1316,6 +1361,14 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     self.assertEqual(sum(finding.path == path for finding in live), 3)
 
     def test_test_file_folding_resolves_the_supported_live_forms(self) -> None:
+        scan_lints = '''#[cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "tests should panic on unexpected values"
+    )
+)]'''
         for parent, declaration, source in (
                 ("census/herdr.rs", '#[cfg(test)] #[path = "herdr_tests.rs"] mod tests;', "census/herdr_tests.rs"),
                 ("census/hierarchy.rs", '#[cfg(test)] #[path = "hierarchy_file_tests.rs"] mod file_tests;',
@@ -1327,6 +1380,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 ("render/mod.rs", "#[cfg(test)] mod word_contrast_tests;", "render/word_contrast_tests.rs"),
                 ("census/worker_dispatch/mod.rs", "#[cfg(test)] mod prompt_opening_tests;",
                  "census/worker_dispatch/prompt_opening_tests.rs"),
+                ("census/scan/census.rs", '#[cfg(test)] #[path = "census_tests.rs"] mod tests;',
+                 "census/scan/census_tests.rs"),
+                ("census/scan/conditional.rs", '#[cfg(test)] #[path = "conditional_tests.rs"] mod tests;',
+                 "census/scan/conditional_tests.rs"),
                 ("owner.rs", "#[cfg(test)] mod plain_tests;", "owner/plain_tests.rs"),
                 ("lib.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs"),
                 ("main.rs", "#[cfg(test)] mod root_tests;", "root_tests.rs")):
@@ -1337,7 +1394,13 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     rule = case.rule("test-move-forms", "tier: D\nfamily: modules\ninput_scope: file\n")
                     root = "crates/alpha/src/"
                     case.write(root + "lib.rs", "mod census;\nmod render;\nmod owner;\n")
-                    case.write(root + "census/mod.rs", "mod herdr;\nmod hierarchy;\nmod worker_dispatch;\n")
+                    scan_attribute = scan_lints if parent == "census/scan/conditional.rs" else '#[cfg(\n    feature = "scan"\n)]'
+                    inner_attribute = ('#![cfg_attr(test, cfg_attr(feature = "scan", allow(dead_code)), doc = "Scan")]'
+                                       if parent == "census/scan/conditional.rs" else '#![cfg(\n    feature = "scan"\n)]')
+                    case.write(root + "census/mod.rs", "mod herdr;\nmod hierarchy;\nmod worker_dispatch;\n"
+                               + scan_attribute + "\npub(crate) mod scan;\n")
+                    case.write(root + "census/scan/mod.rs",
+                               inner_attribute + "\npub(crate) mod census;\npub(crate) mod conditional;\n")
                     if parent == "main.rs":
                         _ = (case.repo / root / "lib.rs").unlink()
                     case.write(root + parent, declaration + "\n")
@@ -1345,9 +1408,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     case.write(path, "fn moved_fixture() {}\n")
                     _ = case.commit("Declare a supported sibling test module")
                     ledger = case.ledger()
-                    for line in (1, 2):
-                        _ = ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
-                                        "Inline the whole test file.", case.blob(rule), "outside")
+                    _ = case.legacy_test_file_findings(
+                        ledger, rule, path,
+                        tuple((line, f"item_{line}", "Separate test item.", f"Move item_{line} into {root + parent}.")
+                              for line in (1, 2)), "")
                     folded, = ledger.fold_test_files()
                     live, = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
                     self.assertEqual(folded.path, path)
@@ -1357,35 +1421,109 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     case.doCleanups()
 
     def test_test_file_folding_keeps_unsupported_and_ambiguous_findings(self) -> None:
-        for declaration, other in (
-                ("mod widget_tests;", ""),
-                ("#[cfg(test)] pub mod widget_tests;", ""),
-                ('#[cfg(test)] #[path = "../widget_tests.rs"] mod tests;', ""),
-                ('#[cfg(test)] #[path = r"widget_tests.rs"] mod tests;', ""),
-                ('#[cfg(test)] #[path = 17] mod tests;', ""),
-                ('#[cfg(test)] #[path = "widget_tests.rs"] #[path = "other.rs"] mod tests;', ""),
-                ("#[cfg(test)] #[allow(dead_code)] mod widget_tests;", ""),
-                ('#[cfg_attr(all(), path = "widget_tests.rs")] mod tests;', ""),
+        whole = "Inline the whole test file."
+        for declaration, other, module_attribute, after in (
+                ("mod widget_tests;", "", "", whole),
+                ("#[cfg(test)] pub mod widget_tests;", "", "", whole),
+                ('#[cfg(test)] #[path = "../widget_tests.rs"] mod tests;', "", "", whole),
+                ('#[cfg(test)] #[path = r"widget_tests.rs"] mod tests;', "", "", whole),
+                ('#[cfg(test)] #[path = 17] mod tests;', "", "", whole),
+                ('#[cfg(test)] #[path = "widget_tests.rs"] #[path = "other.rs"] mod tests;', "", "", whole),
+                ("#[cfg(test)] #[allow(dead_code)] mod widget_tests;", "", "", whole),
+                ('#[cfg_attr(all(), path = "widget_tests.rs")] mod tests;', "", "", whole),
+                ("#[cfg(test)] mod widget_tests;", "", '#[cfg_attr(test, path = "owner.rs")]', whole),
+                ("#[cfg(test)] mod widget_tests;", "", '#[cfg_attr(test, cfg_attr(all(), path = "owner.rs"))]', whole),
+                ("#[cfg(test)] mod widget_tests;", "", '#[cfg_attr(test, custom_macro)]', whole),
                 ("#[cfg(test)] mod widget_tests;",
-                 '#[cfg(test)] #[path = "widget_tests.rs"] mod shared_tests;')):
-            with self.subTest(declaration=declaration, other=other):
+                 '#[cfg(test)] #[path = "widget_tests.rs"] mod shared_tests;', "", whole),
+                # A supported declaration: a finding that does not move its item into lib.rs keeps its own row.
+                ("#[cfg(test)] mod widget_tests;", "", "", whole),
+                ("#[cfg(test)] mod widget_tests;", "", "",
+                 "Replace widget_tests.rs with a widget_tests/ directory. widget_tests/mod.rs keeps the fixtures."),
+                ("#[cfg(test)] mod widget_tests;", "", "", "Move the item into the inline tests in crates/alpha/src/owner.rs."),
+                ("#[cfg(test)] mod widget_tests;", "", "", "Move the item into lib.rs and its fixture into owner.rs.")):
+            with self.subTest(declaration=declaration, other=other, module_attribute=module_attribute, after=after):
                 case = StyleLedgerFindingsTests()
                 case.setUp()
                 try:
                     rule = case.rule("test-move-unsupported", "tier: D\nfamily: modules\ninput_scope: file\n")
-                    path = "crates/alpha/src/widget_tests.rs"
-                    case.write("crates/alpha/src/lib.rs", declaration + "\n" + ("mod other;\n" if other else ""))
+                    path = "crates/alpha/src/" + ("owner/" if module_attribute else "") + "widget_tests.rs"
+                    if module_attribute:
+                        case.write("crates/alpha/src/lib.rs", module_attribute + "\npub(crate) mod owner;\n")
+                        case.write("crates/alpha/src/owner.rs", declaration + "\n")
+                    else:
+                        case.write("crates/alpha/src/lib.rs", declaration + "\n" + ("mod other;\n" if other else ""))
                     if other:
                         case.write("crates/alpha/src/other.rs", other + "\n")
                     case.write(path, "fn moved_fixture() {}\n")
                     _ = case.commit("Declare an unsupported or ambiguous test module")
                     ledger = case.ledger()
                     originals = tuple(ledger.hold(rule, path, line, f"item_{line}", "restructure", "Separate test item.",
-                                                  "Inline the whole test file.", case.blob(rule), "outside")
+                                                  after, case.blob(rule), "outside")
                                       for line in (1, 2))
                     self.assertEqual(ledger.fold_test_files(), ())
                     live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
                     self.assertEqual({item.finding_id for item in live}, {item.finding_id for item in originals})
+                finally:
+                    case.doCleanups()
+
+    def test_unfold_returns_findings_that_an_old_fold_took_without_moving_them_into_its_file(self) -> None:
+        for mode in ("cli", "backup"):
+            with self.subTest(mode=mode):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    rule = case.rule("test-unfold", "tier: D\nfamily: modules\ninput_scope: file\n")
+                    root = "crates/alpha/src/"
+                    case.write(root + "lib.rs", "#[cfg(test)] mod widget_tests;\n#[cfg(test)] mod split_tests;\n")
+                    for name in ("widget_tests", "split_tests"):
+                        case.write(root + name + ".rs", "fn moved_fixture() {}\n")
+                    _ = case.commit("Declare two sibling test modules")
+                    ledger = case.ledger()
+                    split = "Replace {0}.rs with a {0}/ directory. {0}/mod.rs keeps the shared fixtures."
+                    moved, elsewhere, filed = case.legacy_test_file_findings(ledger, rule, root + "widget_tests.rs", (
+                        (1, "item_1", "Separate test item.", f"Move item_1 into the inline tests module in {root}lib.rs."),
+                        (2, "item_2", "Separate test item.", "Move item_2 into the inline tests in crates/alpha/src/owner.rs."),
+                        (3, "item_3", "Separate test item.", split.format("widget_tests"))), "")
+                    alone, = case.legacy_test_file_findings(
+                        ledger, rule, root + "split_tests.rs", ((1, "item_1", "Split the file.", split.format("split_tests")),), "")
+                    issue = case.root / "decision.md"
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.execute("UPDATE held_findings SET state='filed',proposal=? WHERE finding_id=?",
+                                               (str(issue), filed.finding_id))
+                    # The fold before this fix took every finding on the file.
+                    with mock.patch.object(style_ledger, "moves_into_test_file_destination", return_value=True):
+                        folds = {group.path: group for group in ledger.fold_test_files()}
+                    kept, emptied = folds[root + "widget_tests.rs"], folds[root + "split_tests.rs"]
+                    before = case.held_rows(ledger.database)
+                    if mode == "cli":
+                        result = case.cli("held", "unfold-test-files")
+                        backup = ledger.database.with_name("ledger.before-unfold-test-files.sqlite")
+                        self.assertEqual(result.stdout, f"{rule}: restored unfiled 2, restored filed 1, folds kept 1, "
+                                         + f"folds withdrawn 1\nverified; deleted the backup {backup}\n")
+                        self.assertFalse(backup.exists())
+                        self.assertEqual(case.cli("held", "unfold-test-files").stdout,
+                                         f"{rule}: restored unfiled 0, restored filed 0, folds kept 1, folds withdrawn 0\nunchanged\n")
+                    else:
+                        with mock.patch.object(Path, "unlink", autospec=True) as unlink:
+                            unfolded = ledger.unfold_test_files()
+                        assert not isinstance(unfolded.backup, style_ledger.NoUnfoldBackup)
+                        unlink.assert_called_once_with(unfolded.backup)
+                        # The copy holds the ledger as it was before the writes.
+                        self.assertEqual(case.held_rows(unfolded.backup), before)
+                    returned = (replace(elsewhere, state=style_ledger.Unfiled()), replace(filed, state=style_ledger.Filed(issue)),
+                                replace(alone, state=style_ledger.Unfiled()))
+                    self.assertEqual(set(ledger.named_held(finding.finding_id for finding in returned)), set(returned))
+                    still, = ledger.named_held((moved.finding_id,))
+                    self.assertEqual(still.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.DuplicateOf(kept.finding_id)))
+                    whole, = ledger.named_held((kept.finding_id,))
+                    gone, = ledger.named_held((emptied.finding_id,))
+                    self.assertEqual(whole.state, style_ledger.Filed(issue))
+                    assert isinstance(gone.state, style_ledger.Withdrawn) and isinstance(gone.state.by, style_ledger.FoldUndone)
+                    self.assertEqual(style_ledger.withdrawn_line(gone.state.by),
+                                     f"fold undone at {gone.state.by.at}; its item findings returned")
+                    # The fixed fold does not take the returned findings again.
+                    self.assertEqual(ledger.fold_test_files(), ())
                 finally:
                     case.doCleanups()
 
@@ -1403,12 +1541,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 if generation < 2:
                     self.write(path, f"fn item_{generation}() {{}}\n")
                     anchor = self.commit("Change the sibling test file")
-                items = tuple(ledger.hold(rule, path, generation * 2 + line, f"item_{generation}_{line}",
-                                          "restructure", f"Separate item {generation}_{line}.", "Inline the whole test file.",
-                                          self.blob(rule), "outside") for line in (1, 2))
-                with closing(sqlite3.connect(ledger.database)) as connection, connection:
-                    _ = connection.executemany("UPDATE held_findings SET anchor_commit=? WHERE finding_id=?",
-                                               [(anchor, item.finding_id) for item in items])
+                items = self.legacy_test_file_findings(
+                    ledger, rule, path,
+                    tuple((generation * 2 + line, f"item_{generation}_{line}", f"Separate item {generation}_{line}.",
+                           "Move the item into crates/alpha/src/anchor/mod.rs.") for line in (1, 2)), anchor)
                 result = ledger.fold_test_files()
                 live = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
                 if generation == 2:

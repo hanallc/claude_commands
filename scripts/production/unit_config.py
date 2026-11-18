@@ -7,7 +7,6 @@ import re
 import os
 import socket
 from subprocess import run as run_taplo
-import tempfile
 import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -17,6 +16,7 @@ from pathlib import Path
 from threading import RLock
 from typing import cast
 
+from scripts.lib import build_folders
 from scripts.lib import atomic_file, conf, git_exclude
 from scripts.production.staff import StaffId
 from scripts.production import staff
@@ -160,19 +160,9 @@ class NoFormattingWorktree:
 
 
 @dataclass(frozen=True)
-class Branch:
-    value: str
-
-    def __post_init__(self) -> None:
-        if not self.value or any(character.isspace() for character in self.value):
-            raise ConfigRefused(f"retired.branch: invalid branch {self.value!r}")
-
-
-@dataclass(frozen=True)
 class RetiredSession:
     date: str
     session_id: str
-    branch: Branch
 
     def __post_init__(self) -> None:
         try:
@@ -281,10 +271,11 @@ def writer_lock() -> Generator[None]:
 
 
 def parked_path(unit: StaffId, *, home: Path | None = None) -> Path:
-    """Park on this machine, independently of the staff record's owner."""
+    """Use private staff state unless the caller selects a home."""
     if not unit or Path(unit).name != unit or unit in (".", ".."):
         raise ConfigRefused(f"invalid staff id for parked configuration: {unit!r}")
-    return (Path.home() if home is None else home) / ".local/state/staff/units" / f"{unit}.toml"
+    directory = home / ".local/state/staff" if home is not None else staff.record_path().parent
+    return directory / "units" / f"{unit}.toml"
 
 
 def _string(fields: dict[str, object], key: str) -> str:
@@ -322,10 +313,9 @@ def decode(fields: dict[str, object]) -> UnitConfig:
         if not isinstance(raw_retired, dict):
             raise ConfigRefused("retired: expected a table")
         facts = cast(dict[str, object], raw_retired)
-        if set(facts) - {"folder"} != {"date", "session", "branch"}:
-            raise ConfigRefused("retired: expected date, session and branch")
-        retired = RetiredSession(_string(facts, "date"), _string(facts, "session"),
-                                 Branch(_string(facts, "branch")))
+        if set(facts) != {"date", "session"}:
+            raise ConfigRefused("retired: expected date and session")
+        retired = RetiredSession(_string(facts, "date"), _string(facts, "session"))
     formatting = RepositoryTaploConfig(_string(fields, "taplo_config")) if "taplo_config" in fields else DefaultTaploConfig()
     return UnitConfig(plan, port, tuple(duties), retired, formatting)
 
@@ -369,8 +359,7 @@ def _fields(config: UnitConfig) -> dict[str, object]:
         fields["taplo_config"] = config.formatting.text
     if isinstance(config.retired, RetiredSession):
         facts = config.retired
-        fields["retired"] = {"date": facts.date, "session": facts.session_id,
-                             "branch": facts.branch.value}
+        fields["retired"] = {"date": facts.date, "session": facts.session_id}
     return fields
 
 
@@ -399,7 +388,7 @@ def _formatted(config: UnitConfig, worktree: Path | NoFormattingWorktree,
                formatting: RepositoryTaploConfig | DefaultTaploConfig) -> bytes:
     """Run taplo with explicit configuration and a repository-relative input path."""
     try:
-        with tempfile.TemporaryDirectory(prefix="unit-taplo-") as directory:
+        with build_folders.tool_folder("unit-taplo") as directory:
             root = worktree if isinstance(worktree, Path) and worktree.is_dir() else Path(directory)
             options: list[str] = []
             if isinstance(formatting, RepositoryTaploConfig):
@@ -418,7 +407,8 @@ def _formatted(config: UnitConfig, worktree: Path | NoFormattingWorktree,
             environment = dict(os.environ)
             _ = environment.pop("TAPLO_CONFIG", None)
             result = run_taplo(command, input=_text(config).encode("utf-8"),
-                               capture_output=True, check=False, cwd=root, env=environment)
+                               capture_output=True, check=False, cwd=root, env=environment,
+                               pass_fds=(build_folders.build_folder_lock_fd(directory),))
     except (OSError, UnicodeError) as error:
         raise ConfigRefused(f"{worktree}: cannot format configuration with taplo: {error}") from error
     if result.returncode:

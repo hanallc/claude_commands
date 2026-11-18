@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -165,9 +167,7 @@ esac
                               + 'lint_config_skip_notice() { :; }\n')
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
-        claude = self.root / ".claude"
-        claude.mkdir()
-        (claude / "scripts").symlink_to(VERIFY.parent.parent, target_is_directory=True)
+        _ = copy_helpers(self.root, *VERIFY_HELPERS)
         for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup"):
             (self.root / name).mkdir()
         # This workspace's memory fixture must not inherit the host's PSI.
@@ -176,8 +176,8 @@ esac
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
-                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}
+                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"}
+                and not name.startswith("UNIT_DETACHED_")
             },
             "PATH": tool_path,
             "HOME": str(self.root),
@@ -188,6 +188,8 @@ esac
             "FAKE_CHECK_EXIT": "0",
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
+            # No jobserver pool: a test step takes no live /dev/steve token.
+            "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}",
             "TMPDIR": str(self.root / "tmp"),
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),

@@ -39,15 +39,14 @@ from zoneinfo import ZoneInfo
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib.build_steps import read_step_names
 from scripts.lib import conf
-from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, LiveBuildRun, NoLiveBuildRun
+from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
+from scripts.build_queue import queue_place as shell_place
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted, caller_admission
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
 from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
-from scripts.lint import nextest_budget as budget
 from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
 from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, commit_config_fixture
 from scripts.buildlog import store
@@ -298,12 +297,12 @@ class BuildBudgetTests(unittest.TestCase):
             ("wait_reply_seconds", lambda: admission_records.read_memory_config().wait_reply_seconds, 60),
             ("query_timeout_seconds", lambda: admission_records.read_memory_config().query_timeout_seconds, 0.5),
             ("replay_retention_seconds", lambda: admission_records.read_memory_config().replay_retention_seconds, 86400),
+            ("ended_placement_seconds", lambda: admission_records.read_memory_config().ended_placement_seconds, 600),
             ("reconnect_seconds", lambda: admission_records.read_memory_config().reconnect_seconds, 2),
             ("silence_seconds", lambda: admission_records.read_memory_config().silence_seconds, 120),
             ("outage_notice_seconds", lambda: admission_records.read_memory_config().outage_notice_seconds, 60),
             ("source_check_seconds", lambda: admission_records.read_memory_config().source_check_seconds, 1),
             ("source_settle_seconds", lambda: admission_records.read_memory_config().source_settle_seconds, 2),
-            ("override_reconnect_seconds", lambda: admission_records.read_memory_config().override_reconnect_seconds, 10),
         )
         for key, reader, fallback in readers:
             with self.subTest(key=key):
@@ -384,7 +383,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
                                        "since": NOW_EPOCH}
                 inputs = admission_records.QueueInputs([(Path("200.waiting"), waiter)], (run, ci),
                     (fixture_reservation(100, 8 * GIB),), admission_records.HostMemory(20 * GIB, 64 * GIB),
-                    admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), NOW_EPOCH)
+                    admission_records.NoPressureHold(), admission_records.ReadyToStart(), NOW_EPOCH)
                 baseline = replace(inputs, running=(run, baseline_ci))
                 before = gate.admission_pass(baseline, NOW_EPOCH, policy).rows[0].decision
                 after = gate.admission_pass(inputs, NOW_EPOCH, policy).rows[0].decision
@@ -426,6 +425,116 @@ class MemoryRoomRulesTests(unittest.TestCase):
         reading = gate.memory_room(missing, [], admission_policy_fixture())
         self.assertEqual(reading, missing)
 
+    def test_swap_outside_the_build_and_ci_slices_is_demand(self) -> None:
+        policy = admission_policy_fixture()
+        for case, swap_used, build_and_ci, returned, share, demand in (
+            ("agents idle in swap", 15, 0, 0, 100, 0),
+            ("build and CI swap excluded", 15, 4, 15, 100, 11),
+            ("only build and CI swapped", 4, 4, 4, 100, 0),
+            ("share 0", 15, 0, 4, 0, 0),
+            ("share 50", 15, 0, 4, 50, 2),
+            ("swapped past the cap", 30, 0, 30, 100, 30),
+            ("burst below swapped total", 15, 0, 2, 100, 2),
+            ("burst exceeds current swap", 2, 0, 15, 100, 2),
+        ):
+            with self.subTest(case=case):
+                host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, int((32 - swap_used) * GIB),
+                                                    build_and_ci_swap=build_and_ci * GIB,
+                                                    swap_in_window_bytes=returned * GIB)
+                reading = gate.memory_room(host, [], replace(policy, agent_swap_share_percent=share))
+                assert isinstance(reading, admission_records.MemoryRoom)
+                self.assertEqual(reading.agent_swap_demand, int(demand * GIB))
+                self.assertEqual(reading.signed_room, 17 * GIB - int(demand * GIB))
+                # The measured return reserve reduces the cap.
+                cap = reading.cap
+                assert isinstance(cap, int)
+                self.assertEqual(cap, max(0, 17 * GIB - int(demand * GIB)))
+                self.assertEqual(reading.room, max(0, cap - reading.cap_use - reading.kept))
+                self.assertLessEqual(cap, max(0, host.available - policy.safety_bytes))
+
+    def test_swap_in_window_sums_samples_and_expires_the_burst(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vmstat"
+            history = gate.SwapInHistory()
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            for now, pages, demand_pages in (
+                (0, 100, 0), (1, 100, 0), (2, 110, 10), (3, 115, 15),
+                (600, 115, 15), (602, 115, 5), (603, 115, 0),
+                (604, 3, 0), (605, 5, 2), (604, 5, 0),
+            ):
+                with self.subTest(now=now, pages=pages):
+                    _ = path.write_text(f"pswpin {pages}\npswpout 900\n")
+                    self.assertEqual(history.read(path, now, 600), demand_pages * page_size)
+
+    def test_swap_in_window_is_independent_of_the_sample_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vmstat"
+            for interval in (1, 5, 10):
+                with self.subTest(interval=interval):
+                    history = gate.SwapInHistory()
+                    amount: int | admission_records.ReadingUnavailable = 0
+                    for now in range(0, 101, interval):
+                        _ = path.write_text(f"pswpin {1000 + now * 2}\n")
+                        amount = history.read(path, now, 600)
+                    self.assertEqual(amount, 200 * int(os.sysconf("SC_PAGE_SIZE")))
+
+    def test_missing_or_invalid_swap_in_never_becomes_zero_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vmstat"
+            history = gate.SwapInHistory()
+            for content in (None, "pswpout 100\n", "pswpin -1\n", "pswpin invalid\n", "pswpin 1\npswpin 2\n"):
+                with self.subTest(content=content):
+                    if content is not None:
+                        _ = path.write_text(content)
+                    reading = history.read(path, 100, 600)
+                    self.assertIsInstance(reading, admission_records.ReadingUnavailable)
+                    assert isinstance(reading, admission_records.ReadingUnavailable)
+                    self.assertIn(str(path), reading.reason)
+
+    def test_unavailable_slice_swap_cannot_publish_room(self) -> None:
+        missing = admission_records.ReadingUnavailable("builds.slice: memory.swap.current is missing")
+        host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, 17 * GIB, build_and_ci_swap=missing)
+        self.assertEqual(gate.memory_room(host, [], admission_policy_fixture()), missing)
+
+    def test_swapped_agents_leave_one_build_to_start_alone(self) -> None:
+        policy = admission_policy_fixture()
+        host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, 17 * GIB)
+        run = admission_records.RunningStep("run", "run", "check", "/run", 2 * GIB,
+            admission_records.MeasuredMemory(2 * GIB, anonymous=admission_records.AnonymousRunUse(2 * GIB)), pid=100)
+        waiter: admission_records.Waiter = {"pid": 200, "start_time": "200", "need": 8 * GIB, "since": NOW_EPOCH}
+        for case, running, reservations, state in (
+            ("no build runs", (), (), "admit"),
+            ("one build runs", (run,), (fixture_reservation(100, 2 * GIB),), "admit"),
+        ):
+            with self.subTest(case=case):
+                inputs = admission_records.QueueInputs([(Path("200.waiting"), waiter)], running, reservations, host,
+                    admission_records.NoPressureHold(), admission_records.ReadyToStart(),
+                    NOW_EPOCH)
+                decision = gate.admission_pass(inputs, NOW_EPOCH, policy).rows[0].decision
+                self.assertEqual(decision.state, state)
+
+    def test_slice_swap_reads_only_live_slices_and_only_when_the_host_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            builds, ci = root / "builds.slice", root / "ci.slice"
+            meminfo = root / "meminfo"
+            _ = meminfo.write_text("MemAvailable: 1048576 kB\nSwapTotal: 8388608 kB\nSwapFree: 4194304 kB\n")
+            environment = {"BUILDLOG_BUILDS_CGROUP": str(builds), "BUILDLOG_CI_CGROUP": str(ci)}
+            with patch.dict(os.environ, environment):
+                self.assertEqual(gate.read_meminfo(meminfo).build_and_ci_swap, 0)
+                for group, amount in ((builds, GIB), (ci, 2 * GIB)):
+                    group.mkdir()
+                    _ = (group / "memory.swap.current").write_text(f"{amount}\n")
+                self.assertEqual(gate.read_meminfo(meminfo).build_and_ci_swap, 3 * GIB)
+                (ci / "memory.swap.current").unlink()
+                self.assertIsInstance(gate.read_meminfo(meminfo).build_and_ci_swap, admission_records.ReadingUnavailable)
+                _ = meminfo.write_text("MemAvailable: 1048576 kB\nSwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
+                self.assertEqual(gate.read_meminfo(meminfo).build_and_ci_swap, 0)
+            with patch.dict(os.environ, {"BUILDLOG_CI_CGROUP": ""}), patch.object(
+                    subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "\n", "")):
+                self.assertIsInstance(gate.systemd_slice_group("hana-ci.slice"), gate.InactiveSlice)
+                self.assertIsInstance(gate.ci_slice_cgroup("hana-ci.slice"), admission_records.ReadingUnavailable)
+
     def test_overlapping_grants_count_each_anonymous_scope_once(self) -> None:
         from scripts.build_queue.scope_activity import LiveBuildRun
         run = LiveBuildRun(900, "900", NOW_EPOCH - 60)
@@ -442,7 +551,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
                     steps.append(admission_records.RunningStep("run", "run", "nextest", "/tree", 6 * GIB,
                         admission_records.MeasuredMemory(amount, anonymous=admission_records.AnonymousRunUse(amount), anonymous_source=admission_records.ScopeSource(Path(scope), frozenset())), run=run, pid=index))
                 inputs = admission_records.QueueInputs([], tuple(steps), tuple(rows), admission_records.HostMemory(20 * GIB, 64 * GIB),
-                    admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), NOW_EPOCH)
+                    admission_records.NoPressureHold(), admission_records.ReadyToStart(), NOW_EPOCH)
                 reading = gate.queue_read_from(inputs, admission_policy_fixture())
                 room = reading.explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
@@ -472,7 +581,7 @@ class WaitHolderRulesTests(unittest.TestCase):
             reservations.append(row)
         return admission_records.QueueInputs([(Path("waiting"), self.waiter(999))], tuple(steps), tuple(reservations),
             admission_records.HostMemory(4 * GIB, 64 * GIB), admission_records.NoPressureHold(), admission_records.ReadyToStart(),
-            admission_records.NoHeadAdmissionOverride(), NOW_EPOCH)
+            NOW_EPOCH)
 
     def running(self, pid: int, need: int, *, session: str = "runner", unit: str = "",
                 use: admission_records.AnonymousRunUse | admission_records.RunUseUnavailable = ZERO_ANONYMOUS_USE,
@@ -647,6 +756,29 @@ class HistoryTests(unittest.TestCase):
     def test_unfinished_rows_do_not_change_the_full_suite_estimate(self) -> None:
         self.add_measured(5)
         assert_unfinished_history_ignored(self, self.admission / "anon_peaks.jsonl", self.peak)
+
+    def test_the_history_window_decodes_no_row_that_ended_a_day_before_it(self) -> None:
+        window_start = NOW - timedelta(days=step_estimator.HISTORY_DAYS)
+        self.add_measured(40, at=window_start - timedelta(days=3))
+        self.add_measured(1, at=window_start + timedelta(minutes=10), start_gib=20)
+        # This row came late: it follows a newer row, but it ended before the window.
+        self.add_measured(1, at=window_start - timedelta(hours=5), start_gib=30)
+        self.add_measured(5, at=window_start + timedelta(hours=1), start_gib=3)
+        with patch.object(json, "loads", wraps=json.loads) as decode:
+            history = step_estimator.read_estimate_history(self.root, self.host, ("nextest",), NOW)
+        self.assertEqual(sorted(cast(int, row["anon_peak_bytes"]) // GIB for row in history.rows["nextest"]),
+                         [3, 4, 5, 6, 7, 20])
+        self.assertLess(decode.call_count, 40)
+
+    def test_the_history_window_decodes_no_row_of_another_host_or_step(self) -> None:
+        self.add_measured(30, host="other-host")
+        self.add_measured(5)
+        with patch.object(json, "loads", wraps=json.loads) as decode:
+            history = step_estimator.read_estimate_history(self.root, self.host, ("nextest",), NOW)
+            program = step_estimator.program_peak_estimate("clippy", self.host, NOW, self.root, 1)
+        self.assertEqual(len(history.rows["nextest"]), 5)
+        self.assertEqual(program, admission_records.FirstProgramPeak(1))
+        self.assertLess(decode.call_count, 30)
 
     def test_measured_overrides_index_at_five(self) -> None:
         self.add_index()
@@ -2070,10 +2202,6 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 self.assertEqual(running.promise, hold.memory.need)
                 assert isinstance(running.step.measured, admission_records.MeasuredMemory)
                 self.assertIsInstance(running.step.measured.peak_history, admission_records.TestPhaseStarted)
-                text = queue_evidence.running_text(running, reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
-                self.assertIn(f"tests started: need {expected:.1f} GiB", text)
-                self.assertIn(f"test peak {peak / GIB:.1f} GiB, history 3.0 GiB x 1.2", text)
-                self.assertIn(queue_evidence.keep_aside_text(hold), text)
                 self.assertEqual(gate.read_reservation(path)["need"], 12 * GIB)
 
     def test_test_peak_grows_past_the_frozen_baseline_with_the_frozen_margin(self) -> None:
@@ -2765,8 +2893,6 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual(gate.read_need_basis(saved_basis), before.basis)
 
     def test_changed_dev_margin_changes_only_the_next_estimate(self) -> None:
-        from scripts.build_queue.queue_evidence import need_text
-        from scripts.lib.user_zone import user_zone
 
         shape = build_shape(["cargo", "build", "--bin", "hana"])
         self.sample(6.3, shape=shape)
@@ -2781,14 +2907,8 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual(after.bytes, step_estimator.shape_headroom_bytes(int(6.3 * GIB), rule))
         self.assertEqual(self.same_shape_basis(after).factor, rule)
         self.assertEqual(gate.read_need_basis(saved), before.basis)
-        text = need_text(admission_records.RecordedNeed(after.source, after.count, 14, "full", "", (),
-                                         admission_records.WidthNotRecorded(), after.basis), zone=user_zone())
-        self.assertIn(f"{config.dev_size_margin_bytes / GIB:.1f} GiB", text)
-        self.assertIn(f"{config.dev_size_factor:g}", text)
 
     def test_changed_release_headroom_changes_only_the_next_estimate(self) -> None:
-        from scripts.build_queue.queue_evidence import need_text
-        from scripts.lib.user_zone import user_zone
 
         self.sample(6)
         before = self.estimate()
@@ -2802,9 +2922,6 @@ class BuildShapePromiseTests(BuildPromiseFixture):
         self.assertEqual(after.bytes, step_estimator.shape_headroom_bytes(6 * GIB, rule))
         self.assertEqual(self.same_shape_basis(after).factor, rule)
         self.assertEqual(gate.read_need_basis(saved), before.basis)
-        text = need_text(admission_records.RecordedNeed(after.source, after.count, 14, "full", "", (),
-                                         admission_records.WidthNotRecorded(), after.basis), zone=user_zone())
-        self.assertIn(f"release headroom × {config.release_headroom:g}", text)
 
     def test_sparse_build_history_keeps_its_shape_rule_above_a_lower_pool(self) -> None:
         other = admission_records.RepositoryIdentity("https://example.org/nate/other", "other", "other")
@@ -3257,10 +3374,11 @@ class BuildFinalizerTests(BuildPromiseFixture):
                 reads_at_expiry = 0
                 history_reader = step_estimator.anonymous_history_rows
                 history_scans = 0
-                def count_history_scans(path: Path) -> Iterator[dict[str, object]]:
+                def count_history_scans(path: Path, window: step_estimator.HistoryWindow | step_estimator.AllHistoryRows = step_estimator.ALL_HISTORY_ROWS
+                                        ) -> Iterator[dict[str, object]]:
                     nonlocal history_scans
                     history_scans += 1
-                    return history_reader(path)
+                    return history_reader(path, window)
                 def observe(reply: wire.Wait) -> None:
                     nonlocal reads_at_expiry
                     replies.append(reply)
@@ -3297,7 +3415,7 @@ class BuildFinalizerTests(BuildPromiseFixture):
                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
                      test_hang_guard.LauncherHangGuard(self.id()).protect(), fixture.serving():
                     with self.assertRaises(RefreshChecked):
-                        _ = client.main(["admit", "--pid", str(owner.pid), "--since", str(NOW_EPOCH),
+                        _ = shell_place.main(["admit", "--pid", str(owner.pid), "--since", str(NOW_EPOCH),
                                          "--", *RELEASE_BUILD])
                 self.assertEqual(len(replies), 3)
 
@@ -3718,7 +3836,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         captured = gate.reservation_memory(path, row, NOW, gate.process_table(self.root / "proc"), self.root / "proc", admission_policy_fixture())
         step = admission_records.RunningStep("owner", "owner", "nextest", "/tree", GIB, captured, pid=row["pid"])
         inputs = admission_records.QueueInputs([], (step,), (row,), admission_records.HostMemory(40 * GIB, 60 * GIB),
-            admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), NOW.timestamp())
+            admission_records.NoPressureHold(), admission_records.ReadyToStart(), NOW.timestamp())
         result = gate.queue_read_from(inputs, policy=admission_policy_fixture())
         self.assertEqual(result.explanation.totals.measured, 2 * GIB)
         self.assertEqual(result.explanation.totals.charged, 2 * GIB)
@@ -3796,17 +3914,25 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         return self.pass_for(pid, need, 40, seconds=seconds)
 
 
-    def test_swap_and_some_need_both_strict_thresholds(self) -> None:
-        for index, (free, some, expected) in enumerate(((14, 26, "hold"), (15, 26, "admit"),
-                                     (14, 25, "admit"), (90, 37, "admit"), (1, 0, "admit"))):
-            with self.subTest(swap_free=free, some=some):
-                self.readings_for(swap_free=free, some=some)
+    def test_pressure_holds_above_either_strict_threshold_without_swap(self) -> None:
+        for index, (free, some, full, condition) in enumerate((
+            (14, 26, 0, "some"), (15, 26, 0, "some"), (14, 25, 0, ""),
+            (90, 37, 0, "some"), (50, 91, 0, "some"), (1, 0, 0, ""), (0, 0, 0, ""),
+            (100, 0, 6, "full"), (100, 26, 6, "full"), (0, 25, 5, ""),
+        )):
+            with self.subTest(swap_free=free, some=some, full=full):
+                self.readings_for(swap_free=free, some=some, full=full)
                 result = self.admit_at(seconds=120 * index)
-                self.assertEqual(result.decision.state, expected)
-                if expected == "hold":
+                self.assertEqual(result.decision.state, "hold" if condition else "admit")
+                if condition:
+                    self.assertIsInstance(result.decision.pressure, admission_records.MemoryPressure)
+                    if isinstance(result.decision.pressure, admission_records.MemoryPressure):
+                        self.assertEqual(result.decision.pressure.condition, condition)
                     self.assertIsInstance(result.reason, admission_records.HeadAdmissionStatus)
                     if isinstance(result.reason, admission_records.HeadAdmissionStatus):
-                        self.assertIn("swap", admission_records.head_wait_text(result.reason, ZoneInfo("UTC")))
+                        self.assertIn(f"{condition} avg10", admission_records.head_wait_text(result.reason, ZoneInfo("UTC")))
+                else:
+                    self.assertIsInstance(result.decision.pressure, admission_records.NoPressureHold)
 
 
     def test_sccache_anon_is_one_charge_and_missing_or_unreadable_is_zero(self) -> None:
@@ -3869,7 +3995,7 @@ class PressureAdmissionTests(MemoryQueueFixture):
     def test_full_memory_stall_holds_only_above_five(self) -> None:
         for full in (4, 5, 6):
             with self.subTest(full_avg10=full):
-                _ = self.pressure.write_text(f"some avg10=71.0 avg60=1.0 total=1\nfull avg10={full} avg60=1.0 total=1\n")
+                _ = self.pressure.write_text(f"some avg10=0.0 avg60=1.0 total=1\nfull avg10={full} avg60=1.0 total=1\n")
                 self.assert_admission(full > 5)
 
     def test_idle_swap_at_ninety_nine_percent_does_not_hold_low_pressure_admission(self) -> None:
@@ -4352,7 +4478,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
             row["worktree"], row["need"], reading, pid=row["pid"], run=LiveBuildRun(50, "50", 100))
             for row, reading in zip(rows, readings, strict=True)), rows,
             admission_records.HostMemory(30 * GIB, 60 * GIB), admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(),
-            admission_records.NoHeadAdmissionOverride(), 100)
+            100)
 
     def test_the_user_readings_keep_nothing_extra_until_the_peak_enters_the_window(self) -> None:
         row = self.reservation()
@@ -4401,9 +4527,20 @@ class ProgressKeepAsideTests(unittest.TestCase):
         self.assertEqual(gate.reservation_need(row, reading), 4 * GIB)
         self.assertEqual(row["need"], 4 * GIB)
         text = gate.progress_text(adjusted)
-        self.assertIn("suites:1, 80% done", text)
+        self.assertIn("suites:1, 80.0% done", text)
         self.assertIn("need 1.5 GiB", text)
-        self.assertIn("highest anonymous use in the next 20%", text)
+        self.assertIn("highest anonymous use in the next 20.0%", text)
+
+    def test_progress_text_rounds_down_until_the_counter_is_complete(self) -> None:
+        for done, total, expected in (
+            (835, 836, "99.8%"), (836, 836, "100.0%"),
+            (10**18 - 1, 10**18, "99.9%"), (0, 836, "0.0%"),
+        ):
+            with self.subTest(done=done, total=total):
+                reading = admission_records.ProgressAdjustedMemory(GIB,
+                    counter=progress.ProgressCounter("build:1", done, total),
+                    window=progress.NoMatchingProfile("private fixture"), remaining_need=GIB)
+                self.assertIn(f"build:1, {expected} done", gate.progress_text(reading))
 
     def test_gate_profiles_separate_types_and_share_test_only_copies(self) -> None:
         first = self.reservation("merge-gate")
@@ -4461,6 +4598,52 @@ class ProgressKeepAsideTests(unittest.TestCase):
                     counter, profile, admission_policy_fixture())
                 self.assertEqual(gate.reservation_need(row, adjusted), 10 * GIB)
                 self.assertEqual(gate.reservation_need(row, reading), 10 * GIB)
+
+    def test_compilers_that_sccache_runs_count_in_the_step_that_names_their_scope(self) -> None:
+        # The user, 11-16: "uses 0.0 has to be a bug". A build's compilers ran in sccache.service.
+        row = self.reservation(need=10 * GIB)
+        scope = Path("/cgroup/builds.slice/run-build.scope")
+        reading = admission_records.MeasuredMemory(GIB, anonymous=admission_records.AnonymousRunUse(GIB // 10),
+            anonymous_source=admission_records.ScopeSource(scope, frozenset({100})))
+        compilers = admission_records.CompilerServiceMemory(2 * GIB, pid=7, jobs=(
+            admission_records.CompilerJob(scope, admission_records.AnonymousRunUse(6 * GIB)),
+            admission_records.CompilerJob(Path("/cgroup/builds.slice/run-ended.scope"), admission_records.AnonymousRunUse(GIB))))
+        base = self.inputs((row,), (reading,))
+        inputs = replace(base, running=(*base.running, admission_records.RunningStep(
+            "", "sccache.service", "compile", "builds.slice", 0, compilers, pid=7)))
+        (_, _, use), = gate.attributed_step_uses(inputs)
+        self.assertEqual(use, gate.AttributedStepUse(admission_records.AnonymousRunUse(6 * GIB + GIB // 10), True))
+        room = gate.inputs_room(inputs, admission_policy_fixture())
+        assert isinstance(room, admission_records.MemoryRoom)
+        self.assertEqual((room.used, room.kept), (6 * GIB + GIB // 10, 10 * GIB - 6 * GIB - GIB // 10))
+
+    def test_sccache_reading_groups_its_compilers_by_step_scope_and_keeps_the_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / "builds.slice" / "sccache.service"
+            service.mkdir(parents=True)
+            _ = (service / "memory.current").write_text(str(9 * GIB) + "\n")
+            _ = (service / "memory.stat").write_text(f"anon {8 * GIB}\nshmem 0\ninactive_file 0\n")
+            _ = (service / "cgroup.procs").write_text("10\n11\n12\n13\n")
+            proc = root / "proc"
+            scope = "/cgroup/run-build.scope"
+            for pid, program, kib, environment in ((10, "sccache", 2 * 1024 * 1024, b"HOME=/h\0"),
+                    (11, "rustc", 3 * 1024 * 1024, b"HOME=/h\0BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0"),
+                    (12, "cc", 1024 * 1024, b"BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0"),
+                    (13, "rustc", 2 * 1024 * 1024, b"BUILDLOG_STEP_SCOPE=/cgroup/run-other.scope\0")):
+                folder = proc / str(pid)
+                folder.mkdir(parents=True)
+                _ = (folder / "comm").write_text(program + "\n")
+                _ = (folder / "environ").write_bytes(environment)
+                _ = (folder / "status").write_text(f"VmRSS:\t{kib} kB\nRssAnon:\t{kib} kB\nRssShmem:\t0 kB\n")
+            with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice")}):
+                reading, = gate.sccache_memory(proc)
+            assert isinstance(reading, admission_records.CompilerServiceMemory)
+            self.assertEqual(reading.pid, 10)
+            self.assertEqual(reading.jobs, (
+                admission_records.CompilerJob(Path(scope), admission_records.AnonymousRunUse(4 * GIB)),
+                admission_records.CompilerJob(Path("/cgroup/run-other.scope"), admission_records.AnonymousRunUse(2 * GIB))))
+            self.assertEqual(reading.bytes, 3 * GIB)
 
     def test_shared_process_use_is_counted_once_before_distinct_step_profiles_are_grouped(self) -> None:
         rows = (self.reservation("build", identity="z-parent"), self.reservation("clippy", identity="a-child"))
@@ -4846,11 +5029,14 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         admission = caller_admission(self, self.root, self.environment)
         grants: list[tuple[str, wire.RunIdentity | wire.NoRun]] = []
+        observed_grants: set[str] = set()
 
         def capture(reply: wire.Reply) -> wire.Reply:
-            if isinstance(reply, wire.Admitted):
+            grant = reply.grant if isinstance(reply, wire.LocalPlacementGranted) else reply
+            if isinstance(grant, wire.Admitted) and grant.reservation not in observed_grants:
                 record, = (record for record in admission.server.reservations.values()
-                    if record.reservation_id == reply.reservation)
+                    if record.reservation_id == grant.reservation)
+                observed_grants.add(grant.reservation)
                 grants.append((record.step, record.run))
             return reply
 
@@ -4858,6 +5044,7 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
         for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
             with self.subTest(command=command):
                 grants.clear()
+                observed_grants.clear()
                 result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
                     env=self.environment, start_new_session=True, capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
@@ -4904,7 +5091,7 @@ class ShellTests(unittest.TestCase):
     def formatted(self, peak: admission_records.ExpectedPeak, *, available: int = 0, reserve: int = 0,
                   measured: int = 0, running: tuple[admission_records.RunningStep, ...] = (),
                   reason: admission_records.WaitReason = READY_FOR_ADMISSION, head_need: int = 0,
-                  head_label: str = "", periodic: bool = False) -> str:
+                  head_label: str = "", position: int = 3) -> str:
         decision = admission_records.AdmissionDecision("hold", peak.bytes + reserve, 0, reserve, measured,
             pressure=reason.decision.pressure if isinstance(reason, admission_records.HeadAdmissionStatus) else
                 reason if isinstance(reason, admission_records.MemoryPressure) else admission_records.NO_PRESSURE_HOLD,
@@ -4913,17 +5100,14 @@ class ShellTests(unittest.TestCase):
             admission_policy_fixture(), (), head_need, head_label, reason)
         output = client.WaitOutput()
         with patch.object(client, "CLOCK", self.admission.clock), contextlib.redirect_stderr(io.StringIO()) as text:
-            output(wire.Wait(reason, 1, head_label, "", snapshot))
-            if periodic:
-                self.admission.clock.advance(admission_records.read_memory_config().wait_reply_seconds)
-                output(wire.Wait(reason, 1, head_label, "", snapshot))
-        return text.getvalue().splitlines()[-1] + "\n"
+            output(wire.Wait(reason, position, head_label, "", snapshot))
+        return text.getvalue()
 
     def test_mac_claim_admission_never_opens_a_socket_or_reads_proc(self) -> None:
         before = self.admission.readings.counts.copy()
         result = self.shell('unset BUILDLOG_MEMINFO; OSTYPE=darwin; '
             + 'buildlog_wait_for_memory "$@"; printf "%s|%s\\n" "$?" "$BUILDLOG_MEM_OUTCOME"',
-            BUILDLOG_MEM_ADMIT_SCRIPT="/nonexistent/admission_client.py", BUILDLOG_PROC="/nonexistent/proc")
+            BUILDLOG_QUEUE_PLACE_SCRIPT="/nonexistent/queue_place.py", BUILDLOG_PROC="/nonexistent/proc")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "0|Granted\n")
         self.assertEqual(result.stderr, "")
@@ -4954,18 +5138,13 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.stdout, "target-admitted\n")
         self.assertEqual(result.stderr, "")
 
-    def test_shape_without_earlier_builds_names_the_fallback(self) -> None:
-        text = self.formatted(admission_records.ExpectedPeak(17_000_000_000, "shape", 0, admission_records.ShapeFallback(admission_records.UnderBudget())))
-        self.assertIn("fallback", text)
-        self.assertNotIn("0 earlier builds", text)
-
-    def test_first_wait_line_names_a_same_shape_promise_without_claiming_p90(self) -> None:
-        text = self.formatted(admission_records.ExpectedPeak(17_000_000_000, "shape", 2, admission_records.ShapeLargest(2, admission_records.NoFloor(), admission_records.NoHeadroom(), admission_records.UnderBudget())))
+    def test_first_wait_line_names_place_need_and_free_memory_and_points_to_the_queue(self) -> None:
+        text = self.formatted(admission_records.ExpectedPeak(17_000_000_000, "shape", 2, admission_records.ShapeLargest(2, admission_records.NoFloor(), admission_records.NoHeadroom(), admission_records.UnderBudget())),
+            available=12 * GIB)
         self.assertEqual(len(text.splitlines()), 1)
-        self.assertIn("same-shape promise", text)
-        self.assertNotIn("percentile", text)
-        self.assertNotIn("p90", text)
-        self.assertNotIn("fallback", text)
+        pattern = (r"^waiting for memory since \d\d:\d\d \S+: place 3 in line; hana build needs 15\.8 GiB; "
+                   + r"12\.0 GiB free; reason: admission refresh; /build:page shows the detail\n$")
+        self.assertRegex(text, pattern)
 
     def test_shell_accepts_shape_source(self) -> None:
         def source(reply: wire.Reply) -> wire.Reply:
@@ -4974,43 +5153,31 @@ class ShellTests(unittest.TestCase):
         result = self.shell('buildlog_wait_for_memory', launch=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_wait_line_carries_head_need_step_and_measured_memory(self) -> None:
+    def test_wait_line_names_the_head_need_and_never_lists_running_steps(self) -> None:
         running = (admission_records.RunningStep("one", "first", "nextest", "/tmp/one", 0, admission_records.MeasuredMemory(GIB), pid=123),
                    admission_records.RunningStep("two", "second", "clippy", "/tmp/two", 0, admission_records.MeasuredMemory(2 * GIB), pid=123))
-        for periodic in (False, True):
-            text = self.formatted(admission_records.ExpectedPeak(11_600_000_000, "measured", 5),
-                available=49_000_000_000, reserve=3_000_000_000, measured=3 * GIB, running=running,
-                head_need=11_703_785_881, head_label="clone88ci nextest (verify pid 300)", periodic=periodic)
-            self.assertEqual(len(text.splitlines()), 1)
-            self.assertIn("head clone88ci nextest (verify pid 300) needs 10.9 GiB", text)
-            self.assertIn("0.0 GiB promised, 3.0 GiB measured across 2 running steps: one nextest in /tmp/one, two clippy in /tmp/two; ", text)
-            self.assertTrue(text.endswith("2.8 GiB kept for earlyoom)\n"))
+        text = self.formatted(admission_records.ExpectedPeak(11_600_000_000, "measured", 5),
+            available=49_000_000_000, reserve=3_000_000_000, measured=3 * GIB, running=running,
+            head_need=11_703_785_881, head_label="clone88ci nextest (verify pid 300)", position=2)
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertIn("head clone88ci nextest (verify pid 300) needs 10.9 GiB", text)
+        for absent in ("/tmp/one", "/tmp/two", "running steps", "promised", "earlyoom"):
+            self.assertNotIn(absent, text)
 
-    def test_wait_line_shows_reason_in_place_of_zero_running_steps(self) -> None:
+    def test_wait_line_shows_the_reason(self) -> None:
         pressure = admission_records.MemoryPressure(11, condition="full")
         decision = admission_records.AdmissionDecision("hold", 19_434_727_014, 0, 3 * GIB, 0,
             room=admission_records.RoomCheck(16_213_501_542, 15 * GIB, False, basis=admission_records.DoesNotFit()))
         pressure_reason = pressure
         head_reason = admission_records.HeadAdmissionStatus(decision, 16_213_501_542,
             18 * GIB, cause=admission_records.NeedsMemory(16_213_501_542, 18 * GIB))
-        for periodic in (False, True):
-            for reason, expected in ((pressure_reason, "memory pressure: full avg10 11.0"),
-                                     (head_reason, "needs 15.1 GiB; room 15.0 GiB")):
-                with self.subTest(periodic=periodic, reason=reason):
-                    text = self.formatted(admission_records.ExpectedPeak(16_213_501_542, "measured", 5),
-                        reserve=3 * GIB, reason=reason, periodic=periodic)
-                    self.assertEqual(len(text.splitlines()), 1)
-                    self.assertIn(expected, text)
-                    self.assertTrue(text.endswith("; 3.0 GiB kept for earlyoom)\n"))
-                    self.assertNotIn("0 running steps", text)
-                    self.assertNotIn("GiB promised", text)
-                    self.assertNotIn("GiB measured", text)
-
-    def test_wait_line_keeps_zero_running_text_when_reason_is_empty(self) -> None:
-        for periodic in (False, True):
-            text = self.formatted(admission_records.ExpectedPeak(0, "fallback", 0), periodic=periodic)
-            self.assertEqual(len(text.splitlines()), 1)
-            self.assertTrue(text.endswith("; 0.0 GiB promised, 0.0 GiB measured across 0 running steps)\n"))
+        for reason, expected in ((pressure_reason, "; memory pressure: full avg10 11.0; "),
+                                 (head_reason, "; head: needs 15.1 GiB; room 15.0 GiB; ")):
+            with self.subTest(reason=reason):
+                text = self.formatted(admission_records.ExpectedPeak(16_213_501_542, "measured", 5),
+                    reserve=3 * GIB, reason=reason)
+                self.assertEqual(len(text.splitlines()), 1)
+                self.assertIn(expected, text)
 
     def test_invoke_twice_with_temporary_home(self) -> None:
         config = self.admission.root / "config.sh"
@@ -5043,28 +5210,56 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
-        self.assertIn("GiB needed", result.stderr)
+        self.assertRegex(result.stderr, r"needs \d+\.\d GiB; \d+\.\d GiB free")
         self.assertIn("memory admission check failed (launch wait limit reached without admission); step refused", result.stderr)
         self.assertEqual(self.admission.server.reservations, {})
         self.assertEqual(self.admission.server.waiters, {})
 
-    def test_gate_wait_lines_in_order_without_repeated_prefix(self) -> None:
+    def test_wait_prints_a_line_only_when_the_reason_or_the_place_changes(self) -> None:
         peak = admission_records.ExpectedPeak(8 * GIB, "fallback", 0)
         snapshot = admission_records.AdmissionWaitSnapshot(queue_decision(0, 60 * GIB, peak.bytes, [], policy=admission_policy_fixture()), peak, (), 0, "repo", "nextest",
-            admission_policy_fixture(), ())
-        reply = wire.Wait(admission_records.NeedsMemory(), 1, "", "", snapshot)
+            admission_policy_fixture(), (), head_reason=admission_records.NeedsMemory())
+        reply = wire.Wait(admission_records.NeedsMemory(), 3, "", "", snapshot)
         with patch.object(client, "CLOCK", self.admission.clock), contextlib.redirect_stderr(io.StringIO()) as output:
             notice = client.WaitOutput()
             notice(reply)
-            self.admission.clock.advance(admission_records.read_memory_config().wait_reply_seconds + 1)
+            self.admission.clock.advance(61)
             notice(reply)
+            notice(replace(reply, position=2))
+            notice(replace(reply, position=2, reason=admission_records.MemoryPressure(11), snapshot=replace(snapshot,
+                head_reason=admission_records.MemoryPressure(11))))
             notice.finished()
         lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 3, lines)
+        self.assertEqual(len(lines), 4, lines)
         self.assertTrue(lines[0].startswith("waiting for memory since "))
-        self.assertTrue(lines[1].startswith("still waiting for memory (1 min): "))
-        self.assertRegex(lines[2], r"^memory free after 1 min \d+ s: starting$")
+        self.assertTrue(lines[0].endswith("; /build:page shows the detail"))
+        self.assertTrue(lines[1].startswith("still waiting for memory (1 min): place 2 in line; "), lines[1])
+        self.assertTrue(lines[2].startswith("still waiting for memory (1 min): place 2 in line; "), lines[2])
+        self.assertIn("memory pressure", lines[2])
+        self.assertNotIn("/build:page", lines[1] + lines[2])
+        self.assertRegex(lines[3], r"^memory free after 1 min \d+ s: starting$")
         self.assertEqual(output.getvalue().count("waiting for memory since "), 1)
+
+    def test_terminal_wait_rewrites_one_status_line_in_place(self) -> None:
+        class Terminal(io.StringIO):
+            @override
+            def isatty(self) -> bool:
+                return True
+
+        peak = admission_records.ExpectedPeak(8 * GIB, "fallback", 0)
+        snapshot = admission_records.AdmissionWaitSnapshot(queue_decision(0, 60 * GIB, peak.bytes, [], policy=admission_policy_fixture()), peak, (), 0, "repo", "nextest",
+            admission_policy_fixture(), ())
+        reply = wire.Wait(admission_records.NeedsMemory(), 3, "", "", snapshot)
+        with patch.object(client, "CLOCK", self.admission.clock), contextlib.redirect_stderr(Terminal()) as output:
+            notice = client.WaitOutput()
+            notice(reply)
+            self.admission.clock.advance(61)
+            notice(replace(reply, position=2))
+            notice.finished()
+        text = output.getvalue()
+        first, second = text.split("\r\x1b[K")[1:]
+        self.assertTrue(first.startswith("waiting for memory since ") and "\n" not in first, first)
+        self.assertRegex(second, r"^still waiting for memory \(1 min\): place 2 in line; [^\n]*\nmemory free after 1 min \d+ s: starting\n$")
 
     def test_build_never_starts_at_the_limit_and_waits_first_in_line(self) -> None:
         self.admission.free(0)
@@ -5085,7 +5280,7 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Granted\n")
         self.assertEqual(len(waits), 2)
-        self.assertEqual(result.stderr.count("this step is now first in line"), 1, result.stderr)
+        self.assertEqual(result.stderr.count("this build is the queue head"), 1, result.stderr)
         self.assertNotIn("starting anyway", result.stderr)
         self.assertEqual(self.admission.server.waiters, {})
         self.assertEqual(self.admission.server.reservations, {})
@@ -5108,7 +5303,7 @@ class ShellTests(unittest.TestCase):
     def test_python_failure_refuses_the_step_and_names_the_checker_error(self) -> None:
         broken = self.admission.root / "broken.py"
         _ = broken.write_text('raise RuntimeError("broken lookup")\n')
-        result = self.shell('BUILDLOG_MEM_ADMIT_SCRIPT=$TEST_BROKEN; buildlog_wait_for_memory "$@"; printf "step started\\n"',
+        result = self.shell('BUILDLOG_QUEUE_PLACE_SCRIPT=$TEST_BROKEN; buildlog_wait_for_memory "$@"; printf "step started\\n"',
             TEST_BROKEN=str(broken))
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
@@ -5131,7 +5326,7 @@ def queue_leave_client_main(argv: list[str]) -> int:
     """Advance the client clock at its first held answer."""
     import time
     from unittest.mock import patch
-    from scripts.build_queue import admission_client as client, admission_records
+    from scripts.build_queue import admission_client as client, admission_records, queue_place
 
     class HeldWaitClock:
         def __init__(self) -> None:
@@ -5158,7 +5353,7 @@ def queue_leave_client_main(argv: list[str]) -> int:
             advanced = True
 
     with patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held):
-        return client.main(argv)
+        return queue_place.main(argv)
 
 
 class QueueLeaveTests(unittest.TestCase):
@@ -5170,6 +5365,7 @@ class QueueLeaveTests(unittest.TestCase):
     calls: Path = Path()
     ran: Path = Path()
     recorded: Path = Path()
+    invoke: Path = Path()
     environment: dict[str, str] = {}
 
     @override
@@ -5179,9 +5375,17 @@ class QueueLeaveTests(unittest.TestCase):
         self.calls = self.root / "hook-calls"
         self.ran = self.root / "ran"
         self.recorded = self.root / "recorded"
-        scripts = self.root / ".claude/scripts"
+        scripts = self.root / "helpers"
         (scripts / "lib").mkdir(parents=True)
         (scripts / "buildlog").mkdir()
+        (scripts / "lint").mkdir()
+        self.invoke = scripts / "lint/invoke.sh"
+        _ = self.invoke.write_text(INVOKE.read_text())
+        _ = (scripts / "lint/memory_gate.sh").write_text(INVOKE.with_name("memory_gate.sh").read_text())
+        for name in ("nextest_budget.py", "nextest_tokens.py"):
+            (scripts / "lint" / name).symlink_to(INVOKE.with_name(name))
+        for name in ("build_hold", "build_queue", "build_targets"):
+            (scripts / name).symlink_to(Path(__file__).resolve().parents[1] / name, target_is_directory=True)
         py = scripts / "lib/py"
         _ = py.write_text((Path(__file__).resolve().parents[1] / "lib/py").read_text())
         py.chmod(0o755)
@@ -5194,7 +5398,9 @@ class QueueLeaveTests(unittest.TestCase):
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
-                            "LINT_CONFIG_READER": str(config)}
+                            "LINT_CONFIG_READER": str(config),
+                            # No jobserver pool unless a case makes one: test runs take no tokens.
+                            "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}"}
         _ = self.environment.pop("LINT_QUEUE_LEAVE_HOOK", None)
         from scripts.build_queue.admission_test_support import caller_admission
         self.admission = caller_admission(self, self.root, self.environment)
@@ -5212,7 +5418,7 @@ class QueueLeaveTests(unittest.TestCase):
         self.environment["TEST_QUEUE_CLIENT"] = str(queue_client)
         self.environment["TEST_CAPTURE_WIDTH"] = str(capture)
         self.environment["TEST_PY"] = str(Path(__file__).resolve().parents[1] / "lib/py")
-        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
 
 
     def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
@@ -5237,11 +5443,11 @@ class QueueLeaveTests(unittest.TestCase):
             _ = (self.root / "pressure").write_text("full avg10=0\nsome avg10=0\n")
         self.admission.server.reply_filter = advance_memory
         command = ('source "$1"; buildlog_memory_python() { '
-                   + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then shift; '
+                   + 'if [[ "$1" == "$BUILDLOG_QUEUE_PLACE_SCRIPT" ]]; then shift; '
                    + '"$TEST_PY" "$TEST_QUEUE_CLIENT" "$@"; else "$TEST_PY" "$@"; fi; }; '
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
-        result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
+        result = subprocess.run(["bash", "-c", command, "test", str(self.invoke), str(self.ran)],
             capture_output=True, text=True, timeout=30,
             check=False, env=environment)
         self.admission.server.reply_filter = lambda reply: reply
@@ -5293,15 +5499,13 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(outputs[0][0], "Granted")
 
-    def test_nextest_helper_returns_the_status_and_drops_its_width_claim(self) -> None:
+    def test_nextest_helper_returns_the_status_when_it_leaves_the_queue(self) -> None:
         step = ('LINT_TEST_WIDTH=logical; cargo() { [[ "$*" == "nextest --version" ]] && return 0; touch "$2"; }; '
                 + 'run_nextest --workspace')
         result = self.run_step("exit 0", ":;", step)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
         self.assertFalse(self.ran.exists())
-        # A run still waiting for memory claims no share, so it leaves no marker behind.
-        self.assertEqual(list((self.root / "log/admission/nextest").iterdir()), [])
         self.assertEqual(self.reservations(), [])
 
     def nextest_step(self, ran_args: Path, reservation: Path) -> str:
@@ -5309,38 +5513,36 @@ class QueueLeaveTests(unittest.TestCase):
                 + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"; }}; '
                 + 'run_nextest --workspace')
 
-    def test_a_run_waiting_for_memory_claims_its_share_only_once_admitted(self) -> None:
-        listing, ran_args, reservation = self.root / "listing", self.root / "args", self.root / "reservation"
-        free = (f'ls -A "$BUILDLOG_DIR/admission/nextest" >> "{listing}"; echo waited >> "{listing}"; '
+    def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
+        pool, calls = self.root / "pool", self.root / "cargo-calls"
+        ran_args, reservation, waited = self.root / "args", self.root / "reservation", self.root / "waited"
+        os.mkfifo(pool)
+        keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, keeper)
+        _ = os.write(keeper, bytes(6))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        cargo = bin_dir / "cargo"
+        _ = cargo.write_text("#!/usr/bin/env bash\n"
+            + '[[ "$*" == "nextest --version" ]] && exit 0\n'
+            + f'printf "%s\\n" "$*" >> "{calls}"\n'
+            + '[[ " $* " == *" --no-run "* ]] && exit 0\n'
+            + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"\n')
+        cargo.chmod(0o755)
+        self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
+        self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
+        free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
-        result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
+        step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
+        result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
-        self.assertEqual(listing.read_text().splitlines(), ["waited"])
-        width = os.sysconf("SC_NPROCESSORS_ONLN")
-        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(width)])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], width)
-        self.assertEqual([path.name for path in (self.root / "log/admission/nextest").iterdir()], ["lock"])
-
-    def test_an_admitted_run_shares_the_threads_with_a_run_in_flight(self) -> None:
-        width = os.sysconf("SC_NPROCESSORS_ONLN")
-        shared = budget.shared_width(width, 2)
-        if shared == width:
-            self.skipTest("this machine has too few cores to share")
-        ran_args, reservation = self.root / "args", self.root / "reservation"
-        markers = self.root / "log/admission/nextest"
-        markers.mkdir(parents=True)
-        free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
-        with (markers / "other.run").open("a") as other:
-            fcntl.flock(other, fcntl.LOCK_EX)
-            result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stdout,
-            rf"(?m)^nextest: {shared} of {width} test threads; load \d+\.\d{{2}} on [1-9]\d* CPUs "
-            + r"\([^()\n]+\); shared with the runs in flight$")
-        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(shared)])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], shared)
-        self.assertEqual(sorted(path.name for path in markers.iterdir()), ["lock", "other.run"])
+        # The memory wait comes before the build, and the build before the tokens.
+        self.assertEqual(waited.read_text().splitlines(), ["waited"])
+        self.assertEqual(calls.read_text().splitlines(), ["nextest run --no-run --workspace",
+                                                          "nextest run --test-threads 6 --workspace"])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 6)
+        self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
         ran_args, reservation = self.root / "args", self.root / "reservation"
@@ -5453,11 +5655,6 @@ class QueueExplanationTests(MemoryQueueFixture):
         _ = self.waiting(400, 2 * GIB, 5)
         inputs = self.snapshot_inputs()
         head_path, head = inputs.ordered[0]
-        override: admission_records.HeadAdmissionOverride = {
-            "waiter": head_path.name, "pid": head["pid"], "start_time": head["start_time"],
-            "unit": "head", "step": "nextest", "need": head["need"], "free": 40 * GIB,
-            "reserve": 3 * GIB, "why": "urgent", "set_by": "showrunner",
-        }
         scenarios = {
             "strict": inputs,
             "backfill": replace(inputs, now=NOW_EPOCH + 500),
@@ -5476,7 +5673,6 @@ class QueueExplanationTests(MemoryQueueFixture):
                                                              inputs.ordered[1]],
                 priority=admission_records.QueuePriority(({"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
                           "set_by": "showrunner"},))),
-            "override": replace(inputs, override=override, host=admission_records.HostMemory(60 * GIB, 60 * GIB)),
             "unavailable": replace(inputs, host=admission_records.ReadingUnavailable()),
             "expired": replace(inputs, ordered=[(head_path, {**head, "estimated_at": NOW_EPOCH - 600}),
                                                      inputs.ordered[1]]),
@@ -5496,6 +5692,45 @@ class QueueExplanationTests(MemoryQueueFixture):
                 self.assertTrue(all(isinstance(row.blocker, gate.BlockerNotRequested) for row in result.rows))
                 if scenario == "older fit":
                     self.assertEqual(result.rows[1].reason, admission_records.StartSpacingWait(NOW_EPOCH + 5))
+
+    def test_a_gpu_test_waits_while_another_gpu_test_holds_the_slot(self) -> None:
+        _ = self.running(100, 2, age=30, fields={"repo": "hana"})
+        _ = self.waiting(300, 2 * GIB, 20, repository_name="hana")
+        _ = self.waiting(400, 2 * GIB, 5, repository_name="other")
+        roomy = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        gpu = replace(admission_policy_fixture(), gpu_tests=admission_records.GpuTestSlots(1, frozenset({"hana"})))
+        held = admission_records.GpuSlotWait(1, 1)
+        result = gate.admission_pass(roomy, roomy.now, policy=gpu)
+        self.assertEqual([row.decision.state for row in result.rows], ["hold", "admit"])
+        self.assertEqual(result.rows[0].decision.gpu, held)
+        self.assertEqual(cast(admission_records.HeadAdmissionStatus, result.rows[0].reason).cause, held)
+        reading = gate.queue_read_from(roomy, policy=gpu)
+        head = reading.explanation.head
+        assert isinstance(head, admission_records.HeadExplanation)
+        self.assertEqual(head.cause, held)
+        status = cast(admission_records.HeadAdmissionStatus, reading.view.waiting[0].reason)
+        self.assertEqual(admission_records.head_wait_text(status, ZoneInfo("UTC")),
+                         "head: waiting for the GPU test slot (1 of 1 in use)")
+        released = replace(roomy, reservations=(), running=())
+        self.assertEqual(gate.admission_pass(released, roomy.now, policy=gpu).rows[0].decision.state, "admit")
+        for name, policy in (("no GPU repository", replace(gpu, gpu_tests=admission_records.NO_GPU_TESTS)),
+                             ("another repository", replace(gpu, gpu_tests=admission_records.GpuTestSlots(1, frozenset({"bevy"})))),
+                             ("two slots", replace(gpu, gpu_tests=admission_records.GpuTestSlots(2, frozenset({"hana"}))))):
+            with self.subTest(name=name):
+                rows = gate.admission_pass(roomy, roomy.now, policy=policy).rows
+                self.assertEqual(rows[0].decision.state, "admit")
+                self.assertEqual(rows[0].decision.gpu, admission_records.GpuSlotFree())
+
+    def test_a_gpu_test_admitted_in_the_pass_holds_the_next_gpu_test(self) -> None:
+        _ = self.waiting(300, 2 * GIB, 20, repository_name="hana")
+        _ = self.waiting(400, 2 * GIB, 5, repository_name="hana", step="build")
+        _ = self.waiting(200, 2 * GIB, 1, repository_name="hana")
+        roomy = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        gpu = replace(admission_policy_fixture(), gpu_tests=admission_records.GpuTestSlots(1, frozenset({"hana"})))
+        rows = gate.admission_pass(roomy, roomy.now, policy=gpu).rows
+        self.assertEqual(rows[0].decision.state, "admit")
+        self.assertEqual([row.decision.gpu for row in rows],
+                         [admission_records.GpuSlotFree(), admission_records.GpuSlotFree(), admission_records.GpuSlotWait(1, 1)])
 
     def test_pass_is_pure_and_ignores_reader_environment_and_clock(self) -> None:
         _ = self.waiting(300, 4 * GIB, 1)
@@ -5705,7 +5940,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "build_admission.conf"
             for key in ("estimate_refresh_seconds", "slot_gap_seconds", "program_first_peak_gib.cargo",
-                        "peak_history_share_percent"):
+                        "peak_history_share_percent", "progress_profile_sweep_seconds"):
                 invalid_values = (None, "invalid", "70") if key == "peak_history_share_percent" else (None, "invalid")
                 for bad in invalid_values:
                     with self.subTest(key=key, value=bad), patch.dict(os.environ, {"CONF_DIR": directory}):
@@ -5726,6 +5961,8 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                             self.assertEqual(repaired.config.policy.timing.slot_gap_seconds, 7)
                         elif key == "peak_history_share_percent":
                             self.assertEqual(repaired.peak_history_share_percent, 7)
+                        elif key == "progress_profile_sweep_seconds":
+                            self.assertEqual(repaired.progress_profile_sweep_seconds, 7)
                         else:
                             self.assertEqual(repaired.config.program_first_peaks["cargo"], 7 * GIB)
 
@@ -5741,7 +5978,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
     def test_invalid_policy_values_name_the_default_and_the_bad_input(self) -> None:
         baseline = admission_records.read_memory_config()
         keys = ("slot_gap_seconds", "estimate_refresh_seconds", "recovery_start_seconds",
-                "full_pressure_limit", "swap_used_limit", "some_pressure_limit")
+                "full_pressure_limit", "some_pressure_limit")
         for key in keys:
             for raw in (None, "abc", "-5", "nan", "inf", "0"):
                 with self.subTest(key=key, raw=raw):
@@ -5799,14 +6036,14 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
 
 
     def test_pressure_reader_uses_the_supplied_thresholds_after_config_edit(self) -> None:
-        self.write_config(full_pressure_limit="9", swap_used_limit="70", some_pressure_limit="12")
+        self.write_config(full_pressure_limit="9", some_pressure_limit="12")
         policy = admission_records.read_memory_config().policy
         _ = (self.root / "pressure").write_text("full avg10=8\nsome avg10=15\n")
         host = admission_records.HostMemory(20 * GIB, 60 * GIB, 10 * GIB, 2 * GIB)
-        self.write_config(full_pressure_limit="3", swap_used_limit="95", some_pressure_limit="30")
+        self.write_config(full_pressure_limit="3", some_pressure_limit="30")
         with patch.object(admission_records, "read_memory_config", side_effect=AssertionError("reader reread config")):
-            self.assertEqual(gate.read_pressure(host, policy=policy), admission_records.MemoryPressure(8, 15, 80, condition="swap"))
-            self.assertIsInstance(gate.read_pressure(policy=policy), admission_records.NoPressureHold)
+            self.assertEqual(gate.read_pressure(host, policy=policy), admission_records.MemoryPressure(8, 15, 80, condition="some"))
+            self.assertEqual(gate.read_pressure(policy=policy), admission_records.MemoryPressure(8, 15, 0, condition="some"))
             self.assertEqual(gate.read_pressure(host, policy=admission_policy_fixture()),
                              admission_records.MemoryPressure(8, 15, 80, condition="full"))
 
@@ -5950,6 +6187,29 @@ class CiSliceMemoryTests(unittest.TestCase):
         _ = (self.proc / "234/comm").write_text("Runner.Worker\n")
         _ = (self.ci / "cgroup.procs").write_text("123\n234\n")
 
+    def test_ci_worker_identity_distinguishes_admission_wait_and_unmatched_work(self) -> None:
+        self.start_ci_job()
+        write_process(self.proc, 235, GIB, parent=234)
+        _ = (self.ci / "cgroup.procs").write_text("123\n234\n235\n")
+        row = fixture_reservation(235, 8 * GIB)
+        waiter: admission_records.Waiter = {"pid": 235, "start_time": "235", "need": 8 * GIB,
+            "since": NOW_EPOCH, "session_id": "", "session_name": "CI", "step": "build", "folder": "/ci"}
+        for admitted, waiting, expected in (
+            (True, False, RunningServiceJob), (False, True, WaitingServiceJob),
+            (False, False, UnmatchedServiceJob),
+        ):
+            with self.subTest(admitted=admitted, waiting=waiting):
+                reading, = gate.unowned_slice_memory([row] if admitted else [], gate.process_table(self.proc), self.proc,
+                    ci_memory_slice=admission_records.read_memory_config().ci_memory_slice,
+                    waiters=[waiter] if waiting else [])
+                self.assertIsInstance(reading.service_job_state, expected)
+                self.assertIsInstance(reading.job_state, IdleService if admitted else RunningServiceJob)
+                self.assertEqual(reading.bytes, (2 if admitted else 3) * GIB)
+        waiter["start_time"] = "old-owner"
+        reading, = gate.unowned_slice_memory([], gate.process_table(self.proc), self.proc,
+            ci_memory_slice=admission_records.read_memory_config().ci_memory_slice, waiters=[waiter])
+        self.assertIsInstance(reading.service_job_state, UnmatchedServiceJob)
+
     def test_registered_and_unregistered_jobs_each_enter_the_cap_once(self) -> None:
         for shared in (0, 2):
             for pid, parent, used, program in (
@@ -5989,7 +6249,7 @@ class CiSliceMemoryTests(unittest.TestCase):
                     runs.extend(admission_records.RunningStep("CI slice", "CI", "service", str(self.ci), 0, reading,
                         pid=reading.pid) for reading in readings)
                     inputs = admission_records.QueueInputs([], tuple(runs), tuple(reservations), admission_records.HostMemory(20 * GIB, 64 * GIB),
-                        admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), NOW_EPOCH)
+                        admission_records.NoPressureHold(), admission_records.ReadyToStart(), NOW_EPOCH)
                     room = gate.inputs_room(inputs, policy)
                     self.assertIsInstance(room, admission_records.MemoryRoom)
                     if isinstance(room, admission_records.MemoryRoom):
@@ -6003,7 +6263,7 @@ class CiSliceMemoryTests(unittest.TestCase):
         step = admission_records.RunningStep("ci", "ci", "service", "/ci", 0, reading,
             pid=reading.pid if isinstance(reading, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)) else admission_records.PidNotRecorded())
         inputs = admission_records.QueueInputs([], (step,), (), admission_records.HostMemory(available, 64 * GIB),
-            admission_records.NoPressureHold(), admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), NOW_EPOCH)
+            admission_records.NoPressureHold(), admission_records.ReadyToStart(), NOW_EPOCH)
         return gate.queue_read_from(inputs, config.policy)
 
     def test_ci_use_counts_only_readable_service_slice_evidence(self) -> None:
@@ -6024,6 +6284,7 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.start_ci_job()
         reading = self.reading()
         self.assertIsInstance(reading.job_state, RunningServiceJob)
+        self.assertIsInstance(reading.service_job_state, UnmatchedServiceJob)
         active = self.queue_with_ci(reading).explanation.room
         assert isinstance(idle, admission_records.MemoryRoom)
         assert isinstance(active, admission_records.MemoryRoom)
@@ -6041,7 +6302,9 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.start_ci_job()
         for resident, available in ((2, 22), (6, 18)):
             with self.subTest(resident=resident):
+                # 1 GiB of the CI working set is active file cache: available RAM holds it, so the cap does not count it.
                 _ = (self.ci / "memory.current").write_text(str(resident * GIB))
+                _ = (self.ci / "memory.stat").write_text(f"anon {(resident - 1) * GIB}\nshmem 0\ninactive_file 0\n")
                 reading = self.reading()
                 room = self.queue_with_ci(reading, available * GIB).explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
@@ -6050,7 +6313,7 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(room.used, 0)
                 self.assertEqual(room.kept, 0)
                 self.assertEqual(room.runs, ())
-                self.assertEqual(room.cap, (resident + available - 3) * GIB)
+                self.assertEqual(room.cap, (resident - 1 + available - 3) * GIB)
                 self.assertEqual(room.room, (available - 3) * GIB)
 
     def test_idle_ci_charges_resident_memory_and_records_swap_separately(self) -> None:
@@ -6081,6 +6344,8 @@ class CiSliceMemoryTests(unittest.TestCase):
         reading = self.reading()
         self.assertEqual(reading.bytes, 2 * GIB)
         self.assertEqual(reading.swap_bytes, GIB)
+        # The active file cache stays in the working set but not in the swap-backed use.
+        self.assertEqual(reading.anonymous, admission_records.AnonymousRunUse(1024))
         _ = (self.ci / "memory.stat").write_text(f"inactive_file {11 * GIB}\n")
         self.assertEqual(self.reading().bytes, 0)
 

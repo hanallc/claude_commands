@@ -44,8 +44,8 @@ def backend_fixture_command(directory: Path, command: list[str],
         f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
     )) + "\n")
     child_environment = dict(environment)
-    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT))
-    child_environment["PYTHONPATH"] = os.pathsep.join((str(directory), str(ROOT)))
+    child_environment["FIXTURE_ASSIGN_PYTHONPATH"] = environment.get("PYTHONPATH", str(ROOT / "scripts/lib/python_startup"))
+    child_environment["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(directory)))
     return ["bash", str(ASSIGN)], child_environment
 
 
@@ -122,6 +122,8 @@ class AssignLauncherFixture(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.native.setUp()
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "build_folders.conf",
+                                 "patterns.legacy-stable={purpose}\n")
         config = Path(os.environ["CONF_DIR"]) / "direct.conf"
         _ = config.write_text((ROOT / "config/direct.conf").read_text())
         _ = config.with_name("shutdown.conf").write_text((ROOT / "config/shutdown.conf").read_text())
@@ -154,9 +156,9 @@ class AssignLauncherFixture(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.history), 
             "UNIT_RUN_ROOT": str(self.session_dir.parent), "ROSTER_RUN_ROOT": str(self.session_dir.parent),
             "MODELS_CONFIG_FILE": str(self.registry), "UNIT_SYNC_WRITES": "0", "UNIT_RUN_DIR": str(self.session_dir),
-            "PYTHONPATH": str(ROOT), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
+            "PYTHONPATH": str(ROOT / "scripts/lib/python_startup"), "ASTRA_ROLES_STATE": str(self.session_dir.parent / "roles"),
         })))
-        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE", "AGENTS_CALLER_FAMILY", "AGENTS_CALLER_ASSIGNMENT"):
+        for key in ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE"):
             _ = os.environ.pop(key, None)
         original = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -267,7 +269,7 @@ class AssignLauncherFixture(unittest.TestCase):
             f"        runpy.run_path({str(injection)!r})",
             f"if sys.argv[0] == {str(ASSIGN.with_suffix('.py'))!r}: sys.setprofile(enter)",
         )))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PYTHONPATH": f"{directory}{os.pathsep}{ROOT}"})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"PYTHONPATH": f"{ROOT / 'scripts/lib/python_startup'}{os.pathsep}{directory}"})))
         self.injections.append(code)
         saved = vars(assign).copy()
         exec(code, {})

@@ -5,9 +5,12 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -53,33 +56,37 @@ class UnsupportedVersion(ValueError):
 
 @dataclass(frozen=True)
 class Owner:
+    """The owner identity holds a process identifier and start time."""
     pid: int
     start_time: str
 
 
 @dataclass(frozen=True)
 class RunIdentity:
+    """The run identity holds a process identifier and start time."""
     pid: int
     start_time: str
 
 
 @dataclass(frozen=True)
 class NoRun:
-    pass
+    """The request has no named build run."""
 
 
 @dataclass(frozen=True)
 class LocalPlace:
-    pass
+    """The admission request runs locally."""
 
 
 @dataclass(frozen=True)
 class CloudPlace:
+    """The admission request runs on this cloud target."""
     target: str
 
 
 @dataclass(frozen=True)
 class RunPlace:
+    """The run placement holds its identity, first owner, start time, and unit."""
     run: RunIdentity
     since: float
     first_owner: Owner
@@ -88,6 +95,7 @@ class RunPlace:
 
 @dataclass(frozen=True)
 class Identity:
+    """The caller identity holds its session, step, folder, and unit."""
     session_id: str
     name: str
     step: str
@@ -97,6 +105,7 @@ class Identity:
 
 @dataclass(frozen=True, kw_only=True)
 class CallerCode:
+    """The request carries the caller code version."""
     code_version: str = ""
 
 
@@ -105,6 +114,7 @@ NO_RUN = NoRun()
 
 @dataclass(frozen=True)
 class AdmitRequest(CallerCode):
+    """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
     owner: Owner
     argv: tuple[str, ...]
@@ -119,6 +129,50 @@ class AdmitRequest(CallerCode):
     token_back_at: float = 0.0
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
+    route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+
+
+@dataclass(frozen=True)
+class RepositorySlotRequest(CallerCode):
+    """Wait for one attempt to acquire a repository slot."""
+    episode: str
+    owner: Owner
+    since: float
+    repository: str
+    machine: str
+    root: str
+    maximum: int
+    deadline: float
+    identity: Identity
+
+
+@dataclass(frozen=True)
+class RepositorySlotWaiting:
+    """The repository pool has no free slot for this waiter."""
+    repository: str
+    held: tuple[int, ...]
+    maximum: int
+    maximum_key: str
+
+    @property
+    def text(self) -> str:
+        return f"waits for a free {self.repository} slot ({len(self.held)} of {self.maximum} in use)"
+
+    @property
+    def expired_text(self) -> str:
+        held = ", ".join(f"{self.repository}-slot{number}" for number in self.held) or "none"
+        return f"slots: wait ended for {self.repository}; held slots: {held}; maximum {self.maximum} ({self.maximum_key})"
+
+
+@dataclass(frozen=True)
+class RepositorySlotReady:
+    """The first waiter can attempt to acquire a repository slot."""
+
+
+@dataclass(frozen=True)
+class RepositorySlotExpired:
+    """The repository slot wait ended before capacity became available."""
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -135,10 +189,12 @@ class ServiceEstimateRequest(CallerCode):
     runner: str
     job: str
     test_width: records.TestWidth = field(default_factory=_no_test_width)
+    route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
 
 
 @dataclass(frozen=True)
 class LaunchRequest(CallerCode):
+    """The launch request holds the episode, owner, caller identity, and memory profile."""
     episode: str
     owner: Owner
     since: float
@@ -148,6 +204,7 @@ class LaunchRequest(CallerCode):
 
 @dataclass(frozen=True)
 class ReleaseRequest(CallerCode):
+    """The request releases a reservation with its final status."""
     request_id: str
     reservation: str
     status: int
@@ -155,6 +212,7 @@ class ReleaseRequest(CallerCode):
 
 @dataclass(frozen=True)
 class WidthRequest(CallerCode):
+    """The request updates the test width of a reservation."""
     request_id: str
     reservation: str
     width: int
@@ -162,33 +220,28 @@ class WidthRequest(CallerCode):
 
 @dataclass(frozen=True)
 class BuildHistoryRequest(CallerCode):
-    pass
+    """The request asks for the build history generation."""
 
 
 @dataclass(frozen=True)
 class ViewRequest(CallerCode):
-    pass
+    """The request asks for the queue view."""
 
 
 @dataclass(frozen=True)
 class ExplainRequest(CallerCode):
-    pass
+    """The request asks for the queue explanation."""
 
 
 @dataclass(frozen=True)
 class MineRequest(CallerCode):
+    """The request asks for the queue reading for this session."""
     session_id: str
 
 
 @dataclass(frozen=True)
-class AdmitHeadRequest(CallerCode):
-    request_id: str
-    why: str
-    actor: str
-
-
-@dataclass(frozen=True)
 class PrioritySetRequest(CallerCode):
+    """The request sets queue priority for a unit with a reason and actor."""
     request_id: str
     unit: str
     why: str
@@ -197,6 +250,7 @@ class PrioritySetRequest(CallerCode):
 
 @dataclass(frozen=True)
 class PriorityClearRequest(CallerCode):
+    """The request clears queue priority with an actor and optional unit."""
     request_id: str
     actor: str
     unit: str = ""
@@ -204,12 +258,14 @@ class PriorityClearRequest(CallerCode):
 
 @dataclass(frozen=True)
 class TokenWaitRequest(CallerCode):
+    """The request marks a reservation as waiting for the Cargo token."""
     request_id: str
     reservation: str
 
 
 @dataclass(frozen=True)
 class CloudSlotWait:
+    """The cloud wait holds the used slot count and slot limit."""
     used: int
     slots: int
 
@@ -220,6 +276,7 @@ class CloudSlotWait:
 
 @dataclass(frozen=True)
 class Wait:
+    """The wait reply holds its reason, queue position, text, and admission snapshot."""
     reason: records.WaitReason | CloudSlotWait
     position: int
     head: str
@@ -241,6 +298,7 @@ PROTOCOL_ACQUISITION_TIMING = AcquisitionTiming(120.0, 2.0, 300.0)
 
 @dataclass(frozen=True)
 class CleanupTiming:
+    """The timing limits control silence detection and reconnection during cleanup."""
     silence_seconds: float
     reconnect_seconds: float
 
@@ -254,6 +312,7 @@ CLEANUP_STATUS_MAX = 2 ** 63 - 1
 
 @dataclass(frozen=True)
 class Admitted:
+    """The admission grant holds its reservation, memory need, and sampling settings."""
     reservation: str
     need: int
     source: str
@@ -265,6 +324,7 @@ class Admitted:
 
 @dataclass(frozen=True)
 class RunnerExecutionTiming:
+    """The runner timings control program sampling, stop checks, and peak waves."""
     program_sample_seconds: float
     program_stop_seconds: float
     peak_wave_seconds: float
@@ -272,119 +332,244 @@ class RunnerExecutionTiming:
 
 @dataclass(frozen=True)
 class RunnerAdmitted(Admitted):
+    """The runner admission grant includes execution timings."""
     execution: RunnerExecutionTiming = field(kw_only=True)
 
 
 @dataclass(frozen=True)
 class LaunchAdmitted:
+    """The launch grant holds its memory need and estimate source."""
     need: int
     source: str
 
 
 @dataclass(frozen=True)
 class Refused:
+    """The reply gives the reason for refusal."""
     reason: str
+
+
+PLACEMENT_REQUEST_MISSING_REASON = "placement request is missing"
 
 
 @dataclass(frozen=True)
 class Ok:
-    pass
+    """The reply confirms that the request succeeded."""
 
 
 @dataclass(frozen=True)
 class BuildHistoryReply:
+    """The reply holds the current build history generation."""
     generation: int
 
 
 @dataclass(frozen=True)
+class LocalAdmissionContext:
+    """The context holds the local command, test width, and admission options."""
+    argv: tuple[str, ...]
+    cwd: str
+    sidecar: str
+    call: records.Call
+    test_width: records.TestWidth
+    fresh_test: bool
+    token_back_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class LocalAdmissionUnavailable:
+    """The reason explains why local admission context is unavailable."""
+    reason: str
+
+
+@dataclass(frozen=True)
 class PlacementRequest(CallerCode):
+    """The request holds placement constraints, caller identity, and local prerequisites."""
     episode: str
     owner: placement.SubmittingOwner
     since: float
     profile: records.StepProfile | records.ProgramProfile
     constraints: placement.PlacementConstraints
+    identity: Identity = Identity("", "", "", "")
+    run: RunIdentity | NoRun = NO_RUN
+    local: LocalAdmissionContext | LocalAdmissionUnavailable = LocalAdmissionUnavailable("not supplied")
+    prerequisite: placement.LocalExecutionPrerequisite = field(default_factory=lambda: placement.TokenNotRequired())
+    purpose: placement.PlacementPurpose = field(default_factory=lambda: placement.NormalStep())
+    # Where the caller lets the step run. The queue stores it on the waiter for the Builds page.
+    route: target_config.StepRoute = target_config.ANY_ELIGIBLE_TARGET
 
 
 @dataclass(frozen=True)
-class ClaimFailure(CallerCode):
-    request_id: str
+class PlacementStatusRequest(CallerCode):
+    """The request asks for the status of an episode and attempt."""
+    episode: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class KnownPlacementStatus:
+    """The status holds a known assignment, its state, and provider claim."""
     assignment: placement.PlacementAssignment
+    state: placement.AssignmentState
+    claim: placement.ProviderClaimReference | placement.NoProviderClaim
+
+
+@dataclass(frozen=True)
+class UnknownPlacementStatus:
+    """The requested episode and attempt have no known placement status."""
+    episode: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class PlacementStatusReply:
+    """The reply holds the known or unknown placement status."""
+    status: KnownPlacementStatus | UnknownPlacementStatus
+
+
+@dataclass(frozen=True)
+class PrerequisiteReport(CallerCode):
+    """The report updates local execution prerequisites for an episode and owner."""
+    request_id: str
+    episode: str
+    owner: placement.SubmittingOwner
+    prerequisite: placement.LocalExecutionPrerequisite
+
+
+@dataclass(frozen=True)
+class CancelPlacement(CallerCode):
+    """The request cancels an episode for its owner with a reason."""
+    request_id: str
+    episode: str
+    owner: placement.SubmittingOwner
     reason: str
 
 
 @dataclass(frozen=True)
+class ClaimFailure(CallerCode):
+    """The report holds an assignment, failed provider claim, and reason."""
+    request_id: str
+    assignment: placement.PlacementAssignment
+    reason: str
+    claim: placement.ProviderClaimReference | placement.NoProviderClaim = field(
+        default_factory=lambda: placement.NoProviderClaim())
+
+
+@dataclass(frozen=True)
 class ConsumePermission(CallerCode):
+    """The request consumes launch permission for an assignment and claim holder."""
     request_id: str
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference
+    holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = field(
+        default_factory=lambda: placement.ClaimHolderUnconfirmed("not supplied"))
 
 
 @dataclass(frozen=True)
 class ExecutionReport(CallerCode):
+    """The report holds assignment, claim, execution evidence, outcome, and path state."""
     request_id: str
     assignment: placement.PlacementAssignment
-    claim: placement.ProviderClaimReference
+    claim: placement.ProviderClaimReference | placement.NoProviderClaim
     evidence: placement.ExecutionEvidence
-    outcome: str = ""
+    outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
+    path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
+
+
+@dataclass(frozen=True)
+class PlacementEvidenceWait:
+    """Placement waits for host evidence."""
+
+
+@dataclass(frozen=True)
+class PlacementResourceWait:
+    """Placement waits for this resource with a reason and holder."""
+    resource: str
+    reason: str
+    holder: placement.ResourceHolder = field(default_factory=lambda: placement.ResourceHolderUnknown())
 
 
 @dataclass(frozen=True)
 class PlacementWait:
+    """The wait holds candidate eligibility, queue position, and provider diagnostics."""
     episode: str
     since: float
     position: int
     eligibility: tuple[placement.CandidateEligibility, ...]
+    wait: Wait | PlacementEvidenceWait | PlacementResourceWait = field(default_factory=PlacementEvidenceWait)
+    provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    mac_disk_exclusions: tuple[str, ...] = ()
+    retry_notices: tuple[placement.ProviderRetryNotice, ...] = ()
 
 
 @dataclass(frozen=True)
 class Assignment:
+    """The reply holds a placement assignment and provider diagnostics."""
     assignment: placement.PlacementAssignment
+    provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    mac_disk_exclusions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LocalPlacementGranted:
+    """The reply pairs a local assignment with its memory admission grant."""
+    assignment: placement.PlacementAssignment
+    grant: Admitted
+    provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    mac_disk_exclusions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class FirstAuthorization:
+    """The first launch authorization pairs an assignment with its provider claim."""
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference
 
 
 @dataclass(frozen=True)
 class DispatchStatus:
+    """The dispatch status holds assignment state, launch permission, and retry decision."""
     assignment: placement.PlacementAssignment | placement.UnknownAssignment
     state: placement.AssignmentState
     permission: placement.LaunchPermission | placement.NoLaunchPermission
     reason: str = ""
+    retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
-Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
-           | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
-           | PlacementRequest | ClaimFailure | ConsumePermission | ExecutionReport)
+Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+           | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
+           | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
-         | PlacementWait | Assignment | FirstAuthorization | DispatchStatus)
+Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+         | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
 
 _REQUESTS: dict[str, type] = {
+    "repository_slot": RepositorySlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
-    "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
+    "build_history": BuildHistoryRequest, "mine": MineRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
-    "placement": PlacementRequest, "claim_failure": ClaimFailure,
+    "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
+    "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
 }
 REPLY_TYPES: dict[str, type] = {
+    "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
+    "repository_slot_expired": RepositorySlotExpired,
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
+    "local_placement_granted": LocalPlacementGranted, "placement_status": PlacementStatusReply,
 }
-_PLACEMENT_TYPES = (PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport,
-                    PlacementWait, Assignment, FirstAuthorization, DispatchStatus)
+_PLACEMENT_TYPES = (PlacementStatusRequest, PlacementStatusReply, PlacementRequest, ClaimFailure, ConsumePermission, ExecutionReport, PrerequisiteReport, CancelPlacement,
+                    PlacementWait, Assignment, LocalPlacementGranted, FirstAuthorization, DispatchStatus)
 T = TypeVar("T")
 
 
 def admission_socket_path() -> Path:
     from scripts.build_hold.override_guard import refuse_overrides
     refuse_overrides(Path(__file__).with_name("admission_protocol.py"), "build_queue/admission_protocol.py")
-    return Path(os.environ.get("ADMISSION_SOCKET") or "/run/build-admission/build-admission.sock")
+    return Path(os.environ.get("ADMISSION_SOCKET") or DEFAULT_ADMISSION_SOCKET)
 
 
 def encode_record(value: object) -> str:
@@ -402,12 +587,25 @@ def _read_wire_record(record: dict[str, object]) -> dict[str, object]:
     return record
 
 
+def _placement_wire_defaults(record: dict[str, object]) -> dict[str, object]:
+    """Decode older placement messages into semantic recovery states."""
+    record = _read_wire_record(record)
+    if record.get("kind") == "AdoptedProviderClaim" and "holder" not in record:
+        return {**record, "holder": {"kind": "ClaimHolderUnconfirmed", "reason": "older holder evidence"}}
+    if record.get("kind") == "ExecutionReport" and isinstance(record.get("outcome"), str):
+        return {**record, "outcome": {"kind": "AttemptOutcomeUnavailable", "reason": record["outcome"] or "older outcome"}}
+    return record
+
+
 def _write_wire_record(value: object) -> object:
     if isinstance(value, list):
         return [_write_wire_record(item) for item in cast(list[object], value)]
     if not isinstance(value, dict):
         return value
     record = {key: _write_wire_record(item) for key, item in cast(dict[str, object], value).items()}
+    if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
+            and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
+        del record["route"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
     if record.get("kind") == "ShapeRankedPeak" and record.get("share_percent") == 10:
         record["kind"] = "ShapeP90"
@@ -438,7 +636,7 @@ def encode_envelope(value: object, variants: dict[str, type], version: int = VER
 
 def parse_envelope(line: str | bytes, variants: dict[str, type]) -> tuple[int, object]:
     try:
-        value = cast(object, json.loads(line, object_hook=_read_wire_record))
+        value = cast(object, json.loads(line, object_hook=_placement_wire_defaults))
         if not isinstance(value, dict):
             raise ValueError("invalid admission envelope")
         envelope = cast(dict[str, object], value)
@@ -517,6 +715,17 @@ def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
 
 def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
     return encode_envelope(reply, REPLY_TYPES, version)
+
+
+def read_assignment(path: Path) -> Assignment | LocalPlacementGranted:
+    reply = parse_reply(path.read_text())
+    if isinstance(reply, (Assignment, LocalPlacementGranted)):
+        return reply
+    raise AdmissionUnavailable("file contains no assigned attempt")
+
+
+def write_assignment(path: Path, reply: Assignment | LocalPlacementGranted) -> None:
+    write_text_atomic(path, encode_reply(reply))
 
 
 # JSON escapes one character into at most six ASCII bytes; include the newline.

@@ -13,6 +13,12 @@ from scripts.style.approved_renames import (AppliedCheck, AppliedInCode, Approve
                               refactor_rename, rename_declaration, RenameDeclaration,
                               pattern_binding_check, PatternBindingCollision, DistinctPatternBindings)
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 def files(sources: dict[str, str]) -> FileReader:
     def read(path: str) -> bytes | Folder | MissingFile:

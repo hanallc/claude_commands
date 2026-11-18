@@ -4,8 +4,9 @@
 Changes that match origin/main can come from an interrupted update. Prove every
 candidate's content, mode, and index state before changing any file. Remove proved
 untracked files before restoring tracked paths to HEAD. Then finish the update
-with git merge --ff-only. A blocked report names every path that fails the proof
-or collides with an incoming path.
+with waiting_rows.move_to, which keeps the live configuration rows that main does
+not have yet. A blocked report names every path that fails the proof or collides
+with an incoming path.
 
 Each run appends a JSON line to SYNC_LOG. Each blocked run with --notify calls
 send.py with a key for the host and state. send.py limits delivery to one message
@@ -34,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from scripts.lib import conf
+from scripts.lib import conf, waiting_rows
 from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
 
@@ -129,8 +130,11 @@ def _has_untracked_update(checkout: Path, blocking_details: list[str]) -> bool:
     return bool(untracked_paths & added_paths) or bool(collisions)
 
 
-def _finish_interrupted_update(checkout: Path, blocking_details: list[str]) -> bool:
-    """Restore candidates only after every changed working file matches origin/main."""
+def _finish_interrupted_update(checkout: Path, blocking_details: list[str], waiting: set[str]) -> bool:
+    """Restore candidates only after every changed working file matches origin/main.
+
+    Files in `waiting` hold waiting rows; the move keeps them.
+    """
     queries = [
         _git(checkout, "ls-tree", "-r", "-z", "HEAD"),
         _git(checkout, "ls-tree", "-r", "-z", "origin/main"),
@@ -166,7 +170,7 @@ def _finish_interrupted_update(checkout: Path, blocking_details: list[str]) -> b
                 unmerged.add(name)
             else:
                 index_files[name] = GitFileState(mode, object_id)
-    tracked = (set(queries[2].stdout.split("\0") + queries[3].stdout.split("\0")) - {""}) | unmerged
+    tracked = (set(queries[2].stdout.split("\0") + queries[3].stdout.split("\0")) - {""} - waiting) | unmerged
     untracked = {name for name in queries[4].stdout.split("\0")
                  if name in target_files and name not in head_files}
     restore: list[str] = []
@@ -229,18 +233,25 @@ def sync(checkout: Path) -> Outcome:
         return Outcome(CURRENT, head[:8])
     if _git(checkout, "merge-base", "--is-ancestor", "HEAD", "origin/main").returncode:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
-    status = _git(checkout, "status", "--porcelain", "--untracked-files=no")
+    status = _git(checkout, "status", "--porcelain", "--untracked-files=no", "--",
+                  ".", f":(exclude,glob){waiting_rows.WAITING_GLOB}")
     interrupted = False
     blocking_details: list[str] = []
+    try:
+        waiting = set(waiting_rows.waiting_files(checkout))
+    except OSError as error:
+        waiting = set[str]()
+        blocking_details.append(str(error))
     if status.returncode:
         blocking_details.append(_first_line(status))
-    elif _has_untracked_update(checkout, blocking_details) or status.stdout.strip():
-        interrupted = _finish_interrupted_update(checkout, blocking_details)
+    elif not blocking_details and (_has_untracked_update(checkout, blocking_details) or status.stdout.strip()):
+        interrupted = _finish_interrupted_update(checkout, blocking_details, waiting)
     if blocking_details:
         return Outcome("dirty", f"{checkout} has local changes that block the update ({', '.join(blocking_details)})")
-    merged = _git(checkout, "merge", "--ff-only", "-q", "origin/main")
-    if merged.returncode:
-        return Outcome("ff-failed", f"git merge --ff-only origin/main failed in {checkout}: {_first_line(merged)}")
+    try:
+        waiting_rows.move_to(checkout, target)
+    except (OSError, UnicodeError) as error:
+        return Outcome("ff-failed", f"the move to origin/main failed in {checkout}: {' '.join(str(error).split())}")
     detail = f"{head[:8]}..{target[:8]}"
     if interrupted:
         detail += "; finished an interrupted update"

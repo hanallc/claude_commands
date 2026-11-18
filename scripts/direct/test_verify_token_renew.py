@@ -4,13 +4,13 @@ from __future__ import annotations
 import fcntl
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
-from threading import Event
-import time
+import tempfile
 import unittest
 from unittest import mock
+
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.direct import verify_lint_scope_test_support as lint_support
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
@@ -24,7 +24,7 @@ SCRIPTS = VERIFY.parent.parent
 
 
 def token_renewal_functions() -> str:
-    return shell_functions(VERIFY, "start_token_renewer", "stop_token_renewer", "with_token_renewal")
+    return shell_functions(VERIFY, "collect_child", "start_token_renewer", "stop_token_renewer")
 
 
 def token_admission_functions() -> str:
@@ -103,17 +103,6 @@ for step in first second; do
     printf 0 > "$BOARD_DIR/locks/cargo.d/expires"
     buildlog_exec true
 done
-nested_step() {
-    test "$outer" = "$TOKEN_RENEWER_PID"
-    kill -0 "$outer"
-    printf 'nested renewal uses the same process\n'
-}
-nested_span() {
-    local outer=$TOKEN_RENEWER_PID
-    with_token_renewal nested_step
-    kill -0 "$outer"
-}
-with_token_renewal nested_span
 test -z "${TOKEN_RENEWER_PID:-}"
 bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
 ''')
@@ -121,7 +110,6 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
                                 env={**self.environment, "TEST_STEP_SCRIPT": str(VERIFY.with_name("step_record.py")), "TEST_HOLD_DIR": str(self.root)}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count("command started after renewal"), 2)
-        self.assertIn("nested renewal uses the same process", result.stdout)
 
     def memory_wait_process(self, *, lose_at_launch: bool = False, scoped_attempt: bool = False,
                             board_helper: Path = BOARD, noncompiling: bool = False) -> subprocess.Popen[str]:
@@ -193,7 +181,6 @@ acquire_token() {
 buildlog_wait_for_memory_only() {
     passes=$(( passes + 1 ))
     if (( passes == 1 )); then
-        cp "$BOARD_DIR/locks/cargo.d/expires" "$TEST_ROOT/original-expiry"
         : > "$TEST_ROOT/memory-wait"
         "$PY" "$TEST_WAIT_HELPER" "$TEST_RELEASE"
     fi
@@ -229,108 +216,38 @@ release_token
             self.end_group(process.pid)
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def test_memory_wait_renews_the_held_token_until_the_step_runs(self) -> None:
+    def test_a_memory_wait_holds_no_token_and_the_step_takes_it_after_the_grant(self) -> None:
         process = self.memory_wait_process()
         lock = self.root / "board" / "locks" / "cargo.d"
         self.wait_for_running(self.root / "memory-wait", process)
-        original_expiry = int((self.root / "original-expiry").read_text())
-        wait_until(lambda: int((lock / "expires").read_text() or "0") > original_expiry,
-                   lock, processes=(process,))
-        # Try another acquisition after the initial lease expires, during admission.
-        _ = Event().wait(max(0, original_expiry + 1 - time.time()))
-        rival = self.board(self.root / "board", "acquire", "second", "cargo", "--pid", str(os.getpid()))
-        try:
-            self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
-            self.assertGreater(int((lock / "expires").read_text()), original_expiry)
-            self.assertFalse((self.root / "command-ran").exists())
-        finally:
-            if rival.returncode == 0:
-                _ = self.board(self.root / "board", "release", "second", "cargo", "--pid", str(os.getpid()))
-            (self.root / "release").touch()
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertTrue((self.root / "command-ran").exists())
-        self.assertFalse(lock.exists())
-        self.assertEqual(self.live_group_processes(process.pid), [])
-
-    def test_busy_board_guard_does_not_stop_memory_wait_renewal(self) -> None:
-        helper = self.root / "traced-board.sh"
-        _ = helper.write_text('exec 8>>"$TEST_ROOT/board.trace"\n'
-                              + 'export BASH_XTRACEFD=8\n'
-                              + 'exec bash -x "$TEST_REAL_BOARD" "$@"\n')
-        process = self.memory_wait_process(board_helper=helper)
-        self.wait_for_running(self.root / "memory-wait", process)
-        board = self.root / "board"
-        lock = board / "locks" / "cargo.d"
-        original_expiry = int((self.root / "original-expiry").read_text())
-        trace = self.root / "board.trace"
-        config = self.root / "direct.conf"
-        original_config = config.read_text()
-        _ = write_config_fixture(config, "TOKEN_GUARD_ATTEMPTS=2\nTOKEN_GUARD_DELAY_MS=1")
-        try:
-            with (board / "locks" / "cargo.guard").open("a") as guard:
-                fcntl.flock(guard, fcntl.LOCK_EX)
-                # The trace closes after both failed retries return status 2.
-                wait_until(lambda: "+ status=75" in trace.read_text(), trace, processes=(process,))
-        finally:
-            _ = config.write_text(original_config)
-        # Observe renewed expiry before another sender tries to acquire the token.
-        wait_until(lambda: int((lock / "expires").read_text() or "0") > original_expiry,
-                   lock, processes=(process,))
-        # Try another acquisition after the initial lease expires.
-        _ = Event().wait(max(0, original_expiry + 1 - time.time()))
-        rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
-        try:
-            self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
-            self.assertGreater(int((lock / "expires").read_text()), original_expiry)
-            self.assertFalse((self.root / "command-ran").exists())
-        finally:
-            if rival.returncode == 0:
-                _ = self.board(board, "release", "second", "cargo", "--pid", str(os.getpid()))
-            (self.root / "release").touch()
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertTrue((self.root / "command-ran").exists())
-        self.assertFalse(lock.exists())
-        self.assertEqual(self.live_group_processes(process.pid), [])
-
-    def test_token_lost_during_memory_wait_is_reacquired_before_the_step(self) -> None:
-        process = self.memory_wait_process()
-        self.wait_for_running(self.root / "memory-wait", process)
-        # Release ownership during admission. Keep TOKEN_HELD stale until the launch check.
-        released = self.board(self.root / "board", "release", "first", "cargo", "--pid", str(process.pid))
-        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        self.assertFalse(lock.exists(), "the memory wait holds the token")
         (self.root / "release").touch()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertTrue((self.root / "command-ran").exists())
-        self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired", "acquired"])
-        self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
-        self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
+        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0"])
+        self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired"])
+        self.assertFalse(lock.exists())
         self.assertEqual(self.live_group_processes(process.pid), [])
 
-    def test_lost_token_releases_memory_before_waiting_to_reacquire(self) -> None:
+    def test_a_grant_keeps_its_reservation_while_a_peer_holds_the_token(self) -> None:
         process = self.memory_wait_process()
         board = self.root / "board"
         self.wait_for_running(self.root / "memory-wait", process)
-        released = self.board(board, "release", "first", "cargo", "--pid", str(process.pid))
-        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
         rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
         self.assertEqual(rival.returncode, 0, rival.stdout + rival.stderr)
         try:
             (self.root / "release").touch()
             self.wait_for_running(self.root / "token-wait", process)
-            self.assertFalse((self.root / "reservation").exists(),
-                             "token queue kept memory needed by its current holder")
+            self.assertTrue((self.root / "reservation").exists(), "the token wait gave up its grant")
             self.assertFalse((self.root / "command-ran").exists())
         finally:
             _ = self.board(board, "release", "second", "cargo", "--pid", str(os.getpid()))
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertTrue((self.root / "command-ran").exists())
-        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["1", "1"])
+        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0"])
         self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
-        self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
         self.assertFalse((self.root / "reservation").exists())
         self.assertFalse((self.root / "hold").exists())
         self.assertEqual(self.live_group_processes(process.pid), [])
@@ -343,8 +260,10 @@ release_token
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertTrue((self.root / "command-ran").exists())
         self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired", "acquired"])
-        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["1", "1"])
+        # Each memory wait runs without the token.
+        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0", "0"])
         self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
+        # The first take waits for no peer, so only the retry records a token wait.
         self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
         self.assertFalse((self.root / "reservation").exists())
         self.assertFalse((self.root / "hold").exists())
@@ -394,20 +313,7 @@ class LintInputIdentityTests(VerifyLintCacheFixture):
 
     def private_scripts(self) -> tuple[Path, Path]:
         scripts = Path(self.environment["HOME"]) / ".claude" / "scripts"
-        scripts.unlink()
-        scripts.mkdir()
-        for entry in SCRIPTS.iterdir():
-            target = scripts / entry.name
-            if entry.name in ("direct", "lint"):
-                target.mkdir()
-                for child in entry.iterdir():
-                    destination = target / child.name
-                    if child.name in ("verify.sh", "invoke.sh"):
-                        _ = shutil.copy2(child, destination)
-                    else:
-                        destination.symlink_to(child, target_is_directory=child.is_dir())
-            else:
-                target.symlink_to(entry, target_is_directory=entry.is_dir())
+        _ = copy_helpers(Path(self.environment["HOME"]), *VERIFY_HELPERS)
         return scripts / "direct" / "verify.sh", scripts / "lint" / "invoke.sh"
 
     def test_script_edits_during_lint_add_no_fix_pass_or_tree_change_notice(self) -> None:
@@ -462,19 +368,46 @@ if arguments[:1] == ["clippy"]:''')
         _ = self.verify("lint", "sample")
         self.assert_lint_calls()
 
-    def test_each_lint_script_edit_invalidates_a_previously_reused_pass(self) -> None:
-        verify, invoke = self.private_scripts()
+    def test_a_lint_script_edit_invalidates_a_previously_reused_pass(self) -> None:
+        verify, _ = self.private_scripts()
         _ = self.enable_cache()
         with mock.patch.object(lint_support, "VERIFY", verify):
             _ = self.verify("lint", "sample")
             _ = self.verify("lint", "sample")
             self.assertEqual(self.calls("clippy"), [])
-            for script in (verify, invoke, self.config):
-                with self.subTest(script=script.name):
-                    with script.open("a") as output:
-                        _ = output.write("\n# cache input changed\n")
-                    _ = self.verify("lint", "sample")
-                    self.assert_lint_calls()
+            # LintKeyInputTests checks that the tree key reads each lint script. This complete run checks that
+            # an edit to one of them changes the key and stops the reuse of the cached pass.
+            with verify.open("a") as output:
+                _ = output.write("\n# cache input changed\n")
+            _ = self.verify("lint", "sample")
+            self.assert_lint_calls()
+
+
+class LintKeyInputTests(unittest.TestCase):
+    def test_the_lint_tree_key_reads_verify_invoke_prebuild_dev_shell_fix_return_and_the_lint_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "verify.sh"
+            config = root / "lint.conf"
+            _ = script.write_text(shell_functions(VERIFY, "lint_code_files", "tree_key") + "\n" + r'''
+verify_helper() { printf '%s\0' "$@"; }
+CMD=lint ARGS=(sample) FILTER_RUN=0 CACHE_DIR=cache GATE_METADATA={} VERIFY_USER_ENVIRONMENT=()
+TREE_WATCH_SCRIPT=tree_watch.py FIX_RETURN_SCRIPT=fix_return.py
+BUILD_HELPER_ROOT=$HOME/.claude/scripts
+tree_key --with-tree-content
+''')
+            result = subprocess.run(["bash", "-e", str(script)], cwd=root, text=True, capture_output=True,
+                                    env={**os.environ, "HOME": str(root), "LINT_CONFIG_FILE": str(config)},
+                                    timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        words = result.stdout.split("\0")[:-1]
+        separator = words.index("--")
+        self.assertEqual(words[:2], ["--stdin", "tree_watch.py"])
+        self.assertEqual(words[separator - 6:separator],
+                         [str(script), str(root / ".claude/scripts/lint/invoke.sh"),
+                          str(root / ".claude/scripts/lint/prebuild.py"), str(root / ".claude/scripts/lib/dev_shell.py"),
+                          "fix_return.py", str(config)])
+        self.assertEqual(words[separator + 1:], ["lint"])
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -26,7 +26,7 @@ trap stop_before_sleep_wait DEBUG
 ''')
         harness = self.root / "renew-and-stop.sh"
         _ = harness.write_text("set -eu\n"
-                               + shell_functions(VERIFY, "renew_token", "start_token_renewer")
+                               + shell_functions(VERIFY, "collect_child", "renew_token", "start_token_renewer")
                                + '''BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=holder
 TOKEN_HELD=1 TOKEN_HOLD_S=120 TOKEN_RENEW_S=60
 bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold 120

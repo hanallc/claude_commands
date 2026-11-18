@@ -7,15 +7,33 @@ keeps its declaration.
 
 from __future__ import annotations
 
+from array import array
+
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 import difflib
+import json
 from enum import StrEnum
-from functools import cached_property, lru_cache
+from functools import cached_property
 from itertools import accumulate
 import re
+import zlib
+from typing import Literal, cast
 
 from scripts.style import style_footprint
+
+
+def source_tokens(text: str) -> tuple[style_footprint.Token, ...]:
+    """Read tokens without retaining source in the global tokenizer cache."""
+    return style_footprint.tokenized_text.__wrapped__(text).tokens
+
+
+def source_spans(text: str) -> tuple[style_footprint.TokenSpan, ...]:
+    """Transfer token ownership from the tokenizer cache to the returned spans."""
+    try:
+        return style_footprint.token_spans(text)
+    finally:
+        style_footprint.tokenized_text.cache_clear()
 
 # The keywords that declare an item directly in a module, trait or impl body.
 ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})
@@ -285,18 +303,93 @@ class DeclarationSite(StrEnum):
 
 
 @dataclass(frozen=True)
+class NormalizedSourceTokens:
+    """Keep normalized token values and offsets after temporary source indexes are released."""
+
+    words: bytes
+    kinds: bytes
+    offsets: tuple[array[int], array[int]]
+
+    def spans(self) -> tuple[style_footprint.TokenSpan, ...]:
+        """Expand the reader's normalized tokens without scanning source."""
+        words = cast(list[str], json.loads(zlib.decompress(self.words)))
+        kinds = cast(list[Literal["identifier", "literal", "punctuation", "unknown"]],
+                     json.loads(zlib.decompress(self.kinds)))
+        starts, ends = self.offsets
+        return tuple(style_footprint.TokenSpan(style_footprint.Token(word, kind), start, end)
+                     for word, kind, start, end in zip(words, kinds, starts, ends, strict=True))
+
+
+@dataclass(frozen=True)
+class UnreadNormalizedSource:
+    """The reader supplies no token reading for the normalized source."""
+
+
+@dataclass(frozen=True)
 class DeclaredFile:
     """A Rust file read once: its named items, and what a line needs to read as one of them."""
 
     # Every named item of the file, in file order. An item of an impl whose type is not a plain path is left out.
     declared_items: tuple[DeclaredItem, ...]
-    source_lines: tuple[str, ...]
+    _compressed_source: bytes
     # The span of each declared item, in the same order.
     _spans: tuple[_Span, ...]
     # The impls and `use` items: a line they hold most closely reads as no declaration.
     _others: tuple[_Span, ...]
     # The line of each word.
-    _word_lines: tuple[int, ...]
+    _word_lines: array[int]
+    _compressed_words: bytes
+    _compressed_kinds: bytes
+    _source_offsets: tuple[array[int], array[int]] | style_footprint.UnreadableTokenSpans
+
+    @property
+    def word_values(self) -> tuple[str, ...]:
+        """Expand the stored words without scanning Rust source again."""
+        return tuple(cast(list[str], json.loads(zlib.decompress(self._compressed_words))))
+
+    @property
+    def word_lines(self) -> array[int]:
+        return self._word_lines
+
+    @cached_property
+    def source_token_spans(self) -> tuple[style_footprint.TokenSpan, ...]:
+        """Expand one shared token reading from compact values and source offsets."""
+        if isinstance(self._source_offsets, style_footprint.UnreadableTokenSpans):
+            raise style_footprint.UnreadableTokenSpans(str(self._source_offsets))
+        kinds = cast(list[Literal["identifier", "literal", "punctuation", "unknown"]],
+                     json.loads(zlib.decompress(self._compressed_kinds)))
+        starts, ends = self._source_offsets
+        return tuple(style_footprint.TokenSpan(style_footprint.Token(word, kind), start, end)
+                     for word, kind, start, end in zip(self.word_values, kinds, starts, ends, strict=True))
+
+    @cached_property
+    def normalized_source_tokens(self) -> NormalizedSourceTokens | style_footprint.UnreadableTokenSpans | UnreadNormalizedSource:
+        """The reader can supply normalized tokens without a Python source scan."""
+        return UnreadNormalizedSource()
+
+    @cached_property
+    def normalized_token_spans(self) -> tuple[style_footprint.TokenSpan, ...]:
+        """Share original offsets when line normalization leaves token positions unchanged."""
+        reading = self.normalized_source_tokens
+        if isinstance(reading, style_footprint.UnreadableTokenSpans):
+            raise style_footprint.UnreadableTokenSpans(str(reading))
+        if isinstance(reading, NormalizedSourceTokens):
+            return reading.spans()
+        source = zlib.decompress(self._compressed_source).decode()
+        normalized = "\n".join(self.source_lines)
+        if source.startswith(normalized) and not source[len(normalized):].strip("\n"):
+            return self.source_token_spans
+        return source_spans(normalized)
+
+    @cached_property
+    def source_lines(self) -> tuple[str, ...]:
+        return tuple(zlib.decompress(self._compressed_source).decode().splitlines())
+
+    def release_source(self) -> None:
+        """Keep compact declaration facts after the current source work ends."""
+        for name in ("source_lines", "source_token_spans", "normalized_token_spans", "body_readings", "binding_readings"):
+            if name in self.__dict__:
+                del self.__dict__[name]
 
     def declaration_at(self, line: int) -> DeclaredItem | NoDeclarationAtLine:
         """The innermost item whose lines hold the line. A line with no token reads as the next line that has one."""
@@ -313,9 +406,32 @@ class DeclaredFile:
         return max(holding, key=lambda entry: entry[:3])[3]
 
     @cached_property
-    def _body_spans(self) -> tuple[style_footprint.TokenSpan, ...]:
-        """Immutable source offsets shared by every item body in this file."""
-        return style_footprint.token_spans("\n".join(self.source_lines))
+    def body_readings(self) -> dict[DeclaredItem, ReadableBody | UnreadableBody]:
+        """Keep body results only while their parsed file remains live."""
+        return {}
+
+    @cached_property
+    def binding_readings(self) -> dict[DeclaredItem, tuple[LocalBinding, ...]]:
+        """Keep binding results only while their parsed file remains live."""
+        return {}
+
+    @cached_property
+    def _body_offsets(self) -> tuple[array[int], array[int]] | style_footprint.UnreadableTokenSpans:
+        """Keep integer offsets without retaining token objects or source text."""
+        reading = self.normalized_source_tokens
+        if isinstance(reading, NormalizedSourceTokens):
+            return reading.offsets
+        if isinstance(reading, style_footprint.UnreadableTokenSpans):
+            return reading
+        source = zlib.decompress(self._compressed_source).decode()
+        normalized = "\n".join(self.source_lines)
+        if source.startswith(normalized) and not source[len(normalized):].strip("\n"):
+            return self._source_offsets
+        try:
+            spans = self.normalized_token_spans
+        except style_footprint.UnreadableTokenSpans as error:
+            return style_footprint.UnreadableTokenSpans(str(error))
+        return array("I", (span.start for span in spans)), array("I", (span.end for span in spans))
 
     def item_body(self: DeclaredFile, item: DeclaredItem) -> ReadableBody | UnreadableBody:
         """Read only source inside this item's braces, including comments and header-line fragments."""
@@ -324,13 +440,13 @@ class DeclaredFile:
         if not isinstance(body, _Body):
             return UnreadableBody()
         text = "\n".join(self.source_lines)
-        try:
-            spans = self._body_spans
-        except style_footprint.UnreadableTokenSpans:
+        offsets = self._body_offsets
+        if isinstance(offsets, style_footprint.UnreadableTokenSpans):
             return UnreadableBody()
-        if body.close >= len(spans):
+        starts, ends = offsets
+        if body.close >= len(starts):
             return UnreadableBody()
-        source = text[spans[body.open].end:spans[body.close].start]
+        source = text[ends[body.open]:starts[body.close]]
         return ReadableBody(tuple(line for line in source.splitlines() if line.strip()))
 
     def site_kind(self, item: DeclaredItem, line: int) -> DeclarationSite:
@@ -363,7 +479,7 @@ class DeclaredFile:
         span = self._spans[self.declared_items.index(owner)]
         if not isinstance(span.body, _Body):
             return ()
-        words = tuple(token.value for token in style_footprint.tokens("\n".join(self.source_lines)))
+        words = self.word_values
         stack: list[int] = []
         children: dict[int, int] = {}
         signatures: dict[int, tuple[int, tuple[str, ...]]] = {}
@@ -397,7 +513,7 @@ class DeclaredFile:
         span = self._spans[self.declared_items.index(owner)]
         if not isinstance(span.body, _Body):
             return ()
-        words = tuple(token.value for token in style_footprint.tokens("\n".join(self.source_lines)))
+        words = self.word_values
         bindings: list[LocalBinding] = []
         braces: list[int] = []
         closure_end = -1
@@ -436,9 +552,143 @@ class DeclaredFile:
                      else binding for binding in bindings)
 
 
+def _reader_fields(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("the declaration reader requires an object")
+    return cast(dict[str, object], value)
+
+
+def _reader_values(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError("the declaration reader requires an array")
+    return cast(list[object], value)
+
+
+def _reader_number(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("the declaration reader requires a nonnegative integer")
+    return value
+
+
+def _reader_text(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("the declaration reader requires text")
+    return value
+
+
+def _reader_position(value: object) -> ImplPosition:
+    if value == "file_level":
+        return FileLevelImpl()
+    if value == "unproved":
+        return UnprovedImplPosition()
+    return BlockScopedImpl(_reader_number(_reader_fields(value)["block_scoped"]))
+
+
+def _reader_trait(value: object) -> TraitMembership:
+    if value == "none":
+        return NoImplementedTrait()
+    if value == "unreadable":
+        return UnreadableImplementedTrait()
+    fields = _reader_fields(value)
+    return ImplementedTrait(tuple(_reader_text(part) for part in _reader_values(fields["path"])),
+                            tuple(_reader_text(part) for part in _reader_values(fields["arguments"])),
+                            _reader_position(fields["position"]))
+
+
+def _reader_type(value: object) -> TypeMembership:
+    membership = _reader_trait(value)
+    if isinstance(membership, NoImplementedTrait):
+        return NoImplementedType()
+    if isinstance(membership, UnreadableImplementedTrait):
+        return UnreadableImplementedType()
+    return ImplementedType(membership.path, membership.arguments, membership.position)
+
+
+def _reader_span(value: object) -> _Span:
+    fields = _reader_fields(value)
+    body = fields["body"]
+    if body == "none":
+        return _Span(_reader_number(fields["keyword"]), _reader_number(fields["end"]), _NoBody())
+    bounds = _reader_fields(body)
+    return _Span(_reader_number(fields["keyword"]), _reader_number(fields["end"]),
+                 _Body(_reader_number(bounds["open"]), _reader_number(bounds["close"])))
+
+
+def _reader_body_spans(value: object, tokens: tuple[style_footprint.TokenSpan, ...]
+                       ) -> tuple[style_footprint.TokenSpan, ...] | style_footprint.UnreadableTokenSpans:
+    if value == "unreadable":
+        return style_footprint.UnreadableTokenSpans("the reader cannot locate normalized tokens")
+    if value == "original":
+        result = tokens
+    else:
+        spans: list[style_footprint.TokenSpan] = []
+        for entry in _reader_values(value):
+            fields = _reader_fields(entry)
+            word = _reader_text(fields["value"])
+            kind = _reader_text(fields["kind"])
+            if kind not in ("identifier", "literal", "punctuation", "unknown"):
+                raise ValueError("the declaration reader returned an unknown token kind")
+            start = _reader_number(fields["start"])
+            spans.append(style_footprint.TokenSpan(style_footprint.Token(word, kind), start, start + len(word)))
+        result = tuple(spans)
+    if any(span.token.kind == "unknown" for span in result):
+        return style_footprint.UnreadableTokenSpans("the reader returned an unknown normalized token")
+    return result
+
+
+def decode_reader_fact(text: str, tokens: tuple[style_footprint.TokenSpan, ...],
+                       value: dict[str, object], token_lines: tuple[int, ...]) -> DeclaredFile:
+    """Restore compact declaration facts without scanning Rust source."""
+    items: list[DeclaredItem] = []
+    for entry in _reader_values(value["items"]):
+        fields = _reader_fields(entry)
+        owner = fields["owner"]
+        items.append(DeclaredItem(
+            Declaration(_reader_text(fields["keyword"]), _reader_text(fields["name"]),
+                        ModuleItem() if owner == "module" else ImplOrTraitItem(_reader_text(_reader_fields(owner)["impl_or_trait"]))),
+            _reader_number(fields["keyword_line"]), _reader_number(fields["first_line"]),
+            _reader_number(fields["last_line"]), _reader_trait(fields["implemented_trait"]),
+            _reader_position(fields["import_position"]), _reader_type(fields["implemented_type"])))
+    spans = tuple(_reader_span(span) for span in _reader_values(value["spans"]))
+    others = tuple(_reader_span(span) for span in _reader_values(value["others"]))
+    if len(spans) != len(items):
+        raise ValueError("the declaration reader returned different item and span counts")
+    if any(span.keyword >= len(tokens) or span.end >= len(tokens) for span in (*spans, *others)):
+        raise ValueError("the declaration reader returned a span outside the tokens")
+    if len(token_lines) != len(tokens):
+        raise ValueError("the declaration reader returned different token and line counts")
+    lines = array("I", token_lines)
+    offsets: tuple[array[int], array[int]] | style_footprint.UnreadableTokenSpans
+    if any(span.token.kind == "unknown" for span in tokens):
+        offsets = style_footprint.UnreadableTokenSpans("the declaration reader returned an unknown token")
+    else:
+        offsets = array("I", (span.start for span in tokens)), array("I", (span.end for span in tokens))
+    archived_words = zlib.compress(json.dumps(tuple(span.token.value for span in tokens), ensure_ascii=True).encode(), level=1)
+    archived_kinds = zlib.compress(json.dumps(tuple(span.token.kind for span in tokens)).encode(), level=1)
+    file = DeclaredFile(tuple(items), zlib.compress(text.encode(), level=1), spans, others, lines,
+                        archived_words, archived_kinds, offsets)
+    normalized = _reader_body_spans(value["body_tokens"], tokens)
+    if isinstance(normalized, style_footprint.UnreadableTokenSpans):
+        file.__dict__["normalized_source_tokens"] = normalized
+    elif normalized is tokens and not isinstance(offsets, style_footprint.UnreadableTokenSpans):
+        file.__dict__["normalized_source_tokens"] = NormalizedSourceTokens(archived_words, archived_kinds, offsets)
+    else:
+        file.__dict__["normalized_source_tokens"] = NormalizedSourceTokens(
+            zlib.compress(json.dumps(tuple(span.token.value for span in normalized), ensure_ascii=True).encode(), level=1),
+            zlib.compress(json.dumps(tuple(span.token.kind for span in normalized)).encode(), level=1),
+            (array("I", (span.start for span in normalized)), array("I", (span.end for span in normalized))))
+    return file
+
+
 def read_declarations(text: str) -> DeclaredFile:
     """Tokenize the file once and read its named items."""
     tokenized = style_footprint.tokenized_text(text)
+    try:
+        located = source_spans(text)
+        offsets: tuple[array[int], array[int]] | style_footprint.UnreadableTokenSpans = (
+            array("I", (span.start for span in located)), array("I", (span.end for span in located)))
+    except style_footprint.UnreadableTokenSpans as error:
+        offsets = style_footprint.UnreadableTokenSpans(str(error))
     words = tuple(token.value for token in tokenized.tokens)
     lines = tokenized.lines
     starts = style_footprint.item_starts(words)
@@ -502,7 +752,11 @@ def read_declarations(text: str) -> DeclaredFile:
             item_spans.append(span)
             items.append(DeclaredItem(Declaration(keyword, name, owner), lines[index],
                                       lines[first_attribute.get(index, index)], lines[span.end], trait, position, implementing_type))
-    return DeclaredFile(tuple(items), tuple(text.splitlines()), tuple(item_spans), tuple(others), lines)
+    source = zlib.compress(text.encode(), level=1)
+    archived_words = zlib.compress(json.dumps(words, ensure_ascii=True).encode(), level=1)
+    archived_kinds = zlib.compress(json.dumps(tuple(token.kind for token in tokenized.tokens)).encode(), level=1)
+    return DeclaredFile(tuple(items), source, tuple(item_spans), tuple(others), array("I", lines),
+                        archived_words, archived_kinds, offsets)
 
 
 def moved_site_line(old: DeclaredFile, old_line: int, old_item: DeclaredItem, new: DeclaredFile, new_item: DeclaredItem) -> int:
@@ -534,14 +788,13 @@ def statement_site(new: DeclaredFile, new_item: DeclaredItem, text: str) -> int 
     Comments are not tokens, so a comment in the text or on the line does not count, and a string literal is one
     token, so a copy inside a string does not match. A text or file whose tokens cannot be read holds no match.
     """
-    site = tuple(style_footprint.tokens(text)) if "\n" not in text.strip() else ()
+    site = tuple(source_tokens(text)) if "\n" not in text.strip() else ()
     if not site or any(token.kind == "unknown" for token in site):
         return StatementRefusal.TEXT_NOT_FOUND
-    source = "\n".join(new.source_lines)
     offsets = tuple(accumulate((len(line) + 1 for line in new.source_lines), initial=0))
     by_line: dict[int, list[style_footprint.Token]] = {}
     try:
-        spans = style_footprint.token_spans(source)
+        spans = new.normalized_token_spans
     except style_footprint.UnreadableTokenSpans:
         return StatementRefusal.TEXT_NOT_FOUND
     for span in spans:
@@ -711,27 +964,44 @@ class UnreadableLocalBinding:
     """The line holds an unsupported or ambiguous binding pattern."""
 
 
-@lru_cache(maxsize=1024)
 def item_body(file: DeclaredFile, item: DeclaredItem) -> ReadableBody | UnreadableBody:
-    return file.item_body(item)
+    if item not in file.body_readings:
+        file.body_readings[item] = file.item_body(item)
+    return file.body_readings[item]
 
 
-def preserved_body(old: ReadableBody, new: ReadableBody, before: str, after: str) -> int:
-    """Count equal lines once, in order, after replacing only the renamed identifier."""
+@dataclass(frozen=True)
+class NameSites:
+    """An old body's source and the offsets of each code identifier that is the item's old name."""
+
+    source: str
+    sites: tuple[tuple[int, int], ...]
+
+
+def name_sites(old: ReadableBody, before: str) -> NameSites | UnreadableBody:
+    """Tokenize the old body once for every candidate that `preserved_body` compares it with."""
     source = "\n".join(old.lines)
     try:
-        spans = style_footprint.token_spans(source)
+        spans = source_spans(source)
     except style_footprint.UnreadableTokenSpans:
-        return 0
+        return UnreadableBody()
     # A comment-only body needs no replacements; unreadable code supplies no proof.
-    if not spans and style_footprint.tokens(source):
+    if not spans and source_tokens(source):
+        return UnreadableBody()
+    return NameSites(source, tuple((span.start, span.end) for span in spans
+                                   if span.token.kind == "identifier" and span.token.value == before))
+
+
+def preserved_body(old: NameSites | UnreadableBody, new: ReadableBody, after: str) -> int:
+    """Count equal lines once, in order, after replacing only the renamed identifier."""
+    if isinstance(old, UnreadableBody):
         return 0
+    source = old.source
     fragments: list[str] = []
     cursor = 0
-    for span in spans:
-        if span.token.kind == "identifier" and span.token.value == before:
-            fragments.extend((source[cursor:span.start], after))
-            cursor = span.end
+    for start, end in old.sites:
+        fragments.extend((source[cursor:start], after))
+        cursor = end
     fragments.append(source[cursor:])
     lines = tuple("".join(fragments).splitlines())
     lengths = [0] * (len(new.lines) + 1)
@@ -789,9 +1059,10 @@ def lexical_parent(file: DeclaredFile, item: DeclaredItem) -> DeclaredItem | NoD
     return file.lexical_parent(item)
 
 
-@lru_cache(maxsize=1024)
 def local_bindings(file: DeclaredFile, owner: DeclaredItem) -> tuple[LocalBinding, ...]:
-    return file.local_bindings(owner)
+    if owner not in file.binding_readings:
+        file.binding_readings[owner] = file.local_bindings(owner)
+    return file.binding_readings[owner]
 
 
 def binding_at(file: DeclaredFile, owner: DeclaredItem, line: int) -> LocalBinding | NoLocalBinding | UnreadableLocalBinding:
@@ -803,7 +1074,7 @@ def binding_at(file: DeclaredFile, owner: DeclaredItem, line: int) -> LocalBindi
                 return UnreadableLocalBinding()
         return binding
     text = file.source_lines[line - 1] if 0 < line <= len(file.source_lines) else ""
-    words = tuple(token.value for token in style_footprint.tokens(text))
+    words = tuple(token.value for token in source_tokens(text))
     if bindings or "let" in words or "|" in words:
         return UnreadableLocalBinding()
     return NoLocalBinding()

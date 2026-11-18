@@ -609,7 +609,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 #### As-built
 
 - A long outage of the build queue service sends one message. `down_alert` in `scripts/build_queue/admission_client.py` sends it to session `builds` with `session_send_argv`, sender `build-admission`. The text names the journal command and the restart command.
-- A send result other than `sent` adds one blocked phone push through `alert.blocked`, with the action "On natedev, run: sudo systemctl restart build-admission.socket build-admission.service". `--clears-when` runs `admission_client.py view`, which exits nonzero while the service is down.
+- A send result other than `sent` adds one blocked phone push through `alert.blocked`, with the action "On natedev, run: systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service". `--clears-when` runs `admission_client.py view`, which exits nonzero while the service is down.
 - The claim stays when a send sent or kept a message. It releases only when both sends return `failed`, `refused` or `retry`.
 - `_check_outage_alert()` in `scripts/build_queue/admission_service.py` runs from `run_once`. It clears the `build-admission` claim once, after `silence_seconds` of listener uptime, with the last usable config. A failed clear prints one line and retries. Listener setup clears nothing.
 - `build_admission.down` is not in the push catalog.
@@ -1224,7 +1224,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 **Gotchas:**
 - A test that counts grants counts distinct reservations, because a replay resends the grant.
 - Tests and `verify.sh` fixtures use the private service socket, never the live one. A direct `handle_request` call in a test goes inside `fixture.loop_turn`.
-- Timing tests (`test_queue_view` render time, `review_links` `test_change_page`, `codex_mesh`) can fail once at load 60-100 and pass alone.
+- Timing tests (`test_queue_view` render time, `review_links` `test_change_page`) can fail once at load 60-100 and pass alone.
 
 **Ruled out:**
 - A shadow run beside the old checker (user, 2026-10-31): one cut-over, no second admitter.
@@ -1245,7 +1245,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - `scripts/lib/build_folders.py`, `scripts/lib/unit_runs.py`, `scripts/lib/socket_test_support.py` — naming, run paths, markers, and short socket parents.
 - `scripts/production/{merge_gate,fast_track,waiting,bump_gate,ci_points}.py`, `scripts/style/{bulk_run,style_sync}.py` — temporary checkout and index callers.
 - `scripts/buildlog/rust_release.py` — shared trial prefix and inherited parent; Git creates the clone.
-- `scripts/direct/{verify,prepare_session,implement}.sh`, `scripts/lint/invoke.sh`, `scripts/agents/codex_mesh.py` — CLI allocations and run temporary folders.
+- `scripts/direct/{verify,prepare_session,implement}.sh`, `scripts/lint/invoke.sh` — CLI allocations and run temporary folders.
 - `scripts/hooks/{session-start-temp-root,pre-tool-use-checkpoint-doc-gate}.py` — stable session roots and temporary checkpoint folders.
 - `scripts/build_queue/{queue_place,admission_test_support}.py`, `scripts/mac_test/{copy_watch,linux_runner}.py`, `scripts/lint/style_review.py` — sidecar, admission, staging, and review folders.
 - `scripts/lint/{tmp_sweep,sweep,folder_audit,memory_admit}.py` — shared names, ownership classification, and sweep-state reads.
@@ -1711,7 +1711,15 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
    A local SSH exit, owner death, timeout, or empty remote scan proves no departure.
    If pending startup cannot be resolved, retain the provider claim.
    Report unavailable evidence and refuse overlapping reuse.
-   Do not add a remote replay marker or another cleanup protocol.
+   Do not add a remote replay marker or another cleanup protocol, except the start fence below.
+
+   Amendment (builds, 2026-11-12, from the closure review): one start fence settles an unacknowledged start.
+   The race: ssh ends with no start acknowledgement, a scan finds no process, and the delayed original command starts after release.
+   Existing claim records cannot tell that delayed start from an abandoned one.
+   Without the fence, each lost acknowledgement keeps a Mac slot out of service until a hand cleanup.
+   The fence is a lock and a cancel file per exact claim under the provider state folder, plus one local pending-start record.
+   It lives outside the mirror, so a source copy cannot delete it.
+   The fence files remove themselves when their claim settles. No hand step and no signal handler.
 
    After restart, reconstruct execution and cleanup views from existing provider records and background observations.
    Observe existing runner markers, mirror process evidence, and host generation.
@@ -1902,7 +1910,7 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 The changed records contain placement request context, consumed claim-holder identity, and retry deadlines.
 Physical claims remain in the existing provider stores.
 Execution observations remain reconstructed evidence.
-The phase adds no second durable provider lifecycle.
+The phase adds no second durable provider lifecycle. The start fence in item 9 is the one exception; it settles a start and removes itself.
 
 Claim records and `run.json` retain their Phase 10g shape.
 Their conversion is **none**.
@@ -1912,7 +1920,7 @@ Use the following deploy procedure:
 
 1. Prepare `deploy_convert.py` outside the repository in the director’s Phase 44 record folder.
 2. Prove conversion against private copies of admission state and provider records.
-3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py hold --drain --for 'Phase 44 deploy'` (Phase 44b). Continue only on exit 0 and a last line `drained`. Keep the hold until step 12 ends. The drain covers verify.sh, merge_gate.py and targeted_test.py only: drain standalone offload adapters, copy watchers and manual claim commands separately.
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py drain --for 'Phase 44 deploy'` (Phase 44aj). Continue only on exit 0 and a last line `drained; natedev stays held until release`. Keep the hold until step 12 ends. The drain lets existing running and queued natedev work finish: drain standalone offload adapters, copy watchers and manual claim commands separately.
 4. Prevent new launches through their units, timers, sockets, and supervising directors.
 5. Stop `build-admission.service`, `build-admission.socket`, and `build-memory-feed.service`.
 6. Keep their activation sources disabled or runtime-masked throughout conversion and installation.
@@ -2066,7 +2074,7 @@ Contact no live service, session, Mac, or AWS account.
     Exercise direct offload and fixed local shared lint callers.
 
 ### Phase 44c — The queue service lets a run that a drain keeps pass the hold  · status: todo
-**Depends on:** 44 and 44b (44b is on builds and main at b09bc83ae). It lands with Phase 44 in one deploy: the showrunner holds the Phase 44 merge until this phase is ready. Found by the 44b architect review, 2026-11-10.
+**Depends on:** 44 and 44b (44b is on builds and main at b09bc83ae). It lands with Phase 44 in one deploy: the showrunner holds the Phase 44 merge until this phase is ready. Found by the 44b architect review, 2026-11-10. Schedule change (user, 2026-11-12: "do what you can to parallelize"): 44c starts at once in its own worktree, on a local snapshot of the Phase 44 tree with builds merged in, while Phase 44 finishes its final test run and review. Its merge resolution is recorded and reused for the Phase 44 checkpoint merge.
 
 #### Work Order
 
@@ -2124,7 +2132,7 @@ Work:
 **Workers:** 1 writer. **Verification:** the admission service, memory_admit, build_queue, queue_view and head_facts tests, `targeted_test.py`, and basedpyright with zero findings. **Deploy:** restart `build-admission.service` after the hash reaches main.
 
 ### Phase 44f — The cap stays known while a step starts or ends  · status: todo
-**Depends on:** 44c, because Phase 44 also edits `scripts/lint/memory_admit.py`. Starts first after the 44 and 44c deploy, before 44e. The user on 2026-11-11: "the cap keeps showing as unavailable - then it comes back - this should never happen".
+**Depends on:** 44c, because Phase 44 also edits `scripts/lint/memory_admit.py`. Starts after 44j, before 44h. Order set by builds on 2026-11-11: 44g, then 44j, go first after the 44 and 44c deploy. The user on 2026-11-11: "the cap keeps showing as unavailable - then it comes back - this should never happen".
 
 Cause, measured 08:29–08:33: 4 of 50 build page readings showed "Cap unavailable: swap-backed use unavailable for <run>: scope not measured". Each was a run in its first pass after admission. `memory_admit.py` (line 1775 on main) gives `RunUseUnavailable("scope not measured")` to every step whose reading is not `MeasuredMemory`, that is `PromisedMemory` (admitted, scope not populated yet) and `GoneMemory` (its processes ended). One such run makes `memory_room` set `CapUnavailable`.
 
@@ -2136,7 +2144,7 @@ Work:
 **Workers:** 1 writer. **Verification:** the memory_admit and admission tests, `targeted_test.py`, and basedpyright with zero findings.
 
 ### Phase 44h — Admission never starts a GPU test step that the GPU cannot hold  · status: todo
-**Depends on:** 44f, because both edit `scripts/lint/memory_admit.py`. Starts after 44f, before 44g. Ordered by builds on 2026-11-11. Facts from hana: the natedev GPU has 16303 MiB. One full hana suite peaks at 15768 MiB. Per test: median 279 MiB, p90 791 MiB, largest 7971 MiB. Two hana suites at once ran out of GPU memory (OutOfMemory RenderError at 05:34 and 09:17).
+**Depends on:** 44f, because both edit `scripts/lint/memory_admit.py`. Starts after 44f, before 44e. Ordered by builds on 2026-11-11. Facts from hana: the natedev GPU has 16303 MiB. One full hana suite peaks at 15768 MiB. Per test: median 279 MiB, p90 791 MiB, largest 7971 MiB. Two hana suites at once ran out of GPU memory (OutOfMemory RenderError at 05:34 and 09:17).
 
 More facts from hana (full suite on ca801be38c, 32 threads):
 1. The board peak is 15768 MiB. The peak sum of the test processes is 8951 MiB. Other users of the GPU hold the rest.
@@ -2157,7 +2165,7 @@ Design (builds approved it with two changes, items 2 and 6):
 
 The Work Order follows at phase start.
 
-### Phase 44e — Every build page tooltip shows labelled rows in one shape  · status: todo
+### Phase 44e — Every build page tooltip shows labelled rows in one shape  · status: merged into 44ad (2026-11-12); its hana CI rule is built by 44af
 **Depends on:** 44c. Starts next after the 44 and 44c deploy, before 44d and 44a. The user asked on 2026-11-11, from a shot of the cap line tooltip ("Cap 24.3 GiB; anonymous use 0.0 GiB + CI use 0.1 GiB + free 27.2 GiB – safety 3.0 GiB; reserved 0.0 GiB; room 24.2 GiB"): "i would like this tooltip for the cap (and other tooltips) to be more structured showing name: value pairs in rows - i also don't know what anonymous means so you need to provide better context - i don't want huge tool tips but i do want them to be informative and communicate information consistently". The Work Order follows at phase start.
 
 Every tooltip on `scripts/build_queue/memory_live.html` uses one shape:
@@ -2196,8 +2204,9 @@ Rules:
 - Writer: `queue_evidence.py` and `memory_feed.py` row data, and the `memory_live.html` tooltip renderer and CSS.
 - Tester: `test_memory_hover.py`, `test_memory_feed.py` and `memory_page_proof.mjs` rows for each tooltip kind, with no "anonymous" text.
 
-### Phase 44g — Mac builds show in the queue as their own rows, with their kind and progress  · status: todo
-**Depends on:** 44 and 44c (Phase 44 records each Mac placement and gives each running step its machine through `admission_records.execution_host`). The user asked on 2026-11-11: "you should find a way to add the mac builds and indicate whether they are test mirrors or actual runs somehow - they should show in the build queue with their machine just like we show aws in their own rows with their own machine. progress should show". The Work Order follows at phase start.
+### Phase 44g — Mac builds show in the queue as their own rows, with their kind and progress  · status: done
+**Landed alone (user, 2026-11-12: "deploy working things when they work"):** rows for build work started on the Mac, owner names from the owner record, local test progress, the one-decimal round-down percent, and the unit name from the staff record in each step name ("trunk check", repository name only when no unit is recorded). Rows for steps sent from natedev moved to Phase 44m, because their source is Phase 44 placement.
+**Depends on:** 44 and 44c. Starts after their deploy, at the same time as 44j in its own worktree (builds, 2026-11-12, item 78). (Phase 44 records each Mac placement and gives each running step its machine through `admission_records.execution_host`). The user asked on 2026-11-11: "you should find a way to add the mac builds and indicate whether they are test mirrors or actual runs somehow - they should show in the build queue with their machine just like we show aws in their own rows with their own machine. progress should show". The Work Order follows at phase start.
 
 Goal: the queue view, the queue card and the build page show each build or test on the Mac as its own row, as AWS rows show today (`memory_feed.CloudWorkRow`, `machine: "aws"`). Each Mac row shows:
 1. **Machine:** `mac`.
@@ -2208,6 +2217,314 @@ Goal: the queue view, the queue card and the build page show each build or test 
 4. **Memory:** a Mac row takes no natedev memory, so it stays out of the cap, the room and the bar, as AWS rows do.
 
 Interpretation (director, 2026-11-11, a one-line revert): "test mirrors or actual runs" means queue-placed mirror work against all other Mac build work. If the user meant a speculative copy against a placed run, that is a third value of the same Kind field.
+
+Schedule change (user, 2026-11-12: "do what you can to parallelize"): 44g starts at once in its own worktree, on a local snapshot of the Phase 44 tree, while Phase 44 finishes review and 44c runs. It lands in the same deploy as 44 and 44c.
+
+#### Work Order
+
+**Goal:** The queue view, the queue card and the build page show each build or test on the Mac as its own row, with machine `mac`, a kind, progress, and no natedev memory, as AWS rows show today.
+
+**Spec:**
+
+1. **Placed Mac steps.** Phase 44 already gives a running step its machine through `admission_records.execution_host` (`memory_feed.py:876`, `queue_card.py:146`, `queue_view.py:545`). Each running step whose execution host is the Mac shows as a Mac row with kind "sent from natedev". It names its unit, as a local row does.
+2. **Other Mac build work.** Build work on the Mac that no queue step owns (`cargo`, `rustc`, `cargo-nextest`, or a `/target/` binary outside the mirror) shows as a Mac row with kind "started on the Mac". The row names the folder. Take the split from `mac_test.mac_activity_script`. Read it from a periodic reader with a stated age, never with an ssh call on each feed pass. If no periodic reader exists, add one owned by the feed's existing refresh loop and name its interval as a config key.
+3. **One row type.** The Mac row uses the same columns and look as the AWS row (`memory_feed.CloudWorkRow`): widen `machine` to the machines it can hold, add the kind field. No coined term reaches the page.
+4. **Progress.** A placed Mac step shows the same done / total bar as a local or AWS row, from the counter its natedev caller already reads. A "started on the Mac" row shows progress only when a counter can be read; otherwise it says why, as a local row does.
+5. **Memory.** A Mac row takes no natedev memory: it stays out of the cap, the room and the bar, as AWS rows do.
+6. **Absent Mac.** When the Mac is unreachable or its reading is older than its stated age, the placed rows stay and the "started on the Mac" rows show one line that says the reading is old, with its age.
+
+**Files:**
+
+- `scripts/build_queue/memory_feed.py`
+- `scripts/build_queue/queue_view.py`
+- `scripts/build_queue/queue_card.py`
+- `scripts/build_queue/memory_live.html`
+- `scripts/build_queue/test_memory_feed.py`
+- `scripts/build_queue/test_queue_view.py`
+- `scripts/build_queue/test_queue_card.py`
+
+**Workers:** 1 writer + 1 tester.
+
+- `impl` owns `memory_feed.py`, `queue_view.py`, `queue_card.py` and `memory_live.html`. Hub file: `memory_feed.py`.
+- `test` owns the three test files. Tests use private state folders and a fake Mac reading, never the live Mac, the live feed or the live admission service.
+
+**State:** none written beyond the periodic Mac reading, if Spec item 2 adds one. Conversion: none.
+
+**Acceptance:**
+
+1. A running step placed on the Mac shows as a Mac row, kind "sent from natedev", with its unit and a done / total bar, in the feed, the card and the view.
+2. Mac build work outside the mirror shows as a Mac row, kind "started on the Mac", with its folder.
+3. Mac rows add nothing to the cap, the room or the memory bar.
+4. An old or absent Mac reading shows its age and keeps the placed rows.
+5. Existing local and AWS row tests stay green with no assertion change.
+
+**Added 2026-11-12 (user requests, same deploy):**
+1. The step table has a `Stage` column after `Duration`. It shows the row's progress phase ("building" or "testing"). The user: "when we have things that have a build phase vs a test (or other phase) i would like to show the word "building" or "testing"".
+2. When steps wait, a second header row sits directly above the first waiting row. Its duration header reads `Waiting`. The chart has a spacer of the same height at the same place. The user: "the column header should repeat when we have the Queue - and the column headers can repeat on the same row because they can differ".
+3. Column order: `#`, `Step`, `Duration`, `Stage`, `Unit`, `Pid`, `Machine`, `vCPU`. The user: "Machine and vCPU should go at the end of the columns because they are only active while a build is running".
+4. The heading reads `Next step room` with no waiting count. The user: "the 12 steps wait at the top can be removed".
+5. Every percent on the build page and in `memory_admit.py` `progress_text` shows one decimal place and rounds down, so only a complete step shows 100.0%. The user, via builds: "the queue needs to show % complete with a decimal place because 100% is not accurate here" (835 of 836 units showed 100%).
+6. Every running and waiting row shows its showrunner and unit, also for gate trials that systemd starts and for detached runs. The owner comes from the run's owner record, not only the process tree. The user, via builds: "i do not see the showrunner or the unit on these targeted test runs so i have no idea what they are for".
+
+**Verification:** `python3 -m unittest scripts.build_queue.test_memory_feed scripts.build_queue.test_queue_view scripts.build_queue.test_queue_card`, then `targeted_test.py` for the unit, and basedpyright on each changed file with zero findings. The director checks the page in a browser after the deploy, with a Mac step running.
+
+### Phase 44m — Mac steps sent from natedev show as Mac rows  · status: todo
+**Depends on:** 44 (placement records each Mac step and its execution host).
+
+Split from 44g on 2026-11-12. Current builds has no source for these rows: `verify.sh` sends a Mac test through `try_mac_test`, and `copy_watch` starts speculative copies, with no record the feed can read.
+
+1. Each running step whose execution host is the Mac shows as a Mac row with kind "sent from natedev", its unit, and a done / total bar, in the feed, the card and the view. A speculative copy shows the same way.
+2. The rows take no natedev memory.
+3. An old or absent Mac reading keeps these rows.
+4. Port from the saved 44g tree `f86053a80` (the parts imp41 left out: the `verify.sh` placement log, `copy_watch` placement constraints and `SpeculativeCopy`, the placed-Mac fields and their tests).
+
+### Phase 44s — The AWS row shows its stage, region and zone  · status: done (a2720807b, landed alone on builds as 1b43bdbad)
+
+User ask, relayed by aws 2026-11-12: show region and zone on the AWS row, with a smaller row font.
+aws landed `CloudProgress.stage`, `.region` and `.zone` (868eb2a14, all `str`, default `''`).
+
+1. The page and terminal AWS rows show the live stage text when it is not empty.
+2. The AWS row shows the region and the zone after launch, for example `eu-south-2, zone a`. An empty value shows nothing.
+3. The AWS row detail text uses the smaller row font of the owner line.
+4. Old progress files without the fields render as today.
+
+### Phase 44t — The running panel has no separate table  · status: done (fb17c6952, landed alone on builds)
+
+User ask 2026-11-12: "whatever this table is at the bottom of the "Running, in start order" panel - i don't need that table - anything that is useful in it should show either in the main table or in a tooltip".
+The table is `.walk-table` in `memory_live.html` (columns #, Step, Duration, Machine, vCPU, Unit, Pid). It shows beside the chart when wide and below it when narrow.
+
+1. Remove the table in every layout.
+2. Each chart row shows its time: run duration, or the wait time for a waiting row.
+3. Each row tooltip shows place, machine, vCPU, unit and pid. Values the row already shows are not repeated.
+4. No feed, wire or record change.
+
+### Phase 44u — Test and proof runs leave no folders in the session TMPDIR  · status: done (c53a39f97, landed alone on builds)
+
+builds 2026-11-12: report's session TMPDIR held 56 `queue-place-*` and 2 `linux-copy-*` folders, plus 8 Chrome `url_fetcher` folders from page proofs. Each writer deletes its own folder at its end.
+
+1. `memory_page_proof.mjs` starts Chrome with `TMPDIR` set inside its profile folder, so Chrome's own temporary folders go with the profile.
+2. The `test_queue_place.py` fixture sets `TMPDIR` to its own root. A `queue_place.py` child that is killed then leaves its folder inside the fixture root, and the fixture removes it.
+3. Find each other test fixture that starts `queue_place.py` or the linux copy path without a private `TMPDIR`, and give it one.
+4. A test proves each writer leaves no folder in the caller's `TMPDIR`, also after a killed child.
+
+### Phase 44v — The protocol test builds its own version-one input  · status: done (3ed43b33f, sent to land alone on builds)
+
+aws via builds 2026-11-12: `test_admission_service.py:3692` runs `git show 7ab78b74e:scripts/build_queue/admission_protocol.py`. A copy without that history fails. The test builds its own input; no fixed old commit.
+
+1. The test reads its version-one reply decoder from a source the repository holds, not from git history.
+2. The test still checks that both protocol versions decode each unparsed-request refusal.
+3. The test passes in a copy with no git history.
+
+### Phase 44w — The step table returns; the reason list below the chart goes  · status: done (e071583c7, landed alone on builds and main eb53c88eb)
+
+User 2026-11-12, via builds: "it was not at my request - i was asking about the table at the bottom - not on the right - i even provided a screenshot highlighting exactly which table - the one that i asked to be deleted is still there and the one i did not ask to be deleted is gone". 44t removed the wrong table.
+
+1. Restore the step table beside the Running chart as it was before 44t (fb17c6952), in every layout. Revert the rest of 44t too. Keep the 44u cleanup in the page proof.
+2. Remove the list below the chart: the queue priority line, the Head line and each per-step reason line (`#priority-line`, `#head-line`, `#wait-reasons`).
+3. Move each useful value into the rows or their tooltips: a waiting row's tooltip gives its reason; the head row's tooltip gives the Head values; the priority row shows that it holds the queue priority. No value is shown twice.
+4. Page views prove both, wide and narrow.
+
+### Phase 44x — Saved priority evidence needs a readable document, and it expires  · status: todo
+**Depends on:** the priority follow-up to the queue answer fix (builds-queue-44answer).
+
+Two minor findings from the fourth closure review of the priority repair. They moved here under the hard-landing rule: neither is a regression, neither breaks what worked, and the user does not see them in normal use.
+
+1. `memory_admit.py:412` makes eligibility from any matching unit label. The roster can label a worker through staff relations without a readable document. Make evidence only from a successful document check in the background reader. Add a test row: an unavailable document with a labeled worker.
+2. `memory_admit.py:389` detects staff changes, but not a document removed at the same path. Evidence survives a restart. Give evidence a lifetime, refresh documents in the background, and reject evidence after a failed refresh.
+
+### Phase 44y — Test cleanup keeps the original failure  · status: todo
+**Depends on:** 44.
+
+A minor finding from the phase 44 closure review, moved here under the hard-landing rule. `verify_mac_offload_test_support.py:1240` and `verify_ssh_targets_test_support.py:520` capture diagnostics and stop processes before they raise again. If either step raises, its exception replaces the original failure.
+
+1. Keep the original exception. Attach a cleanup or diagnostic error to it.
+2. Add rows to the existing cleanup test: the exception identity stays, and a failed diagnostic capture is attached.
+
+### Phase 44z — /build:queue is removed; /build:page is the one queue view  · status: moved to report-unit (builds, 2026-11-13: work off the critical path goes to a unit off it)
+**Depends on:** none to build; it merges builds again after Phase 44 lands, and lands after it.
+
+User 2026-11-12, change review C1474: "okay - it's time to retire the /build:queue output within the claude sesssion - we will use /build:page going foward - you can remove the skill and any code dedicated to showing the /build:queue view - but keep whatever is needed (obviously) for the build memory page". builds: use `/remove_command build:queue`; remove the skill, the view code, its tests, its doc lines and any plugin pane that only shows that view; keep the bump action only if the page or another caller uses it.
+
+1. Inventory and classify every hit by `/remove_command` steps 1–3. Report the table before any deletion.
+2. Remove each dedicated part: `commands/build/queue.md`, the queue view and card code, the unit-board queue pane, and their tests and doc lines.
+3. Keep each shared part and name its caller: everything the build page reads, and `bump`/`clear`/`admit-head` when `/showrunner:bump` or another caller uses them.
+4. Verify by `/remove_command` step 5. The landing runs the full tests-only gate.
+
+### Phase 44aa — queue_place.py starts a program with no signal handler  · status: done (85ed7572d, sent to land alone on builds)
+**Depends on:** none to build; it lands alone on builds.
+
+The user's rule, via builds 2026-11-12: no signal handlers. `queue_place.py:293` wraps the program start in `build_folders.defer_signals()`, which installs `signal.signal` handlers. sdlc devtools deletes `defer_signals` when both callers are gone; `merge_gate.py` is the other caller.
+
+1. Remove the `defer_signals` call from `QueuePlace.popen`.
+2. Make an interrupt in the start window safe without a handler: write each record atomically, and let the next start find and clean up a program whose holder died before it was tracked.
+3. Add rows to `test_queue_place.py`: TERM, INT and KILL in the start window leave no untracked program and no partial record, and the next start cleans up.
+
+### Phase 44ae — Start recovery finds a detached descendant of an unscoped program  · status: todo
+**Depends on:** 44aa.
+
+Review finding F004 of 44aa. Recovery at the next start rebuilds an unscoped program tree from the program identity and its process group (`queue_place.py` near line 255). A descendant that calls `setsid()` and outlives its parent escapes it, and recovery deletes the record. `ProgramPurpose.RUNNER` uses this path. The same gap existed before 44aa under KILL. Keep the descendant identities or use durable containment, and add a row that fails without the change.
+
+### Phase 44ab — A bump names its caller and ends with its step  · status: todo
+**Depends on:** none to build. It lands alone on builds, before 44z. 44z merges it.
+
+builds sent this defect from cargo-liner on 2026-11-12. port-unit's bump at 11:24 stored `{unit: port, why: "the user's bump"}`. Every later port step still goes ahead of the queue, hours after port's Phase 7 merged. builds' bump of resources step #10 at 18:15 has the same open end. The port entry stays until the user clears it.
+
+1. Find why the bump stored a priority while the client printed "admission service unavailable". A failed request must store nothing. When the service stored the priority, the client must not report a failure.
+2. Find why /build:queue said bump is off while the bump stored a priority. When bump is off, a bump stores nothing and says so.
+3. The default `--why` names the real caller (its staff name), not "the user's bump". Only an explicit `--why` gives the user's words.
+4. A priority ends when its step ends. A bump selects one step, not every later step of the same unit. A priority with no live step ends on the next queue read.
+5. Add rows to the existing bump and admission tests for each item. Item 4 has a row that fails without the change: the next step of the same unit gets no priority.
+
+### Phase 44ac — The Mac builds row shows no awk error  · status: done (c71a75d63, landed alone on builds 5187b127c)
+**Depends on:** none. It lands alone on builds.
+
+The user's screenshot of 2026-11-12 18:10 (`/tmp/claude/scratch/user-shot-30-waits-tooltip.png`) shows the Mac builds row with a raw error: `awk: extra ] ... nonterminated character class`. The Mac reading program in `scripts/build_queue/queue_view.py:115` uses `sub(/\/[^/]*$/, "", folder)`. The Mac's awk ends the regular expression at the `/` inside the bracket.
+
+1. Write the expression so that the Mac awk and GNU awk both accept it.
+2. Proof: run the program on the Mac and on natedev; the Mac builds row shows the reading, not an error.
+
+### Phase 44af — The Running table shows the stage in its first column, and hana CI only while CI runs  · status: done (54c9f3403, sent to land alone on builds)
+**Depends on:** none. It lands alone on builds.
+
+The user, 2026-11-12, on the build memory page (`/tmp/claude/scratch/user-shot-33-running-stage.png`): "the stage should not be its own column - it should be that where it says # in the running section - it should say Stage and it should say there whether it is testing or building - based on what it knows".
+
+1. In the Running table, the `#` column (which shows `run`) becomes `Stage`. It shows `building` or `testing`.
+2. The separate Stage column goes.
+3. A row with no known stage (Mac builds, hana CI today) shows `—`, as other unknown cells do. If the page knows the stage from its data, it shows it.
+4. The Waiting table keeps its `#` place column.
+5. The user, again the same day (`/tmp/claude/scratch/user-shot-34-hana-ci-row.png`): "the hana CI row should only show if there is a CI running - otherwise it should be hidden and just reflected as part of the used - builds used memory - because it is negligible when ci is not running - but when it is running we should see the ci run". Hide the hana CI row when no CI job runs, and count its memory in the used total. Show the row only while a CI job runs. This is a repeat ask: find the earlier change and why the row came back. A test row holds it this time.
+6. Proof: the Running table from the screenshots, before and after, with and without a CI job.
+
+### Phase 44ad — Every tooltip on the build page is clear, short and consistent  · status: done (63b86a475 on builds-queue-44ad, contains 44ag; sent to land on builds)
+**Depends on:** 44ab for the priority setter name, and 44ag (the Mac row). It lands alone on builds after both and merges them.
+
+This phase carries out Phase 44e, which the user approved on 2026-11-11. 44e's shape (title line, one short sentence, name and value rows, calculations with `+`, `−` and `=`) and its rules 1, 2, 4 and 5 are the starting point for the astra review. 44e's hana CI rule is built by 44af.
+
+The user, C1488 on 2026-11-12, about the waits tooltip in the same screenshot: "the waiting should be on its own row. Then reason on the next. i can't interpret the Head: free 7.6 GiB; reserve 3.0 GiB; need 1.9GiB ... the queue priority line should just say priority: and 'port (the user's bump)' doesn't make any sense. please ask it to review with an astra designer so we can get useful and consistent information, concisely expressed in all of our tool tips on this page."
+
+1. List every tooltip on the page, with a live example of each.
+2. An astra review of that list gives one content rule for all tooltips: useful, consistent and short.
+3. The waits tooltip: the title names the step; the wait time is on its own line; the reason is on the next line, in words that match the drawn outline; the priority line reads `Priority: <who set it>`.
+4. Apply the rule to every other tooltip.
+5. The user, later the same day: "the free, reserve and need figures are fine with me as long as they make sense and align with what i see on screen - these ones didn't - i expect they should - and be explained correctly and succinctly". Keep free, reserve and need. Each number matches a part drawn on the page (the outline, a bar segment, the cap line), and the words say how they relate. In the screenshot, free 7.6 GiB and reserve 3.0 GiB matched nothing, while the bar showed 0.0 GiB next step room. Find why they disagree. A wrong number is a defect to fix, not only a label.
+6. builds decided on 2026-11-12: the bar draws the truth. The summary hatching now clips reserved memory to available minus safety (`memory_feed.py:1024`), so the screenshot showed 4.6 GiB while the rows reserved 15.8 GiB. Draw the full reservations and the shortfall. Name the safety amount "safety", never "reserve". The astra review sets the wording and layout around this.
+7. Proof: the waits tooltip from the screenshot, before and after, and each changed tooltip after.
+8. The astra review (2026-11-12, `/tmp/claude/astra/20261112T234648Z-932244/review.md`) is the design. It sets the content rule, the waits, room, cap, reserved and safety layouts, the pressure gauge text (`Full > limit`, or `Some > limit` and `Swap > limit`), one captured reading for the pressure decision and its gauges, the rounding rule (`=` only when the shown terms add up, otherwise `≈`), and the change for each tooltip. The labels are Free, Safety, Reserved, Needs, Next step room and Shortfall.
+
+### Phase 44ag — A Mac build row reads like every other Running row  · status: done (a4ac8f03b, sent to land alone on builds)
+**Depends on:** 44af, for the Stage column. It lands alone on builds, before 44ad. 44ad merges it.
+
+The user, 2026-11-12, after 44ac (`/tmp/claude/scratch/user-shot-31-mac-row.png`): "so the mac isn't reading an error per se - but it also doesn't read like any of the other rows - and it should".
+
+1. One row for each Mac build. The Step column names the repository and the command, as natedev rows do (for example `hana nextest`), not the folder name.
+2. Stage shows `building` or `testing`. A test binary that runs under the build means `testing`; otherwise `building`.
+3. Duration, Unit, Pid, Machine and vCPU fill as on a natedev row. Unit comes from a record the queue already keeps for the Mac run (its Mac claim or copy lease). vCPU comes from the command's jobs value. A value with no source shows `—`.
+4. The bar draws the build's used memory (the resident memory of its process tree on the Mac) in the same used style and the same GiB scale. The Mac has no reservation, so the row has no hatching. The tooltip says that Mac memory does not count against natedev.
+5. A failed or old reading shows one `Mac builds` row with a short status, such as `Mac reading unavailable · 9 min old`. The raw error goes to the feed log, not the page.
+6. The tooltip follows the 44ad content rule: title with the step and its used memory, one short sentence, then rows for Machine, Started, Used, and reading age.
+7. Proof: the Running table with a Mac row next to a natedev row, before and after, plus the failed-reading row.
+8. The user, the same day (`/tmp/claude/scratch/user-shot-36-hana-ci-owner.png`, Waiting rows 16 and 18): "hana-linux-2 and hana-linux-1 - pretty sure these are CI - they should not say owner not recorded they should just say hana CI". builds: every hana CI runner step names its owner `hana CI`, in Running and Waiting. One rule in the feed decides that a step belongs to a CI runner; the page does not match names. Proof: the same rows before and after.
+9. The user, the same day (`/tmp/claude/scratch/user-shot-37-mac-counter.png`, row `trunk-p172-assembly-rows`): "it should not be the case that the mac process has no readable counter - i am pretty sure i see the readable counter when i run cargo tile on the mac". Read the Mac build's progress counter the way `cargo tile` does (source: `~/rust/cargo-liner-tile`), and fill Unit from the Mac claim. Proof: this row before and after.
+10. The user, the same day (`/tmp/claude/scratch/user-shot-38-mac-tile.png`, `/tmp/claude/scratch/user-shot-39-page-mac-one-row.png`): "i see progress bars on the mac - additionally i see 3 runs happening on the mac where as the build queue page only shows 1". `cargo tile` showed three runs (a trunk-p172 release build at 60.4%, a hana mirror nextest at 64.7%, a cargo-liner mirror nextest at 98.3%). The page showed one row, `bevy_text-0.20.1`, a crate name, with no counter. Show one Mac row for each run that `cargo tile` shows, named by its run, with the done% that `cargo tile` reads. Proof: these three runs on the page next to a `cargo tile` capture.
+
+### Phase 44ai — The page's time cells say "<1 min" and drop "waits"  · status: done (1c132a7f1, on builds 4c043d6a1)
+**Depends on:** the 44 re-land lands first. Merge report phase 65 (memory_live.html Queued title and hairline) first if it lands before this phase.
+
+User 2026-11-13, via builds: "under duration in the running section - it shouldn't spell out under it should just show <1 min - save column space. similarly under the Queued section remove the \"waits\" word in front of every row entry in that column - the Waiting column header tells us what is happening. assign to queue for after its current work". Shot: `/tmp/claude/scratch/user-shot-duration-waits.png`.
+
+1. `scripts/build_queue/memory_live.html` `ago()` returns `<1 min`, not `under 1 min`. Every use reads the same short form (decision: one format for the table and the tips; a one-line revert if wrong).
+2. The Queued rows show the wait time with no `waits ` prefix (`memory_live.html:828`).
+3. The duration column width measure (`memory_live.html:900`) measures the longest text the column now shows (`99 h 59 min`), not `waits 99 h 59 min`.
+4. The diff holds these three changes only. Update the page tests that assert the old texts.
+5. Proof: a screenshot of the shot's area (Running and Queued sections) before and after.
+
+**Files:** `scripts/build_queue/memory_live.html` and its page tests.
+
+### Phase 44aj — drain finishes existing work, then holds; clear stops all work at once  · status: todo
+**Depends on:** the 44 re-land (44c lets a kept run pass the service hold). The drain part starts on 16a9610e7; the hold part waits for builds' answers to A1–A5.
+
+User 2026-11-13 (item 35, via morty and builds): "hold | drain are two alternatives. hold clears the waiting queue immediately and enters the held state. drain finishes existing queued and running work, then enters the held state. Both prevent new natedev work from running until explicit release. Do not use hold --drain as the new interface. Fast-track this through queue. Update commands, documentation and tests consistently. Preserve the existing immediate hold behavior for running work; report any ambiguity before changing it. Keep the live proof as a separate user-approved step." Proposal: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/proposals/drain_hold.md`.
+
+1. `build_hold.py drain --for '<why>'` keeps every run live at its start: each outermost gate (working or waiting) and each hana CI `Runner.Worker`. It stops nothing.
+2. The drain command waits until no kept identity is alive, prints progress each 60 s, then `drained; natedev stays held until release`, and exits 0. Ctrl-C leaves the hold.
+3. Status and the build page show `draining (N runs left)` or `held`, derived from the keep list liveness.
+4. `clear` (the new name for `hold`) stops running natedev work as today, clears queued runs, and holds new work until release. User 2026-11-13: "clear | drain ... 'held' names the resulting state"; A1 approved for local runs. A2 (hana CI exception) and A3 approved: clear stops the whole controllable queued verify run, including its planned Mac tests; the release notice tells its session to submit again. A4, A5 and A5b wait for the user.
+5b. A5, user 2026-11-13: `build_hold.py clear --for <why>` and `drain --for <why>`; both accept `--keep`, `--release-eta` and `--zone`; `release`, `quiet` and `status` stay. The slash command stays `/build:hold`, with `clear <why>` or `drain <why>`. A5b (remote targets) waits for the user.
+5. A4, user 2026-11-13: remove the `hold` subcommand and the `hold --drain` form from the grammar. No alias, no old-form detection, no special error: normal parser validation rejects them. Update callers and docs in the same change.
+5a. A2, user 2026-11-13: hana-linux CI jobs that the control cannot stop stay queued until release. Status names each one. GitHub timeouts still apply. Do not expand process permissions for this change. A separate pre-power-off CI check confirms that no active or waiting CI job remains: a checklist step with existing read-only tools (Hana ci.yml queued and in_progress runs, the runner service state), not new code in this plan.
+6. `/build:hold`, its as-built doc and tests match.
+7. Proof: unit tests and a service test for a kept CI lineage. The live proof is a separate step the user approves.
+
+**Files:** `scripts/build_hold/build_hold.py`, `scripts/build_hold/hold_enforcer.py`, their tests, `commands/build/hold.md`, the matching as-built doc.
+
+5c. A5b, user 2026-11-13: `drain [natedev | mac | aws | all]` and `clear [natedev | mac | aws | all]` read target names from the shared build-target configuration; one key names natedev as the default. This delivery supports natedev only. Any other target, and `all`, returns exit 2 "<command> <target> is not supported yet". The Mac hold stays at `/build:mac block`.
+
+### Phase 44al — placement-status: a read-only placement check for the Mac guard  · status: todo
+**Depends on:** 44aj (both change `admission_service.py`). **Consumer:** resources' Mac guard Phase A (checkpoint about 18:30 EST) calls it before and during each Mac cargo run.
+
+builds 2026-11-13: "The check is on the placement, not the bare Mac claim. You own it: build the read-only 'placement-status --episode E --attempt A' request in admission_service.py and admission_wire.py right after 44aj. It answers current or closed, the target, owner, session and provider claim. It changes no state."
+
+1. A new wire request `PlacementStatusRequest(episode, attempt)` and reply. The reply names current or closed (with the close reason), the destination target, the owner, the session and the provider claim reference, or unknown for an id the service never saw.
+2. The service reads its saved assignment and changes no state, no permission and no record.
+3. A client command `placement-status --episode E --attempt A` prints one parseable line and exits 0 for current, 1 for closed or unknown, 2 for an unreachable service.
+4. Tests: current, closed, unknown, unreachable, and a check that the call writes no state.
+
+**Files:** `scripts/build_queue/admission_wire.py`, `admission_service.py`, `admission_client.py`, their tests, `docs/as-built/build-memory-admission.md`.
+
+### Phase 44k — A hana or cargo-liner step waits for a busy Mac instead of running on natedev  · status: todo
+**Depends on:** 44. Starts after the 14:00 deploy on 2026-11-12. ETA 17:00 EST.
+
+builds gave this to verify-unit on 2026-11-12 as urgent. After Phase 44 the queue places every step. A busy Mac (a live or cleanup claim in an overlapping scope) is `TemporaryExclusion("busy")`, and `_placement_reply` then places the step on natedev when natedev is possible. verify-unit measured 143 hana runs that fell back to natedev since 11-10 (43.5 h). The policy lives in queue placement, so it is a queue phase. verify-unit sends the measured case and the wanted rule, and changes `verify.sh` only if the wake needs it.
+
+Goal: when the Mac is busy with another live run of the same repository, a hana or cargo-liner step waits for the Mac. It wakes when the holder's claim or copy lease is released, not after the 120 s mirror-busy backoff. The Work Order follows at phase start.
+
+**Measured (verify-unit, buildlog since 2026-11-10):** hana: 143 busy fallbacks to natedev, 43.5 h natedev wall time (median 250 s, p90 3733 s), against 178 Mac runs (19.8 h). cargo-liner: 89 busy fallbacks (2.7 h), against 157 Mac runs (7.7 h). The Mac was in use about 27.5 h of about 60 h.
+
+**Rule (verify-unit, with the resources conditions):**
+1. Scope: a step whose repository the Mac can run (a Mac mirror and Mac-eligible packages: hana, cargo-liner). Linux-only packages keep their Linux placement.
+2. When the only Mac exclusion is busy (another holder's live or cleanup claim in an overlapping scope, or a held copy lease), hold the step for the Mac. Do not place it on natedev.
+3. Wake on the release of that claim or lease, not on a timer. The 120 s mirror-busy backoff (`mirror_busy_backoff_s`, `offload.py` `write_mirror_busy`) must not delay a start after the release.
+4. No fixed time cap. The wait ends when the holder releases or the Mac claim expires (`claim_idle_minutes`, dead-holder release).
+5. The wait obeys a natedev build hold.
+6. Natedev placement stays for every other reason: unreachable, a user Mac block, disk, an unreachable backoff, state errors, `--local` and a pinned target.
+7. A step never waits on a claim or lease that its own session holds.
+8. The call row records the wait (target mac, wait seconds in an existing field).
+
+**Proof:** a row that fails without the change (busy Mac, natedev possible: the step waits, then runs on the Mac at release, with no local run), and rows for each fallback that stays. Diffs in `mac_test.py`, `offload.py` and `build_targets.py` go to resources before the checkpoint. verify-unit counts the after value from the buildlog after the deploy.
+
+### Phase 44j — A test run with no history for its filters keeps only what its tests use  · status: todo
+**Depends on:** 44c, because Phase 44 also edits `scripts/lint/memory_admit.py`. Runs at the same time as 44g, in its own worktree, after the 44 + 44c deploy (builds, 2026-11-12, item 78). It shares only `admission_records.py` with 44g, which only reads it.
+
+Cause, from the saved records of pid 2940313 (reservation `3629442-94520057-1794433606678362112`): a hana nextest step in tool-based-ui-trunk, 7 filters, 1 test thread. It kept its 11.47 GiB build need for its 18-minute test phase (16:55–17:13 EST), and its tests used at most 1.03 GiB. Room was about 1.2 GiB, so 13 waiting Hana steps did not fit.
+1. `test_phase_need_from_rows` (`memory_admit.py:784`) finds history only for the exact filter set (line 803). With none, it returns `NoTestPhaseNeed("no_history")`.
+2. `reservation_need` (line 1711) then keeps `row["need"]` for the whole step. `test_phase_margin` (`config/build_admission.conf:84`) multiplies only a history need (`test_phase_charge`, line 1706), so it does not apply.
+3. On 2026-11-11, 158 of 352 filtered nextest steps had no test-phase history. 95 of them had a measured test phase and kept about 14.4 GiB-hours above 1.2 × their measured test peak.
+
+Design (builds, 2026-11-11; revised after the Astra blind design review, 2026-11-12, `/tmp/claude/astra/20261112T080039Z-3011320/review.md`):
+1. **Eligibility.** A filtered nextest step whose history search succeeded and found no row for its exact filter set. Split today's `NoTestPhaseNeed("no_history")` into a successful search with no match and unavailable evidence. Unavailable history, a read error, a missing repository identity, an invalid width and an unreadable memory reading keep the build need (`memory_admit.py:793`, `:841`).
+2. **Wait.** Elapsed time from `ObservedTestPhase.started_at`. The observation must match the current reservation; `observed_test_phase` (`memory_admit.py:850`) keeps the record identity for that check.
+3. **Charge.** Fallback = max(test-phase peak so far × `test_phase_margin`, current readable use × `test_phase_margin`, floor). Recompute it each pass. It rises at once with the peak and may rise above the original build need. `row["need"]` stays unchanged; the fallback feeds the existing `memory_room` keep (`kept = max(0, charge − current use)`, `memory_admit.py:612`). Head protection and start spacing stay.
+4. **One path.** `reservation_need` (`memory_admit.py:1713`) applies the fallback through the progress path too: a progress profile never lowers the charge below the floor or the observed peak with margin (`progress_memory`, `:1830`).
+5. **Observation loss.** The sampler writes the phase file only when its peak rises (`scripts/lint/invoke.sh:258`), so a file age does not prove a live sampler. A lost observation, a width change or a service restart returns the step to the build need until a valid observation returns.
+6. **Settings.** The floor and the wait are new keys in `config/build_admission.conf`, read at use, set with /tune. Trial candidates: floor 2 GiB, wait 60 s. Before the keys get values, a replay over pinned records (named source files, cutoff and zone) compares candidates by peak growth after activation and by concurrent memory deficit. The 14.4 GiB-hours figure is an upper bound, not a wait-time saving.
+7. **Record.** The captured explanation names the fallback reason, activation time, floor, margin and charge. A fallback is not written as history: `TestPhaseStarted` (`admission_records.py:354`) requires `TestPhaseNeed`, so a new record variant needs codec and reader tests. This adds `admission_records.py` to 44j; 44g only reads `execution_host` from it, so the second phase to land merges the first.
+8. **Limitation.** The wait and the rising charge do not bound later growth. Memory a test takes after activation may already be promised to another step. Pressure checks stop new starts only. Another filtered run with no history reached 6.63 GiB (`~/.local/state/buildlog/admission/anon_peaks.jsonl:52932`), more than a 2 GiB charge plus the 3 GiB safety.
+9. Other history shapes do not fit: same repo and package at the nearest width gives 10.6 GiB here, and width scaling gives 0.66 GiB, below the real 1.03 GiB.
+
+Acceptance (rows in the existing `memory_admit` and admission-service tests; one service test covers the progress wrapper):
+
+| Case | Result |
+| --- | --- |
+| Before, at and after the wait | The fallback starts at the stated boundary. |
+| Missing observation, invalid width, unavailable history | The build need stays. |
+| Peak rises after activation, then current use falls | The charge rises at once and keeps the peak. |
+| Current use above the saved peak | The charge includes current use. |
+| A progress profile appears or goes away | Neither path goes below the floor or the peak with margin. |
+| Head and a younger waiter compete | Freed room follows head protection and spacing. |
+| The charge rises while builds run | Kept memory rises; ordinary starts stop when room is short. |
+| Config change, width change, service restart | The shown charge matches the stated rule. |
+
+The Work Order follows at phase start.
 
 ### Phase 44d — The queue holder signal test passes under a loaded gate  · status: todo
 **Depends on:** 44c. Ordered by builds 2026-11-10 (not urgent). In a full AWS gate run (hierarchies 62efaf), `scripts/build_queue/test_queue_place.py` `test_holder_signals_release_and_restore_handlers` (SIGINT case) failed its fixed 8 s wait, "signal cleanup did not finish" (line 1019), then passed alone. The wait must not depend on load. The forked holder already arms `signal.alarm(TEST_HANG_GUARD_SECS)` (line 997), so the parent can wait on the holder's pidfd with no fixed limit of its own and keep every assertion. The Work Order follows at phase start.
@@ -2252,7 +2569,7 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 - `commands/build/hold.md` — drain usage
 - Tests: `test_build_hold.py`, `test_hold_enforcer.py`, `test_hold_applies.py`, `test_detached_runs.py`, `test_build_targets.py`, `test_step_record.py`
 
-**Binds later work:** a deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert and continues only on `drained`. The drain covers verify.sh, merge_gate.py and targeted_test.py only. `hold_waited_on` reads the keep lineage from `os.getpid()`, so a caller in another process must pass the requester's lineage. `holds_only_own`, `caller_holds_only_own` and `holds_apply_to_caller` are gone.
+**Binds later work:** a deploy runs `build_hold.py drain --for '<purpose>'` before the stop-convert and continues only on its `drained` line (Phase 44aj replaced `hold --drain`). `hold_waited_on` reads the keep lineage from `os.getpid()`, so a caller in another process must pass the requester's lineage. `holds_only_own`, `caller_holds_only_own` and `holds_apply_to_caller` are gone.
 
 **Gotchas:** never take `record_lock` twice in one process: `flock` on a second open file blocks the same process. The deploy stop script keeps its own refusal as the last guard.
 
@@ -2264,7 +2581,7 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 **Constraints from 44b (architect review of 44b, 2026-11-10).**
 1. The hold check at `merge_gate.py:472` is `build_targets.caller_waits_on_hold(holds, directory)`; `caller_holds_only_own` is gone. Keep this check when gate routing moves to the queue.
 2. Keep the Phase 44c rule: a hold decision uses the checked requesting process's lineage, never the service's.
-3. The deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert, as Phase 44 deploy step 3 does.
+3. The deploy runs `build_hold.py drain --for '<purpose>'` before the stop-convert, as Phase 44 deploy step 3 does.
 
 **Workers:** 2 writers.
 - Queue writer: placement types, protocol, service policy, and their tests.
@@ -2273,7 +2590,7 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 ### Phase 46 — Every view names the machine a step runs on, and the old route code is gone  · status: todo
 **Depends on:** 45. Checkpoint 4 of section 8 in `docs/plans/builds-queue-placement.md`. The Work Order follows at phase start. It switches the remaining readers first and deletes the old selectors only after their last caller switches. Phase 44 item 4 (claim ownership) applies.
 
-**Constraints from 44b.** The hold-policy helpers in `build_targets.py` (`hold_waited_on`, `caller_waits_on_hold`) are not host selectors: keep them. Status and report readers keep the complete list of holds in force. The deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert.
+**Constraints from 44b.** The hold-policy helpers in `build_targets.py` (`hold_waited_on`, `caller_waits_on_hold`) are not host selectors: keep them. Status and report readers keep the complete list of holds in force. The deploy runs `build_hold.py drain --for '<purpose>'` before the stop-convert.
 
 **Workers:** 1 writer + 1 tester.
 - Writer: the remaining readers, and deletion of the old selectors after their last caller switches.

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import sqlite3
+import statistics
 from pathlib import Path
 import sys
 import time
@@ -43,6 +45,9 @@ TYPE_CHECK_JOB: Final = ("types", "basedpyright")
 
 
 class ModuleRun(TypedDict):
+    # Older records can omit the module times.
+    started_at: NotRequired[str]
+    ended_at: NotRequired[str]
     config_reads: NotRequired[list[str]]
     folder_scans: NotRequired[list[str]]
     content_reads: NotRequired[list[str]]
@@ -71,6 +76,7 @@ class SuiteRun(TypedDict):
 
 
 class GateRun(TypedDict):
+    vcpus: NotRequired[int]
     step: str
     dirty_paths: list[str]
     dirty_path_count: int
@@ -106,6 +112,19 @@ class GateRunRecord(GateRun):
 
 @dataclass(frozen=True)
 class NoModuleTimes:
+    reason: str
+
+
+@dataclass(frozen=True)
+class WallClockSpan:
+    """The wall-clock epoch seconds for one module attempt."""
+    started_at: float
+    ended_at: float
+
+
+@dataclass(frozen=True)
+class WallClockNotRecorded:
+    """The attempt has no recorded wall-clock span."""
     reason: str
 
 
@@ -223,6 +242,7 @@ class Execution:
     restart: Literal["", "hold"]
     times: ModuleTimes | NoModuleTimes | TimingNotApplicable
     output: str
+    wall_clock: WallClockSpan | WallClockNotRecorded = field(default=WallClockNotRecorded("not recorded"), kw_only=True)
 
 
 def _fields(value: object) -> dict[str, object]:
@@ -302,6 +322,8 @@ def slow_test_s() -> float:
 
 def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[ModuleRun]:
     """Keep each attempt and select its test times with one threshold."""
+    from scripts.buildlog import store
+
     attempts: dict[tuple[str, str], int] = {}
     modules: list[ModuleRun] = []
     for job in executions:
@@ -315,6 +337,9 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
             "times_missing": job.times.reason if isinstance(job.times, NoModuleTimes) else "",
             "log": "",
         }
+        if isinstance(job.wall_clock, WallClockSpan):
+            module["started_at"] = store.utc_iso(job.wall_clock.started_at)
+            module["ended_at"] = store.utc_iso(job.wall_clock.ended_at)
         if not isinstance(job.times, (NoModuleTimes, TimingNotApplicable)):
             times = job.times
             reads = module_read_record(times.get("config_reads"), times.get("folder_scans"), times.get("content_reads"))
@@ -375,3 +400,63 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
         store.append_line(store.host_file(host, epoch), entry)
     except Exception as error:
         report_not_written(error)
+
+
+@dataclass(frozen=True)
+class GateTimeLimit:
+    """The history supports a deadline for this run."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
+class NoGateTimeLimit:
+    """No passing history supports a deadline for this run."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReadGateTimeLimit:
+    """Read the local gate index before the run starts."""
+
+
+READ_GATE_TIME_LIMIT: Final = ReadGateTimeLimit()
+
+
+def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequence[str],
+                       jobs: int, targeted: bool) -> GateTimeLimit | NoGateTimeLimit:
+    """Use passing records from the same vCPU count and the configured history size.
+
+    A full run also matches the job count: a cloud host runs one job per vCPU, and a
+    shared natedev run with the same vCPU count runs fewer jobs and takes longer.
+    A full run counts only when it ran test modules: a run of the type check alone is shorter.
+    """
+    factor = conf.read("merge_gate").number("GATE_TIME_LIMIT_FACTOR")
+    count = conf.read("test_times").whole("TOP_RUNS")
+    if not targeted:
+        walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
+            """SELECT wall_s FROM gate_runs
+               WHERE vcpus = ? AND max_jobs = ? AND status = 0 AND aborted = 0
+                 AND selection = 'full' AND step = 'merge-gate' AND wall_s > 0 AND modules_run > 0
+               ORDER BY started_at DESC, id DESC LIMIT ?""", (vcpus, jobs, count)).fetchall())]
+        if walls:
+            return GateTimeLimit(factor * statistics.median(walls))
+        return NoGateTimeLimit(f"no passing full gate history for {vcpus} vCPUs at {jobs} jobs")
+    medians: list[float] = []
+    for path in modules:
+        name = path.removeprefix("scripts/")
+        suite, module = name.split("/", 1)
+        walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
+            """SELECT m.wall_s FROM gate_modules m JOIN gate_runs r ON r.id = m.run_id
+               WHERE r.vcpus = ? AND r.status = 0 AND r.aborted = 0
+                 AND r.selection != 'reused' AND m.status = 0 AND m.restart = ''
+                 AND m.suite = ? AND m.module = ? AND m.wall_s > 0
+               ORDER BY r.started_at DESC, r.id DESC, m.attempt DESC LIMIT ?""",
+            (vcpus, suite, module, count)).fetchall())]
+        if not walls:
+            return NoGateTimeLimit(f"no passing module history for {name} on {vcpus} vCPUs")
+        medians.append(statistics.median(walls))
+    if medians:
+        return GateTimeLimit(factor * max(max(medians), sum(medians) / jobs))
+    return NoGateTimeLimit(f"no passing module history for {vcpus} vCPUs")

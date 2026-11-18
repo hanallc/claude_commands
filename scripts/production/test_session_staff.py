@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from dataclasses import replace
 import os
+import subprocess
 from typing import cast
 import json
 from io import StringIO
@@ -14,9 +15,8 @@ from scripts.lib import unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, fixture_session, unit_membership
 from scripts.herdr import herdr, pane_launch
-from scripts.herdr.pane_launch import PaneLaunch
 
 
 class StatusDiscoveryTests(StaffTestCase):
@@ -58,15 +58,30 @@ class StatusDiscoveryTests(StaffTestCase):
                 self.assertEqual(lines, [f"anomaly: {row.id}: {anomaly}"] if anomaly else [])
         self.assertEqual(self.staff_state(), before)
 
+        record = staff.snapshot()
+        expected = labels.RowResolver(record).production_doc(fixture.unit)
+        facts = labels.RowResolver(record).production_document_facts()
+        with (self.machine("mac"), labels.supplied_production_facts(facts),
+              mock.patch.object(subprocess, "run", side_effect=AssertionError("document fact ssh"))):
+            for row in (fixture.runner, fixture.unit, fixture.worker):
+                with self.subTest(kind=row.kind):
+                    self.assertEqual(labels.RowResolver(record).production_doc(row), expected)
+        write_text_atomic(fixture.doc, "# Changed production\n")
+        current = labels.RowResolver(record).production_doc(fixture.unit)
+        self.assertIsInstance(current, labels.ProductionDoc)
+        assert isinstance(current, labels.ProductionDoc)
+        self.assertEqual(current.text, "# Changed production\n")
+
     def test_run_workers_follow_the_staff_owner_without_a_roster(self) -> None:
         fixture = self.row_production()
         showrunner_worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
+        resumed_unit = replace(fixture.unit, current_session=fixture_runtime_id("resumed-run-owner"))
         rows = (fixture.runner, fixture.unit, fixture.worker)
         before = self.staff_state()
         for state, membership, expected in (
             ({"owner_staff_id": fixture.unit.id}, rows, (fixture.worker,)),
             ({"owner_staff_id": fixture.runner.id}, (*rows[:-1], showrunner_worker), (showrunner_worker,)),
-            ({"main_agent": {"session_id": fixture.unit.current_session}}, rows, (fixture.worker,)),
+            ({"owner_staff_id": fixture.unit.id}, (fixture.runner, resumed_unit, fixture.worker), (fixture.worker,)),
             ({}, rows, ()),
         ):
             with self.subTest(state=state):
@@ -83,6 +98,7 @@ class StatusDiscoveryTests(StaffTestCase):
                                    {"CODEX_HOME": str(self.root / ".codex2")}, ["codex"], kind="codex")
         launch["environment"] = {"CODEX_HOME": str(cast(staff.SessionHome, pane_launch.config_home(launch)).path),
                                  "CODEX_THREAD_ID": fixture.unit.current_session, "STAFF_ID": fixture.unit.id}
+        fixture_session(fixture.unit.current_session, staff.CodexBackend(self.root / ".codex2"))
         names = LaunchNames(staff.snapshot())
         before = self.staff_state()
         self.assertEqual(names.environment(launch), {
@@ -101,7 +117,8 @@ class StatusDiscoveryTests(StaffTestCase):
         path = self.root / "panes.json"
         pane_launch.write(path, entry)
         saved = pane_launch.read_strict(path)["w1:p1"]
-        self.assertEqual(saved, {**entry, "session_id": fixture.unit.id})
+        self.assertEqual(saved, {**{field: value for field, value in entry.items()
+            if field not in {"session_id", "name", "cwd", "kind", "config_dir"}}, "staff_id": fixture.unit.id})
         self.assertEqual(entry["session_id"], fixture.unit.current_session)
 
     def test_record_membership_derives_staff_marks_only_at_launch(self) -> None:
@@ -111,6 +128,7 @@ class StatusDiscoveryTests(StaffTestCase):
         fixture = self.row_production()
         entry = pane_launch.launch("w1:p1", fixture.unit.current_session, str(fixture.worktree),
             {}, ["claude", "--model", "sonnet"])
+        fixture_session(fixture.unit.current_session, staff.ClaudeBackend())
         with mock.patch.object(pane_record, "launches", return_value=[]):
             saved = labels.record_membership(entry)
             self.assertEqual(saved, entry)
@@ -128,6 +146,7 @@ class StatusDiscoveryTests(StaffTestCase):
                                 "STAFF_ID": fixture.unit.id, "ENABLE_TOOL_SEARCH": "true"}
         directory = self.root / "retained"
         path = directory / "agents.json"
+        entry = pane_launch.retained_launch(entry, staff.initial_snapshot())
         write_text_atomic(path, json.dumps({"w1:p1": entry}))
         with (mock.patch.object(pane_record, "RECORD_DIR", directory),
               mock.patch.object(sessions, "running_sessions", return_value=[])):
@@ -158,7 +177,7 @@ class StatusDiscoveryTests(StaffTestCase):
         broken = unit_membership("show", "broken")
         healthy = unit_membership("show", "healthy")
         place = labels.Place("agents", "w1:p1")
-        launch = PaneLaunch(pane_id=place.pane, session_id=broken.current_session, config_dir="", cwd="",
+        launch = pane_launch.NativePaneLaunch(pane_id=place.pane, session_id=broken.current_session, config_dir="", cwd="",
                             name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
         processes = [herdr.HerdrProcess(910001, place, {}, "claude", ""),
                      herdr.HerdrProcess(910002, labels.Place("agents", "w2:p1"),
@@ -181,7 +200,7 @@ class StatusDiscoveryTests(StaffTestCase):
     def test_denied_thread_read_reports_only_when_the_pane_holds_staff(self) -> None:
         row = unit_membership("show", "unit")
         place = labels.Place("agents", "w2C")
-        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+        launch = pane_launch.NativePaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
                             name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
         unknown = labels.LabeledSession("", labels.ClaudeUnknown("thread read denied"), place,
                                         labels.ObservedProcess(910001, "codex"))
@@ -206,7 +225,7 @@ class StatusDiscoveryTests(StaffTestCase):
     def test_exited_process_in_a_staff_pane_is_quiet_and_not_placed(self) -> None:
         row = unit_membership("show", "unit")
         place = labels.Place("agents", "w2C")
-        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+        launch = pane_launch.NativePaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
                             name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
         unknown = labels.LabeledSession("", labels.ClaudeUnknown("thread read denied"), place,
                                         labels.ObservedProcess(910001, "codex"))
@@ -230,7 +249,7 @@ class StatusDiscoveryTests(StaffTestCase):
     def test_unregistered_thread_in_a_unit_pane_is_quiet_and_not_placed(self) -> None:
         row = unit_membership("show", "unit")
         place = labels.Place("agents", "w2C")
-        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+        launch = pane_launch.NativePaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
                             name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
         observed = [labels.LabeledSession("", labels.ClaudeUnknown("no registered session"), place,
                     labels.ObservedProcess(910001, "codex"), labels.LiveSession(fixture_runtime_id("fake-thread"))),
@@ -281,17 +300,15 @@ class StatusDiscoveryTests(StaffTestCase):
     def test_morty_without_environment_identity_never_uses_the_retained_unit_launch(self) -> None:
         row = unit_membership("show", "unit")
         place = labels.Place("agents", "w2C")
-        launch = PaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
+        launch = pane_launch.NativePaneLaunch(pane_id=place.pane, session_id=row.current_session, config_dir="", cwd="",
                             name="", model="", remote_control=False, environment={}, flags_read=True, written_at="")
         unknown = labels.LabeledSession("", labels.ClaudeUnknown("no identity"), place,
                                         labels.ObservedProcess(198033, "codex"))
         morty = fixture_runtime_id("retained-pane-morty")
+        _ = fixture_member("producer", name="morty", runtime_id=morty)
         from scripts.message import codex_daemon
 
-        sessions = [codex_daemon.DaemonSession(morty, "morty", str(self.root), "idle")]
-
-        def configured_morty(identity: str) -> bool:
-            return identity == morty
+        sessions = [codex_daemon.DaemonSession(morty, str(self.root), "idle")]
 
         with (mock.patch.object(herdr, "shared_session", return_value=place.session),
               mock.patch.object(herdr, "process_environment", return_value={}),
@@ -300,7 +317,6 @@ class StatusDiscoveryTests(StaffTestCase):
                   "pane": {"terminal_title_stripped": "morty | idle"},
                   "process_info": {"foreground_processes": [{"pid": 198033, "argv": ["codex"]}]}}),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=sessions),
-              mock.patch.object(labels, "morty_thread", side_effect=configured_morty),
               labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
             grouped = labels.group_labeled_sessions([unknown], record=staff.snapshot(),
                                                     sources=labels.MemberSources((launch,)))

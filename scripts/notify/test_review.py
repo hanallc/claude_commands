@@ -37,6 +37,7 @@ REAL_REVIEW = review.review
 REAL_PROCESS_RUN = subprocess.run
 
 from scripts.accounts import accounts
+from scripts.whoami.account_test_support import create_claude_account
 from scripts.production import staff
 from scripts.production.update_registration_test_support import RegistrationFixture
 from scripts.production.cli_fixture import production_paths
@@ -149,11 +150,9 @@ class LocalReviewTests(unittest.TestCase):
         notes.mkdir()
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
-        _ = (notes / "claude2.md").write_text("---\nlogin: reviewer@example.invalid\n---\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFY_STATE_DIR": str(self.root / "state")})))
-        self.assertEqual(accounts.setup("claude2"), [])
-        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
+        create_claude_account("claude2", "reviewer@example.invalid")
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
@@ -161,10 +160,11 @@ class LocalReviewTests(unittest.TestCase):
         registry = write_registry(self.root / "models.conf")
 
         def process(argv: list[str], *, env: dict[str, str], capture_output: bool, text: bool,
-                    check: bool, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+                    check: bool, timeout: float = 60, input: str | None = None) -> subprocess.CompletedProcess[str]:
             if argv[0] != "bash" or env.get("MODELS_CONFIG_FILE") != str(registry):
                 raise AssertionError(f"unexpected process: {argv}")
-            return REAL_PROCESS_RUN(argv, env=env, capture_output=capture_output, text=text, check=check, timeout=timeout)
+            return REAL_PROCESS_RUN(argv, env=env, capture_output=capture_output, text=text, check=check, timeout=timeout,
+                                    input=input)
 
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=process))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
@@ -1544,10 +1544,8 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
-        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: unit@example.invalid\n---\n")
-        self.assertEqual(accounts.setup("claude3"), [])
+        create_claude_account("claude3", "unit@example.invalid")
         directory = accounts.account_dir("claude3")
-        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
         with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "writer config", "ANTHROPIC_API_KEY": "writer key"})):
             result = review.review(self.draft, False, runner=runner)

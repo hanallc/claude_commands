@@ -10,6 +10,8 @@ import subprocess
 from typing import override
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import copy_helpers
+
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr_types
 from scripts.production import staff, unit_config, unit_command
@@ -90,7 +92,7 @@ class UnitCommandTests(StaffTestCase):
         unit = staff.StaffRow(
             staff.StaffId(fixture_runtime_id("command")), "unit", "panes", staff.ReportsTo(runner.id),
             worktree=staff.PresentWorktree("natedev", self.folder),
-            current_session=staff.StaffId(fixture_runtime_id("command-unit-current")))
+            current_session=staff.StaffId(fixture_runtime_id("command-unit-current")), unit_type=staff.UnitDetails("direct"))
         worker = staff.StaffRow(
             staff.StaffId(fixture_runtime_id("command-worker")), "worker", "impl", staff.ReportsTo(unit.id),
             current_session=staff.StaffId(fixture_runtime_id("command-worker-current")))
@@ -120,14 +122,13 @@ class UnitCommandTests(StaffTestCase):
         return fields
 
     def parked_unit(self) -> tuple[staff.StaffRow, Path]:
-        removed = replace(self.unit, worktree=staff.RemovedWorktree("natedev", self.root / "gone"))
+        removed = replace(self.unit, worktree=staff.RemovedWorktree("natedev", self.root / "gone", staff.ParkedBranch("parked/member")))
         parked = unit_config.parked_path(removed.id)
         parked.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(parked, (
             'plan = "docs/plans/retained.md"\nresponsibilities = ["member"]\n'
             '[retired]\ndate = "2026-11-01"\n'
-            f'session = "{removed.current_session}"\nfolder = "{self.root / "original"}"\n'
-            'branch = "parked/member"\n'))
+            f'session = "{removed.current_session}"\n'))
         return removed, parked
 
     def test_unknown_id_reports_one_line_and_fails(self) -> None:
@@ -404,9 +405,7 @@ class UnitCommandTests(StaffTestCase):
             "unavailable: duplicate live panes: first (herdr:agents:w1:p1), second (herdr:agents:w1:p2)"))
 
     def test_the_executable_entry_forwards_the_id_and_failure_status(self) -> None:
-        shim = Path.home() / ".claude/scripts/lib/py"
-        shim.parent.mkdir(parents=True, exist_ok=True)
-        shim.symlink_to(CHECKOUT / "scripts/lib/py")
+        _ = copy_helpers(Path.home())
         completed = subprocess.run(
             [str(CHECKOUT / "scripts/production/unit"), "missing-entry-id"],
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)

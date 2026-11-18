@@ -319,7 +319,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 - `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`: `start` and `end` bound the recent window, in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`. `CostAction(action, owner)`.
 - `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
 - Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
-- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
+- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=7`, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
 - `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
 **Files:**
@@ -491,7 +491,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 #### As-built
 
-- `offload.repository_identity` reads `repository.repository_key(str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
+- `eligibility.repository_identity` reads `repository.repository_key(str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
 - `persist_attempt` writes `repository.key`, else `store.UNKNOWN_IDENTITY`. A keyless repository no longer writes an empty `repo_identity` that `index.py` reads as a real identity.
 - `memory_admit.git_identity` reads the same function and keeps only its name and legacy-name rules, so one place holds the key rule. `git_output` is gone.
 - `offload.py` imports `record` and `store` at module top; it calls no `memory_admit` function.
@@ -1012,3 +1012,1037 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 **Files:**
 - `scripts/buildlog/cli.py` — `cell` and the text branch of `query`.
 - `scripts/buildlog/test_gate_index.py` — `test_query_text_aligns_numbers_and_prints_empty_results`.
+
+### Phase 50 — Gate records hold each module's start and end time · status: done
+
+#### As-built
+
+- Each gate module run records its wall-clock start and end. `start_gate_job` sets `RunningGateJob.started_at`; `finish_gate_job` passes it on and sets `ended_at`. A hold restart keeps both times.
+- `GateJobResult` and `gate_record.Execution` carry `started_at` and `ended_at` as keyword-only `float | None`. `None` means "not recorded": a job that never started, or a result from a box that runs an older tree.
+- `gate_record.module_runs` writes `started_at` and `ended_at` as UTC ISO text (`store.utc_iso`) only when recorded. `ModuleRun` marks both keys `NotRequired`.
+- The cloud transfer keeps the times. `gate_box.encode_run` leaves out an unknown time. The decoder accepts a row with no times and refuses a negative or non-finite time.
+- `buildlog` schema 40 adds `gate_modules.module_started_at` and `module_ended_at` (TEXT). Older records give NULL. `gate_runs.started_at` is still the run start.
+- `docs/as-built/merge-gate-and-test-speed.md` has a "Module start and end times" section with the ordering query.
+
+**Files:**
+- `scripts/production/merge_gate.py` — `GateJobResult`, `RunningGateJob`, `start_gate_job`, `finish_gate_job`, `record_gate_run`.
+- `scripts/test_times/gate_record.py` — `ModuleRun`, `Execution`, `module_runs`.
+- `scripts/aws_target/gate_box.py` — `encode_run`, the job decoder, `execution_records`.
+- `scripts/buildlog/index.py` — `SCHEMA_VERSION`, `GATE_MODULE_COLUMNS`, `add_gate_run`.
+- `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py`, `scripts/production/test_merge_gate_holds.py` — the tests.
+- `docs/as-built/merge-gate-and-test-speed.md` — module start and end times.
+
+### Phase 51 — Gate module times use named recorded and not-recorded states · status: done
+
+#### As-built
+
+- `gate_record.py` has two frozen dataclasses. `WallClockSpan(started_at, ended_at)` holds the wall-clock epoch seconds of one module attempt. `WallClockNotRecorded(reason)` means the attempt has no recorded span.
+- `gate_record.Execution` and `merge_gate.GateJobResult` hold one keyword field `wall_clock: WallClockSpan | WallClockNotRecorded`. The defaults are `WallClockNotRecorded("not recorded")` and `WallClockNotRecorded("job did not run")`. `finish_gate_job` sets a `WallClockSpan`; `RunningGateJob.started_at` stays a `float`.
+- `module_runs` writes `started_at` and `ended_at` only for a span. The JSON record and the `buildlog` columns do not change.
+- The cloud wire format does not change. `gate_box.encode_job` writes the top-level `started_at` and `ended_at` keys only for a span. The decoder gives a span for both keys, `WallClockNotRecorded("box result has no module times")` for none, and `WallClockNotRecorded("box result has only one module time")` for one. A row with one time keeps its job status and gate result. A negative or non-finite time is still refused.
+- `docs/as-built/merge-gate-and-test-speed.md` says that a cloud row with only one of the two times records neither.
+- A separate main fix (0236b558e) narrowed the Phase 50 test times. A merge of it with this phase conflicts in `test_merge_gate_suites_tripwires.py`; keep this phase's side.
+
+**Files:**
+- `scripts/test_times/gate_record.py` — `WallClockSpan`, `WallClockNotRecorded`, `Execution`, `module_runs`.
+- `scripts/production/merge_gate.py` — `GateJobResult`, `finish_gate_job`, `record_gate_run`.
+- `scripts/aws_target/gate_box.py` — `encode_job`, the job decoder, `execution_records`.
+- `scripts/test_times/test_gate_record.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py` — the tests, with half-timed cloud rows.
+- `docs/as-built/merge-gate-and-test-speed.md` — partial cloud times.
+
+### Phase 52 — The 10-minute disk job reads almost nothing · status: done
+
+#### As-built
+
+- `disk.snapshot()` walks the build folders only when there is no full previous snapshot (none, or an old shape), or when the last walk is at least `DISK_WALK_MINUTES` old **and** the current hour in the user's zone (`scripts.lib.user_zone.user_zone()`) is `DISK_WALK_HOUR`.
+- Every other run refreshes only free and used space: `/` and each `filesystems` row through `filesystem.filesystem_usage`. A path that fails keeps its old row. It refreshes `floor` and sets `capacity_measured_at`. It keeps `rows`, the outside data, `measured_at`, `previous_measured_at` and `output_unavailable`. It calls no walk function. A whole `buildlog disk` refresh took 0.17-0.28 s on a copy of the live `disk.json`.
+- A full walk sets `capacity_measured_at` equal to `measured_at`. `sweep.read_disk_measurement` still reads the walk time, so folder growth spans walks.
+- `report.disk_section` names both times when they differ: `Folder sizes measured by the buildlog disk job at {walk}; free and used space at {capacity}: allocated blocks, each hard-linked file once.` Without the key, or with equal times, it keeps the one-time line.
+- `config/buildlog.conf`: `DISK_WALK_MINUTES=1200` (below a day, so drift never skips the daily walk) and `DISK_WALK_HOUR=3` (the builds showrunner, 2026-11-12: a walk at a random daytime minute makes the keyboard stick).
+- natedev's IO scheduler is `none`, so `ionice` has no effect; the interval and the quiet hour are the fix.
+- With a daily walk, floor-crossing alerts drop folder choices after 15 minutes (`sweep_snapshot_max_age_seconds=900`). Phase 53 holds the fix.
+
+**Files:**
+- `config/buildlog.conf` — `DISK_WALK_MINUTES`, `DISK_WALK_HOUR`.
+- `scripts/buildlog/disk.py` — `snapshot()`, `capacity_measured_at` in `DiskSnapshot` and `MeasuredDiskSnapshot`.
+- `scripts/buildlog/report.py` — the `disk_section` closing line.
+- `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py` — refresh, quiet-hour, old-snapshot, gone-path and report-line cases.
+
+### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: done
+
+From the user (via the builds showrunner), 2026-11-12: "approve. Question: allow a 28-hour-old folder snapshot for the disk floor alert (sweep_snapshot_max_age_seconds 900 -> 100800)."
+
+#### As-built
+
+- `/tune` set `sweep_snapshot_max_age_seconds=100800` on main (d83275f72). Two daily walks can be 90,120 seconds apart on the day clocks go back; the limit adds timer drift and the walk time.
+- `folder_choices` and `disk_measurement_lines` read the limit at use, so no code changed. Folder freshness uses `measured_at`; `capacity_measured_at` does not make folder sizes fresh.
+- `config/lint.conf`: the comment above the value states the daily walk.
+- `docs/as-built/build-followups.md` **Measuring**: the walk rule (no full snapshot, or `DISK_WALK_MINUTES` old in the `DISK_WALK_HOUR` hour, or a newer walk request) and the two-time report line.
+
+**Files:**
+- `config/lint.conf` — the comment.
+- `scripts/lint/test_sweep.py` — `test_crossing_session_keeps_trash_and_scratch_effects` rows with their own 100800 limit: a 26-hour-old walk offers its folders; an older one offers none and says "stale".
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
+
+### Phase 54 — The tmp sweep judges each entry of a kept run's tmp/ · status: done
+
+From builds (not the user), 2026-11-12: go on this phase; `tmp_sweep.py` is resources' file, and the builds showrunner gave the go for this unit to write the fix.
+
+#### As-built
+
+- `tmp_sweep.judge_entries`: a run keep reason from `run_folder_guards` keeps the run folder and its `tmp/` folder. It no longer keeps the entries inside `tmp/`.
+- Each run `tmp/` entry goes by the 4 h rule, process use (`IN_USE`), `WORKER_USES` and the git check.
+- `RunKeepReason.UNREADABLE_RECORD` and an unreadable session registry (`NO_SESSIONS`) still keep run `tmp/` entries.
+- The module docstring states the rule once.
+- Cause: killed test runs left temp folders in run `tmp/` folders (verify.sh's TMPDIR). On 2026-11-12 the sweep kept 925 such entries in one run; the dry run after the fix selects 55,100 across all runs.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, the module docstring.
+- `scripts/lint/test_tmp_sweep.py` — `assert_run_tmp_entries` covers `DIRECTOR`, `OPEN_RUN` and `SESSION_WORKTREE` runs.
+
+### Phase 55 — A large unnamed disk fall starts one folder walk · status: done
+
+From builds (not the user), 2026-11-12: put the 2 h limit and the fall size in config as new keys; start the walk only on an unnamed fall beyond cache growth.
+
+Problem: after Phase 52 the folder walk runs once a day, so the 15:23 EST floor alert on 2026-11-12 could not name a 13.9 GiB fall.
+
+#### As-built
+
+- New keys in `config/lint.conf`: `sweep_walk_request_fall_bytes=10737418240` and `sweep_walk_request_interval_seconds=7200`.
+- `store.py`: `DISK_WALK_REQUEST_NAME`, the `DiskWalkRequest` TypedDict (`requested_at`, `alert_at`, `unnamed_bytes`), `DiskWalkRequestState` (`ABSENT`, `UNREADABLE`), `read_disk_walk_request` and an atomic `write_disk_walk_request`.
+- `sweep.py` `unnamed_disk_fall` holds the fall arithmetic that `disk_measurement_lines` also uses.
+- The natedev floor pass writes a request when all of these are true:
+  - the previous floor record is recent, with the same build holds and filesystem (the checks the growth alert uses, computed once);
+  - no request file exists;
+  - the unnamed fall is over `sweep_walk_request_fall_bytes`;
+  - the last walk is at least `sweep_walk_request_interval_seconds` old.
+- `disk.py` `snapshot()` walks when the request's `requested_at` is later than the previous `measured_at`. The 03:00 daily walk stays.
+- `finish_disk_walk_request` sends "Folder walk for the <alert_at> fall:" with the growth lines through `send_floor_alert`. It deletes the request only after the send is accepted. It runs only on a natedev root-scope sweep.
+- An unreadable request file prints one stderr line and blocks a new request.
+- Review: F001 (blocker) — a changed build hold could request a walk with no free-space change; fixed by the shared checks above.
+
+**Files:**
+- `config/lint.conf` — the two keys.
+- `scripts/buildlog/store.py` — the request file types and I/O.
+- `scripts/buildlog/disk.py` — the request walk.
+- `scripts/lint/sweep.py` — `unnamed_disk_fall`, the request gate, `finish_disk_walk_request`.
+- `scripts/buildlog/test_disk.py`, `scripts/lint/test_sweep.py` — request, no-request and follow-up rows.
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
+
+### Phase 56 — Old buildlog indexes go by change time only · status: done
+
+From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahead of Phase 55.
+
+#### As-built
+
+- `cleanup_unused_indexes` compares `st_mtime` alone with the `INDEX_UNUSED_DAYS` cutoff. It does not read `st_atime`.
+- Cause: `complete_gate_index_in` reads every index and refreshes its atime, so the old `max(atime, mtime)` test kept every index (37 GiB held on 2026-11-12).
+- `update_in` sets an index mtime at least each `INDEX_TOUCH_MINUTES`, so an index that a tree updates stays.
+- `config/buildlog.conf` keeps `INDEX_UNUSED_DAYS=2`; its Basis states the mtime rule.
+
+**Files:**
+- `scripts/buildlog/index.py` — `cleanup_unused_indexes`.
+- `scripts/buildlog/test_index.py` — an old mtime with a fresh atime goes; a fresh mtime stays.
+- `config/buildlog.conf` — the `INDEX_UNUSED_DAYS` Basis.
+
+### Phase 57 — Floor alerts name the owner of a worker's detached run · status: done
+
+From builds (not the user), 2026-11-12: the floor alert said "no session found" for 15 of 17 live `verify.sh` pids; fix the lookup so the alert names each owner.
+
+#### As-built
+
+- Cause: a worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`, so no ancestor is a Claude session.
+- `sweep.holder_sessions`: when `process_table.nearest_named` finds no session, the nearest `detached_runs.py supervise` ancestor gives the record path.
+- The record names an owner only when its `pid` is that supervisor and its `status` is `running`. Its `staff_id` gives the worker; the worker's `parent_of` name is the owner. The holder message goes to that director.
+- A missing or unreadable record, staff row or parent leaves the pid unnamed. Each record and the staff snapshot are read once per call.
+- Live check, 2026-11-12 19:40 EST: the new lookup named 113 of 113 `verify.sh` pids; main named 17 of 115.
+
+**Files:**
+- `scripts/lint/sweep.py` — `holder_sessions`.
+- `scripts/lint/test_sweep.py` — rows in `test_a_pid_belongs_to_its_nearest_named_session`: owner, wrong pid, missing worker, missing parent, finished run, missing record, invalid JSON.
+
+### Phase 58 — The tmp sweep judges closed phase folders of a run that is not open · status: done
+
+From builds (not the user), 2026-11-12: "TOP PRIORITY. … The user approved deleting folders of finished runs in /tmp/claude/unit (open runs stay). … Fix tmp_sweep where it lives: a closed phase folder whose run has ended is a candidate, with the normal process and unsaved-git checks. Then run --plan and --apply with the fix."
+
+#### As-built
+
+- Cause: `run_folder_guards` kept a whole run folder for `SESSION_WORKTREE` or `DIRECTOR`, so every `phases/<id>/` folder of a finished run stayed while its director session lived.
+- `tmp_sweep.judge_entries`: a run kept only by `SESSION_WORKTREE` or `DIRECTOR` adds its `phases/` folder (not a link) to the judged parents. The `phases/` folder itself stays.
+- Open phase ids from `recorder_state.read_open_phase_ids`, mapped through `phase_reservation.phase_directory_name` (`ad hoc` is `adhoc`), keep their folders with the reason "its phase is open". An unreadable recorder state keeps every phase folder of that run.
+- `OPEN_RUN`, `UNREADABLE_RECORD`, an unreadable session registry and `UNENDED_WORKER` keep every phase folder. `run_folder_guards` no longer lets `SESSION_WORKTREE` replace `UNENDED_WORKER`.
+- Other phase folders use the run `tmp/` rules: the 4-hour idle rule, `IN_USE`, `WORKER_USES` and the git check.
+- `ClosedPhaseEntry` carries `CleanupEndReason.CLOSED_PHASE` into `--plan` and `--apply`. Removal checks again that the parent is a real folder at the judged root; otherwise the entry stays with "its phases parent changed".
+- Director ruling on review finding F003: the window between the parent recheck and `rmtree` stays. Every other sweep removal has the same window; a file-descriptor delete for all removals is a separate change.
+- Live run, 2026-11-12 20:18 EST: `--apply` deleted 641 closed phase folders, 5.5 GiB. Most of the 35 GiB in the first plan was gone before apply.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, `run_folder_guards`, `ClosedPhaseEntry`, `CleanupEndReason.CLOSED_PHASE`, `remove_entry`.
+- `scripts/lint/test_tmp_sweep.py` — rows in `assert_run_tmp_entries`, `OwnerTests`, `RunFolderTests` and `PaneRunTests`: both eligible guards, open and older open phases, `ad hoc`, fresh and used folders, unreadable state, an unended worker with a live worktree, a replaced parent, and `--plan`/`--apply`.
+
+### Phase 59 — The disk walk measures ~/.local/state · status: done
+
+From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~/.local/state/gpu-size-trial` in 90 min, and neither the disk walk nor the floor alert saw it; measure the large writers under `~/.local/state` too.
+
+#### As-built
+
+- `disk.FOLDERS` includes `~/.local/state`. Its walk rows (levels 0 to 3, cargo targets excluded) and growth total reach `read_disk_measurement` and the floor alert with no other change.
+- Measured 2026-11-12 20:25 EST: `~/.local/state` held 92 GiB in about 291,000 files; `gpu-size-trial` 45 GiB, `buildlog` 27 GiB, `nightly-review` 11 GiB.
+- The checkpoint also carries the package import block for `scripts/aws_target/gpu_size_trial.py`, which bootstrap added after the builds merge.
+
+**Files:**
+- `scripts/buildlog/disk.py` — `FOLDERS`.
+- `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
+
+### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: done
+
+**Reverted 2026-11-13, landed again in phase 62.** From builds (not the user): at 02:02 EST the live admission service sent the new `WaitingServiceJob` and `UnmatchedServiceJob` job states. Admission clients on older code (hana CI runners pinned at claude-commands `7fdfd9a6a`, and verify.sh clients started before 02:02) refused the snapshot as "invalid snapshot variant" and stopped their steps. The revert removes all phase 60 code and its config keys. Phase 61 fixes the wire format; phase 62 lands phase 60 again on top of it. The as-built below holds again, with the job state change in phase 62.
+
+From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C1507 and the hana CI row. From the user (via the showrunner): give memory that does not count against natedev its own bar color; put the Mac note last and unwrapped; add a % done column right after Stage; color each machine name; and "hana ci still shows as a row when ci isn't running". Colors come from config, not code.
+
+#### As-built
+
+- `config/memory_feed.conf` holds eight colors as six hex digits: `remote_memory_light`/`_dark` and `machine_{natedev,mac,aws}_light`/`_dark`. `memory_feed.FeedConfiguration.colors` reads them once and checks each value; `memory.json` carries them as `colors` (`PageColors`, by theme).
+- `memory_live.html` draws a Mac or AWS used bar in the remote color, colors the Machine text by machine, and shows a Done column after Stage in the Running and Waiting tables (`—` without a percent). The "N% done" text under the bar is gone, and the Mac note is the last tooltip line, on one line.
+- `scope_activity.py` adds `WaitingServiceJob` and `UnmatchedServiceJob`; `ServiceJobState` is the closed union. `memory_admit.service_job_state` matches each `Runner.Worker` process tree against reservation pids (Running), then waiter pid and start time (Waiting), else Unmatched. `memory_admit.py` and `admission_service.py` both classify through it; `admission_records.py` and `queue_evidence.py` read every state.
+- `build_ci_row` sets `admitted` only for `RunningServiceJob`, so a hana CI row shows in Running only for a matched reservation. A waiting job stays in the Waiting table. CI amounts, `duplicate_use`, the taken total and the cap do not change.
+- Text colors exceed 5.55:1 contrast in light and 7.79:1 in dark. `memory_page_proof.mjs` saves before and after screenshots of the three user-shot elements in both themes and keeps the after-page table, note list, layout and tooltip checks.
+
+**Files:**
+- `config/memory_feed.conf`, `config/README.md` — the eight color keys.
+- `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs` — colors, Done column, note position, CI row.
+- `scripts/build_queue/scope_activity.py`, `admission_records.py`, `admission_service.py`, `queue_evidence.py`; `scripts/lint/memory_admit.py` — service job states and `service_job_state`.
+- `scripts/build_queue/test_memory_feed.py`, `test_memory_hover.py`, `test_admission_service.py`; `scripts/lint/test_memory_admit.py` — rows for colors from config, the Done column, the note position, and waiting, unmatched and running CI workers.
+
+### Phase 61 — Older admission clients parse a newer service snapshot · status: done
+
+From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, admission clients on older code refused the snapshot with "invalid snapshot variant" and stopped about a dozen waiting steps and three hana CI jobs (runners pinned at claude-commands `7fdfd9a6a`). From queue (not the user): keep the old wire shape, add one new optional field per record, add no value to an existing enum on the wire, and keep every used field strict.
+
+#### As-built
+
+- `admission_records.UnownedSliceMemory.job_state` keeps its three old variants. A new keyword-only `service_job_state` field defaults to `ServiceJobStateNotRecorded`; phase 62 puts the waiting and unmatched states there. The old codec ignores the extra key.
+- `snapshot_codec.SnapshotReadPolicy` (`ALL_FIELDS`, `ACQUISITION_FIELDS`) is set by the `snapshot_read_policy` context manager. Under `ACQUISITION_FIELDS`, fields with `acquisition_unused` metadata and a default are not decoded, so an unknown variant there does not stop the client. All other readers keep `ALL_FIELDS`.
+- `admission_client` parses each reply under `ACQUISITION_FIELDS`. Decisions, reasons, amounts and reply types stay strict and refuse an unknown value with the named error.
+
+**Files:**
+- `scripts/build_queue/admission_records.py`, `snapshot_codec.py`, `admission_client.py` — the optional field, the read policy and its use.
+- `scripts/build_queue/test_snapshot_codec.py` — `test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` loads the codec and records from `7fdfd9a6a` with `git show`; rows for unused-field defaults and used-field refusal.
+- `scripts/build_queue/test_admission_client.py` — unknown unused variants keep the wait, an unknown used variant keeps the named error, and the silent-queue deadline does not change.
+
+### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: done
+
+From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61, with a test that the client at `7fdfd9a6a` parses the new service snapshot.
+
+#### As-built
+
+- The phase 60 as-built above applies again, with one change: `WaitingServiceJob` and `UnmatchedServiceJob` go only in `UnownedSliceMemory.service_job_state`, beside `ServiceJobStateNotRecorded`.
+- `job_state` keeps `RunningServiceJob`, `IdleService` and `NotServiceSlice`. A waiting or unmatched worker keeps the `job_state` value the code before phase 60 wrote, so older clients see no change.
+- `build_ci_row`, `queue_evidence` and `admission_service` read `service_job_state`. The hana CI row shows in Running only for a worker matched to a reservation.
+- `test_snapshot_codec.test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` encodes real waiting and unmatched states and parses them with the codec and records from `7fdfd9a6a` (`git show`). The review checked 18 service-state combinations against the pinned code.
+
+**Files:** the 14 phase 60 files, plus `scripts/build_queue/test_snapshot_codec.py`.
+
+### Phase 63 — The disk floor alert compares build caches over the same folders · status: done
+
+From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches shrank 151.6 GiB" while free space fell 0.9 GiB. The cache total must count the same folders before and after each sweep.
+
+#### As-built
+
+- Cause: the old `scripts/lint/sweep.py` subtracted two cache totals without matching folder paths. A folder that left the list counted as shrinkage.
+- `cache_folder_growth` compares only folders in both readings (`common_cache_bytes`). A folder in only one reading adds no growth and no shrinkage. A record from before phase 63 gives no growth.
+- `MeasuredCacheFolders` keeps one total per folder and a `SharedCacheInode` only for an inode in two or more folders. `CacheFoldersNotMeasured` marks a reading with no folder sizes.
+- `CacheFolderWalk` holds a map in memory from each inode to the first folder that saw it. A second folder registers both as owners, whatever `st_nlink` says. So a link made or removed during the walk counts once. The map is not saved, and it carries across the protected and CI measurements of one sweep.
+- On 37 real folders the saved snapshot is 3,255 bytes and process peak memory is 203.0 MiB.
+- Tests in `test_sweep.py` cover a folder that leaves or joins the list, a real shrink, a shared inode, a link removed or made between folders, the next stable sweep, protected and CI folders, and many private files with no saved identity.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
+
+### Phase 64 — A slow admission answer under load does not fail a lint run · status: done
+
+From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited 2 with "admission service unavailable: no answer in 0.5 s" while the service was alive and slow under load. A live service that answers slowly must not fail a run.
+
+#### As-built
+
+- Cause: the placement requests used `_query`, which gives up after one `query_timeout_seconds` answer. Queue phase 44 (`e825b83e2`) added the lint and hana calls that failed. Builds reverted phases 44 and 44c as `9aa7fa219`; phase 64 is built on that tree.
+- `request_placement`, `claim_failure`, `consume_permission` and `report_execution` in `admission_client.py` now go through the shared `_call`/`_acquire` wait. The shared unreachable deadline bounds silence and repeated connection resets.
+- A missing socket or a refused connection still fails at once with the same message.
+- `view`, `explain` and `mine` keep the one-answer limit. They are diagnostics.
+- On `9aa7fa219` no caller in `verify.sh` or `offload.py` reaches the four requests. Queue lands phase 44 again with its calls on this wait.
+- Two tests in `test_admission_client.py` cover 28 cases: slow replies, both dead-service errors, and silence and resets stopping at 3 s and 60 s. The `7fdfd9a6a` pinned client test stays green.
+
+**Files:** `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py`.
+
+### Phase 65 — The build page titles the waiting section by its order · status: done
+
+From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/scratch/user-shot-queued-title.png`: a hairline after the Next step room row, and a title for the waiting section that names its order.
+
+#### As-built
+
+- The Next step room row keeps its place. A 1px hairline after it matches the one before it.
+- The waiting section has a title in the style of "Running, in start order":
+  - "Queued, in order of submission" with no bump.
+  - "Queued, <unit> first, then in submission order" for one bumped unit.
+  - "Queued, <unit> followed by <unit> and then in submission order" for more than one.
+- `memory_feed.py` sends `queued_priority_units`. It reads the queue's own `QueuePriority.entries` (written by `build_queue.py` bump) and the captured waiting order. It does not sort the queue. It drops absent units and duplicates.
+- Tests in `test_memory_feed.py` and `test_memory_hover.py` cover zero, one and two units, removed priorities, source order and escaped text. `memory_page_proof.mjs` checks 18 title cases at three widths in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
+### Phase 67 — The Queued title shares the waiting header row · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queued-title-space.png`: "eliminate the vertical space under the title - it should be the font it is but it can align bottom with the column headers".
+
+#### As-built
+
+- The phase 65 title sits on the waiting header row, bottom-aligned with the column headers. It keeps its `.section-head` font.
+- The empty title row and its height code are gone. The Next step room row and its hairline do not move.
+- A long title ends in an ellipsis before the header columns and shows its full text on hover. The stacked phone layout does not change.
+- `test_memory_hover.py` checks that the header row follows the room row. `memory_page_proof.mjs` checks bottom alignment and no overlap at 1400, 900 and 390 px in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
+### Phase 66 — Retire /build:queue · status: todo
+
+From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
+
+### Phase 68 — The build page joins the admin console as Builds · status: done
+
+From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation: Changes and Builds. sdlc's admin-console unit builds the console and adds the builds block to `config/console.conf`.
+
+#### As-built
+
+- The page title and heading read "Builds". `/build:page` uses the same name.
+- `memory_feed.page_url() -> str` returns the page URL. `page_link` prints it. A missing page raises `FileNotFoundError`, a `review_link.SNAPSHOT_ERRORS` member, with no publication.
+- The page allows same-origin framing and draws no site navigation. Links that leave the page use `target=_top`.
+- `test_memory_feed.py` checks the URL, the missing-page error and the unchanged published bytes. `test_memory_hover.py` and `memory_page_proof.mjs` check the title and the framed console view.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `test_memory_feed.py`, `test_memory_hover.py`; `commands/build/page.md`.
+
+### Phase 69 — A Mac build in a hand-made clone takes its repository's one claim · status: done
+
+From builds (not the user), 2026-11-13, shot `/tmp/claude/scratch/user-shot-mac-unit-dash.png`: the Mac row "hana build" showed Unit "—". Its build ran in a hand-made clone outside the claim worktree and every copies mirror. The claim also recorded `remote_host` as `natemccoy@mac`.
+
+#### As-built
+
+- The Mac reading marks each build with `MacBuildOrigin`: `CI` when a `Runner.Worker` or `Runner.Listener` process is an ancestor, else `NON_CI`. A saved record without the field reads `UNKNOWN`.
+- `memory_feed.mac_build_units` gives a `NON_CI` build with no session and no worktree or mirror match the unit of its repository's one Mac claim. A build with another session, two claims for one repository, or a `CI` or `UNKNOWN` origin takes no unit from this rule.
+- A claim whose host part after any `user@` is `mac` counts as a Mac claim.
+- Tests cover the ancestor walk, the record round trip and each match rule. A fixture proof shows the Unit cell "—" before and "research" after.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
+
+### Phase 70 — Cloud step names carry their unit · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-step-names.png`: a targeted test should read "<unit> targeted", and a merge gate "showrunner merge" or "<unit> merge".
+
+#### As-built
+
+- `make_labels` sets `OwnerRole` on `UnitLabels`. `SHOWRUNNER`: a session that runs a production, or a showrunner's own staff worker with no unit. `UNIT`: a unit director or a worker under one, running or not. `UNKNOWN`: every other path.
+- `StepNames.for_owner(step, unit, role)` reads new `owned.*` keys in `config/build_steps.conf`: `{unit} targeted`, `{unit} merge` and `showrunner merge`. `UNKNOWN` keeps the current name. The `names.*` and `prose.*` values do not change.
+- One cloud naming helper in `queue_view.py` names both the Running and the Queued rows.
+- A worker's step belongs to its owner (director decision, 2026-11-13). sdlc's merge worker, staff kind unit, reads "sdlc-merge-gate merge".
+- Tests cover each role mapping and name, in both tables. A fixture proof shows both tables before and after.
+- Repair (merge test red, from builds): live Claude workers take their labels through `staff_relationships` and `make_labels`, so the live, recorded and roster readers give the same role. `priority_labels` order does not change.
+
+**Files:** `scripts/message/unit_labels.py`, `test_unit_labels.py`; `scripts/build_queue/test_admission_service.py`; `scripts/message/test_roster.py`; `scripts/production/test_unit_lookup.py`; `scripts/lib/build_steps.py`; `config/build_steps.conf`; `scripts/build_queue/queue_view.py`, `memory_feed.py`, `memory_page_proof.mjs`, `test_queue_view.py`, `test_memory_feed.py`.
+
+### Phase 69f — The Mac reading survives an unreadable folder · status: done
+
+From builds (not the user), 2026-11-13, urgent: phase 69 broke the Mac reading at 13:20. `project_record` called `Path.exists()` on `/Users/hana-ci/actions-runner/_work/hana/hana/.git`, which natepiano cannot read, so a `PermissionError` failed the whole read.
+
+1. `project_record` returns the empty record on `OSError`, so an unreadable folder reads as unknown.
+2. `read_builds` keeps a row when one field fails, and the other rows stay.
+3. No folder rule and no config key: the phase 69 ancestry rule alone marks the CI row as CI. From builds (not the user), 2026-11-13.
+4. Landed alone as 4c434349d, on main as f3e703de9, ahead of the phase 70 repair. The live Mac reading has the CI row and no error.
+
+### Phase 71 — Every row names its unit and showrunner · status: done
+
+From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/user-shot-mac-showrunner-names.png, user-shot-done-duration-gap.png and user-shot-mac-ci-unattributed.png: show the unit and step on top and the showrunner in small text under it, name both in every tooltip, make the column gaps equal, and rename Machine to Target and Duration to Dur. From builds (not the user): the item list and the Mac CI case.
+
+#### As-built
+
+- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name.
+- Every Running and Queued row on natedev, the Mac and AWS uses these names. The small text is the showrunner name, or the CI label for a CI row.
+- A CI row's Unit cell reads "CI" (director decision). A missing CI field (runner, job) is left out, so a live Mac CI row reads "hana CI": the Mac script cannot read the runner environment (director decision).
+- Every tooltip, swap tooltips included, names the showrunner and the unit, or CI. The custom and native tooltips share one owner field list.
+- Column gaps are equal in both tables. The headers read Target and Dur, and the freed space goes to Unit.
+- Proof: before and after shots of both tables, a Mac CI row and its tooltip, an owner tooltip and a 600px view. A live read rendered Mac CI pid 69040 as "CI nextest" over "hana CI".
+- Repair (merge test red, from builds): `test_memory_hover.py` expects the phase 71 text and checks the owner lines in each tooltip. Its page data supplies `walk`, `waiters` and `swap_by`, as the live feed does. The page does not change.
+
+**Files:** `config/build_steps.conf`; `scripts/lib/build_steps.py`; `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`, `test_memory_hover.py`.
+
+### Phase 72 — AWS rows name their owner · status: done
+
+From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png). A gate worker and a paired-trial worker start as a `systemd-run` unit without the caller's session id or unit.
+
+#### As-built
+
+- `cloud_gate.service_command` forwards `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_NAME` and `BUILDLOG_UNIT` with `--setenv`, each only when the caller sets it. An empty value stays empty.
+- The gate worker and the paired-trial worker both use `service_command`, so `gate_trial.py` does not change.
+- The existing `admission_records.waiter_identity` reads the forwarded values. The worker's step record names its session and unit, and the AWS row reads "{unit} {step}" over the showrunner name.
+- The AWS `UnsetEnvironment` list does not change, and no new credential data is read. A hold owned by another session still refuses the worker (exit 10).
+- `memory_page_proof.mjs --cloud-owner` saves before and after shots of an AWS row and its tooltip.
+- aws-unit's conditions are met. A live check of the owner on the next gate worker and paired-trial worker goes to builds.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `test_cloud_gate.py`; `scripts/build_queue/memory_page_proof.mjs`.
+
+### Phase 73 — The Builds page shows each block and hold · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-shot-mac-block-banner.png: "this design is not quite what i had in mind although it does tell me that the mac is idle - although it should say that it is blocked. i want you to ask that whoever implements showing the mac block should do an astra design review to make it more beautiful than what we're currently doing". No AWS hold exists, so the page has no AWS row (director decision).
+
+#### As-built
+
+- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. A free or busy target has no row.
+- The "Target availability" card on the Builds page shows these rows. A narrow view puts the reason, owner, since and until in that order.
+- `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
+- Cost: `step_policy` runs local git reads, 5–25 ms for each repository in each 3 s reading. Accepted, because a cache across readings would hide a config change.
+- `ssh_target_snapshot` puts a block before a failed probe, running jobs and backoff. `read_backoff(strict=True)` returns `UnreadableBackoff`; the non-strict read does not change.
+- The idle alert says "MAC BLOCKED by ...". When the card shows the block, the page omits the block sentence from the alert (`BlockText.OMITTED`); admission diagnostics stay.
+- The astra design review came before the build. Its findings and rulings are in the phase notice to builds.
+- `memory_page_proof.mjs --blocks` saves before and after shots with the user shot's values, a narrow view with two natedev holders, and one tooltip for each Mac line form.
+
+### Phase 74 — Every row hover names who ran it · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/until-2026-11-16T0500Z-hover-shot-a361af/user-hover-identity.png: "this hover panel is going in the right direction - i want to make sure we non-redundantly indentify the showrunner: {showrunner} unit : {unit} worker : {worker} if the showrunner is the only thing that ran it, then it should say showrunner: {showrunner} unit : this run is from the showrunner and don't show the unit similarly if it is something run from the unit it should be showrunner: {showrunner} unit : {unit} worker : this run is from the unit director This should be a standard at the beginning of each hover over every running and queued row". From builds (not the user), 2026-11-13: a showrunner run has no worker line; use the user's label texts exactly; one shared block from one place in the code; a run with no recorded owner keeps "owner not recorded"; a showrunner's worker shows "unit: this run is from the showrunner".
+
+#### As-built
+
+- `unit_labels.Runner` records who ran the step: showrunner, unit director, worker, or unknown. `make_labels` sets it through `runner_of`. It is the only place that builds labels from the relationships, so the fast and full readers agree.
+- `memory_feed.page_owner_labels` sends `runner` and `worker` on every running and queued row. Cloud rows use it too. A CI row sends runner unknown and keeps its CI line.
+- `identityHtml` on the Builds page is the one place for the block. Every walk and waiter hover, Mac rows included, starts with it: showrunner, unit, then worker, with the user's label texts. The labels are lowercase and the colons align.
+- Row headings and the local row body no longer repeat the owner that the block names. A hover with the block is up to 24rem wide, so the values do not wrap.
+- `memory_page_proof.mjs --identity` saves before and after shots of the Mac row hover, plus one showrunner-run row and one unit-director-run row.
+
+### Phase 75 — The hover colons line up exactly · status: done
+
+From builds (not the user), 2026-11-13 23:46: align the colons in the who-ran-it hover block exactly.
+
+#### As-built
+
+- `identityHtml` gives each line three cells: `<dt>` label, `<dd class="colon" aria-hidden="true">:</dd>` and `<dd>` value. The `.identity` grid columns are `max-content max-content minmax(0, 1fr)`, so all colons share one left edge. The Mac fields list keeps two cells per line.
+- `test_memory_hover.field_values` reads value cells without the colon cells; the who-ran-it test checks one aria-hidden colon per label.
+- `memory_page_proof.mjs --identity` measures each colon's left edge. It captures `before-` and `after-colons-mac-row` and `-queued-row` shots, and requires one edge on the after page and on the showrunner row.
+- Checkpoint 1bd7b8067.
+
+### Phase 76 — The running-row hover closes its memory sentence · status: done
+
+From builds (not the user), 2026-11-14 00:06 and 00:08: put the missing period between the running row's memory text and the source sentence. keep_text is data; the page owns the sentence.
+
+#### As-built
+
+- `rawTipText` writes `${r.keep_text ? r.keep_text + "." : res} ${src}`: the page always adds the period after `keep_text`. `res` is page text with its own periods.
+- `memory_feed.py` keep_text descriptions carry no end mark: the compiler cache row, the unowned processes row and the group row.
+- `test_memory_hover.test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` covers a feed keep_text, a feed description and `res`.
+- Checkpoint e34c01903.
+
+### Phase 77 — The running-row memory sentence starts with a capital · status: done
+
+From builds (not the user), 2026-11-14 09:35: fix the lowercase "need" after "Started … ago." in the running-row hover.
+
+#### As-built
+
+- `rawTipText` writes `${r.keep_text ? sentence(r.keep_text) + "." : res}`: the page starts `keep_text` with a capital and ends it with a period. `keep_text` stays data.
+- `test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` gives each row a start time and checks "Started 5 min ago. " followed by a capital.
+- Checkpoint b62309ba4.
+
+### Phase 78 — The AWS prices page joins the admin console · status: done
+
+From builds (not the user), 2026-11-14 14:2x: put the /aws_prices tables on the admin console from one source, with a filter for merge gates, targeted runs or both. From aws-unit (not the user), 2026-11-14: write the split on top of main; keep the math in `run_cost.py`; give the region state typed fields; `render()` output must not change.
+
+#### As-built
+
+- `spot_table.spot_tables()` returns `SpotTables`: `prices` and `quotas` as `Table` (title, headers, `right` number columns, rows), one `RegionRead` per region (`age_s`, `stale`, `failure`, `failure_age_s`; `note` and `detail` are properties) and one `RunCosts` per scope (explanation, one `Table` per type, `Cheapest`). `render()` draws `/aws_prices` from these values; its output is byte-identical (live snapshot, widths 40–400).
+- `run_cost.SCOPES` holds `RunScope` merge-gate, targeted-test and both (name, filter label, noun, modes). `RunEvidence.box_seconds` and `expected_usd` take `modes: tuple[str, ...]`; `cloud_gate.py` passes `(mode,)`.
+- `aws_page.py` writes `aws_prices.html` with the page data as JSON to `config/aws_page.conf` `output_folder`, and gives `page_url()` for `config/console.conf`. The hourly buildlog job "AWS prices page" publishes it after the AWS snapshot.
+- The page right-aligns number columns, draws the cost per run tables of one scope as one grid, and keeps the filter choice per browser.
+- Tests: `test_each_scope_counts_only_its_run_kinds` (against `run_evidence`), `test_page_holds_the_tables_as_data_and_its_link_needs_the_page`, `test_page_data_cannot_end_its_script_element`, and the hourly job tests in `test_sync`.
+- Checkpoint 0c64c36b5.
+
+### Phase 79 — The AWS tables take the user's review changes · status: done
+
+From builds (not the user), 2026-11-14 14:42, the user's AWS table review. aws owns `run_cost.py` data changes; report owns the display in `spot_table.py` and `aws_page.py`.
+
+#### As-built
+
+- `spot_table.spot_tables()` is the one typed source for `/aws_prices` and the page. `Table.right` names the number columns, and both views right-align them.
+- `render()` draws the price and quota tables with `split_table()`: the first column, then as many equal columns as fit the terminal width.
+- The quota table is `Spot quotas and boxes that fit`: standard and G and VT quotas, then boxes per type.
+- `SpotTables.snapshot_lines` gives one `Snapshot read N min ago` line when every region has the same state and minute. Otherwise it gives one line per region. A failed read always gives one line per region.
+- The run cost headers are region, Spot USD/h, the scope noun, estimate, paid USD/h, paid USD/run, refused, launched.
+- Refused and launched count only the requests of the selected scope (repair from builds (not the user), 2026-11-14). `RunEvidence` keys requests by type, region and mode. A request without a mode (`NO_MODE`, written before launch rows recorded a mode) counts only under Both (from builds (not the user), 2026-11-14). The refusal wait in the estimate still counts every request, because capacity refusals do not depend on the run kind.
+- `unbilled()` writes a paid cell without a bill: `bill due (N runs)` when runs of the scope wait for their day's bill, `no <scope noun> runs` when only other kinds ran, else `no runs`. The paid USD/h cell uses only `no runs` and `bill due`.
+- The cheapest line considers only `instance_types`, the types that placement picks. `runs_text()` writes `1 run` and `N runs`.
+- `aws_page.PageData` carries `snapshot` and no regions list. In `aws_prices.html`, each table scrolls inside its card, with a sticky first column and an edge shadow; `markOverflow()` adds the column line when the table is wider than its card.
+- Calls sent to builds, each a one-line revert: the third label names the scope (`no merge gate runs`); paid USD/h uses two labels; tables scroll; regions that differ get one line each.
+- Proof: 1661 aws_target and buildlog tests pass; page shots of each filter in dark and light mode and at 390 px width.
+
+### Phase 80 — The Mac idle watch pushes the user only when the user must act · status: done
+
+From builds (not the user), 2026-11-14 15:10: the user could not understand the phone push `mac_idle.stuck` ("Waiting tests are not using the Mac", 13:22) and asked for a fix for good. A phone push goes out only when the user must act, in plain words; a session acts on all else.
+
+#### As-built
+
+- Cause of the 13:22 push: a kept claim (holder cargo-liner). The kept-claim takeover 5214a5d reached `~/.claude` main at 12:41, but the admission service ran from its 12:01 start until 13:40. The takeover is live since that restart.
+- A free Mac, an idle claim, a block and the disk case send no phone push. `watch_once` sends them as the one message to builds (`notify_outage`), and free-Mac repairs still run.
+- An unreachable Mac with waiting calls past `alert_seconds` messages builds once. After `push_seconds` it pushes `mac_idle.unreachable` once (need blocked, key `mac-idle-<since>`) and runs no repairs. The unreachable state writes `idle.json`, so its outage start holds across passes.
+- `mac_idle.unreachable` (`push_catalog.py`): title "Mac tests stopped", action "Wake the Mac or check its network.", body "Mac tests stopped {minutes} min ago." and "{tests}; builds cannot reach the Mac." `waiting_tests()` writes "1 test waits" or "N tests wait".
+- `mac_idle.py cleared --since <since>` is the push's clears-when. It exits 1 while the fresh saved alert is unreachable with that start and waiting tests; else 0.
+- `mac_idle.stuck`, `mac_idle.blocked` and `mac_idle_reservation` are gone from the catalog and from `push_texts_reviewed.json`. The unreadable state does not change.
+- Calls sent to builds, each a one-line revert: the idle states send no push; the new unreachable push; the unreadable state unchanged.
+- `mac_idle.unreachable` waits for the user's approval (`review.py texts --id mac_idle.unreachable --approve`). Until then `test_every_catalog_example_has_current_approval` fails for it. The other 117 tests in `test_mac_idle` and `test_push_texts` pass.
+
+### Phase 81 — The AWS prices page takes the user's second review · status: done
+
+From the user (via builds, 2026-11-14 20:2x): seven changes to the AWS prices page. Builds' calls (not the user): the row lowest gets a fill, the box-type lowest an outline; GPU and standard types get separate tables; refused and launched become sections; decimal minutes under a "merge gate" header with "(minutes)" below it.
+
+#### As-built
+
+- `spot_table.SpotTables` holds `prices` and `quotas` as (standard, GPU) table pairs, `runs`, `hours` and `hours_note`. The standard rows are `instance_types` then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
+- `Table.row_lowest` and `Table.group_lowest` hold the (row, column) cells with the lowest price of the row, and of the types with the same vCPU count (`largest_gate_vcpus`). Equal prices are all lowest.
+- Quota cells show no age: one region read writes the prices and both quotas together. The snapshot lines follow the prices. Answer sent to the user via builds.
+- Run tables: `region`, `Spot USD/h`, `<noun> (minutes)` (median seconds / 60, one decimal, `run_minutes`), `runs` (`N`, or `N elsewhere` when the time comes from other regions), `estimate`, `paid USD/h`, `paid USD/run`, `paid runs`. `unbilled()` writes `bill due` or `no runs`; a scope with no runs of its kind says `no runs` too (builds, 2026-11-14: one word set).
+- `RunCosts.refused` and `RunCosts.launched` are type x region tables per scope: "Refused <noun> requests (capacity and quota)" and "Launched <noun> boxes".
+- `billed_hours()` builds "Billed hours / box hours" from aws's `run_cost.hours_checks` over the last `run_cost_days`, with `max_ratio` from `billed_hours_gap_max_ratio`. Cells `9.2/8.8 (4%)`, `over`, `not billed`, or `—`. Only types with hours have a row. A region with hours that is not a candidate gets a column. An unreadable cost ledger gives a note and no rows.
+- `aws_page.PageData`: `prices` and `quotas` are lists, plus `hours` and `hours_note`. `TableData` adds `row_lowest` and `group_lowest`. `RunCostData` adds `refused` and `launched`.
+- `aws_prices.html`: one card per price and quota table; a legend under the standard prices; `.mark.low` (fill, `--low`) and `.mark.group-low` (inset 1.5 px accent outline) on a span in the cell. A header or title `name (unit)` shows the unit smaller. The filter also fills the Refused and Launched cards; the billed hours card is fixed. Cells have a 6 px right gutter so a mark in the last column does not overflow.
+- `/aws_prices` prints the same tables without marks, the cheapest line after the run tables, then Refused, Launched and the billed hours.
+- Proof: `phases/81/proof/before-*` and `after-*` (four shots each, plus the terminal text). Live: the one over cell is m7a.4xlarge us-east-2, `21.1/13.5 (56%) over`, as aws said.
+- Tests: 43 in `test_control` pass, with new tests for the marks and the hours table; basedpyright 0/0/0.
+
+### Phase 82 — A failed vault transfer names the machine at fault · status: done
+
+From builds (not the user), 2026-11-14: the 20:27 hourly vault sync stopped with exit 1. The question named the Mac, but natedev's own vault was damaged. Builds gave the go for this fix.
+
+#### As-built
+
+- Cause: natedev lost power at 18:18:27, 2 s after an agent-notes commit. The ref update was saved, but the loose commit object stayed empty. The fetch from the Mac then failed its connectivity check on natedev ("did not send all necessary objects").
+- `vault_pull.mac_git` keeps the unreachable rule. Any other failed transfer calls `failing_machine()`. It runs `git fsck --connectivity-only --no-dangling` on `LOCAL_VAULT` (about 0.3 s). A failed check gives `Machine.NATEDEV`; a good check gives `Machine.MAC`.
+- The failure in the Mac script (`remote_outcome`) still names the Mac.
+- Test `test_a_failed_mac_transfer_names_natedev_when_its_own_vault_is_damaged`: a refused fetch names the Mac; after an empty loose commit object on natedev, the same failure names natedev. 46 tests in `test_vault_pull` pass; basedpyright 0/0/0.
+
+### Phase 83 — The AWS prices page filters by region · status: done
+
+From the user (via builds, 2026-11-14): "please add a filter at the top that allows for choosing any combination or all of the regions to narrow the focus of what is visible". From builds (not the user): put it in `aws_page` only, all regions by default, for every section; do not change `console.py`, `console.conf` or `change_page.py`.
+
+#### As-built
+
+- `aws_prices.html`: a sticky `Regions` bar under the title with an `All` chip and one chip for each region in `PageData.regions` (the candidates, plus a region that only the billed hours table shows). A chip toggles its region; the last chosen region stays on. The choice stays in browser storage (`aws-prices-regions`).
+- `spot_table.Table.region_axis` is `columns` for prices, refused, launched and billed hours, and `rows` for quotas and run tables. The page drops the columns or rows of other regions, and shows "Nothing to show in the chosen regions." for a table with nothing left.
+- `Table.row_lowest` and `group_lowest` became `row_ranks` and `group_ranks`: the cells of each row and each vCPU count from the lowest price up, with equal prices in one set (`ranks()`). The page marks the first set with a cell in the chosen regions, so the marks follow the filter. A ranking with fewer than two prices in view marks nothing, so one chosen region shows no fill and keeps the vCPU outline (from builds, not the user, 2026-11-14).
+- `RunCosts.cheapest` became `estimates`, every candidate estimate cheapest first (`cheapest` is now a property). The page data has `estimates` (region and summary) and `no_estimate`; the cheapest line names the first estimate in the chosen regions.
+- `SpotTables.snapshot_rows` gives (region, line) pairs; one line for all regions has no region. `snapshot_lines` reads them.
+- `/aws_prices` in the terminal does not change.
+- Proof: `phases/83/proof/before-*` (four shots) and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width).
+- Tests: 43 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 84 — The Spot price tables have one row per region · status: done
+
+From the user (via builds, 2026-11-15): "instead of saying 'not sold here' i think you should just do a dash and have a legend underneath that says dash = not sold here - if you can use an appropriate lucide icon that would be even better ... we should transpose the table because there are now so many more regions than machine types. and split the table into two side by side - one for standard and one for gpu based". From builds (not the user): the page uses the lucide `ban` icon with no legend; the terminal uses `—` with one legend line.
+
+#### As-built
+
+- `spot_table.price_table`: one row per region and one column per type, with `region_axis` `rows`. `Table.row_ranks` became `type_ranks`, one ranking per type column; `group_ranks` groups the type columns by vCPU count.
+- `Table.not_sold` holds the (row, column) cells of a type that the region does not sell. The terminal cell reads `—` (`NOT_SOLD`), and `render` adds one line `— not sold here` (`NOT_SOLD_LEGEND`) under the price tables. A region with a note (`no snapshot`, `read failed`, old age) keeps its note.
+- `aws_prices.html`: a not sold cell shows the lucide `ban` icon with the title `Not sold here`. The Standard and GPU price cards sit side by side and stack below 760 px. `lowestShown` uses only cells in the chosen rows and columns.
+- Proof: `phases/84/proof/before-*` and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width, all regions at phone width).
+- Tests: 44 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 85 — The price tables mark only the lowest price of each type · status: done
+
+From builds (not the user), 2026-11-15: remove the vCPU group mark, the outline and its legend line. The user could not tell what it meant, and the cost per run lines already compare the types.
+
+#### As-built
+
+- `Table.group_ranks` and its page data are gone. `price_table` ranks only each type column (`type_ranks`).
+- `aws_prices.html`: the `.mark` fill is the one mark, and the legend has one line, "lowest price of the type". The terminal table had no marks, so it does not change.
+- Proof: `phases/85/proof/before-*` (the phase 84 after shots) and `after-*`.
+
+### Phase 86 — The price cards switch between Spot price and cost per gate · status: done
+
+From the user (via builds, 2026-11-15): "let's have the same table be able to switch between displaying spot price and pricing (which has the subtypes of merge/targeted/both) - these filters apply to both standard and gpu tables ... i want to have the column values be a gradient like in google sheets - red being most expensive green being the cheapest and white in the middle range - the Green one that is the best price should have some extra outline". From builds (not the user): one view switch and one run kind switch for both cards, kept in the URL; remove the per-type Spot and estimate columns that repeat these numbers; the outline replaces the fill.
+
+#### As-built
+
+- `spot_table.Table.values` holds the number of each cell; `Table.type_ranks` and `ranks` are gone. `RunCosts.prices` holds the Standard and GPU cost per run tables (region rows, type columns), from the estimate that gate placement uses. A cell with no estimate is `NOT_SOLD`.
+- `aws_page`: each run kind sends its `prices` tables. The run tables drop the `Spot USD/h` and `estimate` columns (`without_prices`). The terminal does not change.
+- `aws_prices.html`: a `Spot price | Cost per gate` switch, and a `Merge gates | Targeted runs | Both` switch shown only for cost. The URL keeps both (`?prices=cost&runs=merge-gate`); the run kind left browser storage. Each column has a green, white (the card color in dark mode) and red scale from the minimum through the median to the maximum. A strong outline marks the cheapest cell of each table. One legend line explains both.
+- Proof: `phases/86/proof/before-*` (the phase 85 after shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, and phone width).
+- Tests: 45 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 87 — The price cards box the lowest and the highest price of each type · status: done
+
+From the user (via builds, 2026-11-15): "we should white box outline both the lowest price and the highest price now that we have color coding - this is very interesting". From builds (not the user): on every price table that marks the best cell, box the lowest and the highest cell of each type with the same white box, in both themes and at phone width; keep the color coding.
+
+#### As-built
+
+- `aws_prices.html`: `scaleCells` returns `ends`, the lowest and the highest cells of each type column with two or more different values. An `end` cell has a 3 px white box inside a 1 px dark edge (`--box`, `--box-edge`), the same in both themes. The cheapest cell of each table stays bold (`best`) and lost its outline.
+- The legend reads "White box: the lowest and the highest of each type." and "Bold: the cheapest in the table."
+- A column with only two values in view has no box, because the colors already show which is which.
+- From the user (via builds, 2026-11-15): "the filter on the aws page - we need a None at the end that turns all fiters off so i can quickly just select one or two i want to look at". From builds (not the user): add it to this phase. The region filter has a `None` chip after the last region. It clears every region, and each card then says "No region chosen." A region chip can now turn off the last chosen region. The view and run kind switches choose one value each, so they have no `None`.
+- Proof: `phases/87/proof/before-*` (the live phase 86 shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, phone width, and the region filter with All, None, None then one region, and None then two regions).
+
+### Phase 88 — The AWS prices page fills the window and outlines the lowest and highest of each table · status: done
+
+From the user (via builds, 2026-11-15): "the filter for regions shouldn't take 3 rows - it should be either smaller fonts or we should make the content section wider to fit - probably the latter is fine - i don't mind dense information". Also: "on the cost lowest and highest- it looks as if you did a per instance type - which is fine - but we should have a different outline for overall lowest and overall highest as well". From builds (not the user): fill the window width, tighten the chips so 21 fit one row at 1920 px with the same font, and give the overall lowest and highest of each table a stronger outline, with one legend line under each table.
+
+#### As-built
+
+- `aws_prices.html`: `main` has no maximum width. The region chips have 6 px padding and a 4 px gap, and the label gap is 8 px. The 21 chips need about 1857 px, so they fit one row at 1920 px; at 1400 px they take two rows.
+- `scaleCells` returns `extremes`, the lowest and the highest cells of each table with two or more different values. An `extreme` cell has only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes; gold differs from white and from the green and red scale. It replaces the bold `best` mark. The per-type box is now 1 px white inside the 1 px dark edge. From builds (not the user): the sizes and the one outline color.
+- Each price card with a box has a legend line under its table: "Lowest and highest of each type" and "Lowest and highest of the table". The legend line above the cards explains only the colors.
+- The price cells have 10 px padding at the right, so a number does not touch an outline.
+- Proof: `phases/88/proof/after-*` (1920 px Spot and cost, dark and light, two full pages, 1400 px Spot, and phone width). The before shots are the phase 87 after shots.
+
+### Phase 89 — The Builds page shows a jobserver token wait as a stage · status: done
+
+From builds (not the user), from a defect the user saw at 11:00 EST (via sdlc, from cargo-liner): a `port nextest` step built its tests in 29 s, printed `nextest: waiting for 4 more jobserver tokens`, and waited about 11 min while `widget nextest` held the tokens. Its Builds page Running row showed `Stage —` and `Done —`. Fix: show the wait as the stage `waiting for jobserver tokens` on the Builds page and in `/build:queue`, set from the place that prints the line.
+
+#### As-built
+
+- `progress_profile`: `token_wait_line` prints the wait line, and `TOKEN_WAIT_LINE` reads it. `nextest_tokens.py` prints the line with `token_wait_line`. `CounterParser` reads it as `NoCounter("waiting for jobserver tokens", TokenWait(K))`. The next line, which reports the tokens taken, ends the wait.
+- `NoCounter.token_wait` (`TokenWait | NoTokenWait`) is an optional field, so the counter wire union does not change for pinned clients. An older snapshot reads as `NoTokenWait`.
+- `admission_service`: a token wait from the step log skips the Cargo capture fallback. Before, that fallback replaced the wait with "missing or competing Cargo captures".
+- `memory_feed.row_progress` returns `TokenWaitProgress` (`stage`, `tokens`) for a natedev row. `memory_live.html` shows its `stage` in the Stage column; `Done` stays `—`. At phone width the stage wraps in its cell.
+- `/build:queue` prints only the Builds page link; `build_queue.py --json` shows the wait in the running step's `measured.counter.token_wait`.
+- Proof: `phases/89/proof/before-*` and `after-*` (the Running table at 1400 px dark and light, and at phone width), from a fixture of the live feed with one natedev nextest row in the wait.
+
+### Phase 90 — The phone Builds table shows every cell in full · status: done
+
+From builds (not the user), 2026-11-15, from a phase 89 note: the phone-width Running table cut off Pid, Target and vCPU and ended step names in an ellipsis. Fix it so each needed column shows in full, under the UX guide, and add a page proof that fails on a cut cell at 390 px.
+
+#### As-built
+
+- `memory_live.html`: the stacked table shows full cell text. When it is wider than the card, `fitWalkDetails` adds `compact`. Each row is then a two-line subgrid row: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU. Target takes the free width, so Stage fits on one line when the card has room.
+- `--table-label` and the phone `token-wait` rule are gone; the compact layout wraps the stage only when it does not fit.
+- The chart row names wrap in the stacked layout. The row height match now includes the room row and the queue header.
+- `memory_page_proof.mjs`: in the stacked layout no table cell or chart name may be cut, and only 390 px uses two lines. Row offsets measure from the header row. The proof fails at 900 px on the old page.
+- Proof: `phases/90/proof/before-*` and `after-*` (the Running card at 390 px light and dark, and at 900 px dark), from a fixture of the live feed.
+
+### Phase 91 — The cap line crosses no text, and the table room row is gone · status: done
+
+From builds (not the user), 2026-11-15: in the 390 px view the red cap line runs through row text ("setup · bo|ot", "waits for a| cloud slot: 9 of 9 in use"). The "Next step room" table row shows only dashes. Make the line pass behind no text, and give that row its value or remove it.
+
+#### As-built
+
+- `memory_live.html`: `cutCapLine` draws the cap line as `.cap-part` parts. It leaves a 3 px gap around each line of chart text that the line would cross: cloud status text, bar labels and the queue title. Text clipped by an ellipsis does not count.
+- The cap line has no `left` transition. Each layout measure moved the line, so the bar labels and the line parts were measured in mid-move.
+- The table room row has no dashes. The stacked table leaves it out, and its queue header takes the top divider. Beside the chart, the row is empty and keeps the rows aligned.
+- `memory_page_proof.mjs`: it fails when chart text shows on the cap line, or when the table room row shows text. The row offset check applies only beside the chart. The cap pixel check reads the longest line part.
+- Proof: `phases/91/proof/before-*` and `after-*` (the Running card at 390 px light and dark, 900 px dark and 1400 px dark), from a fixture of the live feed. Before: text on the line at all four widths. After: none.
+
+### Phase 92 — A placed Mac row shows only its step name · status: done
+
+From builds (not the user), 2026-11-15: the lfo row shows its step name as "lfo nextest · placement v20261115T162519-1093145-12392-step-2/709e465c…", a raw internal id over five lines in the chart and the table. Show the readable step name only.
+
+#### As-built
+
+- `memory_feed.mac_work_row`: a placed Mac run's name leaves out `placement <id>`. The id stays in the row's `gate_label`. A `user`, `hana-ci` or `unplaced` run still adds that one word to its name, because it marks an exception.
+- `test_memory_feed`: a placed run's name has no `placement`, and its `gate_label` keeps the id.
+
+### Phase 93 — The AWS prices region filter sorts by group, then A to Z · status: done
+
+From the user (via sdlc and builds), 2026-11-15, for the AWS prices page: "it needs top sort the filters alphabetically within the following groups us eu ap ca sa". sdlc reads it as: the region filters show in the group order us, eu, ap, ca, sa, and each group sorts its regions alphabetically.
+
+#### As-built
+
+- `aws_page.page_data`: `regions` sorts by `region_filter_key`, which takes the group from `REGION_GROUPS` (`us`, `eu`, `ap`, `ca`, `sa`), then the region name. A region outside the groups comes last, A to Z.
+- The tables keep their row order; only the filter chips change.
+- `test_control`: the page data regions follow the key, and a mixed list sorts into the group order.
+- Proof: `phases/93/proof/before-1400-dark.png` and `after-1400-dark.png`, from the live AWS state.
+- Follow-up (user, 2026-11-15): a Geography row above Regions selects all regions of one geography (`us`, `eu`, `ap`, `ca`, `sa`), with `all` and `none` chips. `geographyOf` takes the region prefix. A geography chip reads pressed, mixed or not pressed from its regions, and the two rows update each other. The chips use lower case.
+
+### Phase 94 — A cargo-liner step names only what keeps it off the Mac · status: done
+
+From the user (via builds), 2026-11-15: "this said that the mac was busy with a hana run - but the mac can always run one cargo-liner run - so this is a bug - this cargo-liner should be already running on the mac - the only thing that should block cargo liner on the mac is a mac hold, mac unavailable, or mac already has a cargo-liner run".
+
+#### As-built
+
+- `target_config.StepRoute`: where the caller lets a step run. It is `AnyEligibleTarget`, `LocalRequired` (`LOCAL_CALLER` for `verify.sh --local`, `WRITES_TREE` for a step that writes the tree), `MacOnly` or `PinnedTarget(target)`.
+- `target_config.step_route` chooses the route in the placement client's order: a tree write, then `--local`, then `--mac-only`, then `--target`.
+- `admission_wire.PlacementRequest.route` carries the route. `admission_client` sets it from its flags. An older request without it reads as any eligible target.
+- `admission_service._placement_row` stores the route in the waiter record. `admission_records.waiter_route` reads it back. `WaitingStep` and `RunningStep` carry `route`, and `memory_admit` fills it from the waiter record.
+- The merge with queue's batch613 (the Slot column) took queue's waiting-step tooltip: one field on each line, and a "can run on" field from `memory_feed.local_runs_on`. The route lines and the repository filter of the Mac state line went out with the old tooltip.
+- `memory_feed.step_runs_on` names a route that limits the step before the Mac routes:
+  - `LOCAL_CALLER` reads "natedev only (the run asks for it)". Another `LocalRequired` reads "natedev only (<reason>)".
+  - A Mac-only step, or a step pinned to the Mac, reads "Mac only". A step pinned to another target reads "<target> only".
+  - A step either host can take reads `local_runs_on` of `MacRoutes.fit`, for example "natedev or Mac".
+- `target_availability.MacRoutes.is_mac` says whether a pinned target name is the Mac target.
+- A Mac-only step keeps the Mac line that the user approved (pair 2daec4c4c81a), in queue's field style. `MacRoutes.holds(folder)` names what keeps the folder's repository off the Mac: a block, an unreachable or unreadable Mac, or a live claim of this repository or of the whole Mac. A Mac free for this repository gives no line. `memory_feed.target_notes` gives `runs_on`, and `mac_state` only for `mac_only_route`, to the waiting row and to the queued run row. `memory_live.html` `targetFields` shows it as a "Mac" field below "can run on". The repository lookup runs git once for each Mac-only waiting folder in a page reading, only while the Mac runs a claim.
+- Tests: `test_memory_feed` (each route before the Mac routes, the Mac field on the waiting and queued run rows), `test_target_availability` (each Mac state, the repository filter, a whole-Mac claim), `test_memory_hover` (the Mac field below "can run on"), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
+- Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`. They show the tooltip before the merge.
+
+### Phases 95–99 — The Disks page · status: done
+
+From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
+1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
+2. The cache time, the default slider value and the measure limits are config values.
+3. The measure runs at the lowest disk priority under a memory cap, one at a time, and never blocks the page.
+4. Slot "Used by" reads the lease and lock. "deleted tonight" uses the 7-day config value. Sessions read held folders from the hold records.
+5. A part that depends on code not yet merged shows nothing until that code exists.
+
+Proof: one dark desktop shot for the user when the drive cards are live, and one when each later card shows data. I check light and phone widths myself.
+
+Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. The page and its data live in the review root, as the AWS prices page does.
+
+| Phase | Deliverable | Hours | Depends on |
+| --- | --- | ---: | --- |
+| 95 | Measure and data file | 2 | None |
+| 96 | Drive cards: slider and walk | 3 | 95 |
+| 97 | Measure on open; console entry | 1 | 96; owner review of `serve.py` and `console.conf` |
+| 98 | Slots card | 2 | 96; shows nothing until the slot roots exist |
+| 99 | Sessions card | 1.5 | 96; shows nothing until the session root and hold records exist |
+| **Total** | | **9.5** | |
+
+#### Phase 95 — Measure and data file
+
+1. `config/disks.conf` keys: `drives.<machine>` (the mount points, natedev `/build` and `/`), `cache_seconds=600`, `slider.default_gib=10`, `slider.min_gib=1`, `measure.keep_bytes` (the smallest folder the data keeps, below the slider minimum), `measure.memory_max=2G`, `measure.timeout_seconds`.
+2. `scripts/disks/measure.py` measures the drives at the same time. Each drive runs `dust -x -D -j -P -o b -z <keep_bytes - 1> --config scripts/disks/dust.toml` under `systemd-run --user --scope -p MemoryMax=<memory_max>` and `nice -n 19` (sdlc-phases phase 44 replaced one `du` for each drive, one drive after the other).
+3. A file lock lets only one measure run. A second request while one runs does nothing.
+4. The result is a tree for each drive: path, size and children. The size of a folder's "Other" is its size minus its named children, so each level adds up to its parent.
+5. A chain of single large children collapses into one row, such as `/home/natepiano`.
+6. Free and total space come from `scripts/buildlog/filesystem`. The floor line comes from the sweep's floor settings in `lint.conf`.
+7. The measure writes `disks.json` atomically, with `measured_at`, in the page folder.
+8. Tests: the tree from a fixture `du` output, the Other sizes, the chain collapse, the lock, and the timeout.
+
+##### Phase 95 as-built
+
+- `config/disks.conf`: `output_folder` (`ysbjmg` under the review root), `drives` with the host key `drives.natedev=/build /`, `cache_seconds`, `slider.default_gib`, `slider.min_gib`, `measure.keep_bytes` (256 MiB), `measure.memory_max`, `measure.max_depth` and `measure.max_lines` (dust's depth and line limits), `measure.timeout_seconds`.
+- `scripts/disks/measure.py`:
+  - `dust_command` runs `systemd-run --user --scope --quiet -p MemoryMax=<max> -- nice -n 19 dust -x -D -j -P -o b -z <keep_bytes - 1> -d <measure.max_depth> -n <measure.max_lines> --config <scripts/disks/dust.toml> <mount>`. dust keeps a folder only above `-z`, so `keep_bytes - 1` keeps a folder of exactly `keep_bytes`. The empty `scripts/disks/dust.toml` stops dust from reading a personal config. dust counts a hard link once. A folder it cannot read leaves out its size, and the walk still counts as a measure. `parse_dust` reads its JSON into the sizes that `folder_tree` takes. `ionice` is gone: natedev's IO scheduler is `none`, so it had no effect.
+  - `folder_tree`: each folder hangs from its nearest listed ancestor, largest first. `other` is the size less the listed children. `collapse` joins a folder with its only child while the folder's own files are below `keep_bytes`, as `home/natepiano`. The drive root never joins.
+  - `drive_floors`: the home disk floor from `disk.read_floor`, and the other floors from `sweep.filesystem_floors`, matched by device.
+  - `measure` takes `disks.lock` without a wait; a busy lock exits 3. It walks the drives at the same time, one thread for each drive, and keeps the config order. A timeout, a start failure (dust not on PATH) or a failed dust gives the drive an `error`, and the other drive still runs. `disks.json` holds `measured_at`, `keep_bytes` and the drives, with total, used, free, floor and tree.
+- Tests: `scripts/disks/test_measure.py` (the tree, Other, the collapse, the root, the command, a measure, both drives at once, the timeout, a start failure, a failed dust, the lock).
+- First real measure on natedev: 261 seconds for `/build` and `/`.
+
+#### Phase 96 — Drive cards: slider and walk
+
+1. `disks.html` reads `disks.json` and shows the two drive cards of mockup 2: the used bar with the floor mark, the slider and the folder table.
+2. Each card has its own slider, on a log scale from `slider.min_gib` to the largest top folder. The start value is `slider.default_gib`.
+3. A click opens or closes a folder's children, at any depth. Each row shows Size, "Of parent" and a walk bar inside its parent's span.
+4. The status line names the measure time and its age.
+5. Tests: the page renders the fixture data at desktop and phone widths in light and dark mode, with no clipped text.
+
+##### Phase 96 as-built
+
+- `scripts/disks/disks.html` reads `disks.json` (no cache) and shows one card for each drive, in the order of `drives`.
+  - The card head gives the name from `name.<mount>` and the mount, free of total, the used bar with the floor mark, and "Cleanup starts below <floor> free (<percent>)." A drive with no floor reads "The cleanup floor is unknown." A drive with no tree shows its error.
+  - The slider runs on a log scale from `slider.min_gib` to the largest top folder. It starts at `slider.default_gib`. The largest top folder starts open.
+  - `treeRows`: children below the limit join one row, "Other · N folders", with the folder's own files ("and files" when they reach `keep_bytes`). One small child shows by its name. Own files alone read "Files and small folders". Each row starts where the row before it ends, so the walk bars of a folder fill its span.
+  - A click, Enter or Space opens or closes a folder at any depth. A long name wraps; no text is cut. Below 560 px the "Of parent" column hides.
+  - The status line reads "Sizes from <time>, <age>." The dot turns gray after `cache_seconds`.
+- `scripts/disks/disks_page.py`: `publish` writes the page with `page_frame.STYLE` and the page settings; `page_url`; `main` takes `publish` or `link`. `measure.py` publishes the page after each measure.
+- `config/disks.conf`: `name./build=Build drive`, `name./=System drive`. `slider.min_gib` is at least 0.25, the measure's least folder.
+- Tests: `scripts/disks/test_disks_page.py` (publish, the fold, the offsets, the text, the slider). Chrome check: no cut text and no page wider than the window at 1400, 800 and 390 px, light and dark; a click, Enter and the slider work.
+
+#### Phase 97 — Measure on open; console entry
+
+1. The page asks for a measure when `disks.json` is older than `cache_seconds`. It shows the old data at once and the line "Measuring…".
+2. The request goes to a new POST route in `scripts/review_links/serve.py`. The route starts `measure.py` in the background and returns at once. The page reads `disks.json` again until `measured_at` changes.
+3. `config/console.conf` gets `page.disks.*` (label Disks). These are new keys.
+4. `serve.py` and `console.conf` are not report's files. The owner reviews the change, or makes it.
+5. Proof: one dark desktop shot of the live page.
+
+##### Phase 97 as-built
+
+- `scripts/disks/disks.html`:
+  - The page shows the old data at once. It posts to `measure` beside it when `disks.json` is missing or older than `cache_seconds`.
+  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until the data's `generation` reaches the measure's target. (Phase 45 of `docs/plans/sdlc-phases.md` changed the end test from a `measured_at` change and added the refresh button.)
+  - After the wait limit (`measure.timeout_seconds` for each drive), the line adds "The measure did not finish."
+  - With no data, the line reads "Measuring the drives. The first measure takes some minutes."
+  - With current data, the line adds "The page measures again when you open it and the sizes are more than N minutes old."
+- `scripts/disks/disks_page.py`:
+  - `start_measure` returns `current` when the data is newer than `cache_seconds`, and `running` when `disks.lock` is held.
+  - Otherwise it starts `measure.py` in its own session and returns `started`. A thread reaps the process. The server never waits.
+  - `page_url` publishes the page with the current config, then gives its link. `main` prints the link.
+  - `measure.py` no longer publishes the page.
+- `scripts/review_links/serve.py`: a POST to the `measure` path beside the page calls `start_measure` and answers `{"state": ...}` at once. A start failure answers 503.
+- `config/console.conf`: `page.disks.*` with label Disks, the `hard-drive` icon and `disks_page:page_url`. `console.py` adds `hard-drive` to `ICON_NAMES`; the Lucide icon is in `scripts/review_links/lucide`.
+- `config/disks.conf`: `page.poll_seconds=5`.
+- Tests: `start_measure` (missing, current, running, old), the status line, the serve route, the console page list. Chrome check: one POST on open, "Measuring…", then the new time after the data changes.
+
+#### Phase 98 — Slots card
+
+1. The card reads `roots.slots.<machine>` and `roots.slot_cargo.<machine>` from `build_folders.conf`. With no such key, the card does not show.
+2. Each `<repository>-slotN` row shows one Size (checkout plus compiled output), Last used, and Used by.
+3. Used by comes from `build_folders.build_folder_state` and the lease record: showrunner, unit and purpose. A free slot shows "—".
+4. "deleted tonight" shows when the last use is older than the nightly delete's day count, read from config. With no such key, the tag does not show.
+5. The slot sizes come from the same measure as the drive cards.
+
+##### Phase 98 as-built
+
+- `scripts/disks/slots.py`:
+  - `slot_report` reads the slot root and the cargo root through `build_slots` (`slot_folder_root`, `slot_cargo_root`). With no slot root it returns nothing, and the page shows no card.
+  - `read_slots` finds the slots with `build_slots.slot_paths`, as the nightly sweep does. It groups the slots by repository, with the maximum from `build_slots.configured_maximum`.
+  - Size: the checkout plus `<slot_cargo>/<name>`, from the last measure's trees (`tree_size`). A folder that the measure does not list is below `measure.keep_bytes`. A path on no measured drive has no size.
+  - Used by: `build_folders.build_folder_state` gives held or free. A held slot shows the lease's purpose, unit and showrunner, and "now" as its last use.
+  - "deleted tonight": a free slot that `build_slots.unused` names, the same rule the sweep in the nightly merge gate uses.
+- `scripts/lib/build_slots.py` (queue's file, by builds' finding): the public readers `slot_folder_root`, `slot_cargo_root`, `lease_path`, `slot_paths`, `unused` and `configured_maximum`. The pool and the sweep use them.
+- `scripts/review_links/serve.py`: the measure answer adds `slots`, read at each POST, so the holders are current. `json_response` takes any JSON mapping.
+- `scripts/disks/disks.html`:
+  - The page now posts on each open; the server starts a measure only when the sizes are old.
+  - After a measure, the page posts once more for the new slot sizes.
+  - The Slots card follows mockup 2: a group row for each repository ("N of M slots · size"), then Slot, Size, Last used and Used by. On a phone, the holder goes under the slot name.
+- `disks_page.publish` writes the page only when its content changes (admin-console's note on phase 97).
+- Tests: `scripts/disks/test_slots.py` (sizes from the trees, groups, use, the nightly delete, no root), the card HTML, the publish, the serve answer. Chrome check with fixture slots: no cut text and no page wider than the window at 1400, 800, 390 and 360 px, light and dark.
+
+#### Phase 99 — Sessions card
+
+1. The card reads the session root from config when verify adds it. With no such key, the card does not show.
+2. Each session row shows its size, the held folders from verify's hold records, and its state.
+3. An ended session shows when its folder is deleted, from the same records.
+
+##### Phase 99 as-built
+
+Builds asked for verify's folder layout phase 4 (10c25b033) in this branch before it merges, so the card reads verify's own readers.
+
+- `scripts/disks/sessions.py`:
+  - `session_report` reads the root from `session_folder.session_root`. Until that folder exists, it returns nothing and the page shows no card.
+  - `read_sessions` lists each folder under the root, largest first. Dot folders, links and files are not sessions.
+  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a mount of `/build/session`, so the size comes from the build drive's tree.
+  - Held folders: each `scratch.holds()` path inside the folder, by its path in the folder. A hold that ended with unsaved work shows "(unsaved work)".
+  - State: `session_records.session_liveness` of the session id in `.session.json`: running, ended, or unknown ("—").
+  - No code deletes a session folder yet, so the card shows no delete time (condition 5). The held folders go when their task ends (`scratch.end`); the task name is the tooltip of each held folder.
+- `scripts/disks/measure.py`: `tree_size` moved here from `slots.py`, with `read_data`, `read_mounts` (`/proc/self/mountinfo`, none on the Mac) and `drive_path`.
+- `scripts/review_links/serve.py`: the measure answer adds `sessions`.
+- `scripts/disks/disks.html`: the Sessions card follows mockup 2: Session, Size, a bar on the largest session's scale, Held folders and State. `page.sessions_shown` in `disks.conf` (10) names the largest sessions; one row adds up the rest. On a phone the bar does not show.
+- Tests: `test_sessions` (sizes through the mount, held folders, states, no root), `test_measure` (the mount table and `drive_path`), `test_disks_page` (the card HTML), `test_serve` (the answer). Chrome check with fixture sessions: no cut text and no page wider than the window at 1400, 800, 390 and 360 px, light and dark.
+
+### Phases 100–101 — Build history names the cost and its action · status: in progress
+
+Builds' order (11-15): above the plots, show the top three costs as sentences with the number, the cause and the action that cuts it.
+Name each action only from the data the page has. Drop the h/day sum plots, or move them under Details. Fix the Hana phase p90 where the phase record stays open.
+
+#### Phase 100 — Top costs as sentences, sum plots under Details
+
+The Builds page no longer shows the Build history plots, details and moments (buildsteady, C1780); Top 3 costs remains. The as-built notes below describe the code from before that change.
+
+##### Phase 100 as-built
+
+- `scripts/buildlog/cost_actions.py` (new) names the action from the rows behind each cost:
+  - Memory wait: the step kind that holds the most build memory (peak times run time), with its peak p90.
+  - Failed runs: the test that failed most on the machine, else the step kind that failed most.
+  - Any other cause: "No action known."
+  - The step kind that paid the largest part of the cost ("hana nextest paid 34% of it").
+- `scripts/buildlog/costs.py`: each contribution carries its `StepKind` (repository and step).
+- `scripts/buildlog/charts.py`: `TopCost` carries each day of the window, the largest share and the action. The 12 `COST_ACTION_*`/`COST_OWNER_*` keys are deleted; the user approved it on 2026-11-15.
+- `scripts/build_queue/memory_feed.py`: each top cost sends its daily range, share and action text.
+- `scripts/build_queue/memory_live.html`: the Build history card starts with "Top 3 costs" for the last `TOP_COST_RECENT_DAYS` days. Then the Hana phase time plot. The cause and machine plots are under "Details: costs by cause and by machine".
+- Tests: `test_charts` (memory holder, failed test, failed step, no action), `test_memory_feed` (the sent text), `memory_page_proof.mjs` (the sentences and the Details state).
+
+#### Phase 101 — Hana phase time counts only active time
+
+As built:
+
+- Cause: `record_turn_wait` recorded no wait for a `blocked:` turn end that
+  named no supplier address. A pause relayed by the showrunner counted as
+  phase time. Hana phase 14 holds 180 h of such a pause.
+- A `blocked: waiting on ...` turn end, or a `blocked:` turn end that names
+  a pause, now opens a wait. Any other `blocked:` turn end opens no wait, so
+  the Stop hook still wakes the director. The supplier is the named address,
+  else the run's showrunner. A run with no showrunner waits on the user. A
+  `peer` block with no address keeps `NoNamedSupplier`.
+- `finish-phase` writes `phase_active_seconds`: the phase time less the union
+  of its `WaitingForUser` and `WaitingForSupplier` waits. An open wait ends at
+  the finish. `phase_elapsed_seconds` is unchanged, so ETA bands do not change.
+- `moments.progress_events` reads `phase_active_seconds`. A record from before
+  this change is `WaitsNotRecorded`, because its wall time can hold waits.
+  A day with only such records reads `phases ended before waits were recorded`.
+- When no day in the range is measured, the card shows no plot and no table.
+  One line names why: "Shown from the first phase that ends with a wait
+  record. Earlier phases have no wait record.", "Hana phases ended in this
+  range, but none has a valid start time." or "No Hana phase ended in this
+  range."
+- The plot title is "Hana phase time, without waits for the user or the
+  showrunner". The legend says "half of phases take up to" and "most phases
+  take up to". The memory action says "Most runs peak at N GiB or less."
+
+#### Builds page hover wording (C1584, C1309, C1578, C1605)
+
+As built:
+
+- Every hover box shows the run or wait time in bold at the top right.
+- A queued running build says "Current memory: N GiB", "Historically uses N
+  GiB" (with "in the next part of the build" for a progress peak), the room
+  the queue holds for it, and its progress.
+- A waiting build says its place in line, "It needs N GiB to start." and
+  "Why it waits: …". `memory_feed.wait_why` writes one sentence for each
+  wait reason, in the same form.
+- The waiting build that gets memory next shows a table: "Queue cap",
+  "− Builds", "− Build reserved", "− Held for builds ahead in line" (only
+  above 0) and "= Free for builds". Each row is the memory bar legend's
+  amount, so the rows add up and the cap and Builds count the build tools.
+  One note follows: "Build reserved is memory that running builds used at
+  their next points in earlier runs."
+- The queue cap hover says the cap is RAM less the programs that run now,
+  the safety net and the swap coming back, and that those three are
+  outside the cap. The user set what is inside the cap and where it is
+  explained on 2026-11-15; queue gave the words.
+- An unavailable cap shows "Queue cap unavailable: <reason>" and no table.
+- "can run on" and "Mac" are fields in the running and the waiting boxes.
+
+#### Builds page weight (C1672)
+
+From builds, relaying the user on C1672: the memory and the queue should be always visible and fast.
+
+As built:
+
+- Cause: `charts.chart_series` made a chart machine of each buildlog source folder. Each cloud gate host has its own folder, so about 1475 hosts gave 6 causes × 8 days of empty rows: 19.8 MB of the 19.9 MB `memory.json`.
+- `charts.chart_series` took only configured targets and machines with a step in the window. buildsteady removed the chart data, so `report.json` now holds Top 3 costs only.
+- `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
+- `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
+- Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
+
+#### Disks fold — top level first, a working slider, distinct slot bands
+
+From the user (via builds, 2026-11-16): "disks has issues - the top level should be what shows and the sub level should be dynamically expandable/contractable with useful icons (say from lucide) the slider filters do not seem to be working at all the slot titles should be a little more disticntive from the slot rows for each section"
+
+As built:
+
+- Slider cause: each input event rebuilt the whole card, slider included, so a drag stopped after one step. `driveView` now builds each drive card once and keeps it across new data; a slider step, a toggle or new data changes only the head, the slider ends, the value and the rows. `refill` keeps the focus on the same row. The Slots and Sessions cards are fixed elements too. One `onToggle` listener answers a click, Enter and space.
+- The drive cards start with only the top folders; each folder opens and closes at a click. The Slots card starts with one band per repository; a click opens the band and lists its slots.
+- Icons: the Lucide 0.468.0 `chevron-right` turns down on an open row; the `folder` icon marks a repository. Both are inline SVG in `disks.html`.
+- A repository band has an accent-tinted background, a bold name and the count and size; its slot rows are indented.
+- Tests: `test_disks_page` runs `driveView` on a fake document and checks one card write, the same slider after a step and new data, and the rows after a toggle and a slider step; it fails on the old page. The slot test checks the folded and open bands. Chrome check: a drag across the slider now ends at its far end; after new data the slider, the focused row and the open band stay.
+
+#### buildsteady — a refresh keeps the viewed row; no Build history; a shorter Free tooltip
+
+From the user (via builds, 2026-11-16): "changes in the data on the builds page - refreshes - should not change the line the viewer is currently viewing - the builds page constantly jumps around right now and it is disorienting". On C1780: "i think we should remove this history from the builds page for the time being - i'm not learning anything and i want to redesign it later". On C1802: "isn't free and kept for other steps always going to be the same value? that doesn't seem helpful to repeat that".
+
+As built:
+
+- Cause: `renderWalk` replaced all of `#walk`, so the browser lost its scroll anchor, and the tooltip keys were row indexes.
+- `memory_feed.step_key` gives each running and waiting row a stable `key`: machine, kind, pid, start time, group and the CI cgroup. The page uses it in `data-tip`, `data-run` and every `row:`/`wait:` reader. A gone step hides its tooltip.
+- Before each render the page saves an anchor that is in view: the tooltip row, else the focused row, else the first keyed row or section. After the render it scrolls by the anchor's move. `overflow-anchor` is off. The focus, the open `details` and the tooltip stay.
+- The Build history head, plots, details and moments are gone. The feed no longer builds chart data; `charts.chart_data` and its chart-only helpers are deleted. The card keeps Top 3 costs. The recording code is unchanged.
+- The queue admits one step at a time, so only the step it admits next shows Free, Kept, Given back and Short by. The feed marks that step `first_in_line` from the admission head, so a token waiter ahead of it in the list does not take its rows. Every other step shows only Needs. From the user on the Images page: "anything that can't run next doesn't need to show what it goes first to - we can remove Free, goes first to and short by from any item that is after the first in line".
+- Tests: `memory_page_proof.mjs` steady block (old page: the viewed row moved 352 px and the tooltip showed another step; new page: 0 px) and an out-of-view focus check (a rule that took the focused row out of view moved the viewed rows 528 px; new page: 0 px); `test_memory_feed` (stable and unique keys, two CI rows with empty cgroups); `test_memory_hover` (keys, room rows on the first step only).
+
+#### disksmemo — rows start closed and stay as the viewer left them; the filter names top folders only
+
+From the user (via builds, 2026-11-16): "disks should start out collapsed and should remember it's collapse points as long as they are still valid between data updates and page refreshes". Later: "1. the slider doesn't drag - you can only just click on the background - that needs to be fixed 2. the folder of at least size is a filter for the top level only - everything under the top level can always be expanded out 3. the other (now only showing on top level) should also be expandable".
+
+As built:
+
+- Every folder row and every repository band starts closed.
+- `localStorage` key `disks-open` holds the open folder paths and the open repository names. A reload and new data keep them. `forgetGone` drops a folder path that the tree no longer has and a repository that the slot report no longer has. A drive with no tree keeps its paths.
+- The slider names top folders only. An open folder lists every child, and its small files show as one "Files and small folders" row.
+- The top-level Other row opens and lists the top folders under the slider value. Its key is `other:<mount>`; a folder path starts with "/", so no folder has this key.
+- `knownFolders` walks each tree as `folderRows` does, so a joined name such as `cargo/project` stays known. The drive with the longest mount owns a path.
+- Slider: a drag works in Chrome and Firefox, on the page alone and inside the console frame. The user's failure did not show on natedev. These changes guard it: the label is a `div`, so a press on the text does not move the thumb; the ends and the value have fixed widths, so the track does not change size during a drag; the value is written only when it changes.
+- Tests: `test_disks_page` checks that only top folders are filtered and that Other opens, and that open rows stay across a reload until their folder or repository is gone, with rows for a joined name, a folder named `|other` and a drive inside a drive with no tree. Both fail on the old page.
+
+#### gatenames — gate steps get readable names and a description (#108, #109, #97) · status: done
+
+The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/morty/gate-tooltip-mockup-v2.png`). Use "integrate" for "land" and "test nightly" for "nightly". Promote gets no step.
+
+| Step name | Description in the tooltip | Changes | Called today as |
+| --- | --- | --- | --- |
+| integrate | Merges the `<unit>` checkpoint into the `<showrunner>` branch, tests every module, then pushes `<showrunner>`. | branch `<showrunner>` | `merge_gate.py --checkpoint` |
+| test all | Tests every module of `<unit>`. | no branch | `merge_gate.py --tests-only --full` |
+| test modules | Tests `<N>` named modules of `<unit>`. | no branch | `merge_gate.py --tests-only --module X` |
+| test affected | Tests the modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
+| test nightly | Tests the `<showrunner>` branch each night and records a red result with its owner. | no branch | `merge_gate.py --nightly` |
+
+1. The row name is "`<unit>` `<step>`". The tooltip title is "`<unit>` · `<step>`".
+2. Under the title the tooltip shows the description, then a "Changes" row, then the rows it shows today.
+3. The names and description templates live in config, not in code.
+4. The feed reads the job from the pid's command line. The queue does not change.
+5. A `--promote` run shows integrate only.
+6. Disks "Used by" (#97) uses the same name source: "`<unit>` `<step>`", for example "handler integrate".
+7. From the user (via builds), on the Slots pane: "how could the cargo-liner slots both be showing the same merge?" Cause: `copies.py` `standing()` writes `work='gate'` and `purpose='gate · <base commit subject>'` for every slot take, so a `verify.sh test` or `lint` run shows as a gate of main's last merge. Fix at the source: the lease names the real work (the unit and the step, such as test or lint) from the same name source. Never "gate" for a run that is not a gate, and never the base commit subject.
+
+As built:
+
+- `build_steps.command_job` finds the script after a python or shell interpreter, then reads its arguments. `merge_gate.py` gives integrate, test all, test modules, test nightly or promote; `--tests-only` tests every module. `targeted_test.py` gives test affected, test all with `--full` or test modules with `--module`. `verify.sh [--session-dir <dir>] <step>` gives that step. `--promote` gives integrate. Any other command is `OtherCommand`.
+- `config/build_steps.conf` holds the step names, the `[about]` sentences and the `[changes]` text. `StepNames.about` and `StepNames.changes` fill them. An unknown unit gives no sentence.
+- The feed reads `/proc/<pid>/cmdline` for a merge-gate or targeted-test row (`memory_feed.step_job`). The result is a job or a named state: not a gate step, pid not recorded, command unreadable, or another command. The row name and the tooltip title use the job step; the row carries `about` and `changes`. The queue is unchanged.
+- The tooltip shows the description as a caption under the title, then a Changes row, then the rows it showed before.
+- Slot lease: `copies.standing` takes a `step` key. It writes `work=<step>` and `purpose=<shown step name>`. `copies.run` passes the job of its command, else the program name. Every other caller names its work: `merge_gate.py --nightly` test-nightly, `bump_gate.py` integrate, `fast_track.py` promote and fast-track, `ci_points` ci, `waiting.scratch_test` test, `rust_release` toolchain-trial, the style checks style, lint or test, and `copies.py hold` hold. Only test fixtures use the default step run. `gate_purpose` and the base commit subject are gone.
+- Disks Used by: `slots.slot_use` names the staff id from the staff record and builds "`<unit>` `<step>`" with the same owner template as the Builds page, then shows the showrunner.
+- Director calls: the names use the unit that runs the job ("natemerge integrate"), as the mockup shows. "test affected" has no module count; the Testing row shows it. An unknown command uses its program name as the step.
+- Tests: `test_memory_feed` (each gate command gives its job, description and changes; the feed puts them on running and waiting rows), `test_memory_hover` (the caption and Changes rows follow the title), `test_copies` (the lease names the step), `test_slots` and `test_disks_page` (Used by). `memory_page_proof.mjs` checks the gate tooltip and saves `gate-tooltip-dark-desktop.png`.
+
+#### diskpanels — Slots and Sessions get definitions and row tooltips; Sessions gets a size filter · status: done
+
+From the user (via sdlc and builds, 2026-11-16): "sessions and slots should show a hoverable definition of what they are and how they work / what they contain - every row should contain a tooltip that for slots should be the same tooltip that is shown in the build queue so they share code and data  sessions should show all sessions and have a filter that limits the minimum size - like disks". The showrunner's terms: reuse the Builds page slot tooltip code and data, with no copy; Sessions shows every session (it showed 10, then "24 more") with a minimum-size filter like the drive cards.
+
+As built:
+
+- Shared code: `memory_live.html` marks its tooltip rules and its tooltip code with `shared:step-tip:start` and `shared:step-tip:end`. The code part holds `field`, `tooltipRows`, `tooltipHtml`, a new `tipRowsHtml`, a new `placeTipAt` and a new `hoverTips`, which holds the hover and click handlers. The Builds page now calls `hoverTips`; `showTip`, `hideTip` and `placeTip` stay as names.
+- `disks_page.shared_step_tip` reads both marked parts from the Builds page source at publish. The Disks page puts the rules in its style and the code in one function, so the names of the two pages do not collide.
+- Shared data: each Builds row in a slot carries `slot_folder` and `slot_machine` beside `slot` (`memory_feed.build_slot`). The Disks settings carry `builds_data`, the link from the Disks folder to the Builds `memory.json`. The page reads it at start and at each poll interval while it shows.
+- `scripts/build_queue/memory_files.py` holds the Builds page source, its data file name and its output folder. The Disks publisher reads them without the 0.4 s import of `memory_feed`.
+- A held slot that a Builds step runs in shows that step's tooltip, the same HTML as on the Builds page. The Builds data must be newer than `page.builds_max_age_seconds` (30). Any other slot shows its name and state, repository, size, last use, its user and showrunner, and the nightly sweep note. A repository band shows its slot count, size, slots in use and limit.
+- The Slots and Sessions titles carry an info mark and a definition tooltip. The slot definition takes the sweep age from `slots.unused_days`; the slot report now carries `machine` and `unused_days`.
+- Sessions shows every session. A slider "Show sessions of at least" starts at "any size"; its other steps run on a log scale from the measure's least folder to the largest session. The smaller sessions join one row with its own tooltip. Each session row shows a tooltip with its state, size and held folders with their tasks. The card is built once, so a drag goes on across new data. When new data leaves the slider no range, the filter goes back to "any size".
+- `page.sessions_shown` is deleted from `config/disks.conf`.
+- Tests: `test_disks_page` (the published page holds the marked parts; the filter rows; the sessions card keeps its slider and limit across new data; the tooltip of each row kind, and a slot run tooltip equal to `tooltipHtml` of its Builds row on the right machine), `test_memory_feed` (`slot_folder` and `slot_machine`), `test_memory_hover`. A Chrome check on live data hovers each tooltip, checks that none is cut or outside the window, and saves the dark desktop shot.
+
+#### gatefix — A build's Uses counts its compilers; the tooltip names the branch first; CI rows say their job · status: done
+
+From the user (via the Images page, 2026-11-16), on the gate tooltip shot: "why do you say branch sdlc instead of sdlc branch which is more natural? SHowrunner - can you use a real one? i don't know what fixture-production is Runs on "fixture" what is fixture? Uses 0.0 GiB? why does it say that - uses 0.0 has to be a bug - isn't that the bug we have right now? please do better". On the Disks shot: "yes - it should use the same tooltip - a working, fixed tooltip, to be sure!".
+
+Cause of "Uses 0.0 GiB": `~/.cargo/config.toml` sets `rustc-wrapper = "sccache"`. The sccache server starts each compiler in `builds.slice/sccache.service`, not in the step scope. A build's Uses held only cargo, and the compile memory showed in the compiler cache row. The queue also kept the full need aside for that build while its compilers already took that RAM from MemAvailable. On 2026-11-16 the research build in `hana-slot4` showed 0.0 GiB at 778 of 831 units; its scope peak at the link was 13.7 GiB.
+
+As built:
+
+- `invoke.sh`: the step scope exports `BUILDLOG_STEP_SCOPE`, its cgroup folder. sccache gives each compiler its client's environment (checked on natedev with a marker variable). sccache hashes `CARGO_*` variables and the variables that rustc dependency data names. No crate reads `BUILDLOG_STEP_SCOPE`, so cache keys do not change.
+- `memory_admit.sccache_memory` groups the service's processes by the scope each one names (`CompilerJob`, a new field `jobs` on `CompilerServiceMemory`). The compiler cache bytes leave out the jobs.
+- `memory_admit.attributed_step_uses` adds a scope's jobs to the step that holds that scope. Uses, Build reserved, the cap and the progress profiles now count the step's compilers. A job whose scope has no reservation counts in "Other build tools".
+- `memory_feed.build_tool_ram` leaves the jobs out of the compiler cache line.
+- `config/build_steps.conf`: Changes reads "sdlc branch" and "main branch".
+- The Builds proof uses real names: showrunner sdlc, unit handler, machine natedev, and a real Uses for the gate row.
+- Steps that started before the merge keep the old reading until they end. The admission service and the review-links server load the new code on their own.
+
+From the user (via builds, 2026-11-16): "the \"showrunner\" underneath the CI steps in the build queue are messed up - too long - and the actual CI step  that says CI /run/hana-ci-admission/.. - i don't even know what that is but it has to be a bug".
+
+Cause: each hana runner's `cargo` is a store front, `ci_cargo_front.py --front <cargo> --shared-folder /run/hana-ci-admission/<runner> -- <words>`. `memory_feed.cargo_job` matched the `--front` value as cargo and read the shared folder as the job.
+
+- `parse.cargo_front_call` splits the front's options from cargo's words. `ci_cargo_front.main` and `memory_feed.cargo_job` both use it, so a CI row says its job ("CI build", "CI tests").
+- Under a CI step the Builds page shows the label's first part ("hana CI"). The tooltip title keeps the whole label with the runner and the job.
+
+#### overcap — The Builds bar draws build reserved over the queue cap · status: done
+
+From the user (via builds, 2026-11-16), on two Builds shots: "how am i to interpret this overage of 34.6 of 29.9 taken - i see the que cap of 29.9 - but where does it show that it has been overtaken in the memory bar above? I don't think it does". Then: "the rserved is actually a number that we're NOT taking we're just reporting it - we're eating back into the reserve but we're pretty safe because there is still so much of it". The user approved mockup 0f8ecf5d1a1c: "Go: report builds it as in the mockup".
+
+Cause: build reserved is room that running steps may still grow into, not RAM in use. Free RAM covers the safety net and swap coming back first. The bar drew only the covered part of the reserve and stopped at the cap line. Taken counts the full reserve, so it read 34.6 of 29.9 with no box for the 4.7. "builds 12.7" was 3.4 build tools + 9.1 queued builds + 0.2 hana CI, a part too narrow to see.
+
+As built:
+
+- `memory_live.html`: when build reserved is over the cap, a red dashed box (`b-overlay`) lies past the cap line over the safety net and swap, and a dashed "over cap" brace (`b-over`) sits beside "queue cap". The build reserved brace reads "<full> · <covered> covered".
+- The `over` tooltip shows Build reserved (full) − Free RAM after safety net and swap = Over cap. Then it shows what the reserve takes first if steps grow: the safety net, swap coming back, then cache and other programs.
+- `statusLine`: when only the build reserve is not covered, the line says it is over the cap and that a reserve is not RAM in use. An uncovered safety net or swap keeps "reserves exceed free RAM".
+- The hana CI part is at least 3 px wide. Bar parts can shrink, so the bar still ends at its right edge.
+- Tests: `test_memory_hover` (brace list, status line row), the Builds proof (box at the cap line, brace and box widths, labels, tooltip sums, no box when nothing is over the cap; the shot `over-cap-dark-desktop.png`).
+- Tests: `test_memory_admit` (a step's use and kept bytes count its compilers; the sccache reading groups compilers by scope and leaves out the server), `test_invoke_scope` (the step sees `BUILDLOG_STEP_SCOPE`), `test_memory_feed`, `test_memory_hover`, and the Builds proof.
+
+### Tokens — The Builds page shows the jobserver tokens · status: done
+
+From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.
+
+As built:
+
+- `memory_feed.token_pool` runs `stevie -a -t -j` (floor MiB, free, total) from the `stevie_program` path in `config/memory_feed.conf`; the feed service PATH does not hold the system programs folder. The pool is paused while the admission's MemAvailable is under the floor.
+- The memory bar legend starts collapsed; the page refresh keeps it open once the user opens it. It has no "How free is worked out" section: the Free tooltip explains free. The missing-readings fault shows under the RAM-disagree line.
+- Space toggles a pause on the Builds page. A paused page reads no data and does not reload; a "Paused" badge shows at the top, and tooltips still open. The console sends a space press outside a control to the open page as `console-space`, so the pause works before a click in the frame.
+- A queued step's tooltip shows Free as the page's Free row. When the step's own admission room differs, a "− Kept for other steps" or "+ Given back by other steps" line shows the difference, and Short by uses the step's room. A step that left to wait for the Cargo token says "Waits for: Cargo token".
+- The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
+- In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
+- The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
+- steve lists each connected process, holders of 0 included. A local step shows the sum of its lines, 0 included. A step with no line in the dump shows "—". CI, Mac and AWS rows always show "—".
+- The polkit rule (nixos 2ed52e5) is live, so the reload works. When a reload is refused, the column shows "—" and the header hover gives the reason.
+- Tests: `test_memory_feed` (pool, pause text, dump parse, ancestor count, refused reason), `test_memory_hover` (column and header), `memory_page_proof.mjs` (column values, pool line, no overflow).
+
+### Cap bar — Running bars stop at the cap line · status: done
+
+From builds: the reserved bar ran past the chart into the Stage column. "The bar must stop at the chart edge and show the over-cap state inside the chart."
+
+As built:
+
+- `placeMemoryBars` draws each local bar (build tools, CI, used, reserved, Free) with `capBox`. It cuts the bar at the cap line. A cut bar gets the `over-cap` class: square right corners and a 3px cap-colored end. Mac and cloud rows keep their own scale.
+- With a cap, a wait bar ends at the room end or the cap line, whichever is first. A need larger than the cap stops at the cap line.
+- When build reserves do not fit under the cap (`build_missing_bytes` > 0), the Running header reads "X of Y GiB taken · Z GiB over cap" in the cap color. The feed's taken is cap minus free, so the page adds the uncovered reserve: X counts each full build reserve, so X − Y = Z. The user asked on 2026-11-16 how "28.0 of 28.0 GiB taken" could be 1 GiB over the cap; now it reads "29.0 of 28.0".
+- The header tooltip reads Builds + Build reserved (full) = Taken, then "That is Z GiB over the Y GiB queue cap, so nothing is free."
+- The Queue cap legend stays as it is: the feed defines the cap as Builds + covered Build reserved + Free, so its rows always add to the total. The Shortfall row already names the uncovered reserve.
+- Tests: `memory_page_proof.mjs` adds two readings. In the first, build tools grow past the cap and one wait needs cap + 10 GiB; the proof checks that no local bar ends past the cap line and the cut bar's cap-colored end. The legend sum check skips this reading, because live data cannot produce it. In the second, the running build reserves all of free plus 1 GiB; the proof checks the header text and color, that every number in the header and tooltip adds up within 0.1 GiB, and that the base reading names no over-cap amount.

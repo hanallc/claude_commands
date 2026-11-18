@@ -133,7 +133,9 @@ def write_trend_ledger(directory: Path, reservations: Sequence[ledger.GateReserv
          "usd_per_hour": str(row.usd_per_hour), "allowance_usd": str(row.allowance_usd),
          "applied_usd_per_hour": str(row.rate.usd_per_hour), "rate_source": row.rate.source,
          "instance_type": row.instance_type,
-         "state": {"kind": "terminated", "at": row.state.at, "instance_id": row.state.instance_id}}
+         "state": {"kind": "terminated", "at": row.state.at, "instance_id": row.state.instance_id},
+         **({"booked_allowance": {"usd": str(row.booked_allowance.usd), "source": row.booked_allowance.source}}
+            if isinstance(row.booked_allowance, ledger.GateAllowance) else {})}
         for row in reservations if isinstance(row.state, ledger.GateTerminated)]
     _ = book.path.write_text(json.dumps(document))
 
@@ -189,7 +191,9 @@ class TestTimesTests(unittest.TestCase):
             "BUILD_TARGETS_STATE_DIR": str(self.root / "targets"),
         }))
         _ = configure_cleanup(self, self.log)
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7")
+        _ = write_config_fixture(self.config / "test_times.conf",
+                                 "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7\nNEXTEST_SLOW_TEST_S=1.0\n"
+                                 + "TREND_SETTLE_MINUTES=45\n")
         _ = write_config_fixture(self.config / "buildlog.conf")
         _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
         for name in ("test_alpha.py", "test_beta.py", "test_missing.py"):
@@ -755,6 +759,23 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                                  ("median CPU s", "2.000"), ("runs counted", "1")):
             self.assertEqual(self.cell(output, alpha, header), expected, output)
 
+    def test_top_aws_host_ranks_every_aws_gate_host_from_the_aws_checkout(self) -> None:
+        gate = self.root / "gate-trial"
+        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT=~/.claude\nTOP_AWS_CHECKOUT={gate}")
+        self.write_run([module_run("test_alpha.py", 4.0)], host="ip-10-0-0-1.us-east-2.compute.internal",
+                       checkout=str(gate))
+        self.write_run([module_run("test_alpha.py", 8.0)], host="ip-10-0-0-2.us-east-2.compute.internal",
+                       epoch=EPOCH + 60, checkout=str(gate))
+        self.write_run([module_run("test_alpha.py", 900.0)], host="ip-10-0-0-3.us-east-2.compute.internal",
+                       epoch=EPOCH + 120)
+        # A gate host runs this test, so the run off the AWS hosts names its host.
+        self.write_run([module_run("test_alpha.py", 700.0)], host="natedev", epoch=EPOCH + 180, checkout=str(gate))
+        output = self.report("top", "--host", "aws", "--repo", str(self.repo))
+        alpha = self.line(output, "tools/test_alpha.py")
+        self.assertEqual(self.cell(output, alpha, "median s"), "6.000", output)
+        self.assertEqual(self.cell(output, alpha, "runs counted"), "2", output)
+        self.assertIn("no modules recorded yet", self.report("top", "--repo", str(self.repo)))
+
     def test_top_reads_history_when_the_configured_checkout_is_a_symlink(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))
         alias = self.repo.with_name("checkout-alias")
@@ -1034,10 +1055,12 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
 
         state = target_config.ssh_target_state_directory("aws")
         reservations: list[ledger.GateReservation] = []
-        for ordinal, host, selection, hours, rate in (
-                (1, "ip-10-1-1-1.compute.internal", "full", 1, "0.3"),
-                (2, "ip-10-1-1-2", "full", 2, "0.5"),
-                (3, "ip-10-1-1-3.compute.internal", "affected", 1, "0.1")):
+        for ordinal, host, selection, hours, rate, booked_allowance in (
+                (1, "ip-10-1-1-1.compute.internal", "full", 1, "0.3",
+                 ledger.GateAllowance(Decimal("0.01"), "AWS bill 2026-11-03")),
+                (2, "ip-10-1-1-2", "full", 2, "0.5",
+                 ledger.GateAllowance(Decimal(0), "AWS bill 2026-11-03")),
+                (3, "ip-10-1-1-3.compute.internal", "affected", 1, "0.1", ledger.GateAllowanceUnpriced())):
             self.write_run([module_run("test_alpha.py", ordinal * 10)], host=host)
             _ = show.index.update()
             with closing(sqlite3.connect(index_path_in(self.log))) as writer:
@@ -1049,7 +1072,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             reservations.append(ledger.GateReservation(
                 f"attempt-{ordinal}", int(EPOCH), int(EPOCH) + 10000, Decimal("9"), Decimal("0.02"),
                 ledger.GateTerminated(int(EPOCH) + hours * 3600, f"i-{ordinal}"), "m7a.4xlarge",
-                ledger.BoxRate(Decimal(rate), "applied price")))
+                ledger.BoxRate(Decimal(rate), "applied price"), booked_allowance=booked_allowance))
         # A different reservation must not affect any run's cost.
         reservations.append(ledger.GateReservation("unrelated", int(EPOCH), int(EPOCH) + 10000,
             Decimal("100"), Decimal("100"), ledger.GateTerminated(int(EPOCH) + 3600, "i-other"),
@@ -1061,7 +1084,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         tables = trend_tables(output)
         self.assertEqual(list(tables), ["aws merge gates", "aws targeted tests"])
         self.assertEqual(tables["aws merge gates"][1:], [
-            ["2026-11-03", "2", "8", "10", "30", "30", "$0.670", "$1.020", "$1.340"]])
+            ["2026-11-03", "2", "8", "10", "30", "30", "$0.655", "$1.000", "$1.310"]])
         self.assertEqual(tables["aws targeted tests"][1:], [
             ["2026-11-03", "1", "15", "15", "30", "30", "$0.120", "$0.120", "$0.120", "1"]])
 
@@ -1085,7 +1108,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
         self.assertEqual(trend_tables(output)["aws merge gates"][1:], [
-            ["2026-11-03", "5", "5", "10", "30", "30", "$0.553", "$1.020", "$1.660"]])
+            ["2026-11-03", "5", "5", "10", "30", "30", "$0.543", "$1.000", "$1.630"]])
         self.assertEqual(output.count("2 of 5 runs have no cost record."), 1)
         self.assertNotIn("aws-build merge gates", output)
         self.assertNotIn("aws-unpriced merge gates", output)
@@ -1200,7 +1223,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertNotEqual(output.getvalue(), first)
         path = self.log / show.TREND_CACHE_NAME
         document = cast(dict[str, object], json.loads(path.read_text()))
-        for damaged in ("not JSON", json.dumps({**document, "version": 2})):
+        for damaged in ("not JSON", json.dumps({**document, "version": 3})):
             with self.subTest(cache=damaged):
                 _ = path.write_text(damaged)
                 status, output, errors = report_without_update("trend", "--days", "2")
@@ -1237,7 +1260,8 @@ from pathlib import Path
 import os
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
+import runpy
+runpy.run_path(str(Path(sys.argv[1]) / 'scripts/lib/python_startup/sitecustomize.py'), run_name='_trend_python_startup')["select_checkout"](sys.argv)
 from scripts.test_times import show
 from scripts.lib import file_lock
 class FixedTime(datetime):

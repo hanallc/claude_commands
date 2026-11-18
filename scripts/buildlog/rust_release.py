@@ -120,7 +120,7 @@ def pinned_version() -> str | None:
 
 def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
     with subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, stdin=subprocess.DEVNULL, start_new_session=True) as process:
+                          text=True, stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
@@ -368,7 +368,8 @@ def trial_release(version: str, run_command: RunCommand, held: Callable[[], bool
         step = "checkout"
         if held():
             raise TrialDeferred("build hold active")
-        with copies.standing("toolchain-trial", HANA, copies.CommittedSource(revision.stdout.strip())) as checkout:
+        # The raw Cargo commands are OtherCommand and have no first queue step.
+        with copies.standing("toolchain-trial", HANA, copies.CommittedSource(revision.stdout.strip()), step="toolchain-trial") as checkout:
             _ = scratch.save_cargo_outputs(checkout)
             clippy_env = env | {
                 "CARGO_INCREMENTAL": "0", "CARGO_TARGET_DIR": str(checkout / "target"),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shutil
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
@@ -57,7 +58,10 @@ touch hook-finished
         _ = self.git("commit", "-am", "next")
         self.install_gh()
         stopped = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
-        self.assertNotEqual(stopped.returncode, 0)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("post-push hook: failed (exit 9); rerun:", stopped.stderr)
+        self.assertIn("LANDED_SHA=", stopped.stderr)
+        self.assertIn("LANDED_BRANCH=main", stopped.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD").stdout, self.git("rev-parse", "origin/main").stdout)
         landed = self.git("rev-parse", "HEAD").stdout
         finished = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
@@ -74,10 +78,24 @@ touch hook-finished
         self.seed()
         self.install_gh()
         first = self.git("rev-parse", "HEAD").stdout.strip()
-        # Stop after publishing the completion, before the script exits.
-        self.stop_command("mv", target=".git/post-push-completed", after=True)
+        stop = self.write(self.root / "stop-completion", "stop\n")
+        startup = self.root / "startup"
+        _ = self.write(startup / "sitecustomize.py", f'''from pathlib import Path
+from scripts.lib import atomic_file
+write = atomic_file.write_text_atomic
+def stop_after_completion(path, text, **options):
+    write(path, text, **options)
+    flag = Path({str(stop)!r})
+    if path.name == "post-push-completed" and flag.exists():
+        flag.unlink()
+        raise SystemExit(86)
+atomic_file.write_text_atomic = stop_after_completion
+''')
+        self.environment["PYTHONPATH"] = os.pathsep.join((str(startup), str(Path(__file__).resolve().parents[2])))
         stopped = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
         self.assertNotEqual(stopped.returncode, 0)
+        self.assertFalse(stop.exists(), stopped.stdout + stopped.stderr)
+        self.assertEqual((self.repo / ".git/post-push-completed").read_text().strip(), first)
         repeated = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual((self.repo / ".git/hook-runs").read_text().splitlines(), [first])

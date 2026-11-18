@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import pwd
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
+
+from scripts.lib import main_push_lock, models_registry
+from scripts.lib.checkout_test_support import write_python_tool
+from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
 
@@ -153,6 +158,61 @@ def claude_catalog_environment(directory: Path, targets: Mapping[str, str]) -> d
     return {"CLAUDE_CONFIG_DIR": str(directory), "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", "")}
 
 
+class RegistryPublicationTests(ScriptRepositoryTestCase):
+    def test_registry_publication_runs_the_hook_with_the_landed_commit_under_the_lock(self) -> None:
+        self.seed()
+        path = self.write(self.repo / "config/models.conf", "[fixture]\nmodel=old\n")
+        _ = self.git("add", "config/models.conf")
+        _ = self.git("commit", "-m", "seed registry")
+        _ = self.git("push", "origin", "main")
+        log = self.root / "hook-log"
+        _ = self.write(self.repo / ".claude/config/post_push.sh",
+                       f'printf "%s\\n" "$LANDED_SHA" > "{log}"\n')
+        _ = self.write(self.remote / "hooks/pre-receive",
+                       f'#!/bin/sh\nif flock -n "{self.repo}/.git/main-push.lock" true; then exit 93; fi\n')
+        (self.remote / "hooks/pre-receive").chmod(0o755)
+        tools = self.root / "lease-git"
+        tools.mkdir()
+        lease_log = self.root / "index-leases"
+        binary = shutil.which("git")
+        assert binary is not None
+        write_python_tool(tools / "git", """import fcntl, os, sys
+from pathlib import Path
+from scripts.lib import build_folders
+index = os.environ.get("GIT_INDEX_FILE", "")
+if index:
+    folder = Path(index).parent
+    if folder.name.startswith(("models-index", "models-ff-index")):
+        lock = folder.with_name(folder.name + ".lock").stat()
+        inherited = []
+        for entry in Path("/dev/fd").iterdir():
+            try:
+                if os.path.samestat(os.fstat(int(entry.name)), lock):
+                    inherited.append(int(entry.name))
+            except OSError:
+                pass
+        assert inherited, "The Git child has no folder lease"
+        fcntl.flock(inherited[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(""" + repr(str(lease_log)) + """, "a") as output:
+            output.write(folder.name + " " + build_folders.build_folder_state(folder) + "\\n")
+os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
+""")
+        before = path.read_text()
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "1",
+                       "TMPDIR": str(self.root), "PATH": str(tools) + os.pathsep + self.environment.get("PATH", os.defpath)}
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(models_registry, "DEFAULT_PATH", path):
+            result = models_registry.store_registry(path, before, before.replace("old", "new"), "fixture")
+        landed = self.git("rev-parse", "origin/main").stdout.strip()
+        self.assertEqual(result, "[fixture]\nmodel=new\n")
+        self.assertEqual(log.read_text(), landed + "\n")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), landed)
+        for tool in ("models-index", "models-ff-index"):
+            with self.subTest(child=tool):
+                self.assertIn(tool + " held", lease_log.read_text().splitlines())
+        self.assertTrue((self.repo / ".git" / main_push_lock.RECORD_NAME).is_file())
+
+
 class LaunchSettingsTests(unittest.TestCase):
     root: Path = Path()
     path: Path = Path()
@@ -184,11 +244,13 @@ class LaunchSettingsTests(unittest.TestCase):
     def test_launch_settings_match_shell_role_resolution_and_tier_precedence(self) -> None:
         from scripts.lib import models_registry
 
+        # Neither resolver has a branch for one key name, so each section checks one or two keys.
+        # Each case starts the shell resolver's registry reader once.
         for family in ("codex", "claude"):
             for section, keys, reference_section in (
-                ("direct", ("impl", "test", "fix", "review"), "direct"),
-                ("design_roles", ("designer", "reviewer"), "design_roles"),
-                ("producers", ("morty", "brain", "dwight"), "producers"),
+                ("direct", ("impl", "review"), "direct"),
+                ("design_roles", ("designer",), "design_roles"),
+                ("producers", ("morty",), "producers"),
                 ("producers", ("producer_only",), "direct"),
             ):
                 for key in keys:
@@ -209,27 +271,24 @@ class LaunchSettingsTests(unittest.TestCase):
                             self.assertEqual((settings.kind, settings.model, settings.effort, settings.service_tier),
                                              self.shell_settings(reference_section, reference_key))
 
-    def test_registry_changes_affect_the_next_launch_without_changing_caller_context(self) -> None:
+    def test_registry_changes_affect_the_next_launch(self) -> None:
         from scripts.lib import models_registry
 
-        with patch.dict(os.environ, {"AGENTS_CALLER_FAMILY": "claude", "AGENTS_CALLER_ASSIGNMENT": "caller"}):
-            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
-            first = models_registry.launch_settings("direct", "impl")
-            _ = write_registry(self.path, {"assignments": {"direct": "caller"},
-                                          "direct.claude": {"impl": "sonnet:max"}})
-            second = models_registry.launch_settings("direct", "impl")
-            self.assertNotEqual((first.kind, first.model), (second.kind, second.model))
-            self.assertEqual((second.kind, second.model, second.effort, second.service_tier),
-                             self.shell_settings("direct", "impl"))
-            self.assertEqual(os.environ["AGENTS_CALLER_FAMILY"], "claude")
-            self.assertEqual(os.environ["AGENTS_CALLER_ASSIGNMENT"], "caller")
+        _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+        first = models_registry.launch_settings("direct", "impl")
+        _ = write_registry(self.path, {"assignments": {"direct": "claude"},
+                                      "direct.claude": {"impl": "sonnet:max"}})
+        second = models_registry.launch_settings("direct", "impl")
+        self.assertNotEqual((first.kind, first.model), (second.kind, second.model))
+        self.assertEqual((second.kind, second.model, second.effort, second.service_tier),
+                         self.shell_settings("direct", "impl"))
 
-            configuration = models_registry.launch_configuration(os.environ)
-            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
-            for inherited, expected in ((False, first), (True, second)):
-                environment = configuration.environment(os.environ) if inherited else dict(os.environ)
-                with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
-                    self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
+        configuration = models_registry.launch_configuration(os.environ)
+        _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+        for inherited, expected in ((False, first), (True, second)):
+            environment = configuration.environment(os.environ) if inherited else dict(os.environ)
+            with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
+                self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
 
     def test_launch_settings_starts_no_python_registry_process(self) -> None:
         from scripts.lib import models_registry
@@ -285,6 +344,29 @@ class LaunchSettingsTests(unittest.TestCase):
                 _ = write_registry(self.path, rows)
                 with self.assertRaises(ValueError):
                     _ = models_registry.launch_settings(section, key)
+
+    def test_a_producer_row_is_validated_before_the_write_and_an_equal_row_changes_nothing(self) -> None:
+        from scripts.lib import models_registry
+
+        _ = write_registry(self.path, {"producers": {"morty": "codex:gpt-test:high", "brain": "codex:gpt-test:medium"}})
+        unchanged = self.path.read_bytes()
+        checked = models_registry.producer_settings("morty", "claude", "sonnet", "max")
+        self.assertEqual(self.path.read_bytes(), unchanged)
+        stored = models_registry.store_producer("morty", "claude", "sonnet", "max")
+        self.assertEqual(stored, checked)
+        self.assertEqual((stored.kind, stored.model, stored.effort), ("claude", "sonnet", "max"))
+        self.assertEqual(models_registry.launch_settings("producers", "morty"), stored)
+        self.assertEqual(models_registry.parse_registry(self.path.read_text())["producers"],
+                         {"morty": "claude:sonnet:max", "brain": "codex:gpt-test:medium"})
+        before = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        self.assertEqual(models_registry.store_producer("morty", "claude", "sonnet", "max"), stored)
+        for family, model, effort in (("claude", "missing-agent", "max"), ("claude", "sonnet", "invalid-effort"),
+                                      ("unknown-family", "sonnet", "max"), ("claude", "sonnet", "")):
+            with self.subTest(family=family, model=model, effort=effort), self.assertRaises(ValueError):
+                _ = models_registry.store_producer("morty", family, model, effort)
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), before)
+        added = models_registry.store_producer("producer_only", "codex", "gpt-test", "high")
+        self.assertEqual(models_registry.launch_settings("producers", "producer_only"), added)
 
 
 @final

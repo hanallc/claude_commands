@@ -4,7 +4,6 @@ from __future__ import annotations
 import unittest
 import json
 import os
-import runpy
 import select
 import subprocess
 import sys
@@ -16,12 +15,32 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, processes_carrying
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, FixtureHang
 
 
 @final
 class VerifyMacFixtureTests(VerifyMacOffloadFixture):
+    def test_condition_can_become_true_between_its_check_and_process_exit(self) -> None:
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read(1)"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) as process:
+            first = True
+
+            def ended() -> bool:
+                nonlocal first
+                if first:
+                    first = False
+                    assert process.stdin is not None
+                    _ = process.stdin.write("x")
+                    process.stdin.flush()
+                    _ = process.wait(timeout=1)
+                    return False
+                return process.poll() is not None
+
+            self.wait_until(ended, "the child exit", (process,))
+            self.assertEqual(process.returncode, 0)
+
     def test_targets_wrapper_interrupted_publication_keeps_complete_state(self) -> None:
         arguments = ["--leave-hook", "hook with spaces \N{SNOWMAN}"]
         publications = (
@@ -49,16 +68,16 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
                     replace(source, destination)
 
                 def run_wrapper() -> None:
-                    with self.assertRaises(SystemExit) as exited:
-                        exec(TARGETS_WRAPPER, {"__name__": "__main__"})
-                    self.assertEqual(exited.exception.code, 10)
+                    wrapper: dict[str, object] = {"__name__": "targets_wrapper"}
+                    exec(TARGETS_WRAPPER, wrapper)
+                    wrapper["real_targets"] = lambda: 10
+                    self.assertEqual(cast(Callable[[], object], wrapper["main"])(), 10)
 
                 with mock.patch.dict(os.environ, {**self.environment,
                         "TEST_RUNNER_STATE": str(root), "TEST_LOCAL_WAIT_SECONDS": "1",
                         "BUILDLOG_HOLD_WAIT_FILE": str(root / "hold-wait"),
                         "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets/build_targets.py")}), \
-                        mock.patch.object(sys, "argv", ["targets-wrapper", command, *arguments]), \
-                        mock.patch.object(runpy, "run_path", side_effect=SystemExit(10)):
+                        mock.patch.object(sys, "argv", ["targets-wrapper", command, *arguments]):
                     with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=interrupt_publication):
                         with self.assertRaisesRegex(OSError, "interrupted publication"):
                             run_wrapper()
@@ -96,6 +115,41 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
                 child.kill()
             _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
+    def test_exceptional_verify_exit_stops_its_processes_before_the_next_case(self) -> None:
+        for failure in (subprocess.TimeoutExpired("verify", 0), FixtureHang("the fixture stopped")):
+            with self.subTest(failure=type(failure).__name__):
+                process = subprocess.Popen([sys.executable, "-c", """
+import subprocess
+from pathlib import Path
+import os
+from scripts.direct.wait_for_test_state import wait_for_file
+child = subprocess.Popen(["sleep", "300"])
+print("ready", flush=True)
+wait_for_file(Path(os.environ["TEST_RUNNER_STATE"]) / "exception-release")
+"""], cwd=VERIFY.parents[2], env=self.environment, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, start_new_session=True)
+                assert process.stdout is not None
+                self.assertEqual(process.stdout.readline(), "ready\n")
+                communicate = process.communicate
+                first = True
+
+                def interrupt(timeout: float) -> tuple[str, str]:
+                    nonlocal first
+                    if first:
+                        first = False
+                        raise failure
+                    return communicate(timeout=timeout)
+
+                try:
+                    with mock.patch.object(self, "start_verify", return_value=process), \
+                         mock.patch.object(process, "communicate", side_effect=interrupt), \
+                         self.assertRaises(type(failure)):
+                        _ = self.verify("test", "sample")
+                    self.assertIsNotNone(process.poll())
+                    self.assertEqual(processes_carrying(self.child_marker()), set())
+                finally:
+                    self.stop_verify(process)
+
     def test_build_tools_cannot_use_the_host_path(self) -> None:
         host_tools = self.root / "host-tools"
         host_tools.mkdir()
@@ -120,6 +174,7 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
                 (tree / "build_hold").mkdir(parents=True)
                 (tree / "buildlog").mkdir()
                 (tree / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
+                (tree / "direct").symlink_to(VERIFY.parent.parent / "direct", target_is_directory=True)
                 release = tree.parent / "recorder-release"
                 completed = tree.parent / "recorder-completed"
                 self.write_executable(tree / "buildlog/record.py", f'''

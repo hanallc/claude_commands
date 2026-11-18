@@ -10,6 +10,32 @@ from scripts.build_queue.admission_code import (
 )
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import cloud_progress, progress_profile
+from scripts.build_queue.placement import (
+    SourceKeyKnown as SourceKeyKnown,
+    SourceKeyUnavailable as SourceKeyUnavailable,
+    SourceIdentity as SourceIdentity,
+    ClaimHolderIdentity as ClaimHolderIdentity,
+    ClaimHolderUnconfirmed as ClaimHolderUnconfirmed,
+    TokenRequired as TokenRequired,
+    TokenHeld as TokenHeld,
+    TokenNotRequired as TokenNotRequired,
+    LocalExecutionPrerequisite as LocalExecutionPrerequisite,
+    NormalStep as NormalStep,
+    SpeculativeCopy as SpeculativeCopy,
+    PlacementPurpose as PlacementPurpose,
+    AttemptRunning as AttemptRunning,
+    AttemptCompleted as AttemptCompleted,
+    PrelaunchRefused as PrelaunchRefused,
+    AttemptDeclined as AttemptDeclined,
+    AttemptCancelled as AttemptCancelled,
+    AttemptOutcomeUnavailable as AttemptOutcomeUnavailable,
+    AttemptOutcome as AttemptOutcome,
+    RetryAt as RetryAt,
+    DoNotRetry as DoNotRetry,
+    RetryDecision as RetryDecision,
+    DispatchPathSettled as DispatchPathSettled,
+    DispatchPathPending as DispatchPathPending,
+)
 from scripts.build_queue.admission_wire import (
     AdmissionUnavailable as AdmissionUnavailable,
     UnsupportedVersion as UnsupportedVersion,
@@ -23,6 +49,10 @@ from scripts.build_queue.admission_wire import (
     CallerCode as CallerCode,
     AdmitRequest as AdmitRequest,
     ServiceEstimateRequest as ServiceEstimateRequest,
+    RepositorySlotRequest as RepositorySlotRequest,
+    RepositorySlotWaiting as RepositorySlotWaiting,
+    RepositorySlotReady as RepositorySlotReady,
+    RepositorySlotExpired as RepositorySlotExpired,
     LaunchRequest as LaunchRequest,
     ReleaseRequest as ReleaseRequest,
     WidthRequest as WidthRequest,
@@ -30,7 +60,6 @@ from scripts.build_queue.admission_wire import (
     ViewRequest as ViewRequest,
     ExplainRequest as ExplainRequest,
     MineRequest as MineRequest,
-    AdmitHeadRequest as AdmitHeadRequest,
     PrioritySetRequest as PrioritySetRequest,
     PriorityClearRequest as PriorityClearRequest,
     TokenWaitRequest as TokenWaitRequest,
@@ -43,14 +72,22 @@ from scripts.build_queue.admission_wire import (
     RunnerAdmitted as RunnerAdmitted,
     LaunchAdmitted as LaunchAdmitted,
     Refused as Refused,
+    PLACEMENT_REQUEST_MISSING_REASON as PLACEMENT_REQUEST_MISSING_REASON,
     Ok as Ok,
     BuildHistoryReply as BuildHistoryReply,
     PlacementRequest as PlacementRequest,
+    LocalAdmissionContext as LocalAdmissionContext,
+    LocalAdmissionUnavailable as LocalAdmissionUnavailable,
+    PrerequisiteReport as PrerequisiteReport,
+    CancelPlacement as CancelPlacement,
     ClaimFailure as ClaimFailure,
     ConsumePermission as ConsumePermission,
     ExecutionReport as ExecutionReport,
     PlacementWait as PlacementWait,
+    PlacementResourceWait as PlacementResourceWait,
+    PlacementEvidenceWait as PlacementEvidenceWait,
     Assignment as Assignment,
+    LocalPlacementGranted as LocalPlacementGranted,
     FirstAuthorization as FirstAuthorization,
     DispatchStatus as DispatchStatus,
     VERSION as VERSION,
@@ -62,6 +99,7 @@ from scripts.build_queue.admission_wire import (
     CLEANUP_STATUS_MAX as CLEANUP_STATUS_MAX,
     CLEANUP_REQUEST_MAX_BYTES as CLEANUP_REQUEST_MAX_BYTES,
     Request as Request,
+    Reply as WireReply,
     admission_socket_path as admission_socket_path,
     encode_record as encode_record,
     parse_record as parse_record,
@@ -79,6 +117,7 @@ Profile = records.StepProfile | records.ProgramProfile
 
 @dataclass(frozen=True)
 class CloudRow:
+    """The cloud queue row holds caller identity, placement, progress, and wait state."""
     owner: Owner
     identity: Identity
     place: CloudPlace
@@ -89,36 +128,45 @@ class CloudRow:
     wait: CloudSlotWait | records.ReadyForAdmission
 
 
+@dataclass(frozen=True)
+class RepositorySlotRow:
+    """A transient repository slot wait appears beside queued memory waits."""
+    owner: Owner
+    identity: Identity
+    since: float
+    machine: str
+    wait: RepositorySlotWaiting
+
 
 @dataclass(frozen=True)
 class CloudQueueRead(records.QueueRead):
+    """The queue reading includes cloud rows, slot capacity, and stale push counts."""
     cloud: tuple[CloudRow, ...] = ()
     cloud_slots: int = 0
     cloud_gate_stale_pushes: int = field(kw_only=True)
-
+    repository_slots: tuple[RepositorySlotRow, ...] = ()
 
 
 @dataclass(frozen=True)
 class ViewReply:
+    """The reply holds the local or cloud queue reading."""
     reading: records.QueueRead | CloudQueueRead
-
 
 
 @dataclass(frozen=True)
 class ExplainReply:
+    """The reply holds the queue explanation and configuration diagnostics."""
     explanation: records.QueueExplanation
     diagnostics: tuple[records.ConfigurationDiagnostic, ...] = ()
 
 
-
 @dataclass(frozen=True)
 class MineReply:
+    """The reply holds the queue reading requested by a session."""
     reading: records.QueueRead | CloudQueueRead
 
 
-
-Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
-         | PlacementWait | Assignment | FirstAuthorization | DispatchStatus)
+Reply = WireReply | ViewReply | ExplainReply | MineReply
 
 _REPLIES: dict[str, type] = {**REPLY_TYPES, "view": ViewReply, "explain": ExplainReply, "mine": MineReply}
 
@@ -129,7 +177,6 @@ def encode_reply(reply: Reply, *, version: int = VERSION) -> str:
         local = records.QueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics)
         reply = type(reply)(local)
     return encode_envelope(reply, _REPLIES, version)
-
 
 
 def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:

@@ -14,6 +14,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_names import fixture_names
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.message import sessions as runtime_sessions
 from scripts.message.process_identity import process_start as REAL_PROCESS_START
 
@@ -287,6 +288,7 @@ class AddUnitTestCase(ShutdownTestCase):
 
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        bind_private_run_roots(self, self.root)
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
         ))
@@ -369,6 +371,20 @@ class AddUnitTestCase(ShutdownTestCase):
 
 
 def submit_command(argv):
+    if argv[2:4] == ["tab", "create"]:
+        from scripts.lib.atomic_file import write_text_atomic
+        path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+        responses = json.loads(path.read_text())
+        for command, response in tuple(responses.items()):
+            if command.startswith("--session " + argv[1] + " ") and "w1:p1" in command:
+                responses[command.replace("w1:p1", "w1:p2")] = response
+        responses[" ".join(argv)] = {"code": 0, "stdout": json.dumps({"result": {
+            "root_pane": {"pane_id": "w1:p2"}, "tab": {"tab_id": "w1:t2"}}})}
+        inventory = json.loads(responses["--session " + argv[1] + " pane list"]["stdout"])
+        inventory["result"]["panes"].append({"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1",
+            "label": argv[argv.index("--label") + 1]})
+        responses["--session " + argv[1] + " pane list"] = {"code": 0, "stdout": json.dumps(inventory)}
+        write_text_atomic(path, json.dumps(responses))
     if argv[2:4] == ["pane", "process-info"] and "FAKE_SHELL_PID" in os.environ:
         from scripts.production.add_unit_test_support import fixture_foreground
         from scripts.lib.atomic_file import write_text_atomic
@@ -377,7 +393,7 @@ def submit_command(argv):
         responses[" ".join(argv)] = fixture_foreground(int(os.environ["FAKE_SHELL_PID"]))
         write_text_atomic(path, json.dumps(responses))
     result = main(argv)
-    if result == 0 and argv[2:4] == ["workspace", "create"]:
+    if result == 0 and argv[2:4] in (["workspace", "create"], ["tab", "create"]):
         from scripts.production.fake_unit_host import process
         from scripts.lib.atomic_file import write_text_atomic
         root = Path(os.environ["HERDR_PROC"])
@@ -385,7 +401,8 @@ def submit_command(argv):
         original = root / os.environ["FAKE_SHELL_PID"]
         parent = int((original / "stat").read_text().rsplit(")", 1)[1].split()[1])
         process(os.environ, shell, parent, ["zsh"],
-                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p1"}, cwd=(original / "cwd").resolve())
+                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p2" if argv[2] == "tab" else "w1:p1"},
+                cwd=(original / "cwd").resolve())
         write_text_atomic(Path(os.environ["STUB_STATE"]) / "pane-shell", str(shell))
     if result == 0 and argv[2:4] == ["agent", "start"]:
         from scripts.production.add_unit_test_support import fixture_agent_started
@@ -403,6 +420,18 @@ def submit_command(argv):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
                                    "message": {"role": "user", "content": argv[-1]}}) + "\n")
+        if argv[4] == "w1:p2":
+            from scripts.production.add_unit_test_support import fixture_foreground
+            from scripts.lib.atomic_file import write_text_atomic
+            responses_path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+            responses = json.loads(responses_path.read_text())
+            inventory = json.loads(responses["--session " + argv[1] + " pane list"]["stdout"])
+            inventory["result"]["panes"].append({"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1",
+                "label": session_id, "agent_session": {"kind": "id", "value": session_id}})
+            responses["--session " + argv[1] + " pane list"] = {"code": 0, "stdout": json.dumps(inventory)}
+            responses["--session " + argv[1] + " pane process-info --pane w1:p2"] = fixture_foreground(
+                int(os.environ["FAKE_SHELL_PID"]))
+            write_text_atomic(responses_path, json.dumps(responses))
     return result
 
 '''
@@ -548,6 +577,7 @@ def submit_command(argv):
             f"--user show -p FragmentPath --value herdr-{SHARED}.service": CommandResponse(
                 code=0, stdout=f"{self.env['HOME']}/.config/systemd/user/herdr-{SHARED}.service\n"),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "workspace": {"workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
         responses["agent get"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
@@ -623,7 +653,7 @@ def submit_command(argv):
     def prepare_herdr_launch(self, *args: str) -> None:
         parser = argparse.ArgumentParser()
         _ = parser.add_argument("name")
-        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
+        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact", "unit-type"):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
@@ -639,6 +669,7 @@ def submit_command(argv):
             launch = add_unit.UnitLaunch(production=requested.production, branch=requested.branch,
                 worktree=requested.worktree, plan=requested.plan, port=requested.port,
                 session=requested.session, timeout=requested.timeout, responsibilities=requested.responsibilities,
+                unit_type=requested.unit_type,
                 identity=add_unit.UnitIdentity(requested.unit, requested.requested_name))
             self.configure_herdr(launch)
         except (Refusal, OSError, ValueError):

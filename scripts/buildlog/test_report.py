@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
-from scripts.buildlog.cli_probe_test_support import MeasuredCliRun, measure_cli_work
+from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
 from scripts.buildlog import disk, ci
 from scripts.buildlog import index
@@ -141,11 +141,11 @@ class ReportSpeedTests(unittest.TestCase):
                 full_rows = path.read_bytes().splitlines(keepends=True)
                 # Preserve the distribution of timestamps, kinds and Mac results.
                 quarter_rows = full_rows[:29_138:4] + full_rows[29_138:65_600:4] + full_rows[65_600:]
-                runs: list[list[MeasuredCliRun]] = []
-                for rows in (quarter_rows, full_rows):
-                    _ = path.write_bytes(b"".join(rows))
-                    _ = index.reindex()
-                    runs.append([measure_cli_work("report", environment, len(rows)) for _ in range(3)])
+                # The full index is current, so only the quarter rows need a new index.
+                full_runs = [measure_cli_work("report", environment, len(full_rows)) for _ in range(3)]
+                _ = path.write_bytes(b"".join(quarter_rows))
+                _ = index.reindex()
+                runs = [[measure_cli_work("report", environment, len(quarter_rows)) for _ in range(3)], full_runs]
                 for size, measurements in zip((len(quarter_rows), len(full_rows)), runs, strict=True):
                     for measured in measurements:
                         result = measured.result
@@ -231,6 +231,29 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.report(connection, day or local_day(STAMP))
+
+    def test_report_uses_one_target_identity_for_all_sections(self) -> None:
+        from scripts.buildlog import record
+
+        self.write(self.root / 'natedev' / 'fixture.jsonl', cargo_build('local-step'))
+        _ = index.update()
+        identity = record.LocalStepIdentity(('natedev',), ('natedev',))
+        changed = record.LocalStepIdentity(('changed-target',), ('changed-host',))
+        snapshots: list[record.LocalStepIdentity] = []
+        local_identity = mac_outcome.local_identity
+
+        def predicate_identity() -> record.LocalStepIdentity:
+            current = local_identity()
+            snapshots.append(current)
+            return current
+
+        with closing(index.read_only()) as connection, mock.patch.object(
+                record, 'local_step_identity', side_effect=[identity, *([changed] * 100)]), mock.patch.object(
+                mac_outcome, 'local_identity', side_effect=predicate_identity):
+            text = report.report(connection, local_day(STAMP))
+        self.assertIn('## Builds,', text)
+        self.assertGreater(len(snapshots), 1)
+        self.assertEqual(set(snapshots), {identity})
 
     def poll_stamp(self, at: datetime, complete: bool = True) -> None:
         path = self.root / "ci" / "polled.json"
@@ -3037,6 +3060,17 @@ class ReportTests(unittest.TestCase):
         disk.write_snapshot(expanded)
         self.assertEqual(report.disk_section(), old_lines)
         self.assertIn("| /tmp | 1.0 GiB |", old_lines)
+        for capacity_at in (base["measured_at"], "2026-10-04T16:24:00+00:00"):
+            with self.subTest(capacity_measured_at=capacity_at):
+                disk.write_snapshot({**expanded, "capacity_measured_at": capacity_at})
+                with mock.patch.object(sync, "sync_time", side_effect=[base["measured_at"], capacity_at]):
+                    lines = report.disk_section()
+                if capacity_at == base["measured_at"]:
+                    expected = f"Measured by the buildlog disk job at {base['measured_at']}"
+                else:
+                    expected = (f"Folder sizes measured by the buildlog disk job at {base['measured_at']}; "
+                                f"free and used space at {capacity_at}")
+                self.assertIn(f"{expected}: allocated blocks, each hard-linked file once.", lines)
 
     def test_no_disk_section_without_snapshot(self) -> None:
         with mock.patch("scripts.buildlog.report.disk.read_snapshot", return_value=None):

@@ -25,14 +25,18 @@ import subprocess
 import sys
 import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
+from collections import Counter, OrderedDict
 from contextvars import Context, ContextVar
-from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext, redirect_stderr
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from contextlib import closing, contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
+from functools import cached_property
 from pathlib import Path
-from typing import override, TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, TextIO, cast, overload
+from threading import Lock
+from typing import override, TYPE_CHECKING, BinaryIO, Literal, NotRequired, Protocol, TypedDict, TextIO, cast, overload
 from importlib import import_module
+from uuid import UUID
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -43,7 +47,7 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 from scripts.whoami import account  # noqa: E402
 from scripts.herdr import herdr_types  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
-from scripts.lib import atomic_file, conf, file_lock, models_registry  # noqa: E402
+from scripts.lib import atomic_file, conf, file_lock, models_registry, registry_rows, transcripts  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone
@@ -60,6 +64,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 
 from scripts.accounts import next_moves
 from scripts.agents import remote, stop_results
+from scripts.message.session_records import latest_transcript
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
     StoredGroupSelection as StoredGroupSelection, StoredGroupSelections as StoredGroupSelections,
@@ -144,6 +149,9 @@ ALWAYS_LINKED = frozenset({
     "paste-cache", "uploads",
 })
 CODEX_ALWAYS_LINKED = frozenset({"skills", "rules", "plugins", "sessions", "archived_sessions"})
+# Keep these links before the first append creates their shared targets.
+CODEX_WRITE_THROUGH = frozenset({"session_index.jsonl", "history.jsonl"})
+NO_WRITE_THROUGH_FILES = frozenset[str]()
 AT_FDCWD = -100  # Linux: resolve relative paths from the current directory.
 RENAME_NOREPLACE = 1  # Linux renameat2: refuse an existing destination.
 RENAME_EXCL = 4  # macOS renamex_np: refuse an existing destination.
@@ -191,7 +199,7 @@ CODEX_ROLE = "workers"
 NO_VALUE = "—"
 TABLE_HEADINGS = (
     "Folder", "Label", "Role", "Weekly left", "Weekly resets",
-    "On credits", "Credits left", "Read",
+    "On credits", "Credits left", "Read", "Login ends",
 )
 
 
@@ -776,12 +784,13 @@ def _repair_link(path: Path, target: Path, shared_home: str = "~/.claude") -> li
 
 def _shared_repair_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Judge shared entries without performing any of their possible repairs."""
     if destination == source_dir:
         return []
     if not source_dir.is_dir():
-        return _shared_link_problems(destination, source_dir, shared, folders)
+        return _shared_link_problems(destination, source_dir, shared, folders, write_through=write_through)
     problems: list[str] = []
     for name in shared:
         path, target = destination / name, source_dir / name
@@ -809,6 +818,7 @@ def _shared_repair_problems(
 
 def _repair_shared_links(
     destination: Path, source_dir: Path, shared: tuple[str, ...], folders: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     """Repair entries inside an existing shared home; never create an empty shared file."""
     if (destination == source_dir or destination.is_symlink() or not destination.is_dir()
@@ -826,7 +836,7 @@ def _repair_shared_links(
                 if name in folders:
                     target.mkdir(mode=0o700, exist_ok=True)
                     target.chmod(0o700)
-                else:
+                elif name not in write_through:
                     if _is_expected_link(path, target):
                         try:
                             path.unlink()
@@ -1003,15 +1013,31 @@ def source_has_claude_trust(source: Path) -> bool:
     return False
 
 
-def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
-    """Trust a folder or remove its project entry in every existing account file. Report each failed home independently."""
+@dataclass(frozen=True)
+class FolderTrustComplete:
+    """Every existing account file has the requested folder trust state."""
+
+
+@dataclass(frozen=True)
+class FolderTrustFailed:
+    """One or more account files could not receive the requested folder trust state."""
+
+    reasons: tuple[str, ...]
+
+    def report(self) -> None:
+        for reason in self.reasons:
+            print(reason, file=sys.stderr)
+
+
+def set_claude_folder_trust(folder: Path, *, trusted: bool) -> FolderTrustComplete | FolderTrustFailed:
+    """Set folder trust in each existing account file and return all failures."""
     try:
         key = str(folder.resolve())
         files = _account_trust_files()
     except (OSError, ValueError) as error:
-        print(f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__})", file=sys.stderr)
-        return
+        return FolderTrustFailed((f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__}): {error}",))
     change = with_trusted_folders if trusted else without_project_entries
+    failures: list[str] = []
     for account_file in files:
         try:
             _ = account_file.path.stat()
@@ -1019,7 +1045,8 @@ def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
         except FileNotFoundError:
             continue
         except (OSError, ValueError) as error:
-            print(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__})", file=sys.stderr)
+            failures.append(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__}): {error}")
+    return FolderTrustFailed(tuple(failures)) if failures else FolderTrustComplete()
 
 
 def trust_accounts() -> int:
@@ -1106,6 +1133,7 @@ def _link_problems(destination: Path) -> list[str]:
 
 def _shared_link_problems(
     destination: Path, source_dir: Path, shared: tuple[str, ...], required: frozenset[str],
+    *, write_through: frozenset[str] = NO_WRITE_THROUGH_FILES,
 ) -> list[str]:
     problems: list[str] = []
     for name in shared:
@@ -1125,7 +1153,7 @@ def _shared_link_problems(
                 problems.append(
                     f"accounts: {path} points to {actual}, not {target}"
                 )
-            elif not path.exists():
+            elif not path.exists() and not (name in write_through and not os.path.lexists(target)):
                 problems.append(f"accounts: {path} is broken")
         elif path.exists():
             problems.append(_real_entry_problem(path, f"~/{source_dir.name}"))
@@ -1335,6 +1363,7 @@ def _link_codex_home(label: str) -> list[str]:
         return [f"accounts: could not create {destination}: {error}"]
     problems = _repair_shared_links(
         destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     return problems
 
@@ -1396,10 +1425,11 @@ def _inspect_codex_home(label: str, destination: Path, workers_home: Path, *, al
         return CodexHomeInspection((diagnostic,), ObservedStateCause(diagnostic,
             ProblemCauseKey("access", CauseAccount(label), CauseFile(str(destination)))))
     problems = (_check_default_codex_home(workers_home) if destination == accounts_home() / ".codex"
-                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED)
+                else _shared_repair_problems(destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+                                            write_through=CODEX_WRITE_THROUGH)
                 if allow_shared_repair
                 else _shared_link_problems(destination, (accounts_home() / ".codex").absolute(),
-                                           CODEX_SHARED, CODEX_ALWAYS_LINKED))
+                                           CODEX_SHARED, CODEX_ALWAYS_LINKED, write_through=CODEX_WRITE_THROUGH))
     problems.extend(_codex_private_link_problems(destination))
     if destination != accounts_home() / ".codex":
         try:
@@ -1708,8 +1738,8 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
 
 
 def _validate_role(role: str) -> None:
-    if role not in {"unit", "showrunner", "workers"}:
-        raise AccountsError(f"accounts: {role} is not a role; only unit, showrunner and workers are supported")
+    if role not in {"unit", "showrunner", "producer", "workers"}:
+        raise AccountsError(f"accounts: {role} is not a role; only unit, showrunner, producer and workers are supported")
 
 
 def read_role_map() -> RoleMap:
@@ -1741,7 +1771,7 @@ def _workers_home() -> Path:
 
 
 @overload
-def role_account(role: Literal["unit", "showrunner"]) -> ClaudeLaunchAccount: ...
+def role_account(role: Literal["unit", "showrunner", "producer"]) -> ClaudeLaunchAccount: ...
 
 
 @overload
@@ -1759,7 +1789,7 @@ def role_account(role: str) -> AccountSelection:
         home = _workers_home()
         label = agent_accounts.codex_home_role_label(home)
         return CodexWorkersAccount(label, home)
-    group: ClaudeGroup = "units" if role == "unit" else "showrunners"
+    group: ClaudeGroup = "units" if role == "unit" else "producers" if role == "producer" else "showrunners"
     selected = group_label(group_accounts(), group)
     if isinstance(selected, GroupNotConfigured):
         raise AccountsError("accounts: " + group_configuration_line(group))
@@ -2188,8 +2218,8 @@ def codex_destination_uses_credits(chosen: PickedAccount, now: datetime) -> bool
     return chosen.weekly_left <= 0
 
 
-ClaudeGroup = Literal["units", "showrunners"]
-CLAUDE_GROUPS: tuple[ClaudeGroup, ...] = ("units", "showrunners")
+ClaudeGroup = role_map.ClaudeGroup
+CLAUDE_GROUPS = role_map.CLAUDE_GROUPS
 
 
 @dataclass(frozen=True)
@@ -2215,6 +2245,7 @@ ACCOUNT_DECISION_NOW = AccountDecisionNow()
 class GroupAccounts(TypedDict, total=False):
     units: str
     showrunners: str
+    producers: str
 
 
 @dataclass(frozen=True)
@@ -2275,8 +2306,8 @@ class UnitsResetSoonest:
 
 
 @dataclass(frozen=True)
-class ShowrunnersMostLeft:
-    """Keep showrunners on the account with the most weekly allowance."""
+class MostWeeklyQuotaLeft:
+    """Select the account with the most weekly quota left."""
 
 
 @dataclass(frozen=True)
@@ -2290,7 +2321,7 @@ class GroupPlacement:
     group: ClaudeGroup
     label: str | GroupNotConfigured
     dir: Path | GroupNotConfigured
-    reason: UnitsResetSoonest | ShowrunnersMostLeft | GroupNoRoom
+    reason: UnitsResetSoonest | MostWeeklyQuotaLeft | GroupNoRoom
     reasons: tuple[PickReason, ...] = ()
 
 
@@ -2322,6 +2353,8 @@ def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["un
         return "units"
     if kind == "showrunner":
         return "showrunners"
+    if kind == "producer":
+        return "producers"
     return "ungrouped"
 
 
@@ -2345,34 +2378,38 @@ class InvalidProducerSettings:
     """The producer has no usable launch settings for this operation."""
 
 
-_reported_producer_settings: ContextVar[set[staff.StaffId]] = ContextVar("reported_producer_settings")
+_scoped_producer_settings: ContextVar[dict[staff.StaffId, models_registry.LaunchSettings | InvalidProducerSettings]] = (
+    ContextVar("scoped_producer_settings"))
 
 
 @contextmanager
 def settings_report_scope() -> Generator[None]:
-    """Report each invalid producer once within an operation."""
+    """Resolve and report each producer's settings once within an operation."""
     try:
-        _ = _reported_producer_settings.get()
+        _ = _scoped_producer_settings.get()
     except LookupError:
-        token = _reported_producer_settings.set(set())
+        token = _scoped_producer_settings.set({})
         try:
             yield
         finally:
-            _reported_producer_settings.reset(token)
+            _scoped_producer_settings.reset(token)
     else:
         yield
 
 
 def producer_settings(member: staff.StaffRow) -> models_registry.LaunchSettings | InvalidProducerSettings:
     """Read one producer's settings and exclude it when its settings are invalid."""
+    resolved = _scoped_producer_settings.get({})
+    if member.id in resolved:
+        return resolved[member.id]
     try:
-        return models_registry.launch_settings("producers", member.name)
+        settings: models_registry.LaunchSettings | InvalidProducerSettings = (
+            models_registry.launch_settings("producers", member.name))
     except ValueError as error:
-        reported = _reported_producer_settings.get(set())
-        if member.id not in reported:
-            reported.add(member.id)
-            account_anomaly(f"{member.name}: {error}")
-        return InvalidProducerSettings()
+        account_anomaly(f"{member.name}: {error}")
+        settings = InvalidProducerSettings()
+    resolved[member.id] = settings
+    return settings
 
 
 def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[staff.StaffRow, ...]:
@@ -2413,10 +2450,11 @@ def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple
         return live, ()
     running = {session["sessionId"] for session in sessions.running_sessions()}
     running.update(member.session_id for member in live)
-    kind = "unit" if group == "units" else "showrunner"
-    candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
-    if group == "showrunners":
-        candidates.update((row.id, row) for row in eligible_producers(membership, "claude"))
+    if group == "producers":
+        candidates = {row.id: row for row in eligible_producers(membership, "claude")}
+    else:
+        kind = "unit" if group == "units" else "showrunner"
+        candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
     live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
             or owner.kind != "producer" or owner.id in candidates]
     verified = {member.session_id for member in live}
@@ -2466,12 +2504,14 @@ def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _N
         reset = candidate.weekly_reset.at if isinstance(candidate.weekly_reset, KnownReset) else datetime.max.replace(tzinfo=timezone.utc)
         return (reset, -candidate.weekly_left, f"{_label_number(candidate.label):020d}")
     selected = min(eligible, key=order) if group == "units" else min(eligible, key=lambda item: (-item.weekly_left, *order(item)))
-    reason = UnitsResetSoonest() if group == "units" else ShowrunnersMostLeft()
+    reason = UnitsResetSoonest() if group == "units" else MostWeeklyQuotaLeft()
     return GroupPlacement(group, selected.label, selected.dir, reason, chosen.reasons)
 
 
 def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConfigured:
-    """Convert the optional JSON key into its configuration meaning."""
+    """Use the showrunners account until the producers group has a selection."""
+    if group == "producers" and "producers" not in groups:
+        group = "showrunners"
     label = groups.get(group, GROUP_NOT_CONFIGURED)
     return note_file.canonical_label(label) if isinstance(label, str) else label
 
@@ -2481,11 +2521,11 @@ def group_configuration_line(group: ClaudeGroup) -> str:
 
 
 def group_status_line(groups: GroupAccounts) -> str:
-    return f"units: {group_label(groups, 'units')}, showrunners: {group_label(groups, 'showrunners')}"
+    return ", ".join(f"{group}: {group_label(groups, group)}" for group in CLAUDE_GROUPS)
 
 
 def group_note_labels() -> dict[ClaudeGroup, str]:
-    """The note labels serving each configured Claude launch group."""
+    """The note labels for the effective Claude group accounts."""
     groups = group_accounts()
     labels: dict[ClaudeGroup, str] = {}
     for group in CLAUDE_GROUPS:
@@ -2498,7 +2538,7 @@ def group_note_labels() -> dict[ClaudeGroup, str]:
 
 
 def group_accounts() -> GroupAccounts:
-    """Read only explicit group selections; an absent key stays unconfigured."""
+    """Read only explicit group selections."""
     result = GroupAccounts()
     stored = _stored_groups()
     for group in CLAUDE_GROUPS:
@@ -2707,7 +2747,7 @@ def _unit_role_history() -> list[UnitRoleAssignment]:
             if not isinstance(decoded, dict):
                 raise ValueError("expected a JSON object")
             values = cast(dict[str, object], decoded)
-            if values.get("group") in ("units", "showrunners"):
+            if values.get("group") in CLAUDE_GROUPS:
                 continue
             role = values.get("role")
             if role not in {"unit", "workers"}:
@@ -2873,8 +2913,13 @@ class AccountWorkerActivity(Protocol):
     def row(self) -> staff.StaffRow: ...
 
 
+class AccountOpenWorkerActivity(AccountWorkerActivity, Protocol):
+    @property
+    def status(self) -> str: ...
+
+
 class AccountPaneReader(Protocol):
-    OpenWorker: type[AccountWorkerActivity]
+    OpenWorker: type[AccountOpenWorkerActivity]
 
     def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[AccountWorkerActivity]]: ...
@@ -3091,6 +3136,34 @@ def _resolve_worker_move_target(destination: FollowWorkersRole | FixedClaudeWork
     return _current_workers_target() if isinstance(destination, FollowWorkersRole) else destination.label
 
 
+@dataclass(frozen=True)
+class TargetCanWork:
+    """The target account can take workers."""
+
+
+@dataclass(frozen=True)
+class CreditsOffTarget:
+    """The target may not spend credits and has no included usage left."""
+
+    reason: str
+
+
+def _codex_target_credit_block(label: str, now: datetime) -> TargetCanWork | CreditsOffTarget:
+    """A worker move never sends work to an account that may not spend credits and has no included usage."""
+    if not isinstance(agent_accounts.codex_credits_setting(label), agent_accounts.CreditsOff):
+        return TargetCanWork()
+    try:
+        login = _codex_home_login(_codex_account_home(label))
+    except AccountsError:
+        return TargetCanWork()
+    reading = refusals.stored_reading("codex", login, now) if login else NoReading()
+    if not isinstance(reading, (FreshReading, StaleReading)) or not isinstance(reading.weekly, ReadingWindow):
+        return TargetCanWork()
+    if _codex_reading_can_work(FreshReading(reading.weekly, reading.five_hour, "0"), now, agent_accounts.CreditsOff()):
+        return TargetCanWork()
+    return CreditsOffTarget(f"{label}: it may not spend credits and its included usage is gone; the worker stays")
+
+
 @settings_report_scope()
 def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                       why: str) -> GroupMoveStarted | GroupMoveStartFailed:
@@ -3111,7 +3184,9 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                 target = _resolve_worker_move_target(destination)
                 if attempted.get(row.id) == target:
                     continue
-                results[row.id] = _move_worker_row(pane_moves, row, record, target, why)
+                block = _codex_target_credit_block(target, datetime.now(timezone.utc)) if family == "codex" else TargetCanWork()
+                results[row.id] = (SessionMoveRefused(row.id, block.reason) if isinstance(block, CreditsOffTarget)
+                                   else _move_worker_row(pane_moves, row, record, target, why))
                 attempted[row.id] = target
             with _workers_move_lock("schedule") if isinstance(destination, FollowWorkersRole) else nullcontext():
                 target = _resolve_worker_move_target(destination)
@@ -3121,7 +3196,8 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                 if isinstance(destination, FollowWorkersRole):
                     pending = _read_pending_worker_moves()
                     if isinstance(pending, PendingWorkerMoves):
-                        _complete_worker_move_requests(pending.requests, target)
+                        _complete_worker_move_requests(pending.requests, target,
+                                                       _codex_target_credit_block(target, datetime.now(timezone.utc)))
                         _workers_move_file().unlink()
                 break
     outcomes = tuple(results.values())
@@ -3361,6 +3437,7 @@ def check_codex_target(label: str, workers_home: Path, *, repair: bool = True) -
     target = _codex_move_target(label)
     problems = (_repair_shared_links if repair else _shared_repair_problems)(
         target.home, (accounts_home() / ".codex").absolute(), CODEX_SHARED, CODEX_ALWAYS_LINKED,
+        write_through=CODEX_WRITE_THROUGH,
     )
     for problem in problems:
         account_anomaly(problem)
@@ -3453,7 +3530,8 @@ def _queue_worker_moves(
     atomic_file.write_text_atomic(_workers_move_file(), json.dumps(document) + "\n", new_file_mode=0o600)
 
 
-def _complete_worker_move_requests(requests: tuple[str, ...], target: str) -> None:
+def _complete_worker_move_requests(requests: tuple[str, ...], target: str,
+                                   block: TargetCanWork | CreditsOffTarget) -> None:
     pending = _pending_workers_requests()
     home = str(_codex_account_home(target) if _label_is(target, "codex") else claude_account_dir(target))
     for identity in requests:
@@ -3462,7 +3540,9 @@ def _complete_worker_move_requests(requests: tuple[str, ...], target: str) -> No
             continue
         common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool=request["tool"],
                                   subject="workers", move_id=identity)
-        if request["to"] == target:
+        if isinstance(block, CreditsOffTarget):
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=block.reason))
+        elif request["to"] == target:
             moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=home))
         else:
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=f"superseded by {target}"))
@@ -4223,6 +4303,29 @@ class AccountSessionDocument(TypedDict):
     state: session_state.SessionState
 
 
+MODEL_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+MODEL_ROLES = ("producers", "showrunners", "units", "workers")
+
+
+@dataclass(frozen=True)
+class ObservedSessionModel:
+    """A full provider model ID and the effort used by a session."""
+
+    model: str
+    effort: str
+
+
+@dataclass(frozen=True)
+class SessionModelUnknown:
+    """The session lacks a full model ID or a known effort."""
+
+
+class SessionModelCountDocument(TypedDict):
+    model: str
+    effort: str
+    count: int
+
+
 @dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
@@ -4243,6 +4346,28 @@ class StatusRow:
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
     selected_roles: tuple[str, ...] = ()
     sessions: tuple[AccountSessionDocument, ...] = ()
+    login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
+    models_by_role: dict[str, Counter[ObservedSessionModel]] = field(default_factory=dict)
+    inherited_roles: tuple[ClaudeGroup, ...] = ()
+
+
+@dataclass(frozen=True)
+class FirstNextMoveTargets:
+    """Each group maps to its first queued target; an absent group has no entry."""
+    targets: dict[next_moves.NextMoveGroup, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NextMovesUnavailable:
+    """The local first targets could not be read."""
+    reason: str = "Next moves have not been read."
+
+
+@dataclass(frozen=True)
+class UpcomingMoves:
+    """One read supplies the upcoming list and the first targets."""
+    lines: tuple[str, ...]
+    first: FirstNextMoveTargets | NextMovesUnavailable
 
 
 @dataclass(frozen=True)
@@ -4255,10 +4380,12 @@ class StatusReading:
     represented_stderr: tuple[str, ...] = ()
     session_inputs: tuple[str, ...] = ()
     upcoming_moves: tuple[str, ...] = ()
+    first_next_moves: FirstNextMoveTargets | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
 
 
 class StatusAccountDocument(TypedDict):
     label: str
+    color: NotRequired[str]
     tool: Literal["claude", "codex"]
     roles: list[str]
     selected_roles: list[str]
@@ -4267,6 +4394,7 @@ class StatusAccountDocument(TypedDict):
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
+    login_ends_at: str | None
     credits: float | Literal["unlimited"] | None
     use_credits: bool
     read_at: str | None
@@ -4274,10 +4402,49 @@ class StatusAccountDocument(TypedDict):
     credits_in_use: bool
 
 
+BoardTone = Literal["default", "success", "error", "warning", "inactive"]
+
+
+class BoardSpan(TypedDict):
+    """One styled piece of a board cell; the console Accounts page draws it as it is."""
+    text: str
+    tone: BoardTone
+    kind: Literal["fact", "bold"]
+    color: NotRequired[str]
+    # The statusline.conf key of a valid color; the console Accounts page offers a swatch for it.
+    color_key: NotRequired[str]
+
+
+class BoardColumn(TypedDict):
+    key: str
+    heading: str
+    align: Literal["left", "right"]
+
+
+class BoardGroup(TypedDict):
+    """A Claude group that this account line serves; the console Accounts page sets its next move."""
+    account: str
+    group: ClaudeGroup
+
+
+class BoardRow(TypedDict):
+    """The cells of one table line."""
+    cells: dict[str, list[BoardSpan]]
+    group: NotRequired[BoardGroup]
+
+
+class Board(TypedDict):
+    """The rows hold the reset text for one local day; a reader draws them again from stale_at, an ISO UTC time."""
+    columns: list[BoardColumn]
+    rows: list[BoardRow]
+    stale_at: str
+
+
 class StatusDocument(TypedDict):
     upcoming_moves: list[str]
     session_inputs: list[str]
     accounts: list[StatusAccountDocument]
+    board: Board
     problems: list[str]
 
 
@@ -4349,7 +4516,9 @@ def _status_row(
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
         read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
         else agent_accounts.UsageReadOutcome.OK,
-        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable())
+        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable(),
+        login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
+        if login and tool == "claude" else agent_accounts.LoginEndUnknown())
 
 
 def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[str, ...]:
@@ -4379,11 +4548,387 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
-        read_cell)
+        read_cell,
+        row.login_ends_at.at.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
+        if row.tool == "claude" and isinstance(row.login_ends_at, agent_accounts.LoginEndKnown) else NO_VALUE)
+
+
+COUNT_COLUMNS = ("busy", "idle", "paused", "exited", "total")
+ACCOUNT_BOARD_DESCENDING_SORTS = (*COUNT_COLUMNS, "credits", "enabled")
+ACCOUNT_ROLE_ORDER = ("units", "showrunners", "workers", "producers", "spare", "")
+BOARD_COLUMNS: tuple[BoardColumn, ...] = (
+    BoardColumn(key="dot", heading="", align="left"), BoardColumn(key="label", heading="account", align="left"),
+    BoardColumn(key="left", heading="left", align="right"), BoardColumn(key="roles", heading="role", align="left"),
+    *(BoardColumn(key=key, heading=key, align="right") for key in COUNT_COLUMNS),
+    BoardColumn(key="resets", heading="resets", align="right"), BoardColumn(key="credits", heading="credits", align="right"),
+    BoardColumn(key="enabled", heading="enabled", align="left"),
+)
+
+
+def _span(text: str, tone: BoardTone = "default", kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
+    return BoardSpan(text=text, tone=tone, kind=kind)
+
+
+@dataclass(frozen=True)
+class AccountColor:
+    """The terminal escape and CSS color for one valid account color."""
+    escape: str
+    css: str
+
+
+@dataclass(frozen=True)
+class NoAccountColor:
+    """The account label uses the default text color."""
+
+
+# ANSI names use the standard sixteen colors. Extended names use the xterm color cube.
+ACCOUNT_COLOR_NAMES: dict[str, tuple[str, str]] = {
+    "black": ("30", "#000000"), "red": ("31", "#800000"),
+    "green": ("32", "#008000"), "yellow": ("33", "#808000"),
+    "blue": ("34", "#000080"), "magenta": ("35", "#800080"),
+    "cyan": ("36", "#008080"), "white": ("37", "#c0c0c0"),
+    "bright-black": ("90", "#808080"), "bright-red": ("91", "#ff0000"),
+    "bright-green": ("92", "#00ff00"), "bright-yellow": ("93", "#ffff00"),
+    "bright-blue": ("94", "#0000ff"), "bright-magenta": ("95", "#ff00ff"),
+    "bright-cyan": ("96", "#00ffff"), "bright-white": ("97", "#ffffff"),
+    "orange": ("38;5;208", "#ff8700"), "purple": ("38;5;141", "#af87ff"),
+    "pink": ("38;5;211", "#ff87af"), "teal": ("38;5;30", "#008787"),
+    "brown": ("38;5;137", "#af875f"), "mauve": ("38;5;139", "#af87af"),
+}
+
+
+def account_color(value: str) -> AccountColor | NoAccountColor:
+    """Resolve a configured name or hex value for both board readers."""
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        channels = (str(int(value[index:index + 2], 16)) for index in (1, 3, 5))
+        return AccountColor("\x1b[38;2;" + ";".join(channels) + "m", value)
+    if value in ACCOUNT_COLOR_NAMES:
+        code, css = ACCOUNT_COLOR_NAMES[value]
+        return AccountColor(f"\x1b[{code}m", css)
+    return NoAccountColor()
+
+
+# The statusline.conf key that colors each account role group's labels.
+ROLE_COLOR_KEYS = {"units": "role.unit-director", "showrunners": "role.showrunner", "workers": "role.worker",
+                   "producers": "role.producer"}
+
+
+@dataclass(frozen=True)
+class StaffRoleColor:
+    """The configured key and valid CSS color for a staff role."""
+
+    key: str
+    css: str
+
+
+def role_colors() -> dict[str, str]:
+    """Read the same current color settings as the Accounts board."""
+    return conf.read_or_repository("statusline").values(host_only_prefix="model.")
+
+
+def staff_role_color(member: staff.StaffRow, colors: Mapping[str, str]) -> StaffRoleColor | NoAccountColor:
+    """Resolve the staff kind through the Accounts role keys and color parser."""
+    group = "units" if member.kind == "unit" else member.kind + "s"
+    key = ROLE_COLOR_KEYS[group]
+    color = account_color(colors.get(key, ""))
+    return StaffRoleColor(key, color.css) if isinstance(color, AccountColor) else NoAccountColor()
+
+
+def _colored_span(text: str, key: str, colors: dict[str, str], kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
+    span = _span(text, kind=kind)
+    if key in colors:
+        span["color"] = colors[key]
+        if isinstance(account_color(colors[key]), AccountColor):
+            span["color_key"] = key
+    return span
+
+
+def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
+    return _colored_span(label, f"account.{label}", colors, kind="bold")
+
+
+def _role_spans(role: str, selected: bool, colors: dict[str, str]) -> list[BoardSpan]:
+    if not role:
+        return [_span("")]
+    key = ROLE_COLOR_KEYS.get(role)
+    return [_colored_span(role, key, colors) if key else _span(role), *([_span(" ✓")] if selected else [])]
+
+
+def _read_ok(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> bool:
+    return (isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at, account_config=account_config)
+            and row.on_credits != "stale"
+            and row.read_outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD))
+
+
+def _reset_text(at: datetime | StatusUnavailable, zone: tzinfo, now: datetime) -> str:
+    """The clock today, the weekday and clock within six days, or the day and month."""
+    if isinstance(at, StatusUnavailable):
+        return ""
+    local = at.astimezone(zone)
+    days = abs((local.date() - now.astimezone(zone).date()).days)
+    if days > 6:
+        return f"{local.day} {local:%b}"
+    return f"{local:%H:%M}" if days == 0 else f"{local:%a %H:%M}"
+
+
+def _count_cells(count: RoleSessionCounts | NoRoleCount | None) -> dict[str, str]:
+    if not isinstance(count, RoleSessionCounts):
+        return {key: "" for key in COUNT_COLUMNS}
+    return {"busy": str(count.busy), "idle": str(count.idle), "paused": str(count.paused),
+            "exited": str(count.exited), "total": str(count.total)}
+
+
+def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead,
+                        colors: dict[str, str]) -> list[BoardRow]:
+    weekly = row.weekly_left_percent
+    known = not isinstance(weekly, (StatusUnavailable, WeeklyNotReadSince))
+    tone: BoardTone = "default" if not known else "error" if weekly < 10 else "warning" if weekly < 25 else "default"
+    left = f"{round(weekly)}%" if known else "—"
+    reset = _reset_text(row.resets_at, reading.zone, reading.checked_at)
+    balance = ("" if isinstance(row.credits, StatusUnavailable) else "unlimited" if row.credits == "unlimited"
+               else f"{row.credits:,.0f}")
+    dot: BoardTone = "success" if _read_ok(row, reading, account_config=account_config) else "error"
+    roles = list(row.roles) or [""]
+    lines: list[BoardRow] = []
+    for index, role in sorted(enumerate(roles), key=lambda item: (
+            ACCOUNT_ROLE_ORDER.index(item[1]) if item[1] in ACCOUNT_ROLE_ORDER else len(ACCOUNT_ROLE_ORDER))):
+        counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
+        cells = {"dot": [_span("●", dot)], "label": [_account_label(row.label, colors)],
+                 "left": [_span(left, tone)], "roles": _role_spans(role, role in row.selected_roles, colors),
+                 **{key: [_span(value)] for key, value in counts.items()},
+                 "resets": [_span(reset)], "credits": [_span(balance)],
+                 "enabled": [_span("yes" if row.use_credits else "")]}
+        if role in row.inherited_roles:
+            cells["roles"].append(_span(" (inherited)"))
+        line = BoardRow(cells=cells)
+        if row.tool == "claude" and role in row.selected_roles and role in CLAUDE_GROUPS:
+            line["group"] = BoardGroup(account=row.label, group=role)
+        lines.append(line)
+    return lines
+
+
+def account_details_in_row_order(rows: list[BoardRow]) -> list[BoardRow]:
+    """Show account details on the first row of each consecutive account run."""
+    result: list[BoardRow] = []
+    previous = ""
+    for row in rows:
+        label = "".join(span["text"] for span in row["cells"]["label"])
+        cells = dict(row["cells"])
+        if label and label == previous:
+            for key in ("dot", "label", "left", "resets", "credits", "enabled"):
+                cells[key] = []
+        result.append({**row, "cells": cells})
+        previous = label
+    return result
+
+
+class AccountRowPlacement(TypedDict):
+    """The source row index and account detail visibility for one sorted row."""
+    index: int
+    details: bool
+
+
+@dataclass(frozen=True)
+class BoardNextMoveTarget:
+    """The first target for the group on this row."""
+
+    label: str
+
+
+def account_board_next_move(
+    row: BoardRow, first: FirstNextMoveTargets | NextMovesUnavailable,
+) -> BoardNextMoveTarget | NextMovesUnavailable | Literal["unselected", "none", "auto"]:
+    """Find the next move state shared by rendering and sorting."""
+    editable = row.get("group")
+    role = "".join(span["text"] for span in row["cells"]["roles"])
+    if editable is None and role != "workers ✓":
+        return "unselected"
+    if isinstance(first, NextMovesUnavailable):
+        return first
+    group = editable["group"] if editable else "workers"
+    if target := first.targets.get(group):
+        return BoardNextMoveTarget(target)
+    return "none" if editable else "auto"
+
+
+def account_board_sort_orders(reading: StatusReading, board: Board) -> dict[str, list[AccountRowPlacement]]:
+    """Prepare both directions of each page sort from the complete account rows."""
+    facts = {row.label: row for row in reading.rows}
+    complete: list[BoardRow] = []
+    labels: list[str] = []
+    details: dict[str, list[BoardSpan]] = {}
+    label = ""
+    for row in board["rows"][:-1]:
+        cells = row["cells"]
+        if cells["label"]:
+            label = "".join(span["text"] for span in cells["label"])
+            details = {key: cells[key] for key in ("dot", "label", "left", "resets", "credits", "enabled")}
+        labels.append(label)
+        complete.append({**row, "cells": {**cells, **details}})
+
+    roles = [spans[0]["text"] if (spans := row["cells"]["roles"]) else "" for row in complete]
+    ranks = {role: rank for rank, role in enumerate(ACCOUNT_ROLE_ORDER)}
+    account_names = [label.casefold() for label in labels]
+
+    def value(index: int, column: str) -> float | str | datetime | StatusUnavailable:
+        fact = facts[labels[index]]
+        if column == "left":
+            quota = fact.weekly_left_percent
+            return quota if isinstance(quota, (float, int)) else StatusUnavailable()
+        if column == "role":
+            return roles[index] or StatusUnavailable()
+        if column == "next":
+            move = account_board_next_move(complete[index], reading.first_next_moves)
+            return move.label.casefold() if isinstance(move, BoardNextMoveTarget) else StatusUnavailable()
+        if column in COUNT_COLUMNS:
+            count = complete[index]["cells"][column][0]["text"]
+            return -int(count) if count else StatusUnavailable()
+        if column == "resets":
+            reset = fact.resets_at
+            return reset.astimezone(timezone.utc) if isinstance(reset, datetime) else reset
+        if column == "credits":
+            credits = fact.credits
+            if isinstance(credits, StatusUnavailable):
+                return credits
+            return -math.inf if credits == "unlimited" else -credits
+        if column == "enabled":
+            return -1 if fact.use_credits else StatusUnavailable()
+        return account_names[index]
+
+    orders: dict[str, list[AccountRowPlacement]] = {}
+    columns = [column["heading"] for column in board["columns"] if column["heading"]]
+    for column in (*columns, "next"):
+        present: dict[int, float | str | datetime] = {}
+        absent: list[int] = []
+        for index in range(len(complete)):
+            sort_value = value(index, column)
+            if isinstance(sort_value, StatusUnavailable):
+                absent.append(index)
+            else:
+                present[index] = sort_value
+        ties = [(account, ranks.get(role, len(ranks)) if column in ("account", "left") else 0)
+                for account, role in zip(account_names, roles)]
+        for reverse in (False, True):
+            indices = sorted(present, key=lambda index: (present[index], ties[index]), reverse=reverse)
+            indices += sorted(absent, key=lambda index: ties[index], reverse=reverse)
+            ordered = account_details_in_row_order([complete[index] for index in indices])
+            orders[column + ("-reverse" if reverse else "")] = [
+                AccountRowPlacement(index=index, details=bool(row["cells"]["label"]))
+                for index, row in zip(indices, ordered)]
+    return orders
+
+
+def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
+    """The accounts board: one line per role of each account, then the total line."""
+    account_config = read_account_settings(account_config)
+    return _status_board(reading, account_config=account_config, colors=role_colors())
+
+
+MODEL_COUNT_COLUMNS = (*MODEL_ROLES, "total")
+MODEL_COLUMNS: tuple[BoardColumn, ...] = (
+    BoardColumn(key="model", heading="model", align="left"),
+    BoardColumn(key="effort", heading="effort", align="left"),
+    *(BoardColumn(key=key, heading=key, align="right") for key in MODEL_COUNT_COLUMNS),
+)
+
+
+@dataclass(frozen=True)
+class ModelsBoard:
+    rows: list[BoardRow]
+    orders: dict[str, list[AccountRowPlacement]]
+
+
+def models_board(reading: StatusReading, colors: dict[str, str]) -> ModelsBoard:
+    """Group the accounts table's session counts by model, effort and role."""
+    grouped: dict[ObservedSessionModel | SessionModelUnknown, Counter[str]] = {}
+    total: Counter[str] = Counter()
+    for row in reading.rows:
+        for role, activity in zip(row.roles, row.role_counts):
+            if not isinstance(activity, RoleSessionCounts):
+                continue
+            known = row.models_by_role.get(role, Counter[ObservedSessionModel]())
+            total[role] += activity.total
+            for model, count in known.items():
+                grouped.setdefault(model, Counter())[role] += count
+            if missing := activity.total - known.total():
+                grouped.setdefault(SessionModelUnknown(), Counter())[role] += missing
+
+    def model_name(model: ObservedSessionModel | SessionModelUnknown) -> str:
+        return model.model if isinstance(model, ObservedSessionModel) else "unknown"
+
+    def effort_order(model: ObservedSessionModel | SessionModelUnknown) -> int:
+        return MODEL_EFFORTS.index(model.effort) if isinstance(model, ObservedSessionModel) else len(MODEL_EFFORTS)
+
+    def count_cells(counts: Counter[str]) -> dict[str, list[BoardSpan]]:
+        values = {key: counts[key] for key in MODEL_ROLES}
+        values["total"] = counts.total()
+        return {key: [_span(str(count), "default" if count else "inactive")] for key, count in values.items()}
+
+    models = sorted(grouped, key=lambda model: (model_name(model), effort_order(model)))
+    hosts: frozenset[str] = conf.known_host_names() if models else frozenset()
+    rows: list[BoardRow] = []
+    previous = ""
+    for model in models:
+        name = model_name(model)
+        key = f"model.{name}"
+        if isinstance(model, ObservedSessionModel) and not conf.host_suffix(key, hosts):
+            label = _colored_span(name, key, colors, kind="bold")
+            label["color_key"] = key
+        else:
+            label = _span(name, kind="bold")
+        rows.append(BoardRow(cells={
+            "model": [label] if name != previous else [],
+            "effort": [_span(model.effort if isinstance(model, ObservedSessionModel) else "-")],
+            **count_cells(grouped[model]),
+        }))
+        previous = name
+    rows.append(BoardRow(cells={"model": [_span("total", kind="bold")], "effort": [], **count_cells(total)}))
+
+    orders: dict[str, list[AccountRowPlacement]] = {}
+    for key in ("model", "effort", *MODEL_COUNT_COLUMNS):
+        for reverse in (False, True):
+            def sort_value(index: int) -> str | int:
+                model = models[index]
+                if key == "model":
+                    return "" if reverse and isinstance(model, SessionModelUnknown) else model_name(model)
+                if key == "effort":
+                    return -1 if reverse and isinstance(model, SessionModelUnknown) else effort_order(model)
+                return grouped[model].total() if key == "total" else grouped[model][key]
+
+            indexes = sorted(range(len(models)), key=sort_value, reverse=reverse != (key in MODEL_COUNT_COLUMNS))
+            previous = ""
+            placements: list[AccountRowPlacement] = []
+            for index in indexes:
+                name = model_name(models[index])
+                placements.append(AccountRowPlacement(index=index, details=name != previous))
+                previous = name
+            orders[key + ("-reverse" if reverse else "")] = placements
+    return ModelsBoard(rows, orders)
+
+
+def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str]) -> Board:
+    rows = sorted(reading.rows, key=lambda row: row.label.casefold())
+    # The reset text changes at the next local midnight.
+    today = reading.checked_at.astimezone(reading.zone).date()
+    stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
+    if not rows:
+        return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
+    lines = account_details_in_row_order([
+        line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)])
+    known = [count for row in rows for count in row.role_counts if isinstance(count, RoleSessionCounts)]
+    total = {"busy": str(sum(count.busy for count in known)), "idle": str(sum(count.idle for count in known)),
+             "paused": str(sum(count.paused for count in known)), "exited": str(sum(count.exited for count in known)),
+             "total": str(sum(count.total for count in known))}
+    empty: list[BoardSpan] = []
+    lines.append(BoardRow(cells={"dot": empty, "label": [_span("total", kind="bold")], "left": empty, "roles": empty,
+                                 **{key: [_span(value)] for key, value in total.items()},
+                                 "resets": empty, "credits": empty, "enabled": empty}))
+    return Board(columns=list(BOARD_COLUMNS), rows=lines, stale_at=stale_at)
 
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
+    colors = role_colors()
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
@@ -4395,15 +4940,17 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
             role_counts_by_machine=row.role_counts_by_machine,
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
+            login_ends_at=agent_accounts.login_end_iso(row.login_ends_at) if row.tool == "claude" else None,
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
-            read_ok=isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at, account_config=account_config)
-            and row.on_credits != "stale" and row.read_outcome in (
-                agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
+            read_ok=_read_ok(row, reading, account_config=account_config),
             credits_in_use=row.on_credits == "yes")
+        if (key := f"account.{row.label}") in colors:
+            item["color"] = colors[key]
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
+                                     board=_status_board(reading, account_config=account_config, colors=colors), problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4592,21 +5139,28 @@ def render_status_table(reading: StatusReading, *, account_config: conf.ConfigRe
         cells = _status_row_cells(row, reading.zone, reading.checked_at, account_config=account_config)
         rows.append(cells)
         rows.extend(tuple(_role_count_text(row, role) if index == 2 else "" for index in range(len(cells))) for role in row.roles[1:])
-    return "\n".join([_render_table(rows), "",
+    colors = conf.read_or_repository("statusline").values() if sys.stdout.isatty() else {}
+    return "\n".join([_render_table(rows, colors=colors), "",
         *reading.upcoming_moves, *(("",) if reading.upcoming_moves else ()), *reading.notes, *reading.detail_lines])
 
 
-def _render_table(rows: list[tuple[str, ...]]) -> str:
+def _render_table(rows: list[tuple[str, ...]], *, colors: dict[str, str]) -> str:
     """A Markdown table, padded so it also reads as plain text."""
     widths = [max(len(line[column]) for line in (TABLE_HEADINGS, *rows)) for column in range(len(TABLE_HEADINGS))]
 
-    def rendered(cells: tuple[str, ...]) -> str:
-        return "| " + " | ".join(cell.ljust(width) for cell, width in zip(cells, widths)) + " |"
+    def rendered(cells: tuple[str, ...], *, account: bool = False) -> str:
+        padded = [cell.ljust(width) for cell, width in zip(cells, widths)]
+        if account and cells[1]:
+            span = _account_label(cells[1], colors)
+            color = account_color(span.get("color", ""))
+            if isinstance(color, AccountColor):
+                padded[1] = color.escape + cells[1] + "\x1b[0m" + " " * (widths[1] - len(cells[1]))
+        return "| " + " | ".join(padded) + " |"
 
     return "\n".join([
         rendered(TABLE_HEADINGS),
         rendered(tuple("-" * width for width in widths)),
-        *(rendered(row) for row in rows),
+        *(rendered(row, account=True) for row in rows),
     ])
 
 
@@ -4909,7 +5463,8 @@ def _test_signin_role_advice(problem: StatusProblem, test_accounts: set[CauseAcc
             and problem.cause.kind in ("note", "unreadable note", "unnoted", "wrong login"))
 
 
-def _read_status(source: UsageSource, *, detail: bool, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
+def _read_status(source: UsageSource, *, detail: bool, include_models: bool = False,
+                 account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """One table row per account folder, then one line for each thing wrong in a folder.
 
     With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
@@ -4966,6 +5521,10 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
         codex = [replace(status, role=NO_VALUE) for status in codex]
     group_directories: dict[ClaudeGroup, Path] = {}
     for group in CLAUDE_GROUPS:
+        if group == "producers" and group not in groups:
+            if "showrunners" in group_directories:
+                group_directories[group] = group_directories["showrunners"]
+            continue
         label = group_label(groups, group)
         if isinstance(label, GroupNotConfigured):
             error = f"accounts: {group} has no account; run accounts.py move {group} <claudeN>"
@@ -4986,8 +5545,11 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
         *(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
             (status.role,) if status.role in (CODEX_ROLE, "spare") else (), account_config=account_config) for status in codex),
     )
-    local_sessions = _read_local_role_sessions(groups)
+    local_sessions = _read_local_role_sessions(groups, include_models=include_models)
     rows, session_inputs = _count_role_sessions(rows, local_sessions)
+    if "producers" not in groups:
+        rows = tuple(replace(row, inherited_roles=("producers",)) if "producers" in row.selected_roles else row
+                     for row in rows)
     rows, count_problems = _machine_role_counts(rows, now, account_config=account_config)
     session_inputs = (*session_inputs, str(_session_counts_cache()))
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
@@ -5139,7 +5701,8 @@ class DiagnosticStream(io.StringIO):
 
 
 @role_map.role_map_command
-def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
+def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False, include_models: bool = False,
+                account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """Read each account once; retain diagnostics before any later failure."""
     account_config = read_account_settings(account_config)
     enclosing = _status_diagnostics.get()
@@ -5150,7 +5713,8 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     try:
         with (redirect_stderr(held), role_map.observe_map_reads(_observe_map_provenance),
               role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
-            reading = _with_upcoming_moves(_read_status(source, detail=detail, account_config=account_config))
+            reading = _with_upcoming_moves(_read_status(
+                source, detail=detail, include_models=include_models, account_config=account_config))
     except BaseException:
         diagnostics.retain_raw(held.getvalue(), delivered=tty)
         if not isinstance(enclosing, StatusDiagnostics):
@@ -5165,32 +5729,53 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
         if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
-        notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", line), NoUserStep())))
+        session_warning = re.fullmatch(r"anomaly: [A-Za-z0-9_.-]+: (.+)", line)
+        key = ("session", session_warning[1]) if session_warning else ("line", line)
+        warning_groups.setdefault(key, []).append(line)
+    for (kind, cause), lines in warning_groups.items():
+        warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
+        rendered = render_status_problem(StatusProblem("accounts", "read warning",
+            ProblemCause("warning", warning), NoUserStep()))
+        notes.append(rendered)
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
-def _upcoming_move_lines() -> tuple[str, ...]:
+def _read_upcoming_moves() -> UpcomingMoves:
     try:
         if not role_map.is_role_map_host():
-            return role_map.read_role_map().upcoming_moves or (
+            lines = role_map.read_role_map().upcoming_moves or (
                 f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
-        upcoming = next_moves.list_next_moves()
-        return ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+            return UpcomingMoves(lines, NextMovesUnavailable("First targets require the role-map host."))
+        entries = next_moves.read_next_moves()
+        targets: dict[next_moves.NextMoveGroup, str] = {}
+        for entry in entries:
+            if entry.group not in targets:
+                targets[entry.group] = next_moves.target_label(entry)
+        upcoming = next_moves.render_next_moves(entries)
+        lines = ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+        return UpcomingMoves(lines, FirstNextMoveTargets(targets))
     except role_map.RoleMapUnavailable:
-        return (f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
+        reason = f"{role_map.ROLE_MAP_HOST} unreachable"
+        return UpcomingMoves((f"Upcoming moves: unavailable; {reason}",), NextMovesUnavailable(reason))
     except (next_moves.NextMoveError, ValueError) as error:
-        return (f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {str(error).splitlines()[0]}",)
+        reason = str(error).splitlines()[0]
+        return UpcomingMoves((f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {reason}",), NextMovesUnavailable(reason))
+
+
+def _upcoming_move_lines() -> tuple[str, ...]:
+    return _read_upcoming_moves().lines
 
 
 def _with_upcoming_moves(reading: StatusReading) -> StatusReading:
-    return replace(reading, upcoming_moves=_upcoming_move_lines())
+    upcoming = _read_upcoming_moves()
+    return replace(reading, upcoming_moves=upcoming.lines, first_next_moves=upcoming.first)
 
 
 def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
@@ -5212,12 +5797,271 @@ class LocalRoleSessions:
     inputs: tuple[str, ...]
     session_lines: tuple[str, ...]
     continuation_lines: tuple[str, ...]
+    models: dict[tuple[Path, str], ObservedSessionModel] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SessionModelOptions:
+    """Model and effort fields from one turn or process command line."""
+
+    model: str = ""
+    effort: str = ""
+
+
+@dataclass(frozen=True)
+class NoRecordedModelTurn:
+    """The transcript has no recorded turn."""
+
+
+MODEL_TAIL_BYTES = 128 * 1024
+
+
+def _model_fields(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def _model_string(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _full_session_model(model: str) -> bool:
+    return bool(re.fullmatch(r"(?:claude-[a-z][a-z0-9-]*-[0-9][a-z0-9-]*|gpt-[0-9][a-z0-9.-]*)", model))
+
+
+def _model_tail_lines(stream: BinaryIO, offset: int) -> Generator[bytes]:
+    """Read at most eight 16 KiB blocks from the end of the transcript."""
+    limit = max(0, offset - MODEL_TAIL_BYTES)
+    pending = b""
+    while offset > limit:
+        size = min(offset - limit, 16 * 1024)
+        offset -= size
+        _ = stream.seek(offset)
+        pending, *lines = (stream.read(size) + pending).split(b"\n")
+        yield from reversed(lines)
+    if offset == 0 and pending:
+        yield pending
+
+
+def _model_turn_options(lines: Iterable[bytes], family: Literal["claude", "codex"]
+                        ) -> Generator[SessionModelOptions | SessionModelUnknown]:
+    turn_type = "assistant" if family == "claude" else "turn_context"
+    marker = f'"{turn_type}"'.encode()
+    for line in lines:
+        if marker not in line:
+            continue
+        try:
+            record = _model_fields(cast(object, json.loads(line)))
+        except (ValueError, UnicodeError):
+            yield SessionModelUnknown()
+            continue
+        if record.get("type") != turn_type:
+            continue
+        if family == "codex":
+            payload = _model_fields(record.get("payload"))
+            yield SessionModelOptions(_model_string(payload.get("model")), _model_string(payload.get("effort")))
+        else:
+            model = _model_string(_model_fields(record.get("message")).get("model"))
+            if model != "<synthetic>":
+                yield SessionModelOptions(model, _model_string(record.get("effort")))
+
+
+def _stream_model_turn(path: Path, family: Literal["claude", "codex"]
+                       ) -> SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown:
+    turn: SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown = NoRecordedModelTurn()
+    with closing(transcripts.compressed_transcript_lines(path)) as lines:
+        for options in _model_turn_options(lines, family):
+            if isinstance(options, SessionModelOptions) or isinstance(turn, NoRecordedModelTurn):
+                turn = options
+    return turn
+
+
+_compressed_model_turns: OrderedDict[
+    tuple[Path, int, int, Literal["claude", "codex"]],
+    SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown,
+] = OrderedDict()
+_compressed_model_turns_lock = Lock()
+
+
+def _cached_compressed_model_turn(path: Path, family: Literal["claude", "codex"], limit: int
+                                 ) -> SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown:
+    """Reuse a compressed transcript's model result in this process."""
+    path = path.resolve()
+    source = path.stat()
+    stamp = (source.st_size, source.st_mtime_ns)
+    key = (path, *stamp, family)
+    with _compressed_model_turns_lock:
+        turn = _compressed_model_turns.get(key)
+    if turn is None:
+        turn = _stream_model_turn(path, family)
+        current = path.stat()
+        if stamp != (current.st_size, current.st_mtime_ns):
+            return SessionModelUnknown()
+    with _compressed_model_turns_lock:
+        _compressed_model_turns[key] = turn
+        _compressed_model_turns.move_to_end(key)
+        while len(_compressed_model_turns) > limit:
+            _ = _compressed_model_turns.popitem(last=False)
+    return turn
+
+
+def _read_plain_model_turn(path: Path, family: Literal["claude", "codex"]
+                           ) -> SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown:
+    """Read the newest turn from the tail of a plain transcript."""
+    with path.open("rb") as stream:
+        size = stream.seek(0, os.SEEK_END)
+        damaged_turn = False
+        for options in _model_turn_options(_model_tail_lines(stream, size), family):
+            if isinstance(options, SessionModelOptions):
+                return options
+            damaged_turn = True
+    return SessionModelUnknown() if damaged_turn or size > MODEL_TAIL_BYTES else NoRecordedModelTurn()
+
+
+def _model_process_options(pid: int) -> SessionModelOptions:
+    """Keep only the model and effort options from a live process."""
+    if not pid:
+        return SessionModelOptions()
+    try:
+        if sys.platform == "darwin":
+            argv = account.procargs2_parts(account.kern_procargs2(pid), lambda name: False).arguments
+        else:
+            argv = tuple(os.fsdecode(word) for word in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"))
+    except (OSError, ValueError):
+        return SessionModelOptions()
+    model = effort = ""
+    options = iter(argv[1:])
+    for argument in options:
+        if argument == "--":
+            break
+        flag, separator, value = argument.partition("=")
+        if flag in ("--model", "-m", "--effort", "-c", "--config"):
+            if not separator:
+                value = next(options, "")
+            if flag in ("--model", "-m"):
+                model = value
+            elif flag == "--effort":
+                effort = value
+            else:
+                key, equals, setting = value.partition("=")
+                if equals and key.strip() == "model_reasoning_effort":
+                    effort = setting.strip().strip('"\'')
+    return SessionModelOptions(model, effort)
+
+
+class SessionModelReader:
+    """Reuse catalog and transcript directory reads during one session scan."""
+
+    def __init__(self) -> None:
+        self.codex_rollouts: dict[Path, dict[str, Path]] = {}
+        self.claude_models: dict[Path, dict[str, str]] = {}
+
+    @cached_property
+    def compressed_cache_limit(self) -> int:
+        return read_account_settings().whole("session_model_cache_entries")
+
+    def _turn(self, path: Path, family: Literal["claude", "codex"]
+              ) -> SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown:
+        if path.suffix == ".zst":
+            return _cached_compressed_model_turn(path, family, self.compressed_cache_limit)
+        return _read_plain_model_turn(path, family)
+
+    @cached_property
+    def registry(self) -> dict[str, dict[str, str]]:
+        try:
+            return registry_rows.parse_registry(models_registry.registry_text())
+        except (OSError, ValueError):
+            try:
+                return registry_rows.parse_registry((REPOSITORY_ROOT / models_registry.REGISTRY_PATH).read_text())
+            except (OSError, ValueError):
+                return {}
+
+    def _resolve(self, family: Literal["claude", "codex"], home: Path, model: str) -> str:
+        if not model or _full_session_model(model):
+            return model
+        families = self.registry.get(f"{family}.families", {})
+        if family == "codex":
+            return families.get(model, "")
+        if model not in families:
+            return ""
+        if home not in self.claude_models:
+            self.claude_models[home] = self._claude_aliases(home)
+        return self.claude_models[home].get(model, "")
+
+    @staticmethod
+    def _claude_aliases(home: Path) -> dict[str, str]:
+        try:
+            path = max((home / "cache/model-catalog").glob("*-cc.json"), key=lambda entry: entry.stat().st_mtime)
+            fields = _model_fields(cast(object, json.loads(path.read_bytes())))
+        except (OSError, ValueError, UnicodeError):
+            return {}
+        config = _model_fields(_model_fields(fields.get("catalog")).get("config"))
+        targets = _model_fields(config.get("provider_alias_targets"))
+        return {name: _model_string(_model_fields(target).get("default")) for name, target in targets.items()}
+
+    def _observation(self, family: Literal["claude", "codex"], home: Path,
+                     turn: SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown, pid: int
+                     ) -> ObservedSessionModel | SessionModelUnknown:
+        if isinstance(turn, SessionModelUnknown):
+            return turn
+        options = _model_process_options(pid) if isinstance(turn, NoRecordedModelTurn) and pid else turn
+        if isinstance(options, SessionModelOptions):
+            model = self._resolve(family, home, options.model)
+            if _full_session_model(model) and options.effort in MODEL_EFFORTS:
+                return ObservedSessionModel(model, options.effort)
+        return SessionModelUnknown()
+
+    def claude(self, home: Path, identity: str, *, pid: int = 0
+               ) -> ObservedSessionModel | SessionModelUnknown:
+        if not re.fullmatch(r"[a-zA-Z0-9-]+", identity):
+            return SessionModelUnknown()
+        try:
+            path = latest_transcript(identity, home / "projects")
+            if path is None:
+                return SessionModelUnknown()
+            turn = self._turn(path, "claude")
+        except (OSError, subprocess.SubprocessError):
+            return SessionModelUnknown()
+        return self._observation("claude", home, turn, pid)
+
+    def codex(self, home: Path, identity: str, *, pid: int = 0) -> ObservedSessionModel | SessionModelUnknown:
+        """Find the rollout by its UUIDv7 date or in the flat archive."""
+        folders: list[Path] = []
+        try:
+            thread = UUID(identity)
+            if thread.version == 7:
+                opened = datetime.fromtimestamp((thread.int >> 80) / 1000, timezone.utc)
+                folders.extend(home / "sessions" / (opened + timedelta(days=delta)).strftime("%Y/%m/%d")
+                               for delta in (0, -1, 1))
+        except (ValueError, OverflowError, OSError):
+            return SessionModelUnknown()
+        folders.append(home / "archived_sessions")
+        for location in folders:
+            try:
+                folder = location.resolve()
+            except (OSError, RuntimeError):
+                return SessionModelUnknown()
+            if folder not in self.codex_rollouts:
+                self.codex_rollouts[folder] = {
+                    transcripts.uncompressed_path(path).stem[-36:]: path
+                    for path in transcripts.transcript_paths(folder, "rollout-*.jsonl")
+                }
+            path = self.codex_rollouts[folder].get(identity)
+            if path is None:
+                continue
+            try:
+                turn = self._turn(path, "codex")
+            except (OSError, subprocess.SubprocessError):
+                return SessionModelUnknown()
+            return self._observation("codex", home, turn, pid)
+        if thread.version == 7:
+            return self._observation("codex", home, NoRecordedModelTurn(), pid)
+        return SessionModelUnknown()
 
 
 @dataclass(frozen=True)
 class CodexRoleProcess:
     pid: int
-    activity: Literal["busy", "idle"]
+    activity: Literal["busy", "idle", "starting"]
 
 
 def _local_codex_processes() -> dict[str, CodexRoleProcess]:
@@ -5228,8 +6072,9 @@ def _local_codex_processes() -> dict[str, CodexRoleProcess]:
         agents = herdr.Herdr(herdr.shared_session()).agents()
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         agents = []
-    activities: dict[str, Literal["busy", "idle"]] = {
-        agent["agent_session"].session_id: "busy" if agent["agent_status"] == herdr.AgentStatus.WORKING else "idle"
+    activities: dict[str, Literal["busy", "idle", "starting"]] = {
+        agent["agent_session"].session_id: ("busy" if agent["agent_status"] == herdr.AgentStatus.WORKING
+            else "starting" if agent["agent_status"] == herdr.AgentStatus.STARTING else "idle")
         for agent in agents if agent.get("agent") == "codex"
         and isinstance(agent["agent_session"], herdr.ReportedAgentSession)
     }
@@ -5250,14 +6095,24 @@ def _session_config_dir(pid: int) -> account.ConfiguredClaudeFolder | account.No
     return account.ConfiguredClaudeFolder(Path(directory)) if directory else account.NoAccountSetting()
 
 
-def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, session_state.SessionState]], tuple[str, ...]]:
+@overload
+def _local_session_counts(*, include_models: Literal[False] = False
+                          ) -> tuple[dict[tuple[Path, str], dict[str, session_state.SessionState]], tuple[str, ...]]: ...
+
+
+@overload
+def _local_session_counts(*, include_models: Literal[True]) -> LocalRoleSessions: ...
+
+
+def _local_session_counts(*, include_models: bool = False
+                          ) -> LocalRoleSessions | tuple[dict[tuple[Path, str], dict[str, session_state.SessionState]], tuple[str, ...]]:
     with role_map.stored_role_map():
-        observed = _read_local_role_sessions(group_accounts())
-    return observed.counts, observed.inputs
+        observed = _read_local_role_sessions(group_accounts(), include_models=include_models)
+    return observed if include_models else (observed.counts, observed.inputs)
 
 
 def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
-    if role in CLAUDE_GROUPS:
+    if role in CLAUDE_GROUPS and (role != "producers" or role in groups):
         selected = group_label(groups, role)
         if isinstance(selected, str) and selected != label:
             return f"; moving to {selected}"
@@ -5265,14 +6120,25 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
 
 
 @settings_report_scope()
-def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
+def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True,
+                              include_models: bool = False) -> LocalRoleSessions:
     """Read local membership, processes, and activity for counts and moves."""
+    from scripts.herdr import herdr
+
+    # One pane and process read serves every member in this read.
+    with herdr.observation_snapshot():
+        return _observed_role_sessions(groups, include_workers=include_workers, include_models=include_models)
+
+
+def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, include_models: bool) -> LocalRoleSessions:
     from scripts.message import sessions
     from scripts.herdr import pane_launch
     from scripts.production import session_staff, staff
 
     inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
     counts: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {}
+    models: dict[tuple[Path, str], ObservedSessionModel] = {}
+    model_reader = SessionModelReader()
     launches: dict[str, pane_launch.PaneLaunch] = {}
     try:
         membership = staff.local_snapshot()
@@ -5280,6 +6146,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         if not isinstance(error.__cause__, FileNotFoundError):
             print(f"accounts: unit counts are incomplete: {error}", file=sys.stderr)
         membership = staff.StaffSnapshot(())
+    detached = session_state.running_detached_work(membership)
+    inputs.update(detached.inputs)
     for path in pane_launch.record_directory().glob("*.json"):
         inputs.add(path)
         try:
@@ -5287,9 +6155,9 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         except (OSError, ValueError):
             continue
         for launch in entries.values():
-            previous = launches.get(launch["session_id"])
+            previous = launches.get(pane_launch.reference_id(launch))
             if previous is None or previous["written_at"] < launch["written_at"]:
-                launches[launch["session_id"]] = launch
+                launches[pane_launch.reference_id(launch)] = launch
     inputs.update(Path(path) for path in membership.inputs)
     machine = _session_counts_machine()
 
@@ -5300,11 +6168,22 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         location = owner.worktree
         return not isinstance(location, staff.PresentWorktree) or location.machine == machine
 
+    def record_claude_model(directory: Path, identity: str, pid: int = 0) -> None:
+        if not include_models:
+            return
+        model = model_reader.claude(directory, identity, pid=pid)
+        if isinstance(model, ObservedSessionModel):
+            models[directory, identity] = model
+
+    def record_codex_model(directory: Path, identity: str, pid: int = 0) -> None:
+        if include_models and isinstance(model := model_reader.codex(directory, identity, pid=pid), ObservedSessionModel):
+            models[directory, identity] = model
+
     for path in sessions.sessions_dir().glob("*.json"):
         inputs.add(path)
     live = {session["sessionId"]: session for session in sessions.running_sessions()}
     session_lines: list[str] = []
-    members: dict[ClaudeGroup, list[LiveGroupMember]] = {"units": [], "showrunners": []}
+    members: dict[ClaudeGroup, list[LiveGroupMember]] = {group: [] for group in CLAUDE_GROUPS}
     for identity, session in live.items():
         owner = membership.by_current_session(identity)
         candidates = [launch for reference, launch in launches.items()
@@ -5316,7 +6195,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                                              session_staff.LiveSession(identity))
             if isinstance(member, session_staff.NoSuchMember) and launch is not None:
                 member = session_staff.unit_match(session_staff.ObservedUnit(""), membership,
-                                                 session_staff.StoredReference(launch["session_id"]))
+                                                 session_staff.StoredReference(pane_launch.reference_id(launch)))
         except (staff.StaffUnreadable, ValueError) as error:
             print(f"accounts: unit {identity}: {error}", file=sys.stderr)
             continue
@@ -5326,7 +6205,7 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
             role = "showrunners" if owner.kind == "showrunner" else "workers"
         if owner is not None and owner.kind == "producer":
             settings = producer_settings(owner)
-            role = ("showrunners" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
+            role = ("producers" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
                     else "")
         setting = _session_config_dir(session["pid"])
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
@@ -5334,18 +6213,18 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
         suffix = _moving_role_suffix(role, label, groups)
         session_lines.append(f"session {identity} ({session['name']}): {label}{suffix}")
         if role in CLAUDE_GROUPS and directory is not None:
-            group = role
-            members[group].append(LiveGroupMember(identity, session["name"], group, directory))
+            members[role].append(LiveGroupMember(identity, session["name"], role, directory))
         if role and directory is not None:
+            member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
             if role == "workers":
-                state = session_state.classify(session_state.UnrecordedStaff(),
-                    session_state.LiveActivity(session.get("status", "")))
+                state = session_state.classify(owner if owner is not None else session_state.UnrecordedStaff(),
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             else:
-                member_row = member.row if isinstance(member, session_staff.MemberFound) else owner
                 state = session_state.classify(
                     member_row if member_row is not None else session_state.UnrecordedStaff(),
-                    session_state.LiveActivity(session.get("status", "")))
+                    session_state.LiveActivity(session.get("status", "")), detached=detached)
             counts.setdefault((directory, role), {})[identity] = state
+            record_claude_model(directory, identity, session["pid"])
     # A member without a live session belongs to its selected role account.
     for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner"),
                    *(row for row in staff.active(membership, "producer")
@@ -5353,15 +6232,18 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                      and settings.kind == "claude")):
         if member.current_session in live or not local_member(member):
             continue
-        role = "units" if member.kind == "unit" else "showrunners"
-        selected = group_label(groups, role)
+        stopped_group: ClaudeGroup = ("units" if member.kind == "unit" else
+                             "producers" if member.kind == "producer" else "showrunners")
+        selected = group_label(groups, stopped_group)
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
-        state = session_state.classify(member, session_state.NoLiveSession())
-        counts.setdefault((directory, role), {})[member.current_session] = state
+        state = session_state.classify(member, session_state.NoLiveSession(), detached=detached)
+        counts.setdefault((directory, stopped_group), {})[member.current_session] = state
+        record_claude_model(directory, member.current_session)
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
+    open_codex_workers: dict[str, Path] = {}
     if include_workers and (parents := session_staff.pane_parents(membership)):
         worker_panes = cast(AccountPaneReader, cast(object, import_module("scripts.herdr.worker_panes")))
 
@@ -5371,7 +6253,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if not isinstance(evidence, session_staff.RecordedWorker):
                     session_lines.append(f"worker {state.row.name}: {evidence.reason}")
                     continue
-                status = worker_panes.worker_state(state)
+                status = ("starting" if isinstance(state, worker_panes.OpenWorker) and state.status == "starting"
+                          else worker_panes.worker_state(state))
                 if status == "unknown":
                     reason = cast(object, getattr(state, "reason", "pane status is unknown"))
                     session_lines.append(f"worker {state.row.name}: {reason}")
@@ -5379,13 +6262,21 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
                     counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
-                        session_state.UnrecordedStaff(), session_state.LiveActivity(status))
+                        state.row, session_state.LiveActivity(status), detached=detached)
+                    if include_models:
+                        open_codex_workers[state.row.current_session] = directory
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
         and isinstance(membership.backends.get(member.id), staff.CodexBackend) and local_member(member)]
-    if unobserved_workers:
+    codex_producers = [member for member in staff.active(membership, "producer")
+        if local_member(member) and isinstance(settings := producer_settings(member), models_registry.LaunchSettings)
+        and settings.kind == "codex"]
+    if unobserved_workers or codex_producers or open_codex_workers:
         codex_processes = _local_codex_processes()
+        for identity, directory in open_codex_workers.items():
+            process = codex_processes.get(identity)
+            record_codex_model(directory, identity, process.pid if process else 0)
         for member in unobserved_workers:
             if process := codex_processes.get(member.current_session):
                 setting = account.process_codex_home(process.pid)
@@ -5393,9 +6284,27 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                     continue
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
                 counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
-                    session_state.UnrecordedStaff(), session_state.LiveActivity(process.activity))
+                    member, session_state.LiveActivity(process.activity), detached=detached)
+                record_codex_model(directory, member.current_session, process.pid)
+        for member in codex_producers:
+            activity: session_state.LiveActivity | session_state.NoLiveSession = session_state.NoLiveSession()
+            if process := codex_processes.get(member.current_session):
+                setting = account.process_codex_home(process.pid)
+                if isinstance(setting, account.ProcessEnvironmentUnread):
+                    continue
+                directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
+                activity = session_state.LiveActivity(process.activity)
+            else:
+                home = member.home.path if isinstance(member.home, staff.SessionHome) else agent_accounts.observe_workers_home()
+                if isinstance(home, agent_accounts.NoWorkersHome):
+                    session_lines.append(f"producer {member.name}: {home.reason}")
+                    continue
+                directory = home
+            counts.setdefault((directory, "producers"), {})[member.current_session] = session_state.classify(
+                member, activity, detached=detached)
+            record_codex_model(directory, member.current_session, process.pid if process else 0)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
-                             tuple(session_lines), ())
+                             tuple(session_lines), (), models)
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
@@ -5411,6 +6320,9 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
         counted.append(replace(row, roles=roles,
             sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
             selected_roles=tuple(role for role in row.roles if role != "spare"),
+            models_by_role={role: Counter(observed.models[directory, identity]
+                for identity in observed.counts.get((directory, role), {}) if (directory, identity) in observed.models)
+                for role in roles},
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
                 tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
     return tuple(counted), observed.inputs
@@ -5420,6 +6332,7 @@ class MachineSessionCounts(TypedDict):
     machine: str
     at: str
     accounts: dict[str, dict[str, RoleSessionCountsDocument]]
+    models: NotRequired[dict[str, dict[str, list[SessionModelCountDocument]]]]
 
 
 def _session_counts_cache() -> Path:
@@ -5431,8 +6344,11 @@ def _session_counts_machine() -> str:
     return "mac" if remote.other_machine() == "natedev" else "natedev"
 
 
-def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]) -> MachineSessionCounts:
+def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]], *,
+                             models: Mapping[tuple[Path, str], ObservedSessionModel] | None = None) -> MachineSessionCounts:
+    """Publish the four session states for each account and role."""
     mapped: dict[tuple[str, str], dict[str, session_state.SessionState]] = {}
+    mapped_models: dict[tuple[str, str], dict[str, ObservedSessionModel]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
         if re.fullmatch(r"codex(?:[1-9][0-9]*)?", label):
@@ -5440,18 +6356,48 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
         if not re.fullmatch(r"(?:claude|codex)[1-9][0-9]*", label):
             continue
         mapped.setdefault((label, role), {}).update(members)
+        if models:
+            for identity in members:
+                if (model := models.get((directory, identity))) is not None:
+                    mapped_models.setdefault((label, role), {})[identity] = model
     values: dict[str, dict[str, RoleSessionCountsDocument]] = {}
     for (label, role), members in mapped.items():
         tool = "codex" if label.startswith("codex") else "claude"
         count = _role_session_counts(tuple(members.values()), tool)
-        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy,
-            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
+        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy, idle=count.idle,
+            paused=count.paused, exited=count.exited, total=count.total)
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
+    if mapped_models:
+        model_counts: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
+        for (label, role), members in mapped_models.items():
+            model_counts.setdefault(label, {})[role] = [
+                SessionModelCountDocument(model=model.model, effort=model.effort, count=count)
+                for model, count in Counter(members.values()).items()
+            ]
+        document["models"] = model_counts
     return document
 
 
+def _decode_model_count(value: object, total: int) -> list[SessionModelCountDocument]:
+    """Keep optional model evidence only if it fits the verified role total."""
+    if not isinstance(value, list):
+        return []
+    models: list[SessionModelCountDocument] = []
+    for item in cast(list[object], value):
+        fields = _model_fields(item)
+        model, effort, count = fields.get("model"), fields.get("effort"), fields.get("count")
+        if (not isinstance(model, str) or not _full_session_model(model)
+                or not isinstance(effort, str) or effort not in MODEL_EFFORTS
+                or not isinstance(count, int) or isinstance(count, bool) or not 0 < count <= total):
+            return []
+        models.append(SessionModelCountDocument(model=model, effort=effort, count=count))
+        total -= count
+    return models
+
+
 def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
+    """Count an older peer's starting sessions as busy; its busy count already holds waiting."""
     value = cast(object, json.loads(text))
     if not isinstance(value, dict):
         raise ValueError("invalid session counts")
@@ -5465,27 +6411,45 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             raise ValueError("invalid account counts")
         checked[label] = {}
         for role, raw in cast(dict[str, object], roles).items():
-            if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
+            if role not in ("units", "showrunners", "workers", "producers") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
+            starting = count.get("starting", 0)
             busy, idle, paused, exited, total = (count.get(key) for key in ("busy", "idle", "paused", "exited", "total"))
-            if any(type(value) is not int for value in (busy, idle, paused, exited, total)):
+            if any(type(value) is not int for value in (busy, starting, idle, paused, exited, total)):
                 raise ValueError("invalid activity counts")
+            starting = cast(int, starting)
             busy, idle, paused, exited, total = (cast(int, value) for value in (busy, idle, paused, exited, total))
-            if min(busy, idle, paused, exited, total) < 0 or busy + idle + paused + exited != total:
+            if min(busy, starting, idle - starting, paused, exited, total) < 0 or busy + idle + paused + exited != total:
                 raise ValueError("invalid count total")
-            checked[label][role] = RoleSessionCountsDocument(busy=busy, idle=idle, paused=paused, exited=exited, total=total)
-    return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
+            checked[label][role] = RoleSessionCountsDocument(busy=busy + starting, idle=idle - starting, paused=paused, exited=exited, total=total)
+    document = MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
+    payload = _model_fields(fields.get("models"))
+    models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
+    for label, roles in checked.items():
+        model_roles = _model_fields(payload.get(label))
+        for role, count in roles.items():
+            if entries := _decode_model_count(model_roles.get(role), count["total"]):
+                models.setdefault(label, {})[role] = entries
+    if models:
+        document["models"] = models
+    return document
+
+
+def _session_counts_failure() -> Path:
+    return _session_counts_cache().with_name("peer_session_counts_failed.json")
 
 
 def _fetch_session_counts() -> int:
-    """Fetch only the other machine's local counts through the shared transport."""
+    """Fetch the other machine's counts; a failed read keeps the last good copy for its age limit."""
     try:
         machine = remote.other_machine()
-        document = _decode_session_counts(role_map.ssh_role_map(("session-counts-read",), machine=machine), machine)
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps(document))
-    except (OSError, ValueError, subprocess.SubprocessError):
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
+        text = role_map.ssh_role_map(("session-counts-read",), machine=machine)
+        _ = _decode_session_counts(text, machine)
+        atomic_file.write_text_atomic(_session_counts_cache(), text)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        atomic_file.write_text_atomic(_session_counts_failure(), json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(), "reason": f"{type(error).__name__}: {error}"}))
         return 1
     return 0
 
@@ -5514,20 +6478,19 @@ def _machine_role_counts(
  *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
     account_config = read_account_settings(account_config)
     local, peer = _session_counts_machine(), remote.other_machine()
+    peer_models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
     try:
         document = _decode_session_counts(_session_counts_cache().read_text(), peer)
         stamp = _stored_time(document["at"])
         if stamp is None or _reading_is_old(stamp, now, account_config=account_config):
             raise ValueError("old counts")
         peer_accounts = document["accounts"]
+        peer_models = document.get("models", {})
         available = True
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
-    if not available:
-        peer_accounts = {}
+    _ = _start_session_counts_fetch()
     counted: list[StatusRow] = []
     for row in rows:
         local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
@@ -5547,13 +6510,21 @@ def _machine_role_counts(
                 idle=sum(count["idle"] for count in counts),
                 paused=sum(count["paused"] for count in counts),
                 exited=sum(count["exited"] for count in counts)))
-        counted.append(replace(row, roles=roles, role_counts=tuple(combined), role_counts_by_machine=machines))
+        models = {role: Counter(counts) for role, counts in row.models_by_role.items()}
+        for role, entries in peer_models.get(row.label, {}).items():
+            known = models.setdefault(role, Counter())
+            for entry in entries:
+                known[ObservedSessionModel(entry["model"], entry["effort"])] += entry["count"]
+        counted.append(replace(row, roles=roles, role_counts=tuple(combined),
+                               role_counts_by_machine=machines, models_by_role=models))
     return tuple(counted), (() if available else (f"{peer} unavailable: counts are {local} only",))
 
 
 def _role_count_text(row: StatusRow, role: str) -> str:
     """Render the same combined counts in the table and detail output."""
     selected = " ✓" if role in row.selected_roles else ""
+    if role in row.inherited_roles:
+        selected += " (from showrunners)"
     if role == "spare":
         return role
     index = row.roles.index(role)
@@ -5765,8 +6736,8 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
         options.label = note_file.canonical_label(options.label)
     try:
         if options.action == "session-counts-read":
-            counts, _inputs = _local_session_counts()
-            print(json.dumps(_session_counts_document(counts)))
+            observed = _local_session_counts(include_models=True)
+            print(json.dumps(_session_counts_document(observed.counts, models=observed.models)))
             return 0
         if options.action == "session-counts-fetch":
             try:
@@ -5779,7 +6750,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             if not role_map.is_role_map_host():
                 raise AccountsError("accounts: account moves belong on natedev")
             if options.action == "next-read":
-                print(next_moves.encode_next_moves(next_moves.read_next_moves()))
+                print(next_moves.read_next_move_log_text(), end="")
             else:
                 entries = next_moves.decode_next_moves(options.entries)
                 if len(entries) != 1:
@@ -5854,7 +6825,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                                      follow_role=options.follow_role, account_config=account_config)
             elif options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:
-                    raise AccountsError("move units|showrunners requires <claudeN>")
+                    raise AccountsError(f"move {'|'.join(CLAUDE_GROUPS)} requires <claudeN>")
                 moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why, alerts=options.alerts, account_config=account_config)
             else:
                 if not options.label or options.source or options.target:

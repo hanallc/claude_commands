@@ -1,6 +1,8 @@
 """Exercise native hook payloads against private staff and transcripts."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import json
 import io
 import os
@@ -9,8 +11,10 @@ import subprocess
 import sys
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stderr
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from datetime import datetime
+from threading import Event, current_thread
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
@@ -18,6 +22,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.accounts import refusals
+from scripts.agents import worker_lifecycle
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
@@ -42,14 +47,14 @@ class NativeHookEntryTests(unittest.TestCase):
                 payload = json.dumps(value)
                 receiver = Path(folder) / "receive.py"
                 receipt = Path(folder) / "receipt.json"
-                atomic_file.write_text_atomic(receiver, "\n".join((
+                atomic_file.write_text_atomic(receiver, python_tool_source("\n".join((
                     "from dataclasses import asdict",
                     "import json, sys",
                     "from pathlib import Path",
                     "from scripts.herdr import turn_end",
                     "from scripts.lib.atomic_file import write_text_atomic",
                     "turn_end.handle = lambda event: write_text_atomic(Path(sys.argv[1]), json.dumps(asdict(event)))",
-                    "raise SystemExit(turn_end.main(sys.argv[2:]))", "")))
+                    "raise SystemExit(turn_end.main(sys.argv[2:]))", ""))))
                 children: list[subprocess.Popen[bytes]] = []
 
                 def receive(arguments: list[str], *, start_new_session: bool, stdin: int,
@@ -137,6 +142,13 @@ class TurnEndTests(unittest.TestCase):
                         kept = scratch.new_worker()
                         atomic_file.write_text_atomic(kept / "peer.txt", "peer output")
                         kept_folders.append(kept)
+                    runs = self.case.run_dir / "detached_runs"
+                    runs.mkdir(exist_ok=True)
+                    for run_id, owner, owner_id in (("own", name, str(row.id)), ("director", "director", "")):
+                        atomic_file.write_text_atomic(runs / f"{run_id}.json", json.dumps(
+                            {"run_id": run_id, "worker": owner, "staff_id": owner_id, "status": "finished",
+                             "started_at": datetime.now().timestamp()}))
+                        atomic_file.write_text_atomic(runs / f"{run_id}.log", "output")
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
@@ -154,6 +166,8 @@ class TurnEndTests(unittest.TestCase):
                 if close == "working":
                     self.case.fixture.world.locations[pane]["agent_status"] = "working"
                 if close == "setup":
+                    if family == "claude":
+                        self.case.fixture.world.record(row, pane)
                     self.case.fixture.world.foreground[pane] = (998598, "direnv", ["direnv", "export", "zsh"])
                 elif close == "outside":
                     self.case.fixture.world.remove_leaf(pane)
@@ -197,6 +211,10 @@ class TurnEndTests(unittest.TestCase):
                 if close == "scratch":
                     self.assertEqual(list(Path(os.environ["TMPDIR"]).iterdir()), kept_folders)
                     self.assertEqual((kept_folders[0] / "peer.txt").read_text(), "peer output")
+                    # The pass end deletes the worker's finished runs; a director keeps its newest run.
+                    runs = self.case.run_dir / "detached_runs"
+                    self.assertEqual(sorted(path.name for path in runs.iterdir() if not path.name.startswith(".")),
+                                     ["director.json", "director.log"])
                 self.assertEqual(staff.by_id(row.id), row)
                 log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
@@ -255,12 +273,13 @@ class TurnEndTests(unittest.TestCase):
                     stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
-        opened = self.case.opened()
         original_run = self.case.run_dir
         original_state = (original_run / "progress_history_state.json").read_bytes()
         outside = Path(self.enterContext(TemporaryDirectory(prefix="outside-worker-run-")))
         atomic_file.write_text_atomic(outside / "progress_history_state.json", original_state.decode())
         self.case.run_dir = outside
+        _ = staff.set_run(self.case.fixture.parent.id, staff.OpenRun(outside))
+        opened = self.case.opened()
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
         self.assertEqual(worker_panes.worker_run(opened.row), outside)
         self.assertEqual(len(self.case.fixture.world.launches), 1)
@@ -306,7 +325,8 @@ class TurnEndTests(unittest.TestCase):
             self.assertNotEqual(*completions)
 
     def test_a_director_or_an_idle_worker_hook_changes_no_pass(self) -> None:
-        row = self.case.opened().row
+        opened = self.case.opened()
+        row = opened.row
         before = (self.case.run_dir / "progress_history_state.json").read_bytes()
         log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
         for identity, name, reason in (
@@ -324,6 +344,8 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
         self.assertEqual(self.case.agent.notices, [])
         self.assertEqual(self.case.agent.submitted, [])
+        self.assertNotIn(opened.pane, self.case.fixture.world.locations)
+        self.assertEqual(self.case.fixture.world.closed, [(opened.pane, opened.terminal)])
 
         for cause, event, closes in (
                 ("empty delivery", turn_end.EventKind.TURN_END, True),
@@ -413,6 +435,88 @@ class TurnEndTests(unittest.TestCase):
             self.case.fixture.world.processes[pid] = process
             self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(process.current_identity))), turn_end.TurnOutcome.IGNORED)
             self.assertIn(consultation.pane, self.case.fixture.world.locations)
+
+    def test_a_stopped_worker_pane_held_by_a_detached_run_closes_when_the_run_ends(self) -> None:
+        opened = self.case.opened("held")
+        world = self.case.fixture.world
+        _ = progress_history.begin_dispatch(self.case.run_dir, slot="held", phase="8", role="impl", worker_name="held",
+            worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.case.prompt, kind="impl", lens="")
+        _ = world.stop(opened.row, world)
+        self.assertEqual(progress_history.cancel_worker_passes(self.case.run_dir, opened.row.id), 1)
+        path, record = self.case.detached_record(opened.row, "held-run")
+        with ExitStack() as cleanup:
+            supervisor = cleanup.enter_context(subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                stdin=subprocess.PIPE, text=True))
+            _ = cleanup.callback(supervisor.kill)
+            assert supervisor.stdin is not None
+            _ = cleanup.callback(supervisor.stdin.close)
+            record.update(status="running", pid=supervisor.pid)
+            atomic_file.write_text_atomic(path, json.dumps(record))
+            self.assertEqual(worker_panes.close(self.case.fixture.parent.id, staff.WorkerName.parse("held")),
+                             worker_panes.Kept("a detached run is live"))
+            self.assertEqual(self.case.finish("held", turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.IGNORED)
+            self.assertIn(opened.pane, world.locations)
+        record.update(status="finished", exit_code=0)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.assertEqual(self.case.finish("held", turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.IGNORED)
+        self.assertNotIn(opened.pane, world.locations)
+        self.assertEqual(world.closed[-1], (opened.pane, opened.terminal))
+
+    def test_ready_hook_waits_from_publication_through_dispatch(self) -> None:
+        for family in ("codex", "claude"):
+            with self.subTest(family=family), ThreadPoolExecutor(max_workers=1) as hooks:
+                _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
+                name = "launching-" + family
+                launcher = current_thread()
+                hook_started = Event()
+                pending: list[Future[turn_end.TurnOutcome]] = []
+                publication_checked = False
+                acquire = worker_panes.worker_lock
+                bind = worker_panes.WorkerLockHold.bind
+                guard = LauncherHangGuard("hook before fixed-id binding")
+                closed = self.case.fixture.world.closed.copy()
+
+                @contextmanager
+                def acquire_lock(parent: staff.StaffId, name: staff.WorkerName, *, blocking: bool = False,
+                                 deadline: float = worker_lifecycle.NO_LOCK_DEADLINE
+                                 ) -> Generator[worker_panes.WorkerLockHold | worker_panes.Kept]:
+                    if current_thread() is not launcher:
+                        hook_started.set()
+                    with acquire(parent, name, blocking=blocking, deadline=deadline) as hold:
+                        yield hold
+
+                def before_bind(hold: worker_panes.WorkerLockHold, row: staff.StaffRow, *,
+                                deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+                    nonlocal publication_checked
+                    if current_thread() is launcher and not publication_checked:
+                        publication_checked = True
+                        self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir), {})
+                        with acquire(hold.parent, hold.name) as competing:
+                            self.assertIsInstance(competing, worker_panes.Kept)
+                        pending.append(hooks.submit(turn_end.handle,
+                            turn_end.WorkerEvent(str(row.current_session), reply="ready")))
+                        self.assertTrue(hook_started.wait(guard.remaining()))
+                        self.assertFalse(pending[0].done())
+                    bind(hold, row, deadline=deadline)
+
+                def during_prompt() -> None:
+                    self.assertEqual(len(pending), 1)
+                    self.assertFalse(pending[0].done())
+                    self.assertEqual(self.case.fixture.world.closed, closed)
+
+                self.case.agent.finish_after = 100
+                with (patch.object(worker_panes, "worker_lock", acquire_lock),
+                      patch.object(worker_panes.WorkerLockHold, "bind", before_bind),
+                      patch.object(self.case.agent, "during_prompt", during_prompt)):
+                    self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(pending[0].result(timeout=guard.remaining()), turn_end.TurnOutcome.IGNORED)
+                pane = self.case.agent.submitted[-1][0]
+                self.assertIn(pane, self.case.fixture.world.locations)
+                self.assertEqual(self.case.fixture.world.closed, closed)
+                self.case.agent.complete(pane)
+                self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                self.assertEqual(self.case.fixture.world.closed, [*closed, (pane, "terminal-" + pane)])
 
     def test_both_completion_events_apply_the_finished_run_exception(self) -> None:
         cases = [(event, reply_state) for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED)
@@ -554,6 +658,8 @@ class TurnEndTests(unittest.TestCase):
         process = self.case.fixture.world.processes[pid]
         self.case.fixture.world.processes[pid] = replace(process, identity=herdr.PaneSessionReport(process.identity.id))
         self.case.fixture.world.locations[friend.pane]["agent_status"] = "working"
+        self.assertIsNone(staff.snapshot().by_current_session(process.identity.id))
+        self.case.fixture.world.locations[friend.pane]["label"] = "unrelated pane label"
         for address, expected in (("codex:another-worker", turn_end.TurnOutcome.NO_DONE),
                                   (f"codex:{row.current_session}", turn_end.TurnOutcome.WAITING_ON_FRIEND)):
             with self.subTest(recipient=address):
@@ -642,6 +748,14 @@ class TurnEndTests(unittest.TestCase):
                 row = self.case.agent.row(pane)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 event = turn_end.EventKind.TURN_END
+                if name == "question":
+                    _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
+                    with patch.dict(os.environ, {"HERDR_PANE_ID": pane, "CODEX_THREAD_ID": str(row.current_session)}):
+                        unrelated = side_pane.open("unrelated", worker_panes.launch_policy("impl"), cwd=self.case.fixture.root)
+                    self.assertIsInstance(unrelated, side_pane.OpenSidePane)
+                    assert isinstance(unrelated, side_pane.OpenSidePane)
+                    self.case.fixture.world.locations[unrelated.pane]["agent_status"] = "working"
+                    _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
                 if name == "subagent":
                     assert isinstance(active, progress_history.ActiveDispatch)
                     backend = staff.backend(row)
@@ -662,6 +776,18 @@ class TurnEndTests(unittest.TestCase):
                 self.case.agent.without_done = False
                 self.case.agent.complete(pane)
                 self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+
+        decision = turn_end._prepare_notice("worker", self.case.fixture.parent, self.case.run_dir,  # pyright: ignore[reportPrivateUsage]
+            {"worker_id": str(row.id)}, "retarget-proof", turn_end.TurnOutcome.NO_DONE,
+            self.case.reply, "question", "")
+        current = staff.native_id("019b3a40-4250-7000-8000-000000009101")
+        _ = staff.rename(self.case.fixture.parent.id, "renamed-director")
+        _ = staff.update_current_session(self.case.fixture.parent.current_session, current)
+        with (patch.object(send, "send", return_value=send.Result("sent", "private")) as notice,
+              patch.object(progress_history, "record_dispatch_notice")):
+            decision.send_notice()
+        delivered = cast(send.Options, notice.call_args.args[0])
+        self.assertEqual(delivered.to, "session:" + current)
 
     def test_a_failed_notice_recovers_the_completed_pass_without_another_close(self) -> None:
         result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.case.prompt,
@@ -854,6 +980,23 @@ class TurnEndTests(unittest.TestCase):
         self.assertIn("ledger write failed", self.case.agent.notices[-1])
         self.assertEqual(len(self.case.agent.notices), 1)
 
+        with self.subTest(completion="error reply is missing"):
+            current = self.case.opened("missing-error-reply")
+            instance = progress_history.begin_dispatch(self.case.run_dir, slot=current.row.name, phase="8", role="impl",
+                worker_name=current.row.name, worker_id=current.row.id, launcher_command=["assign.sh"],
+                prompt=self.case.prompt, kind="impl", lens="")
+            missing = self.case.run_dir / "missing-error-reply.md"
+            progress_history.save_dispatch_delivery(self.case.run_dir, instance,
+                progress_history.DispatchDelivery("saved prompt", instance, str(missing)))
+            progress_history.complete_dispatch(self.case.run_dir, current.row.name, instance, status="error")
+            progress_history.save_hook_completion(self.case.run_dir, instance,
+                progress_history.HookCompletion("error", str(missing), ("error reply write failed",)))
+            turn_end.run_finished(str(current.row.current_session))
+            self.assertEqual(worker_panes.worker_pass(current.row, self.case.run_dir)["status"], "error")
+            self.assertEqual(len(self.case.agent.notices), 2)
+            self.assertIn("error reply write failed", self.case.agent.notices[-1])
+            self.assertFalse(missing.exists())
+
     def test_submission_keeps_the_held_role_until_the_hook_completes(self) -> None:
         self.case.agent.finish_after = 1
         row = self.case.opened("astra-reviewer", "astra-reviewer").row
@@ -879,7 +1022,7 @@ class TurnEndTests(unittest.TestCase):
     def test_the_astra_launcher_returns_with_an_active_pass_and_a_worker_process_hold(self) -> None:
         router = test_worker.PaneCommandRouter()
         router.setup(self, self.case.fixture.root)
-        args = assign.Arguments(new_worker="astra-reviewer", summary=str(self.case.reply), policy="astra-reviewer")
+        args = assign.Arguments(new_worker="astra-reviewer", reply_file=str(self.case.reply), policy="astra-reviewer")
         hold_role = astra_roles.hold
         bootstrap_hooks: list[Future[turn_end.TurnOutcome]] = []
 

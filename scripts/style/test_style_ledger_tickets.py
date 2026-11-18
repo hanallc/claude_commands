@@ -21,7 +21,9 @@ from dataclasses import replace
 from typing import cast, final
 from unittest import mock
 from scripts.style import rules
+from scripts.style import style_config
 from scripts.style import style_ledger
+from scripts.style import style_reader
 from scripts.style import style_plan
 from scripts.style import mechanical_classes
 from scripts.lib import berth_board
@@ -884,6 +886,34 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertNotIn("fatal:", str(refused.exception))
         self.assertIsInstance(refused.exception.__cause__, style_ledger.GitReadFailed)
         self.assertEqual(self.ledger_contents(ledger), before, "failed proof must roll back all rows and reservations")
+
+    def test_reader_failures_use_the_prerequisite_refusal_without_ledger_writes(self) -> None:
+        settings = self.root / "style_reader.conf"
+        executable = self.root / "failed-reader"
+        read_tip = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}):
+            _ = settings.write_text("reader=python\n")
+            cache = style_ledger.GitReadCache(self.repo)
+            _ = cache.tip(self.initial_tip)
+            _ = settings.write_text("reader=rust\n")
+            for failure, command in (("exit", "exit 7"), ("reply", "printf 'invalid JSON\\n'")):
+                _ = executable.write_text(f"#!/bin/sh\n{command}\n")
+                executable.chmod(0o700)
+                with (mock.patch.object(style_config, "refill_reader", return_value=style_config.ReaderSource.RUST),
+                      style_reader.use_client(style_reader.ReaderClient(executable)),
+                      style_ledger.Ledger(self.repo, self.root / "reader-failure.sqlite", git_cache=cache) as ledger):
+                    before = self.ledger_contents(ledger)
+                    operations: tuple[tuple[str, Callable[[], object]], ...] = (
+                        ("tip", lambda: read_tip(self.repo, self.initial_tip)),
+                        ("entries", lambda: style_ledger.tree_entries(self.repo, "HEAD")),
+                        ("names", lambda: ledger.files_naming(self.initial_tip, "fn")),
+                    )
+                    for operation, read in operations:
+                        with self.subTest(failure=failure, operation=operation):
+                            with self.assertRaisesRegex(style_ledger.CheckCouldNotRun, "style reader:") as refused:
+                                _ = read()
+                            self.assertIsInstance(refused.exception.__cause__, style_reader.ReaderError)
+                            self.assertEqual(self.ledger_contents(ledger), before)
 
     def test_git_boundary_checkpoint_restamp_failure_is_contextual_and_atomic(self) -> None:
         ledger = self.checkpointed_read_transition()
@@ -2027,7 +2057,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             self.record_removed(ledger, rule, path, "HEAD")
         self.assertEqual(self.cell_rows(ledger, path), [])
 
-    def test_removed_refuses_a_file_deleted_before_the_ticket_start(self) -> None:
+    def test_removed_closes_a_file_deleted_before_the_ticket_start(self) -> None:
         rule = self.rule("read")
         path = self.sources[1]
         (self.repo / path).unlink()
@@ -2037,8 +2067,16 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
         ledger.ticket_assign("1", "main")
         self.assertEqual(ledger.ticket_base("1"), base)
-        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: not a file at the ticket's start {base[:7]}$"):
-            self.record_removed(ledger, rule, path, base)
+        # A cell read at a synced tip before the delete closes; the row keeps the commit under the start that deleted it.
+        self.record_removed(ledger, rule, path, base)
+        self.assertEqual(self.cell_rows(ledger, path), [(base, "removed")])
+        self.assertEqual(ledger.unjudged_ticket_cells("1", "HEAD", self.in_worktree), ())
+        never = "crates/alpha/src/never.rs"
+        ledger.ticket_add("2", ticket_owner_id("values"), "read", "names", "crates/alpha", [never], [rule])
+        ledger.ticket_assign("2", "main")
+        self.assertEqual(ledger.ticket_base("2"), base)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(never)}: not a file at the ticket's start {base[:7]}, and no commit deletes it$"):
+            self.record_removed(ledger, rule, never, base, ticket="2")
         # A structure ticket's crate cell is a folder, so its removal is out of scope.
         ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "names", "crates/alpha", [], [rule])
         ledger.ticket_assign("3001", "main")
@@ -2360,6 +2398,20 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         kept, freed, issue = self.yield_proposal((self.sources[3], "rename", "Outcome::Old", "Outcome::New"),
                                                  (self.sources[1], "rename", "Shape::Round", "Shape::Square"))
         ledger = self.ledger()
+        need = "crates/tui_pane/src/lib.rs"
+        ticket_before = ledger.ticket_get("7001")
+        findings_before = ledger.named_held((kept, freed))
+        self.assertEqual(self.cli("held", "need", "--finding", freed, "--path", need).stdout, "")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            needs_before = cast(list[tuple[str, str, str]], connection.execute("SELECT * FROM finding_needs").fetchall())
+        self.assertEqual(self.cli("held", "need", "--finding", freed, "--path", need).stdout, "")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM finding_needs").fetchall(), needs_before)
+        self.assertEqual(ledger.ticket_get("7001"), ticket_before)
+        self.assertEqual(ledger.named_held((kept, freed)), findings_before)
+        refused = self.cli("held", "need", "--finding", "not-held", "--path", need, success=False)
+        self.assertEqual(refused.stderr.strip(), "style_ledger: unknown held finding not-held")
+        self.assertIn(need, ledger.pipeline_footprint(ticket_before, frozenset({ledger.synced_commit()})))
         refused = self.cli("ticket", "yield", "--id", "7001", "--path", self.sources[0], success=False)
         self.assertEqual(refused.stderr.strip(), f"style_ledger: 7001: no finding of the ticket is at {self.sources[0]}")
         yielded = self.cli("ticket", "yield", "--id", "7001", "--path", self.sources[1])
@@ -2367,6 +2419,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
         self.assertEqual(findings[freed].state, style_ledger.Filed(issue))
         self.assertEqual(findings[freed].build_ticket, style_ledger.NoBuildTicket())
+        self.assertEqual(ledger.finding_needs(freed), (need,))
         self.assertEqual(findings[kept].build_ticket, style_ledger.BuildTicket("7001"))
         ticket = ledger.ticket_open(ticket_owner_id("proposal"))[0]
         self.assertEqual(ticket["finding_ids"], [kept])
@@ -2387,12 +2440,30 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.ticket_add("7002", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", [self.sources[1]],
                           [findings[freed].rule], proposal=str(issue), finding_ids=(freed,))
         self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[1].build_ticket, style_ledger.BuildTicket("7002"))
+        self.assertIn(need, ledger.pipeline_footprint(ledger.ticket_get("7002"), frozenset({checkpoint})))
+        with self.subTest("record a need after the ticket drops"):
+            ledger.ticket_drop("7002")
+            self.assertEqual(ledger.named_held((freed,))[0].build_ticket, style_ledger.NoBuildTicket())
+            dropped_ticket = ledger.ticket_get("7002")
+            freed_before = ledger.named_held((freed,))
+            later_need = "crates/tui_pane/src/extra.rs"
+            self.assertEqual(self.cli("held", "need", "--finding", freed, "--path", later_need).stdout, "")
+            self.assertEqual(ledger.finding_needs(freed), tuple(sorted((need, later_need))))
+            self.assertEqual(ledger.ticket_get("7002"), dropped_ticket)
+            self.assertEqual(ledger.named_held((freed,)), freed_before)
+            ledger.ticket_add("7003", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", [self.sources[1]],
+                              [findings[freed].rule], proposal=str(issue), finding_ids=(freed,))
+            footprint = ledger.pipeline_footprint(ledger.ticket_get("7003"), frozenset({checkpoint}))
+            self.assertTrue({need, later_need}.issubset(footprint))
 
     def test_a_proposal_yield_frees_a_file_rename_beside_an_independent_one_in_its_crate(self) -> None:
         # Mounts inside alpha, also through an inline module's folder, and one from beta to a file of no finding's
-        # crate, join no finding crate to another.
+        # crate, join no finding crate to another. Alpha also mounts a beta file that holds no finding and reaches
+        # no renamed module.
         mounts = {"crates/alpha/src/other.rs": self.yield_files["crates/alpha/src/other.rs"] + "#[path = \"c.rs\"]\nmod again;\n"
-                  + "#[path = \".\"]\nmod folded {\n    #[path = \"c.rs\"]\n    mod again;\n}\n",
+                  + "#[path = \".\"]\nmod folded {\n    #[path = \"c.rs\"]\n    mod again;\n}\n"
+                  + "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n",
+                  "crates/beta/src/helper.rs": "pub fn help() {}\n",
                   "crates/beta/src/other.rs": "#[path = \"../../../vendor/third-party/src/lib.rs\"]\nmod third;\n"}
         kept, freed, _ = self.yield_proposal(self.kept_rename, self.freed_rename, {**self.yield_files, **mounts})
         self.assertEqual(self.ledger().ticket_yield("7001", self.freed_rename[0]), (freed,))
@@ -2461,6 +2532,17 @@ class StyleLedgerTicketsTests(LedgerTestCase):
               "crates/gamma/src/lib.rs": "#[cfg_attr(any(), path = \".\")]\npub mod deep {\n"
               + "    #[path = \"../../../beta/src/producer.rs\"]\n    pub mod producer;\n}\n"},
              "crates/gamma/src/lib.rs mounts crates/beta/src/producer.rs, a file outside crates/gamma"),
+            ("a path attribute mounts another crate's file into the yielded file",
+             ("crates/beta/src/producer.rs", "type", "u32", "u64"), ("crates/alpha/src/consumer.rs", "type", "u32", "u64"),
+             {"crates/alpha/src/consumer.rs": "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n"},
+             "crates/alpha/src/consumer.rs mounts crates/beta/src/helper.rs, a file outside crates/alpha"),
+            ("a file that the shared crate mounts re-exports a renamed module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n",
+              "crates/beta/src/helper.rs": "pub use crate::a::alpha;\n"}, "crates/beta/src/helper.rs re-exports a"),
+            ("a file that the shared crate mounts holds a glob use", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n",
+              "crates/beta/src/helper.rs": "use crate::*;\n"},
+             "crates/beta/src/helper.rs holds a glob use that the scan cannot resolve"),
             ("a path attribute leaves the repository", self.kept_rename, self.freed_rename,
              {library: "mod a; mod b; mod c; mod other;\n#[path = \"../../../../outside.rs\"]\nmod outside;\n"},
              f"{library} mounts ../outside.rs, a file outside crates/alpha"),

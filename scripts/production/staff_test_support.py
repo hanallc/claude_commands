@@ -38,6 +38,7 @@ from scripts.production import staff
 from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.agents import pane_record, remote
+from scripts.lint.memory_test_support import write_config_fixture
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
@@ -190,18 +191,35 @@ def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff
 
 
 def stopped_worker_module(directory: Path) -> Path:
-    """Install a child-process lifecycle stub that records the source row."""
+    """Install a child-process lifecycle stub that records the source row.
+
+    The stub patches `stop_resume` when a child imports it, so other children skip that import.
+    """
     directory.mkdir()
-    _ = (directory / "sitecustomize.py").write_text('''import json, os
+    _ = (directory / "sitecustomize.py").write_text('''import json, os, sys
+from importlib.machinery import PathFinder
 from pathlib import Path
-from scripts.production import staff
-from scripts.agents import stop_resume
 def stop(reference, kind=""):
+    from scripts.production import staff
+    from scripts.agents import stop_resume
     row = staff.by_id(staff.StaffId(reference))
     if os.environ.get("FIXTURE_STOPPED"):
         Path(os.environ["FIXTURE_STOPPED"]).write_text(json.dumps(row.to_json()))
     return stop_resume.Stopped(row.current_session, 987654)
-stop_resume.stop = stop
+class StopPatch:
+    @classmethod
+    def find_spec(cls, name, path, target=None):
+        if name != "scripts.agents.stop_resume":
+            return None
+        sys.meta_path.remove(cls)
+        spec = PathFinder.find_spec(name, path)
+        load = spec.loader.exec_module
+        def exec_module(module):
+            load(module)
+            module.stop = stop
+        spec.loader.exec_module = exec_module
+        return spec
+sys.meta_path.insert(0, StopPatch)
 ''')
     return directory
 
@@ -367,10 +385,18 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
         ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("HERDR_PANE_RECORD_DIR", "panes"),
         ("XDG_CONFIG_HOME", "config"),
+        # Session folders belong to staff members; a fixture member never makes one in the live root.
+        ("SESSION_TEMP_ROOT", "session"),
     ):
         _ = environment.setdefault(key, str(path.parent / folder))
+    # A row removal edits the restart record; a fixture never edits the live one.
+    _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
+        if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
+            configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
+            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
@@ -379,8 +405,10 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             "NOTIFIER_SESSIONS_DIR": environment["NOTIFIER_SESSIONS_DIR"],
             "HERDR_PANE_RECORD_DIR": environment["HERDR_PANE_RECORD_DIR"],
             "XDG_CONFIG_HOME": environment["XDG_CONFIG_HOME"],
+            "SESSION_TEMP_ROOT": environment["SESSION_TEMP_ROOT"],
+            "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
-            "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
+            "STAFF_CONFIG": environment["STAFF_CONFIG"],
         })))
         for name in ("showrunners", "scripts.production.showrunners"):
             module = sys.modules.get(name)
@@ -1036,10 +1064,21 @@ class StaffTestCase(unittest.TestCase):
         """Create private run evidence for a director and its worker passes."""
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{production_name}-{unit}"
         run.mkdir(parents=True, exist_ok=True)
+        record = staff.local_snapshot()
+        owner = record.by_current_session(director)
+        if owner is None:
+            owner = next(row for row in record.find(kind="unit") if row.name == unit)
+        participants: dict[str, object] = {}
+        for passed in passes:
+            reference = passed.get("worker_id")
+            member = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else
+                      next((row for row in record.find(kind="worker", parent=owner.id)
+                            if row.name == passed.get("worker_name")), None))
+            if member is not None and member.parent == staff.ReportsTo(owner.id):
+                participants[str(passed.get("team_slot") or member.id)] = {
+                    **{key: value for key, value in passed.items() if key != "worker_name"}, "worker_id": member.id}
         self.write_json(run / "progress_history_state.json", {
-            "production": production_name, "unit": unit,
-            "main_agent": {"family": "claude", "session_id": director},
-            "pass": {str(passed["worker_name"]): passed for passed in passes},
+            "owner_staff_id": owner.id, "pass": participants,
         })
         write_text_atomic(run / "director", director + "\n")
         if director_run:

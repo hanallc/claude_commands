@@ -117,7 +117,9 @@ Work moved to another phase is not saved work.
 `progress_history.py check-launch` and `start-pass` check the named open phase and the prompt's first `Phase <id> — <title>` line.
 A recorded launch needs `--phase-id`.
 A fix needs a ledger batch in flight, a landed batch awaiting review, or an explicit `--fix-cause`.
-The launcher records `worker_name` for recovery.
+The launcher records `worker_id` for recovery.
+Current names come from staff when the run has a fixed owner.
+Historical events retain the event-time worker name.
 The director records phase boundaries before the next phase's first dispatch.
 Historical boundaries that are missing remain uncertain.
 
@@ -127,7 +129,7 @@ A stub identifies its authoritative file and the moment to read it.
 Compaction recovery reads the core and the contracts whose moments apply.
 Each rule has one authoritative definition.
 
-`/module_review`, `/team_review`, and `/api_review` run their lenses in the invoking session.
+`/module_review` and `/team_review` run their lenses in the invoking session.
 Each writes its lens result before the next lens starts.
 These commands do not start separate one-shot reviewers.
 The phase review workflow retains its own worker path.
@@ -167,6 +169,12 @@ A rejected resumed handoff keeps its existing unpublished merge.
 The bump path pushes first and starts its background gate afterward.
 
 A main conflict aborts the merge and reports the conflicting paths.
+Before publication, a held batch checks each checkpoint against the same main commit with `git merge-tree --write-tree`.
+Only conflicting items receive their conflict files and instructions to merge `origin/main` into their own unit branch.
+The batch removes those items and their unit's later items, restores the starting tip, and retries the remaining items.
+Clean items can land in the same run.
+If every item is clean, the combined merge conflict keeps the batch held.
+Each notice then says the checkpoint is clean against main and can land alone.
 A malformed incoming manifest also triggers preparation rollback.
 Rollback preserves unpublished work that existed before the run.
 Shrink and as-built ancestry uses Git, without requiring a checkpoint event from a particular worktree.
@@ -182,7 +190,13 @@ Other failures restore the previous file content.
 ## Shared main push lock
 
 `scripts/lib/main_push_lock.py` owns `<git common dir>/main-push.lock`.
-The helper records `held_seconds` when the owner releases the lock.
+Each hold appends one line to `<git common dir>/main-push-lock.jsonl` when the owner releases the lock.
+The line has the holder, its pid, `acquired_at`, `waited_seconds` and `held_seconds`.
+The holder is the caller's name, or the program name by default.
+The shell entry names the command it runs.
+Lines older than `record_days` in `config/main_push_lock.conf` (14) go at the next hold.
+A failed record write prints one stderr line and releases the lock as usual.
+nate decides step 3 of the push lock plan (one landing queue) from these times.
 The helper tracks active holds in the process.
 A nested call in the same process uses the existing hold for that path.
 A different repository takes its own lock.
@@ -201,6 +215,11 @@ scripts/lib/py -m scripts.lib.main_push_lock --checkout "$PWD" -- git push origi
 
 Only main publication takes this lock.
 The checkpoint retest hold remains the exception for long work.
+When `tested_main_push` finds that main moved only by settings commits, it merges them and pushes with no retest.
+A settings commit has one parent, a subject in `main_publish.SETTINGS_SUBJECTS`, and only `config/` paths.
+The subjects are `tune(`, `zone(`, `user zone: ` and `config(models): `.
+Any other commit in the move, a fast track fix included, makes the landing retest as before.
+nate approved this narrower gate (sdlc [60b4a578], 2026-11-14).
 Other pushers release their holds before tests, validation, Mac pulls, and CI waits.
 
 | Pusher | Protected step |

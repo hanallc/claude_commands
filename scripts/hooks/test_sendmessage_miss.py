@@ -62,14 +62,14 @@ class SendMessageMissTests(unittest.TestCase):
                       expect_contact: bool = True) -> Generator[FakeDaemon, None, None]:
         for identity, name in members.items():
             self.members[identity] = staff.StaffRow(staff.StaffId(identity), "unit", name, staff.StaffRoot(),
-                                                   current_session=staff.StaffId(identity))
+                                                   current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct"))
         with loaded_session_daemon(home, members, expect_contact=expect_contact) as daemon:
             yield daemon
 
     def peer_snapshot(self, *, name: str = "", problems: tuple[str, ...] = ()) -> None:
         if name:
             self.members["peer-thread"] = staff.StaffRow(staff.StaffId("peer-thread"), "unit", name, staff.StaffRoot(),
-                                                       current_session=staff.StaffId("peer-thread"))
+                                                       current_session=staff.StaffId("peer-thread"), unit_type=staff.UnitDetails("direct"))
         with patch.dict(os.environ, self.environment, clear=True):
             from scripts.message import codex_daemon
             from scripts.message import roster
@@ -120,6 +120,10 @@ class SendMessageMissTests(unittest.TestCase):
 
     def test_a_relay_name_miss_finds_the_real_senders_session(self) -> None:
         write_relay_session(self.root / "sessions", self.root / "state/message", os.getpid(), "natedev")
+        path = self.root / f"sessions/{os.getpid()}.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        fields["name"] = "Different registry title"
+        _ = path.write_text(json.dumps(fields))
         with self.loaded_daemon(self.home, {"thread": "natedev"}):
             text = self.additional_context(self.run_hook(relay_session_name("natedev")))
         self.assertIn("natedev: codex freestanding, account codex2", text)
@@ -161,7 +165,7 @@ class SendMessageMissTests(unittest.TestCase):
 
     def test_a_clean_miss_checks_the_peer_before_reporting_no_session(self) -> None:
         self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", staff.StaffRoot(),
-                                                 current_session=staff.StaffId("missing"))
+                                                 current_session=staff.StaffId("missing"), unit_type=staff.UnitDetails("direct"))
         text = self.additional_context(self.run_hook())
         self.assertIn("no session named 'morty' on either machine either", text)
         self.assertTrue((self.root / "peer-read").exists())
@@ -183,7 +187,7 @@ class SendMessageMissTests(unittest.TestCase):
         self.assertIn("--to Morty", text)
 
     def test_multiple_matches_list_addresses_instead_of_choosing_one(self) -> None:
-        with loaded_session_daemon(self.home, {"one": "Morty", "two": "morty"}):
+        with self.loaded_daemon(self.home, {"one": "Morty", "two": "morty"}):
             text = self.additional_context(self.run_hook("MORTY"))
         self.assertIn("codex:one", text)
         self.assertIn("codex:two", text)
@@ -192,7 +196,7 @@ class SendMessageMissTests(unittest.TestCase):
 
     def test_a_roster_error_is_context_and_never_blocks(self) -> None:
         self.members["missing"] = staff.StaffRow(staff.StaffId("missing"), "unit", "morty", staff.StaffRoot(),
-                                                 current_session=staff.StaffId("missing"))
+                                                 current_session=staff.StaffId("missing"), unit_type=staff.UnitDetails("direct"))
         self.peer_snapshot(problems=("fixture peer failure",))
         text = self.additional_context(self.run_hook())
         self.assertIn("send.py roster error:", text)

@@ -129,9 +129,49 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         for options in ((), ("--withdraw", "Withdraw the ruling.")):
             with self.subTest(options=options):
                 self.assert_refused(
-                    "Only a held or decided finding can receive an answer", "decision", "--id", finding_id,
+                    "Only a held, decided or accepted finding can receive an answer", "decision", "--id", finding_id,
                     "--answer", "approved", "--user-words", "Remove repeated parsing.", *options,
                 )
+
+    def accepted_finding_in_a_closed_phase(self) -> str:
+        """Phase 62 accepts its finding, then closes while phase 63 runs."""
+        self.write_progress_state("phase-sixty-two", "62")
+        finding_id = self.open_finding("blocker", "The byte split hides a cast")
+        self.close_round([finding_id])
+        state = {"history_file": str(self.history_file),
+                 "phase": {"instance_id": "phase-sixty-three", "id": "63", "title": "63", "status": "active"}}
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
+        return finding_id
+
+    def phase_finding(self, phase: str) -> dict[str, object]:
+        return cast(list[dict[str, object]], self.phase_status(phase)["findings"])[0]
+
+    def test_an_accepted_finding_in_a_closed_phase_takes_the_users_decision(self) -> None:
+        finding_id = self.accepted_finding_in_a_closed_phase()
+        decide = ("decision", "--phase", "62", "--id", finding_id, "--answer", "approved", "--user-words", "Approved")
+        self.assertEqual(self.run_command(*decide, at=1_500), f"{finding_id} decided: approved")
+        entry = self.phase_finding("62")
+        self.assertEqual(entry["state"], "accepted")
+        self.assertEqual(entry["decision"], {"answer": "approved", "user_words": "Approved", "timestamp_epoch": 1_500})
+        event = self.events()[-1]
+        self.assertEqual((event["event_type"], event["finding_id"], event["phase_instance_id"]),
+                         ("finding_decision", finding_id, "phase-sixty-two"))
+        ledger, events = self.ledger(), self.events()
+        _ = self.run_command(*decide, at=1_510)
+        self.assertEqual((self.ledger(), self.events()), (ledger, events))
+        self.assert_refused("use --withdraw", "decision", "--phase", "62", "--id", finding_id,
+                            "--answer", "declined", "--user-words", "Remove the allow.")
+
+    def test_a_decided_finding_a_verdict_accepted_changes_its_ruling_with_withdraw(self) -> None:
+        finding_id = self.decided_finding("approved", "Remove the retry.", at=1_010)
+        _ = self.run_command("verdict", "--id", finding_id, "--state", "accepted")
+        _ = self.run_command("decision", "--id", finding_id, "--answer", "declined", "--user-words", "Keep the retry.",
+                             "--withdraw", "The user changed the answer.", at=1_020)
+        entry = self.finding_rows()[0]
+        self.assertEqual(entry["state"], "accepted")
+        self.assertEqual(cast(dict[str, object], entry["decision"])["answer"], "declined")
+        history = cast(list[dict[str, object]], entry["decision_history"])
+        self.assertEqual([(row["answer"], row["withdrawn_epoch"]) for row in history], [("approved", 1_020)])
 
     def test_an_approved_decision_permits_a_closure_verdict(self) -> None:
         finding_id = self.decided_finding("approved", "Remove the retry.")

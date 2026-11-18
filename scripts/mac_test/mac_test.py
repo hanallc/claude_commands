@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -42,6 +42,7 @@ from scripts.mac_test.claim_state import (
     Showrunner as Showrunner,
     WaitingOnLocalRun as WaitingOnLocalRun,
     WaitingOnCiJob as WaitingOnCiJob,
+    WaitingOnCiMacJob as WaitingOnCiMacJob,
     WaitingOnUnknownCi as WaitingOnUnknownCi,
     WaitingOn as WaitingOn,
     FreeMessageNotNeeded as FreeMessageNotNeeded,
@@ -91,7 +92,9 @@ from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as i
 
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
-    from scripts.mac_test import offload
+    from scripts.build_queue import placement
+    from scripts.buildlog import sync as buildlog_sync
+    from scripts.mac_test import eligibility
 
 MESSAGE_TIMEOUT_S = 30.0
 
@@ -130,6 +133,7 @@ NO_REMOTE_JOB = NoRemoteJob()
 NO_MAC_BLOCK = NoMacBlock()
 NO_SHOWRUNNER = NoShowrunner()
 WAITING_ON_CI_JOB = WaitingOnCiJob()
+WAITING_ON_CI_MAC_JOB = WaitingOnCiMacJob()
 WAITING_ON_UNKNOWN_CI = WaitingOnUnknownCi()
 FREE_MESSAGE_NOT_NEEDED = FreeMessageNotNeeded()
 FREE_MESSAGE_SENT = FreeMessageSent()
@@ -177,8 +181,12 @@ class CiIdle:
     """No queued or running CI Mac job exists."""
 
 
-class CiBusy:
-    """A queued or running CI Mac job exists."""
+class CiJobNotStarted:
+    """A CI run still needs its Mac job to start."""
+
+
+class CiMacJobRunning:
+    """A CI Mac job is running on the Mac."""
 
 
 @dataclass(frozen=True)
@@ -188,9 +196,10 @@ class CiUnknown:
     line: str
 
 
-CiActivity = CiIdle | CiBusy | CiUnknown
+CiActivity = CiIdle | CiJobNotStarted | CiMacJobRunning | CiUnknown
 CI_IDLE = CiIdle()
-CI_BUSY = CiBusy()
+CI_JOB_NOT_STARTED = CiJobNotStarted()
+CI_MAC_JOB_RUNNING = CiMacJobRunning()
 
 
 class NoProblem:
@@ -232,6 +241,7 @@ class MacTestConfig:
     ci_workflow: str
     ci_job: str
     gh_timeout_s: float
+    ci_jobless_queued_minutes: float
     block_hours: float
     block_max_hours: float
     block_warn_minutes: float
@@ -291,6 +301,15 @@ INVALID_BLOCK_DURATION = InvalidBlockDuration()
 FreeNowAnswer = Literal["free", "off", "backoff", "blocked", "busy", "state", "bad"]
 
 
+@dataclass(frozen=True)
+class UnassignedClaim:
+    """A manual claim uses the provider's existing scope selection."""
+
+
+UNASSIGNED_CLAIM = UnassignedClaim()
+
+
+
 class CliArguments(argparse.Namespace):
     """Arguments accepted across the mac-test subcommands."""
 
@@ -311,9 +330,11 @@ class CliArguments(argparse.Namespace):
         self.copy: bool = False
         self.target: str = ""
         self.leased_slots: list[int] = []
+        self.assignment_file: str = ""
+        self.assignment: str = ""
         self.from_pid: int = 0
         self.package: str = ""
-        self.verb: offload.MacVerb = "nextest"
+        self.verb: eligibility.MacVerb = "nextest"
         self.claim_id: str = ""
         self.episode: str = ""
         self.attempt: str = ""
@@ -322,18 +343,18 @@ class CliArguments(argparse.Namespace):
 
 
 def config_path(target: str = "") -> Path:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    return offload.configured_ssh_target(target).settings if target else conf.path("mac_test")
+    return eligibility.configured_ssh_target(target).settings if target else conf.path("mac_test")
 
 
 def read_config(target: str = "") -> MacTestConfig:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
     settings = config_path(target)
     config = conf.read(settings)
     values = config.values()
-    platform = offload.configured_ssh_target(target).platform if target else "macos"
+    platform = eligibility.configured_ssh_target(target).platform if target else "macos"
     if platform == "macos":
         _ = idle_config(config)
     if "ci_repo" not in values:
@@ -351,6 +372,7 @@ def read_config(target: str = "") -> MacTestConfig:
         ci_workflow=ci_fields["ci_workflow"],
         ci_job=ci_fields["ci_job"],
         gh_timeout_s=config.number("gh_timeout_s"),
+        ci_jobless_queued_minutes=config.number("ci_jobless_queued_minutes") if ci_repo else 0.0,
         block_hours=config.number("block_hours"),
         block_max_hours=config.number("block_max_hours"),
         block_warn_minutes=config.number("block_warn_minutes"),
@@ -374,6 +396,17 @@ def lock_if_available(path: Path) -> Generator[bool, None, None]:
             yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def holder_name(key: str) -> str:
+    """Show the current staff name when the fixed holder key resolves."""
+    from scripts.production import staff
+
+    try:
+        member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    except staff.StaffUnreadable:
+        return key
+    return member.name if member is not None else key
 
 
 def decoded_delivery(session: object, holder: str, path: Path) -> MessageDelivery:
@@ -415,6 +448,8 @@ def decode_waiting(value: object, path: Path) -> WaitingOn:
             return WaitingOnLocalRun(what)
     if kind == "ci_job" and set(item) == {"kind"}:
         return WAITING_ON_CI_JOB
+    if kind == "ci_mac_job" and set(item) == {"kind"}:
+        return WAITING_ON_CI_MAC_JOB
     if kind == "ci_unknown" and set(item) == {"kind"}:
         return WAITING_ON_UNKNOWN_CI
     raise StateReadError(f"{path} has an invalid block record")
@@ -506,7 +541,7 @@ def blocking_claim_block(paths: StatePaths, session: SubmittingSession) -> MacBl
 
 
 def blocked_claim(block: PendingMacBlock | ActiveMacBlock) -> ClaimFinished:
-    print(f"blocked by {block.holder}: {block.reason}")
+    print(f"blocked by {holder_name(block.holder)}: {block.reason}")
     return ClaimFinished(10)
 
 
@@ -532,6 +567,8 @@ def block_record(block: PendingMacBlock | ActiveMacBlock) -> dict[str, object]:
             record["waiting_on"] = {"kind": "local_run", "what": waiting.what}
         elif isinstance(waiting, WaitingOnCiJob):
             record["waiting_on"] = {"kind": "ci_job"}
+        elif isinstance(waiting, WaitingOnCiMacJob):
+            record["waiting_on"] = {"kind": "ci_mac_job"}
         else:
             record["waiting_on"] = {"kind": "ci_unknown"}
     else:
@@ -611,6 +648,11 @@ def run_is_live(run: RunRecord) -> bool:
     return "remote_host" in run or process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
 
 
+def claim_owner(run: RunRecord) -> tuple[claim_state.ClaimIdentity, int, str, str]:
+    """The fields that name a claim's owner; the claim watcher changes none of them."""
+    return claim_state.claim_identity(run), run["pid"], run["proc_start"], run["since"]
+
+
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     return "remote_host" in run and process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])
 
@@ -625,19 +667,19 @@ def copy_gives_way(run: RunRecord) -> bool:
 
 def claim_scope(worktree: str) -> ClaimScope:
     """The repository a claim covers: the one its worktree is in, else the whole Mac."""
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    repository = offload.repository_identity(Path(worktree))
-    if isinstance(repository, offload.KnownRepository):
+    repository = eligibility.repository_identity(Path(worktree))
+    if isinstance(repository, eligibility.KnownRepository):
         return RepositoryScope(repository.name, repository.key)
     return WHOLE_MAC
 
 
 def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
     if isinstance(scope, RepositoryScope):
-        key = offload.KnownRepository(scope.name, scope.key).path_key if scope.key else quote(scope.name, safe="")
+        key = eligibility.KnownRepository(scope.name, scope.key).path_key if scope.key else quote(scope.name, safe="")
         suffix = f".slot-{scope.slot}" if scope.slot else ""
         return paths.claims / f"{key}{suffix}.json"
     return paths.run
@@ -660,9 +702,9 @@ def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    return paths.affinity / f"{offload.KnownRepository(scope.name, scope.key).path_key}.json"
+    return paths.affinity / f"{eligibility.KnownRepository(scope.name, scope.key).path_key}.json"
 
 
 def preferred_slots(paths: StatePaths, scope: RepositoryScope, worktree: str, capacity: int) -> tuple[int, ...]:
@@ -685,10 +727,20 @@ def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) 
 
 def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
     """Read every claim and remove each one whose owner has ended."""
+    from scripts.mac_test import offload
+
     live: list[HeldClaim] = []
     for claim in read_claims(paths):
         if run_is_live(claim.record):
             live.append(claim)
+        elif offload.pending_start_path(paths.target, claim_state.ClaimIdentity(
+                claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])).exists():
+            release = CliArguments()
+            release.pid, release.target = claim.record["pid"], paths.target
+            release.claim_id = claim.record["claim_id"]
+            release.episode, release.attempt = claim.record["episode"], claim.record["attempt"]
+            if command_release(release, paths, provider_lock_held=True) != 0:
+                live.append(claim)
         else:
             claim.path.unlink(missing_ok=True)
     return tuple(live)
@@ -716,6 +768,12 @@ def message_timeout_s() -> float:
 
 
 def delivery_target(delivery: MessageDelivery) -> str:
+    from scripts.production import staff
+
+    key = delivery.name if isinstance(delivery, HolderQueue) else delivery.holder
+    member = staff.initial_snapshot().by_id(staff.StaffId(key))
+    if member is not None:
+        return member.id
     if isinstance(delivery, HolderQueue):
         return delivery.name
     sessions_script = message_script("MAC_TEST_SESSIONS", "sessions.py")
@@ -821,23 +879,17 @@ def jobs_for_run(config: MacTestConfig, database_id: int) -> list[object] | GhFa
     return cast(list[object], jobs)
 
 
-def run_ids(answer: GhAnswer) -> list[int] | GhFailure:
-    items = json_items(answer)
-    if isinstance(items, GhFailure):
-        return items
-    ids: list[int] = []
-    for item in items:
-        if not isinstance(item, dict):
-            return GhFailure("gh returned invalid JSON")
-        database_id = cast(dict[str, object], item).get("databaseId")
-        if type(database_id) is not int:
-            return GhFailure("gh returned invalid JSON")
-        ids.append(database_id)
-    return ids
+@dataclass(frozen=True)
+class CiRun:
+    """A CI run that can still need the Mac."""
+
+    status: Literal["queued", "in_progress"]
+    created_at: datetime
 
 
 def ci_activity(config: MacTestConfig) -> CiActivity:
-    ids: list[int] = []
+    runs: dict[int, CiRun] = {}
+    now = utc_now()
     for status in ("queued", "in_progress"):
         answer = run_gh(
             config,
@@ -850,18 +902,36 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
             "--status",
             status,
             "--json",
-            "databaseId",
+            "databaseId,createdAt",
         )
         if isinstance(answer, GhFailure):
             return CiUnknown(answer.line)
-        status_ids = run_ids(answer)
-        if isinstance(status_ids, GhFailure):
-            return CiUnknown(status_ids.line)
-        ids.extend(status_ids)
-    for database_id in dict.fromkeys(ids):
+        items = json_items(answer)
+        if isinstance(items, GhFailure):
+            return CiUnknown(items.line)
+        for item in items:
+            if not isinstance(item, dict):
+                return CiUnknown("gh returned invalid JSON")
+            run = cast(dict[str, object], item)
+            database_id = run.get("databaseId")
+            created = run.get("createdAt")
+            if type(database_id) is not int or not isinstance(created, str):
+                return CiUnknown("gh returned invalid JSON")
+            try:
+                created_at = datetime.fromisoformat(created)
+            except ValueError:
+                return CiUnknown("gh returned invalid JSON")
+            if created_at.tzinfo is None:
+                return CiUnknown("gh returned invalid JSON")
+            runs[database_id] = CiRun(status, created_at)
+    activity: CiIdle | CiJobNotStarted = CI_IDLE
+    for database_id, run in runs.items():
         jobs = jobs_for_run(config, database_id)
         if isinstance(jobs, GhFailure):
             return CiUnknown(jobs.line)
+        if (run.status == "queued" and not jobs
+                and now - run.created_at > timedelta(minutes=config.ci_jobless_queued_minutes)):
+            continue
         mac_job_completed = False
         for raw_job in jobs:
             if not isinstance(raw_job, dict):
@@ -869,12 +939,15 @@ def ci_activity(config: MacTestConfig) -> CiActivity:
             job = cast(dict[str, object], raw_job)
             if job.get("name") != config.ci_job:
                 continue
+            if job.get("status") == "in_progress":
+                return CI_MAC_JOB_RUNNING
             if job.get("status") != "completed":
-                return CI_BUSY
-            mac_job_completed = True
+                activity = CI_JOB_NOT_STARTED
+            else:
+                mac_job_completed = True
         if not mac_job_completed:
-            return CI_BUSY
-    return CI_IDLE
+            activity = CI_JOB_NOT_STARTED
+    return activity
 
 
 def switch_ci_off(config: MacTestConfig) -> CiSwitchOffResult:
@@ -1106,7 +1179,7 @@ def skipped_ci_runs(config: MacTestConfig, since: datetime) -> str:
 def expiry_text(block: PendingMacBlock | ActiveMacBlock, skipped: str, target: str) -> str:
     label = "the Mac" if target == "mac" else target
     text = (
-        f"Message from mac-test: {label} block by {block.holder} ({block.reason}) "
+        f"Message from mac-test: {label} block by {holder_name(block.holder)} ({block.reason}) "
         + f"reached its time limit at {block_time(block.expires)} and lifted by itself."
     )
     if ci_needs_restore(block.ci):
@@ -1145,7 +1218,7 @@ def expire_block(
         restored = switch_ci_back(config)
         if isinstance(restored, GhFailure):
             text = (
-                f"Message from mac-test: {label} block by {block.holder} is past "
+                f"Message from mac-test: {label} block by {holder_name(block.holder)} is past "
                 + f"its time limit but still in place: CI's {label} switch could not be "
                 + f"turned back on ({restored.line}). Run github-warmup, then unblock."
             )
@@ -1401,9 +1474,7 @@ def watch_claim(
         current = read_run(claim.path)
         if isinstance(current, NoRun):
             return False
-        if (current["pid"], current["proc_start"], current["since"]) != (
-            run["pid"], run["proc_start"], run["since"],
-        ):
+        if claim_owner(current) != claim_owner(run):
             return True
         if not run_is_live(current):
             return False
@@ -1442,10 +1513,12 @@ def watch_claim(
         idle_since = aware_timestamp(current["idle_since"], claim.path, "idle_since")
         if now - idle_since < timedelta(minutes=config.claim_idle_minutes):
             return True
-        block_present = not isinstance(read_block(paths.block), NoMacBlock)
-        claim.path.unlink(missing_ok=True)
-    if block_present:
-        start_watcher(paths)
+    release = CliArguments()
+    release.pid, release.target = current["pid"], paths.target
+    release.claim_id = current["claim_id"]
+    release.episode, release.attempt = current["episode"], current["attempt"]
+    if command_release(release, paths) != 0:
+        return True
     released_at = local_time(timestamp(now), include_zone=False)
     quoted_what = "'" + current["what"].replace("'", "'\"'\"'") + "'"
     quoted_worktree = "'" + current["worktree"].replace("'", "'\"'\"'") + "'"
@@ -1611,8 +1684,9 @@ def full_settle(
                 write_block(paths.block, block)
         elif config.ci_repo:
             activity = ci_activity(config)
-            if isinstance(activity, CiBusy):
-                block = pending_with_wait(block, WAITING_ON_CI_JOB)
+            if isinstance(activity, (CiJobNotStarted, CiMacJobRunning)):
+                block = pending_with_wait(block, WAITING_ON_CI_MAC_JOB
+                                          if isinstance(activity, CiMacJobRunning) else WAITING_ON_CI_JOB)
                 with locked(paths.lock):
                     write_block(paths.block, block)
             elif isinstance(activity, CiUnknown):
@@ -1675,9 +1749,9 @@ def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
 
 
 def requested_delivery(holder: str) -> MessageDelivery:
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    owner = build_hold.owning_session()
+    owner = owning_session.owning_session()
     return (
         RecordedSession(owner.session_id, holder)
         if isinstance(owner, OwningSession)
@@ -1739,18 +1813,9 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     return ClaimFinished(13)
 
 
-def bind_instance_generation(paths: StatePaths, claim: RemoteJobClaim) -> None:
-    """Bind new AWS work without changing retained claim evidence."""
-    from scripts.mac_test import offload
-
-    if target_config.is_aws_target(offload.configured_ssh_target(paths.target)):
-        generation = offload.expected_instance_generation(paths.target)
-        if generation:
-            claim['instance_generation'] = generation
-
-
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
-               *, session: SubmittingSession, reserve_wait: bool = False) -> ClaimAttempt:
+               *, session: SubmittingSession, reserve_wait: bool = False,
+               assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
     try:
         claims = live_claims(paths)
@@ -1775,7 +1840,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             if "slot" in record:
                 print(f"slot: {record['slot']}")
             return ClaimFinished(13)
-    if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
+    if (isinstance(assignment, UnassignedClaim)
+            and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)):
         try:
             capacity = slot_capacity(paths, scope)
             slots = preferred_slots(paths, scope, args.worktree, capacity)
@@ -1841,7 +1907,6 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         claimed["copy"] = True
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
-        bind_instance_generation(paths, remote_claim)
         claimed = remote_claim
     if isinstance(owner, OwningSession):
         claimed["holder_session"] = owner.session_id
@@ -1916,7 +1981,6 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         record = {**claim.record}
     else:
         record = {**claim.record, "remote_host": args.remote}
-        bind_instance_generation(paths, record)
     record["pid"] = args.pid
     record["proc_start"] = start.start
     write_json(claim.path, record)
@@ -1932,31 +1996,53 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
 
 
 def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
-                       session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
+                       session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                       assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
     """Reserve a slot for a live local wait without starting remote work."""
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
     settings = Path(args.settings) if args.settings else config_path(args.target)
-    config = offload.read_config(settings)
-    if isinstance(offload.mac_step_eligibility(config, Path(args.repo_root), args.package,
-                                             args.verb, args.target, kind=kind), offload.IneligibleMacStep):
+    config = eligibility.read_config(settings)
+    if isinstance(eligibility.mac_step_eligibility(config, Path(args.repo_root), args.package,
+                                             args.verb, args.target, kind=kind), eligibility.IneligibleMacStep):
         return 1
     args.worktree = args.repo_root
     args.what = f"{args.verb} {args.package or 'workspace'}"
-    return command_claim(args, paths, watch_claim=False, session=session)
+    return command_claim(args, paths, watch_claim=False, session=session, assignment=assignment)
 
 
 def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True,
-                  session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION) -> int:
+                  session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                  assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
+    from scripts.build_queue import admission_protocol as wire, placement
+
+    if (args.assignment_file or args.assignment) and isinstance(assignment, UnassignedClaim):
+        saved = wire.parse_reply(args.assignment or Path(args.assignment_file).read_text())
+        if not isinstance(saved, wire.Assignment):
+            raise ValueError("claim requires a remote assignment")
+        assignment = saved.assignment
     session = claim_state.submitting_session(session)
-    scope = target_claim_scope(paths, args.worktree)
+    if isinstance(assignment, placement.PlacementAssignment):
+        destination = assignment.destination
+        if destination.target != (args.target or "mac") or destination.provider not in ("mac", "ssh"):
+            return 12
+        scope = destination.scope
+        if destination.provider == "ssh" and (not isinstance(scope, RepositoryScope) or scope.slot != destination.slot):
+            return 12
+        if not args.from_pid:
+            args.episode, args.attempt = assignment.episode, assignment.attempt
+            if not args.claim_id:
+                args.claim_id = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+        session = assignment.session
+    else:
+        scope = target_claim_scope(paths, args.worktree)
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
     while True:
         with locked(paths.lock):
             attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
-                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim))
+                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
         if isinstance(attempt, ClaimFinished):
             if watch_claim and attempt.status in (0, 13):
                 start_claim_watcher(paths)
@@ -1991,30 +2077,96 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         time.sleep(min(2.0, remaining))
 
 
-def command_release(args: CliArguments, paths: StatePaths) -> int:
-    with locked(paths.lock):
+@dataclass(frozen=True)
+class EndStoppedWork:
+    """The holder has exited: end its mirror's remote work before the start fence settles."""
+
+    repository: eligibility.KnownRepository
+
+
+@dataclass(frozen=True)
+class KeepRemoteWork:
+    """The holder releases its own claim, so no remote work of its own remains."""
+
+
+KEEP_REMOTE_WORK = KeepRemoteWork()
+
+
+@dataclass(frozen=True)
+class ClaimsReleased:
+    """Every claim the holder owned is gone; the transfers are what those claims recorded."""
+
+    count: int
+    transfers: tuple[buildlog_sync.TransferBytes, ...]
+
+
+@dataclass(frozen=True)
+class ClaimReleaseRefused:
+    """The reason explains why the claim release was refused."""
+    reason: str
+
+
+def release_exact_claims(
+    paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
+    provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
+) -> ClaimsReleased | ClaimReleaseRefused:
+    """Release the claims that pid holds under identity, after their remote start fence settles."""
+    from scripts.mac_test import eligibility, offload
+
+    with nullcontext() if provider_lock_held else locked(paths.lock):
         # Each file is read alone, so another repository's damaged record
         # cannot keep this owner's claim in place.
+        owned: list[tuple[Path, RunRecord]] = []
         for path in claim_files(paths):
             try:
                 record = read_run(path)
             except StateReadError:
                 continue
-            if (isinstance(record, dict) and record["pid"] == args.pid
-                    and claim_state.claim_identity(record) == claim_state.ClaimIdentity(
-                        args.claim_id, args.episode, args.attempt)):
-                transfers = record.get("transfers", [])
-                if transfers:
-                    print("copy_bytes=" + json.dumps(transfers))
-                path.unlink(missing_ok=True)
+            if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
+                owned.append((path, record))
+    transfers: list[buildlog_sync.TransferBytes] = []
+    for path, record in owned:
+        pending = offload.pending_start_path(paths.target, identity)
+        if "remote_host" in record and pending.exists():
+            connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
+            fence = offload.start_fence_command(identity, paths.target, settle=True, scope_key=path.stem)
+            # Stopped work ends first, so the fence it holds is free to settle.
+            command = (offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
+                       + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
+                       else fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
+            observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
+            if not isinstance(observed.result, offload.LeftoversEnded):
+                return ClaimReleaseRefused("the remote work of the claim has not ended")
+            if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
+                return ClaimReleaseRefused("the remote start fence remains unconfirmed")
+        with nullcontext() if provider_lock_held else locked(paths.lock):
+            # The claim watcher rewrites its own fields during the settle; only a new owner refuses.
+            current = read_run(path)
+            if isinstance(current, NoRun) or claim_owner(current) != claim_owner(record):
+                return ClaimReleaseRefused("the exact claim changed during cleanup")
+            transfers.extend(current.get("transfers", []))
+            pending.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+    with nullcontext() if provider_lock_held else locked(paths.lock):
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
         start_watcher(paths)
+    return ClaimsReleased(len(owned), tuple(transfers))
+
+
+def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False) -> int:
+    released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
+                                    args.settings, provider_lock_held=provider_lock_held)
+    if isinstance(released, ClaimReleaseRefused):
+        print(f"cannot release: {released.reason}", file=sys.stderr)
+        return 12
+    if released.transfers:
+        print("copy_bytes=" + json.dumps(list(released.transfers)))
     return 0
 
 
 def free_now(
-    paths: StatePaths, settings: Path | offload.DefaultMacSettings, repo_root: Path, copy: bool = False,
+    paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
@@ -2024,16 +2176,17 @@ def free_now(
     not read, since a claim does not consult it; the claim itself still decides
     under its lock. Another repository's claim leaves the answer free. A copy
     claim gives way to a new test, so it holds the scope only for another copy
-    (`copy`).
+    (`copy`). A kept claim leaves the answer free: its holder is gone, and the
+    next claim takes it over and cleans its leftovers.
     """
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
     from scripts.buildlog import repository
 
-    if not offload.read_config(settings).enabled:
+    if not eligibility.read_config(settings).enabled:
         return "off"
-    backoff = (offload.read_backoff(time.time()) if paths.target == "mac"
-               else offload.read_backoff(time.time(), paths.target))
-    if isinstance(backoff, offload.ActiveBackoff):
+    backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
+               else eligibility.read_backoff(time.time(), paths.target))
+    if isinstance(backoff, eligibility.ActiveBackoff):
         return "backoff"
     session = claim_state.submitting_session(session)
     scope = target_claim_scope(paths, str(repo_root))
@@ -2046,7 +2199,7 @@ def free_now(
         return "state"
     repository_name = repository.repo_name(str(repo_root))
     if repository_name is not None and isinstance(
-            offload.read_mirror_busy(time.time(), repository_name, paths.target), offload.ActiveBackoff):
+            eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
         return "busy"
     scopes: tuple[ClaimScope, ...] = (scope,)
     if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
@@ -2056,22 +2209,22 @@ def free_now(
         except (OSError, ConfigError):
             return "state"
     held = all(any(
-        scopes_overlap(claim.scope, candidate) and run_is_live(claim.record)
+        scopes_overlap(claim.scope, candidate) and run_is_live(claim.record) and not run_is_kept(claim.record)
         and (copy or not copy_gives_way(claim.record)) for claim in claims
     ) for candidate in scopes)
     if held:
         return "busy"
-    if isinstance(offload.read_failed_probe(paths.target), offload.FailedProbe):
+    if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
         return "bad"
-    if repository_name is not None and offload.linux_version_decline_path(paths.target, repository_name).exists():
+    if repository_name is not None and eligibility.linux_version_decline_path(paths.target, repository_name).exists():
         return "bad"
     return "free"
 
 
 def command_free_now(args: CliArguments, paths: StatePaths) -> int:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
+    settings = Path(args.settings) if args.settings else eligibility.DEFAULT_MAC_SETTINGS
     if not args.settings and args.target:
         settings = config_path(args.target)
     answer = free_now(paths, settings, Path(args.repo_root), args.copy, session=args.session)
@@ -2087,18 +2240,23 @@ def block_state_line(
     host = "the Mac" if target == "mac" else target
     if isinstance(block, ActiveMacBlock):
         return (
-            f"{'Mac' if target == 'mac' else target} blocked for {block.holder}: nothing is running there, "
+            f"{'Mac' if target == 'mac' else target} blocked for {holder_name(block.holder)}: nothing is running there, "
             + "it is free now."
         )
     waiting = block.waiting_on
     if isinstance(waiting, WaitingOnLocalRun):
         return (
-            f"Block pending for {block.holder}: {waiting.what} is running on {host}. "
+            f"Block pending for {holder_name(block.holder)}: {waiting.what} is running on {host}. "
             + "Nothing new starts there, and you get a message when it ends."
+        )
+    if isinstance(waiting, WaitingOnCiMacJob):
+        return (
+            f"Block pending for {holder_name(block.holder)}: hana CI is running on the Mac. "
+            + "Nothing new starts there, and you get a message when it finishes."
         )
     if isinstance(waiting, WaitingOnCiJob):
         return (
-            f"Block pending for {block.holder}: a CI run may still use the Mac. "
+            f"Block pending for {holder_name(block.holder)}: a CI run may still use the Mac. "
             + "Nothing new starts there, and you get a message when CI no longer "
             + "needs the Mac."
         )
@@ -2108,7 +2266,7 @@ def block_state_line(
         else "unknown error"
     )
     return (
-        f"Block pending for {block.holder}: CI could not be checked ({line}). "
+        f"Block pending for {holder_name(block.holder)}: CI could not be checked ({line}). "
         + "Nothing new starts there, and you get a message once CI's Mac job is "
         + "known to be idle."
     )
@@ -2134,7 +2292,7 @@ def command_block(
                 not isinstance(existing, NoMacBlock)
                 and existing.holder != args.holder
             ):
-                print(f"already blocked by {existing.holder}")
+                print(f"already blocked by {holder_name(existing.holder)}")
                 return 1
             now = utc_now()
             expires = now + timedelta(hours=duration.hours)
@@ -2224,7 +2382,7 @@ def command_unblock(
             print("no block")
             return 0
         if block.holder != args.holder:
-            print(f"blocked by {block.holder}")
+            print(f"blocked by {holder_name(block.holder)}")
             return 1
         if not config.ci_repo:
             block = replace_ci(block, "not_configured")
@@ -2258,6 +2416,8 @@ def command_unblock(
 def pending_wait_text(waiting: WaitingOn) -> str:
     if isinstance(waiting, WaitingOnLocalRun):
         return "a test is running"
+    if isinstance(waiting, WaitingOnCiMacJob):
+        return "hana CI is running on the Mac"
     if isinstance(waiting, WaitingOnCiJob):
         return "a CI run may still use the Mac"
     return "CI could not be checked"
@@ -2299,7 +2459,7 @@ def print_switch_without_block(config: MacTestConfig) -> None:
 
 
 def command_status(paths: StatePaths, config: MacTestConfig) -> int:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
     with locked(paths.control_lock):
         outcome = full_settle(paths, config)
@@ -2310,7 +2470,7 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
             else outcome.ci_problem
         )
         if not outcome.claims:
-            print("unreachable: failed probe" if isinstance(offload.read_failed_probe(paths.target), offload.FailedProbe) else "free")
+            print("unreachable: failed probe" if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe) else "free")
         for claim in outcome.claims:
             run = claim.record
             if run_is_kept(run):
@@ -2330,20 +2490,20 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
             print_switch_without_block(config)
         elif isinstance(block, PendingMacBlock):
             print(
-                f"block pending for {block.holder} "
+                f"block pending for {holder_name(block.holder)} "
                 + f"({pending_wait_text(block.waiting_on)}), "
                 + f"lifts {block_time(block.expires)}: {block.reason}"
             )
             print_switch_with_block(block, switch_problem)
         else:
             print(
-                f"blocked by {block.holder} since {block_time(block.since)}, "
+                f"blocked by {holder_name(block.holder)} since {block_time(block.since)}, "
                 + f"lifts {block_time(block.expires)}: {block.reason}"
             )
             if isinstance(block.free_message, FreeMessageOwed):
                 print(
                     f'The "{"Mac" if paths.target == "mac" else paths.target} is free" message '
-                    + f'has not reached {block.holder} yet.'
+                    + f'has not reached {holder_name(block.holder)} yet.'
                 )
             print_switch_with_block(block, switch_problem)
         if isinstance(lift_failure, ExpiredBlockLiftFailed):
@@ -2357,7 +2517,7 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
 
 def command_target_status(paths: StatePaths) -> int:
     """Show recorded target state without locks, probes or cleanup."""
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
     try:
         block = read_claim_block(paths)
@@ -2366,13 +2526,13 @@ def command_target_status(paths: StatePaths) -> int:
         print(f"state unreadable: {error}")
         return 12
     if not isinstance(block, NoMacBlock):
-        print(f"blocked by {block.holder} since {block_time(block.since)}: {block.reason}")
+        print(f"blocked by {holder_name(block.holder)} since {block_time(block.since)}: {block.reason}")
     for claim in claims:
         print(f"running: {claim.record['what']} ({claim.record['worktree']})")
     if isinstance(block, NoMacBlock) and not claims:
-        if isinstance(offload.read_failed_probe(paths.target), offload.FailedProbe):
+        if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
             print("unreachable: failed probe")
-        elif isinstance(offload.read_backoff(time.time(), paths.target), offload.ActiveBackoff):
+        elif isinstance(eligibility.read_backoff(time.time(), paths.target), eligibility.ActiveBackoff):
             print("unreachable: retry backoff")
         else:
             print("free")
@@ -2435,11 +2595,14 @@ def parser() -> argparse.ArgumentParser:
 
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
+    _ = release.add_argument("--settings", default="")
     for command in (claim, wait_claim, release):
         for field in ("claim-id", "episode", "attempt"):
             _ = command.add_argument("--" + field, required=command is release, default="")
     for command in (claim, wait_claim):
         _ = command.add_argument("--identity", action="store_true")
+        _ = command.add_argument("--assignment-file", default="")
+        _ = command.add_argument("--assignment", default="")
 
     block = commands.add_parser("block")
     _ = block.add_argument("--holder", required=True)
@@ -2508,25 +2671,6 @@ def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "watch-claim":
         return command_watch_claim(paths, config)
     return command_status(paths, config)
-
-
-@dataclass(frozen=True)
-class StoppedInstanceEvidence:
-    target: str
-    generation: str
-    state: str
-    observed_at: float
-    claims: tuple[HeldClaim, ...]
-    remote_host: str
-
-
-def release_host(paths: StatePaths, generation: str) -> str:
-    from scripts.mac_test import offload
-
-    configured = offload.configured_ssh_target(paths.target)
-    if not target_config.is_aws_target(configured) or not generation:
-        raise StateReadError('instance evidence cannot release these claims')
-    return offload.read_connection_settings(configured.settings).host
 
 
 if __name__ == "__main__":

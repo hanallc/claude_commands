@@ -16,11 +16,11 @@ import io
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test
 from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import test_hang_guard
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
@@ -81,9 +81,9 @@ class MacCleanupProtocolTests(unittest.TestCase):
                 output = io.StringIO()
                 with redirect_stdout(output):
                     offload.report_cleanup(offload.CleanupDone(size, free), "",
-                                           path="~/.local/state/mac-test/mirror/hana/target", free_floor_gib=100)
+                                           path="~/.local/state/mac-test/test-mirror/hana/target", free_floor_gib=100)
                 self.assertEqual(output.getvalue(),
-                                 "Mac build output removed: ~/.local/state/mac-test/mirror/hana/target, "
+                                 "Mac build output removed: ~/.local/state/mac-test/test-mirror/hana/target, "
                                  + text + " under the 100 GiB floor\n")
 
 
@@ -94,21 +94,28 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     temporary_directory: Path = Path()
     bin_directory: Path = Path()
     configuration_environment: dict[str, str] = {}
+    python: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "build_targets.conf", "platform.mac=macos\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.home_directory = self.root / "home with spaces"
-        self.mirror = self.home_directory / offload.remote_mirror(offload.KnownRepository("hana's project"))
+        self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
         self.mirror.mkdir(parents=True)
         self.temporary_directory = self.root / "tmp"
         self.temporary_directory.mkdir()
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.configuration_environment = config_environment(self.root / "configuration")
-        python = self.home_directory / ".claude/scripts/lib/py"
-        python.parent.mkdir(parents=True)
-        write_shell(python, f'exec {shlex.quote(sys.executable)} "$@"\n')
+        # The trim step runs the lint sweep, about 0.5 CPU s a start. Tests of the trim call real_sweep();
+        # the other tests check the shell text around it, so this stub reports a clean trim at once.
+        self.python = self.home_directory / ".claude/scripts/lib/py"
+        self.python.parent.mkdir(parents=True)
+        write_shell(self.python, 'exit 0\n')
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
@@ -134,6 +141,10 @@ printf 'nextest finished\n'
 exit "$CLEANUP_TEST_STATUS"
 ''')
 
+    def real_sweep(self) -> None:
+        """Run the real lint sweep in the trim step."""
+        write_shell(self.python, f'exec {shlex.quote(sys.executable)} "$@"\n')
+
     def run_remote(
         self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
         disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
@@ -144,20 +155,20 @@ exit "$CLEANUP_TEST_STATUS"
         budget_values: tuple[tuple[str, str], ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
-        config = offload.OffloadConfig(
-            enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
+        config = eligibility.OffloadConfig(
+            enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib=budget_gib,
             values={"abandoned_session_minutes": str(abandoned_session_minutes), **dict(budget_values)},
         )
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
-            + offload.remote_test_command(config, request, offload.KnownRepository("hana's project"))
+            + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"))
         )
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
             env={**os.environ, **self.configuration_environment,
-                 "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                  "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
                  "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
@@ -288,6 +299,7 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
+        self.real_sweep()
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
@@ -324,9 +336,10 @@ exit 1
                     target.mkdir()
                     retained = target / "unmatched-output"
                     _ = retained.write_bytes(os.urandom(128 * 1024))
-                    python = self.home_directory / ".claude/scripts/lib/py"
-                    write_shell(python, 'exit 9\n' if trim_fails else
-                                f'exec {shlex.quote(sys.executable)} "$@"\n')
+                    if trim_fails:
+                        write_shell(self.python, 'exit 9\n')
+                    else:
+                        self.real_sweep()
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
                         disk_output=("Filesystem GiB Used Available Capacity Mounted\n"
@@ -402,6 +415,11 @@ class MacActivityShellTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(configuration / "mac_test.conf", "mirror_root=~/.local/state/mac-test/test-mirror\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         for name in ("pgrep", "lsof", "ps", "id"):
@@ -436,8 +454,8 @@ class MacActivityShellTests(unittest.TestCase):
     def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
         responses = {
             "id": (0, "501\n"), "pgrep": (0, "101\n102\n"),
-            "lsof": (0, "p102\nn/Users/test/.local/state/mac-test/mirror/hana\n"
-                     + "p103\nn/Users/test/.local/state/mac-test/mirror\np104\nn/Users/test/rust/hana\n"),
+            "lsof": (0, "p102\nn/Users/test/.local/state/mac-test/test-mirror/hana\n"
+                     + "p103\nn/Users/test/.local/state/mac-test/test-mirror\np104\nn/Users/test/rust/hana\n"),
             "ps": (0, "101 501 /opt/rust/bin/cargo\n105 501 /opt/rust/bin/rustc\n106 501 cargo-nextest\n"
                    + "107 501 /Users/test/rust/hana/target/debug/app\n108 999 /opt/cargo\n"
                    + "109 501 /bin/zsh\n110 501 /opt/cargo-helper\n112 501 /Users/test/my project/target/debug/app\n"),
@@ -453,7 +471,7 @@ class MacActivityShellTests(unittest.TestCase):
                 self.assertEqual(len(pgrep), 1)
                 self.assertIn("-u", pgrep[0]["args"])
                 self.assertIn("501", pgrep[0]["args"])
-                self.assertIn("[.]local/state/mac-test/mirror/", pgrep[0]["args"])
+                self.assertIn("[.]local/state/mac-test/test-mirror/", pgrep[0]["args"])
                 self.assertEqual(lsof[0]["args"], ["-a", "-u", "501", "-d", "cwd", "-Fpn"])
                 self.assertEqual(len(ps), 1)
 
@@ -491,11 +509,11 @@ class MacActivityShellTests(unittest.TestCase):
     def test_repository_selector_stops_at_its_own_mirror_under_sh_and_zsh(self) -> None:
         responses = {
             "id": (0, "501\n"), "pgrep": (1, ""),
-            "lsof": (0, "p201\nn/Users/test/.local/state/mac-test/mirror/hana\n"
-                     + "p202\nn/Users/test/.local/state/mac-test/mirror/hana/crates/hana\n"
-                     + "p203\nn/Users/test/.local/state/mac-test/mirror/hana_other\n"
-                     + "p204\nn/Users/test/.local/state/mac-test/mirror/cargo-liner\n"
-                     + "p205\nn/Users/test/.local/state/mac-test/mirror\n"
+            "lsof": (0, "p201\nn/Users/test/.local/state/mac-test/test-mirror/hana\n"
+                     + "p202\nn/Users/test/.local/state/mac-test/test-mirror/hana/crates/hana\n"
+                     + "p203\nn/Users/test/.local/state/mac-test/test-mirror/hana_other\n"
+                     + "p204\nn/Users/test/.local/state/mac-test/test-mirror/cargo-liner\n"
+                     + "p205\nn/Users/test/.local/state/mac-test/test-mirror\n"
                      + "p206\nn/Users/test/rust/hana\n"),
         }
         for shell in (["/bin/sh"], ["zsh", "-f"]):
@@ -514,16 +532,16 @@ class MacActivityShellTests(unittest.TestCase):
         calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
         pattern = next(call["args"][-1] for call in calls if call["command"] == "pgrep")
         matching = [
-            "sh -c cd .local/state/mac-test/mirror/hana && cargo nextest run",
-            "cargo build --manifest-path /Users/test/.local/state/mac-test/mirror/hana/Cargo.toml",
-            "sh -c cd '/Users/test/.local/state/mac-test/mirror/hana' && cargo test",
-            "sh -c cd \"/Users/test/.local/state/mac-test/mirror/hana\"",
-            "ls /Users/test/.local/state/mac-test/mirror/hana",
+            "sh -c cd .local/state/mac-test/test-mirror/hana && cargo nextest run",
+            "cargo build --manifest-path /Users/test/.local/state/mac-test/test-mirror/hana/Cargo.toml",
+            "sh -c cd '/Users/test/.local/state/mac-test/test-mirror/hana' && cargo test",
+            "sh -c cd \"/Users/test/.local/state/mac-test/test-mirror/hana\"",
+            "ls /Users/test/.local/state/mac-test/test-mirror/hana",
         ]
         other = [
-            "sh -c cd .local/state/mac-test/mirror/hana_other && cargo nextest run",
-            "sh -c cd .local/state/mac-test/mirror/cargo-liner && cargo nextest run",
-            "sh -c cd .local/state/mac-test/mirror/hanabi && cargo test",
+            "sh -c cd .local/state/mac-test/test-mirror/hana_other && cargo nextest run",
+            "sh -c cd .local/state/mac-test/test-mirror/cargo-liner && cargo nextest run",
+            "sh -c cd .local/state/mac-test/test-mirror/hanabi && cargo test",
             "sh -c cd /Users/test/rust/hana && cargo test",
         ]
         selected = subprocess.run(["grep", "-E", "-e", pattern], input="\n".join(matching + other) + "\n",

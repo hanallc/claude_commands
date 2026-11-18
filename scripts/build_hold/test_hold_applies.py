@@ -82,24 +82,6 @@ class TemporaryHoldTest(unittest.TestCase):
         _ = (release / "current").write_text(cycle_id + "\n")
 
 
-class CargoVerbTests(unittest.TestCase):
-    def test_build_verbs_match_the_wrapper_and_lookup_verbs_pass(self) -> None:
-        wrapper = SCRIPT.with_name("cargo").read_text()
-        branch = wrapper.split('case "$subcommand" in', 1)[1].split(') ;;', 1)[0].strip()
-        self.assertEqual(hold_applies.BUILDING_CARGO_VERBS, frozenset(branch.split("|")))
-        for verb in hold_applies.BUILDING_CARGO_VERBS | {"metadata", "locate-project", "tree", "version", "search"}:
-            with self.subTest(verb=verb):
-                self.assertEqual(hold_applies.cargo_verb(("+nightly", "--config=term.color=never", verb)), verb)
-        self.assertEqual(hold_applies.cargo_verb(("+stable", "-v")), "")
-
-    def test_option_values_cannot_turn_a_lookup_into_a_build(self) -> None:
-        for option in hold_applies.CARGO_OPTIONS_WITH_VALUES:
-            with self.subTest(option=option):
-                self.assertEqual(hold_applies.cargo_verb((option, "build", "metadata")), "metadata")
-                self.assertEqual(hold_applies.cargo_verb((option, "metadata", "check")), "check")
-        self.assertEqual(hold_applies.cargo_verb(("--config",)), "")
-
-
 class HoldAppliesTest(TemporaryHoldTest):
     def assert_cli(self, status: int, refusal: str = "") -> None:
         done = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, check=False)
@@ -126,7 +108,7 @@ class HoldAppliesTest(TemporaryHoldTest):
         self.assertEqual(hold_applies.hold_applies(), REFUSAL)
         self.assert_cli(0, REFUSAL)
         proc = self.root / "proc"
-        for pid, parent in ((10, 1), (20, 10), (30, 1)):
+        for pid, parent in ((10, 1), (20, 10), (30, 1), (40, 1)):
             directory = proc / str(pid)
             directory.mkdir(parents=True)
             fields = ["S", str(parent), *(["0"] * 17), str(pid * 100)]
@@ -135,9 +117,9 @@ class HoldAppliesTest(TemporaryHoldTest):
         _ = holder.write_text(json.dumps({
             "holder": "builder", "since": "2026-10-28T12:00:00+00:00",
             "for": "app test", "release_eta": "unknown",
-            "keep": [{"pid": 10, "start_time": "1000"}],
+            "keep": [{"pid": 10, "start_time": "1000"}, {"pid": 40, "start_time": "3999"}],
         }))
-        for pid, refusal in ((10, ""), (20, ""), (30, REFUSAL)):
+        for pid, refusal in ((10, ""), (20, ""), (30, REFUSAL), (40, REFUSAL), (50, REFUSAL)):
             with self.subTest(caller_pid=pid), mock.patch.object(build_hold, "PROC_ROOT", proc), \
                  mock.patch.object(os, "getpid", return_value=pid):
                 self.assertEqual(hold_applies.hold_applies(), refusal)

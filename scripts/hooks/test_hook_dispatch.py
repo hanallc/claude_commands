@@ -33,6 +33,7 @@ LEGACY: dict[str, tuple[tuple[str, str, float], ...]] = {
         ("pre-tool-use-showrunner-move-guard.py", "Bash", 600),
         ("pre-tool-use-change-review-gate.py", "Bash", 600),
         ("pre-tool-use-checkpoint-doc-gate.py", "Bash", 600),
+        ("pre-tool-use-push-alone.py", "Bash", 10),
         ("pre-tool-use-scratch-guard.py", "Bash|Write|NotebookEdit", 10),
     ),
     "post_tool_use": (
@@ -264,6 +265,7 @@ class RealHookEquivalenceTests(IsolatedHookTests):
             }, "this awk read of saved tool output"),
             ("scratch", {"command": f"mkdir {self.home}/rust/loose"}, "new loose folder"),
             ("checkpoint", {"command": 'git commit -m "checkpoint(test): hooks"'}, "Change-Review"),
+            ("push-alone", {"command": "cd /tmp && git push -q origin x"}, "run git push alone"),
         )
         for label, tool_input, reason in cases:
             with self.subTest(case=label):

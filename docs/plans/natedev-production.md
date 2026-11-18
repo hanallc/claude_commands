@@ -14,8 +14,9 @@
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — changes for the user to check, read only when the user asks; never open questions
 - **Proposals:** `~/rust/hanadocs/issues`
 - **User zone:** read it with `python3 ~/.claude/scripts/lib/user_zone.py`. user_zone.conf is the one setting, and every time a report gives is in that zone. This doc stores no zone, because a stored copy goes stale when the user moves (it read AST after the move to EST).
-- **Updates:** on demand (user, 2026-10-10: dailies only when the user asks); each dailies lists every unit; a simple dailies gives each waiting, idle unit one line
-- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `basedpyright scripts/buildlog` (exits 0 when clean, with `0 errors, 0 warnings, 0 notes`), run in the showrunner checkout
+- **Updates:** Use `/showrunner:units` for unit status on request.
+  Dailies were retired on 2026-11-11.
+- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout . --tests-only` and `basedpyright scripts/buildlog` (exits 0 when clean, with `0 errors, 0 warnings, 0 notes`), run in the showrunner checkout. The full gate is the one that sdlc and builds landings run: every module's tests, the buildlog and accounts tests included (user, 2026-11-14 16:19 EST, after no-worker-fyi 766542813 reached main with 2 red accounts tests).
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** five units; `report.py` is shared, and whoever lands second resolves conflicts; its seats share natedev's build slots (steve)

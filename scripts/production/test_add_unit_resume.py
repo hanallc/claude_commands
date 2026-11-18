@@ -16,7 +16,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import add_unit
 from scripts.production import staff, unit_config
 from scripts.production import unit_lookup
-from scripts.message import sessions
+from scripts.message import session_records, sessions
 from scripts.agents import stop_resume
 from scripts.herdr import herdr
 from scripts.herdr.herdr import HerdrPlace
@@ -156,7 +156,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.write_resume_registry_record("recorded-start")
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        with patch.object(sessions, "process_start", return_value=None):
+        with (patch.object(sessions, "process_start", return_value=None),
+              patch.object(session_records, "process_start", return_value=None)):
             result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(result.stderr, "add_unit: cannot tell whether session 62ccbd64-f22e-5647-b20e-7899aa39d766 runs: "
@@ -178,7 +179,8 @@ class AddUnitResumeTests(AddUnitTestCase):
 
     def test_attach_stops_then_launches_once_with_staff_marks_and_finishes(self) -> None:
         prior, trace = self.prepare_attach()
-        result = self.successful("alpha", "--permanent", "--attach", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
+        result = self.successful("alpha", "--unit-type", "merge", "--permanent", "--attach",
+                                 "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(trace, ["stop", "launch"])
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
         self.assertEqual(len(starts), 1)
@@ -188,6 +190,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn(str(prior), self.opened())
         self.assertIn("attached 62ccbd64-f22e-5647-b20e-7899aa39d766 as alpha: one process, pid 202", result.stdout)
         row = unit_membership("build-followups", "alpha")
+        self.assertEqual(row.unit_type, staff.UnitDetails("merge"))
+        self.assertIn("Load /unit:merge before waiting for orders.", self.opening_prompt())
         self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
         self.assertNotIn("STAFF_ID", self.pane_environment())
         arguments = self.agent_arguments()
@@ -408,7 +412,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
-                            "--cwd", str(prior), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+                            "--cwd", str(prior), "--unit-type", "style",
+                            "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(self.opened()[7], str(prior))
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(self.agent_arguments(), [
@@ -420,7 +425,12 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertIn("You are now alpha in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
-        self.assertIn(f"Run /unit:direct {promoted_plan}", command)
+        self.assertIn(f"Run /unit:style {promoted_plan}", command)
+        selected = staff.unit_command(unit_membership("build-followups", "alpha"))
+        self.assertEqual(selected, "/unit:style")
+        contract = SCRIPT.parents[2] / "commands/unit/style.md"
+        self.assertTrue(contract.is_file())
+        self.assertIn("<RestartTakeover/>", contract.read_text())
 
     def test_excluded_standing_plan_launches_and_keeps_the_units_copy(self) -> None:
         plan = Path("docs/style-production/units/alpha-unit.md")

@@ -799,7 +799,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     refusing_logins: set[str] = set()
     owners = live_owners(only=refused_ids) if refused_ids else []
     all_members: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]] = (
-        _action_group_members() if owners else {"units": [], "showrunners": []})
+        _action_group_members() if owners else {group: [] for group in accounts.CLAUDE_GROUPS})
     owner_groups: dict[str, accounts.ClaudeGroup | Literal["ungrouped"]] = {
         member.session_id: member.group for members in all_members.values() for member in members}
     owners = [session for session in owners if not isinstance(detected[session["session_id"]], ProofRefusal)
@@ -1054,10 +1054,11 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     if not proof_group and selected_groups:
         eligible: set[accounts.ClaudeGroup] = {group for group in accounts.CLAUDE_GROUPS
                     if group not in moved_groups | waiting_groups | no_room_groups
+                    and (group != "producers" or group in selected_groups)
                     and isinstance(accounts.group_label(selected_groups, group), str)}
         def completion_members(observed: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]],
                                group_name: accounts.ClaudeGroup, target: str) -> list[accounts.LiveGroupMember]:
-            return [session for session in observed[group_name]
+            return [session for session in observed.get(group_name, ())
                        if not accounts.session_on_account(session, target)
                        and not (session.session_id in state["sessions"] and state["sessions"][session.session_id]["state"] == "cancelled"
                                 and isinstance(detected.get(session.session_id), TranscriptRefusal)
@@ -1263,7 +1264,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         next_moves.write_next_moves(tuple(entry for entry in next_moves.read_next_moves()
                                           if entry.id != rule.entry_id))
         _save_state(state)
-        ids = tuple(member.session_id for member in members[rule.group]
+        ids = tuple(member.session_id for member in members.get(rule.group, ())
                     if not accounts.session_on_account(member, rule.to))
         outcomes = accounts.move_sessions(ids, rule.to, why=why, cause="auto") if ids else ()
         lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
@@ -1366,7 +1367,7 @@ def main(argv: list[str] | None = None, *, account_config: conf.ConfigRead | acc
         for probe in [name, *(args.proof_group or [])]:
             matching = [session for session in owners if session["session_id"] == probe
                         or (member.name if (member := record.by_current_session(session["session_id"]))
-                            is not None else session["name"]) == probe]
+                            is not None else "") == probe]
             if len(matching) != 1:
                 parser.error("name or id must identify one local live owner")
             selected[matching[0]["session_id"]] = matching[0]

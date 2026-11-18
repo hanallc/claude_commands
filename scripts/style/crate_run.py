@@ -34,6 +34,7 @@ from scripts.style import style_ledger as ledger_api
 from scripts.style import style_proposals
 from scripts.style import style_footprint
 from scripts.style import style_sync
+from scripts.style.style_config import ReaderSource
 from scripts.copies import copies
 from scripts.style.style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
 
@@ -148,12 +149,12 @@ def evidence(finding: ledger_api.HeldFinding) -> str:
 
 
 @contextmanager
-def serial(folder: Path) -> Generator[None]:
+def serial(folder: Path) -> Generator[copies.HeldCrateRunLock]:
     """One run lock also serializes different crates and publication retries."""
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / "run.lock").open("a") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
-        yield
+        yield copies.HeldCrateRunLock(folder / "run.lock")
 
 
 def changed(repo: Path, base: str, tip: str) -> tuple[str, ...]:
@@ -308,13 +309,14 @@ class SourceOwnership:
     unreadable loaders make ownership unproved, rather than guessing from a directory.
     """
 
-    def __init__(self, repo: Path, commit: str, members: tuple[rules.WorkspaceMember, ...]) -> None:
+    def __init__(self, repo: Path, commit: str, members: tuple[rules.WorkspaceMember, ...], *,
+                 reader_source: ReaderSource | ledger_api.ConfiguredReader = ledger_api.CONFIGURED_READER) -> None:
         self.directories: tuple[str, ...] = tuple(member.directory for member in members)
         self.owners: dict[str, set[str]] = {}
         self.sources: dict[str, bulk.BindingText] = {}
         self.uncertain: dict[str, list[str]] = defaultdict(list)
         self.inline_folders: dict[str, set[str]] = defaultdict(set)
-        inventory = ledger_api.tree_entries(repo, commit)
+        inventory = ledger_api.tree_entries(repo, commit, reader_source=reader_source)
         blobs = {path: entry.object for path, entry in inventory.items()
                  if (path.endswith(".rs") or Path(path).name == "Cargo.toml") and entry.kind == "blob"
                  and entry.mode in ledger_api.REGULAR_FILE_MODES}
@@ -699,7 +701,7 @@ def dry_run_crates(repo: Path, packages: Sequence[str], rule: str, base_tree: st
     selected = run.select(ledger, definition)
     directories = tuple(member.directory for member in members)
     spanning = cross_crate_proposals(selected, directories)
-    ownership = SourceOwnership(repo, base, members)
+    ownership = SourceOwnership(repo, base, members, reader_source=ledger.reader_source)
     reports: dict[str, list[dict[str, object]]] = {}
     for member in members:
         if member.package_name not in packages:
@@ -865,7 +867,8 @@ class CrateRun:
 
     @contextmanager
     def frozen_checkout(self, manifest: Manifest) -> Generator[Path]:
-        with copies.standing(self.owner, self.repo, copies.CommittedSource(manifest["base"])) as checkout:
+        # This checkout supplies pinned rule files without a queue step.
+        with copies.standing(self.owner, self.repo, copies.CommittedSource(manifest["base"]), step="style") as checkout:
             yield checkout
 
     def definition(self, manifest: Manifest) -> rules.Rule:
@@ -905,7 +908,7 @@ class CrateRun:
             if (set(result["findings"]) & refusals.keys()
                     or set(result["findings"]) | refusals.keys() != tickets.keys()):
                 raise ValueError("result does not partition the frozen claims")
-            checkout = Path(record["checkout"])
+            checkout = self.repo if CrateStage(record["stage"]) == CrateStage.INTEGRATED else Path(record["checkout"])
             base = self.read()["base"]
             parent, tree = run.git(checkout, "rev-parse", result["commit"] + "^1",
                                    result["commit"] + "^{tree}").splitlines()
@@ -974,17 +977,17 @@ class CrateRun:
     def advance(self, package: str, planner: Planner = plan, runner: run.Runner = run.run_command,
                 available: Callable[[Path, str], None] = bulk.check_available,
                 executor: PlanExecutor | ExecutionService = ExecutionService.BULK_RUN) -> Manifest:
-        with serial(self.folder), self.complete_run():
+        with serial(self.folder) as run_lock, self.complete_run(run_lock):
             manifest = self.read()
+            if package not in manifest["crates"]:
+                raise bulk.BulkRenameError("crate is not in the frozen run")
+            record = manifest["crates"][package]
+            stage = CrateStage(record["stage"])
+            if stage in {CrateStage.ABANDONED, CrateStage.INTEGRATED}:
+                return manifest
             with (self.frozen_checkout(manifest) as frozen,
                   self.ledger.rules_from_checkout(frozen), ExitStack() as workers,
                   ExitStack() as validation_checkouts):
-                if package not in manifest["crates"]:
-                    raise bulk.BulkRenameError("crate is not in the frozen run")
-                record = manifest["crates"][package]
-                stage = CrateStage(record["stage"])
-                if stage in {CrateStage.ABANDONED, CrateStage.INTEGRATED}:
-                    return manifest
                 checkout = Path(record["checkout"])
                 validation: HeldCrateValidation | SeparateIntegrationCheckout = SeparateIntegrationCheckout()
                 base = manifest["base"]
@@ -1120,8 +1123,9 @@ class CrateRun:
                         raise bulk.BulkRenameError("worker checkout moved after commit")
                     if run.git(checkout, "status", "--porcelain", "--untracked-files=no"):
                         raise bulk.BulkRenameError("worker files changed after commit")
-                    tested_checkout = validation_checkouts.enter_context(copies.standing(
-                        self.owner, checkout, copies.CommittedSource(commit)))
+                    command = ("bash", str(Path.home() / ".claude/scripts/direct/verify.sh"), "final")
+                    tested_checkout = validation_checkouts.enter_context(copies.command_tree(
+                        self.owner, checkout, copies.CommittedSource(commit), command, step="test"))
                     result = run.test_tree(tested_checkout, commit, result_evidence["tree"], runner, {}, owner=self.owner)
                     if result.code:
                         self.abandon(manifest, record, "tests failed: " + run.first_failing_test(result),
@@ -1156,22 +1160,22 @@ class CrateRun:
                 return manifest
 
     @contextmanager
-    def complete_run(self) -> Generator[None]:
-        """End worker tasks after terminal manifest publication and worker lock release."""
+    def complete_run(self, run_lock: copies.HeldCrateRunLock) -> Generator[None]:
+        """Remove terminal copies after worker locks close and before the run lock closes."""
         try:
             yield
         finally:
             manifest = self.read()
-            if all(CrateStage(record["stage"]) in {CrateStage.INTEGRATED, CrateStage.ABANDONED}
-                   for record in manifest["crates"].values()):
-                paths = [Path(record["checkout"]) for record in manifest["crates"].values()]
-                for record in manifest["crates"].values():
-                    path = Path(record["checkout"])
-                    if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):
-                        with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
-                                              branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
-                            pass
-                copies.end_workspaces(self.task, paths)
+            terminal = [record for record in manifest["crates"].values()
+                        if CrateStage(record["stage"]) in {CrateStage.INTEGRATED, CrateStage.ABANDONED}]
+            paths = [Path(record["checkout"]) for record in terminal]
+            for record in terminal:
+                path = Path(record["checkout"])
+                if path.exists() and isinstance(scratch.pending_removal(path), copy_record.NotRegistered):
+                    with copies.workspace(self.owner, self.repo, manifest["base"], name=path.name,
+                                          branch=record["branch"], task=self.task, path=path, run_manifest=self.path):
+                        pass
+            copies.end_workspaces(self.task, paths, run_lock=run_lock)
 
     def wait_for_reservations(self, manifest: Manifest, record: CrateRecord,
                               pending: tuple[bulk.PendingFinding, ...], refused: dict[str, str]) -> None:
@@ -1193,7 +1197,7 @@ class CrateRun:
                 raise bulk.BulkRenameError("planning requires the exact frozen private base")
         unchanged_base()
         members = coverage_report.workspace(self.ledger, base)
-        ownership = SourceOwnership(checkout, base, members)
+        ownership = SourceOwnership(checkout, base, members, reader_source=self.ledger.reader_source)
         def boundary(_repo: Path, path: str) -> None:
             ownership.require(record["directory"], (path,))
             available(self.repo, path)
@@ -1282,7 +1286,7 @@ class CrateRun:
                 raise bulk.BulkRenameError("no surviving findings: " + "; ".join(sorted(set(refused.values()))))
             _ = run.git(checkout, "add", "--", *sorted(kept))
             tree = run.git(checkout, "write-tree")
-            final_ownership = SourceOwnership(checkout, tree, members)
+            final_ownership = SourceOwnership(checkout, tree, members, reader_source=self.ledger.reader_source)
             def final_boundary(_repo: Path, path: str) -> None:
                 ownership.require(record["directory"], (path,))
                 final_ownership.require(record["directory"], (path,))
@@ -1347,11 +1351,11 @@ class CrateRun:
             _ = record.pop("integration", None)
             self.save(manifest)
         if candidate is None:
-            previous = ledger_api.tree_entries(self.repo, expected)
+            previous = self.ledger.tree_entries(expected)
             base_entries = (previous if expected == manifest["base"] else
-                            ledger_api.tree_entries(self.repo, manifest["base"]))
+                            self.ledger.tree_entries(manifest["base"]))
             worker = result_evidence["commit"]
-            worker_entries = ledger_api.tree_entries(self.repo, worker)
+            worker_entries = self.ledger.tree_entries(worker)
             paths = changed(self.repo, manifest["base"], worker)
             overlap = any(previous.get(path) != base_entries.get(path) for path in paths)
             try:
@@ -1366,7 +1370,7 @@ class CrateRun:
                     union[path] = worker_entries[path]
                 else:
                     _ = union.pop(path, None)
-            if not overlap and ledger_api.tree_entries(self.repo, tree) != union:
+            if not overlap and self.ledger.tree_entries(tree) != union:
                 raise bulk.BulkRenameError("integration tree differs from the exact edit union")
             candidate = run.git(self.repo, "commit-tree", tree, "-p", expected, "-p", worker,
                                 "-m", f"style(crate-run): integrate {self.run_id}")
@@ -1389,14 +1393,15 @@ class CrateRun:
                 if isinstance(validation, HeldCrateValidation):
                     validation.release()
                 source_commit = candidate
-                checkout_scope = copies.standing(self.owner, self.repo, copies.CommittedSource(candidate))
+                # Raw Cargo validation precedes the queue steps in this checkout.
+                checkout_scope = copies.standing(self.owner, self.repo, copies.CommittedSource(candidate), step="test")
             with checkout_scope as checkout:
                 tree = run.git(checkout, "rev-parse", "HEAD^{tree}")
                 run.require_test_tree(checkout, tree)
                 if run.git(checkout, "rev-parse", "HEAD") != source_commit:
                     raise bulk.BulkRenameError("integration checkout moved")
                 members = coverage_report.workspace(self.ledger, candidate)
-                ownership = SourceOwnership(checkout, source_commit, members)
+                ownership = SourceOwnership(checkout, source_commit, members, reader_source=self.ledger.reader_source)
                 for path in changed(self.repo, expected, candidate):
                     ownership.require(ownership.home(path), (path,))
                 workspace = run.WorkspaceEdits(checkout, source_commit, ())

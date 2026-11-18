@@ -25,6 +25,7 @@ from urllib.parse import quote
 from scripts.buildlog import health
 from scripts.buildlog import record
 from scripts.buildlog import store
+from scripts.buildlog.transfer_bytes import TransferBytes as TransferBytes
 
 from pathlib import Path
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -34,13 +35,6 @@ from scripts.lib import conf
 
 REMOTE_ROOT = ".local/state/buildlog/"
 LOCK_NAME = "sync.lock"
-
-
-class TransferBytes(TypedDict):
-    operation: str
-    sent_bytes: int
-    received_bytes: int
-    complete: bool
 
 
 @dataclass
@@ -100,26 +94,29 @@ class SyncRecord(TypedDict):
 
 @dataclass(frozen=True)
 class SyncFailure:
+    """The saved failure holds the time of an unsuccessful synchronization."""
     at: str
 
 
 @dataclass(frozen=True)
 class NoSyncFailure:
-    pass
+    """No synchronization failure was recorded."""
 
 
 @dataclass(frozen=True)
 class LastSynced:
+    """The saved success holds the last successful synchronization time."""
     at: str
 
 
 @dataclass(frozen=True)
 class NeverSynced:
-    pass
+    """No successful synchronization was recorded."""
 
 
 @dataclass(frozen=True)
 class SyncStatus:
+    """The status holds the peer, attempt time, outcome, and last success and failure."""
     at: str
     peer: str
     ok: bool
@@ -129,13 +126,14 @@ class SyncStatus:
 
 @dataclass(frozen=True)
 class SyncPaused:
+    """Synchronization is paused with a start time and reason."""
     since: str
     why: str
 
 
 @dataclass(frozen=True)
 class SyncRunning:
-    pass
+    """Synchronization is not paused."""
 
 
 def peer_name() -> str:
@@ -144,6 +142,7 @@ def peer_name() -> str:
 
 @dataclass(frozen=True)
 class SyncPeer:
+    """The peer holds its target, host, and legacy override setting."""
     target: str
     host: str
     legacy_override: bool = False
@@ -151,6 +150,7 @@ class SyncPeer:
 
 @dataclass(frozen=True)
 class PeerExchange:
+    """The exchange pairs a configured peer with its recorded status."""
     peer: SyncPeer
     status: SyncStatus | NeverSynced
 

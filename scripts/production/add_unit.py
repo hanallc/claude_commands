@@ -9,7 +9,8 @@ except FileNotFoundError:
 
 import argparse
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from contextlib import chdir
 import os
 import shlex
 import subprocess
@@ -25,7 +26,7 @@ from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
-from scripts.lib import git_exclude
+from scripts.lib import build_folders, git_exclude, git_files, models_registry
 from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -180,6 +181,7 @@ class UnitLaunchConfiguration:
     session: NewSession | ResumedSession
     timeout: float
     responsibilities: tuple[str, ...] = ()
+    unit_type: staff.UnitType = "direct"
 
     @property
     def plan_path(self) -> Path:
@@ -372,6 +374,23 @@ def launch_request(args: argparse.Namespace, *,
         raise Refusal("--port must be between 1 and 65535")
     if timeout < 0:
         raise Refusal("--timeout must be nonnegative")
+    requested_type = cast(staff.UnitType | None, getattr(args, "unit_type", None))
+    pending = opening_record(production, name)
+    if pending.exists():
+        fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
+        saved_type = saved_unit_type(fields)
+        if requested_type is not None and requested_type != saved_type:
+            raise Refusal(f"unit {name}: explicit unit_type conflicts with pending admission")
+        requested_type = saved_type
+    member = checked_unit_member(production, name, record,
+        identity=session_staff.LiveSession(identity) if identity is not None else session_staff.NO_SESSION)
+    unit_type = requested_type or "direct"
+    if isinstance(member, staff_sources.MemberFound):
+        if not isinstance(member.row.unit_type, staff.UnitDetails):
+            raise Refusal(f"unit {name}: staff has no unit details")
+        if requested_type is not None and requested_type != member.row.unit_type.value:
+            raise Refusal(f"unit {name}: explicit unit_type conflicts with staff")
+        unit_type = member.row.unit_type.value
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
@@ -383,6 +402,7 @@ def launch_request(args: argparse.Namespace, *,
         session=session,
         timeout=timeout,
         responsibilities=tuple(cast(list[str], getattr(args, "responsibility", None) or [])),
+        unit_type=unit_type,
     )
 
 
@@ -459,10 +479,17 @@ def worktree_on_branch(request: UnitLaunch) -> bool:
 def director_agent(request: UnitLaunch) -> DirectorAgent:
     """Resolve the unit director in this script's checkout before any writes."""
     resolver = Path(__file__).resolve().parents[1] / "agents" / "models_config.sh"
+    try:
+        with chdir(request.production.checkout):
+            configuration = models_registry.launch_configuration(
+                os.environ, registry=models_registry.registry_path(os.environ))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise Refusal(f"ERROR: {error}") from error
     result = subprocess.run(
-        ["bash", "-c", 'source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
+        ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
+         + 'agents_resolve production.director && printf "%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT"',
          "_", str(resolver)], cwd=request.production.checkout,
-        text=True, capture_output=True, check=False)
+        input=models_registry.configuration_shell(configuration), text=True, capture_output=True, check=False)
     if result.returncode != 0:
         error = next((line for line in result.stderr.splitlines() if line.startswith("ERROR:")),
                      result.stderr.splitlines()[0] if result.stderr else "ERROR: cannot resolve production.director.")
@@ -536,6 +563,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
         session=request.session,
         timeout=request.timeout,
         responsibilities=request.responsibilities,
+        unit_type=request.unit_type,
     )
     if launch.worktree.exists():
         git_exclude.require_untracked_ignored(launch.worktree, ".unit.toml", planned_pattern="/.unit.toml")
@@ -698,8 +726,8 @@ def ensure_worktree(request: UnitLaunch) -> None:
     if worktree.exists():
         _ = worktree_on_branch(request)
     else:
-        _ = git(production, "worktree", "add", str(worktree), "-b", request.branch,
-                production.merge_branch)
+        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+            worktree, production.checkout, build_folders.NewWorktreeBranch(request.branch, production.merge_branch)))
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path
         if not destination.exists():
@@ -719,6 +747,7 @@ def ensure_worktree(request: UnitLaunch) -> None:
 def prompt_for(request: UnitLaunch) -> str:
     production = request.production
     doc = str(production.doc)
+    command = staff.unit_command(request.unit_type)
     # The showrunner's address is written nowhere: a unit looks it up, since a restart changes it.
     # It is the session on this machine, so no other session of the same name can be meant.
     showrunner = ("the showrunner, whose `SendMessage` address `~/.claude/scripts/lib/py "
@@ -732,6 +761,8 @@ def prompt_for(request: UnitLaunch) -> str:
                  + "Do nothing until the showrunner sends you work.")
         prompt = (f"You are {request.identity.unit} in production {production.name} (doc {doc}), under "
                   f"{showrunner}, on standby.{kept}{place}")
+        if request.unit_type != "direct":
+            prompt += f" Load {command} before waiting for orders."
         return prompt
     plan = request.plan_path.as_posix()
     if isinstance(request.session, ResumedSession):
@@ -740,15 +771,15 @@ def prompt_for(request: UnitLaunch) -> str:
                     f"{showrunner}. Work only in your worktree {request.worktree}, "
                     f"branch {request.branch}, and name in every Work Order the worktree and branch "
                     "git reports at dispatch.")
-        return f"{identity} Run /unit:direct {plan}."
+        return f"{identity} Run {command} {plan}."
     if isinstance(request.plan, PlanGiven):
-        return f"/unit:direct {plan}"
+        return f"{command} {plan}"
     return (f"You are {request.identity.unit} in production {production.name} (doc {doc}), under "
             f"{showrunner}. Work only in your worktree {request.worktree}, "
             f"branch {request.branch}, and name in every Work Order the worktree and branch git reports "
             f"at dispatch. Your plan {plan} holds only the "
             f"user's words. Write the full phased plan there, send it to the showrunner, and wait for its "
-            f"approval before you run /unit:direct {plan}.")
+            f"approval before you run {command} {plan}.")
 
 
 def attach_hint(request: UnitLaunch) -> str:
@@ -815,11 +846,12 @@ def launch_session(
     def published(transcript: herdr.SessionTranscript) -> None:
         write_text_atomic(pending, json.dumps({
             "session_id": transcript.session_id,
+            "unit_type": request.unit_type,
             "prompt": prompt, "launched_at": datetime.now(UTC).isoformat(),
         }) + "\n")
         _ = ensure_staff_unit(request.production, request.unit_id,
             worktree=staff.PresentWorktree(remote.local_machine(), request.worktree.resolve()),
-            runtime_id=transcript.session_id)
+            runtime_id=transcript.session_id, unit_type=request.unit_type)
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
@@ -838,14 +870,13 @@ def launch_session(
 
 def opening_record(production: Production, unit: str) -> Path:
     """Keep pending prompt work in the checkout's Git directory, outside tracked files."""
-    checkout = production.checkout
-    directory = checkout / ".git"
-    if directory.is_file():
-        pointer = directory.read_text(encoding="utf-8").strip()
-        if not pointer.startswith("gitdir: "):
-            raise Refusal(f"invalid Git directory pointer: {directory}")
-        directory = (checkout / pointer.removeprefix("gitdir: ")).resolve()
-    return directory / "add-unit-openings" / f"{unit}.json"
+    try:
+        git_dir = git_files.at(production.checkout).git_dir
+    except git_files.NotACheckout:
+        git_dir = production.checkout / ".git"
+    except git_files.UnreadableGitFiles as error:
+        raise Refusal(f"invalid Git directory: {error}") from error
+    return git_dir / "add-unit-openings" / f"{unit}.json"
 
 
 def pending_opening(production: Production, unit: str, session_id: str) -> bool:
@@ -859,6 +890,14 @@ def pending_opening(production: Production, unit: str, session_id: str) -> bool:
 
 class NoPendingOpening(NamedTuple):
     """No live conversation still needs this saved opening."""
+
+
+def saved_unit_type(fields: Mapping[str, object]) -> staff.UnitType:
+    """Read the saved operation type; older records used the direct command."""
+    value = fields.get("unit_type", "direct")
+    if value not in staff.UNIT_TYPES:
+        raise Refusal("pending admission has invalid unit_type")
+    return value
 
 
 def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.PromptSubmitOutcome | NoPendingOpening:
@@ -887,7 +926,7 @@ def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.Pr
     transcript = herdr.SessionTranscript(home.path, fields["session_id"])
     _ = ensure_staff_unit(request.production, request.unit_id,
         worktree=staff.PresentWorktree(remote.local_machine(), request.worktree.resolve()),
-        runtime_id=transcript.session_id)
+        runtime_id=transcript.session_id, unit_type=saved_unit_type(fields))
     at = datetime.fromisoformat(fields["launched_at"])
     outcome = herdr.submitted_prompt(transcript, fields["prompt"], at)
     if not isinstance(outcome, herdr.PromptSubmitted):
@@ -1032,9 +1071,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
                                     or conversation.account != target):
                 raise Refusal("--source-fallback must name the pane launch's source account")
             if isinstance(conversation, unit_move.UnitConversation) and (not target or target == conversation.account):
-                prepared = accounts.prepared_account(conversation.account, resume=True)
-                if isinstance(prepared, accounts.AccountRefused):
-                    raise Refusal(prepared.reason)
+                _ = accounts.prepare_claude_launch(conversation.account, resume=True)
                 return accounts.NamedAccount(conversation.account, accounts.claude_account_dir(conversation.account))
         elif source_fallback:
             raise Refusal("--source-fallback requires a resumed session and its pane launch account")
@@ -1213,7 +1250,8 @@ def admit_unit(request: UnitLaunch, *,
     row = selected.row if isinstance(selected, staff_sources.MemberFound) else None
     if row is not None:
         row = ensure_staff_unit(request.production, request.unit_id, worktree=location, record=record,
-                                runtime_id=request.session.session_id if isinstance(request.session, ResumedSession) else "")
+                                runtime_id=request.session.session_id if isinstance(request.session, ResumedSession) else "",
+                                unit_type=request.unit_type)
     _ = unit_config.write(request.worktree, config)
     return UnitMembershipPublished(row) if row is not None else UnitAdmissionPending()
 
@@ -1277,12 +1315,15 @@ def checked_unit_member(production: Production, unit: str,
 def ensure_staff_unit(production: Production, unit: str, *,
                       worktree: staff.PresentWorktree | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED,
                       runtime_id: str = "",
-                      record: staff.StaffSnapshot | None = None) -> staff.StaffRow:
+                      record: staff.StaffSnapshot | None = None,
+                      unit_type: staff.UnitType | None = None) -> staff.StaffRow:
     """Admit a unit with its location; only agents resume --retired reactivates a removed row."""
     record = staff.initial_snapshot() if record is None else record
     found = checked_unit_member(production, unit, record,
                                 identity=session_staff.LiveSession(runtime_id) if runtime_id else session_staff.NO_SESSION)
     if isinstance(found, staff_sources.MemberFound):
+        if unit_type is not None and staff.UnitDetails(unit_type) != found.row.unit_type:
+            raise Refusal(f"unit {unit}: explicit unit_type conflicts with staff")
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
             raise Refusal(f"{unit}: native session conflicts with retained staff identity")
         if isinstance(worktree, staff.WorktreeUnfilled) or worktree == found.row.worktree:
@@ -1292,11 +1333,12 @@ def ensure_staff_unit(production: Production, unit: str, *,
         raise Refusal(f"unit {unit}: no filled worktree for admission")
     runner = ensure_staff_showrunner(production)
     return pane_launch.staff_admitted(staff.ensure("unit", name=unit_names.name(unit), parent=staff.ReportsTo(runner.id),
-                                                  worktree=worktree, runtime_id=runtime_id))
+                                                  worktree=worktree, runtime_id=runtime_id, unit_type=unit_type))
 
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
+    _ = parser.add_argument("--unit-type", choices=staff.UNIT_TYPES)
     _ = parser.add_argument("name")
     _ = parser.add_argument("--plan")
     _ = parser.add_argument("--brief")
@@ -1338,7 +1380,7 @@ def _main(argv: list[str]) -> int:
             problems = accounts.check(unit_account.label)
             if problems:
                 raise Refusal(
-                    f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
+                    f"unit account {unit_account.label}: {problems[0]}; see Hana console, Accounts"
                 )
             resume_model = model_for_resume(request, cast(str, args.model))
             resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))

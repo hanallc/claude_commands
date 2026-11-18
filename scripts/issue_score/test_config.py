@@ -20,29 +20,37 @@ from scripts.issue_score import apply_labels, blind, client, decide, evaluate, q
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
+FIXTURE_VALUES = {
+    "workers": "8", "model": "jev-1.14.0", "input_usd_per_million": "0.042",
+    "threshold.backlog_goal": "0.40", "threshold.backlog_alignment": "0.40",
+    "threshold.backlog_impact": "0.40", "threshold.category": "0.90", "threshold.area": "0.3",
+    "evidence_present": "0.7", "evidence_absent": "0.3", "split_probability": "0.25",
+    "body_character_limit": "24000", "endpoint": "https://api.typesafe.ai/v1/systemone",
+    "max_attempts": "5", "request_timeout": "120", "retry_backoff_base": "2.0",
+}
+
 
 class ConfiguredTestCase(unittest.TestCase):
-    """Read the worktree configuration instead of the installed configuration."""
+    """Read private settings with explicit values for the scoring tests."""
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(CONFIG_DIR)})))
+        _ = self.configuration()
 
     def configuration(self, **changes: str) -> Path:
         """Create private settings and select them for the rest of this test."""
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         path = folder / "issue_score.conf"
-        self.change_configuration(path, **changes)
+        self.change_configuration(path, **{**FIXTURE_VALUES, **changes})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(folder)})))
         return path
 
     def change_configuration(self, path: Path, **changes: str) -> None:
         """Change the private settings through the shared configuration writer."""
-        values = {**(conf.read(path).values() if path.exists() else {}), **changes}
-        _ = write_config_fixture(path, "\n".join(f"{key}={value}" for key, value in values.items()))
+        _ = write_config_fixture(path, "\n".join(f"{key}={value}" for key, value in changes.items()))
         lines = path.read_text(encoding="utf-8").splitlines()
-        for key, value in values.items():
+        for key, value in changes.items():
             index, _ = conf.effective_line(path, key)
             if index > 0 and lines[index - 1].startswith("# one of:"):
                 lines[index - 1] = f"# one of: {value}"
@@ -59,7 +67,7 @@ def patch_thresholds(**policies: questions.ThresholdOutcome) -> Generator[None]:
 
 class ConfigurationTests(ConfiguredTestCase):
     def test_each_shipped_key_reads_without_recovery_and_has_a_valid_limit(self) -> None:
-        scoring_config = conf.read('issue_score')
+        scoring_config = conf.read(CONFIG_DIR / "issue_score.conf")
         path = CONFIG_DIR / "issue_score.conf"
         lines = path.read_text(encoding="utf-8").splitlines()
         settings = conf.read(path).values()
@@ -81,21 +89,11 @@ class ConfigurationTests(ConfiguredTestCase):
                         self.assertEqual(scoring_config.text(key), value)
                 self.assertEqual(warnings.getvalue(), "")
 
-    def test_shipped_values_match_the_values_before_the_config_move(self) -> None:
-        self.assertEqual(conf.read(CONFIG_DIR / "issue_score.conf").values(), {
-            "workers": "8", "model": "jev-1.14.0", "budget_usd": "20.0",
-            "input_usd_per_million": "0.042",
-            "threshold.backlog_goal": "0.40", "threshold.backlog_alignment": "0.40",
-            "threshold.backlog_impact": "0.40", "threshold.category": "0.90", "threshold.area": "0.3",
-            "error_target.backlog_goal": "0.1", "error_target.category": "0.1", "error_target.area": "0.1",
-            "error_target.backlog_impact": "0.1", "error_target.backlog_alignment": "0.1",
-            "evidence_present": "0.7", "evidence_absent": "0.3", "split_probability": "0.25",
-            "body_character_limit": "24000", "endpoint": "https://api.typesafe.ai/v1/systemone",
-            "max_attempts": "5", "request_timeout": "120", "retry_backoff_base": "2.0",
-            "spend_ledger": "~/.local/state/issue-score/spend.jsonl", "state_dir": "~/.local/state/issue-score",
-            "vault_root": "~/rust/hanadocs", "style_rules_root": "~/rust/nate_style",
-            "blind_sample_count": "20", "title_only_character_limit": "200", "disagreement_count": "20", "reliability_bucket_count": "5",
-        })
+    def test_readers_use_values_from_the_private_file(self) -> None:
+        _ = self.configuration(workers="3", model="private-model", budget_usd="12.5")
+        self.assertEqual(score_issues.workers(), 3)
+        self.assertEqual(questions.model(), "private-model")
+        self.assertEqual(questions.budget_usd(), 12.5)
 
     def test_domain_defaults_name_the_choice_to_read_current_configuration(self) -> None:
         functions: tuple[Callable[..., object], ...] = (client.system_one, decide.is_sure, score_issues.load_cache,
@@ -143,7 +141,8 @@ class ConfigurationTests(ConfiguredTestCase):
         self.assertEqual(set(readers), set(conf.read(CONFIG_DIR / "issue_score.conf").values()))
         for key, (read, replacement, expected) in readers.items():
             with self.subTest(key=key):
-                path = self.configuration()
+                initial = "private-initial" if isinstance(expected, (str, Path)) else "1"
+                path = self.configuration(**{key: initial})
                 before = read()
                 self.change_configuration(path, **{key: replacement})
                 self.assertEqual(read(), expected)

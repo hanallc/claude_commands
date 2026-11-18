@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from typing import cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.production import showrunners, staff
+from scripts.lib import build_folders
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
@@ -219,6 +221,9 @@ def _production_text(style: StyleProduction) -> str:
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
         "## Style units", "", "| Unit | Families | Open tickets |", "| --- | --- | --- |",
         *(f"| {style.name}-{family} | {family} | 1 |" for family in FAMILIES), "",
+        "## Unit launch", "",
+        "Launch each configured unit through `production/add_unit.py --unit-type style`.",
+        "The selected command is `/unit:style`; read `docs/direct/style_unit.md` for ticket contracts.", "",
     ])
 
 
@@ -230,6 +235,9 @@ def _plan_text(style: StyleProduction, assignment: style_config.StyleUnitAssignm
         "> **Standing:** style_plan.py", "", "## Delegation Context", "",
         f"- **Project:** {style.repository.name} — standing {family} style coverage",
         f"- **Repository:** {style.repository}",
+        (f"- **Launch:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py "
+         + f"--production {style.name} {assignment.unit} --unit-type style "
+         + f"--plan {PLAN_DIRECTORY / (assignment.unit + '-unit.md')}`"),
         "- **Stack:** Rust; Python style ledger and ticket planner",
         "- **Layout:** Ticket files are selected at refill; this unit owns no files.",
         "- **Key files:** `~/.claude/docs/style_production.md` — standing procedure, yielding and mechanical criteria",
@@ -404,11 +412,20 @@ def main(argv: list[str]) -> int:
                 ["git", "-C", str(style.repository), "show-ref", "--verify", "--quiet", f"refs/heads/{style.merge_branch}"],
                 check=False, capture_output=True, text=True,
             )
+            branch: build_folders.NewWorktreeBranch | build_folders.ExistingWorktreeBranch
             if present.returncode == 1:
-                _ = _git(style.repository, "branch", style.merge_branch, style.branch_tip)
+                branch = build_folders.NewWorktreeBranch(style.merge_branch, style.branch_tip)
             elif present.returncode:
                 raise Refusal(present.stderr.strip())
-            _ = _git(style.repository, "worktree", "add", str(style.checkout), style.merge_branch)
+            else:
+                branch = build_folders.ExistingWorktreeBranch(style.merge_branch)
+            checkout_mode = stat.S_IMODE(style.checkout.stat().st_mode) if style.checkout.exists() else None
+            if checkout_mode is not None:
+                style.checkout.rmdir()
+            _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+                style.checkout, style.repository, branch))
+            if checkout_mode is not None:
+                style.checkout.chmod(checkout_mode)
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         config = style_config.read_config(style.doc)

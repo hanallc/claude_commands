@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib.process_failure import failure_detail
+from scripts.lib import build_folders
 from scripts.production import session_staff, staff
 from scripts.agents import remote
 
@@ -269,7 +270,7 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
 
 
 def cleanup(path: Path) -> CleanupReady | Kept:
-    _ = git(path, "fetch", "--prune", "origin")
+    _ = git(path, "fetch", "--no-prune", "origin")
     dirty = git(path, "status", "--porcelain").stdout
     if dirty:
         return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
@@ -344,8 +345,9 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     registered = path in worktree_branches(repo)
     if local_branch_tip(repo, record.branch) != local:
         return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
-    if path.exists() or registered:
-        _ = git(repo, "worktree", "remove", str(path))
+    if not build_folders.remove_build_folder(
+            path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True):
+        return Kept(path, "the build folder lock is held; the worktree stays")
     if isinstance(local, CheckedLocalTip):
         deletion = git(repo, "update-ref", "-d", f"refs/heads/{record.branch}", local.sha, check=False)
         if deletion.returncode:
@@ -394,12 +396,13 @@ def end_landed(repo: Path, merge_branch: str) -> list[Ended | Kept]:
 def make(path: Path, branch: str, caller: Path, repo: Path, snapshot: staff.StaffSnapshot) -> None:
     owner, merge_branch = caller_branch(repo, caller, snapshot)
     base = git(caller, "rev-parse", "HEAD").stdout.strip()
-    _ = git(caller, "worktree", "add", str(path), "-b", branch)
+    _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+        path, caller, build_folders.NewWorktreeBranch(branch, base)))
     record = new_record(path, branch, repo, base, owner, merge_branch)
     try:
         write_record(record)
     except OSError:
-        _ = git(caller, "worktree", "remove", str(path))
+        _ = build_folders.remove_build_folder(path, lambda: git(caller, "worktree", "remove", str(path)))
         _ = git(caller, "branch", "-D", branch)
         raise
     print(f"made worktree {path} on {branch}")

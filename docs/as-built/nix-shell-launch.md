@@ -26,8 +26,9 @@ a repository under a trusted root, using file reads alone.
 Style-sync lint uses `copies.standing` below the trusted `~/worktrees/gates` root.
 Forged links still require explicit approval.
 
-Standing copies under the configured copies root (normally `/tmp/claude/copies/<pair>/<copy>`) also qualify.
-Task clones from `copies.py clone` at `<scratch root>/<task>/checkout` qualify with the same proof.
+Standing copies under the configured copies root (`build_folders.conf` `roots.copies`: `/build/claude/copies` on natedev,
+`/tmp/claude/copies` on the Mac) at `<pair>/<copy>` also qualify.
+Task clones from `copies.py clone` qualify with the same proof. A clone is its task folder, `<scratch root>/<task>`.
 The `.envrc` must be a regular file at the checkout root.
 `copy_record.record_path` finds a standing copy's record inside the copy.
 For a task clone, it finds the parent's record and requires `test_hana_clone: true`.

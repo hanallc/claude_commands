@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import re
 import subprocess
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.production import staff
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import transcripts, unit_runs  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
@@ -48,6 +54,8 @@ class PlanPhase(TypedDict):
     id: str
     title: str
     done: bool
+    waits_for: NotRequired[str]
+    depends_on: NotRequired[tuple[str, ...]]
 
 
 class EtaBand(NamedTuple):
@@ -62,8 +70,80 @@ class EtaProjectionUnavailable(NamedTuple):
     """The reported progress cannot support an ETA projection."""
 
 
+@dataclass
+class HistorySnapshot:
+    """Share staff and run history reads within one report."""
+
+    record: staff.StaffSnapshot
+    events: dict[Path, list[dict[str, object]]] = field(default_factory=dict)
+    plans: dict[Path, tuple[list[PlanPhase], list[str]]] = field(default_factory=dict)
+
+    @cached_property
+    def starts(self) -> list[tuple[Path, dict[str, object]]]:
+        return _run_starts()
+
+
+class NoHistorySnapshot(NamedTuple):
+    """Read history directly outside a report."""
+
+
+_history_snapshot: ContextVar[HistorySnapshot | NoHistorySnapshot] = ContextVar(
+    "history_snapshot", default=NoHistorySnapshot())
+
+
+@contextmanager
+def history_snapshot(record: staff.StaffSnapshot) -> Generator[None]:
+    """Retain history reads until the report ends."""
+    token = _history_snapshot.set(HistorySnapshot(record))
+    try:
+        yield
+    finally:
+        _history_snapshot.reset(token)
+
+
+def staff_record() -> staff.StaffSnapshot:
+    """Use the report's staff snapshot, or read staff for another caller."""
+    snapshot = _history_snapshot.get()
+    return snapshot.record if isinstance(snapshot, HistorySnapshot) else staff.snapshot()
+
+
+def _read_run_events(path: Path) -> list[dict[str, object]]:
+    """Read run events under a shared lock and skip invalid JSON rows."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            lines = handle.read().splitlines()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, UnicodeError):
+        return []
+    events: list[dict[str, object]] = []
+    for line in lines:
+        try:
+            event = cast(object, json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(cast(dict[str, object], event))
+    return events
+
+
+def read_run_events(path: Path) -> list[dict[str, object]]:
+    """Read each run's events once within a report, or directly outside it."""
+    snapshot = _history_snapshot.get()
+    if isinstance(snapshot, NoHistorySnapshot):
+        return _read_run_events(path)
+    if path not in snapshot.events:
+        snapshot.events[path] = _read_run_events(path)
+    return snapshot.events[path]
+
+
 def history_root() -> Path:
     return unit_runs.history_root()
+
+
+def run_events_path(session_dir: Path) -> Path:
+    """The events file of the run that uses this session folder."""
+    return history_root() / "runs" / f"{session_dir.name}.jsonl"
 
 
 def now_epoch() -> float:
@@ -85,12 +165,17 @@ def plan_member(plan_path: Path, *, resolver: session_staff.RowResolver | None =
 
 
 def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+    """Read phase headings and their recorded waits from one plan read."""
+    snapshot = _history_snapshot.get()
+    if isinstance(snapshot, HistorySnapshot) and plan_path in snapshot.plans:
+        return snapshot.plans[plan_path]
     text = plan_path.read_text(encoding="utf-8")
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
-    headings = list(PHASE_HEADING_PATTERN.finditer(text))
-    for match in headings:
+    headings = [match for match in PHASE_HEADING_PATTERN.finditer(text)
+                if PHASE_STATUS_PATTERN.search(match.group("rest")) or PHASE_TITLE_PATTERN.match(match.group("rest"))]
+    for index, match in enumerate(headings):
         rest = match.group("rest")
         status_match = PHASE_STATUS_PATTERN.search(rest)
         # `### Phase 12 Review` and its like are sections, not phases.
@@ -111,13 +196,17 @@ def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
         # No status marker means the phase was shrunk into its as-built record,
         # which only happens after the phase completed.
         done = status_match is None or status_match.group("status") == "done"
-        phases.append(
-            PlanPhase(
-                id=identifier,
-                title=title,
-                done=done,
-            )
-        )
+        phase = PlanPhase(id=identifier, title=title, done=done)
+        section = text[match.end():headings[index + 1].start() if index + 1 < len(headings) else len(text)]
+        waits = re.search(r"(?im)^[ \t]*(?:[-*][ \t]+)?\*\*Waits for:\*\*[ \t]*(.+)$", section)
+        depends = re.search(r"(?im)^[ \t]*(?:[-*][ \t]+)?\*\*Depends on:\*\*[ \t]*(.+)$", section)
+        if waits:
+            phase["waits_for"] = waits.group(1).strip()
+        if depends:
+            phase["depends_on"] = tuple(re.findall(r"\b(\d+[a-z]?)\b", depends.group(1), re.IGNORECASE))
+        phases.append(phase)
+    if isinstance(snapshot, HistorySnapshot):
+        snapshot.plans[plan_path] = (phases, duplicates)
     return phases, duplicates
 
 
@@ -145,17 +234,38 @@ def run_started_event(path: Path) -> dict[str, object] | None:
     return event
 
 
+def _run_starts() -> list[tuple[Path, dict[str, object]]]:
+    try:
+        paths = list((history_root() / "runs").glob("*.jsonl"))
+    except OSError:
+        return []
+    return [(path, event) for path in paths if (event := run_started_event(path)) is not None]
+
+
+def run_starts() -> list[tuple[Path, dict[str, object]]]:
+    """Read run headers once within a report."""
+    snapshot = _history_snapshot.get()
+    return snapshot.starts if isinstance(snapshot, HistorySnapshot) else _run_starts()
+
+
 def _text(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
-    """Resolve the director's current folder without changing its stored record."""
-    if fields.get(unit_runs.OWNER_FIELD) and fields.get("status"):
-        return fields
-    row = unit_runs.run_owner(fields, record)
-    if isinstance(row, unit_runs.RunOwnerUnrecorded):
-        return fields
+def _director_family(row: staff.StaffRow) -> str:
+    """Read the current director's native transcript evidence."""
+    from scripts.message import sessions
+
+    extra_homes = (row.home.path,) if isinstance(row.home, staff.SessionHome) else ()
+    for home in transcripts.codex_transcript_homes(extra_homes):
+        for folder in ("sessions", "archived_sessions"):
+            if transcripts.transcript_paths(home / folder, f"**/*{row.current_session}.jsonl"):
+                return "codex"
+    return "claude" if sessions.transcript_locations(row.current_session) else "unknown"
+
+
+def _staff_paths(fields: dict[str, object], row: staff.StaffRow) -> None:
+    """Resolve recorded plan paths through the owner's current worktree."""
     previous = _text(fields.get("working_dir"))
     for key in ("plan_doc", "project_plan_doc"):
         value = _text(fields.get(key))
@@ -166,14 +276,91 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
             del fields[key]
     if not isinstance(row.worktree, staff.WorktreeUnfilled):
         fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
-        if fields.get(unit_runs.OWNER_FIELD) and not fields.get("event_type"):
-            branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
-                                    capture_output=True, text=True, check=False)
-            fields["branch"] = branch.stdout.strip()
-            if branch.returncode == 0 and not fields["branch"]:
-                commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
-                                        capture_output=True, text=True, check=False)
-                fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
+
+
+class _KnownBranch(NamedTuple):
+    head: str
+    name: str
+
+
+# Each state read resolves the branch; one git start for each HEAD keeps reads cheap.
+_KNOWN_BRANCHES: dict[Path, _KnownBranch] = {}
+
+
+def _head_text(worktree: Path) -> str | None:
+    """Return the HEAD file text of a worktree root, or None when no file names its branch."""
+    marker = worktree / ".git"
+    try:
+        if marker.is_dir():
+            git_dir = marker
+        else:
+            pointer = marker.read_text(encoding="utf-8")
+            if not pointer.startswith("gitdir: "):
+                return None
+            git_dir = worktree / pointer.removeprefix("gitdir: ").strip()
+        head = (git_dir / "HEAD").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # A reftable repository keeps this fixed stub in HEAD whatever the branch.
+    return None if head.startswith("ref: refs/heads/.invalid") else head
+
+
+def _worktree_branch(worktree: Path) -> str:
+    """Return the current branch, or detached@<commit>, and run git again only when HEAD changes."""
+    head = _head_text(worktree)
+    known = _KNOWN_BRANCHES.get(worktree)
+    if head is not None and known is not None and known.head == head:
+        return known.name
+    branch = subprocess.run(["git", "-C", str(worktree), "branch", "--show-current"],
+                            capture_output=True, text=True, check=False)
+    name = branch.stdout.strip()
+    succeeded = branch.returncode == 0
+    if succeeded and not name:
+        commit = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True, check=False)
+        name = f"detached@{commit.stdout.strip() or 'unknown'}"
+        succeeded = commit.returncode == 0
+    # A failed git run keeps nothing, so the next read runs git again.
+    if head is not None and succeeded:
+        _KNOWN_BRANCHES[worktree] = _KnownBranch(head, name)
+    return name
+
+
+def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot, *,
+                    pass_agents: bool = True) -> dict[str, object]:
+    """Resolve current state through staff and preserve recorded events.
+
+    pass_agents=False leaves each pass as recorded and finds no worker backend.
+    """
+    if fields.get("event_type"):
+        return fields
+    row = unit_runs.run_owner(fields, record)
+    if isinstance(row, unit_runs.RunOwnerUnrecorded):
+        return fields
+    _staff_paths(fields, row)
+    if not isinstance(row.worktree, staff.WorktreeUnfilled):
+        if not fields.get("event_type"):
+            fields["branch"] = _worktree_branch(row.worktree.path)
+    if not fields.get("event_type"):
+        main = fields.get("main_agent")
+        identity = dict(cast(dict[str, object], main)) if isinstance(main, dict) else {}
+        identity.update(session_id=row.current_session, family=_director_family(row))
+        fields["main_agent"] = identity
+        passes = fields.get("pass")
+        if pass_agents and isinstance(passes, dict):
+            for value in cast(dict[str, object], passes).values():
+                if not isinstance(value, dict):
+                    continue
+                passed = cast(dict[str, object], value)
+                worker = record.by_id(staff.StaffId(_text(passed.get("worker_id"))))
+                if worker is None or worker.kind != "worker" or worker.parent != staff.ReportsTo(row.id):
+                    continue
+                passed["worker_name"] = worker.name
+                called = passed.get("called_agent")
+                agent = dict(cast(dict[str, object], called)) if isinstance(called, dict) else {}
+                backend = record.backends.get(worker.id)
+                agent.update(session_id=worker.current_session, family=backend.family if backend is not None else "unknown")
+                passed["called_agent"] = agent
     return fields
 
 
@@ -181,19 +368,18 @@ def plan_runs(plan_path: Path, *,
               record: staff.StaffSnapshot | None = None) -> list[Path]:
     """Return this plan's durable run files, oldest first."""
     target = plan_path.expanduser().resolve()
-    try:
-        paths = list((history_root() / "runs").glob("*.jsonl"))
-    except OSError:
-        return []
-    starts = [(path, event) for path in paths if (event := run_started_event(path)) is not None]
+    starts = run_starts()
     if record is None:
-        record = (staff.snapshot() if any(event.get(unit_runs.OWNER_FIELD) or event.get("main_agent") or event.get("owner_session") for _, event in starts)
+        record = (staff_record() if any(event.get(unit_runs.OWNER_FIELD) or event.get("main_agent") or event.get("owner_session") for _, event in starts)
                   else staff.StaffSnapshot(()))
     matches: list[tuple[float, str, Path]] = []
     for path, event in starts:
-        event = staff_directory(event, record)
-        working_dir = event.get("working_dir")
-        plan_doc = event.get("plan_doc")
+        owner = unit_runs.run_owner(event, record)
+        fields = dict(event)
+        if isinstance(owner, staff.StaffRow):
+            _staff_paths(fields, owner)
+        working_dir = fields.get("working_dir")
+        plan_doc = fields.get("plan_doc")
         if not isinstance(working_dir, str) or not isinstance(plan_doc, str):
             continue
         if not working_dir or not plan_doc:

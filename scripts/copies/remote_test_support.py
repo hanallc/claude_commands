@@ -16,7 +16,8 @@ from types import SimpleNamespace
 from typing import cast, final
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.mac_test import floor_claims
@@ -108,9 +109,7 @@ def local_remote_transport(root: Path) -> Generator[None]:
     repository = Path(__file__).resolve().parents[2]
     tools = root / "remote-tools"
     tools.mkdir(exist_ok=True)
-    scripts = root / ".claude/scripts"
-    scripts.parent.mkdir(exist_ok=True)
-    scripts.symlink_to(repository / "scripts", target_is_directory=True)
+    _ = copy_helpers(root, *COPY_HELPERS)
     ssh = tools / "ssh"
     _ = ssh.write_text(f"#!{sys.executable}\n" + '''import os, sys
 environment = dict(os.environ)
@@ -121,9 +120,9 @@ os.execve('/bin/bash', ['bash', '-c', sys.argv[-1]], environment)
     ssh.chmod(0o755)
     seed_interpreter_cache(root / "cache")
     with mock.patch.dict(os.environ, {
-        **config_environment(root), **copies_environment(root),
+        **copies_environment(root),
         "PATH": str(tools) + os.pathsep + os.environ["PATH"],
-        "PYTHONPATH": str(repository), "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(root / "cache"),
+        "PYTHONPATH": str(repository / "scripts/lib/python_startup"), "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(root / "cache"),
         "MAC_TEST_STATE_DIR": str(root / "local-claims"),
         "REMOTE_CLAIM_STATE": str(root / "remote-claims"),
     }):

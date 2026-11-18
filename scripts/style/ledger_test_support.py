@@ -18,17 +18,19 @@ from collections.abc import Callable, Generator
 from pathlib import Path
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-from typing import ClassVar, TypedDict, cast, override
+from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 from unittest import mock
 from scripts.style import rules
 from scripts.style.style_config import StyleUnitAssignment
 from scripts.style import style_ledger
 from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-from scripts.style import style_plan
 from scripts.style import style_rules
-from scripts.style import declarations
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+if TYPE_CHECKING:
+    from scripts.style import declarations
 
 
 STYLE_UNIT_NAMES = (
@@ -258,6 +260,7 @@ class LedgerTestCase(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(oracle_reader())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = self.root / "sample"
         self.rule_dir = self.root / "nate_style" / "rust"
@@ -310,6 +313,19 @@ class LedgerTestCase(unittest.TestCase):
         prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
         return [str(Path(__file__).resolve().parents[1] / "lib/py"), str(Path(style_ledger.__file__)), *arguments[:prefix],
                 "--repo", str(self.repo), *arguments[prefix:]]
+
+    def forget_tips(self) -> None:
+        """Drop the process tip cache, as a new ledger process starts with none."""
+        read_tip = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_read_tip"])
+        cast(Callable[[], None], getattr(read_tip, "cache_clear"))()
+
+    @contextmanager
+    def tip_builds(self) -> Generator[mock.MagicMock]:
+        """Spy on each tip build. Drop the process tip cache first, so the spy sees each read."""
+        self.forget_tips()
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with mock.patch.object(style_ledger, "_tip", wraps=builder) as builds:
+            yield builds
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
         # main owns and closes its ledger each call; only argparse's argv is process-global.
@@ -636,6 +652,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def widen(self, *paths: str, ticket: str = "1", reason: str = "the move needs a new file",
               by: str = "showrunner") -> tuple[int, str]:
+        from scripts.style import style_plan
+
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(output):
             result = style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", *paths,
@@ -827,6 +845,8 @@ class LedgerTestCase(unittest.TestCase):
     def renamed_binding(self, ledger: style_ledger.Ledger, built_path: str, before: str, after: str) -> str:
         """A filed rename of the binding ws in fn old, a built rename of fn old at built_path, and a tip that renames
         only the fn. The step follows the finding to fn new."""
+        from scripts.style import declarations
+
         function = "pub fn old() {\n    let ws = 1;\n}\n"
         _ = self.commit_tip(ledger, {PARENT_FILE: function, MOVED_FILE: "pub fn caller() {\n    crate::a::old();\n}\n"})
         _, (finding_id,) = self.judge_parent(ledger, ((2, "let ws = 1;"),), before="ws", after="workspace")
@@ -841,6 +861,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_gone_from_file(self, ledger: style_ledger.Ledger, finding_id: str, approved: Callable[[Path], bool]) -> None:
         """The declaration step leaves the filed finding on struct Parent gone from its file and writes nothing."""
+        from scripts.style import declarations
+
         filed = ledger.held_findings(style_ledger.HeldFindingsInState("filed"))[0]
         before = self.held_rows(ledger.database)
         left, = ledger.follow_declarations([finding_id], ledger.synced_commit(), approved).outcomes
@@ -872,6 +894,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_method_rename_built_in_place(self, ledger: style_ledger.Ledger, finding_id: str) -> None:
         """The step builds the filed rename of Parent::old to Parent::new at fn new in impl Parent in a.rs."""
+        from scripts.style import declarations
+
         filed = next(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings()) if finding.finding_id == finding_id)
         renamed, = self.follow_approved(ledger, [finding_id])
         self.assertEqual(renamed, style_ledger.DeclarationRenamed(

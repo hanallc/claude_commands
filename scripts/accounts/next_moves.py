@@ -7,6 +7,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager
@@ -136,7 +137,7 @@ class StartedHoldReader(Protocol):
 
 
 class GroupHoldResolver(Protocol):
-    def group_half_point_hold(self, group: Literal["units", "showrunners"], now: datetime) -> ResolvedHold: ...
+    def group_half_point_hold(self, group: role_map.ClaudeGroup, now: datetime) -> ResolvedHold: ...
 
 
 def account_pace(label: str, now: datetime) -> PaceEstimate | NoUsablePace:
@@ -179,14 +180,14 @@ def _check_move_input(percent: float, added_at: datetime) -> None:
 @dataclass(frozen=True, init=False)
 class ClaudeGroupMove:
     id: str
-    group: Literal["units", "showrunners"]
+    group: role_map.ClaudeGroup
     at_percent: float
     hold_mode: HoldMode
     to: str
     added_at: datetime
     fallback_targets: tuple[str, ...]
 
-    def __init__(self, id: str, group: Literal["units", "showrunners"], at_percent: float,
+    def __init__(self, id: str, group: role_map.ClaudeGroup, at_percent: float,
                  hold_mode: HoldMode | float, to: str, added_at: datetime,
                  fallback_targets: tuple[str, ...] = ()) -> None:
         object.__setattr__(self, "id", id)
@@ -205,8 +206,8 @@ class ClaudeGroupMove:
         return self.hold_mode.minutes
 
     def __post_init__(self) -> None:
-        if not self.id or self.group not in ("units", "showrunners"):
-            raise NextMoveError("next: expected an id and units or showrunners")
+        if not self.id or self.group not in role_map.CLAUDE_GROUPS:
+            raise NextMoveError("next: expected an id and a Claude group")
         _check_move_input(self.at_percent, self.added_at)
         if any(not re.fullmatch(r"claude[1-9][0-9]*", target) for target in (self.to, *self.fallback_targets)):
             raise NextMoveError("next: target must be a numbered Claude account")
@@ -260,7 +261,7 @@ class WorkersMove:
 
 
 NextMove = ClaudeGroupMove | WorkersMove
-NextMoveGroup = Literal["units", "showrunners", "workers"]
+NextMoveGroup = role_map.Role
 
 
 def target_label(entry: NextMove) -> str:
@@ -287,24 +288,35 @@ def encode_hold_mode(mode: HoldMode) -> dict[str, object]:
             else {"hold_mode": "half-point"})
 
 
-def decode_next_moves(text: str) -> tuple[NextMove, ...]:
+@dataclass(frozen=True)
+class DecodedNextMoves:
+    entries: tuple[NextMove, ...]
+    unknown_groups: dict[str, list[dict[str, object]]]
+
+
+def _decode_next_moves(text: str) -> DecodedNextMoves:
     try:
         raw = cast(object, json.loads(text))
         if not isinstance(raw, list):
             raise NextMoveError("next: expected an entry list")
         entries: list[NextMove] = []
+        unknown_groups: dict[str, list[dict[str, object]]] = {}
         ids: set[str] = set()
         for item in cast(list[object], raw):
             if not isinstance(item, dict):
                 raise NextMoveError("next: expected an entry object")
             fields = cast(dict[str, object], item)
             name, group, target, added = (fields.get(key) for key in ("id", "group", "to", "added_at"))
+            if not isinstance(group, str) or not group:
+                raise NextMoveError("next: invalid entry fields")
+            if group not in ("units", "showrunners", "producers", "workers"):
+                unknown_groups.setdefault(group, []).append(fields)
+                continue
             percent, hold = fields.get("at_percent"), fields.get("hold_minutes", 0)
             mode = fields.get("hold_mode", "fixed")
             if mode not in ("fixed", "half-point"):
                 raise NextMoveError("next: unknown hold mode")
-            if (not isinstance(name, str) or group not in ("units", "showrunners", "workers")
-                    or not isinstance(target, str) or not isinstance(added, str)
+            if (not isinstance(name, str) or not isinstance(target, str) or not isinstance(added, str)
                     or not isinstance(percent, (int, float)) or isinstance(percent, bool)
                     or not isinstance(hold, (int, float)) or isinstance(hold, bool)):
                 raise NextMoveError("next: invalid entry fields")
@@ -330,20 +342,35 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
                 raise NextMoveError("next: duplicate entry id")
             ids.add(entry.id)
             entries.append(entry)
-        return tuple(entries)
+        return DecodedNextMoves(tuple(entries), unknown_groups)
     except (ValueError, TypeError, OverflowError) as error:
         raise NextMoveError(f"next: invalid log: {error}") from error
 
 
-def read_next_moves() -> tuple[NextMove, ...]:
+def decode_next_moves(text: str) -> tuple[NextMove, ...]:
+    decoded = _decode_next_moves(text)
+    if decoded.unknown_groups:
+        names = ", ".join(repr(group) for group in sorted(decoded.unknown_groups))
+        print(f"next: anomaly: skipped entries for unknown groups {names}", file=sys.stderr)
+    return decoded.entries
+
+
+def read_next_move_log_text() -> str:
+    """Read the stored queue with its original formatting."""
     try:
-        if not role_map.is_role_map_host():
-            return decode_next_moves(role_map.ssh_role_map(("next-read",)))
-        try:
-            text = next_moves_file().read_text()
-        except FileNotFoundError:
-            return ()
-        return decode_next_moves(text)
+        with next_moves_file().open(encoding="utf-8", newline="") as log:
+            return log.read()
+    except FileNotFoundError:
+        return "[]\n"
+    except OSError as error:
+        raise NextMoveError(f"next: cannot read log: {error}") from error
+
+
+def read_next_moves() -> tuple[NextMove, ...]:
+    if role_map.is_role_map_host():
+        return decode_next_moves(read_next_move_log_text())
+    try:
+        return decode_next_moves(role_map.ssh_role_map(("next-read",)))
     except (OSError, subprocess.TimeoutExpired) as error:
         raise NextMoveError(f"next: cannot read log: {error}") from error
 
@@ -368,10 +395,20 @@ def write_next_moves(entries: tuple[NextMove, ...]) -> None:
     """Replace the local log; the caller holds next_moves_lock."""
     _check_log_host()
     path = next_moves_file()
+    encoded = encode_next_moves(entries)
+    try:
+        previous = path.read_text()
+    except FileNotFoundError:
+        pass
+    else:
+        unknown = _decode_next_moves(previous).unknown_groups
+        if unknown:
+            known_fields = cast(list[dict[str, object]], json.loads(encoded))
+            encoded = json.dumps([*known_fields, *(item for group in unknown.values() for item in group)])
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".next-")
     try:
         with os.fdopen(descriptor, "w") as output:
-            _ = output.write(encode_next_moves(entries) + "\n")
+            _ = output.write(encoded + "\n")
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -399,13 +436,18 @@ def insert_next_move(entry: NextMove, insertion: AppendToGroup | InsertAt = APPE
         raise NextMoveError(f"next: cannot add entry: {error}") from error
 
 
+def _new_next_move(group: NextMoveGroup, at_percent: float, to: str, hold_minutes: float | HoldMode = 0, *,
+                   fallback_targets: tuple[str, ...] = ()) -> NextMove:
+    # All text-to-domain conversions use the same boundary as file and remote reads.
+    return decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
+        **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
+        to=to, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+
+
 def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
                   hold_minutes: float | HoldMode = 0, *, fallback_targets: tuple[str, ...] = (),
                   insertion: AppendToGroup | InsertAt = APPEND_TO_GROUP) -> NextMove:
-    # All text-to-domain conversions use the same boundary as file and remote reads.
-    entry = decode_next_moves(json.dumps([dict(id=uuid4().hex, group=group, at_percent=at_percent,
-        **encode_hold_mode(hold_minutes if isinstance(hold_minutes, (FixedHold, HalfPointHold)) else FixedHold(hold_minutes)),
-        to=to, **{"else": fallback_targets}, added_at=datetime.now(timezone.utc).isoformat())]))[0]
+    entry = _new_next_move(group, at_percent, to, hold_minutes, fallback_targets=fallback_targets)
     if not role_map.is_role_map_host():
         try:
             arguments = ("next-write", encode_next_moves((entry,)))
@@ -420,6 +462,33 @@ def add_next_move(group: NextMoveGroup, at_percent: float, to: str,
         except (OSError, subprocess.TimeoutExpired) as error:
             raise NextMoveError(f"next: remote add failed: {error}") from error
     insert_next_move(entry, insertion)
+    return entry
+
+
+def console_next_move_percent() -> float:
+    """The weekly percent left at which a next move chosen on the console Accounts page runs."""
+    return conf.read("accounts").number("next_move_percent")
+
+
+def set_first_next_move(group: role_map.ClaudeGroup, at_percent: float, to: str) -> NextMove:
+    """Make `to` the group's first next move; the new entry replaces the group's current first entry."""
+    if not role_map.is_role_map_host():
+        if any(entry.group == group for entry in read_next_moves()):
+            remove_next_move(group, FIRST_GROUP_POSITION)
+        return add_next_move(group, at_percent, to, insertion=InsertAt(FIRST_GROUP_POSITION))
+    entry = _new_next_move(group, at_percent, to)
+    watcher = cast(NextMoveEdit, cast(object, import_module("scripts.accounts.refusal_watch")))
+    try:
+        with watcher.editing_next_moves() as edit:
+            entries = list(read_next_moves())
+            first = next((index for index, saved in enumerate(entries) if saved.group == group), None)
+            if first is None:
+                entries.append(entry)
+            else:
+                entries[first] = entry
+            edit.commit(tuple(entries))
+    except OSError as error:
+        raise NextMoveError(f"next: cannot set entry: {error}") from error
     return entry
 
 
@@ -519,7 +588,7 @@ def render_next_moves(entries: tuple[NextMove, ...]) -> str:
     current = {} if isinstance(holds, WatchStateUnreadable) else holds
     sections = ["\n".join(_render_next_move(entry, GroupPosition(index), current.get(entry.id, HOLD_NOT_STARTED), now)
                           for index, entry in enumerate((entry for entry in entries if entry.group == group), 1))
-                for group in ("showrunners", "units", "workers")]
+                for group in ("showrunners", "units", "producers", "workers")]
     return _with_watch_state_notice("\n\n".join(section for section in sections if section), holds)
 
 

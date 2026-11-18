@@ -71,10 +71,13 @@ def _friend_pending(client: herdr.Herdr, state: worker_panes.WorkerPane | worker
     kind = "codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"
     address = ("codex:" if kind == "codex" else "session:") + str(row.current_session)
     for pane in panes:
-        if not (pane.get("tab_id") == tab and str(pane.get("label", "")).startswith("friend-")
+        if not (pane.get("tab_id") == tab and pane["pane_id"] != state.pane
                 and client.readiness(pane["pane_id"])["agent_status"] == herdr.AgentStatus.WORKING):
             continue
-        native = client.native_pane_process(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+        try:
+            native = client.native_pane_process(pane["pane_id"], kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane)
+        except herdr_types.HerdrFailure:
+            continue
         backend = (staff.CodexBackend(Path(native.environment["CODEX_HOME"])) if kind == "codex"
                    else staff.ClaudeBackend())
         source = worker_admission.transcript_source(replace(row, current_session=staff.native_id(native.current_identity)), backend)
@@ -138,7 +141,11 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
     options = options._replace(sender_origin=send.ForwardedSender(sender), shown_sender=send.ShownSender(worker_name))
 
     def send_notice() -> None:
-        result = send.send(options)
+        current = staff.snapshot().by_id(parent.id)
+        if current is None:
+            raise ValueError(f"{parent.id}: notice recipient is not in staff")
+        address = ("codex:" if isinstance(staff.backend(current), staff.CodexBackend) else "session:") + str(current.current_session)
+        result = send.send(options._replace(selection=send.RosterLookup(address)))
         if result.outcome not in ("sent", "skipped"):
             raise ValueError(result.detail)
         progress_history.record_dispatch_notice(run, instance, stamp)
@@ -211,6 +218,11 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
         _ = scratch.end(scratch.worker_task(row.id))
     except Exception as error:
         details.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
+    from scripts.agents import detached_runs
+    try:
+        _ = detached_runs.prune_finished(run / detached_runs.DETACHED_RUNS_DIR)
+    except OSError as error:
+        details.append(f"detached run cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
     try:
         if not completion.pane_closed:
             with redirect_stderr(io.StringIO()) as diagnostics:
@@ -246,7 +258,13 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
             details.append(reason)
     completion = replace(completion, details=tuple(details))
     progress_history.save_hook_completion(run, instance, completion)
-    decision = _prepare_notice(row.name, parent, run, passed, instance, outcome, path, path.read_text(), "\n".join(details))
+    try:
+        reply = path.read_text()
+    except FileNotFoundError:
+        if outcome != TurnOutcome.ERROR:
+            raise
+        reply = "\n".join(completion.details)
+    decision = _prepare_notice(row.name, parent, run, passed, instance, outcome, path, reply, "\n".join(details))
 
     def send_notice() -> None:
         decision.send_notice()
@@ -337,10 +355,17 @@ def _handle_locked(event: WorkerEvent) -> TurnOutcome | TurnDecision:
         passed = worker_panes.worker_pass(row, run)
 
         def ignore_turn(reason: str) -> TurnOutcome:
-            if event.kind == EventKind.TURN_END:
+            # The Codex capacity stop cancels the pass, and a live detached run keeps the stopped pane at the
+            # shell. The run end closes that pane. The canceled pass gates the pane scan.
+            stopped = (event.kind == EventKind.RUN_FINISHED and passed.get("status") == "canceled" and isinstance(
+                worker_panes.observe_worker(parent.id, row, record), worker_panes.StoppedWorker))
+            if event.kind == EventKind.TURN_END or stopped:
                 dispatch = worker_panes.worker_dispatch_state(row, run, hold)
                 if not isinstance(dispatch, worker_panes.DispatchHoldsWorker):
-                    _ = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
+                    closed = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
+                    if stopped and not isinstance(closed, worker_panes.Closed):
+                        blocker = closed.blocker if isinstance(closed, worker_panes.Kept) else closed.reason
+                        reason = f"{reason}; the stopped pane did not close: {blocker}"
             return _ignored(event, reason, row.name)
 
         completion = progress_history.hook_completion(passed)
@@ -382,6 +407,9 @@ def _handle_locked(event: WorkerEvent) -> TurnOutcome | TurnDecision:
         if isinstance(receipt, worker.DispatchSubmitted) and not receipt.reply:
             if event.kind == EventKind.STAGE_READY:
                 return TurnOutcome.SUBMITTED
+            if event.kind == EventKind.TURN_END and not event.reply and receipt.compacted_after_prompt:
+                return _prepare_notice(row.name, parent, run, passed, instance, TurnOutcome.NO_DONE,
+                                       Path(delivery.reply_file), "", "")
             return _ignored(event, "the submitted dispatch has no final reply", row.name)
         anomalies = receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ()
         if event.kind == EventKind.TURN_END and (not reply or reply != event.reply):

@@ -294,6 +294,34 @@ run() {{
 
         self.assert_success(result, "<cargo><nextest><run><--workspace>\nstatus=7\n")
 
+    def test_failed_version_check_names_its_first_error_line(self) -> None:
+        refusing_bin = self.root / "refusing-bin"
+        refusing_bin.mkdir()
+        self.write_executable(refusing_bin / "cargo", shell_lines(
+            "#!/usr/bin/env bash",
+            "echo 'mac cargo gate refused: no answer in 10s; run it through mac_queue_run.py' >&2",
+            "echo 'second line' >&2",
+            "exit 125",
+            "",
+        ))
+        path = {"PATH": f"{refusing_bin}{os.pathsep}{self.environment['PATH']}"}
+        result = self.run_shell("require_nextest", extra=path)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        refusal = "mac cargo gate refused: no answer in 10s; run it through mac_queue_run.py"
+        self.assertEqual(result.stderr, f"cargo nextest is required: {refusal}\n")
+
+    def test_version_check_without_error_text_keeps_the_short_message(self) -> None:
+        silent_bin = self.root / "silent-bin"
+        silent_bin.mkdir()
+        self.write_executable(silent_bin / "cargo", shell_lines("#!/usr/bin/env bash", "exit 101", ""))
+        result = self.run_shell("require_nextest", extra={"PATH": f"{silent_bin}{os.pathsep}{self.environment['PATH']}"})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "cargo nextest is required\n")
+
+    def test_present_nextest_passes_without_output(self) -> None:
+        self.assert_success(self.run_shell("require_nextest"), "")
+
 
 if __name__ == "__main__":
     _ = unittest.main()

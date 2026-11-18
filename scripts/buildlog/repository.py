@@ -7,8 +7,10 @@ from pathlib import Path
 import subprocess
 
 from scripts.buildlog import store
+from scripts.lib import git_files
 
 GIT_TIMEOUT_S = 5
+MANIFEST_IDENTITY_PREFIX = "manifest-path:"
 
 def output(args: list[str], cwd: str, timeout: float) -> str | None:
     try:
@@ -44,7 +46,19 @@ def remote_identity(remote: str, directory: str) -> str:
 
 
 def repository_key(directory: str) -> str:
-    """Read the remote identity or the first root commit of a directory."""
+    """Keep Git identities or use the nearest real manifest without Git."""
+    folder = Path(directory).resolve()
+    ceilings = {Path(value).resolve() for value in os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if value}
+    git_parents: list[Path] = []
+    for parent in (folder, *folder.parents):
+        if parent != folder and parent in ceilings:
+            break
+        git_parents.append(parent)
+    if folder.is_dir() and not any((parent / ".git").exists() for parent in git_parents):
+        for parent in (folder, *folder.parents):
+            manifest = parent / "Cargo.toml"
+            if manifest.is_file():
+                return MANIFEST_IDENTITY_PREFIX + str(manifest.resolve())
     remote = output(["git", "-C", directory, "remote", "get-url", "origin"], directory, GIT_TIMEOUT_S)
     if remote and remote.strip():
         return remote_identity(remote.strip(), directory)
@@ -54,8 +68,6 @@ def repository_key(directory: str) -> str:
 
 
 GIT_DIR = ".git"
-GITDIR_PREFIX = "gitdir:"
-COMMONDIR_FILE = "commondir"
 ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
 
 
@@ -73,31 +85,10 @@ def repo_name(directory: str) -> str | None:
 
 def git_common_dir(directory: str) -> str | None:
     """Return the Git folder that the repository worktrees share."""
-    current = os.path.abspath(directory)
-    while not os.path.lexists(os.path.join(current, GIT_DIR)):
-        parent = os.path.dirname(current)
-        if parent == current:
-            return None
-        current = parent
-    common = os.path.join(current, GIT_DIR)
-    if os.path.isfile(common):
-        # The .git file names the private folder. Its commondir file names the shared folder.
-        try:
-            with open(common, encoding="utf-8") as handle:
-                pointer = handle.readline().strip()
-        except OSError:
-            return None
-        if not pointer.startswith(GITDIR_PREFIX):
-            return None
-        common = os.path.join(current, pointer[len(GITDIR_PREFIX) :].strip())
-        try:
-            with open(os.path.join(common, COMMONDIR_FILE), encoding="utf-8") as handle:
-                common = os.path.join(common, handle.readline().strip())
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return None
-    return os.path.normpath(common)
+    try:
+        return str(git_files.locate(Path(directory)).common_dir)
+    except git_files.GitFilesError:
+        return None
 
 
 def source_git_dir(common: str) -> str:

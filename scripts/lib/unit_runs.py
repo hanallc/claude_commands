@@ -2,7 +2,9 @@
 """Read run folders and the open run in each director's staff row.
 
 Staff supplies each run's current owner. Run records keep task history.
-Run folders can use the current unit name or the former delegate name.
+A new run folder goes in its director's session folder, at <session root>/<name>/run/<run id>
+(user decision 8, 2026-11-15). Each such `run` folder is a run root, so a run keeps its id.
+Older run folders stay in /tmp/claude/unit or the former delegate root until they end.
 """
 from __future__ import annotations
 try:
@@ -18,7 +20,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, cast
@@ -64,7 +66,7 @@ class RunOwnerUnrecorded:
 
 
 def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
-    """Resolve a fixed owner first; older runs can still name their director."""
+    """Resolve the run owner through its fixed staff reference."""
     from scripts.production import staff
 
     reference = fields.get(OWNER_FIELD)
@@ -73,11 +75,7 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
         if row is None or row.kind not in ("unit", "showrunner"):
             raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
         return row
-    identity = fields.get("main_agent")
-    agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
-    reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
-    row = record.owner_of(reference) if isinstance(reference, str) and reference else None
-    return row if row is not None and row.kind in ("unit", "showrunner") else RunOwnerUnrecorded("run has no unit staff owner")
+    return RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -90,15 +88,44 @@ def environ(name: str) -> str:
     return os.environ.get(f"UNIT_{name}") or os.environ.get(f"PLAN_DELEGATE_{former}", "")
 
 
+def session_run_roots() -> tuple[Path, ...]:
+    """The run root of each session folder that has one, read at each call."""
+    from scripts.lib import session_folder
+
+    root = session_folder.session_root()
+    if root is None:
+        return ()
+    return tuple(sorted(path for path in root.glob(f"[!.]*/{session_folder.RUN}") if path.is_dir()))
+
+
 def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
-    """The folders that hold run folders, the new name first."""
-    return (Path(override),) if override else (RUN_ROOT, FORMER_RUN_ROOT)
+    """The folders that hold run folders: session folders first, then the former roots."""
+    return (Path(override),) if override else (*session_run_roots(), RUN_ROOT, FORMER_RUN_ROOT)
+
+
+def new_run_root() -> Path:
+    """The root for a new run: the director's session folder, else RUN_ROOT before session folders exist."""
+    from scripts.lib import session_folder
+
+    folder = session_folder.caller_folder()
+    return RUN_ROOT if folder is None else folder / session_folder.RUN
+
+
+def _in_session_run_root(folder: Path) -> bool:
+    from scripts.lib import session_folder
+
+    root = session_folder.session_root()
+    if root is None or not folder.is_relative_to(resolved := root.resolve()):
+        return False
+    parts = folder.relative_to(resolved).parts
+    return len(parts) > 2 and not parts[0].startswith(".") and parts[1] == session_folder.RUN
 
 
 def is_unit_run(folder: Path) -> bool:
     """Test whether the folder is under a unit run root."""
     folder = folder.resolve()
-    return any(folder.is_relative_to(root.resolve()) for root in run_roots())
+    return (any(folder.is_relative_to(root.resolve()) for root in (RUN_ROOT, FORMER_RUN_ROOT))
+            or _in_session_run_root(folder))
 
 
 def run_temp_path(run: Path) -> Path:
@@ -116,6 +143,14 @@ def run_temp_path(run: Path) -> Path:
 
 class RunStaffAtUse(Enum):
     LOCAL = "read the local staff record"
+
+
+@dataclass(frozen=True)
+class LauncherRunDirectories:
+    """Share worker resolution and parent scans within one display."""
+
+    by_worker: dict[staff.StaffId, tuple[Path, ...]]
+    by_session: dict[str, list[str]]
 
 
 
@@ -146,11 +181,9 @@ def run_is_open(folder: Path, *, record: staff.StaffSnapshot | None = None) -> b
         return "status" not in fields
     record = staff.local_snapshot() if record is None else record
     reference = fields.get(OWNER_FIELD)
-    agent = fields.get("main_agent")
-    identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
-    identity = identity or fields.get("owner_session") or fields.get("director_session")
-    owner = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str)
-             else record.by_member_reference(identity) if isinstance(identity, str) else None)
+    owner = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else
+             next((row for row in record.rows if isinstance(row.run, staff.OpenRun)
+                   and row.run.path.resolve() == folder), None))
     return (isinstance(owner, staff.StaffRow) and isinstance(owner.run, staff.OpenRun)
             and owner.run.path.resolve() == folder)
 
@@ -252,13 +285,24 @@ def _has_resumable_workers(run: Path, *, record: staff.StaffSnapshot | RunStaffA
 
 
 def held_by_session(root_override: str | Path | None = None, *,
-                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL) -> dict[str, list[str]]:
+                    record: staff.StaffSnapshot | RunStaffAtUse = RunStaffAtUse.LOCAL,
+                    additional_roots: Sequence[Path] = ()) -> dict[str, list[str]]:
     """Read each run's director once, in root and name order."""
     found: dict[str, list[str]] = {}
-    for folder in run_folders(root_override):
+    folders: dict[Path, Path] = {}
+    for root in (root_override, *additional_roots):
+        for folder in run_folders(root):
+            _ = folders.setdefault(folder.resolve(), folder)
+    for folder in folders.values():
         if (folder / STATE_FILE).is_file():
             found.setdefault(director(folder, record=record), []).append(str(folder))
     return found
+
+
+@lru_cache(maxsize=4096)
+def _real_path(folder: str) -> Path:
+    """Resolve a scanned run folder once per process; one board read compares each folder many times."""
+    return Path(folder).resolve()
 
 
 def held(session_id: str, root_override: str | Path | None = None,
@@ -274,16 +318,16 @@ def held(session_id: str, root_override: str | Path | None = None,
     if target is not None:
         resolved = target.resolve()
         owner = next((session for session, paths in folders.items()
-                      if any(Path(path).resolve() == resolved for path in paths)), None)
+                      if any(_real_path(path) == resolved for path in paths)), None)
         if owner is None:
             owner = director(target, record=record)
             if owner == session_id:
                 folders.setdefault(owner, []).append(str(target))
         if owner == session_id:
             runs.append(str(target))
-    seen = {Path(run).resolve() for run in runs}
+    seen = {_real_path(run) for run in runs}
     for folder in folders.get(session_id, ()):
-        resolved = Path(folder).resolve()
+        resolved = _real_path(folder)
         if resolved not in seen:
             seen.add(resolved)
             runs.append(folder)

@@ -95,6 +95,7 @@ class VerifyStepOwnerTests(unittest.TestCase):
         self.shell = "\n".join((
             "set -euo pipefail",
             shell_function(invoke, "buildlog_exec"),
+            shell_function(verify, "collect_child"),
             verify[start:end],
             shell_function(invoke, "sweep_after_step"),
             'mkdir -p "$BOARD_DIR/locks/cargo.d"',

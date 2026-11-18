@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class CargoOutputRoots:
+    """The paths identify the Cargo workspace, target directory, and build directory."""
     workspace_root: Path
     target_directory: Path
     build_directory: Path
@@ -20,6 +21,7 @@ class CargoOutputRoots:
 
 @dataclass(frozen=True)
 class CargoOutputUnavailable:
+    """The reason explains why Cargo output paths are unavailable."""
     reason: str
 
 

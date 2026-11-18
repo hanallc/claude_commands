@@ -11,7 +11,7 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 | File | Role |
 | --- | --- |
 | `scripts/validate_and_push/validate_and_push.sh` | The `--cancel-prior` flag and `cancel_prior_runs`. |
-| `scripts/validate_and_push/push_direct.sh` | Locks main publication, runs the post-push hook, waits for the sha's run, and prints the CI handoff. |
+| `scripts/validate_and_push/push_direct.sh` | Lands the default branch through `scripts/lib/land_main.py` under the main push lock, waits for the sha's run, and prints the CI handoff. |
 | `scripts/validate_and_push/test_cancel_prior.sh` | Test with stubbed `git` and `gh`. |
 | `commands/showrunner/produce.md` | The cancel-prior rule at <MergeCheckpoint/> (the `merge_checkpoint.py` call) and <CIPoint/> (`ci_points.py ci start`). |
 
@@ -27,9 +27,9 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 4. `push_direct.sh` checks up to 40 times, 3 s apart (120 s), for the first run of any workflow on the pushed sha before it returns. `cancel_prior_runs` starts only after that return.
 
 Main publication uses the [shared lock's shell entry](repair-rounds.md#shared-main-push-lock).
-The hold covers publication checks and push.
+The hold covers publication checks, the push and the post-push hook that `land_main.py` runs.
 Validation runs before it.
-Hooks, CI discovery, and cancellation run after it.
+CI discovery and cancellation run after it.
 A child of a checkpoint uses the inherited hold for the same repository.
 Other branches take no main push lock.
 
@@ -57,7 +57,7 @@ Output lines:
 ### Exit status
 
 - `cancel_prior_runs` returns 0 on every path, so the script exits with `push_direct.sh`'s status.
-- When the post-push hook fails, `push_direct.sh` still prints the handoff and exits with the hook's status. The runs are still cancelled and the script still fails.
+- A post-push hook failure does not fail the push. `land_main.py` prints the failure and its rerun command, and `push_direct.sh` prints the handoff and exits 0. The runs are still cancelled.
 - After a failed `git push`, the function still runs. An unpushed sha has no run, so it prints the `no run` line and cancels nothing.
 
 ### The showrunner rule
@@ -71,7 +71,8 @@ Run `bash scripts/validate_and_push/test_cancel_prior.sh`. It exits 0 when all n
 - **Setup.** It copies `validate_and_push.sh` and `push_direct.sh` into a `mktemp -d` directory, which is removed on exit. Three stub scripts sit beside the copies:
   - `run_validation.sh` does nothing.
   - `choose_push_path.sh` prints `{"push_path":"direct"}`.
-  - `post_push_hook.sh` exits with `$HOOK_EXIT_STATUS`.
+  - `lib/py` runs its script with bash, and `lib/main_push_lock.py` runs its command.
+  - `lib/land_main.py` pushes the branch and reports a hook result from `$HOOK_EXIT_STATUS`.
 - **Command stubs.** Stub `git`, `gh` and `sleep` come first on `PATH`.
   - `git` and `gh` write each call, `%q`-quoted, to `$GIT_CALLS` and `$GH_CALLS`, and fail on any call they do not expect.
   - `sleep` does nothing, so `push_direct.sh`'s 120 s wait returns at once.
@@ -92,12 +93,12 @@ Run `bash scripts/validate_and_push/test_cancel_prior.sh`. It exits 0 when all n
   - A failed cancel moves on to the next run.
   - A failed successor query prints a warning and cancels nothing.
   - A failed `queued` query still cancels 103.
-  - A hook failure on each push path keeps its exit status (7 and 9) and still cancels.
+  - A hook failure on each push path (`HOOK_EXIT_STATUS` 7 and 9) prints its failure line and rerun line, exits 0, and still cancels.
   - A missing successor run prints its line and makes no `--workflow` query.
 
 ## Invariants
 
-- **A synced PR path retries an unfinished post-push hook.** `push_pr_branch_and_merge.sh` fetches and fast-forwards the default branch before retrying its hook with the remote tip as `LANDED_SHA`. After success it saves that SHA in the Git directory's `post-push-completed` file. A rerun skips the completed SHA; a failed hook saves no completion, and a new landed SHA runs the hook again. A stop after hook success but before the completion record causes another run for that SHA: hooks have an at-least-once contract and must be safe to repeat. A failed fast-forward runs no hook.
+- **A synced PR path retries an unfinished post-push hook.** `push_pr_branch_and_merge.sh` fetches and fast-forwards the default branch, then calls `land_main.py` with the new HEAD. `land_main.py` finds the commit already landed and runs the hook with that commit as `LANDED_SHA`. After success it saves the commit in `post-push-completed` in the git common directory. A rerun skips the completed commit. A failed hook saves no record, so the next landing runs the hook again. A stop after hook success but before the record causes another run for that commit: hooks run at least once and must be safe to repeat. A failed fast-forward runs no hook.
 - **Interrupted autofixes can finish only their own commit.** `validate_ci.sh` saves HEAD before an autofix, then records the complete fixed tree before committing. It computes that tree through a copy of the real index with repository hooks disabled, leaving the real index untouched. A dirty rerun with the same HEAD finishes the commit only if its complete tree matches the saved tree, including force-added ignored paths. Different output is refused with the paths outside that output. Unrecorded formatter output is preserved and refused with the paths and instructions to inspect `git diff`, then discard with `git checkout -- <paths>` and rerun, or commit the changes yourself. A clean rerun runs the formatter again. Each completed fix removes the state file. Unowned dirty work is still refused.
 
 - **Tests never touch real GitHub.** They stub `gh` and `git` and run throwaway copies, so they never push. A new `gh` or `git` call in either script needs a stub branch, because the stubs reject any call they do not expect.

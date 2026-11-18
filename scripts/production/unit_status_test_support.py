@@ -1,6 +1,8 @@
 """Seeded unit-status shell fixtures with static fake-host responses."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_runtime
+
 from scripts.agents import remote
 
 from scripts.production.fake_unit_host import labeled as labeled_host
@@ -27,6 +29,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import (
     fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
 )
+from scripts.production.unit_status import StatusBlock, status_blocks
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit
 from scripts.message.sessions import SessionRecord
@@ -113,6 +116,7 @@ class UnitStatusFixture(unittest.TestCase):
         for name in ("sessions",):
             (root / name).mkdir()
         _ = (root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
+        copy_runtime(root)
         _ = shutil.copytree(root, cls.fixture_seed)
         shutil.rmtree(root)
 
@@ -252,3 +256,15 @@ class UnitStatusFixture(unittest.TestCase):
         """One unit's status text, from its `== unit` line to the next unit; units print in staff row order."""
         self.assertIn(f"\n== {unit}\n", output)
         return f"== {unit}" + ("\n" + output.partition(f"\n== {unit}\n")[2]).partition("\n== ")[0]
+
+    def status_block(self, output: str, unit: str, units: tuple[str, ...]) -> StatusBlock:
+        """The parsed block of one unit; units print in staff row order."""
+        blocks = [block for block in self.parse_status(output, units) if block.session == unit]
+        self.assertEqual(len(blocks), 1, output)
+        return blocks[0]
+
+    def parse_status(self, output: str, units: tuple[str, ...] = ("hook",)) -> tuple[StatusBlock, ...]:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "status.txt"
+            _ = path.write_text(output, encoding="utf-8")
+            return status_blocks(path, units)

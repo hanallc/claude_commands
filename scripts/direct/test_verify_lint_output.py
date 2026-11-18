@@ -33,9 +33,9 @@ set -euo pipefail
 SANDBOX_SIGNATURE=not-a-sandbox-failure
 buildlog_step_compiles() { return 1; }
 buildlog_begin() { :; }
+buildlog_check_nested_step() { :; }
 buildlog_exec() { "$@"; }
 buildlog_finish_memory() { :; }
-nextest_share_end() { :; }
 buildlog_end() { :; }
 sweep_after_step() { :; }
 '''

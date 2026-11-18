@@ -1,6 +1,7 @@
 """Registration behavior against a private seeded fixture."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import config_environment, copy_config_fixture
 
 import json
 import io
@@ -15,22 +16,161 @@ from typing import IO, cast, final, override
 from unittest import mock
 
 from scripts.production import session_staff, staff, showrunners
+from scripts.production.production_doc import read_production
 from scripts.agents import shutdown
 from scripts.agents import remote
 from scripts.production.rename_test_support import RenameDisplays
 from scripts.production.cli_fixture import production_paths
 from scripts.production.staff_test_support import fixture_member, showrunner_relationship
-from scripts.production.update_registration_test_support import RegistrationFixture, review, dailies_render, registration
+from scripts.production.update_registration_test_support import RegistrationFixture, review, registration
 
 from scripts.production import footer_counts
 from scripts.production import next_item
 from scripts.production import tidy_wrapped
 from scripts.hooks import showrunner_footer
+from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import fixture_runtime_id
+from scripts.review_links import change_browser, change_page
+from scripts.statusline import counts_row
+from scripts.lib import urgency
+from scripts.lint.memory_test_support import write_config_fixture
 
+
+class ProducerQuestionTests(RegistrationFixture):
+    producer: staff.StaffRow = staff.StaffRow(staff.StaffId(""), "producer", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.producer = fixture_member("producer", name="dwight")
+        listing = self.root / "reviews/change-review - example.md"
+        _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
+        config = self.root / "config"
+        _ = copy_config_fixture(Path(__file__).parents[2] / 'config', config)
+        settings = config / "review_links.conf"
+        _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\n")
+        self.env.update({"CLAUDE_CODE_SESSION_ID": self.producer.current_session, "CODEX_THREAD_ID": "",
+                         "CHANGE_REVIEW_DIR": str(self.root / "reviews"), "REVIEW_LINKS_ROOT": str(self.root / "links"),
+                         "CONF_DIR": str(config)})
+        self.enterContext(mock.patch.dict(os.environ, self.env))
+
+    def file_question(self, title: str = "Choose the next project") -> None:
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(title + "?")):
+            result = invoke_cli(registration, registration.main, ["ask", "--text", title, "--ask", title + "?"],
+                                self.env, self.checkout, production_state=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_producers_file_reviewed_questions_without_a_production(self) -> None:
+        for name in ("dwight", "morty", "brain"):
+            with self.subTest(name=name):
+                self.producer = fixture_member("producer", name=name)
+                self.env.update({"CLAUDE_CODE_SESSION_ID": "" if name == "brain" else self.producer.current_session,
+                                 "CODEX_THREAD_ID": self.producer.current_session if name == "brain" else ""})
+                self.file_question(name)
+                identities = registration.QuestionStaff.read()
+                records = registration.question_records_for_document(self.producer, identities)
+                self.assertEqual(len(records), 1)
+                question = records[0]
+                self.assertEqual((question.owner, question.asker), (self.producer.id, self.producer.id))
+                self.assertEqual(question.path.parent, self.state / "showrunner" / self.producer.id / "questions")
+                self.assertEqual(question.item.get("reviewed"), name + "?")
+                self.assertFalse(list((self.root / "issues").glob("question-*.md")))
+
+    def test_producer_questions_use_the_existing_review_and_caller_rules(self) -> None:
+        held = review.QuestionAwaitingFacts("Which project?", ("Give the project names.",))
+        with mock.patch.object(review, "review_question", return_value=held):
+            result = invoke_cli(registration, registration.main, ["ask", "--ask", "Which project?"],
+                                self.env, self.checkout, production_state=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("question held for review", result.stdout)
+        self.assertFalse(list((self.state / "showrunner" / self.producer.id).glob("questions/*.md")))
+        for kind in ("showrunner", "unit"):
+            member = next(row for row in staff.snapshot().rows if row.kind == kind)
+            environment = {**self.env, "CLAUDE_CODE_SESSION_ID": member.current_session}
+            with mock.patch.object(review, "review_question", side_effect=AssertionError("No review without an owner")):
+                result = invoke_cli(registration, registration.main, ["ask", "--ask", "Which project?"],
+                                    environment, self.checkout, production_state=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("pass --unit", result.stdout)
+
+    def test_the_producer_page_count_and_next_share_the_question_store(self) -> None:
+        self.file_question()
+        status = change_page.DeliveryStatus(self.root / "links")
+        browser = change_page.ReviewBrowser("producer-test", kind="questions")
+        prepared = change_browser.prepare(browser, status)
+        self.assertEqual([question.tab for question in prepared.questions], ["dwight"])
+        body = change_browser.render(browser, status).decode()
+        self.assertIn('data-tab="dwight"', body)
+        self.assertIn('value="dwight">dwight (1)</option>', body)
+        self.assertIn('name="outcome" value="answer"', body)
+        self.assertNotIn("No showrunner owns this question.", body)
+        instance = self.state / "notifier" / f"showrunner-{self.producer.id}"
+        sources: list[Path] = []
+        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("Review: 1 question", ""))
+        question = prepared.questions[0].record
+        self.assertIn(question.path, sources)
+        self.assertIn("Choose the next project?", next_item.show("question", urgency.URGENT, None))
+        _ = staff.rename(self.producer.id, "renamed-dwight")
+        self.assertEqual([question.tab for question in change_browser.prepare(browser, status).questions], ["renamed-dwight"])
+
+    def test_producer_answers_retry_the_current_session_and_recover_after_restart(self) -> None:
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery):
+                title = f"Project choice {recovery}"
+                self.file_question(title)
+                status = change_page.DeliveryStatus(self.root / "links")
+                browser = change_page.ReviewBrowser("producer-test", kind="questions")
+                question = next(item for item in change_browser.prepare(browser, status).questions if item.record.item["text"] == title)
+                delivery, answer = change_browser.submit_question(question, "answer", "Choose the first project.", status)
+                self.assertEqual(answer, "Choose the first project.")
+                current = staff.by_id(self.producer.id)
+                assert current is not None
+                replacement = staff.StaffId(fixture_runtime_id(f"producer-answer-{recovery}"))
+                _ = staff.update_current_session(current.current_session, replacement)
+                self.env["CLAUDE_CODE_SESSION_ID"] = replacement
+                calls: list[tuple[str, str]] = []
+
+                def sender(recipient: str, name: str, message: str) -> None:
+                    del name
+                    calls.append((recipient, message))
+                    if len(calls) == 1:
+                        raise RuntimeError("fixture sender unavailable")
+
+                with mock.patch.object(change_page, "send_message", side_effect=sender):
+                    if recovery:
+                        change_page.recover_question_answers(change_page.DeliveryStatus(self.root / "links"))
+                    else:
+                        change_page.deliver(delivery, status)
+                self.assertEqual([recipient for recipient, _ in calls], [f"session:{replacement}"] * 2)
+                self.assertTrue(all("Choose the first project." in message for _, message in calls))
+                self.assertEqual(status.slots(delivery.page, delivery.row).intents(), ())
+                self.assertEqual(registration.question_records_for_document(self.producer, registration.QuestionStaff.read())[-1].status,
+                                 "closed")
+
+    def test_producer_delivery_exhaustion_uses_the_existing_alert(self) -> None:
+        self.file_question()
+        status = change_page.DeliveryStatus(self.root / "links")
+        browser = change_page.ReviewBrowser("producer-test", kind="questions")
+        question = change_browser.prepare(browser, status).questions[0]
+        delivery, _ = change_browser.submit_question(question, "answer", "Choose the first project.", status)
+        calls: list[str] = []
+
+        def sender(recipient: str, name: str, message: str) -> None:
+            del name
+            self.assertEqual(recipient, f"session:{self.producer.current_session}")
+            calls.append(message)
+            if "delivery needs attention" not in message:
+                raise RuntimeError("fixture sender unavailable")
+
+        with mock.patch.object(change_page, "send_message", side_effect=sender):
+            change_page.deliver(delivery, status)
+        self.assertEqual(len(calls), 4)
+        self.assertIn("Tries: 3", calls[-1])
+        self.assertIn("Choose the first project.", calls[-1])
 
 
 class RegistrationTests(RegistrationFixture):
-    def test_unreadable_timer_reports_and_continues_prompt_adoption(self) -> None:
+    def test_unreadable_timer_reports_without_rewriting_a_legacy_prompt(self) -> None:
         timer = self.state / "notifier" / f"showrunner-{self.owner_id}"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_bytes(b"TARGET=\xff\n")
@@ -46,8 +186,8 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("timer configuration unreadable", result.stderr)
         self.assertIn("decode", result.stderr)
-        self.assertIn(f"rewrote {prompt} from produce.md", result.stdout)
-        self.assertIn(str(self.state / "showrunner" / self.owner_id / "session"), prompt.read_text())
+        self.assertEqual(prompt.read_text(), "old prompt\n")
+        self.assertNotIn("rewrote", result.stdout)
 
     def test_start_and_resume_retarget_only_updates_and_retire_old_session(self) -> None:
         doc_bytes = self.doc.read_bytes()
@@ -58,7 +198,11 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"]]), 1)
         updates = next(call for call in initial_calls if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
         self.assertEqual(updates[updates.index("--to") + 1], f"session:{self.fixture_staff_id()}")
-        self.assertIn("next_due", first.stdout)
+        self.assertEqual(updates[updates.index("--prompt") + 1], "scheduled")
+        self.assertNotIn("--prompt-file", updates)
+        self.assertNotIn("--from", updates)
+        self.assertFalse((self.state / "showrunner" / self.owner_id / "prompt.txt").exists())
+        self.assertIn("automatic reports are off", first.stdout)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in initial_calls if call[:2] == ["new", instance]]), 1)
 
@@ -78,6 +222,53 @@ class RegistrationTests(RegistrationFixture):
                          [f"session:{self.fixture_staff_id()}"] * 3)
         for instance in ("stall-watch",):
             self.assertEqual(len([call for call in calls if call[:2] == ["new", instance]]), 1)
+
+    def test_on_demand_keeps_a_stopped_timer_as_the_showrunners_record(self) -> None:
+        first = self.run_command("register")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes", "- **Updates:** on demand"),
+                                encoding="utf-8")
+        _ = self.git("commit", "-qam", "reports on demand")
+        before = len(self.notifier_calls())
+        resumed = self.run_command("register")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} registered; automatic reports are off", resumed.stdout)
+        calls = self.notifier_calls()[before:]
+        self.assertIn(["new", f"showrunner-{self.fixture_staff_id()}"], [call[:2] for call in calls])
+        self.assertIn(["stop", f"showrunner-{self.fixture_staff_id()}"], calls)
+        self.assertNotIn(["remove", f"showrunner-{self.fixture_staff_id()}"], calls)
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
+        again = self.run_command("register")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        # A re-register retargets the timer and stops it again, so it stays stopped.
+        self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
+                         ["new", "stop", "status"])
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
+
+    def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes\n", ""), encoding="utf-8")
+        _ = self.git("commit", "-qam", "no Updates line")
+        first = self.run_command("register")
+
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn(f"register: ok — showrunner-{self.fixture_staff_id()} registered; automatic reports are off", first.stdout)
+        self.assertEqual((self.state / f"instance-showrunner-{self.fixture_staff_id()}").read_text(encoding="utf-8"), "stopped")
+        self.assertNotIn("footer", first.stdout)
+
+    def test_a_legacy_interval_keeps_the_registration_stopped(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("every 15 minutes", "every 20 minutes"), encoding="utf-8")
+        _ = self.git("commit", "-qam", "every 20 minutes")
+
+        result = self.run_command("register")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updates = next(call for call in self.notifier_calls() if call[:2] == ["new", f"showrunner-{self.fixture_staff_id()}"])
+        self.assertEqual(updates[updates.index("--every") + 1], str(registration.DEFAULT_MINUTES))
+        self.assertIn(["stop", f"showrunner-{self.fixture_staff_id()}"], self.notifier_calls())
+        self.assertIn("automatic reports are off", result.stdout)
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}
@@ -106,11 +297,19 @@ class RegistrationTests(RegistrationFixture):
                               encoding="utf-8")
         result = self.run_command("register")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("register: warn", result.stdout)
-        self.assertIn("production example has showrunner other", result.stdout)
-        self.assertIn("/agents rename example other", result.stdout)
+        self.assertNotIn("register: warn", result.stdout)
+        self.assertNotIn("production example has showrunner other", result.stdout)
+        self.assertNotIn("/agents rename example other", result.stdout)
+        with mock.patch.dict(os.environ, self.env):
+            _ = staff.rename(staff.StaffId(self.owner_id), "renamed-example")
+        renamed = self.run_command("register")
+        self.assertEqual(renamed.returncode, 0, renamed.stdout + renamed.stderr)
+        self.assertNotIn("register: warn", renamed.stdout)
+        updates = [call for call in self.notifier_calls() if call[:2] == ["new", f"showrunner-{self.owner_id}"]]
+        self.assertEqual([call[call.index("--to") + 1] for call in updates], [f"session:{self.owner_id}"] * 2)
         self.assertIn("register: ok", result.stdout)
         self.assertNotEqual(self.notifier_calls(), [])
+
 
 @final
 class QuestionIdentityTests(RegistrationFixture):
@@ -120,6 +319,8 @@ class QuestionIdentityTests(RegistrationFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.env.update(config_environment(self.root / "fixture-config"))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         self.issues = self.root / "issues"
         self.issues.mkdir(exist_ok=True)
         self.timer("example")
@@ -129,7 +330,7 @@ class QuestionIdentityTests(RegistrationFixture):
 
     def file_question(self, title: str = "Choose the layout", question: str = "Keep the layout?") -> None:
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
-            result = self.run_command("ask", "--text", title, "--question", question,
+            result = self.run_command("ask", "--text", title, "--ask", question,
                                       "--unit", "alpha")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.question_rows()
@@ -204,18 +405,18 @@ class QuestionIdentityTests(RegistrationFixture):
         self.migrate()
         with self.forbid_legacy_question_access():
             counts = footer_counts.read_counts(self.doc,
-                                                questions=len(dailies_render.read_outstanding(self.outstanding())))
+                                                questions=len(registration.read_open_items(self.outstanding())))
             sources = footer_counts.sources(self.doc)
         self.assertEqual(counts.questions, 1)
-        self.assertEqual(footer_counts.counts_line(counts), "For you: 1 question")
+        self.assertEqual(footer_counts.counts_line(counts), "Review: 1 question")
         for record in self.issues.glob("*.md"):
             self.assertIn(record, sources)
+
 
     def test_showrunner_footer_reads_migrated_records_without_the_legacy_list(self) -> None:
         self.file_question()
         self.migrate()
         production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                                                  showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
                                                   showrunners.owner_for("example"))
         with self.forbid_legacy_question_access():
             self.assertEqual(showrunner_footer.open_questions([production]), 1)
@@ -277,7 +478,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.outstanding().read_bytes(), original)
         self.migrate()
         rows = self.question_rows()
-        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id}])
+        self.assertEqual(rows, [{**legacy, "asked_by": self.asker_id, "review_id": "Q1"}])
         remaining: object = cast(object, json.loads(self.outstanding().read_text())) if self.outstanding().exists() else []
         self.assertEqual(remaining, [])
         before = self.store_snapshot()
@@ -337,7 +538,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(self.store_snapshot(), before)
 
     def test_next_keeps_local_items_when_a_remote_child_has_a_local_reminder(self) -> None:
-        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout"})
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout", "question": "Choose the layout?"})
         parent = staff.by_id(self.asker_id)
         assert parent is not None
         child = fixture_member("showrunner", name="remote-child", parent=parent.parent,
@@ -379,7 +580,7 @@ class QuestionIdentityTests(RegistrationFixture):
         from scripts.production.cli_fixture import invoke_cli
         owner = staff.by_id(self.fixture_staff_id())
         assert owner is not None
-        environment = {**self.env, "CLAUDE_CODE_SESSION_ID": owner.current_session}
+        environment = {**self.env, "CLAUDE_CODE_SESSION_ID": owner.current_session, "CODEX_THREAD_ID": ""}
         with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot,
               mock.patch.object(session_staff, "member_sources",
                                 wraps=session_staff.member_sources) as sources):
@@ -397,15 +598,14 @@ class QuestionIdentityTests(RegistrationFixture):
         _ = staff.set_doc(owner.parent.id, staff.LiveDoc("macbook", self.doc))
         with mock.patch.dict(os.environ, self.env), production_paths(self.env):
             production = showrunner_footer.Production("example", self.doc, "America/Los_Angeles",
-                            showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED,
                                                   showrunners.owner_for("example"))
             errors = io.StringIO()
             with redirect_stderr(errors):
                 self.assertEqual(showrunner_footer.open_questions([production]), 0)
             self.assertIn("questions: unavailable", errors.getvalue())
-            self.assertEqual(dailies_render.read_outstanding(self.outstanding()), [])
+            self.assertEqual(registration.read_open_items(self.outstanding()), [])
             self.assertIn(self.doc, footer_counts.sources(self.doc))
-        refused = self.run_command("ask", "--text", "Choose the compiler", "--question", "Use it?")
+        refused = self.run_command("ask", "--text", "Choose the compiler", "--ask", "Use it?")
         self.assertEqual(refused.returncode, 2)
         self.assertIn("no showrunner staff row", refused.stdout + refused.stderr)
 
@@ -431,6 +631,16 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertIn("renamed", result.stdout)
         self.assertNotIn("relay: to alpha", result.stdout)
 
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            production = read_production("example")
+            identities = registration.QuestionStaff.read()
+            asker = registration.StaffAsker(self.asker_id)
+            relay = registration.answer_relay(production, production.name, asker, identities)
+            self.assertEqual(relay.recipient, self.asker_id)
+            self.assertEqual(relay.line, registration.relay_line(production, production.name, asker, identities))
+            with self.assertRaises(registration.RegistrationFailure):
+                _ = registration.answer(production, "Choose the layout", identities=identities, only_open=True)
+
     def test_answer_resolves_the_fixed_asker_after_a_transfer(self) -> None:
         self.file_question()
         destination = fixture_member("showrunner", name="destination")
@@ -448,6 +658,31 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertIn(str(self.asker_id), references)
         self.assertIn("destination", result.stdout)
         self.assertIn("alpha", result.stdout)
+
+    def test_followup_waits_for_the_reply_and_keeps_the_exchange(self) -> None:
+        self.file_question()
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            production = read_production("example")
+            relay = registration.followup(production, "Choose the layout", "Which file holds it?")
+            self.assertEqual(relay.recipient, self.asker_id)
+            with self.assertRaises(registration.RegistrationFailure):
+                _ = registration.followup(production, "Choose the layout", "A second one")
+        waiting = self.run_command("open")
+        self.assertEqual(waiting.returncode, 0, waiting.stdout + waiting.stderr)
+        self.assertIn("waiting for the asker's reply since", waiting.stdout)
+        self.assertIn("0 due, 0 deferred, 1 waiting for a reply", waiting.stdout)
+        self.assertNotIn("Keep the layout?", self.run_command("next").stdout)
+
+        replied = self.run_command("reply", "--item", "Choose the layout", "--text", "The file is layout.toml.")
+        self.assertEqual(replied.returncode, 0, replied.stdout + replied.stderr)
+        self.assertIn("reply: ok", replied.stdout)
+        again = self.run_command("reply", "--item", "Choose the layout", "--text", "Again")
+        self.assertNotEqual(again.returncode, 0)
+        listed = self.run_command("open")
+        self.assertIn("1 due, 0 deferred", listed.stdout)
+        self.assertIn("Follow-up: Which file holds it?\nReply: The file is layout.toml.", listed.stdout)
+        self.assertEqual(self.question_rows()[-1].get("followups"),
+                         [{"followup": "Which file holds it?", "reply": "The file is layout.toml."}])
 
     def test_reminder_replacement_and_answer_preserve_the_filed_question(self) -> None:
         self.file_question()
@@ -476,7 +711,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn("Keep the layout?", first.stdout)
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Ship the release?")):
-            filed = self.run_command("ask", "--text", "Choose the release", "--question", "Ship the release?",
+            filed = self.run_command("ask", "--text", "Choose the release", "--ask", "Ship the release?",
                                      "--unit", "alpha", "--urgency", "user")
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         repeated = self.run_command("next")
@@ -542,14 +777,14 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_question_review_and_defer_keep_the_fixed_asker(self) -> None:
         held = review.QuestionAwaitingFacts("Keep the layout?", ("Which layout?",))
         with mock.patch.object(review, "review_question", return_value=held):
-            result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
+            result = self.run_command("ask", "--text", "Choose the layout", "--ask", "Keep the layout?",
                                       "--unit", "alpha")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("Which layout?", result.stdout + result.stderr)
         self.assertEqual(list(self.issues.glob("*.md")), [])
         with mock.patch.object(review, "review_question",
                                return_value=review.QuestionReviewUnavailable("Keep the layout?", "fixture timeout")):
-            filed = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
+            filed = self.run_command("ask", "--text", "Choose the layout", "--ask", "Keep the layout?",
                                      "--unit", "alpha")
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         state = self.question_state([{"text": "Choose the layout", "after": "2099-01-02T08:00"}])

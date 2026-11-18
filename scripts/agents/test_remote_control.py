@@ -1,4 +1,4 @@
-"""Remote Control repair uses only a proven idle session's own pane."""
+"""Remote Control repair uses only the own pane of a proven session at its prompt."""
 from __future__ import annotations
 
 import io
@@ -56,7 +56,7 @@ class RegistryFixture(TypedDict):
     updatedAt: int
     tmux: str
     formerNames: list[str]
-    status: Literal["idle", "busy"]
+    status: Literal["idle", "shell", "busy"]
     bridgeSessionId: str
 
 
@@ -109,7 +109,7 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(target, "owner")
         self.assertEqual(place, self.place)
         current = cast(dict[str, object], json.loads((self.registry / "321.json").read_text()))
-        self.assertEqual(current["status"], "idle", "busy registry must never authorize input")
+        self.assertIn(current["status"], ("idle", "shell"), "busy registry must never authorize input")
         self.assertEqual(current["procStart"], "original", "replacement must never receive input")
         self.typed.append((self.clock.at, text))
 
@@ -220,6 +220,20 @@ class RemoteControlTests(ShutdownTestCase):
         outcome, _text, pushes = self.run_fix()
         self.assertIsInstance(outcome, remote_control.TurnedOn)
         self.assertEqual(self.typed, [(75.0, "/remote-control")])
+        self.assertEqual(pushes, [])
+
+    def test_session_holding_a_background_command_gets_the_repair(self) -> None:
+        self.fields["status"] = "shell"
+        self.write()
+        def turn_on(at: float) -> None:
+            del at
+            if self.typed:
+                self.fields["bridgeSessionId"] = "bridge"
+                self.write()
+        self.clock.tick = turn_on
+        outcome, _text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.TurnedOn)
+        self.assertEqual(self.typed, [(60.0, "/remote-control")])
         self.assertEqual(pushes, [])
 
     def test_three_unsuccessful_attempts_only_journal_after_last_confirmation_wait(self) -> None:

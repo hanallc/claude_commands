@@ -1,6 +1,6 @@
 # Duties and names in the development process
 
-> **Status: RECORD — frozen.** This doc records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states what is true now. The baselines, change-file lists and step logs below name files as they stood when measured. `codex_mesh.py`, `mesh_runs.py` and the review pool are removed. Those tables do not say that the files exist now.
+> **Status: RECORD — frozen.** This document records how the duty and name answers were reached. `docs/as-built/roles-and-names.md` states the current facts. The baselines, change-file lists and step logs record their dated source trees. Commit `ce529466f` removed `codex_mesh.py` and `mesh_runs.py` on 2026-11-08. The review pool is also removed. The historical tables do not request edits to removed files.
 
 Scope: duties and names as `docs/as-built/roles-and-names.md` records them. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
 
@@ -797,9 +797,14 @@ The worker finding is a false duplicate, not a removal target. `docs/as-built/se
 
 ### Reporting default and duty-source measurement (former Step 6)
 
-O20-A is recommended; O20-B is the setup/runtime alternative. Ask the user about the source resolution and P-A before changing it. The checked sources are `docs/production_format.md:100–103` (on demand when absent), `commands/showrunner/produce.md:393–394` (15 minutes when absent), `commands/showrunner/produce.md:412–418` (timer creation/stop, already agrees), and `commands/producer/to_production.md:118` (every 15 minutes, contrary to PF). Correct the producer line and SR's introductory absent-default clause against PF. Keep SR's actual setup/stop behavior; it is in the checked acceptance set, not a policy conflict to remove.
-
-Before dispatch, add a typed duty-source measure proposal using `scripts/production/role_terms.toml`, `scripts/production/roles_audit.py` and `scripts/production/test_roles_audit.py`, recording every cited clause, owner and reference. The current baseline does not count D20's source clauses. Print that new before set before fixing a numeric target. The later acceptance set must cover every source clause for agreement with the approved runtime owner and on-demand default, with no clause dropped. A matrix relabel is not a measure. Undo restores the source clauses and registry together and starts no timer.
+2026-11-11: Dailies and their schedule command were retired.
+Remove their setup/runtime source comparison from the pending work.
+Use `/showrunner:units` for unit status on request.
+Keep the historical duty-source counts above as the record of the earlier review.
+For remaining duty-source work, record each cited clause, owner, and reference through the existing role-term audit.
+Print the measured source set before selecting a numeric target.
+Check each retained clause against its approved owner.
+Undo restores the source clauses and registry without starting a timer.
 
 ### Account-move readiness (former Step 7)
 
