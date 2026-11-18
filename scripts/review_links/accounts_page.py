@@ -186,8 +186,10 @@ def board(reading: accounts.StatusReading) -> str:
         if key not in ("account", "left", "role", "busy"):
             return f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
         direction = "ascending" if key == "account" else "none"
-        return (f'<th class="{column["align"]}" data-account-sort="{key}" tabindex="0" aria-sort="{direction}">'
-                + f'{html.escape(column["heading"])}<span class="sort-arrow" aria-hidden="true">▲</span></th>')
+        label = html.escape(column["heading"])
+        arrow = '<span class="sort-arrow" aria-hidden="true">▲</span>'
+        content = arrow + label if column["align"] == "right" else label + arrow
+        return f'<th class="{column["align"]}" data-account-sort="{key}" tabindex="0" aria-sort="{direction}">{content}</th>'
     head = "".join(heading(column)
                    + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "")
                    + ('<th class="left">next</th>' if column["key"] == "roles" else "") for column in table["columns"])
@@ -252,6 +254,7 @@ th,td{padding:5px 0 5px 18px;white-space:nowrap}th:first-child,td:first-child{pa
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
 th[data-account-sort]{cursor:pointer}th[data-account-sort]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 .sort-arrow{display:inline-block;width:1em;margin-left:.25em;text-align:center;visibility:hidden}
+th.right .sort-arrow{margin-left:0;margin-right:.25em}
 th[aria-sort=ascending] .sort-arrow,th[aria-sort=descending] .sort-arrow{visibility:visible}
 .left{text-align:left}.right{text-align:right}
 tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}

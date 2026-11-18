@@ -235,13 +235,13 @@ class AccountsPageTests(unittest.TestCase):
         self.assertIn('<thead><tr><th class="left"></th>'
                       + '<th class="left" data-account-sort="account" tabindex="0" aria-sort="ascending">account'
                       + '<span class="sort-arrow" aria-hidden="true">▲</span></th><th class="left"></th>'
-                      + '<th class="right" data-account-sort="left" tabindex="0" aria-sort="none">left'
-                      + '<span class="sort-arrow" aria-hidden="true">▲</span></th>'
+                      + '<th class="right" data-account-sort="left" tabindex="0" aria-sort="none">'
+                      + '<span class="sort-arrow" aria-hidden="true">▲</span>left</th>'
                       + '<th class="left" data-account-sort="role" tabindex="0" aria-sort="none">role'
                       + '<span class="sort-arrow" aria-hidden="true">▲</span></th><th class="left"></th>'
                       + '<th class="left">next</th>'
-                      + '<th class="right" data-account-sort="busy" tabindex="0" aria-sort="none">busy'
-                      + '<span class="sort-arrow" aria-hidden="true">▲</span></th>', markup)
+                      + '<th class="right" data-account-sort="busy" tabindex="0" aria-sort="none">'
+                      + '<span class="sort-arrow" aria-hidden="true">▲</span>busy</th>', markup)
         self.assertNotIn(">Color<", markup)
         self.assertEqual(markup.count('<tr class="account">'), 2)
         self.assertEqual(markup.count("<tr>"), 1)
@@ -332,6 +332,26 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const header=key=>document.querySelector('[data-account-sort="'+key+'"]');
+ const bounds=node=>{
+  const range=document.createRange();
+  range.selectNodeContents(node);
+  return range.getBoundingClientRect();
+ };
+ const checkAlignment=(key,direction)=>{
+  const cell=header(key),arrow=cell.querySelector('.sort-arrow');
+  const label=[...cell.childNodes].find(node=>node.nodeType===Node.TEXT_NODE);
+  const value=[...document.querySelector('tbody').rows].slice(0,-1)
+   .map(row=>row.cells[cell.cellIndex]).find(candidate=>candidate.textContent.trim());
+  const name=key+' '+direction;
+  const text=bounds(label);
+  check(Math.abs(text.right-bounds(value).right)<=1,name+': the header and value end at the same edge');
+  check(cell.getAttribute('aria-sort')===direction,name+': the header has the expected sort state');
+  check(getComputedStyle(arrow).visibility===(direction==='none' ? 'hidden' : 'visible'),name+': the arrow visibility matches the sort state');
+  if(direction!=='none'){
+   const icon=arrow.getBoundingClientRect();
+   check(icon.left>=cell.getBoundingClientRect().left && icon.right<text.left,name+': the arrow fits before the text');
+  }
+ };
  const keys=()=>{let account='';return [...document.querySelector('tbody').rows].slice(0,-1).map(row=>{
   account=row.cells[1].textContent || account;return account+':'+row.cells[4].textContent.replace(' ✓','');
  });};
@@ -348,6 +368,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
     'columns keep their positions: '+label);
   };
   check(original[0]==='claude1:units' && original[1]==='claude1:workers','the default account order');
+  for(const key of ['left','busy']) checkAlignment(key,'none');
   check(document.querySelectorAll('[data-account-sort]').length===4,'only four headers sort');
   check([...document.querySelectorAll('[data-account-sort]')].every(node=>node.tabIndex===0 && getComputedStyle(node).cursor==='pointer'),
    'the sort headers support focus and show a pointer');
@@ -355,7 +376,9 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   check(header('account').getAttribute('aria-sort')==='descending','the account arrow reverses');
   click('account');same([0,1,2,3,4,5,6],'account ascending');
   click('left');same([5,0,1,2,3,4,6],'left ascending');
+  checkAlignment('left','ascending');
   click('left');same([3,2,1,0,5,6,4],'left descending');
+  checkAlignment('left','descending');
   header('role').focus();header('role').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
   same([3,5,2,6,0,1,4],'Enter selects role ascending');
   const roleRows=[...document.querySelector('tbody').rows];
@@ -365,9 +388,11 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
    'a consecutive account run shows details once');
   click('role');same([1,0,6,2,5,3,4],'role descending');
   click('busy');same([0,2,3,1,5,4,6],'busy descending');
+  checkAlignment('busy','descending');
   check(header('busy').getAttribute('aria-sort')==='descending' && header('busy').querySelector('.sort-arrow').textContent==='▼',
    'busy starts with the descending arrow');
   click('busy');same([5,1,2,3,0,6,4],'busy ascending');
+  checkAlignment('busy','ascending');
   check(JSON.parse(localStorage.getItem('accounts-sort')).reverse===true,'the choice enters viewer storage');
   const oldTable=document.querySelector('table');
   document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
