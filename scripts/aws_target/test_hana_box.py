@@ -548,9 +548,23 @@ class HanaBoxTests(CostFixture):
         starts = len(self.provider.starts)
         _ = self.tick()
         self.assertEqual(len(self.provider.starts), starts)
+        interrupted = self.controller.path.read_text()
         self.provider.cause = hana_box.StopCause.UNKNOWN
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        unknown = self.controller.path.read_text()
+        for state, cause, record in (
+                (hana_box.Lifecycle.INTERRUPTED, hana_box.StopCause.INTERRUPTION, interrupted),
+                (hana_box.Lifecycle.STOPPED_UNKNOWN, hana_box.StopCause.UNKNOWN, unknown)):
+            with self.subTest(state=state):
+                _ = self.controller.path.write_text(record)
+                self.provider.cause = cause
+                self.assertEqual(ledger.rows(self.record(), 'claims')[0]['execution'], 'execution-one')
+                with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+                    self.assertEqual(self.tick(), state)
+                self.assertEqual(self.record()['claims'], [])
+                self.assertEqual(self.record()['reason'], 'The Hana start owner exited')
+                self.assertEqual(len(self.provider.starts), starts)
 
     def test_interruption_during_idle_stop_forbids_a_manual_restart(self) -> None:
         self.ready()
