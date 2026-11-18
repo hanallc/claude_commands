@@ -219,16 +219,15 @@ If a timing write fails, `up` prints a warning and continues.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
 
-An unchanged regional request still calls `cloudformation deploy`.
-The AWS CLI creates a change set and waits for its result before it detects an empty change set.
-`--no-fail-on-empty-changeset` controls the exit status; it does not skip this work.
-The deployment wrapper captures the AWS CLI output.
-The regional progress lines therefore show work that was previously silent.
-The regional template has no generated timestamp or UserData.
-The recorded Nix revision belongs to the deployment manifest, not the regional template.
-Local templates alone cannot prove whether AWS created resources, updated resources, or returned an empty change set.
-A future optimization could compare the live template and effective parameters before deployment.
-It must also check the stack status before it skips deployment.
+`up` always runs the home stack update and checks each regional stack.
+It skips regional deployment when the template, stack name, and parameters match the last successful deployment.
+The live stack ID and last update time must also match the saved values.
+The live status must be `CREATE_COMPLETE` or `UPDATE_COMPLETE`.
+The output reports the skip and measures the region's elapsed time.
+The first run without saved digests deploys every region and saves each digest after success.
+An unreadable or invalid `regional-stack-digests.json` produces one warning and deploys every region.
+CloudFormation deployment can take several minutes per changed region.
+For a home-only change, regional time goes to network and image preparation and stack status checks.
 
 ## Foundation maintenance
 
