@@ -23,6 +23,10 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        fixed = " ".join(f"{name}={value}" for name, value in FIXED_ENVIRONMENT.items())
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf",
+                                 f"VERIFY_TEST_FIXED_ENV={fixed}\nVERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR RUST_LOG\n"
+                                 + "VERIFY_RESULT_ENV_PREFIXES=\n")
         for name in ("NO_COLOR", "CLICOLOR"):
             _ = self.environment.pop(name, None)
         cargo = CARGO_STUB.replace(

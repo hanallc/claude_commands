@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 import sys
 import tempfile
 from typing import cast, override
 import unittest
 from unittest.mock import patch
+
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/lib/nix_env.py"
@@ -47,7 +48,9 @@ class NixFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         configuration = self.root / "settings"
-        _ = shutil.copytree(ROOT / "config", configuration)
+        _ = copy_config_fixture(ROOT / "config", configuration)
+        _ = write_config_fixture(configuration / "nix_env.conf",
+                                 "trusted_home_folders=rust worktrees\ntrusted_home_prefix=.claude\n")
         self.env = {"CONF_DIR": str(configuration), "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
                     "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CONFIG_HOME": str(self.root / "config"),

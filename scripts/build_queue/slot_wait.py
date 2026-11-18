@@ -36,19 +36,21 @@ def read_pool(repository: str, machine: str, root: Path, locks: str) -> wire.Rep
 
 
 def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, episode: str,
-                  since: float, showrunner: str, unit: str, work: str, purpose: str) -> None:
+                  since: float, showrunner: str, unit: str, work: str, purpose: str,
+                  expires_at: float | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> None:
     """Block on one queue connection; retain episode and since after a lost race."""
     from scripts.build_queue import admission_client as client, admission_records as records
     from scripts.build_queue import admission_protocol as wire
 
     seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
+    deadline = since + seconds if isinstance(expires_at, conf.UseConfiguredValue) else expires_at
     start = records.process_start_time(os.getpid())
     if start is None:
         raise RuntimeError("the slot waiter has no process identity")
     identity = wire.Identity(os.environ.get("CLAUDE_CODE_SESSION_ID", "") or os.environ.get("CODEX_THREAD_ID", ""),
                              showrunner, purpose, work, unit)
     request = wire.RepositorySlotRequest(episode, wire.Owner(os.getpid(), start), since,
-        repository, machine, str(root), maximum, since + seconds, identity)
+        repository, machine, str(root), maximum, deadline, identity)
     reply = client.repository_slot(request)
     if isinstance(reply, wire.RepositorySlotExpired):
         raise SlotWaitExpired(reply.reason)

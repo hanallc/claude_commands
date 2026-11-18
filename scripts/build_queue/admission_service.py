@@ -1995,7 +1995,9 @@ class AdmissionServer:
                     self._prune_places()
             self.persist()
             (self.state_dir / "queue.json").unlink(missing_ok=True)
-            for waiting in self.waiters.values():
+            for episode, waiting in tuple(self.waiters.items()):
+                if self.waiters.get(episode) is not waiting:
+                    continue
                 self._deliver(waiting, wire.Refused(self.configuration.reason))
                 if isinstance(waiting.connection, Connection):
                     if self._detach_admission(waiting.connection):
@@ -2030,7 +2032,9 @@ class AdmissionServer:
                         key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
         for decision in starts:
             episode = by_owner[decision.owner]
-            waiting = self.waiters[episode]
+            waiting = self.waiters.get(episode)
+            if waiting is None:
+                continue
             placement_request = self.placement_requests.get(episode)
             if placement_request is not None:
                 candidate = next(candidate for candidate in self.placement_eligibility[episode]
@@ -2098,6 +2102,8 @@ class AdmissionServer:
         started = False
         position = 0
         for waiting in waiting_cloud:
+            if self.waiters.get(waiting.request.episode) is not waiting:
+                continue
             if used < slots:
                 self._admit(waiting, config, configuration.peak_history_share_percent)
                 used += 1
@@ -3031,11 +3037,14 @@ done
             if submitted is not None and (submitted.episode in self.current_assignments
                     or self._placement_waiting(submitted)):
                 _ = self._request_host_evidence(submitted, saved.assignment.destination)
-        for request in self.placement_requests.values():
+        for request in tuple(self.placement_requests.values()):
+            if self.placement_requests.get(request.episode) is not request:
+                continue
             saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
             if (not self._placement_owner_live(request.owner) and saved is not None
                     and isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved)):
                 self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
+                continue
             if not self._placement_waiting(request):
                 continue
             candidates, local_holder = self._candidate_eligibility(request)

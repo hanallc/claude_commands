@@ -4316,6 +4316,25 @@ class StatusRow:
 
 
 @dataclass(frozen=True)
+class FirstNextMoveTargets:
+    """Each group maps to its first queued target; an absent group has no entry."""
+    targets: dict[next_moves.NextMoveGroup, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NextMovesUnavailable:
+    """The local first targets could not be read."""
+    reason: str = "Next moves have not been read."
+
+
+@dataclass(frozen=True)
+class UpcomingMoves:
+    """One read supplies the upcoming list and the first targets."""
+    lines: tuple[str, ...]
+    first: FirstNextMoveTargets | NextMovesUnavailable
+
+
+@dataclass(frozen=True)
 class StatusReading:
     rows: tuple[StatusRow, ...]
     notes: tuple[str, ...]
@@ -4325,6 +4344,7 @@ class StatusReading:
     represented_stderr: tuple[str, ...] = ()
     session_inputs: tuple[str, ...] = ()
     upcoming_moves: tuple[str, ...] = ()
+    first_next_moves: FirstNextMoveTargets | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
 
 
 class StatusAccountDocument(TypedDict):
@@ -4498,6 +4518,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
 
 
 COUNT_COLUMNS = ("busy", "idle", "paused", "exited", "total")
+ACCOUNT_ROLE_ORDER = ("units", "showrunners", "workers", "producers", "spare", "")
 BOARD_COLUMNS: tuple[BoardColumn, ...] = (
     BoardColumn(key="dot", heading="", align="left"), BoardColumn(key="label", heading="account", align="left"),
     BoardColumn(key="left", heading="left", align="right"), BoardColumn(key="roles", heading="role", align="left"),
@@ -4551,7 +4572,29 @@ def account_color(value: str) -> AccountColor | NoAccountColor:
 
 
 # The statusline.conf key that colors each account role group's labels.
-ROLE_COLOR_KEYS = {"units": "role.unit-director", "showrunners": "role.showrunner", "workers": "role.worker"}
+ROLE_COLOR_KEYS = {"units": "role.unit-director", "showrunners": "role.showrunner", "workers": "role.worker",
+                   "producers": "role.producer"}
+
+
+@dataclass(frozen=True)
+class StaffRoleColor:
+    """The configured key and valid CSS color for a staff role."""
+
+    key: str
+    css: str
+
+
+def role_colors() -> dict[str, str]:
+    """Read the same current color settings as the Accounts board."""
+    return conf.read_or_repository("statusline").values()
+
+
+def staff_role_color(member: staff.StaffRow, colors: Mapping[str, str]) -> StaffRoleColor | NoAccountColor:
+    """Resolve the staff kind through the Accounts role keys and color parser."""
+    group = "units" if member.kind == "unit" else member.kind + "s"
+    key = ROLE_COLOR_KEYS[group]
+    color = account_color(colors.get(key, ""))
+    return StaffRoleColor(key, color.css) if isinstance(color, AccountColor) else NoAccountColor()
 
 
 def _colored_span(text: str, key: str, colors: dict[str, str], kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
@@ -4610,14 +4653,14 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     dot: BoardTone = "success" if _read_ok(row, reading, account_config=account_config) else "error"
     roles = list(row.roles) or [""]
     lines: list[BoardRow] = []
-    for index, role in enumerate(roles):
-        first = index == 0
+    for index, role in sorted(enumerate(roles), key=lambda item: (
+            ACCOUNT_ROLE_ORDER.index(item[1]) if item[1] in ACCOUNT_ROLE_ORDER else len(ACCOUNT_ROLE_ORDER))):
         counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
-        cells = {"dot": [_span("●", dot)] if first else [], "label": [_account_label(row.label, colors)] if first else [],
-                 "left": [_span(left, tone)] if first else [], "roles": _role_spans(role, role in row.selected_roles, colors),
+        cells = {"dot": [_span("●", dot)], "label": [_account_label(row.label, colors)],
+                 "left": [_span(left, tone)], "roles": _role_spans(role, role in row.selected_roles, colors),
                  **{key: [_span(value)] for key, value in counts.items()},
-                 "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
-                 "enabled": [_span("yes" if row.use_credits else "")] if first else []}
+                 "resets": [_span(reset)], "credits": [_span(balance)],
+                 "enabled": [_span("yes" if row.use_credits else "")]}
         line = BoardRow(cells=cells)
         if row.tool == "claude" and role in row.selected_roles and (role == "units" or role == "showrunners"):
             line["group"] = BoardGroup(account=row.label, group=role)
@@ -4625,10 +4668,90 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     return lines
 
 
+def account_details_in_row_order(rows: list[BoardRow]) -> list[BoardRow]:
+    """Show account details on the first row of each consecutive account run."""
+    result: list[BoardRow] = []
+    previous = ""
+    for row in rows:
+        label = "".join(span["text"] for span in row["cells"]["label"])
+        cells = dict(row["cells"])
+        if label and label == previous:
+            for key in ("dot", "label", "left", "resets", "credits", "enabled"):
+                cells[key] = []
+        result.append({**row, "cells": cells})
+        previous = label
+    return result
+
+
+class AccountRowPlacement(TypedDict):
+    """The source row index and account detail visibility for one sorted row."""
+    index: int
+    details: bool
+
+
+def account_board_sort_orders(reading: StatusReading, board: Board) -> dict[str, list[AccountRowPlacement]]:
+    """Prepare both directions of each page sort from the complete account rows."""
+    facts = {row.label: row for row in reading.rows}
+    complete: list[BoardRow] = []
+    labels: list[str] = []
+    details: dict[str, list[BoardSpan]] = {}
+    label = ""
+    for row in board["rows"][:-1]:
+        cells = row["cells"]
+        if cells["label"]:
+            label = "".join(span["text"] for span in cells["label"])
+            details = {key: cells[key] for key in ("dot", "label", "left", "resets", "credits", "enabled")}
+        labels.append(label)
+        complete.append({**row, "cells": {**cells, **details}})
+
+    def role(index: int) -> str:
+        spans = complete[index]["cells"]["roles"]
+        return spans[0]["text"] if spans else ""
+
+    def quota(index: int) -> float:
+        value = facts[labels[index]].weekly_left_percent
+        return value if isinstance(value, (float, int)) else 0
+
+    def busy(index: int) -> int:
+        return int(complete[index]["cells"]["busy"][0]["text"] or "0")
+
+    def key(index: int, column: str) -> tuple[float | str, ...]:
+        account = labels[index].casefold()
+        role_name = role(index)
+        rank = ACCOUNT_ROLE_ORDER.index(role_name) if role_name in ACCOUNT_ROLE_ORDER else len(ACCOUNT_ROLE_ORDER)
+        if column == "left":
+            return quota(index), account, rank
+        if column == "role":
+            return role_name, account
+        if column == "busy":
+            return -busy(index), account
+        return account, rank
+
+    def missing(index: int, column: str) -> bool:
+        if column == "left":
+            return not isinstance(facts[labels[index]].weekly_left_percent, (float, int))
+        if column == "busy":
+            return not complete[index]["cells"]["busy"][0]["text"]
+        return column == "role" and not role(index)
+
+    orders: dict[str, list[AccountRowPlacement]] = {}
+    for column in ("account", "left", "role", "busy"):
+        for reverse in (False, True):
+            present = [index for index in range(len(complete)) if not missing(index, column)]
+            absent = [index for index in range(len(complete)) if missing(index, column)]
+            indices = sorted(present, key=lambda index: key(index, column), reverse=reverse)
+            indices += sorted(absent, key=lambda index: key(index, column), reverse=reverse)
+            ordered = account_details_in_row_order([complete[index] for index in indices])
+            orders[column + ("-reverse" if reverse else "")] = [
+                AccountRowPlacement(index=index, details=bool(row["cells"]["label"]))
+                for index, row in zip(indices, ordered)]
+    return orders
+
+
 def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> Board:
     """The accounts board: one line per role of each account, then the total line."""
     account_config = read_account_settings(account_config)
-    return _status_board(reading, account_config=account_config, colors=conf.read_or_repository("statusline").values())
+    return _status_board(reading, account_config=account_config, colors=role_colors())
 
 
 def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, colors: dict[str, str]) -> Board:
@@ -4638,7 +4761,8 @@ def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, co
     stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
     if not rows:
         return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
-    lines = [line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)]
+    lines = account_details_in_row_order([
+        line for row in rows for line in _account_board_rows(row, reading, account_config=account_config, colors=colors)])
     known = [count for row in rows for count in row.role_counts if isinstance(count, RoleSessionCounts)]
     total = {"busy": str(sum(count.busy for count in known)), "idle": str(sum(count.idle for count in known)),
              "paused": str(sum(count.paused for count in known)), "exited": str(sum(count.exited for count in known)),
@@ -4652,7 +4776,7 @@ def _status_board(reading: StatusReading, *, account_config: conf.ConfigRead, co
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
-    colors = conf.read_or_repository("statusline").values()
+    colors = role_colors()
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles), selected_roles=list(row.selected_roles),
@@ -5461,21 +5585,35 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
-def _upcoming_move_lines() -> tuple[str, ...]:
+def _read_upcoming_moves() -> UpcomingMoves:
     try:
         if not role_map.is_role_map_host():
-            return role_map.read_role_map().upcoming_moves or (
+            lines = role_map.read_role_map().upcoming_moves or (
                 f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
-        upcoming = next_moves.list_next_moves()
-        return ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+            return UpcomingMoves(lines, NextMovesUnavailable("First targets require the role-map host."))
+        entries = next_moves.read_next_moves()
+        targets: dict[next_moves.NextMoveGroup, str] = {}
+        for entry in entries:
+            if entry.group not in targets:
+                targets[entry.group] = next_moves.target_label(entry)
+        upcoming = next_moves.render_next_moves(entries)
+        lines = ("Upcoming moves: none",) if upcoming == "nothing set up" else ("Upcoming moves:", *upcoming.splitlines())
+        return UpcomingMoves(lines, FirstNextMoveTargets(targets))
     except role_map.RoleMapUnavailable:
-        return (f"Upcoming moves: unavailable; {role_map.ROLE_MAP_HOST} unreachable",)
+        reason = f"{role_map.ROLE_MAP_HOST} unreachable"
+        return UpcomingMoves((f"Upcoming moves: unavailable; {reason}",), NextMovesUnavailable(reason))
     except (next_moves.NextMoveError, ValueError) as error:
-        return (f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {str(error).splitlines()[0]}",)
+        reason = str(error).splitlines()[0]
+        return UpcomingMoves((f"Upcoming moves: unavailable from {role_map.ROLE_MAP_HOST}; {reason}",), NextMovesUnavailable(reason))
+
+
+def _upcoming_move_lines() -> tuple[str, ...]:
+    return _read_upcoming_moves().lines
 
 
 def _with_upcoming_moves(reading: StatusReading) -> StatusReading:
-    return replace(reading, upcoming_moves=_upcoming_move_lines())
+    upcoming = _read_upcoming_moves()
+    return replace(reading, upcoming_moves=upcoming.lines, first_next_moves=upcoming.first)
 
 
 def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
@@ -5622,15 +5760,16 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
             role = "showrunners" if owner.kind == "showrunner" else "workers"
         if owner is not None and owner.kind == "producer":
             settings = producer_settings(owner)
-            role = ("showrunners" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
+            role = ("producers" if isinstance(settings, models_registry.LaunchSettings) and settings.kind == "claude"
                     else "")
         setting = _session_config_dir(session["pid"])
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         label = claude_config_label(directory) if directory is not None else "account unreadable"
-        suffix = _moving_role_suffix(role, label, groups)
+        move_role = "showrunners" if role == "producers" else role
+        suffix = _moving_role_suffix(move_role, label, groups)
         session_lines.append(f"session {identity} ({session['name']}): {label}{suffix}")
-        if role in CLAUDE_GROUPS and directory is not None:
-            group = role
+        if move_role in CLAUDE_GROUPS and directory is not None:
+            group = move_role
             members[group].append(LiveGroupMember(identity, session["name"], group, directory))
         if role and directory is not None:
             if role == "workers":
@@ -5649,8 +5788,9 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
                      and settings.kind == "claude")):
         if member.current_session in live or not local_member(member):
             continue
-        role = "units" if member.kind == "unit" else "showrunners"
-        selected = group_label(groups, role)
+        group = "units" if member.kind == "unit" else "showrunners"
+        role = "producers" if member.kind == "producer" else group
+        selected = group_label(groups, group)
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
@@ -5681,7 +5821,10 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
     unobserved_workers = [member for member in staff.active(membership, "worker")
         if include_workers and member.id not in observed_workers and member.current_session not in observed_workers
         and isinstance(membership.backends.get(member.id), staff.CodexBackend) and local_member(member)]
-    if unobserved_workers:
+    codex_producers = [member for member in staff.active(membership, "producer")
+        if local_member(member) and isinstance(settings := producer_settings(member), models_registry.LaunchSettings)
+        and settings.kind == "codex"]
+    if unobserved_workers or codex_producers:
         codex_processes = _local_codex_processes()
         for member in unobserved_workers:
             if process := codex_processes.get(member.current_session):
@@ -5691,6 +5834,22 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
                 counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
                     member, session_state.LiveActivity(process.activity), detached=detached)
+        for member in codex_producers:
+            activity: session_state.LiveActivity | session_state.NoLiveSession = session_state.NoLiveSession()
+            if process := codex_processes.get(member.current_session):
+                setting = account.process_codex_home(process.pid)
+                if isinstance(setting, account.ProcessEnvironmentUnread):
+                    continue
+                directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
+                activity = session_state.LiveActivity(process.activity)
+            else:
+                home = member.home.path if isinstance(member.home, staff.SessionHome) else agent_accounts.observe_workers_home()
+                if isinstance(home, agent_accounts.NoWorkersHome):
+                    session_lines.append(f"producer {member.name}: {home.reason}")
+                    continue
+                directory = home
+            counts.setdefault((directory, "producers"), {})[member.current_session] = session_state.classify(
+                member, activity, detached=detached)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
                              tuple(session_lines), ())
 
@@ -5764,7 +5923,7 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             raise ValueError("invalid account counts")
         checked[label] = {}
         for role, raw in cast(dict[str, object], roles).items():
-            if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
+            if role not in ("units", "showrunners", "workers", "producers") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
             starting = count.get("starting", 0)
