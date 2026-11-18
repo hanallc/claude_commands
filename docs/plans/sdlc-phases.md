@@ -1260,6 +1260,28 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on the phase 74 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 79 — Review-trial rows keyed by checkpoint  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18). `review_regime.py add` keys a row on unit, plan and phase only. natemerge batch postmaster2 (main dc2481efc) printed "kept postmaster phase 1 of permanent: a row exists from the merge at 2026-11-18T12:35:22-05:00; nothing added". Those were two different postmaster phases (the relay prefix at 12:35, then the no-lead-in change 45bef9a09). Both were "phase 1" of plan "permanent", so the second row was lost.
+
+**Spec:**
+1. A row records its checkpoint commit. `merge_checkpoint.py` passes `--checkpoint <commit>` to `review_regime.py add`.
+2. Two rows name the same phase only when unit, plan, phase and checkpoint match. A rerun of the same merge still adds nothing. A row written before this change has no checkpoint; it matches only a new row with the same unit, plan, phase and started time.
+3. Record the lost row once: postmaster phase 1 of plan permanent, checkpoint 45bef9a09, started 2026-11-18T13:05:00-05:00, merged at its merge commit time on main, review trial "ux 0 findings, code 0 findings, review-worker minutes 4, ux check minutes 0, ux repair minutes 0", excluded "no merge design check". Source: /tmp/claude/unit/d74163b1-8ec5-4722-9b1d-4ab50215c9a5/phases/postmaster2/batch.txt. The director runs the one `review_regime.py add` on natedev after the phase lands.
+4. Add rows to the existing review_regime and merge_checkpoint tests.
+
+**Files:** `scripts/production/review_regime.py`, `scripts/production/merge_checkpoint.py`, their tests.
+
+**Workers:** 1 writer.
+
+**Order:** after phases 75 to 78.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
