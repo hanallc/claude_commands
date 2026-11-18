@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import subprocess
 import sys
@@ -82,11 +83,11 @@ exit "$EXIT_STATUS"
             text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
-    def check_version_change(self, tool: str) -> None:
+    def check_identity_change(self, set_identity: Callable[[str], None]) -> None:
         _ = self.dirty_cache()
         for old_status, new_status in ((0, 43), (43, 0)):
             with self.subTest(cached_status=old_status):
-                self.environment["TEST_VERSION_" + tool] = f"{tool} before-{old_status}"
+                set_identity(f"before-{old_status}")
                 self.environment["TEST_CLIPPY_STATUS"] = str(old_status)
                 first = self.invoke_cache_functions()
                 self.assertEqual(first.returncode, old_status, first.stdout + first.stderr)
@@ -96,12 +97,15 @@ exit "$EXIT_STATUS"
                 self.assertIn("(recorded)", repeated.stdout)
                 self.assertFalse(self.clippy_ran())
 
-                self.environment["TEST_VERSION_" + tool] = f"{tool} after-{old_status}"
+                set_identity(f"after-{old_status}")
                 self.environment["TEST_CLIPPY_STATUS"] = str(new_status)
                 changed = self.invoke_cache_functions()
                 self.assertEqual(changed.returncode, new_status, changed.stdout + changed.stderr)
                 self.assertNotIn("(recorded)", changed.stdout)
                 self.assertTrue(self.clippy_ran())
+
+    def check_version_change(self, tool: str) -> None:
+        self.check_identity_change(lambda version: self.environment.update({"TEST_VERSION_" + tool: version}))
 
     def test_mend_version_invalidates_passes_and_failures(self) -> None:
         reads = self.root / "config-reads"
@@ -110,23 +114,9 @@ exit "$EXIT_STATUS"
         self.check_version_change("MEND")
         self.assertIn(self.config.stem, reads.read_text().splitlines())
 
-    def test_mend_replacement_rechecks_a_failure_with_the_same_version(self) -> None:
-        _ = self.dirty_cache()
-        self.environment.update({"TEST_VERSION_MEND": "mend 0.23.0-dev", "TEST_CLIPPY_STATUS": "43"})
-        first = self.invoke_cache_functions()
-        self.assertEqual(first.returncode, 43, first.stdout + first.stderr)
-        self.assertTrue(self.clippy_ran())
-        repeated = self.invoke_cache_functions()
-        self.assertEqual(repeated.returncode, 43, repeated.stdout + repeated.stderr)
-        self.assertIn("FAIL (recorded)", repeated.stdout)
-        self.assertFalse(self.clippy_ran())
-
-        write_fixture_cargo_mend(self.root / "bin/cargo-mend", "replacement revision")
-        self.environment["TEST_CLIPPY_STATUS"] = "0"
-        changed = self.invoke_cache_functions()
-        self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
-        self.assertNotIn("(recorded)", changed.stdout)
-        self.assertTrue(self.clippy_ran())
+    def test_mend_replacement_rechecks_each_verdict_with_the_same_version(self) -> None:
+        mend = self.root / "bin/cargo-mend"
+        self.check_identity_change(lambda build_id: write_fixture_cargo_mend(mend, build_id))
 
     def test_rustfmt_version_invalidates_passes_and_failures(self) -> None:
         self.check_version_change("RUSTFMT")
@@ -137,7 +127,7 @@ exit "$EXIT_STATUS"
     def test_taplo_version_invalidates_passes_and_failures(self) -> None:
         self.check_version_change("TAPLO")
 
-    def test_unknown_version_prevents_cache_reuse_and_publication(self) -> None:
+    def test_unknown_build_info_prevents_cache_reuse_and_publication(self) -> None:
         cache = self.dirty_cache()
         _ = self.verify("lint", "sample")
         self.assertEqual(len(list(cache.glob("*.pass"))), 1)
@@ -145,7 +135,7 @@ exit "$EXIT_STATUS"
             with self.subTest(version_status=status):
                 self.write_executable(self.root / "bin/cargo", (
                     "import sys\n"
-                    "if sys.argv[1:] == ['mend', '--version']:\n"
+                    "if sys.argv[1:] == ['mend', '--build-info']:\n"
                     f"    raise SystemExit({status})\n"
                 ) + CARGO_STUB)
                 for attempt in range(2):
@@ -160,13 +150,15 @@ exit "$EXIT_STATUS"
 class LintVersionKeyTests(TreeWatchFixture):
     def test_unknown_versions_preserve_the_input_watch(self) -> None:
         metadata = json.dumps(self.metadata)
-        _, watched = tree_watch.TreeInputs(["--", "lint"], metadata).keys(cache=False)
+        expected = tree_watch.TreeInputs(["--", "lint"], metadata)
+        tree, watched = expected.keys(lint_versions=False)
         for error in (OSError("tool missing"), ValueError("empty version"),
                       subprocess.CalledProcessError(1, "cargo"), subprocess.TimeoutExpired("cargo", 10)):
             with self.subTest(error=type(error).__name__), \
                  mock.patch.object(tree_watch, "lint_tool_versions", side_effect=error):
                 inputs = tree_watch.TreeInputs(["--", "lint"], metadata)
                 self.assertEqual(inputs.keys(), ("", watched))
+                self.assertEqual(inputs.tree_content_key, tree)
 
     def test_test_keys_and_input_watches_skip_lint_tool_queries(self) -> None:
         metadata = json.dumps(self.metadata)

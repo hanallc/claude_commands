@@ -1884,7 +1884,7 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi
     fi
-    if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
+    if [[ "$CMD" == lint && ( "$content" == 1 || -z "${CACHE_DIR:-}" ) ]]; then
         key_options+=(--without-lint-versions)
     fi
     VERIFY_RESULT_ENVIRONMENT_FD=3 \
@@ -3260,15 +3260,16 @@ user_clock() {
 }
 
 cache_record() {
-    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
+    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail key_options=()
     # A lost token gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
     if [[ "$CMD" == lint ]]; then
         # A remote mend result has no binary identity in the local key.
         [[ "${LINT_USED_REMOTE_MEND:-0}" == 0 ]] || return 1
         [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
+        key_options+=(--recheck-mend)
     fi
-    key="$(tree_key)"
+    key="$(tree_key ${key_options[@]+"${key_options[@]}"})"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
         if [[ -z "$VERDICT_TREE_KEY" || "$(tree_key --tree-content)" != "$VERDICT_TREE_KEY" ]]; then

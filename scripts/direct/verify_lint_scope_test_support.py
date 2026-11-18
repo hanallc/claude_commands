@@ -61,9 +61,17 @@ class CargoWorkspaceMetadata(TypedDict):
     packages: list[CargoPackageMetadata]
 
 
-def write_fixture_cargo_mend(path: Path, revision: str = "") -> None:
-    """Install a fixture binary with a stable version string."""
-    write_stdlib_tool(path, f'print("mend 0.23.0-dev")\n# {revision}\n')
+def write_fixture_cargo_mend(path: Path, build_id: str = "fixture") -> None:
+    """Install a fixture with a stable version and a selectable build ID."""
+    write_stdlib_tool(path, f'''import os
+import sys
+
+print(os.environ.get("TEST_VERSION_MEND", "cargo-mend 0.23.0-dev"))
+if sys.argv[-1] == "--build-info":
+    print("git_hash: fixture")
+    print({("build_id: " + build_id)!r})
+    print("build_sysroot: fixture")
+''')
 
 
 CARGO_STUB = r'''
@@ -75,6 +83,7 @@ import sys
 arguments = sys.argv[1:]
 version_tools = {
     ("mend", "--version"): "MEND",
+    ("mend", "--build-info"): "MEND",
     ("+nightly", "fmt", "--version"): "RUSTFMT",
     ("clippy", "--version"): "CLIPPY",
 }
@@ -87,6 +96,9 @@ if version_tool:
     if "TEST_VERSION_EVENTS" in os.environ:
         with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
             output.write(version_tool + "\n")
+    if version_tool == "MEND":
+        mend = str(Path(__file__).with_name("cargo-mend"))
+        os.execv(mend, [mend, arguments[-1]])
     print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
     raise SystemExit(0)
 if arguments[:1] == ["metadata"]:

@@ -61,8 +61,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
             admission.free(64 * 1024**3)
 
     def local_mend(self) -> list[list[str]]:
-        return [row["args"] for row in self.cargo_events()
-                if row["args"][:1] == ["mend"] and "--version" not in row["args"]]
+        return [row["args"] for row in self.cargo_events() if row["args"][:1] == ["mend"]]
 
     def mac_verbs(self) -> list[str]:
         words = [row["args"] for row in self.runner_events()]
@@ -175,6 +174,20 @@ if arguments[:1] == ["mend"]:
         self.assertEqual(sum(row["args"][:1] == ["clippy"] and "--fix" not in row["args"]
                              for row in self.cargo_events()), 1)
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
+
+    def test_mend_installed_during_the_memory_wait_prevents_cache_publication(self) -> None:
+        self.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.runner_state / "mac-free")
+        process = self.queued_lint()
+        self.wait_for_memory_wait(process)
+        write_fixture_cargo_mend(self.bin_directory / "cargo-mend", "replacement")
+        self.release_memory()
+
+        _ = self.finish_lint(process)
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.pass")), [])
 
     def test_linux_only_workspace_lint_leaves_memory_for_the_mac(self) -> None:
         # Only the Mac compiles macOS code, so a lint ignores linux_only and the Mac judges the whole workspace.
