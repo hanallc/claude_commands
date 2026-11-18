@@ -576,7 +576,7 @@ sweep_after_step() {
         else
             invoke_sweep </dev/null >/dev/null 2>&1 &
         fi
-    )
+    ) 8>&-
 }
 
 # A failed version check prints its first error line, so a refusal such as the
