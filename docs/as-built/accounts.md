@@ -419,6 +419,18 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
 The `board` is `accounts.status_board()`: the table the console Accounts page draws.
+`accounts.models_board()` groups the same role counts by full model ID and effort.
+The reader finds the Claude transcript by session ID across project folders.
+Claude model and effort come from the latest real assistant message.
+Codex model and effort come from the latest `turn_context`.
+The model reader scans at most 128 KiB from the end of a plain file.
+For a compressed file, it streams the records and caches the result in memory by path, size, and modification time.
+`session_model_cache_entries` in `config/accounts.conf` sets the limit for each process.
+The cache evicts the least recently used result when a new result exceeds the limit.
+A missing Claude transcript gives `unknown`.
+Live process options apply when the reader can establish that no turn was recorded.
+The peer count document carries known model counts by account and role.
+The Models table puts the remainder of each role count in the `unknown` row.
 `config/statusline.conf` holds each account color under `account.<label>`.
 `ROLE_COLOR_KEYS` maps each role group to its color key:
 
@@ -435,25 +447,32 @@ The account details include the dot, label, swatch, allowance, reset, credits, a
 A separated row shows the account details again.
 A lone producer row shows all account details.
 The helper preserves the complete input rows for later sorts.
-The Accounts page sorts through four focusable column headers:
+Each named header on the Accounts page has a sort control.
+The first selection sets the order for that column.
 
 1. Account sorts by label and then by role order.
 2. Left sorts by the full quota value, least first, then by account and role order.
 3. Role sorts by role name and then by account.
-4. Busy sorts by count, most first, then by account.
+4. Next sorts by the target account name.
+5. Busy, idle, paused, exited, and total sort by count, largest first.
+6. Resets sorts by the reset time, soonest first.
+7. Credits sorts by the full balance, largest first. An unlimited balance comes first.
+8. Enabled puts accounts with credits enabled first.
 
 The role order is units, showrunners, workers, producers, spare, and no role.
 The default sort uses account order.
 Missing values stay last in both directions.
+Next cells without a target stay last in both directions.
+Blank enabled cells also stay last in both directions.
 Clicking the selected header reverses its order.
 Enter performs the same action on a focused header.
-Each sortable header reserves space for its arrow.
+Each sort arrow uses the gap beside its label without adding column width.
 `account_board_sort_orders` prepares both directions and uses `account_details_in_row_order` for each order.
 The browser moves the existing rows and restores the account details for each consecutive account run.
 The total row stays last.
-Sorting preserves the total values and upcoming moves.
+Sorting preserves the total values.
 Browser storage keeps each viewer's choice through refreshes and page visits.
-Failed storage reads use the default sort.
+A failed storage read or an unknown saved column uses the default sort.
 Failed storage writes keep the current choice for the open page.
 The shipped value of `role.producer` is `pink`.
 `role_colors` reads the current settings for the Accounts board and the console name renderer.
@@ -466,6 +485,7 @@ The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
+A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.
 The Accounts page adds a `next` column after the role color swatch.
@@ -474,7 +494,7 @@ A selected Claude group shows its first target, or `none`, and an arrow button o
 A selected Codex workers line shows its first target, or `auto`, without a button.
 Other lines show a minus icon; the total cell stays empty.
 `StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
-One queue read supplies both the first targets and the unchanged upcoming list.
+One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
 Off the role-map host, first targets are unavailable.
 The menu marks the current target and can remove the group's first entry.
 Its `stale_at` is the next local midnight, when its reset text changes.

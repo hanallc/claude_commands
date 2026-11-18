@@ -4891,22 +4891,24 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                                                 {"/private/protected": 27 * GIB}), [])
 
     def test_measured_target_folder_has_no_cargo_or_rebuild_claim(self) -> None:
-        with self.crossing_delivery({}) as delivery:
-            folder = str(delivery.base / "unknown" / "target")
-            _ = write(Path(folder) / sweep.RUSTC_INFO, 0)
-            measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
-                sweep.OutsideCacheDirectory(folder, 26 * GIB, 0, sweep.NoLargestGrowingChild()),
-            ], 0)
-            with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
-                self.finalize_crossing(140)
-            for attempt in delivery.attempts:
-                self.assertIn(folder, attempt.text)
-                self.assertNotIn("Cargo", attempt.text)
-                self.assertNotIn("compiled", attempt.text)
-                self.assertNotIn("rebuild", attempt.text)
-            message = delivery.attempts[0].text
-            self.assertIn("holds 26.0 GiB", message)
-            self.assertIn("their use is unknown", message)
+        for name in ("unknown", "rebuild-Cargo-compiled"):
+            with self.subTest(name=name), self.crossing_delivery({}) as delivery:
+                folder = str(delivery.base / name / "target")
+                _ = write(Path(folder) / sweep.RUSTC_INFO, 0)
+                measurement = sweep.AvailableDiskMeasurement(datetime.now(UTC), sweep.NoEarlierDiskMeasurement(), [
+                    sweep.OutsideCacheDirectory(folder, 26 * GIB, 0, sweep.NoLargestGrowingChild()),
+                ], 0)
+                with mock.patch.object(sweep, "read_disk_measurement", return_value=measurement):
+                    self.finalize_crossing(140)
+                for attempt in delivery.attempts:
+                    self.assertIn(folder, attempt.text)
+                    text = attempt.text.replace(folder, "")
+                    self.assertNotIn("Cargo", text)
+                    self.assertNotIn("compiled", text)
+                    self.assertNotIn("rebuild", text)
+                message = delivery.attempts[0].text
+                self.assertIn("holds 26.0 GiB", message)
+                self.assertIn("their use is unknown", message)
 
     def test_failure_after_an_interrupted_crossing_receipt_uses_no_crossing_key(self) -> None:
         for crossing_start, failure_free in (("interrupted receipt", 140), ("failed delivery", 151)):
