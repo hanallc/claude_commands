@@ -14,7 +14,7 @@ from unittest import mock
 
 from scripts.aws_target import aws_target, hana_box, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.lib import conf
 
 
@@ -114,8 +114,7 @@ class HanaBoxTests(CostFixture):
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.clock = TestClock()
         self.workload_path = self.root / 'hana_aws.conf'
-        _ = self.workload_path.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        text_setting(self.workload_path, 'enabled', 'on')
+        install_hana_spending_settings(self.workload_path)
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private inventory', True))
         self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'private account inventory'))

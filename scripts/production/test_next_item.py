@@ -419,7 +419,7 @@ class NextItemTests(unittest.TestCase):
         queue = next_item.change_queue(doc)
         self.assertEqual({entry.key for entry in queue.entries}, {"kid/C9", "kid/C10", "C9", "C434"})
         self.assertEqual(footer_counts.changes(doc), len(queue.entries))
-        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 4 changes")
+        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "Review: 4 changes")
         self.assertEqual(set(lists) & set(footer_counts.sources(doc)),
                          {change_review.list_file("top"), change_review.list_file("kid")})
         self.assertEqual({path: path.read_bytes() for path in lists}, lists)
@@ -561,7 +561,7 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(output.splitlines()[1], "kid/C9 Earlier child change")
             self.assertEqual(footer_counts.changes(doc), 2)
-            self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 2 changes")
+            self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "Review: 2 changes")
 
     def test_bad_urgency_in_earlier_list_leaves_current_rows_in_show_and_count(self) -> None:
         doc = self.attached_changes()["kid"]

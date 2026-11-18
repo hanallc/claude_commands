@@ -95,6 +95,10 @@ class HanaRunnerTests(unittest.TestCase):
         self.fixture = source_tests.HanaSourceTests()
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
+        _ = write_config_fixture(self.fixture.configuration.source,
+                                 'step_cpu_limit=4\nstep_memory_gib=24\n')
+        _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
+                                 'loopback.command_timeout_s=600\n')
         self.root = self.fixture.root
         self.compiler_version = self.root / 'compiler-version'
         _ = self.compiler_version.write_text('1.2.3\n')
