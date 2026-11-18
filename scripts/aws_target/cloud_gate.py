@@ -191,6 +191,15 @@ class UncertainGateLaunch:
     expires: int
 
 
+@final
+class AwsServiceFailure(AwsUnavailable):
+    """The AWS CLI reports a service error code for the operation."""
+    def __init__(self, operation: str, code: str, *, first_attempt: bool) -> None:
+        super().__init__(f'{operation}: {code}')
+        self.code = code
+        self.first_attempt = first_attempt
+
+
 def cleanup_folder(folder: Path, worker: GateWorker) -> bool:
     """Clean one gate folder or all module folders in a trial."""
     paths = [folder / 'request.json'] if (folder / 'request.json').exists() else sorted(folder.glob('*/request.json'))
@@ -359,6 +368,10 @@ class GateWorker:
         try:
             _ = self.api.call('get-object', '--bucket', bucket, '--key', key, str(path), service='s3api')
             return True
+        except AwsServiceFailure as error:
+            if error.code in ('404', 'NoSuchKey'):
+                return False
+            raise
         except AwsUnavailable as error:
             if any(code in str(error) for code in ('NoSuchKey', '(404)', 'Not Found')):
                 return False

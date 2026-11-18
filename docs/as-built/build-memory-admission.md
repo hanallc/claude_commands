@@ -205,6 +205,11 @@ An empty remote observation cannot establish that condition.
 A settled prelaunch refusal permits retry only after fresh provider evidence confirms that the exact claim has departed.
 The service retains terminal reports while cached evidence still contains the claim.
 Later passes reevaluate those reports after provider evidence refreshes.
+An exact settled Hana journal can confirm a prelaunch refusal with no command start.
+The first pass after service replacement can use this journal to close a saved refusal.
+The step can then use another eligible target in the same episode.
+A pending Hana refusal with unused permission returns the same assignment so the adapter can finish settlement.
+A repeated request for an assignment with consumed permission returns a wait.
 The saved terminal report preserves the outcome, dispatch settlement, and original report time across restart.
 Execution observations remain reconstructed evidence.
 The retry deadline uses the original report time.

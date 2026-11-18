@@ -39,7 +39,7 @@ from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import session_staff, staff, unit_config  # noqa: E402
+from scripts.production import session_staff, staff, unit_config, worker_admission  # noqa: E402
 # The name events carried before the rename: every history written before it, and a run still open.
 FORMER_SKILL_NAME = "plan-delegate"
 MIN_CALIBRATION_SAMPLES = 5
@@ -659,12 +659,39 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         return ActiveDispatchUnavailable(f"worker {worker_id}: {error}")
 
 
+@dataclass(frozen=True)
+class ValidatedDispatchReply:
+    text: str
+
+
+@dataclass(frozen=True)
+class NoValidatedDispatchReply:
+    """The saved file does not supply a valid reply for a retained pass."""
+
+
+def read_completed_reply(run: Path, reply: Path) -> ValidatedDispatchReply | NoValidatedDispatchReply:
+    """Read the saved DONE reply for a pass retained in current state."""
+    completion_ids = {
+        delivery.completion_id
+        for item in pass_recorder.pass_slots(pass_recorder.read_state(run)).values()
+        if isinstance(completion := hook_completion(item), HookCompletion)
+        and completion.reply_file and Path(completion.reply_file) == reply
+        and (delivery := pass_recorder.dispatch_delivery(item)).completion_id
+    }
+    if not completion_ids:
+        return NoValidatedDispatchReply()
+    try:
+        text = reply.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return NoValidatedDispatchReply()
+    if any(worker_admission.reply_ends_dispatch(text, completion_id) for completion_id in completion_ids):
+        return ValidatedDispatchReply(text)
+    return NoValidatedDispatchReply()
+
+
 def reply_completed(run: Path, reply: Path) -> bool:
-    """Read a saved reply only after the hook completes its recorded pass."""
-    state = pass_recorder.read_state(run)
-    return any(item.get("status") == "completed" and
-               Path(pass_recorder.dispatch_delivery(item).reply_file) == reply
-               for item in pass_recorder.pass_slots(state).values())
+    """Check whether the saved reply has a matching DONE."""
+    return isinstance(read_completed_reply(run, reply), ValidatedDispatchReply)
 
 
 class DispatchDetailNotRecorded(Enum):
@@ -1266,16 +1293,13 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
-    """Record completion for the exact dispatch, including DONE after a launcher error."""
+    """Record completion for the exact open dispatch."""
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             state = pass_recorder.read_state(session_dir)
-            opened = pass_recorder.pass_slots(state).get(slot)
+            opened = pass_recorder.open_passes(state).get(slot)
             if opened is not None and opened.get("instance_id") == instance_id:
-                if opened.get("status") == "error" and status == "completed":
-                    # Close the corrected pass through the existing recorder event.
-                    opened["status"] = "active"
                 _ = pass_recorder.close_slot_pass(session_dir, state, slot, status, pass_recorder.now_epoch())
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

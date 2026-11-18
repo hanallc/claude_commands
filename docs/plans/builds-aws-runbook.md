@@ -479,13 +479,36 @@ The local plan makes no AWS call.
 Approved setup uses the existing encrypted admin session and progress display.
 It reserves compute and storage costs before requesting resources.
 Setup permission does not enable command permission.
-The separate stack creates the instance, retained data volume, launch template, security group, private control bucket, and scaler policy.
+The separate stack creates the launch template, security group, private control bucket, and scaler policy.
+Setup reads Spot prices and skips candidates with no price or a price above the ceiling.
+It tries the configured type in the registered subnet first when that price qualifies.
+It then tries eligible fallback types and subnets in order of price.
+If every launch fails, rerun approved setup to use the same stack.
+Setup creates the encrypted data volume in the zone of the successful launch.
+It saves the instance, Spot request, and data volume identities in `hana/setup.json`.
 The root disk keeps its data while the box is stopped. AWS deletes the root disk when the box is terminated.
 The Spot request is persistent and uses interruption behavior `stop`.
 Setup confirms the instance, request, and stopped state before registering the lifecycle controller.
-Repeat approved setup after a timeout to read the existing stack and confirm its stop.
-An expired reservation cannot authorize another stack request.
-Changed resource inputs require a separate replacement review.
+Repeat approved setup after a timeout to continue an eligible launch or confirm the instance stopped.
+An expired reservation cannot authorize a pending launch.
+Setup skips the Spot price check if it already has the instance ID.
+Setup can change the ceiling on the saved stack after AWS refuses all launch requests.
+Other resource changes require a separate replacement review.
+If setup finds a legacy instance in the stack, run `deploy.py down --workload hana --approve-destroy` first.
+Teardown checks for a pending launch or disk creation before it deletes anything.
+If AWS does not confirm a pending request within `intent_lookup_timeout_s`, run approved teardown again.
+Approved teardown cancels the Spot request, terminates the instance, then deletes the data volume and stack.
+
+Before a launch, setup checks current Spot prices for the eligible instance types and subnets.
+If all priced candidates exceed the ceiling, setup shows the cheapest candidate.
+Setup gives a `/tune` command when the effective ceiling key is editable.
+If the configuration rejects the command, setup reports the error and the suggested ceiling.
+
+If setup gives a `/tune` command:
+
+1. Run the displayed `/tune` command.
+2. Run `deploy.py prepare --workload hana`.
+3. Run `deploy.py hana-setup --approve-resources`.
 
 The image must include the independent Hana guard, watchdog, data mount, and root receiver.
 The Natedev owner must install the files from `hana_guest.render_files()` and `hana_receiver.render_files()`.
