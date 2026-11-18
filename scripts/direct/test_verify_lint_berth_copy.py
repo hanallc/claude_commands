@@ -129,6 +129,29 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
         self.assertFalse(any("clippy" in cast(list[str], call["args"]) for call in self.copy_calls()))
         self.assert_copy_gone()
 
+    def test_unheld_fix_failure_is_not_replayed_after_claim(self) -> None:
+        cache = self.enable_cache()
+        fixed_text = "pub(crate) fn free() {}\n"
+        self.environment["TEST_MEND_FIXES"] = json.dumps({"src/free.rs": fixed_text})
+
+        result = self.invoke_verify("lint", cwd=self.root)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("not written: no reservation holds src/free.rs", output)
+        self.assertEqual(self.text("src/free.rs"), "fn free() {}\n")
+        with self.subTest("cache after unheld fix"):
+            self.assertEqual(list(cache.glob("*.fail")), [])
+
+        self.environment["TEST_BERTH_BOARD"] = board(
+            snapshot("own-1", self.root, "refs/heads/mine", "src/lib.rs"),
+            snapshot("other-2", self.root.parent / "other", "refs/heads/theirs", "src/foreign.rs"),
+            snapshot("own-3", self.root, "refs/heads/mine", "src/free.rs"),
+        )
+        result = self.invoke_verify("lint", cwd=self.root)
+        with self.subTest("lint after claim"):
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.text("src/free.rs"), fixed_text)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

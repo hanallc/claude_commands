@@ -1,18 +1,19 @@
 """Test the reader installation and the execution boundary with local commands."""
 
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import os
 import shlex
 import subprocess
 import sys
 import tempfile
-from threading import Barrier
-import time
+from threading import Barrier, Event, Lock
 import unittest
+from typing import cast, override
 from unittest.mock import patch
 
-from scripts.style import declarations, style_config, style_plan, style_reader, style_reader_oracle
+from scripts.style import declarations, style_plan, style_reader, style_reader_oracle
+from scripts.style.style_reader_test_support import oracle_reader
 
 
 class ReaderClientTests(unittest.TestCase):
@@ -89,155 +90,16 @@ class ReaderClientTests(unittest.TestCase):
             self.assertEqual(sites[(query.blob, query.path)], (True,))
             self.assertEqual(sites[(missing, query.path)], style_reader.UnreadableFact(style_reader.UnreadableReason.MISSING_BLOB))
             self.assertEqual(count.read_text(), "call\ncall\n")
-
-    def test_missing_and_stale_stamps_build_once_and_current_stamp_builds_none(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            binary = Path(temporary) / "selected-reader"
-            with (patch.dict(os.environ, {"STYLE_READER_BINARY": str(binary)}),
-                  patch.object(style_reader, "_source_tree", side_effect=AssertionError("Unexpected stamp read")),
-                  patch.object(style_reader, "_build", side_effect=AssertionError("Unexpected reader build"))):
-                self.assertEqual(style_reader.reader_binary(), binary)
-        for previous in ("missing", "stale", "checkout moves during build", "checkout moves during failed build",
-                         "private configuration"):
-            with self.subTest(previous=previous), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                install = root / "installed"
-                checkout = root / "checkout"
-                checkout.mkdir()
-
-                def git(*arguments: str) -> str:
-                    return subprocess.run(["git", "-C", str(checkout), *arguments],
-                                          capture_output=True, check=True, text=True).stdout.strip()
-
-                _ = git("init", "-q")
-                _ = git("config", "user.name", "Reader Test")
-                _ = git("config", "user.email", "reader@example.invalid")
-                project = checkout / "rust" / "style_reader"
-                project.mkdir(parents=True)
-                _ = (project / "main.rs").write_text("first source")
-                _ = git("add", ".")
-                _ = git("commit", "-qm", "Create the first reader source")
-                first = git("rev-parse", "HEAD")
-                _ = (project / "main.rs").write_text("second source")
-                _ = git("add", ".")
-                _ = git("commit", "-qm", "Change the reader source")
-                second = git("rev-parse", "HEAD")
-                expected_tree = git("rev-parse", "HEAD:rust/style_reader")
-                if previous.startswith("checkout moves"):
-                    _ = git("checkout", "-q", first)
-                source = root / "built-reader"
-                _ = source.write_text("#!/bin/sh\nprintf 'ready\\n'\n")
-                source.chmod(0o755)
-                count = root / "builds"
-                arguments = root / "arguments"
-                observed_environment = root / "environment"
-                verifier = root / "verify.sh"
-                move = (f"git -C {shlex.quote(str(checkout))} checkout -q {second}\n"
-                        if previous.startswith("checkout moves") else "")
-                failure = (f"test $(wc -l < {shlex.quote(str(count))}) -eq 1 && exit 9\n"
-                           if previous == "checkout moves during failed build" else "")
-                _ = verifier.write_text(
-                    "#!/bin/sh\n" + move + f"printf 'build\\n' >> {shlex.quote(str(count))}\n"
-                    + f'printf "%s\\n%s\\n" "${{CONF_DIR+set}}" "${{STYLE_READER_TEST_VALUE}}" > {shlex.quote(str(observed_environment))}\n'
-                    + failure + f"printf '%s\\n' \"$@\" > {shlex.quote(str(arguments))}\n"
-                    + f"printf 'binary: %s\\n' {shlex.quote(str(source))}\n"
-                )
-                if previous == "stale":
-                    old = install / "old"
-                    old.mkdir(parents=True)
-                    _ = (old / "stamp").write_text("an old tree\n")
-                    (install / "current").symlink_to("old", target_is_directory=True)
-                barrier = Barrier(2)
-
-                def resolve() -> Path:
-                    _ = barrier.wait()
-                    return style_reader.reader_binary()
-
-                environment = ({"CONF_DIR": str(root / "config"), "STYLE_READER_TEST_VALUE": str(root)}
-                               if previous == "private configuration" else {})
-                with (patch.dict(os.environ, environment),
-                      patch.object(style_reader, "VERIFY_SCRIPT", verifier),
-                      patch.object(style_reader, "CHECKOUT", checkout),
-                      patch.object(style_config, "reader_install_folder", return_value=install)):
-                    with ThreadPoolExecutor(max_workers=2) as threads:
-                        futures = (threads.submit(resolve), threads.submit(resolve))
-                        results = [future.result() for future in futures]
-                    self.assertEqual(results[0], results[1])
-                    self.assertEqual(results[0].read_bytes(), source.read_bytes())
-                    self.assertEqual(count.read_text(), "build\n" * (2 if previous.startswith("checkout moves") else 1))
-                    self.assertEqual(arguments.read_text().splitlines()[:3], ["build", "style_reader", "--release"])
-                    self.assertEqual(style_reader.reader_binary(), results[0])
-                    self.assertEqual(count.read_text(), "build\n" * (2 if previous.startswith("checkout moves") else 1))
-                    self.assertEqual((results[0].parent / "stamp").read_text().strip(), results[0].parent.name.split("-")[0])
-                    self.assertEqual((results[0].parent / "stamp").read_text().strip(), expected_tree)
-                    if previous == "private configuration":
-                        self.assertEqual(observed_environment.read_text().splitlines(), ["", str(root)])
-                        self.assertEqual(os.environ["CONF_DIR"], environment["CONF_DIR"])
-
-    def test_failed_build_keeps_the_previous_installation_and_reports_output(self) -> None:
-        # A stuck build has a child that runs on; test_build_limit_holds_after_the_caller_ends proves the group ends.
-        cases = (
-            ("failure", "printf 'build failed\\n'\nprintf 'compiler detail\\n' >&2\nexit 9\n",
-             "build failed[\\s\\S]*compiler detail", False),
-            ("stuck", "trap 'touch \"$0.stopped\"; exit 143' TERM\nsleep 5 &\nwait\n", "passed its 0.5 s limit", True),
-            ("ignores TERM", "trap '' TERM\nsleep 5 &\nwait\n", "passed its 0.5 s limit", False),
-        )
-        for name, body, message, stopped in cases:
-            with self.subTest(name), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                install = root / "installed"
-                old = install / "old"
-                old.mkdir(parents=True)
-                _ = (old / "stamp").write_text("old tree\n")
-                _ = (old / "style_reader").write_text("old binary")
-                (install / "current").symlink_to("old", target_is_directory=True)
-                verifier = root / "verify.sh"
-                _ = verifier.write_text("#!/bin/sh\n" + body)
-                started = time.monotonic()
-                with (patch.object(style_reader, "VERIFY_SCRIPT", verifier),
-                      patch.object(style_config, "reader_install_folder", return_value=install),
-                      patch.object(style_config, "reader_build_limit_seconds", return_value=0.5),
-                      patch.object(style_config, "reader_build_stop_grace_seconds", return_value=0.5),
-                      self.assertRaisesRegex(style_reader.ReaderError, message)):
-                    _ = style_reader.reader_binary()
-                self.assertLess(time.monotonic() - started, 4)
-                # The stuck build got TERM before KILL, so verify.sh can give back its claims.
-                self.assertEqual(verifier.with_name("verify.sh.stopped").exists(), stopped)
-                self.assertEqual((install / "current" / "style_reader").read_text(), "old binary")
-                self.assertEqual((install / "current").resolve(), old)
-
-    def test_build_limit_holds_after_the_caller_ends(self) -> None:
-        def alive(pid: int) -> bool:
-            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
-            return bool(state.strip()) and not state.strip().startswith("Z")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pids = root / "pids"
-            verifier = root / "verify.sh"
-            _ = verifier.write_text(f"#!/bin/sh\necho $$ >> '{pids}'\nsleep 30 &\necho $! >> '{pids}'\nwait\n")
-            caller = (
-                "from pathlib import Path\n"
-                "from unittest.mock import patch\n"
-                "from scripts.style import style_config, style_reader\n"
-                f"with (patch.object(style_reader, 'VERIFY_SCRIPT', Path({str(verifier)!r})),\n"
-                f"      patch.object(style_config, 'reader_install_folder',\n"
-                f"                   return_value=Path({str(root / 'installed')!r})),\n"
-                "      patch.object(style_config, 'reader_build_limit_seconds', return_value=1.0),\n"
-                "      patch.object(style_config, 'reader_build_stop_grace_seconds', return_value=0.5)):\n"
-                "    _ = style_reader.reader_binary()\n")
-            with subprocess.Popen([sys.executable, "-c", caller], cwd=style_reader.CHECKOUT) as process:
-                deadline = time.monotonic() + 10
-                while len(pids.read_text().split() if pids.exists() else ()) < 2 and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                # The caller ends while the stuck build runs.
-                process.kill()
-            build = [int(pid) for pid in pids.read_text().split()]
-            self.assertEqual(len(build), 2)
-            deadline = time.monotonic() + 4
-            while any(alive(pid) for pid in build) and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertEqual([pid for pid in build if alive(pid)], [])
+            with self.subTest(binary="shared oracle"):
+                configuration = root / "config"
+                configuration.mkdir()
+                _ = (configuration / "style_reader.conf").write_text(
+                    "# whole: 1..\nprotocol=7\n# text:\nminimum_version=2.3.4\n")
+                self.addCleanup(style_reader.reset_reader_cache)
+                with patch.dict(os.environ, {"CONF_DIR": str(configuration)}), oracle_reader() as oracle:
+                    self.assertEqual(style_reader.reader_binary(), oracle)
+                    self.assertEqual(style_reader.reader_version_line(), "cargo-style 2.3.4 protocol 7")
+                    self.assertEqual(style_reader.read_blob_facts(repo, [blobs["one.rs"]]), {blobs["one.rs"]: one})
 
     def test_reader_failure_and_invalid_output_raise_named_errors(self) -> None:
         cases = (
@@ -261,3 +123,131 @@ class ReaderClientTests(unittest.TestCase):
                         with self.assertRaisesRegex(style_reader.ReaderError, message):
                             _ = operation()
 
+class InstalledReaderTests(unittest.TestCase):
+    root: Path = Path()
+    calls: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.root / "bin").mkdir()
+        self.calls = self.root / "calls"
+        _ = (self.root / "style_reader.conf").write_text(
+            "# one of: python, rust\nreader=rust\n# whole: 1..\nprotocol=7\n"
+            + "# text:\nminimum_version=2.3.4\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(self.root), "PATH": str(self.root / "bin")})))
+        _ = os.environ.pop("STYLE_READER_BINARY", None)
+        style_reader.reset_reader_cache()
+        self.addCleanup(style_reader.reset_reader_cache)
+
+    def installed(self, version: str, name: str = "cargo-style") -> Path:
+        """Create a version command that records every argument."""
+        binary = self.root / "bin" / name
+        _ = binary.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + shlex.quote(str(self.calls))
+            + "\nprintf '%s\\n' " + shlex.quote(version) + "\n")
+        binary.chmod(0o755)
+        return binary
+
+    def test_installed_version_passes_at_the_minimum_and_above_it(self) -> None:
+        with patch.object(subprocess, "Popen", wraps=subprocess.Popen) as processes:
+            for version in ("2.3.4", "2.3.5", "2.4.0", "3.0.0", "2.10.0"):
+                with self.subTest(version=version):
+                    style_reader.reset_reader_cache()
+                    binary = self.installed(f"cargo-style {version} protocol 7")
+                    self.assertEqual(style_reader.reader_binary(), binary)
+            self.assertEqual(processes.call_count, 5)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--version"] * 5)
+
+    def test_install_failures_name_the_state_and_install_command_without_building(self) -> None:
+        cases = (
+            ("missing", "", "missing|not found|not installed"),
+            ("older", "cargo-style 2.3.3 protocol 7", "older|too old|at least|minimum"),
+            ("protocol", "cargo-style 2.3.4 protocol 8", "protocol"),
+            ("unreadable", "not a cargo-style version", "unreadable|invalid|cannot parse|unrecognized"),
+        )
+        messages: list[str] = []
+        with patch.object(subprocess, "Popen", wraps=subprocess.Popen) as processes:
+            for state, version, pattern in cases:
+                with self.subTest(state=state):
+                    style_reader.reset_reader_cache()
+                    if version:
+                        _ = self.installed(version)
+                    with self.assertRaises(style_reader.ReaderError) as caught:
+                        _ = style_reader.reader_binary()
+                    message = str(caught.exception)
+                    self.assertRegex(message.lower(), pattern)
+                    self.assertIn("scripts/install-cargo-style.sh", message)
+                    with self.assertRaises(style_reader.ReaderError) as repeated:
+                        _ = style_reader.reader_version_line()
+                    self.assertEqual(str(repeated.exception), message)
+                    messages.append(message)
+            self.assertEqual(processes.call_count, 3)
+        self.assertEqual(len(set(messages)), 4)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--version"] * 3)
+
+    def test_explicit_binary_overrides_an_incompatible_path_binary(self) -> None:
+        _ = self.installed("cargo-style 0.0.1 protocol 99")
+        explicit = self.installed("cargo-style 2.3.4 protocol 7", "selected-reader")
+        with patch.dict(os.environ, {"STYLE_READER_BINARY": str(explicit)}):
+            self.assertEqual(style_reader.reader_binary(), explicit)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--version"])
+
+    def test_version_is_checked_once_in_each_process(self) -> None:
+        binary = self.installed("cargo-style 2.3.4 protocol 7")
+        for _ in range(3):
+            self.assertEqual(style_reader.reader_binary(), binary)
+            self.assertEqual(style_reader.reader_version_line(), "cargo-style 2.3.4 protocol 7")
+        self.assertEqual(self.calls.read_text().splitlines(), ["--version"])
+        program = (
+            "from scripts.style import style_reader\n"
+            "for _ in range(3):\n"
+            "    print(style_reader.reader_binary())\n")
+        child = subprocess.run([sys.executable, "-c", program],
+                               capture_output=True, text=True, check=True)
+        self.assertEqual(child.stdout.splitlines(), [str(binary)] * 3)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--version", "--version"])
+        for line in ("cargo-style 2.3.4 protocol 7", "invalid version"):
+            with self.subTest(concurrent_version=line):
+                style_reader.reset_reader_cache()
+                _ = self.installed(line)
+                begin = Barrier(8)
+                arrivals_lock = Lock()
+                all_arrived = Event()
+                release_version = Event()
+                arrivals = 0
+                run_command = subprocess.run
+
+                def read_once() -> Path | str:
+                    nonlocal arrivals
+                    _ = begin.wait(timeout=10)
+                    with arrivals_lock:
+                        arrivals += 1
+                        if arrivals == 8:
+                            all_arrived.set()
+                    try:
+                        return style_reader.reader_binary()
+                    except style_reader.ReaderError as error:
+                        return str(error)
+
+                def version_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    self.assertTrue(release_version.wait(timeout=10))
+                    return run_command(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+
+                with (patch.object(subprocess, "run", side_effect=version_command) as processes,
+                      ThreadPoolExecutor(max_workers=8) as executor):
+                    futures = [executor.submit(read_once) for _ in range(8)]
+                    try:
+                        self.assertTrue(all_arrived.wait(timeout=10))
+                    finally:
+                        release_version.set()
+                    observed = [future.result(timeout=10) for future in futures]
+                self.assertEqual(processes.call_count, 1)
+                self.assertEqual(len(set(observed)), 1)
+                if line == "invalid version":
+                    self.assertIn("unreadable version", str(observed[0]))
+                else:
+                    self.assertEqual(observed, [binary] * 8)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--version"] * 4)

@@ -218,7 +218,8 @@ Keep `start_timeout_seconds=120`, `idle_stop_seconds=600`, and `max_steps=1` as 
 | `enabled` | `off` | Require an explicit decision before routing Hana work. |
 | `region` | `us-east-2` | Use the supplied Ohio prices and one storage zone. |
 | `instance_type` | `m7a.2xlarge` | Provide 32 GiB RAM at the smaller supplied price. |
-| `spot_max_usd_per_hour` | `0.15` | Bound compute exposure; refuse higher prices. |
+| `spot_max_usd_per_hour` | `0.25` | Bound compute exposure and refuse higher Spot prices during setup. |
+| `spot_ceiling_margin` | `0.25` | Add this positive fraction of the current Spot price when setup suggests a new ceiling. |
 | `idle_stop_seconds` | `600` | Retain short bursts and stop through quiet periods. |
 | `start_timeout_seconds` | `120` | Bound a caller's startup wait. |
 | `max_steps` | `1` | Establish memory and slot behavior before concurrent execution. |

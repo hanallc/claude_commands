@@ -136,12 +136,16 @@ def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", 
     return PendingProducerAdmission(row["pane_id"], herdr.json_text(row.get("terminal_id"), "producer terminal"), kind, home)
 
 
+def _write_producer_reservation(request: ProducerFirstStart, pending: PendingProducerAdmission) -> None:
+    write_text_atomic(_producer_admission_path(request.name), json.dumps({
+        "pane": pending.pane, "terminal": pending.terminal, "kind": pending.kind,
+        "home": str(pending.home), "folder": str(request.folder)}))
+
+
 def _save_producer_reservation(request: ProducerFirstStart, pending: PendingProducerAdmission,
                                client: herdr.Herdr) -> None:
     try:
-        write_text_atomic(_producer_admission_path(request.name), json.dumps({
-            "pane": pending.pane, "terminal": pending.terminal, "kind": pending.kind,
-            "home": str(pending.home), "folder": str(request.folder)}))
+        _write_producer_reservation(request, pending)
     except OSError:
         _ = client.close_tab_confirmed(pending.pane, terminal=pending.terminal)
         raise
@@ -379,13 +383,24 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
                 live = herdr.read_conversation(pane_record.resume_launch(retained)["session_id"], kind)
                 if not isinstance(live, herdr.StoppedConversation):
                     raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
+            shell_setup = ":"
             if kind == "claude":
-                herdr.trust_claude_launch(request.folder, pending.home)
                 from scripts.whoami.account import named_account_environment
 
+                if recovering_admission:
+                    if not to:
+                        selected = member_account.producer_account(kind)
+                        assert isinstance(selected, accounts.NamedAccount)
+                        if selected.dir.resolve() != pending.home.resolve():
+                            pending = replace(pending, home=selected.dir)
+                            _write_producer_reservation(request, pending)
+                    # A retry can follow an interruption between the write and the shell update.
+                    exports = shlex.join([f"{key}={value}" for key, value in named_account_environment(pending.home).items()])
+                    shell_setup = f"export {exports}"
+                herdr.trust_claude_launch(request.folder, pending.home)
                 arguments = models_registry.claude_arguments(arguments,
                     herdr.agent_base_environment(named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
-            client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + ":"], terminal=pending.terminal)
+            client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
                 int(conf.read("shutdown").number("START_SECONDS") * 1000), agent=request.name)

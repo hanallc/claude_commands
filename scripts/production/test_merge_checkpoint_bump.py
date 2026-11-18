@@ -249,7 +249,7 @@ class CheckpointBumpTests(MergeCheckpointFixture):
                     and row.reports_to(owner.id))
         self.assertEqual(record["unit_id"], str(unit.id))
         row = unit if renamed == "unit" else owner
-        _ = staff.rename(row.id, "renamed-" + renamed)
+        _ = staff.rename(row.id, "renamed-" + ("alpha" if renamed == "unit" else renamed))
         self.move_bump_recipients()
         resumed = self.launch_competing_bump_gate(original.head)
         self.wait_competing_bump_gate(resumed)

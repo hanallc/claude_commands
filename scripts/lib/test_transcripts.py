@@ -1,15 +1,27 @@
 """Read plain and compressed transcripts through the same interface."""
 from pathlib import Path
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 from scripts.lib.transcript_test_support import compressed_copy
-from scripts.lib.transcripts import codex_transcript_homes, open_transcript, transcript_paths
+from scripts.lib.transcripts import codex_transcript_homes, compressed_transcript_lines, open_transcript, transcript_paths
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_compressed_lines_stream_in_order_and_report_a_decoder_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            content = b'{"message":"one"}\n{"message":"two"}'
+            _ = path.write_bytes(content)
+            archive = compressed_copy(path)
+            self.assertEqual(list(compressed_transcript_lines(archive)), content.splitlines(keepends=True))
+            _ = archive.write_bytes(b"invalid compressed data")
+            with self.assertRaises(subprocess.CalledProcessError):
+                _ = list(compressed_transcript_lines(archive))
+
     def test_missing_transcript_raises_file_not_found_for_plain_and_compressed_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

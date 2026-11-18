@@ -6,12 +6,15 @@ import html
 import json
 import re
 import time
+from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 ICONS = Path(__file__).with_name("lucide")
+QUESTION_WAITING = "The {owner_role} will answer this"
 
 
 def icon_svg(name: str) -> str:
@@ -171,6 +174,22 @@ def code_block_html(block: re.Match[str]) -> str:
             + '</code></pre>' + COPY_BUTTON + '</div>')
 
 
+def render_code_blocks(text: str, render_text: Callable[[str], str]) -> str:
+    """Render code blocks and pass the text between them to the caller's renderer."""
+    content: list[str] = []
+    start = 0
+    for block in CODE_BLOCK.finditer(text):
+        before = text[start:block.start()]
+        if before.strip():
+            content.append(render_text(before))
+        content.append(code_block_html(block))
+        start = block.end()
+    after = text[start:]
+    if after.strip() or not content:
+        content.append(render_text(after))
+    return "".join(content)
+
+
 # The title, status and content share one centered column and page background.
 # A text page keeps a 1124 px column; a page whose main has the page-wide class uses the pane width.
 # A page that measures its layout uses the desktop gutter.
@@ -205,11 +224,17 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''')
 
-def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "") -> str:
+class ReturningActionHeading(StrEnum):
+    ITEM_RETURNS = "The item returns to you"
+    SENDS_TO_SHOWRUNNER = "Sends to showrunner"
+
+
+def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,
+                         returning_heading: ReturningActionHeading = ReturningActionHeading.ITEM_RETURNS) -> str:
     """Render the Review action groups that have controls."""
     groups = (
         ("Closes the item", closing_buttons, "", ""),
-        ("The item returns to you", returning_buttons, "", ""),
+        (returning_heading, returning_buttons, "", ""),
         ("Hides it until", later_controls, " review-later", ' class="later-menu"'),
     )
     return '<div class="review-actions">' + "".join(

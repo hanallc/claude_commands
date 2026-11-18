@@ -506,7 +506,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
     except accounts.AccountsError as error:
         messages.append(f"roles: {error}")
         groups = None
-    group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"))
+    group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"), ("producers", "producer"))
     sessions = session_table.live_sessions(os.environ)
     machines_seen: dict[str, str] = {}
     if isinstance(sessions, session_table.SessionsUnread):

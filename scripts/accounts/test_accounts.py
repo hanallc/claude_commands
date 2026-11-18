@@ -356,7 +356,7 @@ class AccountsTests(unittest.TestCase):
                 self.main_dir if tool == "claude" else self.home / ".codex3", 1,
                 accounts.KnownReset(now + timedelta(days=1)))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
-              patch.object(sessions, "running_records", return_value=[owner]),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("scripts.message.sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
               patch.object(accounts, "pick", side_effect=chosen),
@@ -434,7 +434,7 @@ class AccountsTests(unittest.TestCase):
         # Each run stores a usage reading at the current time; the two outputs must match.
         with (patch.object(accounts, "datetime", RoleWriteTime),
               patch.object(sessions, "live_sessions", return_value=[owner]),
-              patch.object(sessions, "running_records", return_value=[owner]),
+              patch.object(sessions, "running_sessions", return_value=[owner]),
               patch.object(import_module("scripts.message.sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir))):
             summary = self.run_cli()
@@ -509,7 +509,7 @@ class AccountsTests(unittest.TestCase):
                   patch.object(staff, "local_snapshot", side_effect=failure),
                   patch.object(pane_launch, "record_directory", return_value=records),
                   patch.object(sessions, "live_sessions", return_value=[owner]),
-                  patch.object(sessions, "running_records", return_value=[owner]),
+                  patch.object(sessions, "running_sessions", return_value=[owner]),
                   patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations((
                       inventory.ShowrunnerRegistration("runner", "runner", ""),))),
                   patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.main_dir)),
@@ -617,9 +617,12 @@ class AccountsTests(unittest.TestCase):
         units = accounts.RoleSessionCountsDocument(busy=2, idle=0, paused=0, exited=1, total=3)
         runners_count = accounts.RoleSessionCountsDocument(busy=0, idle=1, paused=0, exited=0, total=1)
         selected_runners = accounts.RoleSessionCountsDocument(busy=0, idle=1, paused=0, exited=1, total=2)
+        no_producers = accounts.RoleSessionCountsDocument(busy=0, idle=0, paused=0, exited=0, total=0)
         cases: tuple[tuple[str, dict[str, tuple[list[str], list[accounts.RoleSessionCountsDocument]]]], ...] = (
-            ("claude2", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": (["showrunners"], [selected_runners])}),
-            ("claude1", {"claude1": (["units", "showrunners"], [units, selected_runners]), "claude2": (["showrunners"], [runners_count])}),
+            ("claude2", {"claude1": (["units", "showrunners"], [units, runners_count]),
+                         "claude2": (["showrunners", "producers"], [selected_runners, no_producers])}),
+            ("claude1", {"claude1": (["units", "showrunners", "producers"], [units, selected_runners, no_producers]),
+                         "claude2": (["showrunners"], [runners_count])}),
         )
         def live_directory(pid: int) -> account.ConfiguredClaudeFolder:
             identity = next(owner["sessionId"] for owner in owners if owner["pid"] == pid)
@@ -632,7 +635,7 @@ class AccountsTests(unittest.TestCase):
             _ = accounts.set_group_account("units", "claude1", why="fixture")
             _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
             with (self.subTest(runner_label=runner_label),
-                  patch.object(sessions, "running_records", return_value=owners),
+                  patch.object(sessions, "running_sessions", return_value=owners),
                   patch.object(staff, "local_snapshot", return_value=membership),
                   patch.object(pane_launch, "record_directory", return_value=records),
                   patch.object(accounts, "_session_config_dir", side_effect=live_directory),
@@ -681,7 +684,7 @@ class AccountsTests(unittest.TestCase):
         before = Path(os.environ["STAFF_FILE"]).read_bytes()
         with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH}),
               patch.object(staff, "local_snapshot", return_value=membership),
-              patch.object(sessions, "running_records", return_value=live),
+              patch.object(sessions, "running_sessions", return_value=live),
               patch.object(pane_launch, "record_directory", return_value=self.root / "private-launches"),
               patch.object(session_staff, "pane_parents", return_value=()),
               patch.object(session_state, "running_detached_work", return_value=session_state.NO_DETACHED_WORK),
@@ -702,8 +705,8 @@ class AccountsTests(unittest.TestCase):
             (self.home / ".claude4", "showrunners"): {runner.current_session: "busy"},
             (self.home / ".codex2", "producers"): {codex.current_session: "idle", paused.current_session: "paused"},
             (self.home / ".codex1", "producers"): {stopped.current_session: "exited"}})
-        self.assertEqual({member.session_id for member in observed.members["showrunners"]},
-                         {claude.current_session, runner.current_session})
+        self.assertEqual({member.session_id for member in observed.members["showrunners"]}, {runner.current_session})
+        self.assertEqual({member.session_id for member in observed.members["producers"]}, {claude.current_session})
         self.assertIn("producer fixture-unmapped: unmapped fixture", observed.session_lines)
         publish = cast(Callable[[dict[tuple[Path, str], dict[str, session_state.SessionState]]], accounts.MachineSessionCounts],
                        getattr(accounts, "_session_counts_document"))
@@ -724,17 +727,17 @@ class AccountsTests(unittest.TestCase):
             "producer-claude": "claude:opus:max", "producer-codex": "codex:gpt-test:high"}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "PATH": MODELS_RESOLVER_PATH})))
         cases: tuple[tuple[staff.Kind, accounts.ClaudeGroup, str, str, str], ...] = (
-            ("unit", "units", "claude", "", ""), ("producer", "showrunners", "claude", "", ""),
-            ("producer", "showrunners", "codex", "", ""),
-            ("unit", "units", "claude", "live", ""), ("producer", "showrunners", "claude", "live", ""),
-            ("unit", "units", "claude", "stopped", ""), ("producer", "showrunners", "claude", "stopped", ""),
+            ("unit", "units", "claude", "", ""), ("producer", "producers", "claude", "", ""),
+            ("producer", "producers", "codex", "", ""),
+            ("unit", "units", "claude", "live", ""), ("producer", "producers", "claude", "live", ""),
+            ("unit", "units", "claude", "stopped", ""), ("producer", "producers", "claude", "stopped", ""),
             ("unit", "units", "claude", "", "paused"),
             ("showrunner", "showrunners", "claude", "", "paused"),
             ("unit", "units", "claude", "", "wrapped"),
             ("showrunner", "showrunners", "claude", "", "retired"),
             ("unit", "units", "claude", "", "remote document"),
             ("showrunner", "showrunners", "claude", "", "remote worktree"),
-            ("producer", "showrunners", "claude", "", "paused"))
+            ("producer", "producers", "claude", "", "paused"))
         for kind, group, family, missing_settings, state in cases:
             with self.subTest(kind=kind, family=family, missing_settings=missing_settings, state=state):
                 member = (unit_membership("fixture", "models") if kind == "unit" else
@@ -769,7 +772,6 @@ class AccountsTests(unittest.TestCase):
                             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy"))
                 membership = staff.StaffSnapshot(tuple(members))
                 with (patch.object(staff, "local_snapshot", return_value=membership),
-                      patch.object(sessions, "running_records", return_value=live),
                       patch.object(sessions, "running_sessions", return_value=live),
                       patch.object(pane_launch, "record_directory", return_value=records),
                       patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(self.home / ".claude4")),
@@ -778,6 +780,11 @@ class AccountsTests(unittest.TestCase):
                     reading = accounts.read_status(source=accounts.StoredUsageOnly())
                     with redirect_stderr(io.StringIO()) as errors:
                         result = accounts.move_group(group, "claude2", dry_run=True)
+                    if kind == "producer":
+                        runners = accounts.move_group("showrunners", "claude2", dry_run=True)
+                        self.assertIsInstance(runners, accounts.GroupMoveDryRun)
+                        assert isinstance(runners, accounts.GroupMoveDryRun)
+                        self.assertEqual(runners.session_ids, ())
                     unproved = result
                     if state:
                         with patch.object(accounts, "_session_config_dir", return_value=account.ProcessEnvironmentUnread("fixture")):
@@ -796,7 +803,10 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 0, "paused": 1, "exited": 0, "idle": 0, "total": 1}])
                 else:
                     self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}] if family == "claude" else [])
-                self.assertEqual(rows["claude2"]["role_counts"], [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
+                selected_roles = [group, "producers"] if group == "showrunners" else [group]
+                self.assertEqual(rows["claude2"]["roles"], selected_roles)
+                self.assertEqual(rows["claude2"]["role_counts"],
+                                 [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}] * len(selected_roles))
                 self.assertIsInstance(result, accounts.GroupMoveDryRun)
                 assert isinstance(result, accounts.GroupMoveDryRun)
                 if kind == "producer" and state == "paused":
@@ -844,6 +854,9 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(row["role_counts"][row["roles"].index("units")],
                          {"state": "unknown", "reason": "Claude session registry unreadable"})
         self.assertEqual(document["board"]["rows"][-1]["cells"]["total"][0]["text"], "unknown")
+        for direction in ("total", "total-reverse"):
+            order = accounts.account_board_sort_orders(status, document["board"])[direction]
+            self.assertEqual([entry["index"] for entry in order], [0])
         self.assertEqual((published_code, published_error), (0, ""))
         local = "mac" if remote.other_machine() == "natedev" else "natedev"
         self.assertIs(decode_session_counts(published, local).get("claude_registry_unreadable"), True)
@@ -885,6 +898,9 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(cells["total"][0]["text"], "unknown")
                 for column in ("busy", "idle", "paused", "exited"):
                     self.assertEqual(cells[column][0]["text"], "")
+                model_totals = accounts.models_board(status, {}).rows[-1]["cells"]
+                self.assertEqual([model_totals[column][0]["text"] for column in accounts.MODEL_COUNT_COLUMNS],
+                                 ["unknown"] * len(accounts.MODEL_COUNT_COLUMNS))
 
     def test_unreadable_peer_registry_keeps_combined_claude_counts_unknown(self) -> None:
         local = accounts.RoleSessionCounts(1, 2, 0, 0)
@@ -892,11 +908,21 @@ class AccountsTests(unittest.TestCase):
                       roles=("units",), role_counts=(local,))
         now = datetime.now(timezone.utc)
         peer = remote.other_machine()
-        atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
-            "machine": peer, "at": now.isoformat(), "accounts": {}, "claude_registry_unreadable": True}))
+        publish = cast(Callable[..., accounts.MachineSessionCounts], getattr(accounts, "_session_counts_document"))
+        folder = self.home / ".claude1"
+        members: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {(folder, "units"): {"unit": "busy"}}
+        models = {(folder, "unit"): accounts.ObservedSessionModel("claude-opus-5-5", "high")}
+        unreadable = publish(members, models=models, claude_registry_unreadable=True)
+        self.assertEqual(unreadable["accounts"], {})
+        self.assertNotIn("models", unreadable)
+        document = publish(members, models=models)
+        document.update(machine=peer, at=now.isoformat(), claude_registry_unreadable=True)
+        atomic_file.write_text_atomic(session_counts_cache(), json.dumps(document))
         counts = machine_role_counts((row,), now)
         rows, problems = counts.rows, counts.problems
         self.assertEqual(rows[0].role_counts, (accounts.UnknownRoleCounts(),))
+        self.assertEqual(rows[0].role_counts_by_machine[peer], {})
+        self.assertEqual(rows[0].models_by_role, {})
         self.assertEqual(problems, (f"{peer}: Claude session registry unreadable. Claude session counts are unknown.",))
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
@@ -926,7 +952,7 @@ class AccountsTests(unittest.TestCase):
 
         membership = staff.local_snapshot()
         with (patch.object(staff, "local_snapshot", return_value=membership) as staff_read,
-              patch.object(sessions, "running_records", return_value=[*live, live[0]]),
+              patch.object(sessions, "running_sessions", return_value=[*live, live[0]]),
               patch.object(sessions, "read_registry", wraps=sessions.read_registry) as registry_read,
               patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(pane_launch, "record_directory", return_value=records),
@@ -938,11 +964,12 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(settings_read.call_count, 3)
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         rows = {row["label"]: row for row in document["accounts"]}
-        self.assertEqual(rows["claude2"]["roles"], ["units", "showrunners"])
-        self.assertEqual(rows["claude2"]["selected_roles"], ["units", "showrunners"])
+        self.assertEqual(rows["claude2"]["roles"], ["units", "showrunners", "producers"])
+        self.assertEqual(rows["claude2"]["selected_roles"], ["units", "showrunners", "producers"])
         self.assertEqual(rows["claude2"]["role_counts"], [
             {"busy": 1, "paused": 0, "exited": 1, "idle": 0, "total": 2},
-            {"busy": 0, "paused": 0, "exited": 1, "idle": 0, "total": 1}])
+            {"busy": 0, "paused": 0, "exited": 1, "idle": 0, "total": 1},
+            {"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
         self.assertEqual(rows["claude4"]["roles"], ["units"])
         self.assertEqual(rows["claude4"]["selected_roles"], [])
         self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 2, "idle": 0, "paused": 0, "exited": 0, "total": 2}])
@@ -994,7 +1021,7 @@ class AccountsTests(unittest.TestCase):
                     snapshot = staff.StaffSnapshot((member, parent) if parent is not None else (member,))
                     process_args = ["python3", "detached_runs.py", "supervise", str(run_path)] if supervisor == "live" else []
                     with (patch.object(staff, "local_snapshot", return_value=snapshot),
-                          patch.object(sessions, "running_records", return_value=observed),
+                          patch.object(sessions, "running_sessions", return_value=observed),
                           patch.object(pane_launch, "record_directory", return_value=records),
                           patch.object(accounts, "_session_config_dir", side_effect=live_directory),
                           patch.object(detached_run_process, "process_args", return_value=process_args),
@@ -1107,20 +1134,21 @@ class AccountsTests(unittest.TestCase):
         _ = accounts.set_group_account("showrunners", "claude4", why="fixture")
         records = self.root / "no-launch-records"
         records.mkdir()
-        with (patch.object(sessions, "running_records", return_value=[]),
+        with (patch.object(sessions, "running_sessions", return_value=[]),
               patch.object(pane_launch, "record_directory", return_value=records),
               patch.object(accounts, "_local_codex_processes", return_value={})):
             reading = accounts.read_status(source=accounts.StoredUsageOnly(), detail=True)
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         rows = {row["label"]: row for row in document["accounts"]}
         exited = {"busy": 0, "idle": 0, "paused": 0, "exited": 1, "total": 1}
-        for label in ("claude2", "claude4"):
-            self.assertEqual(rows[label]["role_counts"], [exited])
+        self.assertEqual(rows["claude2"]["role_counts"], [exited])
+        self.assertEqual(rows["claude4"]["role_counts"], [exited,
+            {"busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
         self.assertEqual(rows["codex2"]["role_counts"], [
             {"busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
         self.assertEqual(rows["codex1"]["roles"], ["spare"])
         self.assertNotIn("shell", accounts.render_status_table(reading))
-        with (patch.object(sessions, "running_records", return_value=[]),
+        with (patch.object(sessions, "running_sessions", return_value=[]),
               patch.object(pane_launch, "record_directory", return_value=records),
               patch.object(accounts, "_local_codex_processes", return_value={
                   worker.current_session: accounts.CodexRoleProcess(990, "busy")}) as native,
@@ -1200,7 +1228,7 @@ class AccountsTests(unittest.TestCase):
                         messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status=activity)
                     process_args = ["python3", "detached_runs.py", "supervise", str(run_path)] if supervisor == "live" else []
                     with (patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}),
-                          patch.object(sessions, "running_records", return_value=[observed] if family == "claude" else []),
+                          patch.object(sessions, "running_sessions", return_value=[observed] if family == "claude" else []),
                           patch.object(pane_launch, "record_directory", return_value=records),
                           patch.object(session_staff, "pane_parents", return_value=[member]
                               if ownership == "pane" and family == "codex" else []),
@@ -1270,7 +1298,7 @@ class AccountsTests(unittest.TestCase):
         for here, peer in (("natedev", "mac"), ("mac", "natedev")):
             with (self.subTest(here=here), patch.object(remote, "local_machine", return_value=here),
                   patch.object(remote, "other_machine", return_value=peer),
-                  patch.object(sessions, "running_records", return_value=[]),
+                  patch.object(sessions, "running_sessions", return_value=[]),
                   patch.object(role_map, "ssh_role_map", side_effect=AssertionError("status waited on ssh"))):
                 published = session_counts_document({(self.home / ".claude1", "units"):
                     {"one": "busy", "two": "exited", "three": "idle", "four": "idle"}})
@@ -1509,7 +1537,7 @@ class AccountsTests(unittest.TestCase):
         from scripts.message import sessions
         peer = remote.other_machine()
         before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
-        with (patch.object(sessions, "running_records", return_value=[]),
+        with (patch.object(sessions, "running_sessions", return_value=[]),
               patch.object(role_map, "ssh_role_map", side_effect=AssertionError("role fetch")),
               patch.object(accounts, "account_statuses", side_effect=AssertionError("account read")),
               patch.object(subprocess, "run", side_effect=AssertionError("network or process probe"))):
@@ -1582,11 +1610,14 @@ class AccountsTests(unittest.TestCase):
     def test_status_notes_each_missing_group_and_uses_roles_for_configured_groups(self) -> None:
         self.login_directory("claude1", "unit@example.invalid")
         self.login_directory("claude3", "runner@example.invalid")
-        for configured in ((), ("units",), ("units", "showrunners")):
+        self.login_directory("claude2", "producer@example.invalid")
+        groups: tuple[accounts.ClaudeGroup, ...] = accounts.CLAUDE_GROUPS
+        labels = {"units": "claude1", "showrunners": "claude3", "producers": "claude2"}
+        for configured in ((), ("units",), ("units", "showrunners"), groups):
             with self.subTest(configured=configured):
                 for group in accounts.CLAUDE_GROUPS:
                     if group in configured:
-                        _ = accounts.set_group_account(group, "claude1" if group == "units" else "claude3", why="fixture")
+                        _ = accounts.set_group_account(group, labels[group], why="fixture")
                 code, output, error = self.run_cli("status")
                 self.assertEqual((code, error), (0, ""))
                 json_code, document, json_error = self.run_cli("status", "--json")
@@ -1598,13 +1629,19 @@ class AccountsTests(unittest.TestCase):
                 for group in accounts.CLAUDE_GROUPS:
                     note = f"{group}: not configured; the role map selects no account; run accounts.py move {group} <claudeN>"
                     missing = group not in configured
-                    self.assertEqual(output.splitlines().count(note), int(missing))
-                    self.assertEqual(problems.count(note), int(missing))
-                    label = "claude1" if group == "units" else "claude3"
+                    expected_note = int(missing and group != "producers")
+                    self.assertEqual(output.splitlines().count(note), expected_note)
+                    self.assertEqual(problems.count(note), expected_note)
+                    label = labels[group]
                     row = next(row for row in rows if row[1] == label)
                     json_row = next(row for row in json_rows if row["label"] == label)
                     self.assertEqual(row[2], "" if missing else f"{group} ✓ 0 (busy 0, idle 0, paused 0, exited 0)")
-                    self.assertEqual(json_row["roles"], [] if missing else [group])
+                    expected_roles = ([] if missing else [group, "producers"]
+                                      if group == "showrunners" and "producers" not in configured else [group])
+                    self.assertEqual(json_row["roles"], expected_roles)
+                    if expected_roles == ["showrunners", "producers"]:
+                        self.assertIn("producers ✓ (from showrunners) 0 (busy 0, idle 0, paused 0, exited 0)",
+                                      [cells[2] for cells in rows])
                 if not configured:
                     self.assertFalse(accounts.groups_file().exists())
 
@@ -1614,7 +1651,7 @@ class AccountsTests(unittest.TestCase):
         _ = accounts.set_group_account("units", "claude1", why="fixture", now=datetime.now(timezone.utc))
         self.assertEqual(accounts.group_note_labels(), {"units": "claude1"})
         _ = accounts.set_group_account("showrunners", "claude3", why="fixture", now=datetime.now(timezone.utc))
-        self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3"})
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3", "producers": "claude3"})
 
     def test_group_note_labels_resolve_a_stored_default_from_its_actual_login(self) -> None:
         self.write_note("claude2", "home@example.invalid")
@@ -5368,6 +5405,30 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertIn("units 1: at 1% → claude2, hold half a point", output)
         self.assertEqual(next_moves.read_next_moves(), (first, worker, second))
 
+    def test_mac_next_read_gets_the_whole_queue_and_reports_unknown_groups(self) -> None:
+        now = datetime.now(timezone.utc)
+        unit = next_moves.ClaudeGroupMove("unit", "units", 1, 0, "claude2", now)
+        runner = next_moves.ClaudeGroupMove("runner", "showrunners", 1, 0, "claude3", now)
+        known = cast(list[dict[str, object]], json.loads(next_moves.encode_next_moves((unit, runner))))
+        future = {"id": "future", "group": "future-role", "hold_mode": "future-mode"}
+        stored = json.dumps([known[0], future, known[1]], indent=2)
+        path = next_moves.next_moves_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(stored, encoding="utf-8")
+
+        with patch.object(role_map, "is_role_map_host", return_value=True):
+            code, output, error = self.run_cli("next-read")
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(subprocess, "run",
+                           return_value=subprocess.CompletedProcess([], code, stdout=output, stderr=error)) as ssh,
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(next_moves.read_next_moves(), (unit, runner))
+        ssh.assert_called_once_with(("ssh", "-o", "BatchMode=yes", role_map.ROLE_MAP_HOST,
+            "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py next-read"),
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(errors.getvalue().splitlines(), ["next: anomaly: skipped entries for unknown groups 'future-role'"])
+        self.assertEqual((code, output, error), (0, stored, ""))
+
     def test_mac_half_point_add_and_hold_resolve_positions_on_the_host(self) -> None:
         self.login_directory("claude2", "target@example.invalid")
         first = next_moves.add_next_move("units", 1, "claude2", 5)
@@ -5933,6 +5994,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units ✓ 0 (busy 0, idle 0, paused 0, exited 0)")
         self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
                          ["", "", "showrunners ✓ 0 (busy 0, idle 0, paused 0, exited 0)", "", "", "", "", "", ""])
+        self.assertEqual([cell.strip() for cell in lines[index + 2].strip("|").split("|")],
+                         ["", "", "producers ✓ (from showrunners) 0 (busy 0, idle 0, paused 0, exited 0)", "", "", "", "", "", ""])
 
     def test_board_shows_upcoming_moves_between_the_table_and_problems(self) -> None:
         _ = next_moves.add_next_move("units", 1, "claude4")
@@ -6096,7 +6159,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
             ("claude1", "claude", [], None, None, None, False, None),
             ("claude2", "claude", ["units"], 70.6, reset.isoformat(), None, False, read.isoformat()),
-            ("claude3", "claude", ["showrunners"], 12, reset.isoformat(), None, False, read.isoformat()),
+            ("claude3", "claude", ["showrunners", "producers"], 12, reset.isoformat(), None, False, read.isoformat()),
             ("claude4", "claude", [], None, None, None, False, None),
             ("codex1", "codex", ["workers"], 0, reset.isoformat(), 13446.5, False, read.isoformat()),
             ("codex2", "codex", ["spare"], None, None, None, True, None),
@@ -6120,7 +6183,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         changed = cast(list[dict[str, object]], json.loads(output)["accounts"])
-        self.assertEqual([row["roles"] for row in changed[:4]], [[], [], ["units", "showrunners"], []])
+        self.assertEqual([row["roles"] for row in changed[:4]], [[], [], ["units", "showrunners", "producers"], []])
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_real_codex_history_file_has_the_same_repair_line_in_the_table_and_json_problems(self) -> None:
@@ -7197,7 +7260,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 self.assertEqual(stdout, "")
                 self.assertEqual(
                     stderr,
-                    "accounts: unknown is not a role; only unit, showrunner and workers are supported\n",
+                    "accounts: unknown is not a role; only unit, showrunner, producer and workers are supported\n",
                 )
 
     def workers_fixture(self) -> tuple[Path, Path]:
@@ -8807,7 +8870,7 @@ class PickerTests(unittest.TestCase):
         original = path.read_bytes()
         groups = accounts.group_accounts()
         self.assertEqual(accounts.group_label(groups, "units"), "claude1")
-        self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3"})
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3", "producers": "claude3"})
         self.assertIsInstance(accounts.group_transition("units"), accounts.NoGroupTransition)
         self.assertEqual(path.read_bytes(), original)
         transition = accounts.set_group_account("units", "claude2", why="operator choice", now=self.now)
@@ -8819,7 +8882,7 @@ class PickerTests(unittest.TestCase):
         self.assertTrue(selection["move_id"])
         self.assertEqual(stored["showrunners"], "claude3")
         self.assertEqual(accounts.group_transition("units"), transition)
-        self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3", "producers": "claude3"})
 
     def test_historical_transition_reason_is_unavailable_only_when_the_field_is_absent(self) -> None:
         path = self.groups()
@@ -8964,7 +9027,7 @@ class PickerTests(unittest.TestCase):
             self.assertIn("claude2", stdout)
             self.assertNotRegex(stdout, r"\bdefault\b")
             self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3", "producers": "claude3"})
         _ = accounts.set_group_account("showrunners", "claude1", why="numbered selection", now=self.now)
         self.assertEqual(stored_group_labels(path), {"units": "default", "showrunners": "claude1"})
 
@@ -9218,7 +9281,7 @@ class PickerTests(unittest.TestCase):
     def test_placement_showrunners_choose_most_weekly_left(self) -> None:
         result = accounts.placement("showrunners", self.now, exclude=frozenset())
         self.assertEqual(result.label, "claude1")
-        self.assertIsInstance(result.reason, accounts.ShowrunnersMostLeft)
+        self.assertIsInstance(result.reason, accounts.MostWeeklyQuotaLeft)
 
     def test_placement_no_room_stays_on_stored_group_account(self) -> None:
         path = self.groups()

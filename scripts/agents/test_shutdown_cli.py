@@ -51,6 +51,7 @@ from scripts.production.staff import StaffId
 from scripts.production.staff_test_support import (
     foreign_hostname,
     fixture_member,
+    fixture_unit_saved_name,
     fixture_worker,
     StaffTestCase,
     fixture_runtime_id,
@@ -760,6 +761,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         call = [Path(argv[1]).name, *argv[2:]] if argv[0] == sys.executable else argv
         self.calls.append(call)
         if call[:2] == ["build_hold.py", "release"]:
+            self.assertEqual(Path(argv[1]), Path(shutdown.__file__).resolve().parents[1] / "build_hold/build_hold.py")
             (Path(os.environ["BUILD_HOLD_DIR"]) / call[call.index("--holder") + 1]).unlink(missing_ok=True)
         stdout = ""
         return subprocess.CompletedProcess(argv, 0, stdout, "")
@@ -1376,6 +1378,32 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
                 start.assert_not_called()
         self.assertEqual((self.staff.staff_file.read_bytes(), self.parked_facts().read_bytes()), before)
         self.assertEqual(self.calls, [])
+
+    def test_retired_resume_refuses_the_old_name_before_restoring_the_unit(self) -> None:
+        row = unit_membership("alpha", "alpha")
+        legacy = fixture_unit_saved_name(row, "alpha-unit")
+        parked = unit_config.parked_path(row.id)
+        before = self.staff.staff_state(), parked.read_bytes()
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+            code = shutdown.main(["resume", legacy.name, "--retired"])
+        self.assertEqual((code, output.getvalue(), error.getvalue()),
+                         (2, "", "StaffRefused: unit name 'alpha-unit' must not end in -unit\n"))
+        self.assertEqual((self.staff.staff_state(), parked.read_bytes()), before)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_retired_resume_accepts_an_underscore_in_the_unit_name(self) -> None:
+        row = unit_membership("alpha", "alpha")
+        renamed = staff.rename(row.id, "alpha_unit")
+        record = staff.initial_snapshot()
+        unit = shutdown.recovery_find_unit("alpha", renamed.name, record=record)
+        assert isinstance(unit, shutdown.RetiredUnitRecovery)
+        unit = replace(unit, branch="alpha-alpha-unit")
+        with redirect_stdout(io.StringIO()) as output:
+            code = shutdown.recovery_resume(unit, record)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("alpha_unit resumed", output.getvalue())
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), unit.branch)
 
     def test_resume_restores_retained_workers(self) -> None:
         from scripts.production import worker
@@ -2355,7 +2383,7 @@ class WorkerRenameTests(StaffTestCase):
     def test_worker_id_rename_keeps_the_full_pane_label_and_shared_tab(self) -> None:
 
         owner = fixture_member("showrunner", name="TEST-owner")
-        unit = fixture_member("unit", name="TEST-unit", parent=owner.id)
+        unit = fixture_member("unit", name="TEST-member", parent=owner.id)
         for kind in ("claude", "codex"):
             with self.subTest(kind=kind):
                 backend = (staff.ClaudeBackend() if kind == "claude"
@@ -2376,7 +2404,7 @@ class WorkerRenameTests(StaffTestCase):
     def test_unavailable_worker_pane_keeps_the_staff_rename_and_reports_one_anomaly(self) -> None:
 
         owner = fixture_member("showrunner", name="TEST-owner")
-        unit = fixture_member("unit", name="TEST-unit", parent=owner.id)
+        unit = fixture_member("unit", name="TEST-member", parent=owner.id)
         row = fixture_worker("TEST-worker", unit.id)
         arguments = ["rename", str(row.id), "TEST-renamed"]
         with mock.patch.object(herdr.Herdr, "retitle_row", side_effect=herdr_types.HerdrFailure("pane unavailable")):
@@ -2975,6 +3003,21 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertFalse(folder.with_name("claude-demo-alpha-unit").exists())
         self.assertEqual(self.git("branch", "--show-current", cwd=folder), "demo-alpha")
         self.assertEqual((backend.starts, backend.stops), ([], []))
+
+    def test_rename_refuses_the_reserved_suffix_in_the_plan_and_apply(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        path = f"demo/{row.name}-unit"
+        before = file_versions(self.root)
+        self.assertEqual(shutdown.rename_plan(path, row.name).member, row)
+        with self.subTest(stage="plan"):
+            with self.assertRaisesRegex(staff.StaffRefused, "^unit name 'x-unit' must not end in -unit$"):
+                _ = shutdown.rename_plan(path, "x-unit")
+            self.assertEqual(file_versions(self.root), before)
+        with self.subTest(stage="apply"):
+            result = self.rename(old=f"{row.name}-unit", new="x-unit")
+            self.assertEqual((result.returncode, result.stdout, result.stderr),
+                             (2, "", "StaffRefused: unit name 'x-unit' must not end in -unit\n"))
+            self.assertEqual(file_versions(self.root), before)
 
     def test_explicit_branch_change_keeps_the_staff_row(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
@@ -3803,7 +3846,7 @@ class StartupRenameTests(FolderRenameFixture):
         super().setUp()
         _ = self.enterContext(mock.patch.object(shutdown, "rename_send_notice"))
         _ = self.enterContext(mock.patch.object(shutdown, "rename_repair_displays", return_value=False))
-        _ = staff.rename(self.owner.id, "startup-unit")
+        _ = fixture_unit_saved_name(self.owner, "startup-unit")
 
     def restore_startup_name(self) -> subprocess.CompletedProcess[str]:
         arguments = ["rename", str(self.owner.id), "startup"]
