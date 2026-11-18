@@ -128,6 +128,15 @@ class FilterControlTests(unittest.TestCase):
         self.assertIn('aria-pressed="false" data-filter-count="2">All<b>2</b>', row)
         self.assertIn('aria-pressed="true" data-filter-count="0"><span>One</span><b>0</b>', row)
         self.assertIn('data-filter-count="">Two<b></b>', row)
+        self.assertEqual(row,
+                         '<div class="record-filter-row" role="group" aria-label="Owner" data-filter-row="owner">'
+                         + '<span aria-hidden="true">Owner</span><div>'
+                         + '<button type="button" id="filter-owner-all" data-filter-value="all" aria-pressed="false"'
+                         + ' data-filter-count="2">All<b>2</b></button>'
+                         + '<button type="button" id="filter-owner-one" data-filter-value="one" aria-pressed="true"'
+                         + ' data-filter-count="0"><span>One</span><b>0</b></button>'
+                         + '<button type="button" id="filter-owner-two" data-filter-value="two" aria-pressed="false"'
+                         + ' data-filter-count="">Two<b></b></button></div></div>')
         self.assertIn('aria-label="Filter by &quot;words&quot;"',
                       record_table.words_box('review-search', 'Filter by "words"'))
 

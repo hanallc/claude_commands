@@ -31,9 +31,19 @@ def chip_row(name: str, chips: Iterable[Chip], selected: str) -> str:
         buttons.append(f'<button type="button" id="filter-{html.escape(key, quote=True)}-{quote(chip.value, safe="")}"'
                        + f' data-filter-value="{value}" aria-pressed="{pressed}" data-filter-count="{count}">'
                        + f'{chip.label_html}<b>{count}</b></button>')
+    return labelled_chip_row(name, ''.join(buttons), filter_key=key)
+
+
+def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '') -> str:
+    """Render a visible label and a group of filter buttons."""
     label = html.escape(name, quote=True)
-    return (f'<div class="record-filter-row" role="group" aria-label="{label}" data-filter-row="{html.escape(key, quote=True)}">'
-            + f'<span aria-hidden="true">{label}</span><div>' + ''.join(buttons) + '</div></div>')
+    group = f' role="group" aria-label="{label}"'
+    key = f' data-filter-row="{html.escape(filter_key, quote=True)}"' if filter_key else ''
+    classes = f' class="{html.escape(chip_classes, quote=True)}"' if chip_classes else ''
+    identity = f' id="{html.escape(chip_id, quote=True)}"' if chip_id else ''
+    return (f'<div class="record-filter-row"{group + key if filter_key else ""}>'
+            + f'<span aria-hidden="true">{label}</span>'
+            + f'<div{classes}{identity}{"" if filter_key else group}>{buttons}</div></div>')
 
 
 def words_box(element_id: str, placeholder: str) -> str:
@@ -85,15 +95,16 @@ background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;b
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
-.record-filter-row button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
+[data-filter-row] button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
 color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
-.record-filter-row button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
+[data-filter-row] button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
 .record-filter-row button[aria-pressed=true] .staff-name{color:inherit!important}
-.record-filter-row button[data-filter-count="0"][aria-pressed=false]{opacity:.6}
-.record-filter-row button[data-filter-count="0"][aria-pressed=true]{
+[data-filter-row] button[data-filter-count="0"][aria-pressed=false]{opacity:.6}
+[data-filter-row] button[data-filter-count="0"][aria-pressed=true]{
 background:color-mix(in srgb,var(--filter-selected-bg) 75%,var(--card))}
-.record-filter-row b{font-variant-numeric:tabular-nums}.record-filter-row b:empty{display:none}
+[data-filter-row] b{font-variant-numeric:tabular-nums}[data-filter-row] b:empty{display:none}
+.record-filter-row+[data-list-count]{display:block;margin:8px 0 12px;text-align:right}
 .list-table{border:1px solid var(--line);border-radius:12px;background:var(--card);overflow:hidden}
 .list-table table{width:100%;border-collapse:collapse;table-layout:fixed}
 .list-table th{text-align:left;color:var(--ink-2);font-size:13px;border-bottom:1px solid var(--line)}
@@ -242,67 +253,80 @@ let highlightedRow,highlightTimer;
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
 const rowMotion=new Map(),actionNotices=new Map();
+const motionsByKey=()=>new Map([...rowMotion].map(([node,motion])=>[node.dataset.key,motion]));
 let latestSubmission=0,latestActionFailure=null;
 const boundRoots=new WeakSet();
 const collator=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
-let windowItems=[],prefix=[0],pendingFrame=0,revealKey='',windowGap=null;
-const measured=new Map(),mounted=new Map();
+let windowEntries=[],pendingFrame=0,revealKey='';
+const measured=new Map(),mounted=new Map(),windowGaps=[];
 const resize=typeof ResizeObserver==='function' ? new ResizeObserver(()=>scheduleWindow()) : null;
 function scheduleWindow(){if(options.mount && !pendingFrame) pendingFrame=requestAnimationFrame(()=>{pendingFrame=0;drawWindow();});}
 function spacer(node,height){
  node.innerHTML=height>0 ? '<tr aria-hidden="true"><td colspan="'+columns.length+'" style="height:'+height+'px;padding:0;border:0"></td></tr>' : '';
 }
-function offsets(){
- const estimate=innerWidth<=960 ? 230 : 84;
- prefix=[0];for(const item of windowItems) prefix.push(prefix.at(-1)+(measured.get(item.dataset.key) || estimate));
-}
-function locate(y){
- let low=0,high=windowItems.length;
+function locate(prefix,y){
+ let low=0,high=prefix.length-1;
  while(low<high){const middle=(low+high)>>1;if(prefix[middle+1]<y) low=middle+1;else high=middle;}
  return low;
+}
+function mergeRanges(ranges){
+ const merged=[];
+ for(const [start,end] of ranges.sort((a,b)=>a[0]-b[0])){
+  const last=merged.at(-1);
+  if(last && start<=last[1]) last[1]=Math.max(last[1],end);
+  else merged.push([start,end]);
+ }
+ return merged;
 }
 function drawWindow(){
  if(!options.mount) return;
  const table=content.querySelector('table'),before=table.querySelector('[data-window-before]'),after=table.querySelector('[data-window-after]');
  for(const [key,node] of mounted){const height=node.getBoundingClientRect().height;if(height>0) measured.set(key,height);}
- offsets();
+ const motions=motionsByKey();
+ const entries=windowEntries.filter(({data,visible})=>visible || motions.has(data.key));
+ const prefix=[0],motionRanges=[],estimate=innerWidth<=960 ? 230 : 84;
+ for(const [at,{data}] of entries.entries()){
+  const motion=motions.get(data.key);
+  if(motion) motionRanges.push([at,at+1]);
+  const height=motion ? motion.clip.getBoundingClientRect().height : measured.get(data.key) || estimate;
+  prefix.push(prefix.at(-1)+height);
+ }
  const origin=scrollY+table.getBoundingClientRect().top+table.tHead.getBoundingClientRect().height;
  if(revealKey){
-  const at=windowItems.findIndex(item=>item.dataset.key===revealKey);
+  const at=entries.findIndex(({data})=>data.key===revealKey);
   if(at>=0){spacer(before,0);spacer(after,prefix.at(-1));const y=origin+prefix[at];if(y<scrollY || y>scrollY+innerHeight-120) scrollTo({top:y-16,behavior:'instant'});}
   revealKey='';
  }
- const start=Math.max(0,locate(scrollY-origin)-8);
- const end=Math.min(windowItems.length,start+90,Math.max(start+18,locate(scrollY-origin+innerHeight)+9));
+ const start=Math.max(0,locate(prefix,scrollY-origin)-8);
+ const end=Math.min(entries.length,start+90,Math.max(start+18,locate(prefix,scrollY-origin+innerHeight)+9));
  const focused=document.activeElement?.closest('[data-list-item]')?.dataset.key || options.focusKey?.();
- const focusAt=focused ? windowItems.findIndex(item=>item.dataset.key===focused) : -1;
- const ranges=[[start,end]];
- if(focusAt>=0){
-  const focusStart=Math.max(0,focusAt-1),focusEnd=Math.min(windowItems.length,focusAt+2);
-  if(focusEnd<start) ranges.unshift([focusStart,focusEnd]);
-  else if(focusStart>end) ranges.push([focusStart,focusEnd]);
-  else ranges[0]=[Math.min(start,focusStart),Math.max(end,focusEnd)];
- }
- const [[firstStart,firstEnd],second]=ranges;
- const window=ranges.flatMap(([from,to])=>windowItems.slice(from,to));
- if(second){
-  windowGap ||= document.createElement('tbody');
-  windowGap.setAttribute('data-window-gap','');
-  spacer(windowGap,prefix[second[0]]-prefix[firstEnd]);
- }else windowGap?.remove();
- const keys=new Set(window.map(item=>item.dataset.key));
+ const focusAt=focused ? entries.findIndex(({data})=>data.key===focused) : -1;
+ const ranges=[[start,end],...motionRanges];
+ if(focusAt>=0) ranges.push([Math.max(0,focusAt-1),Math.min(entries.length,focusAt+2)]);
+ const windows=mergeRanges(ranges);
+ const keys=new Set(windows.flatMap(([from,to])=>entries.slice(from,to)
+  .filter(entry=>entry.visible).map(({data})=>data.key)));
  for(const [key,node] of mounted){if(!keys.has(key)){options.unmount?.(node);resize?.unobserve(node);node.hidden=true;node.remove();mounted.delete(key);}}
- spacer(before,prefix[firstStart]);
- spacer(after,prefix.at(-1)-prefix[second ? second[1] : firstEnd]);
+ for(const gap of windowGaps.splice(windows.length-1)) gap.remove();
+ spacer(before,prefix[windows[0][0]]);
+ spacer(after,prefix.at(-1)-prefix[windows.at(-1)[1]]);
  let cursor=before;
- for(const [position,item] of window.entries()){
-  if(second && position===firstEnd-firstStart){
-   if(cursor.nextElementSibling!==windowGap) cursor.after(windowGap);
-   cursor=windowGap;
-  }
-  const node=mount(item.dataset);
+ const placeNode=node=>{
   if(cursor.nextElementSibling!==node) cursor.after(node);
   cursor=node;
+ };
+ for(const [position,[from,to]] of windows.entries()){
+  if(position){
+   const gap=windowGaps[position-1] ??= document.createElement('tbody');
+   gap.setAttribute('data-window-gap','');
+   spacer(gap,prefix[from]-prefix[windows[position-1][1]]);
+   placeNode(gap);
+  }
+  for(const {data,visible} of entries.slice(from,to)){
+   if(visible) placeNode(mount(data));
+   const motion=motions.get(data.key);
+   if(motion) placeNode(motion.spacer);
+  }
  }
  showHiddenActionResults([...mounted.values()]);
  options.mounted?.();
@@ -407,6 +431,14 @@ function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}
  const params=placeParams();
  const jumpKey=params.get('jump'),key=jumpKey || params.get('item');
  if(!key) return false;
+ const motion=rowMotion.size ? motionsByKey().get(key) : undefined;
+ if(motion){
+  const hash=location.hash;
+  void motion.finished.then(()=>{
+   if(location.hash===hash) followItemLink({inheritFilters,unappliedOnly:true,beforeJump});
+  });
+  return true;
+ }
  if(beforeJump?.(key)===false) return true;
  if(inheritFilters){
   for(const [name,value] of Object.entries({owner,show,q:query,sort,dir:direction,type,'source-owner':sourceOwner,...filters}))
@@ -436,11 +468,11 @@ function setExpanded(item,expanded){
  item.querySelector('.list-row').classList.toggle('open',expanded);
  return changed;
 }
-function animateRow(table,item,showRow){
- const previous=rowMotion.get(item);
+function animateRow(table,item,showRow,previousItem=item){
+ const previous=rowMotion.get(previousItem);
  const heightBefore=previous?.clip.getBoundingClientRect().height;
  const opacityBefore=previous ? Number(getComputedStyle(previous.clip).opacity) : Number(!showRow);
- stopMotion(item);
+ stopMotion(previousItem);
  const height=item.getBoundingClientRect().height+(parseFloat(getComputedStyle(item).marginBottom) || 0);
  if(!height) return;
  // A copy can fade and shrink while the record leaves the view at once.
@@ -461,7 +493,9 @@ function animateRow(table,item,showRow){
   {height:(showRow ? height : 0)+'px',opacity:Number(showRow)},
  ],{duration:200,easing:'ease-in-out',fill:'both'});
  const finished=animation.finished.then(()=>{
-  if(rowMotion.get(item)?.animation===animation) stopMotion(item);
+  if(rowMotion.get(item)?.animation!==animation) return;
+  stopMotion(item);
+  scheduleWindow();
  },()=>{});
  rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? sortValues(item.dataset) :
   previous?.sortValues ?? sortValues(item.dataset)});
@@ -491,8 +525,7 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  apply(false,{animate:true});
  const restored=mounted.get(key);
  if(kind==='failure' && restored && restored!==item && !matchMedia('(prefers-reduced-motion: reduce)').matches){
-  stopMotion(item);
-  animateRow(content.querySelector('table'),restored,true);
+  animateRow(content.querySelector('table'),restored,true,item);
  }
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
@@ -549,19 +582,28 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const active=currentSelection();
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
- const sortValue=item=>(rowMotion.get(item)?.sortValues ?? sortValues(item.dataset))[column];
+ const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
+ const sortValue=item=>{
+  const transition=windowMotions ? windowMotions.get(item.dataset.key) : rowMotion.get(item);
+  return (transition?.sortValues ?? sortValues(item.dataset))[column];
+ };
  const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare(sortValue(a),sortValue(b)) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
  const table=content.querySelector('table');let count=0,expandedOutsideFilter=false;
  if(options.mount){
-  windowItems=items.filter(item=>matches(item,active,counts));count=windowItems.length;
-  const visibleKeys=new Set(windowItems.map(item=>item.dataset.key));
+  const visibleKeys=new Set(items.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
+  count=visibleKeys.size;
   for(const [key,node] of mounted){
    if(visibleKeys.has(key)) continue;
    if(motion) animateRow(table,node,false);
    options.unmount?.(node);resize?.unobserve(node);node.hidden=true;node.remove();mounted.delete(key);
   }
+  const movingKeys=new Set([...rowMotion.keys()].map(item=>item.dataset.key));
+  windowEntries=items.flatMap(({dataset:data})=>{
+   const visible=visibleKeys.has(data.key);
+   return visible || movingKeys.has(data.key) ? [{data,visible}] : [];
+  });
   drawWindow();
  }else{
   const linkedSection=content.querySelector('[data-linked-item]');
@@ -778,7 +820,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
   const previous=words(),previousQuery=query;
-  windowGap?.remove();
+  for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
   if(sharedWords()){query=previous.value;words().value=query;}
