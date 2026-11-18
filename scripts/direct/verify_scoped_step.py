@@ -26,6 +26,8 @@ from scripts.lib import build_folders, conf, inotify
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
+# poll() takes a signed 32-bit timeout in milliseconds.
+POLL_MAX_MILLISECONDS = (1 << 31) - 1
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,15 @@ def drain_scope(scope: Path) -> None:
         os.close(events)
 
 
+def poll_checkout_until(owners: select.poll, deadline: float) -> list[tuple[int, int]]:
+    """Wait for a checkout event or the end of the publication deadline."""
+    while (remaining := deadline - time.monotonic()) > 0:
+        milliseconds = math.ceil(min(remaining * 1000, POLL_MAX_MILLISECONDS))
+        if events := owners.poll(milliseconds):
+            return events
+    return []
+
+
 def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit: str, deadline: float) -> Path:
     """Read the published scope while Cargo waits for its checkout lease."""
     owners.register(watch, select.POLLIN)
@@ -142,10 +153,10 @@ def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit
         while True:
             if isinstance(scope, Path):
                 return scope
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            ready = poll_checkout_until(owners, deadline)
+            if not ready:
                 raise TimeoutError("the checkout scope publication timed out")
-            if any(descriptor != watch for descriptor, _ in owners.poll(math.ceil(remaining * 1000))):
+            if any(descriptor != watch for descriptor, _ in ready):
                 raise ValueError("the checkout scope owner exited before launch")
             events = inotify.read_events(watch)
             if any(event.mask & inotify.WATCH_REMOVED for event in events):
@@ -162,8 +173,8 @@ def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: fl
     owners.register(reply, select.POLLIN)
     try:
         while len(confirmation) < len(expected) and b"\n" not in confirmation:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not (ready := owners.poll(math.ceil(remaining * 1000))) or time.monotonic() >= deadline:
+            ready = poll_checkout_until(owners, deadline)
+            if not ready or time.monotonic() >= deadline:
                 raise TimeoutError("the copy owner did not confirm the checkout scope")
             if any(descriptor != reply for descriptor, _ in ready):
                 raise ValueError("a scope owner exited before launch")

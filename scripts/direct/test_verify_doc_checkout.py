@@ -310,6 +310,14 @@ def split_reply(descriptor, size):
         self.assertEqual(len(self.cargo_calls()), 1)
         self.assertEqual(len(self.pass_records()), 1)
 
+    def test_doc_accepts_a_publication_timeout_above_the_poll_limit(self) -> None:
+        config = Path(self.environment["CONF_DIR"]) / "direct.conf"
+        _ = write_config_fixture(config, "# range: 5e-324..\nVERIFY_SCOPE_PUBLICATION_SECONDS=1e308\n")
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.cargo_calls()), 1)
+        self.assertEqual(len(self.pass_records()), 1)
+
     def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
         recorded_failure = self.root / "recorded-scope-failure"
         self.install_scope_interpreter(f'''
@@ -633,7 +641,9 @@ for descriptor in (8, 74):
         self.assert_doc_uses_the_prepared_copy(DOC_COMMAND)
 
     def test_prepared_doc_keeps_the_slot_lock_inherited_on_descriptor_nine(self) -> None:
-        handoff = '''exec 9>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"
+        handoff = '''if [[ "$BUILDLOG_PREPARED_COPY_LOCK_FD" != 9 ]]; then
+    exec 9>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-
+fi
 export BUILDLOG_PREPARED_COPY_LOCK_FD=9
 exec "$@"'''
         self.assert_doc_uses_the_prepared_copy((
@@ -656,11 +666,29 @@ exec "$@"'''
     def test_prepared_doc_lock_does_not_reach_the_background_sweep(self) -> None:
         self.assert_prepared_lock_stays_out_of_the_sweep(DOC_COMMAND)
 
-    def test_prepared_doc_lock_aliases_do_not_reach_the_background_sweep(self) -> None:
-        handoff = '''exec {descriptor}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"
+    def test_prepared_doc_lock_above_descriptor_nine_does_not_reach_the_sweep(self) -> None:
+        handoff = '''exec {descriptor}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-
 export BUILDLOG_PREPARED_COPY_LOCK_FD=$descriptor
 exec "$@"'''
         self.assert_prepared_lock_stays_out_of_the_sweep((
+            "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
+        ))
+
+    def test_prepared_doc_preserves_an_independent_open_of_the_lock_file(self) -> None:
+        self.install_scope_interpreter('''
+try:
+    descriptor = int(os.environ["TEST_INDEPENDENT_CHECKOUT_FD"])
+    matches = os.path.samestat(os.fstat(descriptor), os.fstat(9))
+except OSError:
+    matches = False
+if not matches:
+    raise SystemExit("Verify closed the independent lock file descriptor")
+os.execv(sys.executable, [sys.executable, *arguments])
+''')
+        handoff = '''exec {independent}<"/dev/fd/$BUILDLOG_PREPARED_COPY_LOCK_FD"
+export TEST_INDEPENDENT_CHECKOUT_FD=$independent
+exec "$@"'''
+        self.assert_doc_uses_the_prepared_copy((
             "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
         ))
 
