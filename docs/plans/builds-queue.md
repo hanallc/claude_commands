@@ -2894,6 +2894,17 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 2. Measure the sampled release (20 runs, median and max). Report the number to builds.
 3. Only if it does not reach about 150 ms, add a replay record so history and cleanup run after `Ok`, with history dedup on restart. Builds reads the measured number first.
 
+### Phase 44cf — A running row of a showrunner CI run shows its name  · status: todo
+**From builds, 2026-11-18 15:4x:** assigned to queue, after the 44bb re-merge. The user rule: every queue row has a name.
+
+Live case at 15:41 EST: the running `nextest` row in `/build/slot/hana-slot2` showed no session name and no unit.
+1. The caller is pid 1220023, `lint nextest --workspace --all-features --tests`, started 14:29:31.
+2. Its chain is `ci_points.py ci start --production spacetime` → `validate_and_push.sh --validate-only` → `run_validation.sh` → `validate_ci.sh` → `lint nextest`.
+3. Its environment has `CLAUDE_CODE_SESSION_ID=b6374931-fe3a-4f6d-96b7-ad20415a8346` (the spacetime showrunner) and `CLAUDE_SESSION_FOLDER=spacetime`.
+4. The queue row has that session id, but `session_name` and `unit` are empty.
+
+Work: find where the row name comes from, and why a showrunner session id gives no name. Fix it at that source, so every caller kind gets a name. A test replays this chain with a private staff record and a private socket.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
