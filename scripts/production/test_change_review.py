@@ -359,7 +359,9 @@ class NativeVerdictTests(unittest.TestCase):
                 self.assertFalse(pending.get('Review log'))
                 record = change_routing.delivery_path(case.root, listing, row)
                 record.parent.mkdir(parents=True, exist_ok=True)
-                _ = record.write_text(json.dumps({**fields, 'waiting_why': 'The showrunner checks the spacing.'}))
+                handed_at = '2026-11-16T12:49:08-05:00'
+                _ = record.write_text(json.dumps({**fields, 'waiting_why': 'The showrunner checks the spacing.',
+                                                  'handed_at': handed_at}))
                 result = change_review.save_verdict(listing, row, 'not works: the spacing differs',
                                                    case.fixture.production, validation_id=identity)
                 self.assertIsInstance(result, change_review.VerdictSaved)
@@ -370,6 +372,7 @@ class NativeVerdictTests(unittest.TestCase):
                 slots = change_routing.delivery_slots(record)
                 self.assertFalse(slots.validation_requested)
                 self.assertEqual(slots.waiting_why, 'The showrunner checks the spacing.')
+                self.assertEqual(cast(dict[str, object], json.loads(record.read_text())).get('handed_at'), handed_at)
 
     def test_native_verdict_uses_the_current_validation_id(self) -> None:
         from scripts.review_links import change_page, question_record, review_items, review_page, test_review_page
