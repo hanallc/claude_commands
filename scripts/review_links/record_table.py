@@ -31,9 +31,19 @@ def chip_row(name: str, chips: Iterable[Chip], selected: str) -> str:
         buttons.append(f'<button type="button" id="filter-{html.escape(key, quote=True)}-{quote(chip.value, safe="")}"'
                        + f' data-filter-value="{value}" aria-pressed="{pressed}" data-filter-count="{count}">'
                        + f'{chip.label_html}<b>{count}</b></button>')
+    return labelled_chip_row(name, ''.join(buttons), filter_key=key)
+
+
+def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '') -> str:
+    """Render a visible label and a group of filter buttons."""
     label = html.escape(name, quote=True)
-    return (f'<div class="record-filter-row" role="group" aria-label="{label}" data-filter-row="{html.escape(key, quote=True)}">'
-            + f'<span aria-hidden="true">{label}</span><div>' + ''.join(buttons) + '</div></div>')
+    group = f' role="group" aria-label="{label}"'
+    key = f' data-filter-row="{html.escape(filter_key, quote=True)}"' if filter_key else ''
+    classes = f' class="{html.escape(chip_classes, quote=True)}"' if chip_classes else ''
+    identity = f' id="{html.escape(chip_id, quote=True)}"' if chip_id else ''
+    return (f'<div class="record-filter-row"{group + key if filter_key else ""}>'
+            + f'<span aria-hidden="true">{label}</span>'
+            + f'<div{classes}{identity}{"" if filter_key else group}>{buttons}</div></div>')
 
 
 def words_box(element_id: str, placeholder: str) -> str:
@@ -85,15 +95,16 @@ background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;b
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
-.record-filter-row button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
+[data-filter-row] button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
 color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
-.record-filter-row button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
+[data-filter-row] button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
 .record-filter-row button[aria-pressed=true] .staff-name{color:inherit!important}
-.record-filter-row button[data-filter-count="0"][aria-pressed=false]{opacity:.6}
-.record-filter-row button[data-filter-count="0"][aria-pressed=true]{
+[data-filter-row] button[data-filter-count="0"][aria-pressed=false]{opacity:.6}
+[data-filter-row] button[data-filter-count="0"][aria-pressed=true]{
 background:color-mix(in srgb,var(--filter-selected-bg) 75%,var(--card))}
-.record-filter-row b{font-variant-numeric:tabular-nums}.record-filter-row b:empty{display:none}
+[data-filter-row] b{font-variant-numeric:tabular-nums}[data-filter-row] b:empty{display:none}
+.record-filter-row+[data-list-count]{display:block;margin:8px 0 12px;text-align:right}
 .list-table{border:1px solid var(--line);border-radius:12px;background:var(--card);overflow:hidden}
 .list-table table{width:100%;border-collapse:collapse;table-layout:fixed}
 .list-table th{text-align:left;color:var(--ink-2);font-size:13px;border-bottom:1px solid var(--line)}

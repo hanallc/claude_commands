@@ -123,7 +123,13 @@ class ReviewPageTests(unittest.TestCase):
 
     def test_staff_owners_sources_and_log_names_have_role_colors(self) -> None:
         _ = self.question()
+        _ = self.investigation(False)
         snapshot = review_page.build_snapshot(self.root)
+        owner_menu = snapshot.render().decode().partition('id="list-owner"')[2].partition('</div>')[0]
+        entry = next(entry for entry in snapshot.entries if entry['type'] == review_items.ReviewType.INVESTIGATION)
+        for name, markup in ((entry['ownerName'], entry['ownerHtml']), (entry['sourceName'], entry['sourceHtml'])):
+            self.assertIn('class="staff-name"', markup)
+            self.assertIn(f'data-owner-name="{html.escape(name)}" aria-pressed="false">{markup} <b>', owner_menu)
         body = ''.join(snapshot.body(item.key).decode() for item in snapshot.records.values())
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
@@ -1647,6 +1653,14 @@ requestAnimationFrame(focusRow);
         for show, _ in review_page.SHOWS:
             with self.subTest(show=show):
                 source = review_page.render(self.root, show=show).decode()
+                for label, container in (
+                    ('Type', 'class="review-types"'),
+                    ('State', 'class="review-types review-shows" id="list-show"'),
+                    ('Owner', 'class="review-types" id="list-owner"'),
+                ):
+                    self.assertIn('<div class="record-filter-row">'
+                                  + f'<span aria-hidden="true">{label}</span>'
+                                  + f'<div {container} role="group" aria-label="{label}">', source)
                 group = source.partition('<div class="review-types review-shows"')[2].partition('</div>')[0]
                 self.assertTrue(group, 'Show has a second chip row')
                 self.assertNotIn('<select id="list-show"', source)
@@ -1833,6 +1847,15 @@ window.fetch=async(url,options)=>{
     [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
+  const labels=groups.map(group=>group.previousElementSibling);
+  check(labels.map(label=>label.textContent).join('|')==='Type|State|Owner' &&
+    groups.every((group,index)=>group.getAttribute('aria-label')===labels[index].textContent),
+    'The three filter rows have visible and accessible labels');
+  const narrow=matchMedia('(max-width:480px)').matches;
+  check(groups.every((group,index)=>{
+    const chips=group.getBoundingClientRect(),label=labels[index].getBoundingClientRect();
+    return narrow ? chips.left===label.left && chips.top>=label.bottom : chips.left>=label.right;
+  }),'Chips align to the right of the label on desktop and below it on narrow screens');
   check(groups.length===3 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom &&
     groups[2].getBoundingClientRect().top>=groups[1].getBoundingClientRect().bottom,
     'Show follows Type and Owner follows Show');
@@ -1864,7 +1887,15 @@ window.fetch=async(url,options)=>{
   const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
   chip('open').click();await flush();await flush();
   const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
-  chooseOwner(builder);chooseType('question');
+  const builderChip=ownerChip(builder),builderName=builderChip.querySelector('.staff-name');
+  check(builderName?.dataset.colorText==='role.unit-director' &&
+    getComputedStyle(builderName).color!==getComputedStyle(builderChip).color,
+    'An unselected Owner name uses its role color');
+  chooseOwner(builder);
+  check(builderChip.getAttribute('aria-pressed')==='true' &&
+    getComputedStyle(builderName).color===getComputedStyle(builderChip).color,
+    'A selected Owner name inherits the chip color');
+  chooseType('question');
   check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1' &&
     ownerChips().some(button=>button.textContent==='page-owner 1') &&
     ownerChip(builder).hidden,
