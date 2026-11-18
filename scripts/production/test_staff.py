@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.production import staff
+from scripts.production import demote_showrunner, promote_showrunner, staff
 from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
@@ -1905,6 +1905,50 @@ class StaffTests(StaffCommandTestCase):
         for action in actions:
             with self.subTest(action=action):
                 self.assert_refused(action)
+
+    def test_unit_name_writers_refuse_the_reserved_suffix(self) -> None:
+        runner, unit, _ = self.tree()
+        child = fixture_member("showrunner", name="child", parent=runner.id)
+        location = ("--machine", "natedev", "--path", str(self.root / "child"))
+        cases = (
+            ("ensure-unit", ("ensure", "unit", "--parent", runner.id, "--runtime-id", fixture_runtime_id("new-x"))),
+            ("rename-unit", ("rename", unit.id)),
+            ("promote-unit", ("promote-unit", unit.id, "--parent", runner.id, *location)),
+            ("demote-unit", ("demote-showrunner", child.id, "--parent", runner.id, *location)),
+        )
+        before = self.staff_state()
+        for name, arguments in cases:
+            with self.subTest(command=arguments[0]):
+                result = self.cli(*arguments, "--name", name, code=2)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, f"StaffRefused: unit name {name!r} must not end in -unit\n")
+                self.assertEqual(self.staff_state(), before)
+
+    def test_a_legacy_unit_name_loads_and_survives_an_unrelated_write(self) -> None:
+        runner, unit, worker = self.tree()
+        legacy = replace(unit, name="x-unit")
+        self.write_json(self.staff_file, {"schema": 2, "rows": [
+            runner.to_json(), legacy.to_json(), worker.to_json(),
+        ]})
+        self.assertEqual(staff.snapshot().by_path(f"{runner.name}/x-unit"), legacy)
+        _ = staff.rename(runner.id, "tools")
+        self.assertEqual(staff.snapshot().by_path("tools/x-unit"), legacy)
+
+    def test_role_change_commands_refuse_the_reserved_suffix_before_changing_staff(self) -> None:
+        runner, unit, _ = self.tree()
+        _ = fixture_member("showrunner", name="x-unit", parent=runner.id)
+        cases = (
+            (promote_showrunner, promote_showrunner.main,
+             [unit.name, "--production", "x-unit", "--model", "opus", "--effort", "high"]),
+            (demote_showrunner, demote_showrunner.main, ["x-unit"]),
+        )
+        before = self.staff_state()
+        for command, main, arguments in cases:
+            with self.subTest(command=command.__name__):
+                result = invoke_cli(command, lambda: main(arguments), arguments, dict(os.environ), CHECKOUT)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (2, "", "StaffRefused: unit name 'x-unit' must not end in -unit\n"))
+                self.assertEqual(self.staff_state(), before)
 
     def test_promoted_showrunner_and_original_unit_have_distinct_paths(self) -> None:
         showrunner, unit, worker = self.tree()

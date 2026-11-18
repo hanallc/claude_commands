@@ -1788,6 +1788,7 @@ def recovery_resumed_session_proven(production_name: str, name: str, session_id:
             and entry.get("staff_id") == row.id and session_id == row.current_session)
 
 def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
+    staff.validate_unit_name_for_write(unit.name)
     refused = recovery_refusals(unit)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
@@ -1969,6 +1970,8 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
         if to_doc:
             raise RenameRefused("--to-doc is only for showrunners; the staff row is a unit, not a showrunner")
         name = row.name if new == row.name + "-unit" else unit_names.name(new)
+        if name != row.name:
+            staff.validate_unit_name_for_write(name)
         staff.validate_name(row.kind, name)
         if any(other.id != row.id and other.name == name and other.parent == row.parent
                for other in record.find(kind="unit")):
@@ -2256,6 +2259,8 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
         if (row := record.by_id(request.member.id)) is None:
             raise ValueError(f"{request.member.id}: no unit staff row")
         changed = row.name != request.name
+        if changed:
+            staff.validate_unit_name_for_write(request.name)
         replaced_pending = False
         pending = unit_move.pending_rename(row.id)
         if pending is not None and (pending.name != request.name or isinstance(request.move, UnitBranchMove)
