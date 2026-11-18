@@ -1,18 +1,20 @@
 """Check the Hana setup plan with private fixtures and a restricted AWS fake."""
-from collections.abc import Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import cast, final, override
 from unittest import mock
 
 from scripts.aws_target import admin_secrets, deploy, hana_box, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
-from scripts.aws_target.ledger_test_support import CostFixture
-from scripts.lib import conf
+from scripts.aws_target.controller_lock import control_lock
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting
+from scripts.lib import conf, file_lock
 
 
 OWNER = plan_identity.PlanAccount('aws', '0' * 12)
@@ -33,6 +35,7 @@ BUCKET_POLICY = {
 ALLOWED = frozenset((*plan_identity.READ_ACTIONS, *plan_identity.STACK_READS, *plan_identity.IAM_READS,
                      *plan_identity.BUCKET_READS, *plan_identity.CHANGE_SET_ACTIONS))
 S3_SIMULATIONS = [('iam', 's3:PutObject'), ('iam', 's3:GetObject')]
+CONFIRM_REMOVAL = ('cloudformation', 'describe-change-set')
 PLAN_CALLS = (
     ('sts', 'get-caller-identity'),
     ('cloudformation', 'describe-stacks'),
@@ -66,6 +69,9 @@ class PlanSetupTests(CostFixture):
         self.change_exists = False
         self.deleting = False
         self.failure = ''
+        self.execution_status = 'AVAILABLE'
+        self.check_claim: Callable[[], None] = lambda: None
+        self.confirmations = 0
         self.region = ''
         self.change: dict[str, str] = {'Action': 'Modify', 'LogicalResourceId': 'ScalerPolicy',
                                       'ResourceType': 'AWS::IAM::ManagedPolicy', 'Replacement': 'False'}
@@ -164,6 +170,15 @@ class PlanSetupTests(CostFixture):
             return subprocess.CompletedProcess(arguments, 1, '',
                 f'An error occurred ({code}) when calling the {action} operation: fixture-private-physical')
 
+        def inject(stage: str, action: str) -> subprocess.CompletedProcess[str] | None:
+            if self.failure == stage + '-interrupt':
+                raise KeyboardInterrupt
+            if self.failure == stage + '-timeout':
+                raise subprocess.TimeoutExpired(operation, timeout)
+            if self.failure == stage + '-error':
+                return error('AccessDenied', action)
+            return None
+
         if operation == 'get-caller-identity':
             reply = {'Arn': OWNER.user_arn, 'Account': OWNER.account}
         elif operation == 'describe-stacks':
@@ -173,6 +188,7 @@ class PlanSetupTests(CostFixture):
                 'Outputs': [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()],
                 'Parameters': [{'ParameterKey': key, 'ParameterValue': value} for key, value in self.parameters.items()]}]}
         elif operation == 'get-template':
+            self.check_claim()
             reply = {'TemplateBody': self.live_template}
         elif operation == 'describe-stack-resource':
             self.assertEqual(option('--stack-name'), self.stack_arn)
@@ -190,24 +206,40 @@ class PlanSetupTests(CostFixture):
                 | {'ScalerPolicy': ledger.mapping(expected_policy['Resources'])['ScalerPolicy']}})
             values = ledger.rows({'rows': cast(object, json.loads(option('--parameters')))}, 'rows')
             self.assertCountEqual(values, [{'ParameterKey': key, 'UsePreviousValue': True} for key in self.parameters])
+            injected = inject('create', 'CreateChangeSet')
+            if injected is not None:
+                return injected
+            if self.failure == 'create-unknown':
+                return subprocess.CompletedProcess(arguments, 0, '{}', '')
+            if self.failure == 'create-late':
+                raise subprocess.TimeoutExpired(operation, timeout)
             self.change_exists = True
-            reply = {}
+            reply = {'Id': 'fixture-change-id', 'StackId': self.stack_arn}
         elif operation == 'describe-change-set':
             self.assertEqual(option('--change-set-name'), self.change_name)
             if self.failure == 'describe' and not self.deleting:
                 return error('AccessDenied', 'DescribeChangeSet')
+            injected = inject('confirm' if self.deleting else 'describe', 'DescribeChangeSet')
+            if injected is not None:
+                return injected
+            if self.deleting:
+                self.confirmations += 1
+                if self.failure == 'create-late' and self.confirmations == 2:
+                    self.change_exists = True
             if not self.change_exists:
                 return error('ChangeSetNotFound', 'DescribeChangeSet')
             reply = {'Status': 'DELETE_IN_PROGRESS' if self.deleting else 'CREATE_COMPLETE',
+                     'ChangeSetName': self.change_name, 'ExecutionStatus': self.execution_status,
                      'Changes': [{'ResourceChange': self.change | {'PhysicalResourceId': POLICY}}],
                      'Parameters': [{'ParameterKey': key, 'UsePreviousValue': True} for key in self.parameters]}
+            if self.failure == 'wait-interrupt' and not self.deleting:
+                reply['Status'] = 'CREATE_IN_PROGRESS'
         elif operation == 'delete-change-set':
             self.assertEqual(option('--change-set-name'), self.change_name)
             self.deleting = True
-            if self.failure == 'delete-timeout':
-                raise subprocess.TimeoutExpired('fixture delete', timeout)
-            if self.failure == 'delete-error':
-                return error('AccessDenied', 'DeleteChangeSet')
+            injected = inject('delete', 'DeleteChangeSet')
+            if injected is not None:
+                return injected
             self.change_exists = self.failure == 'delete-lingers'
             reply = {}
         elif operation == 'simulate-principal-policy':
@@ -222,6 +254,8 @@ class PlanSetupTests(CostFixture):
             self.assertIn(f'arn:aws:s3:::fixture-bucket/control/{DEPLOYMENT}/*', document)
             self.assertNotIn('"ec2:Attribute"', document)
             action, = cast(list[str], request['ActionNames'])
+            if action == 's3:GetObject':
+                self.check_claim()
             resource, = cast(list[str], request['ResourceArns'])
             if action.startswith('s3:'):
                 if self.expect_bucket_policy:
@@ -263,6 +297,47 @@ class PlanSetupTests(CostFixture):
         self.assertNotIn('plan note:', output)
         self.assertTrue(output.endswith('plan run: pass\n'))
         self.assertFalse(self.change_exists)
+
+    def test_stack_owned_plan_accepts_the_explicit_hana_workload(self) -> None:
+        self.prepare_hana()
+        status, output = self.run_plan('hana-setup', '--workload', 'hana')
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
+
+    def test_plan_blocks_claims_after_the_idle_check_and_through_the_last_simulation(self) -> None:
+        self.prepare_hana()
+        workload = conf.path('hana_aws')
+        text_setting(workload, 'enabled', 'on')
+        controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
+        blocked: list[str] = []
+
+        @contextmanager
+        def try_controller_lock(directory: Path) -> Generator[None]:
+            with file_lock.exclusive(directory / 'controller.lock', wait=False) as result:
+                if result is file_lock.LockResult.BUSY:
+                    raise BlockingIOError
+                yield
+
+        def check_claim() -> None:
+            with mock.patch.object(hana_box, 'control_lock', new=try_controller_lock), \
+                    self.assertRaises(BlockingIOError):
+                _ = controller.request('fixture-claim')
+            blocked.append(self.calls[-1][1])
+
+        self.check_claim = check_claim
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 0, output)
+        self.assertEqual(blocked, ['get-template', 'simulate-principal-policy'])
+        self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
+
+    def test_busy_controller_lock_refuses_before_aws(self) -> None:
+        self.prepare_hana()
+        with control_lock(self.state):
+            status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1, output)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(output.endswith('plan run: refused: The Hana lifecycle is busy. '
+                                        + 'Run hana-setup again when the box is idle.\n'))
 
     def test_stack_owned_plan_passes_without_a_bucket_policy(self) -> None:
         self.prepare_hana()
@@ -352,6 +427,99 @@ class PlanSetupTests(CostFixture):
         self.assertIn('plan stack: change set removal confirmed', output)
         self.assertTrue(output.splitlines()[-1].startswith('plan run: refused: An error occurred (AccessDenied)'))
 
+    def test_change_set_cleanup_after_failure_at_each_step(self) -> None:
+        self.prepare_hana()
+        for stage in ('create', 'describe', 'delete', 'confirm'):
+            for failure in ('error', 'timeout', 'interrupt'):
+                with self.subTest(stage=stage, failure=failure):
+                    self.calls.clear()
+                    self.change_exists = False
+                    self.deleting = False
+                    self.failure = f'{stage}-{failure}'
+                    status, output = self.run_plan('hana-setup')
+                    self.assertEqual(status, 1, output)
+                    self.assertIn(('cloudformation', 'delete-change-set'), self.calls)
+                    confirmed = 'plan stack: change set removal confirmed'
+                    if stage == 'describe':
+                        self.assertIn(confirmed, output)
+                        self.assertFalse(self.change_exists)
+                    else:
+                        self.assertNotIn(confirmed, output)
+                    if failure == 'interrupt':
+                        self.assertIn(self.change_name, output)
+                        self.assertTrue(output.endswith('plan run: refused: interrupted\n'))
+                    elif stage != 'describe':
+                        self.assertIn(self.change_name, output)
+                        self.assertTrue(output.endswith('plan run: refused: change set not removed\n'))
+                    else:
+                        reason = ('An error occurred (AccessDenied)' if failure == 'error'
+                                  else 'AWS did not confirm describe-change-set')
+                        self.assertTrue(output.splitlines()[-1].startswith('plan run: refused: ' + reason))
+                    if stage == 'create':
+                        self.assertEqual(self.calls, [*PLAN_CALLS[:10], PLAN_CALLS[11],
+                            *([CONFIRM_REMOVAL] * len(plan_identity.PROOF_RETRY_DELAYS))])
+                        self.assertIn('plan stack: change set may still appear: ' + self.change_name, output)
+
+    def test_unknown_create_reply_requires_the_full_removal_check(self) -> None:
+        self.prepare_hana()
+        self.failure = 'create-unknown'
+        with mock.patch.object(time, 'sleep') as pause:
+            status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1, output)
+        self.assertEqual(pause.call_args_list, [mock.call(delay) for delay in plan_identity.PROOF_RETRY_DELAYS if delay])
+        self.assertNotIn('plan stack: change set removal confirmed', output)
+        self.assertIn('plan stack: change set may still appear: ' + self.change_name, output)
+        self.assertTrue(output.endswith('plan run: refused: change set not removed\n'))
+
+    def test_late_change_set_gets_a_second_delete_and_confirmation(self) -> None:
+        self.prepare_hana()
+        self.failure = 'create-late'
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1, output)
+        self.assertEqual(self.calls, [*PLAN_CALLS[:10], PLAN_CALLS[11],
+            CONFIRM_REMOVAL, CONFIRM_REMOVAL, PLAN_CALLS[11], CONFIRM_REMOVAL])
+        self.assertFalse(self.change_exists)
+        self.assertIn('plan stack: change set removal confirmed', output)
+        self.assertTrue(output.endswith('plan run: refused: AWS did not confirm create-change-set before the call ended.\n'))
+
+    def test_interrupt_in_the_change_set_wait_reports_the_name(self) -> None:
+        self.prepare_hana()
+        self.failure = 'wait-interrupt'
+        with mock.patch.object(time, 'sleep', side_effect=KeyboardInterrupt):
+            status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1, output)
+        self.assertEqual(self.calls, list(PLAN_CALLS[:13]))
+        self.assertIn('plan stack: change set removal confirmed', output)
+        self.assertIn(self.change_name, output)
+        self.assertTrue(output.endswith('plan run: refused: interrupted\n'))
+
+    def test_caller_interrupt_cannot_suppress_a_cleanup_refusal(self) -> None:
+        created = subprocess.CompletedProcess('fixture create', 0, '{"Id": "fixture-change-id"}', '')
+        present = subprocess.CompletedProcess(
+            'fixture describe', 0, '{"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}', '')
+        deleted = subprocess.CompletedProcess('fixture delete', 0, '{}', '')
+        checks = len(plan_identity.PROOF_RETRY_DELAYS)
+        execute = mock.Mock(side_effect=[created, present, deleted, *([present] * checks)])
+        plan = plan_run.PlanRun(lambda: CREDENTIAL, execute, lambda _seconds: None)
+        output = StringIO()
+        try:
+            raise KeyboardInterrupt
+        except KeyboardInterrupt:
+            with redirect_stdout(output), self.assertRaisesRegex(plan_run.PlanRefused, '^change set not removed$'):
+                with plan.change(plan.api(self.region, 1), self.stack_arn, b'{}', [], 1) as change:
+                    self.assertEqual(change['Status'], 'CREATE_COMPLETE')
+        self.assertEqual(execute.call_count, 3 + checks)
+        self.assertNotIn('plan stack: interrupted', output.getvalue())
+
+    def test_obsolete_change_set_refuses_and_confirms_removal(self) -> None:
+        self.prepare_hana()
+        self.execution_status = 'OBSOLETE'
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1, output)
+        self.assertEqual(self.calls, list(PLAN_CALLS[:13]))
+        self.assertIn('plan stack: change set removal confirmed', output)
+        self.assertTrue(output.endswith('plan run: refused: The change set execution status is OBSOLETE. Expected AVAILABLE.\n'))
+
     def assert_delete_failed(self, failure: str) -> None:
         self.prepare_hana()
         self.failure = failure
@@ -410,6 +578,7 @@ GATE_USER = OWNER.iam('user/fixture-scaler')
 GATE_USER_ID = 'fixture-immutable-user'
 GATE_BUCKET = f'cloud-claude-gate-{DEPLOYMENT}'
 GATE_POLICY_NAMES = ('GateScalerPolicy', 'GateGpuTrialScalerPolicy')
+MANAGED_POLICY = 'AWS::IAM::ManagedPolicy'
 
 
 @final
@@ -425,11 +594,15 @@ class GatePlanTests(CostFixture):
         self.credentials_path = Path()
         self.template: dict[str, object] = {}
         self.enable_gates = True
+        self.displaced_policies: dict[str, dict[str, str]] = {}
+        self.unresolved_policy = ''
 
     @override
     def setUp(self) -> None:
         super().setUp()
         self.regions = (GATE_HOME, GATE_REGION)
+        with control_lock(self.state / 'gate-up'):
+            pass
         self.credentials_path = self.root / '.config/aws-build/credentials'
         self.credentials_path.parent.mkdir(parents=True)
         _ = self.credentials_path.write_text('[build-scaler]\naws_access_key_id = fixture-scaler-key\n')
@@ -487,6 +660,8 @@ class GatePlanTests(CostFixture):
             return arguments[arguments.index(name) + 1]
 
         region = option('--region')
+        with file_lock.exclusive(self.state / 'gate-up/controller.lock', wait=False) as lock:
+            self.assertIs(lock, file_lock.LockResult.BUSY)
         if '--profile' in arguments:
             self.assertEqual(option('--profile'), 'build-scaler')
             self.assertEqual((env or {}).get('AWS_SHARED_CREDENTIALS_FILE'), str(self.credentials_path))
@@ -529,11 +704,13 @@ class GatePlanTests(CostFixture):
             self.assertEqual((region, option('--stack-name')), (GATE_HOME, self.stack_id(GATE_HOME)))
             reply = {'TemplateBody': self.template}
         elif operation == 'describe-stack-resource':
-            self.assertEqual((region, option('--stack-name')), (GATE_HOME, self.stack_id(GATE_HOME)))
+            self.assertEqual(option('--stack-name'), self.stack_id(region))
             logical_id = option('--logical-resource-id')
-            self.assertIn(logical_id, GATE_POLICY_NAMES)
-            reply = {'StackResourceDetail': {'ResourceType': 'AWS::IAM::ManagedPolicy',
-                'LogicalResourceId': logical_id, 'PhysicalResourceId': OWNER.iam('policy/fixture/' + logical_id)}}
+            self.assertTrue(logical_id in self.displaced_policies.get(region, {})
+                            or region == GATE_HOME and logical_id in GATE_POLICY_NAMES)
+            reply = {'StackResourceDetail': {'ResourceType': MANAGED_POLICY, 'LogicalResourceId': logical_id}}
+            if logical_id != self.unresolved_policy:
+                ledger.mapping(reply['StackResourceDetail'])['PhysicalResourceId'] = OWNER.iam('policy/fixture/' + logical_id)
         elif operation == 'describe-route-tables':
             reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
                 {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
@@ -549,6 +726,8 @@ class GatePlanTests(CostFixture):
             self.assertEqual(option('--stack-name'), self.stack_id(region))
             name = option('--change-set-name')
             self.assertTrue(name.startswith(plan_identity.CHANGE_SET_PREFIX))
+            failure = self.failure if region == self.failure_region else ''
+            reads = self.calls_in(region).count(CONFIRM_REMOVAL)
             if operation == 'create-change-set':
                 self.assertNotIn(region, self.change_sets)
                 self.assertEqual(option('--change-set-type'), 'UPDATE')
@@ -566,22 +745,35 @@ class GatePlanTests(CostFixture):
                     self.assertEqual(by_name['VpcId']['ParameterValue'], 'vpc-' + region)
                     self.assertEqual(by_name['HomeGateProfileArn']['ParameterValue'],
                                      OWNER.iam('instance-profile/' + GATE_BUCKET))
+                if failure == 'create-missing-id':
+                    reply = {}
+                else:
+                    self.change_sets[region] = name
+                    reply = {'Id': 'fixture-change-id'}
+            elif failure == 'create-missing-id' and operation == 'describe-change-set' and reads == 2:
                 self.change_sets[region] = name
-                reply = {}
+                reply = {'ChangeSetName': name, 'Status': 'CREATE_COMPLETE'}
             elif region not in self.change_sets:
-                return error('ChangeSetNotFound', 'DescribeChangeSet', 'fixture-private-physical')
+                action = plan_run.action_name('cloudformation', operation).split(':')[1]
+                return error('ChangeSetNotFound', action, 'fixture-private-physical')
             else:
                 self.assertEqual(self.change_sets[region], name)
                 if operation == 'delete-change-set':
+                    if failure == 'delete-not-ready' and reads == 1:
+                        return error('InvalidChangeSetStatus', 'DeleteChangeSet', 'fixture-private-physical')
                     del self.change_sets[region]
                     reply = {}
-                elif self.failure == 'no changes' and region == self.failure_region:
+                elif failure == 'delete-not-ready' and reads == 2:
+                    reply = {'Status': 'CREATE_IN_PROGRESS'}
+                elif failure == 'no changes':
                     reply = {'Status': 'FAILED', 'StatusReason': 'No updates are to be performed.', 'Changes': []}
                 else:
-                    obsolete = self.failure == 'obsolete' and region == self.failure_region
-                    logical_id = 'ScalerUser' if self.failure == 'non-gate' and region == self.failure_region else 'GateLaunchTemplate'
-                    reply = {'Status': 'CREATE_COMPLETE', 'ExecutionStatus': 'OBSOLETE' if obsolete else 'AVAILABLE',
-                             'Changes': [{'ResourceChange': {'LogicalResourceId': logical_id, 'Action': 'Modify'}}]}
+                    logical_id = 'ScalerUser' if failure == 'non-gate' else 'GateLaunchTemplate'
+                    resources = [{'LogicalResourceId': logical_id, 'Action': 'Modify', 'ResourceType': 'AWS::EC2::LaunchTemplate'}]
+                    resources.extend({'LogicalResourceId': policy_id, 'Action': action, 'ResourceType': MANAGED_POLICY,
+                                      'Replacement': 'True'} for policy_id, action in self.displaced_policies.get(region, {}).items())
+                    reply = {'Status': 'CREATE_COMPLETE', 'ExecutionStatus': 'OBSOLETE' if failure == 'obsolete' else 'AVAILABLE',
+                             'Changes': [{'ResourceChange': resource} for resource in resources]}
         elif (service, operation) == ('iam', 'simulate-principal-policy'):
             request = ledger.mapping(cast(object, json.loads(option('--cli-input-json'))))
             reply = self.simulation(region, request)
@@ -591,9 +783,12 @@ class GatePlanTests(CostFixture):
 
     def simulation(self, region: str, request: dict[str, object]) -> dict[str, object]:
         self.assertEqual(request['PolicySourceArn'], GATE_USER)
-        if self.enable_gates:
+        active = GATE_POLICY_NAMES if self.enable_gates else ()
+        exclusions = dict.fromkeys((*active, *(name for place in self.regions
+                                               for name in self.displaced_policies.get(place, {}))))
+        if exclusions:
             self.assertEqual(request['PolicyExclusionList'],
-                             [{'PolicyArn': OWNER.iam('policy/fixture/' + name)} for name in GATE_POLICY_NAMES])
+                             [{'PolicyArn': OWNER.iam('policy/fixture/' + name)} for name in exclusions])
         else:
             self.assertNotIn('PolicyExclusionList', request)
         gate, gpu = cast(list[str], request['PolicyInputList'])
@@ -653,8 +848,8 @@ class GatePlanTests(CostFixture):
             'create-change-set', 'describe-change-set', 'delete-change-set', 'describe-change-set')]
         home = [('sts', 'get-caller-identity'), ('cloudformation', 'describe-stacks'),
                 ('configure', 'export-credentials'), ('sts', 'get-caller-identity'), ('cloudformation', 'get-template'),
-                ('ec2', 'describe-route-tables'), ('ec2', 'describe-subnets'), ('ec2', 'describe-images'),
-                ('cloudformation', 'describe-stack-resource'), ('cloudformation', 'describe-stack-resource')]
+                ('ec2', 'describe-images'), ('ec2', 'describe-route-tables'), ('ec2', 'describe-subnets')]
+        policies = [('cloudformation', 'describe-stack-resource')] * 2
         regional = [('ec2', 'describe-vpcs'), ('ec2', 'describe-route-tables'), ('ec2', 'describe-subnets'),
                     ('ec2', 'describe-images'), ('cloudformation', 'describe-stacks')]
         reads = [('iam', action) for action in ('ec2:DescribeInstances', 'ec2:DescribeInstanceTypeOfferings',
@@ -665,8 +860,72 @@ class GatePlanTests(CostFixture):
         s3 = [('iam', action) for action in ('s3:PutObject', 's3:GetObject', 's3:PutObject', 's3:GetObject',
                                            's3:ListBucket', 's3:AbortMultipartUpload')]
         count = len(self.gpu_types())
-        self.assertEqual(self.calls_in(GATE_HOME), home + change + reads + launch * count + finish + s3)
+        self.assertEqual(self.calls_in(GATE_HOME), home + change + policies + reads + launch * count + finish + s3)
         self.assertEqual(self.calls_in(GATE_REGION), regional + change + launch * count + finish)
+
+    def test_busy_gate_controller_refuses_before_aws(self) -> None:
+        with control_lock(self.state / 'gate-up'):
+            status, output = self.run_plan()
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output, 'plan run: refused: The gate controller lock gate-up/controller.lock is busy.\n')
+        self.assertEqual(self.calls, [])
+
+    def test_missing_home_image_refuses_all_regions(self) -> None:
+        self.regions = (GATE_HOME, GATE_REGION, GATE_LAST)
+        self.failure, self.failure_region = 'image', GATE_HOME
+        status, output = self.run_plan()
+        self.assertEqual(status, 1, output)
+        self.assertEqual(output.splitlines()[1:], [
+            *(f'plan gate: {region}: refused: EC2 did not return the configured home gate image.'
+              for region in self.regions),
+            'plan run: refused: one or more gate regions failed',
+        ])
+        self.assertNotIn(('cloudformation', 'create-change-set'), self.calls_in(GATE_HOME))
+
+    def test_missing_change_set_id_waits_for_late_creation_before_removal_proof(self) -> None:
+        self.regions = (GATE_HOME,)
+        self.failure, self.failure_region = 'create-missing-id', GATE_HOME
+        status, output = self.run_plan()
+        self.assertEqual(status, 1, output)
+        cleanup = [operation for service, operation in self.calls_in(GATE_HOME)
+                   if service == 'cloudformation' and operation.endswith('-change-set')]
+        self.assertEqual(cleanup, ['create-change-set', 'delete-change-set', 'describe-change-set',
+                                   'describe-change-set', 'delete-change-set', 'describe-change-set'])
+        self.assertEqual(output.count('plan stack: change set removal confirmed'), 1)
+        self.assertIn('plan gate: us-east-2: refused: Id: expected nonempty text', output)
+
+    def test_delete_retries_after_the_change_set_becomes_deletable(self) -> None:
+        self.regions = (GATE_HOME,)
+        self.failure, self.failure_region = 'delete-not-ready', GATE_HOME
+        status, output = self.run_plan()
+        self.assertEqual(status, 0, output)
+        cleanup = [operation for service, operation in self.calls_in(GATE_HOME)
+                   if service == 'cloudformation' and operation.endswith('-change-set')]
+        self.assertEqual(cleanup, ['create-change-set', 'describe-change-set', 'delete-change-set',
+                                   'describe-change-set', 'describe-change-set', 'delete-change-set',
+                                   'describe-change-set'])
+        self.assertIn('plan stack: change set removal confirmed', output)
+
+    def test_preview_excludes_removed_and_replaced_policies_from_every_simulation(self) -> None:
+        self.displaced_policies = {GATE_HOME: {'GateLegacyPolicy': 'Remove'},
+                                   GATE_REGION: {'GateOldTrialPolicy': 'Modify'}}
+        status, output = self.run_plan()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls_in(GATE_HOME).count(('cloudformation', 'describe-stack-resource')), 3)
+        self.assertEqual(self.calls_in(GATE_REGION).count(('cloudformation', 'describe-stack-resource')), 1)
+        self.assertIn(('iam', 'ec2:TerminateInstances'), self.calls_in(GATE_HOME))
+        self.assertIn(('iam', 'ec2:TerminateInstances'), self.calls_in(GATE_REGION))
+
+    def test_unresolved_removed_policy_refuses_before_simulation(self) -> None:
+        self.unresolved_policy = 'GateLegacyPolicy'
+        self.displaced_policies = {GATE_REGION: {self.unresolved_policy: 'Remove'}}
+        status, output = self.run_plan()
+        self.assertEqual(status, 1, output)
+        for region in self.regions:
+            self.assertIn(f'plan gate: {region}: refused: CloudFormation did not identify the displaced '
+                          + 'GateLegacyPolicy policy in us-west-2.', output)
+        self.assertFalse(any(service == 'iam' for _, service, _ in self.calls))
+        self.assertNotIn('pass (', output)
 
     def test_existing_foundation_accepts_new_gate_policies(self) -> None:
         self.enable_gates = False
@@ -754,7 +1013,7 @@ class GatePlanTests(CostFixture):
         self.failure_region = GATE_REGION
         for failure, reason in (
             ('non-gate', 'changes a non-gate resource'),
-            ('obsolete', 'did not provide an available gate change set'),
+            ('obsolete', 'The change set execution status is OBSOLETE. Expected AVAILABLE.'),
             ('ec2:TerminateInstances', 'Gate scaler ec2:TerminateInstances denied'),
             ('image', 'the regional gate image needs an EC2 copy'),
         ):

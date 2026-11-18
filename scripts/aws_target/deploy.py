@@ -39,7 +39,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, c
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
-from scripts.lib import conf, user_zone
+from scripts.lib import conf, file_lock, user_zone
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
@@ -51,6 +51,7 @@ PROBE_DENIED_CODES = frozenset(('AccessDenied', 'AccessDeniedException', 'Unauth
 HANA_SETUP_VERSION = 2
 HANA_DATA_DEVICE = '/dev/sdf'
 HANA_DOWN_FIRST = 'Run deploy.py down --workload hana --approve-destroy first.'
+HANA_BUSY = 'The Hana lifecycle is busy. Run hana-setup again when the box is idle.'
 HANA_SPOT_REFUSALS = frozenset(('InsufficientInstanceCapacity', 'SpotMaxPriceTooLow', 'Unsupported',
                                'MaxSpotInstanceCountExceeded'))
 HANA_CREATE_REFUSALS = frozenset((
@@ -640,7 +641,7 @@ class Deployment:
             return self._plan_hana_update(workload, limits, self.mode)
         self._authorize(True)
         child = self._hana_output()
-        with control_lock(self.directory):
+        with self._hana_setup_lock():
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
             ownership = _hana_setup_ownership(saved)
@@ -829,6 +830,18 @@ class Deployment:
         _print_hana_placement(workload)
         return self._probe_hana_scaler(provider, identity)
 
+    @contextmanager
+    def _hana_setup_lock(self, *, wait: bool = True) -> Generator[None]:
+        path = self.directory / 'controller.lock'
+        if wait:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        elif not path.is_file():
+            raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
+        with file_lock.exclusive(path, wait=wait) as result:
+            if result is file_lock.LockResult.BUSY:
+                raise DeploymentRefused(HANA_BUSY)
+            yield
+
     def _plan_hana_update(self, workload: conf.ConfigRead, limits: hana_spend.PermitSettings,
                           plan: plan_run.PlanRun) -> bool:
         path = self.directory / 'hana' / 'setup.json'
@@ -845,8 +858,11 @@ class Deployment:
         if ownership != HanaBoxOwnership.STACK:
             raise plan_run.unsupported('Hana uses direct-owned resources')
         self._check_credentials()
-        plan.confirm_account(limits.region, workload.whole('aws_timeout_s'))
-        return self._update_stack_owned_hana(path, saved, workload, limits)
+        with self._hana_setup_lock(wait=False):
+            if remote.read_record(path) != saved:
+                raise DeploymentRefused('The saved Hana setup changed. Run hana-setup again.')
+            plan.confirm_account(limits.region, workload.whole('aws_timeout_s'))
+            return self._update_stack_owned_hana(path, saved, workload, limits)
 
     def _update_stack_owned_hana(self, path: Path, saved: dict[str, object], workload: conf.ConfigRead,
                                  limits: hana_spend.PermitSettings) -> bool:
@@ -940,7 +956,7 @@ class Deployment:
                      and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
         if (registration.get('state') != hana_box.Lifecycle.IDLE_STOPPED or registration.get('claims') != []
                 or registration.get('start', {}) is not None or (operation is not None and not observing)):
-            raise DeploymentRefused('The Hana lifecycle is busy. ' + retry)
+            raise DeploymentRefused(HANA_BUSY)
         try:
             observed = api.observe(identity.instance, int(self.clock()))
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
@@ -2194,10 +2210,16 @@ class Deployment:
             if not executed:
                 _ = self._discard_change_set(api, stack_id, name)
 
-    def regional_image(self, api: AwsCli, settings: DeploymentSettings, region: str) -> str:
+    def regional_image(self, api: AwsCli, settings: DeploymentSettings, region: str,
+                       *, home_image: dict[str, object] | None = None) -> str:
         """Find the matching release or retain a copied image for recovery."""
         target = api.in_region(region)
-        source = ledger.rows(api.call('describe-images', '--image-ids', settings.ami_id), 'Images')[0]
+        source = home_image
+        if source is None:
+            sources = ledger.rows(api.call('describe-images', '--image-ids', settings.ami_id), 'Images')
+            if isinstance(self.mode, plan_run.PlanRun) and not sources:
+                raise DeploymentRefused('EC2 did not return the configured home gate image.')
+            source = sources[0]
         images = ledger.rows(target.call('describe-images', '--owners', ledger.text(source, 'OwnerId'),
             '--filters', 'Name=name,Values=' + ledger.text(source, 'Name'), 'Name=state,Values=available'), 'Images')
         if images:
@@ -2223,7 +2245,8 @@ class Deployment:
                        timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
         return image
 
-    def regional_network(self, api: AwsCli, settings: DeploymentSettings, region: str) -> RegionalNetwork:
+    def regional_network(self, api: AwsCli, settings: DeploymentSettings, region: str,
+                         *, home_image: dict[str, object] | None = None) -> RegionalNetwork:
         """Read the default VPC and public subnets of a gate region, and find or copy its gate image."""
         target = api.in_region(region)
         vpcs = ledger.rows(target.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
@@ -2234,7 +2257,7 @@ class Deployment:
             subnets = gate_subnets(target, vpc)
         except DeploymentRefused as error:
             raise DeploymentRefused(region + ': ' + str(error)) from error
-        return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region))
+        return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region, home_image=home_image))
 
     def _regional_gate_values(self, settings: DeploymentSettings, parameters: dict[str, str],
                               network: RegionalNetwork, deployment: str, profile: str) -> dict[str, str]:
@@ -2404,11 +2427,18 @@ class Deployment:
 
     def gate_plan(self) -> None:
         """Preview the approved gate update in configured region order."""
-        from scripts.aws_target import cloud_gate, gpu_size_trial
-
         if not isinstance(self.mode, plan_run.PlanRun):
             raise DeploymentRefused('The gate plan requires the plan identity.')
-        plan = self.mode
+        directory = self.directory / 'gate-up'
+        directory.mkdir(parents=True, exist_ok=True)
+        with file_lock.exclusive(directory / 'controller.lock', wait=False) as lock:
+            if lock is file_lock.LockResult.BUSY:
+                raise DeploymentRefused('The gate controller lock gate-up/controller.lock is busy.')
+            self._gate_plan_locked(self.mode)
+
+    def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
+        from scripts.aws_target import cloud_gate, gpu_size_trial
+
         settings = read_deployment_settings(self.settings_path)
         values = cloud_gate.settings()
         regions = gate_regions(settings.region, values)
@@ -2452,6 +2482,7 @@ class Deployment:
                              service='cloudformation')
             body = reply['TemplateBody']
             live = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
+            live_resources = ledger.mapping(live['Resources'])
             source = TEMPLATE.read_bytes()
             template = ledger.mapping(cast(object, json.loads(source)))
             definitions = ledger.mapping(template['Parameters'])
@@ -2460,6 +2491,10 @@ class Deployment:
                                | set(values.words('hana_gpu_instance_types')))
             wait_s = conf.read(self.settings_path).whole('stack_wait_timeout_s')
             print('plan guard: home gate stack and scaler credentials passed', flush=True)
+            images = ledger.rows(api.call('describe-images', '--image-ids', settings.ami_id), 'Images')
+            if len(images) != 1 or images[0].get('ImageId') != settings.ami_id:
+                raise DeploymentRefused('EC2 did not return the configured home gate image.')
+            home_image = images[0]
         except plan_run.PLAN_ERRORS as error:
             for region in regions:
                 print(f'plan gate: {region}: refused: {plan_run.safe_reason(error)}', flush=True)
@@ -2471,7 +2506,7 @@ class Deployment:
                     networks[region] = RegionalNetwork(region, settings.vpc_id, gate_subnets(api, settings.vpc_id),
                                                        settings.ami_id)
                 else:
-                    networks[region] = self.regional_network(api, settings, region)
+                    networks[region] = self.regional_network(api, settings, region, home_image=home_image)
             except plan_run.PLAN_ERRORS as error:
                 failures[region] = plan_run.safe_reason(error)
 
@@ -2484,8 +2519,7 @@ class Deployment:
             regional_definitions = ledger.mapping(regional_template['Parameters'])
             if failures and settings.region not in failures:
                 failures[settings.region] = 'the home gate policy needs the image and VPC of every gate region'
-            policy, shared = plan.gate_scaler_policy(api, stack_id, settings.scaler_user_name, template, live, proposed,
-                                                     gates_enabled=live_parameters.get('EnableGates') == 'true')
+            documents, shared = plan.gate_policy_documents(api.region, settings.scaler_user_name, template, proposed)
             for key, value in (('GateBucket', shared.bucket), ('GateProfileArn', shared.profile), ('GateRoleArn', shared.role)):
                 if key in outputs and outputs[key] != value:
                     raise DeploymentRefused('The home gate outputs differ from the proposed resource identities.')
@@ -2496,6 +2530,10 @@ class Deployment:
                 print(f'plan gate: {region}: refused: {reason}', flush=True)
             raise DeploymentRefused('one or more gate regions failed') from None
 
+        home_policy_ids = tuple(logical_id for logical_id in plan_run.GATE_SCALER_POLICY_IDS
+                                if live_parameters.get('EnableGates') == 'true' and logical_id in live_resources)
+        displaced = {settings.region: (stack_id, home_policy_ids)}
+        pending_probes: dict[str, plan_run.GateLaunchProbe] = {}
         for region in regions:
             if region in failures:
                 continue
@@ -2504,7 +2542,9 @@ class Deployment:
                 network = networks[region]
                 if region == settings.region:
                     changes = gate_update_values(stack, parameters, definitions)
-                    change_kind = plan.gate_update(target, stack_id, source, changes, wait_s)
+                    preview = plan.gate_update(target, stack_id, source, changes, wait_s)
+                    displaced[region] = (stack_id, home_policy_ids + preview.displaced_policy_ids)
+                    change_kind = preview.summary
                     regional_outputs = outputs
                 else:
                     name = settings.stack_name + '-gates-' + region
@@ -2520,20 +2560,37 @@ class Deployment:
                                                                          shared.profile)
                         changes = gate_update_values(regional, {key: value for key, value in regional_parameters.items()
                                                                 if key in regional_definitions}, regional_definitions)
-                        change_kind = plan.gate_update(target, ledger.text(regional, 'StackId'), regional_source,
-                                                           changes, wait_s)
+                        regional_id = ledger.text(regional, 'StackId')
+                        preview = plan.gate_update(target, regional_id, regional_source, changes, wait_s)
+                        displaced[region] = (regional_id, preview.displaced_policy_ids)
+                        change_kind = preview.summary
 
-                launch = plan_run.GateLaunchProbe(deployment, network.image, network.vpc,
+                pending_probes[region] = plan_run.GateLaunchProbe(deployment, network.image, network.vpc,
                     ledger.text(network.subnets[0], 'id'), regional_outputs.get('GateLaunchTemplate', 'lt-00000000000000000'),
                     regional_outputs.get('GateSecurityGroup', 'sg-00000000000000000'), tuple(gpu_types),
                     {'GateAttempt': 'setup-probe', 'GpuSizeTrial': 'setup-probe', 'ExpiresAt': '0',
                      spending.cost_explorer_tag_key: spending.cost_explorer_tag_value},
                     gpu_size_trial.GPU_TRIAL_ARTIFACT_PREFIX + 'setup-probe.json',
                     gpu_size_trial.GPU_TRIAL_REQUEST_PREFIX + 'setup-probe.json')
-                plan.probe_gate_scaler(target, principal, policy, shared, launch, home=region == settings.region)
                 results[region] = change_kind
             except plan_run.PLAN_ERRORS as error:
                 failures[region] = plan_run.safe_reason(error)
+
+        try:
+            exclusions = tuple(dict.fromkeys(arn for region, (stack, ids) in displaced.items()
+                                            for arn in plan.gate_displaced_policies(api.in_region(region), stack, ids)))
+        except plan_run.PlanRefused as error:
+            for region in regions:
+                _ = failures.setdefault(region, plan_run.safe_reason(error))
+        else:
+            policy = plan_run.ScalerPolicyPlan(exclusions, documents)
+            for region, launch in pending_probes.items():
+                try:
+                    plan.probe_gate_scaler(api.in_region(region), principal, policy, shared, launch,
+                                           home=region == settings.region)
+                except plan_run.PLAN_ERRORS as error:
+                    failures[region] = plan_run.safe_reason(error)
+
         for region in regions:
             result = f'refused: {failures[region]}' if region in failures else f'pass ({results[region]})'
             print(f'plan gate: {region}: {result}', flush=True)
@@ -2970,8 +3027,9 @@ class DeploymentArguments(argparse.Namespace):
 
 def run_setup_plan(args: DeploymentArguments) -> int:
     try:
+        workloads = ('rust', 'merge-gates', 'hana') if args.command == 'hana-setup' else ('rust', 'merge-gates')
         if (args.command not in ('up', 'hana-setup')
-                or args.workload not in ('rust', 'merge-gates')
+                or args.workload not in workloads
                 or args.command == 'up' and args.workload != 'merge-gates'
                 or args.trial_action or args.approve_resources or args.approve_destroy):
             raise DeploymentRefused('Use --plan with hana-setup or up --workload merge-gates without approval flags.')
