@@ -23,7 +23,7 @@ from statistics import median
 import sys
 import tempfile
 import time
-from typing import Literal, cast, final
+from typing import BinaryIO, Literal, cast, final
 from uuid import uuid4
 
 from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
@@ -928,6 +928,14 @@ def outcome_result(folder: Path, outcome: dict[str, object]) -> dict[str, object
     return read(folder / RESULT_FILE) if outcome.get('result_file') == RESULT_FILE else ledger.mapping(outcome['result'])
 
 
+def _outcome_imported(folder: Path) -> bool:
+    # The attempt fixes the record ID. The import can remove the result file.
+    try:
+        return read(folder / 'imported.json').get('id') == 'gate-' + folder.name
+    except (FileNotFoundError, ValueError):
+        return False
+
+
 def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
     if request.get('task') == 'paired':
         gate_box.validate_paired_result(row, request, instance)
@@ -952,32 +960,61 @@ def validate_result(row: dict[str, object], request: dict[str, object], *, insta
         raise ValueError('The buildlog record differs from the result')
 
 
+def _import_already_appended(marker: Path, handle: BinaryIO, destination: Path, record_id: str) -> bool:
+    """Search the bytes that another import could have appended for this record."""
+    try:
+        saved = read(marker)
+    except FileNotFoundError:
+        return False
+    if saved.get('id') != record_id or saved.get('destination') != str(destination):
+        return False
+    offset = saved.get('offset')
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise ValueError('The gate import marker has an invalid file offset')
+    _ = handle.seek(offset)
+    with open(handle.fileno(), 'rb', closefd=False) as tail:
+        for line in tail:
+            try:
+                previous = cast(object, json.loads(line))
+            except ValueError:
+                continue
+            if isinstance(previous, dict) and cast(dict[str, object], previous).get('id') == record_id:
+                return True
+    return False
+
+
 def import_record(folder: Path, row: dict[str, object]) -> None:
     record = ledger.mapping(row['record'])
     host = ledger.text(record, 'host')
     if not host or Path(host).name != host or host in ('.', '..'):
         raise ValueError('Invalid remote host')
     at = datetime.fromisoformat(ledger.text(record, 'started_at')).timestamp()
+    record_id = ledger.text(record, 'id')
     # The record keeps the box host; the file is the one AWS place.
-    destination = store.host_file(store.CLOUD_GATE_PLACE, at)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = store.host_file(store.CLOUD_GATE_PLACE, at).absolute()
+    marker = folder / 'import-boundary.json'
     with store.locked_append(destination) as handle:
-        _ = handle.seek(0)
-        records = [ledger.mapping(cast(object, json.loads(line))) for line in handle if line.endswith(b'\n')]
-        if not any(previous.get('id') == record['id'] for previous in records):
+        # The lock repairs a partial row before it gives us the offset.
+        offset = handle.tell()
+        if not _import_already_appended(marker, handle, destination, record_id):
+            save(marker, {'id': record_id, 'destination': str(destination), 'offset': offset})
             run = gate_box.decode_run(row['gate'])
-            gate_record.keep_failure_logs(ledger.text(record, 'id'), store.CLOUD_GATE_PLACE, at,
+            gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
     from scripts.buildlog.record import keep_result
-    imported: dict[str, object] = {'id': record['id']}
+    imported: dict[str, object] = {'id': record_id}
     try:
         # The result leaves the checkout: a gate copy is a reused slot.
-        imported['result'] = keep_result(json.dumps(row).encode(), store.CLOUD_GATE_PLACE, at, ledger.text(record, 'id'))
-        (folder / RESULT_FILE).unlink(missing_ok=True)
+        imported['result'] = keep_result(json.dumps(row).encode(), store.CLOUD_GATE_PLACE, at, record_id)
     except OSError as error:
         gate_record.report_not_written(error)
     save(folder / 'imported.json', imported)
+    if 'result' in imported:
+        try:
+            (folder / RESULT_FILE).unlink(missing_ok=True)
+        except OSError as error:
+            gate_record.report_not_written(error)
 
 
 def working_tree(repo: Path) -> tuple[str, set[str]]:
@@ -1060,17 +1097,11 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
     directory = attempt.directory
     deployment_path = directory / 'gate-deployment.json'
-    if not deployment_path.exists():
-        return LocalFallback('image or stack is absent')
-    home = conf.read(account_settings_path()).text('region')
-    _ = gate_regions(home)
-    deployment = gate_deployment(deployment_path, home)
-    regional = ledger.rows(deployment, 'regions')[0]
-    if not regional.get('image') or not regional.get('template'):
-        return LocalFallback('image or stack is absent')
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
         current = root / 'current.json'
+        if not current.exists() and not deployment_path.exists():
+            return LocalFallback('image or stack is absent')
         tree, _dirty = working_tree(repo)
         previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
@@ -1081,6 +1112,30 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         folder = root / ledger.text(previous, 'attempt') if same_request else root / uuid4().hex
         result_path = folder / 'outcome.json'
         saved_result = read(result_path) if result_path.exists() else {}
+        if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
+            try:
+                request = read(folder / 'request.json')
+                saved_attempt = request.setdefault('attempt', folder.name)
+                if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
+                        or saved_attempt != folder.name):
+                    raise ValueError('The saved request differs from the current cloud attempt')
+                row = outcome_result(folder, saved_result)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            else:
+                attempt.identifier = folder.name
+                with cloud_reservation(repo, folder / 'reservation.cgroup', mode) as reservation:
+                    outcome = _complete_outcome(repo, folder, request, row)
+                    reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
+                    return outcome
+        if not deployment_path.exists():
+            return LocalFallback('image or stack is absent')
+        home = conf.read(account_settings_path()).text('region')
+        _ = gate_regions(home)
+        deployment = gate_deployment(deployment_path, home)
+        regional = ledger.rows(deployment, 'regions')[0]
+        if not regional.get('image') or not regional.get('template'):
+            return LocalFallback('image or stack is absent')
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
             bool(previous.get('retry_launch')) or saved_result.get('status') == 'interrupted'
             and saved_result.get('interruption_code') in SPOT_INTERRUPTION_CODES)
@@ -1184,16 +1239,23 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
     if not (folder / 'outcome.json').exists():
         return LocalFallback('The scaler service has no final result')
     outcome = read(folder / 'outcome.json')
-    if outcome.get('status') == 'fallback':
-        return LocalFallback(ledger.text(outcome, 'reason'))
     if outcome.get('status') != 'complete':
         return LocalFallback(ledger.text(outcome, 'reason'))
     try:
         row = outcome_result(folder, outcome)
-        validate_result(row, request)
     except (OSError, ValueError, KeyError, TypeError) as error:
         return LocalFallback(str(error))
-    if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['head']:
+    return _complete_outcome(repo, folder, request, row)
+
+
+def _complete_outcome(repo: Path, folder: Path, request: dict[str, object],
+                      row: dict[str, object]) -> LocalFallback | CloudCompleted:
+    try:
+        validate_result(row, request)
+        head = ledger.text(request, 'head')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return LocalFallback(str(error))
+    if gate.checked_git(repo, 'rev-parse', 'HEAD') != head:
         return LocalFallback('The checkout changed during the cloud attempt')
     import_record(folder, row)
     print((folder / 'gate.log').read_text(), end='', flush=True)

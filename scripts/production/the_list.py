@@ -131,12 +131,13 @@ class ReadCurrentUpdate(StrEnum):
 
 @dataclass(frozen=True)
 class PageRequest:
-    """Identify a List action and the words it must match on retry."""
+    """Identify the action and its input for a retry."""
 
     request: str
     action: Literal["tell", "remove", "park", "read", "question"]
     words: str
     form_words: str = ""
+    parked_until: Timestamp = NoTimestamp.UNSET
 
 
 class NoPageRequest(StrEnum):
@@ -158,9 +159,10 @@ class PageFeedback:
     read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
     action: Literal["tell", "remove", "park"] = "tell"
     form_words: str = ""
+    parked_until: Timestamp = NoTimestamp.UNSET
 
     def key(self) -> PageRequest:
-        return PageRequest(self.request, self.action, self.words, self.form_words)
+        return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
 
 
 @dataclass(frozen=True)
@@ -171,6 +173,7 @@ class PageItemNotice:
     words: str
     action: Literal["remove", "park"]
     form_words: str = ""
+    parked_until: Timestamp = NoTimestamp.UNSET
 
 
 PAGE_SOURCE = "nate via List"
@@ -206,6 +209,10 @@ class ListItem:
     log: tuple[ItemChange, ...]
     reviews: tuple[str, ...] = ()
     questions: tuple[question_record.Question, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.state == ItemState.CLOSED:
+            object.__setattr__(self, "unread_since", NoTimestamp.UNSET)
 
     @property
     def id(self) -> str:
@@ -245,6 +252,14 @@ class LegacyFieldChange(FieldChange):
     """Keep the original note for the unread update identity."""
 
     note: str
+
+
+@dataclass(frozen=True)
+class PageParkingChange(FieldChange):
+    """Link the parking change to the List page request."""
+
+    action: Literal["Parked"]
+    request: str
 
 
 @dataclass(frozen=True)
@@ -694,7 +709,10 @@ def _question_id(value: object) -> str:
 
 
 def _request_fields(request: PageRequest) -> dict[str, str]:
-    return {"request": _request_id(request.request), "action": request.action, "words": request.words, "form_words": request.form_words}
+    fields = {"request": _request_id(request.request), "action": request.action, "words": request.words, "form_words": request.form_words}
+    if isinstance(request.parked_until, datetime):
+        fields["parked_until"] = request.parked_until.isoformat()
+    return fields
 
 
 def _log_content(content: LogContent) -> dict[str, object]:
@@ -702,6 +720,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"note": content}
     if isinstance(content, LegacyFieldChange):
         return {"note": content.note}
+    if isinstance(content, PageParkingChange):
+        return {"action": content.action, "fields": _log_fields(content.fields), "request": _request_id(content.request)}
     if isinstance(content, FieldChange):
         return {"action": content.action, "fields": _log_fields(content.fields)}
     if isinstance(content, QuestionAnswered):
@@ -752,6 +772,9 @@ def _read_log_line(line: str, number: int) -> ItemChange:
         match fields:
             case {"note": str(note)} if len(fields) == 1:
                 content = _read_legacy_note(note, source, number)
+            case {"action": "Parked", "fields": values, "request": request} if len(fields) == 3:
+                parking = _read_field_change("Parked", values, number)
+                content = PageParkingChange("Parked", parking.fields, _request_id(request))
             case {"action": action, "fields": values} if len(fields) == 2 and action in ("Added", "Updated", "Parked", "Closed"):
                 content = _read_field_change(action, values, number)
             case {"action": "Answered", "question_id": question_id} if len(fields) == 2:
@@ -929,7 +952,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if isinstance(page_action, PageItemNotice):
             if not page_action.words.strip():
                 raise ListError("an item notice needs words")
-            request = PageRequest(page_action.request, page_action.action, page_action.words, page_action.form_words)
+            request = PageRequest(page_action.request, page_action.action, page_action.words, page_action.form_words,
+                                  page_action.parked_until)
         if isinstance(request, PageRequest) and _previous_page_request(item, request) is not NoPageRequest.ABSENT:
             return item
         moment = now()
@@ -941,7 +965,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if isinstance(request, PageRequest):
             if entries and isinstance(page_action, PageItemNotice):
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
-                                       form_words=page_action.form_words)
+                                       form_words=request.form_words, parked_until=request.parked_until)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
             else:
                 entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
@@ -1053,12 +1077,19 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 def park(keeper: staff.StaffId, identity: str, until: Timestamp, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+    fields: LogFields = {"parked_until": until}
+    event = FieldChange("Parked", fields)
+    if isinstance(notice, PageItemNotice) and isinstance(until, datetime):
+        _validate_time(until)
+        notice = replace(notice, parked_until=until.astimezone(UTC))
+        event = PageParkingChange("Parked", fields, notice.request)
+
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if isinstance(notice, PageItemNotice) and (not isinstance(until, datetime) or until <= moment):
             raise ListError("Choose a future parking date.")
         _open(item)
         return replace(item, parked_until=until)
-    return _change(keeper, identity, edit, FieldChange("Parked", {"parked_until": until}), source, page_action=notice)
+    return _change(keeper, identity, edit, event, source, page_action=notice)
 
 
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
@@ -1131,10 +1162,14 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     action = fields.get("action")
     if not isinstance(words, str) or not isinstance(form_words, str):
         raise ListError("invalid List request log")
+    parking_time = fields.get("parked_until", "")
+    if not isinstance(parking_time, str) or (parking_time and action != "park"):
+        raise ListError("invalid List request parking time")
+    parked_until = _required_time(parking_time).astimezone(UTC) if parking_time else NoTimestamp.UNSET
     if receipt:
         if action not in ("read", "remove", "park", "question") or (action != "read" and not words.strip()):
             raise ListError("invalid List request receipt")
-        received = PageRequest(request, action, words, form_words)
+        received = PageRequest(request, action, words, form_words, parked_until)
         if action == "question":
             return QuestionRequestReceipt(received, _question_id(fields.get("question_id")))
         return received
@@ -1144,7 +1179,7 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     if action not in ("tell", "remove", "park") or not words.strip():
         raise ListError("invalid List feedback action")
     return PageFeedback(request, words, state, alerted_to,
-                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words)
+                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words, parked_until)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:
@@ -1172,7 +1207,18 @@ def _previous_page_request(
             key = previous.request
         else:
             key = previous
-        if key != request:
+        if key.action == request.action == "park" and isinstance(request.parked_until, datetime):
+            target = key.parked_until
+            if target is NoTimestamp.UNSET:
+                recorded = [change.fields.get("parked_until", NoTimestamp.UNSET) for entry in item.log
+                            if isinstance(change := entry.what, PageParkingChange) and change.request == key.request]
+                if len(recorded) == 1 and isinstance(recorded[0], datetime):
+                    target = recorded[0].astimezone(UTC)
+            if target != request.parked_until:
+                raise ListError("this request already has a different parking time")
+            if key.form_words != request.form_words:
+                raise ListError("this request already has a different action or words")
+        elif key != request:
             raise ListError("this request already has a different action or words")
     return previous
 
@@ -1396,7 +1442,7 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    answer = commands.add_parser("answer", help="answer a List question and mark the item unread")
+    answer = commands.add_parser("answer", help="save an answer to a List question")
     _ = answer.add_argument("id", help="the List item ID, such as L1")
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")

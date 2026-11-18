@@ -577,6 +577,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
 '''
         completion, refresh = command.split('export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"', 2)[1:]
         environment = self.environment(HOME=str(home), BUILDLOG_RECORD=str(SCRIPT),
+            BUILD_HELPER_ROOT=str(launcher.parent.parent),
             BUILDLOG_SCOPE="0", PY=sys.executable, HOLD_WAIT_DIR=str(hold),
             TEST_FIRST_FOLDER=str(self.repo / "first"), TEST_CHANGED_FOLDER=str(self.repo / "changed"),
             TEST_METADATA=json.dumps({"workspace_root": str(self.repo),

@@ -379,7 +379,8 @@ def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *
         try:
             _ = step()
         except (OSError, ValueError, RuntimeError, ArithmeticError, subprocess.SubprocessError) as error:
-            print(f'aws_target: {name} unavailable: {type(error).__name__}', file=sys.stderr)
+            detail = f'{type(error).__name__}: {error}' if name == 'Hana lifecycle' else type(error).__name__
+            print(f'aws_target: {name} unavailable: {detail}', file=sys.stderr)
             status = 1
     return status
 

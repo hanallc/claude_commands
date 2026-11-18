@@ -72,6 +72,7 @@ from scripts.build_queue.admission_wire import (
     RunnerAdmitted as RunnerAdmitted,
     LaunchAdmitted as LaunchAdmitted,
     Refused as Refused,
+    PLACEMENT_REQUEST_MISSING_REASON as PLACEMENT_REQUEST_MISSING_REASON,
     Ok as Ok,
     BuildHistoryReply as BuildHistoryReply,
     PlacementRequest as PlacementRequest,

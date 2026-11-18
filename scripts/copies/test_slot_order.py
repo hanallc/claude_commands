@@ -383,13 +383,15 @@ placement_once
         self.queue.release(occupied)
 
     def test_leaving_before_admission_returns_without_a_slot(self) -> None:
+        leave = self.root / "leave"
         _ = write_config_fixture(self.queue.root / "build_admission.conf", "running_pass_seconds=0.05\n")
         self.queue.hold_starts()
-        with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "exit 0"}):
+        with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
             process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
+        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the caller did not enter the memory queue")
+        leave.touch()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 75, output + errors)
-        self.assertTrue(self.waiting.is_set(), errors)
         self.assertFalse(self.slot_root.exists())
         self.assertFalse(list(self.slot_root.glob("*.lease.json")))
         with self.queue.loop_turn():

@@ -1239,6 +1239,7 @@ class UnitMembershipPublished:
 def admit_unit(request: UnitLaunch, *,
                record: staff.StaffSnapshot | None = None) -> UnitAdmissionPending | UnitMembershipPublished:
     """Create the actual worktree before the row, then publish the checked config."""
+    staff.validate_unit_name_for_write(request.unit_id)
     record = staff.initial_snapshot() if record is None else record
     config = configuration_for(request)
     ensure_worktree(request)
@@ -1331,6 +1332,7 @@ def ensure_staff_unit(production: Production, unit: str, *,
         return pane_launch.staff_admitted(staff.set_worktree(found.row.id, worktree, expected=found.row.worktree))
     if isinstance(worktree, staff.WorktreeUnfilled):
         raise Refusal(f"unit {unit}: no filled worktree for admission")
+    staff.validate_unit_name_for_write(unit)
     runner = ensure_staff_showrunner(production)
     return pane_launch.staff_admitted(staff.ensure("unit", name=unit_names.name(unit), parent=staff.ReportsTo(runner.id),
                                                   worktree=worktree, runtime_id=runtime_id, unit_type=unit_type))
@@ -1358,6 +1360,7 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
+    staff.validate_unit_name_for_write(cast(str, args.name))
     try:
         request = launch_request(args)
         with staff.row_operation(request.session.session_id if isinstance(request.session, ResumedSession)

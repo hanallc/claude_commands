@@ -23,7 +23,7 @@ def producer_account(kind: Literal["claude", "codex"], *, to: str = "") -> accou
     """Select the producer account before staff admission."""
     if to:
         return resume_account(kind, to=to)
-    return accounts.role_account("workers" if kind == "codex" else "showrunner")
+    return accounts.role_account("workers" if kind == "codex" else "producer")
 
 
 def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW,
@@ -37,7 +37,7 @@ def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWith
     if kind == "codex":
         return accounts.role_account("workers")
     if not isinstance(row, SessionWithoutStaffRow) and row.kind == "producer":
-        return accounts.role_account("showrunner")
+        return accounts.role_account("producer")
     if not isinstance(row, SessionWithoutStaffRow) and row.kind in ("unit", "showrunner"):
         return accounts.role_account(row.kind)
     return accounts.role_account("unit")

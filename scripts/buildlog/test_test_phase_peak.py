@@ -395,7 +395,7 @@ buildlog_memory_python() {
             local attempt
             for attempt in {1..200}; do [[ -s "$LINT_NEXTEST_WIDTH_FILE" ]] && break; command sleep 0.05; done
         fi
-        "$HOME/.claude/scripts/lib/py" "$@"
+        "$BUILD_HELPER_ROOT/lib/py" "$@"
     fi
 }
 buildlog_exec() {
@@ -413,7 +413,7 @@ buildlog_exec() {
     local completed
     read -r -t 10 completed <&7 || return 92
     [[ "$completed" == done ]] || return 93
-    "$HOME/.claude/scripts/lib/py" "$TEST_PHASE_RECORDER" test-phase-context "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" > "$ticks/released-reservation.json"
+    "$BUILD_HELPER_ROOT/lib/py" "$TEST_PHASE_RECORDER" test-phase-context "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" > "$ticks/released-reservation.json"
     printf 'fake nextest completed\n'
 }
 sweep_after_step() { :; }
