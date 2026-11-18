@@ -192,15 +192,14 @@ class FindingResults:
         def publish() -> None:
             if versions != self.facts.source_versions():
                 return
-            with self.facts.publication():
-                _ = self.facts.connection.execute(
-                    "INSERT OR REPLACE INTO refill_findings "
-                    + "(consumer_key,catalog,finding_id,view,input_identity,dirty_version,result,objects,approvals,"
-                    + "crate,old_name,new_name,owner,footprint) VALUES (?,?,?,?,?,0,?,?,?,?,?,?,?,?)",
-                    (key, self.facts.catalog, finding, view, input_identity((FINDING_RESULT_VERSION, identity)),
-                     encoded, json.dumps(objects), json.dumps(approvals, ensure_ascii=False),
-                     crate, old_name, new_name, owner, json.dumps(footprint, ensure_ascii=False)))
-                self.facts.dependencies("refill_findings", key, edges)
+            _ = self.facts.connection.execute(
+                "INSERT OR REPLACE INTO refill_findings "
+                + "(consumer_key,catalog,finding_id,view,input_identity,dirty_version,result,objects,approvals,"
+                + "crate,old_name,new_name,owner,footprint) VALUES (?,?,?,?,?,0,?,?,?,?,?,?,?,?)",
+                (key, self.facts.catalog, finding, view, input_identity((FINDING_RESULT_VERSION, identity)),
+                 encoded, json.dumps(objects), json.dumps(approvals, ensure_ascii=False),
+                 crate, old_name, new_name, owner, json.dumps(footprint, ensure_ascii=False)))
+            self.facts.dependencies("refill_findings", key, edges)
         self.facts.publish(publish)
 
     def source_fact[T](self, kind: str, identity: object, calculate: Callable[[], T],
