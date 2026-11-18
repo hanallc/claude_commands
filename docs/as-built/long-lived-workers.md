@@ -659,6 +659,30 @@ The supervisor installs no signal handler.
 Each checks the supervisor and the command leader identity first, and saves a stop reason.
 The supervisor stays alive, records the exit status and delivers the result.
 A result with a stop reason reads `STOPPED (exit <n>)` and carries a `Stop reason:` line.
+New worker runs save the recorder pass ID or the reason the lookup failed.
+An unavailable pass ID prevents cancellation.
+For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
+After an explicit stop, the supervisor records the leader's exit status and waits for the entire group to end.
+The supervisor starts delivery once the group ends.
+The run stays pending for completion readers until delivery or the reaper confirms that the group ended.
+The folder reader finds pending stops by index and verifies their status in the run record.
+The stop uses the same command and group checks as the orphan reaper for other runs of the worker.
+The stop keeps the pass active if it cannot confirm ownership or the end of the commands.
+It reports the reason for keeping the pass.
+The stop holds the worker lock, then the admission lock, then the recorder lock.
+The stop checks the shared receipt for DONE before it cancels the pass.
+The recorder saves a verified DONE through normal completion.
+The recorder saves the canceled status, stopped outcome, reason, and notice in one state write.
+Assign can reuse the worker when its pane is idle.
+`worker.py answer` reports `no active pass`.
+The turn hook sends the director one stopped notice with the worker name and phase.
+The recorder retains the notice for delivery after another pass replaces the stopped pass.
+The turn hook saves a verified late DONE reply and retains the stopped outcome.
+The recorder retains the original prompt and reply path after a replacement pass starts.
+If the Stop event has no DONE marker, the hook uses each unsaved receipt to check the transcript for its DONE marker.
+A run without a pane pass uses the ordinary result delivery.
+A newer run of the same command suppresses the older orphan result.
+A repeated stop sends no additional signal or notice.
 If the supervisor dies, the orphan reaper finishes the record and delivers the result.
 The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.
