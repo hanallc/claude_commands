@@ -151,3 +151,9 @@ Keep the user-facing status to one or two plain sentences: where it stands and w
 Standalone updates name the topic and number. Do not use the number alone.
 Surface decisions, completion, new blockers, and meaningful timing changes. Save routine detail for requests.
 Do not issue a separate progress announcement for every routine record update.
+
+## Daily `/simplify` failures
+
+Relay each new `/simplify` failure from a daily run at once, with its unit, date, and reason.
+Do not repeat the same failure. Label forced proof failures as tests, not production incidents.
+Honor a proof message's instruction that it needs no user alert. Reply to its sender when it asks for confirmation.
