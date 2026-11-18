@@ -76,7 +76,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = eligibility.read_config(self.config_path)
         expected = (
-            'cd .local/state/mac-test/mirror/hana && { find "$HOME"/.local/state/mac-test/mirror/hana/target -maxdepth 5 -type d '
+            'cd .local/state/mac-test/test-mirror/hana && { find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
             + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
             + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
@@ -84,16 +84,16 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + '~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
-            + 'cd "$HOME"/.local/state/mac-test/mirror/hana && trim_started=$(date +%s); '
+            + 'cd "$HOME"/.local/state/mac-test/test-mirror/hana && trim_started=$(date +%s); '
             + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
                           + 'config = conf.read("lint"); '
                           + 'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
                           + 'config.number(sweep.RECENT_KEY)))')
-            + ' "$HOME"/.local/state/mac-test/mirror/hana/target >/dev/null 2>&1; then '
+            + ' "$HOME"/.local/state/mac-test/test-mirror/hana/target >/dev/null 2>&1; then '
             + 'trim_status=0; else trim_status=$?; fi; '
             + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
-            + 'if trim_size=$(du -sk "$HOME"/.local/state/mac-test/mirror/hana/target 2>/dev/null); then '
+            + 'if trim_size=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
             + 'trim_size=${trim_size%%[[:space:]]*}; '
             + 'over_budget=$(awk -v size="$trim_size" -v budget=64 '
             + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
@@ -104,15 +104,15 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
             + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
             + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/mirror/hana/target 2>/dev/null); then '
+            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
             + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + 'if rm -rf -- "$HOME"/.local/state/mac-test/mirror/hana/target; then '
+            + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
             + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi'
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
-        self.assertTrue(fetch.startswith("cd .local/state/mac-test/mirror/hana && { find "))
+        self.assertTrue(fetch.startswith("cd .local/state/mac-test/test-mirror/hana && { find "))
         self.assertIn(" || :; } && rm -rf -- target/shots && PATH=", fetch)
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
@@ -211,7 +211,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
         pull = events[-2]["args"]
         self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(eligibility.read_config(self.config_path).connection)])])
-        self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
+        self.assertEqual(pull[-2], "mac:.local/state/mac-test/test-mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
         rows = [cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog").glob("*/*.jsonl")

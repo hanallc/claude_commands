@@ -355,10 +355,17 @@ def _handle_locked(event: WorkerEvent) -> TurnOutcome | TurnDecision:
         passed = worker_panes.worker_pass(row, run)
 
         def ignore_turn(reason: str) -> TurnOutcome:
-            if event.kind == EventKind.TURN_END:
+            # The Codex capacity stop cancels the pass, and a live detached run keeps the stopped pane at the
+            # shell. The run end closes that pane. The canceled pass gates the pane scan.
+            stopped = (event.kind == EventKind.RUN_FINISHED and passed.get("status") == "canceled" and isinstance(
+                worker_panes.observe_worker(parent.id, row, record), worker_panes.StoppedWorker))
+            if event.kind == EventKind.TURN_END or stopped:
                 dispatch = worker_panes.worker_dispatch_state(row, run, hold)
                 if not isinstance(dispatch, worker_panes.DispatchHoldsWorker):
-                    _ = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
+                    closed = worker_panes.close(parent.id, staff.WorkerName.parse(row.name), lock=hold)
+                    if stopped and not isinstance(closed, worker_panes.Closed):
+                        blocker = closed.blocker if isinstance(closed, worker_panes.Kept) else closed.reason
+                        reason = f"{reason}; the stopped pane did not close: {blocker}"
             return _ignored(event, reason, row.name)
 
         completion = progress_history.hook_completion(passed)

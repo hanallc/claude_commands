@@ -476,6 +476,9 @@ Worker restore uses the shared run index.
 The stop helpers use the shared Codex snapshot.
 Action checks still prove the target process before a signal.
 Independent rows stop and start in parallel.
+Each row stop reads the pane list and pane processes once, inside its own `herdr.observation_snapshot()`.
+Each identity check forgets its pane's evidence before it reads that pane again.
+A pane process that exits between the pane read and the process read counts as starting or exiting; the scan prints no notice.
 Each restore line starts with the staff name, including worker restore results.
 
 Before a power-off, run `agents stop --all`.
