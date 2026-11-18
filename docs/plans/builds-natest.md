@@ -4793,3 +4793,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `build_queue/first_step.py` names the steps `gate` and `test-affected`; `copies/test_slot_order.py` checks both affected command forms. `aws_target/hana_render.files` lists `program_start.py`, `package_root.py`, `process_start.py` and `python_startup/sitecustomize.py`.
 - Full suite (`merge_gate.py --tests-only`): 843 modules, all exit 0, 362 s. Old names stay only at the AWS wire boundary and in build folder prefixes, by design.
 - Review found three defects already on main, outside the chain; they wait in the add-on list: `test_slot_order.py:82` and `test_hana_render.py:33,45` read tunable config; `first_step.py:137` reads a `-X` value as a gate flag.
+
+### Phase 344 — three tests stop reading tunable config  · status: done
+**Depends on:** Phase 343
+
+#### As-built
+
+- Hash d50d52f2c on branch `natest-chainmerge`: chain 10b35a56e merged with origin/main 4ca4af8dd (sdlc tunesafe) as 4efa9faa5, then this phase. It replaces 10b35a56e on the merge line.
+- `copies/test_slot_order.py` takes admission settings from the committed fixture `lint/fixtures/build_admission.conf` and sets its own folder pattern and suffix length in `lib/build_slots_test_support.py`. The leave test waits for the wait reply.
+- `aws_target/test_hana_render.py` writes private `hana_aws.conf` and `build_targets.conf` files and compares output against them.
+- `build_queue/first_step.py` reads `--affected` and `--type-dirs` only after the script word through the public `build_steps.parse_command_program`.
+- `lint/memory_test_support.py` has one source of admission defaults, the committed fixture; `lib/test_build_folders.py` expects it. `copies/test_live_roots_guard.py` accepts any caller TMPDIR outside the live roots.
+- Proof: tests pass with request_max_bytes=1, names.suffix_length=128, another patterns.tool, guard_grace_seconds=30 and enabled=disabled in the live config. Full suite: 852 modules, all exit 0, 422 s.
