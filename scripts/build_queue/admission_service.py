@@ -2132,6 +2132,8 @@ class AdmissionServer:
                                              if records.waiter_owner(row) not in held_owners])
         inputs = self._placement_pass(inputs, policy)
         result = gate.admission_pass(inputs, inputs.now, policy)
+        for reservation in result.policy.returned_claims:
+            del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
         cloud_started = self._cloud_pass(inputs, self.configuration)
@@ -2161,12 +2163,18 @@ class AdmissionServer:
         waiting_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
             row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
             for (_, row), decision in zip(inputs.ordered, result.rows, strict=True))
+        positions = {row.owner: position for position, row in enumerate(result.rows, 1)}
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
             if episode in self.waiters:
                 waiting = self.waiters[episode]
                 reason = decision.reason
-                reply = wire.Wait(reason, position, head_label, reason_phrase(reason, waiting_steps),
+                cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+                order = decision.decision.order_hold
+                text = (f"behind #{positions[records.waiter_owner(order.waiter)]}"
+                        if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead)
+                        else reason_phrase(reason, waiting_steps))
+                reply = wire.Wait(reason, position, head_label, text,
                     self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder,
                                         head_label, head_need))
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
@@ -2188,7 +2196,9 @@ class AdmissionServer:
         try:
             ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority), policy)
+                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority,
+                        slots=tuple(slot for slot in inputs.slots
+                            if gate.between_steps(slot).reservation not in result.policy.returned_claims)), policy)
         except OSError:
             # An old snapshot expires without changing the admission result.
             pass
