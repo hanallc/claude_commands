@@ -3200,33 +3200,52 @@ cache_lookup() {
     if [[ "$CMD" == lint && ( "$MAC_ONLY" == 1 || "${PINNED_TARGET:-natedev}" != natedev ) ]]; then
         return 1
     fi
-    local record outcome="" word
+    local record kind record_text first_line host status_line saved_s line outcome="" word recheck_mend=0
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
     record="${CACHE_DIR}/${LOOKUP_KEY}"
-    # --local needs a natedev pass; --mac needs a Mac pass.
-    if [[ -f "${record}.pass" \
-          && ! ( "$LOCAL_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) \
-          && ! ( "$MAC_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" != mac ) ]]; then
-        record+=.pass outcome=reused word=PASS
-    elif [[ -f "${record}.fail" ]]; then
-        record+=.fail outcome=replayed word=FAIL
-    fi
+    if [[ "$CMD" == lint && "${1:-}" == --after-wait ]]; then recheck_mend=1; fi
+    for kind in pass fail; do
+        [[ -f "${record}.${kind}" ]] || continue
+        if (( recheck_mend )); then
+            verify_helper "$TREE_WATCH_SCRIPT" --recheck-mend </dev/null 2>/dev/null || return 1
+            recheck_mend=0
+        fi
+        record_text="$(cat -- "${record}.${kind}" 2>/dev/null)" || return 1
+        [[ -n "$record_text" ]] || return 1
+        host="" status_line="" saved_s=""
+        while IFS= read -r line; do
+            case "$line" in
+                host=*) host="${line#host=}" ;;
+                status=*) status_line="$line" ;;
+                saved_s=*) saved_s="${line#saved_s=}" ;;
+            esac
+        done <<< "$record_text"
+        if [[ "$kind" == pass ]]; then
+            # Pass records must match the requested host.
+            if [[ ( "$LOCAL_ONLY" == 1 && "$host" == mac ) || ( "$MAC_ONLY" == 1 && "$host" != mac ) ]]; then
+                continue
+            fi
+            outcome=reused word=PASS
+        else
+            outcome=replayed word=FAIL
+        fi
+        break
+    done
     [[ -n "${outcome}" ]] || return 1
-    if [[ "$CMD" == lint && "${1:-}" == --after-wait ]]; then
-        verify_helper "$TREE_WATCH_SCRIPT" --recheck-mend </dev/null 2>/dev/null || return 1
-    fi
-    LOOKUP_STATUS="$(sed -n 's/^status=//p' "${record}")"
-    LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
-    note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" \
-        "${LOOKUP_STATUS}" || true
+    # Old pass records have no status line.
+    if [[ -z "$status_line" && "$kind" == pass ]]; then status_line=status=0; fi
+    [[ -n "${status_line#status=}" ]] || return 1
+    LOOKUP_STATUS="${status_line#status=}"
+    first_line="${record_text%%$'\n'*}"
+    note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
     if [[ "${FILTER_RUN}" -eq 1 ]]; then
-        echo "verify.sh: ${word} (recorded), skipped — $(head -n 1 "${record}"); the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
+        echo "verify.sh: ${word} (recorded), skipped — ${first_line}; the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
         return 0
     fi
-    echo "verify.sh: ${word} (recorded) — $(head -n 1 "${record}")"
-    if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}\`"; then
+    echo "verify.sh: ${word} (recorded) — ${first_line}"
+    if [[ "$first_line" != *"\`verify.sh $CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}\`"* ]]; then
         echo "verify.sh: lint covers the workspace and every changed member, so that result answers this package too."
     fi
     if [[ "${outcome}" == reused ]]; then

@@ -70,9 +70,13 @@ mkdir -p "$CACHE_DIR"
 set_verdict_keys
 RUN_LOG="$PACKAGE_ROOT/direct-lint.log"
 EXIT_STATUS=0
+if [[ -n "${TEST_PEER_STATUS:-}" ]]; then
+    printf 'peer lint result\n' > "$RUN_LOG"
+    kind=pass
+    if (( TEST_PEER_STATUS != 0 )); then kind=fail; fi
+    EXIT_STATUS="$TEST_PEER_STATUS" cache_record "$kind" 0
+fi
 if [[ -n "${TEST_REPLACEMENT_MEND:-}" ]]; then
-    printf 'peer lint passed\n' > "$RUN_LOG"
-    cache_record pass 0
     mv "$TEST_REPLACEMENT_MEND" "$PACKAGE_ROOT/bin/cargo-mend"
 fi
 if cache_lookup --after-wait; then
@@ -131,6 +135,7 @@ exit "$EXIT_STATUS"
         replacement = self.root / "bin/cargo-mend-new"
         write_fixture_cargo_mend(replacement, "replacement")
         self.environment.update({
+            "TEST_PEER_STATUS": "0",
             "TEST_REPLACEMENT_MEND": str(replacement),
             "TEST_CLIPPY_STATUS": "43",
         })
@@ -139,6 +144,25 @@ exit "$EXIT_STATUS"
 
         self.assertEqual(len(list(cache.glob("*.pass"))), 1)
         self.assertEqual(result.returncode, 43, result.stdout + result.stderr)
+        self.assertNotIn("(recorded)", result.stdout)
+        self.assertTrue(self.clippy_ran())
+
+    def test_second_lookup_misses_when_the_selected_failure_is_removed(self) -> None:
+        _ = self.dirty_cache()
+        self.environment.update({"TEST_PEER_STATUS": "43", "TEST_CLIPPY_STATUS": "37"})
+        self.write_executable(self.root / "bin/cargo", """
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1:] == ["mend", "--build-info"]:
+    for record in Path(os.environ["UNIT_RUN_DIR"], "verify_cache").glob("*.fail"):
+        record.unlink()
+""" + CARGO_STUB)
+
+        result = self.invoke_cache_functions()
+
+        self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
         self.assertNotIn("(recorded)", result.stdout)
         self.assertTrue(self.clippy_ran())
 
