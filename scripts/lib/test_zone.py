@@ -155,7 +155,11 @@ class SetTests(unittest.TestCase):
         self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{self.checkout} main", pull[-1])
         (sent,) = self.log("broadcast.log")
         self.assertEqual(sent[:4], ["--from", "zone", "--all", sent[3]])
-        self.assertIn(f"now America/Curacao (AST, UTC-04:00); it was {INITIAL_ZONE}", sent[3])
+        self.assertRegex(
+            sent[3],
+            r"^The user's time zone is now America/Curacao \(AST, UTC-04:00\) as of [0-9]{2}:[0-9]{2} AST; "
+            + rf"it was {INITIAL_ZONE}\. ",
+        )
         self.assertFalse(self.queued().exists())
 
     def test_an_offline_mac_is_queued_and_a_bare_zone_sends_it_later(self) -> None:

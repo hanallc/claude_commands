@@ -719,7 +719,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual([notice[1] for notice in notices], ["session:fake-names", "session:fake-types"])
         self.assertEqual([notice[notice.index("--key") + 1] for notice in notices],
                          ["style-sync:names", "style-sync:types"])
-        self.assertTrue(all(f"From style_sync: branch point main moved to {self.tip[:7]}; sync." in notice
+        self.assertTrue(all(f"branch point main moved to {self.tip[:7]}; sync." in notice
                             for notice in notices))
         style_sync.notify(self.repo, "another", self.tip)
         self.assertEqual(self.handoff_notices(), notices)
@@ -808,7 +808,7 @@ class StyleSyncTests(unittest.TestCase):
                 arguments = call["arguments"]
                 self.assertEqual(arguments, [
                     "--to", "session:fake-style", "--from", "style_sync", "--text",
-                    f"From style_sync: branch point main moved to {self.tip[:7]}; sync.",
+                    f"branch point main moved to {self.tip[:7]}; sync.",
                     "--key", "style-sync:sample-style", "--timeout", "10",
                 ])
                 self.assertLess(int(arguments[-1]), cast(int, calls.call_args_list[-1].kwargs["timeout"]))
