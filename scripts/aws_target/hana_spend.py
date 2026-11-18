@@ -1,6 +1,7 @@
 """Reserve Hana spending before a controller delivers a guest permit."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -206,9 +207,12 @@ class HanaSpending:
             state.hana_storage = candidate.hana_storage
             return StorageReserved(proposed)
 
-    def reserve_setup(self, now: int, expires: int) -> StartReserved | PermitRefused:
-        """Reserve approved setup without enabling placement or command permission."""
-        return self._reserve_compute(now, expires, expected_generation=0, approved_setup=True)
+    def reserve_setup(self, now: int, expires: int, *, expected_generation: int = 0,
+                      before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None
+                      ) -> StartReserved | PermitRefused:
+        """Reserve or extend setup without a permit."""
+        return self._reserve_compute(now, expires, expected_generation=expected_generation, approved_setup=True,
+                                     before_commit=before_commit)
 
     def record_setup_instance_type(self, generation: int, instance_type: str) -> None:
         """Set the machine type on the exposure for the launched instance."""
@@ -216,8 +220,8 @@ class HanaSpending:
             state.hana_compute = [replace(row, instance_type=instance_type)
                                   if row.generation == generation else row for row in state.hana_compute]
 
-    def close_unlaunched_setup(self, now: int, generation: int) -> None:
-        """Release compute when every request in this setup failed before launch."""
+    def close_setup(self, now: int, generation: int) -> None:
+        """Close the compute reservation for this approved setup."""
         with self.book.transaction() as state:
             state.hana_compute = [replace(row, state=ledger.HanaExposureClosed(now))
                                   if row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen)
@@ -297,7 +301,9 @@ class HanaSpending:
             return result
         return PermitIssued(hana_guest.WorkPermit(float(expires), str(result.exposure.generation), boot_id), result.exposure)
 
-    def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False) -> StartReserved | PermitRefused:
+    def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False,
+                         before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None
+                         ) -> StartReserved | PermitRefused:
         if not self.settings.enabled and not approved_setup:
             return PermitRefused('Hana is disabled')
         if type(now) is not int or type(expires) is not int or now < 0 or not 0 < expires - now <= self.settings.permit_max_seconds:
@@ -307,7 +313,11 @@ class HanaSpending:
             if isinstance(fence, ledger.HanaLifecycleFence) and now < fence.at:
                 return PermitRefused('The permit time precedes the current lifecycle fence')
             active = [row for row in state.hana_compute if isinstance(row.state, ledger.HanaExposureOpen)]
-            if expected_generation:
+            if expected_generation and active and approved_setup:
+                if active[0].generation != expected_generation:
+                    return PermitRefused('The setup reservation generation is old')
+                expires = max(active[0].expires, expires)
+            elif expected_generation and not approved_setup:
                 if not active or active[0].generation != expected_generation:
                     return PermitRefused('The permit generation is old')
                 if now >= active[0].expires or expires <= active[0].expires:
@@ -315,9 +325,14 @@ class HanaSpending:
             elif active:
                 return PermitRefused('Confirm the previous stop before another start')
             candidate, proposed = self._project_compute(state, now, expires)
+            if active and approved_setup:
+                proposed = replace(proposed, generation=active[0].generation)
+                candidate.hana_compute[-1] = proposed
             decision = self._check(candidate, now)
             if isinstance(decision, PermitRefused):
                 return decision
+            if before_commit is not None and proposed.generation != expected_generation:
+                before_commit(proposed)
             state.hana_compute, state.hana_storage = candidate.hana_compute, candidate.hana_storage
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, proposed.generation)
             return StartReserved(proposed)

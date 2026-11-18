@@ -157,7 +157,8 @@ class HanaProviderTests(CostFixture):
                 assert isinstance(action, str)
                 granted.add(action)
         self.assertTrue(actions <= granted)
-        self.assertEqual(set(provider.PROVIDER_OPERATIONS.values()), granted)
+        replacement_reads = {'ec2:DescribeImages', 'ec2:DescribeVolumes', 'ec2:DescribeReplaceRootVolumeTasks'}
+        self.assertEqual(set(provider.PROVIDER_OPERATIONS.values()) | replacement_reads, granted)
         self.assertTrue(all(timeout == conf.read(self.workload).whole('aws_timeout_s') for _, _, timeout in self.fake.calls))
         self.assertEqual([op for _, op, _ in self.fake.calls].count('put-object'), 4)
         self.assertIn('command_url', descriptor)
@@ -171,6 +172,17 @@ class HanaProviderTests(CostFixture):
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
         _ = self.provider.step(IDENTITY, start, operation)
         self.assertEqual([op for _, op, _ in self.fake.calls].count('start-instances'), 1)
+
+    def test_stop_retries_when_aws_still_reports_running(self) -> None:
+        self.fake.state = 'running'
+        self.fake.failure = 'stop-instances'
+        operation = self.operation(box.Action.STOP)
+        with self.assertRaises(provider.ProviderPending):
+            _ = self.provider.step(IDENTITY, box.NoDemandStart(), operation)
+        self.fake.failure = ''
+        self.assertIsInstance(self.provider.step(IDENTITY, box.NoDemandStart(), operation), box.OperationAccepted)
+        self.assertEqual(self.fake.state, 'stopped')
+        self.assertEqual([op for _, op, _ in self.fake.calls].count('stop-instances'), 2)
 
     def test_execution_objects_use_the_exact_boot_and_scoped_policy(self) -> None:
         from scripts.aws_target import hana_execution, test_hana_execution as fixtures

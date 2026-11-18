@@ -99,14 +99,14 @@ Run this command in a terminal on natedev.
 deploy.py hana-setup --plan
 ```
 
-The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
-It refuses first-time Hana setup, pending instance or volume work, and direct-owned boxes.
+The plan checks root replacement for an existing Hana box with a registered image.
+It accepts stack-owned and direct-owned boxes.
+It refuses first-time setup and pending instance or data volume work.
+If a replacement is pending, the plan checks that the original instance still exists.
 
-The plan checks the local credential file and reads the scaler identity with STS.
-It uses the same stack, instance, disk, and parameter checks as approved setup.
-It previews one modification to `ScalerPolicy` without resource replacement.
-The plan deletes the change set and confirms its removal with CloudFormation.
-If removal stays unconfirmed, the plan prints the change set name and refuses.
+For a new replacement, the plan checks the stopped instance, data attachment, and registered image.
+It reads the live stack and previews the change to `ScalerPolicy` through IAM simulation.
+The plan makes read calls only.
 
 The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
 The plan simulates the EC2 probes without reading user data or starting the box.
@@ -1249,6 +1249,47 @@ Existing configuration values remain unchanged.
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
 
+
+### Replace the Hana root image
+
+Register the reviewed image with `deploy.py hana-image --image RESULT --approve-resources`.
+Run `deploy.py hana-setup --plan` to check the registered image against the idle box.
+The replacement plan reads AWS through the plan identity and does not write local state.
+Run `deploy.py hana-setup --approve-resources` to apply the root replacement.
+
+Before the first attempt, setup checks that the box is stopped and has no claims.
+It checks the lifecycle identity and the retained data attachment.
+On each invocation, setup checks the registered image owner, architecture, virtualization, boot mode, billing platform, and product codes.
+If the image root exceeds `root_gib`, setup refuses before it makes any change.
+
+Approved setup installs the replacement grants in the existing Hana `ScalerPolicy`.
+Setup uses the scaler credentials for EC2 replacement calls.
+Start and stop use the existing Hana deployment and workload tag conditions.
+Task creation grants access to the exact Hana instance, registered AMI, and source snapshot.
+The task and new volume grants cover resources in the Hana account and region.
+EC2 requires wildcard resource scope for describe calls.
+The new describe grants apply only in the Hana region.
+[EC2 IAM actions and resources](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html)
+
+The replacement record blocks claims, work starts, and permits.
+The controller keeps its stop duty when the compute reservation expires.
+Setup reserves compute through its time limit before it starts the box or continues on a running box.
+It gives the root replacement task a saved client token.
+EC2 deletes the previous root when the task completes.
+An EC2 stop and start can change an automatically assigned public IPv4 address.
+[EC2 root replacement](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/replace-root.html), [EC2 stop and start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html)
+
+If setup stops early, run the approved command again.
+Setup sends the saved token again and polls the task ID that EC2 returns.
+It waits for an active task and refuses to start an interrupted Spot instance.
+A failed task reports its state and the AWS message when one exists.
+The next invocation uses a new token after either task failure state.
+
+Setup completes when EC2 reports the registered image and the same data attachment.
+It requests a stop, closes the reservation, saves the image, and removes the hold.
+The controller completes the stop if EC2 still reports a running box.
+If replacement execution exits early, setup requests a stop and leaves the reservation open.
+If preflight refuses a rerun, only the controller can request a stop.
 
 ## Hana source transport
 

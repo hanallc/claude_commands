@@ -11,7 +11,7 @@ import time
 from typing import Protocol, cast
 from uuid import uuid4
 
-from scripts.aws_target import hana_guest, hana_spend, ledger
+from scripts.aws_target import hana_guest, hana_replacement, hana_spend, ledger, remote
 from scripts.aws_target.controller_lock import control_lock
 from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
@@ -388,6 +388,30 @@ def _decode(document: dict[str, object]) -> BoxRecord:
     return row
 
 
+def require_idle_setup(path: Path, identity: DeploymentIdentity) -> None:
+    """Confirm that the saved lifecycle allows maintenance."""
+    try:
+        row = _decode(remote.read_record(path))
+    except FileNotFoundError:
+        raise ValueError('The saved Hana setup has no lifecycle registration. Complete approved setup first.') from None
+    except (KeyError, ValueError, TypeError):
+        raise ValueError('The Hana lifecycle cannot confirm an idle box. Run hana-setup again when the box is idle.') from None
+    if row.identity != identity:
+        raise ValueError('The Hana lifecycle registration differs from the saved setup.')
+    if (row.state != Lifecycle.IDLE_STOPPED or row.claims or isinstance(row.start, DemandStart)
+            or isinstance(row.operation, PendingOperation) and row.operation.action != Action.OBSERVE):
+        raise ValueError('The Hana lifecycle is busy. Run hana-setup again when the box is idle.')
+
+
+def record_replacement_stop(path: Path, generation: int, now: int, *, stopped: bool) -> None:
+    """Record the handoff of the stopped or stopping box."""
+    previous = _decode(remote.read_record(path))
+    state = Lifecycle.IDLE_STOPPED if stopped else Lifecycle.STOPPING
+    row = BoxRecord(previous.identity, state, generation=generation, idle_since=now, observed_at=now,
+                    stop_cause=StopCause.IDLE)
+    write_text_atomic(path, json.dumps(_record(row), sort_keys=True) + '\n')
+
+
 class HanaController:
     """Serialize claims and durable intents before releasing the lock for provider calls."""
 
@@ -442,6 +466,8 @@ class HanaController:
         if not execution:
             return ClaimRefused('The execution identity is missing')
         with control_lock(self.directory):
+            if hana_replacement.held(self.directory):
+                return ClaimRefused(hana_replacement.HELD)
             row = self._read()
             if isinstance(row, NoDeployment):
                 return ClaimRefused('Hana is unprovisioned')
@@ -535,6 +561,8 @@ class HanaController:
 
     def permission(self, execution: str, boot_id: str, generation: int) -> CommandPermission | ClaimRefused:
         with control_lock(self.directory):
+            if hana_replacement.held(self.directory):
+                return ClaimRefused(hana_replacement.HELD)
             row = self._read()
             now = int(self.clock())
             if (isinstance(row, NoDeployment) or row.state != Lifecycle.READY or not row.claims
@@ -565,8 +593,17 @@ class HanaController:
                 return Lifecycle.UNPROVISIONED
             settings = read_settings(conf.read(self.workload_path))
             spending = self._spending()
+            replacement = hana_replacement.read(self.directory)
+            if isinstance(replacement, hana_replacement.ReplacementAttempt):
+                if any(exposure.generation == replacement.generation and exposure.expires > now
+                       and isinstance(exposure.state, ledger.HanaExposureOpen)
+                       for exposure in spending.book.read_snapshot().hana_compute):
+                    return row.state
+                if isinstance(row.operation, PendingOperation) and row.operation.action not in (Action.OBSERVE, Action.STOP):
+                    return row.state
             if isinstance(row.operation, NoOperation):
-                if row.state == Lifecycle.IDLE_STOPPED and row.claims and spending.settings.enabled:
+                if (isinstance(replacement, hana_replacement.NoReplacement) and row.state == Lifecycle.IDLE_STOPPED
+                        and row.claims and spending.settings.enabled):
                     refusal = _start_refusal(row, now, settings)
                     if refusal:
                         row.reason, row.claims = refusal, []
@@ -608,7 +645,7 @@ class HanaController:
         with control_lock(self.directory):
             current = self._read()
             if (isinstance(current, NoDeployment) or current.identity != identity
-                    or current.operation != operation):
+                    or current.operation != operation or hana_replacement.read(self.directory) != replacement):
                 return current.state if isinstance(current, BoxRecord) else Lifecycle.UNPROVISIONED
             row = current
             now = int(self.clock())
@@ -617,7 +654,15 @@ class HanaController:
             elif isinstance(reply, BoxObservation):
                 if operation.action != Action.OBSERVE or reply.identity != row.identity or not operation.at <= reply.at <= now:
                     raise ValueError('The provider observation has a stale identity or time')
-                self._observe(row, reply, settings, now)
+                if isinstance(replacement, hana_replacement.ReplacementAttempt):
+                    if reply.state == 'stopped':
+                        row.state, row.operation = Lifecycle.IDLE_STOPPED, NoOperation()
+                    elif reply.state == 'running':
+                        self._stop(row, now, StopCause.IDLE)
+                    else:
+                        row.operation = NoOperation()
+                else:
+                    self._observe(row, reply, settings, now)
             elif isinstance(reply, OperationAccepted):
                 if reply.token != operation.token or operation.action not in (Action.BOOTSTRAP, Action.START, Action.STOP):
                     raise ValueError('The provider accepted a different operation')
@@ -711,6 +756,9 @@ class HanaController:
                 self._stop(row, now, StopCause.IDLE if _boot_is_current(row, observed.boot) else StopCause.UNKNOWN)
                 return
         if observed.state != 'running':
+            return
+        if row.state == Lifecycle.STOPPING:
+            self._stop(row, now, row.stop_cause)
             return
         valid_boot = _boot_is_current(row, observed.boot)
         if not spending.settings.enabled or not row.claims or not valid_boot:

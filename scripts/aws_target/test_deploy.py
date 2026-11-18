@@ -1058,13 +1058,16 @@ class HanaSetupFailureTests(CostFixture):
                 self.instance_reads.append(list(arguments))
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', instance])
                 reply = {'Reservations': [{'Instances': [{'InstanceId': instance,
-                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state},
+                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state}, 'InstanceLifecycle': 'spot',
+                    'BlockDeviceMappings': [{'DeviceName': '/dev/sdf', 'Ebs': {
+                        'VolumeId': volume, 'DeleteOnTermination': False}}],
                     'SpotInstanceRequestId': saved['spot_request']}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if service == 'ec2' and operation == 'describe-volumes':
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--volume-ids', volume])
                 reply = {'Volumes': [{'VolumeId': volume, 'Attachments': [
-                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached'}]}]}
+                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached',
+                     'AttachTime': '2026-01-15T11:00:00Z', 'DeleteOnTermination': False}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if admin_spot_error and (service, operation, arguments[offset + 2]) == ('ec2', 'wait', 'instance-exists'):
                 return subprocess.CompletedProcess(arguments, 0, '{}', '')
@@ -1493,7 +1496,7 @@ class HanaSetupFailureTests(CostFixture):
         subject, _parameters = self.policy_update_fixture([], volume_device='/dev/sdg')
         saved = self.setup_path.read_bytes()
 
-        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'resource identities changed'):
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'retained Hana data attachment'):
             _ = subject.hana_setup(approve_resources=True)
 
         self.assertEqual(self.scaler_calls, [])
