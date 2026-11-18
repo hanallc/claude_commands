@@ -326,8 +326,9 @@ The console inlines the icons and makes no CDN, font, script, or stylesheet requ
 The old addresses redirect to Review with the corresponding type filter.
 The redirect retains the owner, filters, sort and open item.
 Legacy `row` fields become `item` fields.
-The former Investigations Show values select the same records on Review.
-`not-read` and `answer ready` select Open; `open` selects Waiting; `read` selects Done; `all` selects All.
+`not-read` and `answer ready` select Open.
+Old Investigations links with `show=open` or `show=all` select All.
+`read` selects Done.
 Legacy investigation owner filters retain the exact record owner.
 The Review navigation entry uses the Lucide `inbox` icon.
 Selected-row snapshots retain their signed legacy forms.
@@ -336,10 +337,13 @@ Selected-row snapshots retain their signed legacy forms.
 It projects each record into one `ReviewItem`; it stores no second record.
 Each item has an ID, type, owner, source unit, title, state, times, log and permitted actions.
 Each item also exposes `waiting_why`, which is empty on older records without a reason.
-Waiting filers must supply a reason; one shared rule refuses empty or whitespace-only text.
-Changes store `waiting_why` with their delivery state; questions store it in their registration.
-Investigations and proposals store it in their frontmatter; efficiencies store it in the existing review file beside the ledger.
-The user's Ask question text becomes the reason automatically for every type.
+Waiting filers must supply a reason.
+The shared rule refuses empty text and text that contains only spaces.
+Questions store the reason in their registration.
+Investigations and proposals store it in their frontmatter.
+Efficiencies store it in the review file beside the ledger.
+The user's Ask question text supplies the reason.
+Changes store the request reason with their delivery state.
 Validation uses the user's feedback when the feedback contains text.
 Validation uses the stated validation request when the feedback is empty or contains only spaces.
 `waiting_why.py list` lists Waiting items without a reason, with their key, type, title and filer.
@@ -351,8 +355,11 @@ The command prints one plain error line for a refused update.
 `investigation.py file` requires `--waiting-why`. The Python `followup` API stores the follow-up words as the reason.
 `proposal_issue.record_review` and `efficiency_reviews.record` require `waiting_why` when setting the Waiting mark.
 `candidates.py outcome E<n> deferred --waiting-why "<reason>"` stores the reason beside the ledger.
-The states are **Open**, **Waiting** and **Done**.
-A future time hides an item without changing its state.
+The states are **Open**, **Validating**, **Waiting** and **Done**.
+Changes use Validating while the showrunner has the request.
+Questions, investigations, proposals and efficiencies use Waiting while they await a response or action.
+Later hides an item without changing its state.
+Validating changes remain visible in Validating and All.
 The count readers and `/next` use this shared reader.
 Open items count in the status line.
 An open investigation and a deferred efficiency item do not count.
@@ -391,7 +398,8 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The Show row offers Open, Waiting, Done and All below the Type row.
+The Show row offers Open, Validating, Done and All below the Type row.
+Old Waiting links open All.
 The Owner row follows the Show row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
@@ -402,14 +410,22 @@ The index contains the key, ID, type, owner, source owner, owner name, title, st
 It contains no bodies or HTML.
 The browser uses the index for every count and filter.
 The Show chips replace the right count text.
-Each chip selects its state. All selects every state.
-Waiting includes active showrunner checks.
-A save changes its index entry to Waiting, Done or a Later time.
+Open, Validating and Done select their states.
+Ask showrunner to check, Ask question and Send feedback move a change to Validating after the save.
+The change leaves Open and its counts when the request starts.
+A failed save restores the row and its counts.
+Validating and All show the change with **With <showrunner> since <time>** and no buttons.
+Only the Validating chip counts the change.
+The Validating chip is dim at zero.
+The name comes from current staff data.
+The time comes from the saved request and uses the user zone.
+Older requests without a saved time use the delivery file time.
 The next refresh replaces the index.
 When a refresh excludes the focused Owner chip, focus moves to the selected Owner chip.
 The fresh index supplies each item's state and revision, including items outside the rendered Show.
 The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
-An owner answer returns to Open after a refresh from Waiting or Done.
+A showrunner answer, feedback action or fault returns a Validating change to Open.
+A works result moves the change to Done without a notice.
 Stable chip IDs retain keyboard focus after a Show load or refresh.
 Review and The List use Show chips.
 The shared table tracks the selected Show chip.
@@ -431,11 +447,12 @@ The Open view does not carry the proposal texts.
 An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
-Changes offer Works, Does not work, Ask showrunner to check and Send feedback in that group.
+Changes offer Works and Does not work in the closing group.
+Ask showrunner to check, Ask question and Send feedback transfer the change to the showrunner.
 Investigations offer Mark read and Send feedback in that group.
 Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
 A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
-Each card has Ask question in a separate return group and a **Later** button that opens a menu.
+Cards with actions offer Ask question in the return group and **Later** in its own group.
 The menu lists four presets, then a divider and **Choose a time…**:
 1. **In 1 hour**: `later_soon_minutes` from now; the label follows the setting.
 2. **This evening**: `later_evening` today. The item shows only before `later_evening_until`.
@@ -470,19 +487,24 @@ The arrow keys, Home and End move between items, Enter picks one and Escape clos
 A click outside the menu closes it.
 The page refresh waits while a Later menu is open.
 The server stores a preset time, sent as UTC, in the user zone.
-Waiting cards retain the actions of their Open cards, in the same groups and order.
+Waiting cards for questions, investigations, proposals and efficiencies retain their Open actions.
 Unowned questions retain only Later.
-Waiting cards keep their state and counts until the user acts.
-An action supersedes the open question, showrunner check, investigation or decision wait.
+Waiting cards for these types keep their state and counts until the user acts.
+An action on those cards supersedes the open request.
 The record and the owner's production log retain the superseded wait.
 Questions archive the old followup before the new action saves.
-Changes remove the old question and validation slots before the new action saves.
+The Review and change pages use one server check to refuse another change action during an open hand-off.
+The refusal preserves the request and its delivery state.
 Investigations close or replace their open request.
 Proposals replace their review mark; efficiencies also clear a deferred ledger state.
 The primary button comes first.
 The shared sender handles all five types, including retries, owner alerts and startup recovery.
-Send feedback sends the words to the owner and finishes the item with the result **feedback sent**.
-Ask question sends the words to the owner and moves the item to Waiting.
+Send feedback sends the words to the owner.
+It finishes the item for questions, investigations, proposals and efficiencies.
+It transfers a change to the showrunner until the showrunner records what they did.
+The change log shows the feedback once and includes the showrunner's reply.
+Ask question sends the words to the owner.
+It moves a change to Validating and other types to Waiting.
 The owner's answer returns every type to Open.
 The answer stays in the item log.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
@@ -490,13 +512,15 @@ Each new request supplies a question ID to identify the pending exchange.
 The existing question ID rule refuses a reply to a superseded exchange.
 `update_registration.py reply` and `investigation.py answer` apply this rule before they save a native answer.
 A native answer without the current question ID cannot replace a newer Review question.
-`change_review.py verdict` applies the same rule when a Review question replaces a showrunner check.
+`change_review.py verdict` also refuses a verdict during an open question or feedback request.
 These commands retain the existing refusal text and exit 1.
 Each showrunner check uses its delivery attempt as the validation ID.
 Initial and recovered messages include `change_review.py verdict --validation <id>` with the complete answer command.
 The native verdict command refuses a missing, old or completed validation ID under the same rule.
 Every request message includes the complete answer command.
-Later keeps the state and hides the item from every page view, the count totals and `/next` until its time.
+Later keeps the state and hides the item from the page views, the counts and `/next` until its time.
+A change hand-off or return to Open clears the saved Later time.
+The shared reader ignores any old Later time on a Validating change.
 `<SHOWRUNNER_STATE_DIR>/review-later.json` stores one ISO timestamp for each stable Review key across all five types.
 The shared reader applies that timestamp without copying the item or its state.
 The status cache watches that file and expires at the first pending Later time.
@@ -504,9 +528,11 @@ The item returns after that time without a new action.
 Every action keeps its time, actor and words in the existing record log.
 Closed question records retain the user's words without the answer replay archive's 48-hour limit.
 Ask showrunner to check transfers the next action to the showrunner.
-A successful check closes the item; only a problem returns it to Open.
-After a save, the row shows its result and leaves every Show view.
-Refresh keeps a completed row hidden until the page reloads.
+A successful check moves the change to Done without a notice.
+A fault returns the change to Open.
+A saved answer or feedback action also returns the change to Open.
+After a save, the page shows its result.
+A change with the showrunner appears in All as soon as the page reads the saved request.
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
 Refresh retains the open row, scroll position and typed text.
@@ -1131,7 +1157,7 @@ The verdict cell joins stripped, nonblank lines with one space.
 The message and a question keep the normalized line breaks.
 Works with text saves `works: <text>`.
 Does not work with text saves `not works: <text>`.
-Send feedback sends the words and closes the change.
+Send feedback sends the words and transfers the change to the showrunner.
 Each verdict saves the text from **Your words** as its comment.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.
 
@@ -1155,7 +1181,7 @@ The message names the row, list, production, change, and question.
 It includes a separate `Question id: <id>` line.
 The saved row leaves the view without opening another card.
 An open question survives page loads and server restarts.
-A failed HTTP save keeps the row waiting with its typed question and answer form.
+A failed HTTP save keeps the typed words and restores the form.
 A direct link shows the open question without verdict buttons.
 
 The owner answers with `scripts/review_links/change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
@@ -1170,10 +1196,9 @@ The answer keeps its internal line breaks and strips only whitespace at its two 
 All text is escaped, including text in list items.
 The user can ask another question or save a verdict.
 
-Send feedback sends the words through the existing sender and closes the change.
-Legacy forms from pages already open retain their prior feedback delivery record.
-Those forms store `kind: feedback` and accept `change_page.py answer-question --question <Feedback id>` replies.
-The feedback message supplies the ID.
+Send feedback uses the existing sender and stores `kind: feedback`.
+The message includes the feedback ID and the command to record the action.
+The recorded action returns the change to Open.
 
 Each answer uses a background `fetch` POST.
 The row shows **Saving…** during the save and **Saved: <result>** after success.
@@ -1258,7 +1283,8 @@ The server starts no detached shell for message delivery.
 The all-list page sends to the row's current staff showrunner.
 Older selected-row pages use the same staff route.
 The saved verdict selects recipients when a new message attempt begins.
-An exact `works` verdict goes only to the showrunner, including requests from the older feedback endpoint.
+An exact `works` verdict goes only to the showrunner.
+Send feedback and Ask question on either change page send the words to the showrunner and move the change to Validating.
 When one staff unit owns the change, every other verdict also goes to that unit.
 The Producer cell identifies that unit through its fixed staff id.
 An empty Producer cell belongs to the list's staff showrunner.

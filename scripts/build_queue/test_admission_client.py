@@ -172,13 +172,35 @@ class ClientTests(unittest.TestCase):
             (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
             (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
             (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
+            (3, "first · nextest", "behind #2 · second · nextest · compiler", ""),
         ):
             with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
                 waiting = replace(WAIT, position=position, head=label,
                     snapshot=replace(WAIT.snapshot, head_need=int(12.3 * GIB), head_label=label))
+                if position == 3:
+                    fixture.hold_starts()
+                    first = fixture.request(need=GIB, since=fixture.clock.now() - 2)
+                    _ = fixture.server.handle_request(replace(first, identity=replace(first.identity, name="first")))
+                    nextest = fixture.request(need=18 * GIB, since=fixture.clock.now() - 1)
+                    _ = fixture.server.handle_request(replace(nextest,
+                        identity=replace(nextest.identity, name="second", unit="compiler")))
+                    follower = fixture.request(need=GIB)
+                    _ = fixture.server.handle_request(follower)
+                    fixture.free(15 * GIB)
+                    _ = fixture.run_pass()
+                    self.assertIn(first.episode, fixture.server.reservations)
+                    reply = fixture.server.waiters[follower.episode].last_reply
+                    assert isinstance(reply, wire.Wait)
+                    received = wire.parse_reply(wire.encode_reply(reply))
+                    assert isinstance(received, wire.Wait)
+                    waiting = received
+                    self.assertEqual(waiting.position, position)
                 with mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as output:
                     client.WaitOutput(local_reason=reason)(waiting)
                 self.assertIn(expected, output.getvalue())
+                if position == 3:
+                    self.assertNotIn("head first", output.getvalue())
+                    self.assertNotIn("queue head", output.getvalue())
                 if reason:
                     self.assertIn(f"runs on natedev: {reason}", output.getvalue())
                 else:
@@ -689,8 +711,17 @@ class ClientTests(unittest.TestCase):
                     "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     + "kind.natedev=local\nplatform.natedev=linux\n")
                 request = fixture.request(step="check")
-                fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
-                    key, fixture.clock.now(), "the test has not published provider evidence")
+                finish_probe = threading.Event()
+                _ = fixture.callback(finish_probe.set)
+
+                def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    # Only the test supplies Mac evidence until the assertions finish.
+                    if key.destination.target == "mac":
+                        _ = finish_probe.wait()
+                    return placement.HostEvidenceUnavailable(
+                        key, fixture.clock.now(), "the test has not published provider evidence")
+
+                fixture.server.host_probe = provider
                 arguments = ["place-step", "--once", "--wait-events", *selection,
                     "--pid", str(request.owner.pid), "--episode", request.episode,
                     "--since", str(request.since), "--repo-root", str(fixture.root), "--package", "sample",
@@ -1056,6 +1087,117 @@ class ClientTests(unittest.TestCase):
             assert isinstance(refreshed.profile, records.StepProfile)
             self.assertEqual(refreshed.profile.build_history_generation, records.BuildHistoryGeneration(1))
             self.assertEqual(refreshed.profile.peak.bytes, granted.need)
+
+    def test_expired_build_retries_after_an_estimator_io_error(self) -> None:
+        with AdmissionFixture(skip_idle_spacing=True) as fixture:
+            fixture.configure(wait_reply_seconds=0.1, waiting_pass_seconds=0.1,
+                              reconnect_seconds=0.1, min_pass_gap_seconds=0.05)
+            seed = fixture.request(step="build", since=fixture.clock.now() - 60)
+            argv = ["cargo", "build", "-p", "cargo-mend", "--bin", "cargo-mend"]
+            estimates = 0
+            admissions: list[wire.AdmitRequest] = []
+            expired_orders: list[float] = []
+            handle = fixture.server.handle_request
+
+            def estimate(*_args: object, **_kwargs: object) -> records.ExpectedPeak:
+                nonlocal estimates
+                estimates += 1
+                if estimates == 1:
+                    with fixture.loop_turn():
+                        fixture.server.build_history_generation += 1
+                elif estimates == 2:
+                    raise OSError(errno.ESTALE, "test estimate read failed")
+                return records.ExpectedPeak(2 * GIB, "fallback", 0)
+
+            def observe(request: wire.Request,
+                        connection: service.Connection | service.NoConnection) -> list[wire.Reply]:
+                if isinstance(request, wire.AdmitRequest):
+                    admissions.append(request)
+                return handle(request, connection)
+
+            def bound_expiry_replies(reply: wire.Reply) -> wire.Reply:
+                if isinstance(reply, wire.Wait):
+                    cause = reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus) else reply.reason
+                    if isinstance(cause, records.EstimateExpired):
+                        row = fixture.server.waiters[seed.episode].row
+                        expired_orders.append(row.get("order_since", row["since"]))
+                        if len(expired_orders) >= 4 and estimates == 2:
+                            return wire.Refused("the estimator did not retry")
+                return reply
+
+            def refresh() -> wire.AdmitRequest:
+                return client.step_request(argv, seed.cwd, seed.owner, seed.since, "", seed.episode)
+
+            with mock.patch.object(client, "CLOCK", fixture.clock), \
+                    mock.patch.object(fixture.server, "handle_request", side_effect=observe), \
+                    mock.patch.object(fixture.server, "reply_filter", side_effect=bound_expiry_replies), \
+                    mock.patch.object(step_estimator, "git_identity",
+                                      return_value=(records.UnknownRepository(), "tree")), \
+                    mock.patch.object(step_estimator, "expected_peak", side_effect=estimate), fixture.serving():
+                reply = shell_place.request_place(shell_place.RefreshedRequest(refresh), client.WaitOutput())
+            self.assertIsInstance(reply, wire.Admitted)
+            self.assertEqual(estimates, 3)
+            self.assertEqual({request.episode for request in admissions}, {seed.episode})
+            self.assertEqual({request.since for request in admissions}, {seed.since})
+            self.assertEqual(set(expired_orders), {seed.since})
+            row = fixture.server.reservations[seed.episode].queue_waiter
+            self.assertEqual(row.get("order_since"), seed.since)
+            assert isinstance(admissions[-1].profile, records.StepProfile)
+            self.assertEqual(admissions[-1].profile.build_history_generation, records.BuildHistoryGeneration(1))
+
+    def test_expired_estimate_retries_after_disconnect_during_refresh(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+            request = fixture.request(since=fixture.clock.now() - 60)
+            updated = replace(request, episode="different-episode", since=fixture.clock.now(),
+                              profile=replace(request.profile, estimated_at=fixture.clock.now()))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)),
+                                           Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
+            send = ScriptSocket.sendall
+
+            def disconnect_on_refresh(connection: ScriptSocket, data: bytes) -> None:
+                if len(transport.attempts) == 1 and transport.requests:
+                    raise BrokenPipeError(errno.EPIPE, "the service disconnected during the refresh")
+                send(connection, data)
+
+            with mock.patch.object(ScriptSocket, "sendall", autospec=True, side_effect=disconnect_on_refresh):
+                refresh = mock.Mock(return_value=updated)
+                self.assertEqual(client.admit(request, lambda _wait: None, refresh), GRANTED)
+            self.assertEqual(refresh.call_count, 2)
+            self.assertEqual(transport.requests, [request, request, replace(request, profile=updated.profile)])
+
+    def test_repeated_refresh_disconnects_stop_at_the_unreachable_limit(self) -> None:
+        for read_history in (False, True):
+            with self.subTest(read_history=read_history), AdmissionFixture() as fixture:
+                fixture.configure(reconnect_seconds=3, unreachable_limit_seconds=5)
+                request = fixture.request(since=fixture.clock.now() - 60)
+                refreshed = replace(request, profile=replace(request.profile, estimated_at=fixture.clock.now() + 1))
+                history = (reply_bytes(wire.BuildHistoryReply(1)),) if read_history else ()
+                transport = self.use_transport(fixture, *(Exchange(reply_bytes(EXPIRED), *history) for _ in range(4)),
+                    Exchange(reply_bytes(wire.Refused("refresh retry exceeded the fixture limit"))))
+                send = ScriptSocket.sendall
+
+                def close_before_refresh(connection: ScriptSocket, data: bytes) -> None:
+                    if wire.parse_request(data) == refreshed:
+                        raise BrokenPipeError(errno.EPIPE, "closed before the refreshed estimate")
+                    send(connection, data)
+
+                def refresh() -> wire.AdmitRequest:
+                    if read_history:
+                        self.assertEqual(client.build_history_generation(), records.BuildHistoryGeneration(1))
+                    return refreshed
+
+                with mock.patch.object(ScriptSocket, "sendall", autospec=True, side_effect=close_before_refresh), \
+                        redirect_stderr(io.StringIO()):
+                    result = client.admit(request, lambda _wait: None, refresh)
+                self.assertEqual(result, wire.Refused(
+                    "build queue unreachable for 5 s; step stopped; cargo token given back"))
+                self.assertEqual(transport.attempts, [0, 3])
+                self.assertEqual(fixture.clock.sleeps, [3, 2])
+                self.assertEqual(fixture.clock.monotonic(), 5)
+                self.assertEqual([item for item in transport.requests if isinstance(item, wire.AdmitRequest)],
+                                 [request, request])
+                self.doCleanups()
 
     def test_generation_outage_after_expiry_keeps_the_leave_hook_time_and_cli_status(self) -> None:
         for failure in (b"", b"invalid generation reply\n"):

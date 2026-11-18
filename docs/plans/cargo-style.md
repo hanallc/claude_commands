@@ -80,7 +80,7 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 **Repo:** cargo-liner. **Depends on:** the main-red fix in `~/.claude`.
 
-1. Copy `rust/style_reader` to `crates/cargo-style`. Package and binary `cargo-style`; `publish = false`; `[lints] workspace = true`.
+1. M1 copied the reader from `~/.claude` to `crates/cargo-style` in cargo-liner. The package and binary are `cargo-style`. The manifest sets `publish = false` and inherits workspace lints.
 2. Use the workspace pins. Changes: `sha2` 0.10.9 to the workspace 0.11.0 (digest API change), `rayon` 1.11.0 to 1.12.0, `libc` to the workspace pin. `gix =0.89.0` is the same.
 3. `cargo style` works: cargo passes `style` as the first argument; the binary accepts both forms.
 4. `cargo-style --version` prints the crate version and the request protocol version (an integer). The Python client checks both (M2).
@@ -209,6 +209,22 @@ S3 and S4 run at the same time. Each speed phase reports its result against its 
 2. `cargo-mend/src/rust_syntax` (about 2,400 lines: parsed sources, module map, identifier rules): evaluate in S3 for the module map and declarations. cargo-mend is a binary crate; use needs a shared library, which comes only with a measured need.
 3. `cargo-berth/src/git` (about 12,800 lines): it reads refs, status, worktrees and history. The reader's Git code (197 lines) reads blobs by tree. Evaluate in S4 for history and revision comparison, where the profile shows Git cost (about 12%). Same library rule.
 4. A shared library follows the `tui_pane` pattern: a path dependency on main, and the release step pins the published version. A library that cargo-mend uses must be published.
+
+## The end state after S8
+
+Source: nate, 2026-11-17, through dwight: "At some point can we retire the python code around style mgmt?" Answer: yes. No plan holds this work yet. These rules keep S3 to S8 from making it harder.
+
+1. All style management runs in `cargo style`: selection, the ledger, the rule catalog, setup, gate, verify, checkpoint, sync, lint, bulk runs, crate runs and proposals.
+2. Python keeps only the thin adapter to the production: the reservation board, the units and the workers.
+3. The ledger after S8. Today `cargo style` reads `ledger.sqlite` read-only, and Python is its only writer (`cargo-style-api.md`, "The request").
+   1. The ledger keeps its path and its schema. No migration step.
+   2. Each Python command that writes the ledger moves to `cargo style` as one unit: its reads, its writes and its tests. After a move, `cargo style` is the only writer of those tables.
+   3. The `ledger_revision` triggers are in the schema, so the stored-answer key stays correct while both languages write.
+   4. When the last Python writer moves, `cargo-style` owns the schema and its changes.
+4. In S3 to S8, no choice puts new style logic in Python. A new answer goes into `cargo style`, and the adapter only passes it on.
+5. Tests: a check moves to Rust with its command, or it stays in Python. A check is removed only with nate's go.
+6. S7 gives an inventory: each Python file in `scripts/style` that remains after S8, with its line count and its test count. On 2026-11-17 the folder has about 41,300 lines of code and 45,500 lines of tests.
+7. The unit moves from sdlc to the cargo-liner showrunner after M3 and before S3 (nate, 2026-11-17: "Later."). M2 and M3 do not change.
 
 ## Milestones (messages to dwight)
 

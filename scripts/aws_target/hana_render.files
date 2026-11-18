@@ -42,6 +42,7 @@ scripts/buildlog/record.py
 scripts/buildlog/repository.py
 scripts/buildlog/step_context.py
 scripts/buildlog/store.py
+scripts/buildlog/transfer_bytes.py
 scripts/buildlog/treekey.py
 scripts/copies/copies.py
 scripts/direct/local_release_wait.py
