@@ -388,8 +388,8 @@ exit "$status"
         with admission.loop_turn():
             return {waiting.request.owner.pid for waiting in admission.server.waiters.values()}
 
-    def wait_for_owned_exit(self, timeout: float) -> set[int]:
-        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
+    def wait_for_owned_exit(self) -> set[int]:
+        return wait_for_marker_exit(self.fixture.child_marker(), TEST_HANG_GUARD_SECS)
 
     def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)

@@ -34,12 +34,10 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                          "the coordinator waits at admission before any step starts")
         started = time.monotonic()
         send_process_group(process.pid, signum)
-        survivors = self.wait_for_owned_exit(5)
-        code = process.poll()
+        # Drain the log pipes while the coordinator records the interrupted call.
+        code, output = self.finish(process)
+        survivors = self.wait_for_owned_exit()
         remaining = self.memory_queue_pids()
-        output = ""
-        if not survivors:
-            _, output = self.finish(process)
         diagnostic = (f"{signum.name}: exit={code}, elapsed={time.monotonic() - started:.3f}s, "
                       + f"queued={sorted(queued)}, remaining={sorted(remaining)}, survivors={sorted(survivors)}\n"
                       + "\n".join(output.splitlines()[-80:]))
