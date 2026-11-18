@@ -4966,3 +4966,60 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Files:** `scripts/build_queue/test_queue_view.py`.
 
 **Acceptance gate:** `test_queue_view.py` passes with the old values and with the new values in the checkout conf; basedpyright clean.
+
+### Phase 357 — a private run gives the gate's result  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the seven modules pass in a private run that inherits an admission socket and has a long temp path, with every assertion kept.
+
+**Spec:**
+1. Base: origin/main 120c37c1b, worktree `~/worktrees/claude-natedev-natest-inherit357`, branch `natest-inherit357`.
+2. Evidence: queue phase 44ca private runs on 809542ae8 and c4d5ede08. Details: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44ca/earlier-gate-environment.md`; failures: `gate-failed-tests-c4d5ede08.txt` in the same folder.
+3. Modules: `direct/test_verify_step_state`, `lib/test_conf`, `lint/test_invoke_scope` (started real `cargo metadata`), `lint/test_sweep`, `review_links/test_change_page`, `review_links/test_list_page`, `style/test_crate_run`.
+4. Cause one: an inherited `ADMISSION_SOCKET` (and the other build-log and hold variables) reaches the test. Clear the inherited admission environment in the shared test setup, in one place.
+5. Cause two: a long `TMPDIR` makes Unix socket paths too long (Chrome singleton socket 117 bytes; "AF_UNIX path too long"). Keep socket paths short in the shared setup, for example a short socket folder independent of `TMPDIR`.
+6. Fix each cause where it lives. No per-test copies. Tests read no value /tune can change. No signal handlers, no lazy imports.
+7. Proof: run the seven modules with the gate environment of the evidence file (inherited socket, 37-byte `TMPDIR` under /dev/shm) before and after.
+
+**Files:** shared test setup (test runner environment, browser and socket helpers) and the seven modules where a module-local cause remains.
+
+**Acceptance gate:** the seven modules pass in the reproduced environment and in a normal run; full suite green; basedpyright clean on changed files.
+### Phase 358 — the Mac offload test keeps the environment its admission loop reads  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** scripts/mac_test/test_offload.py passes under host load 190-240 with no LiveMemoryReading.
+
+**Spec:**
+- verify saw test_offload.py raise LiveMemoryReading under host load 190-240 (builds, 2026-11-18).
+- The test clears os.environ (`mock.patch.dict(os.environ, ..., clear=True)`, lines 961, 1231, 1265) while the admission loop thread runs. The loop then reads the live memory path.
+- Fix at the cause: the cleared environment keeps every variable the admission loop reads, from one shared helper; or the test stops the loop before it clears the environment. Choose the simpler one.
+- Every assertion remains. Tests read no /tune-changeable value.
+
+**Files:** scripts/mac_test/test_offload.py; the shared fixture that builds `self.environment`, if the fix belongs there.
+
+**Workers:** 1 writer. The change is one test module and its fixture.
+- impl: test_offload.py and its fixture.
+
+**Acceptance gate:** test_offload.py passes 10 times under host load 190-240 in a 2 GB scope; the full suite is green.
+### Phase 359 — the scratch symbolic ref retry test passes under gate load  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** scripts/lib/test_scratch.py test_retry_keeps_a_symbolic_ref_added_or_changed_after_the_intent passes under gate load.
+
+**Spec:**
+- The test failed in sdlc's panedone2 gate on main code and passed alone (builds, 2026-11-18).
+- Find the cause: a timing window, a shared path, a live value or an inherited environment. Fix it where it lives: in scratch.py when the product has the race, in the test when only the test has it.
+- Every assertion remains. Tests read no /tune-changeable value.
+
+**Files:** scripts/lib/test_scratch.py; scripts/lib/scratch.py when the cause is there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: test_scratch.py and scratch.py.
+
+**Acceptance gate:** the test passes 20 times under host load in a 2 GB scope; the full suite is green.
