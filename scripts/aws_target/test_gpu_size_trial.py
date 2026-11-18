@@ -28,6 +28,7 @@ from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
 from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
@@ -173,7 +174,7 @@ elif name == 'cargo':
         guest = folder / 'guest.py'
         _ = guest.write_text(trial.guest_program().replace(
             "root = Path('/var/lib/gpu-size-trial')", 'root = Path(' + repr(str(folder)) + ')', 1))
-        result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=10,
+        result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ.get('PATH', ''),
                  'GPU_TRIAL_CARGO': str(tools / 'cargo')})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -253,7 +254,8 @@ elif name == 'cargo':
             with self.subTest(version=version, device=device):
                 manifest['nextest'] = 'cargo-nextest ' + version
                 trial.write_json(folder / 'manifest.json', manifest)
-                result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=10,
+                result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True,
+                    timeout=TEST_HANG_GUARD_SECS,
                                         env={**environment, 'FIXTURE_VULKAN': device,
                                              'FIXTURE_NEXTEST_VERSION': manifest['nextest']})
                 self.assertEqual(result.returncode, 0, result.stderr)

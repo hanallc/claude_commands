@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
-from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
     SESSION_KEYS, environment_values)
@@ -1387,6 +1387,7 @@ class WaiterAdmission:
     waiter: Waiter
     decision: AdmissionDecision
     state: QueuedWaiter | TokenWaitingWaiter
+    cargo_folder: placement.CargoFolderFree | placement.CargoFolderWait = placement.CargoFolderFree()
 
 
 
@@ -2041,6 +2042,13 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     gpu = policy.gpu_tests
     # The reservation is the slot: it ends at release or when its owner exits.
     gpu_used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
+    first_for_folder: dict[placement.CargoFolder, Waiter] = {}
+    folder_slot_bytes: dict[placement.CargoFolder, int] = {}
+    for owner, claim in claims.items():
+        folder = inputs.cargo_folders.get(owner)
+        if folder is not None:
+            folder_slot_bytes[folder] = folder_slot_bytes.get(folder, 0) + claim.slot.bytes
+    first_folder_wait: Waiter | NoWaiter = NoWaiter()
     first_held: Waiter | NoWaiter = NoWaiter()
     first_held_other_than_gpu: Waiter | NoWaiter = NoWaiter()
     for _, row in ordered:
@@ -2053,9 +2061,17 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         within = reused and need <= held
         state = waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
-        local = can_use_natedev(row) and isinstance(state, QueuedWaiter)
+        local_route = can_use_natedev(row)
+        local = local_route and isinstance(state, QueuedWaiter)
+        folder = inputs.cargo_folders.get(owner) if local_route else None
+        folder_busy = folder in inputs.occupied_cargo_folders
+        earlier = first_for_folder.get(folder, NoWaiter()) if folder is not None else NoWaiter()
+        # A grant returns the other continuation claims for this folder.
+        released = (folder_slot_bytes.get(folder, 0) - held
+                    if folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
+        checked_room = remaining + released
         alone = head_owner == owner and head_can_start_alone
-        fits = extra <= remaining
+        fits = extra <= checked_room
         basis: StartBasis = (WithinSlot() if within else Fits() if fits else
                              StartsAlone() if alone else DoesNotFit())
         room_passes = not isinstance(basis, DoesNotFit)
@@ -2069,24 +2085,34 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         may_pass = (ZERO_NEED_MAY_PASS and need == 0) or (CONTINUATION_MAY_PASS and within)
         if local and not may_pass and not isinstance(ahead, NoWaiter):
             order_hold = HeldBehindHead(ahead)
-        can_start = ready and isinstance(gpu_wait, GpuSlotFree) and isinstance(order_hold, NoOrderHold)
+        elif local and not isinstance(first_folder_wait, NoWaiter):
+            order_hold = HeldBehindHead(first_folder_wait)
+        elif ready and not isinstance(earlier, NoWaiter):
+            order_hold = HeldBehindHead(earlier)
+        if folder is not None and isinstance(earlier, NoWaiter):
+            first_for_folder[folder] = records.stored_waiter(row)
+        can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
+                     and isinstance(order_hold, NoOrderHold))
         decision = AdmissionDecision("admit" if can_start else "hold",
             extra + kept + safety, kept, safety, used,
             NO_PRESSURE_HOLD if within else inputs.pressure,
             used + kept,
             room_passes, order_hold, 0.0 if reused else spacing,
-            reused_slot=reused, room=RoomCheck(extra, remaining, room_passes, basis=basis), gpu=gpu_wait)
-        decisions.append(WaiterAdmission(row, decision, state))
+            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
+        cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
+        decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
         if can_start:
-            remaining += held - need
+            remaining += held + released - need
             gpu_used += gpu_step
             if not reused:
                 new_started = True
-        elif local:
+        elif local or folder_busy:
+            if folder_busy and isinstance(first_folder_wait, NoWaiter):
+                first_folder_wait = records.stored_waiter(row)
             if isinstance(first_held, NoWaiter):
                 first_held = records.stored_waiter(row)
             if GPU_WAIT_MAY_PASS and isinstance(first_held_other_than_gpu, NoWaiter) and not (
-                    ready and isinstance(gpu_wait, GpuSlotWait)):
+                    ready and not folder_busy and isinstance(gpu_wait, GpuSlotWait)):
                 first_held_other_than_gpu = records.stored_waiter(row)
     return decisions
 
@@ -2133,22 +2159,35 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
     rows: list[PassRow] = []
     endings: tuple[PassResult, ...] = ()
     rank = 0
+    spacing_waits: dict[str, float] = {}
     for entry in resolved.walk:
         row, decision = entry.waiter, entry.decision
         owner = records.waiter_owner(row)
         first = head_owner == owner
         within = isinstance(decision.room.basis, WithinSlot)
-        if isinstance(entry.state, TokenWaitingWaiter):
+        if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
             reason: WaitReason = entry.state
         else:
-            if isinstance(resolved.room, ReadingUnavailable) and not within:
-                cause: HeadCause = resolved.room
+            if isinstance(entry.cargo_folder, placement.CargoFolderWait):
+                cause: HeadCause = entry.cargo_folder
+            elif isinstance(resolved.room, ReadingUnavailable) and not within:
+                cause = resolved.room
             elif isinstance(decision.order_hold, HeldBehindHead):
-                cause = queue_order_reason(decision, RecordedQueueIdentities())
+                ahead = records.waiter_owner(decision.order_hold.waiter)
+                folder = inputs.cargo_folders.get(owner)
+                if (decision.starts_at and spacing_waits.get(ahead) == decision.starts_at
+                        and folder is not None and folder == inputs.cargo_folders.get(ahead)
+                        and isinstance(decision.pressure, NoPressureHold)
+                        and isinstance(decision.gpu, GpuSlotFree) and not estimate_expired(row, now, policy)):
+                    cause = StartSpacingWait(decision.starts_at)
+                else:
+                    cause = queue_order_reason(decision, RecordedQueueIdentities())
             elif estimate_expired(row, now, policy):
                 cause = EstimateExpired(row.get("estimated_at", now))
             else:
                 cause = cast(HeadCause, queue_wait_reason(decision, row["need"], available, RecordedQueueIdentities()))
+            if isinstance(cause, StartSpacingWait):
+                spacing_waits[owner] = cause.at
             reason = HeadAdmissionStatus(decision, row["need"], available, cause=cause) if first else cause
         proposal: ProposedAdmission | NotAdmitted = NotAdmitted()
         if decision.state == "admit":

@@ -110,10 +110,12 @@ def historical_issue_folders(doc: Path) -> Iterator[Path]:
 def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path] = (),
                   *, document: Path | None = None, strict: bool = False,
                   include_history: bool = True, require_document: bool = True,
-                  require_existing_document: bool = False) -> tuple[Path, ...]:
+                  require_existing_document: bool = False, sources: list[Path] | None = None) -> tuple[Path, ...]:
     """Return current and former store roots. Use stored_paths to include their archives."""
     configured_roots = tuple(current)
     roots = list(configured_roots)
+    if sources is not None:
+        sources.append(_folder_registry(owner, kind))
     try:
         roots.extend(review_folders(owner, kind))
     except (OSError, ValueError):
@@ -292,7 +294,7 @@ def store_owners(kind: RecordKind, members: staff.StaffSnapshot | None = None, *
 
 def local_document(row: staff.StaffRow | None) -> Path | None:
     """Identify the production document on this machine, if present."""
-    doc = row.doc if row is not None and row.kind in ("showrunner", "producer") else None
+    doc = row.doc if row is not None and row.kind == "showrunner" else None
     return doc.path if isinstance(doc, (staff.LiveDoc, staff.WrappedDoc)) and doc.machine == local_machine() else None
 
 
@@ -532,10 +534,12 @@ class NumberedRecords:
         return self.folder() / f"{identity}.md"
 
     @contextmanager
-    def locked(self) -> Generator[None]:
+    def locked(self, *, check: Callable[[], object] | None = None) -> Generator[None]:
         lock = self.lock_path()
         lock.parent.mkdir(parents=True, exist_ok=True)
         with exclusive(lock):
+            if check is not None:
+                _ = check()
             yield
 
     def lock_path(self) -> Path:

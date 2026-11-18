@@ -33,19 +33,14 @@ def refill_reader() -> ReaderSource:
     return ReaderSource(conf.read_or_repository("style_reader").text("reader"))
 
 
-def reader_install_folder() -> Path:
-    """Read the local folder that holds the reader binary and its stamp."""
-    return Path(conf.read_or_repository("style_reader").text("install_folder")).expanduser()
+def reader_protocol() -> int:
+    """Read the required cargo-style protocol number."""
+    return conf.read_or_repository("style_reader").whole("protocol")
 
 
-def reader_build_limit_seconds() -> float:
-    """Read how long the reader build may run, its memory queue wait included."""
-    return conf.read_or_repository("style_reader").number("build_limit_seconds")
-
-
-def reader_build_stop_grace_seconds() -> float:
-    """Read how long a stopped reader build has to end after TERM before KILL."""
-    return conf.read_or_repository("style_reader").number("build_stop_grace_seconds")
+def reader_minimum_version() -> str:
+    """Read the minimum cargo-style crate version."""
+    return conf.read_or_repository("style_reader").text("minimum_version")
 
 
 @dataclass(frozen=True)

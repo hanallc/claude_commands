@@ -7,8 +7,9 @@ It never holds a copy of the ledger line.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,61 +39,82 @@ def path(ledger: Path) -> Path:
     return ledger.with_name(ledger.stem+'.review.json')
 
 
-held_ledger_locks: ContextVar[frozenset[Path]] = ContextVar('held_ledger_locks', default=frozenset())
+_held_ledger_locks: ContextVar[frozenset[Path]] = ContextVar('held_ledger_locks', default=frozenset())
 
 
 @contextmanager
-def ledger_lock(ledger: Path) -> Generator[None]:
-    """Serialize writes to an efficiency ledger and its Review records."""
+def ledger_lock(ledger: Path, *, check: Callable[[], object] | None = None) -> Generator[None]:
+    """Serialize ledger writes and check the revision under the lock."""
     lock = path(ledger).with_suffix('.lock').resolve()
-    held = held_ledger_locks.get()
-    if lock in held:
-        yield
-        return
+    held = _held_ledger_locks.get()
     lock.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(lock):
-        token = held_ledger_locks.set(held | {lock})
+    with (nullcontext() if lock in held else file_lock.exclusive(lock)):
+        token = _held_ledger_locks.set(held | {lock})
         try:
+            if check is not None:
+                _ = check()
             yield
         finally:
-            held_ledger_locks.reset(token)
+            _held_ledger_locks.reset(token)
 
 
-def read(ledger: Path, sources: list[Path] | None = None) -> dict[str, EfficiencyReview]:
+def stored_reviews(target: Path) -> dict[str, object]:
+    try:
+        stored = cast(object, json.loads(target.read_text(encoding='utf-8')))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(stored, dict):
+        raise ValueError('Expected an object of efficiency reviews.')
+    return cast(dict[str, object], stored)
+
+
+def decode(entry: object) -> EfficiencyReview:
+    entry = cast(StoredReview, entry)
+    log = review_events.from_rows(entry['log'])
+    for event in log:
+        _ = event.who.encode('utf-8'), event.words.encode('utf-8')
+    return EfficiencyReview(log, ReviewMark(entry['mark']) if 'mark' in entry else NoMark(),
+                            review_events.waiting_why(entry.get('waiting_why', '')))
+
+
+def read(ledger: Path, sources: list[Path] | None = None, *,
+         skipped: Callable[[Path, str, Exception], None] | None = None) -> dict[str, EfficiencyReview]:
     target = path(ledger)
     if sources is not None:
         sources.append(target)
-    try:
-        stored = cast(dict[str, StoredReview], json.loads(target.read_text(encoding='utf-8')))
-    except FileNotFoundError:
-        return {}
-    return {identity: EfficiencyReview(review_events.from_rows(entry['log']),
-                                       ReviewMark(entry['mark']) if 'mark' in entry else NoMark(),
-                                       review_events.waiting_why(entry.get('waiting_why', '')))
-            for identity, entry in stored.items()}
+    reviews: dict[str, EfficiencyReview] = {}
+    for identity, entry in stored_reviews(target).items():
+        try:
+            reviews[identity] = decode(entry)
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            if skipped is not None:
+                skipped(target, identity, error)
+            else:
+                logging.getLogger(__name__).warning('Review source %s (%s): %s', target, identity, error)
+    return reviews
 
 
-def record(ledger: Path, identity: str, words: str, change: MarkChange, who: str = 'nate', *,
-           waiting_why: str = '', check_state: Callable[[], None] = lambda: None) -> bool:
+def record(ledger: Path, identity: str, words: str | tuple[str, ...], change: MarkChange, who: str = 'nate',
+           *, check: Callable[[], object] | None = None, waiting_why: str = '',
+           check_state: Callable[[], None] = lambda: None) -> bool:
     """Append one log line and change the mark. Returns False for an exact repeat."""
     reason = review_events.require_waiting_why(waiting_why) if change == ReviewMark.WAITING or waiting_why else ''
     target = path(ledger)
-    with ledger_lock(ledger):
-        reviews = read(ledger)
-        before = reviews.get(identity, EfficiencyReview())
+    with ledger_lock(ledger, check=check):
+        stored = stored_reviews(target)
+        before = decode(stored[identity]) if identity in stored else EfficiencyReview()
         check_state()
-        log = review_events.append(before.log, ReviewLog(datetime.now(timezone.utc), who, words))
+        log = before.log
+        for line in (words,) if isinstance(words, str) else words:
+            log = review_events.append(log, ReviewLog(datetime.now(timezone.utc), who, line))
         after = EfficiencyReview(log, review_events.changed_mark(before.mark, change), reason or before.waiting_why)
         if after == before:
             return False
-        reviews[identity] = after
-        stored: dict[str, StoredReview] = {}
-        for key, review in reviews.items():
-            entry: StoredReview = {'log': review_events.rows(review.log)}
-            if isinstance(review.mark, ReviewMark):
-                entry['mark'] = review.mark.value
-            if review.waiting_why:
-                entry['waiting_why'] = review.waiting_why
-            stored[key] = entry
-        write_text_atomic(target, json.dumps(stored, ensure_ascii=False, indent=1)+'\n')
+        entry: StoredReview = {'log': review_events.rows(after.log)}
+        if isinstance(after.mark, ReviewMark):
+            entry['mark'] = after.mark.value
+        if after.waiting_why:
+            entry['waiting_why'] = after.waiting_why
+        stored[identity] = entry
+        write_text_atomic(target, json.dumps(stored, indent=1)+'\n')
         return True

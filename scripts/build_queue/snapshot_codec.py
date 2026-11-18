@@ -110,7 +110,8 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 
 GPU_SLOT_SUFFIX = "_gpu_slot"
 NATEDEV_HOLD_SUFFIX = "_natedev_hold"
-LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX)
+CARGO_FOLDER_SUFFIX = "_cargo_folder"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX)
 
 
 @lru_cache(maxsize=None)
@@ -136,6 +137,8 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
             head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
         elif wait.get("kind") == "NatedevHeld":
             head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
+        elif wait.get("kind") == "CargoFolderWait":
+            head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}
