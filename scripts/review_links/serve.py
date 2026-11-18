@@ -946,7 +946,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if server.mode is ServerMode.LIST_FIXTURE and fields.get("action") != ["remove"]:
                 raise ValueError("Only Remove is available in this demo.")
             with server.list_store_access():
-                delivery = list_page.submit(server.root, body, server.delivery_status)
+                submission = list_page.submit(server.root, body, server.delivery_status)
                 fixture_reply = ({"state": "saved",
                     **list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)}
                     if server.mode is ServerMode.LIST_FIXTURE else None)
@@ -962,11 +962,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             action = fields["action"][0]
             state = "saved" if action.startswith("resend-") else {"read": "read", "question": "saved"}.get(action, "sent")
-            self.json_response(200, {"state": state,
-                **list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)})
+            current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)
+            reply = {"state": state, **current}
+            if isinstance(submission, list_page.ListUnparkSubmission):
+                reply["unpark_outcome"] = submission.response_outcome(current).value
+            self.json_response(200, reply)
         finally:
             try:
-                list_page.deliver(delivery)
+                list_page.deliver(submission)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
@@ -1026,8 +1029,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             for page in console.read_pages():
                 if page.items is review_page.waiting_items:
                     page = replace(page, items=waiting_review)
-                elif page.items is list_page.waiting_updates:
-                    page = replace(page, items=partial(list_page.waiting_updates, status=server.delivery_status))
                 elif page.items is images.waiting_images:
                     page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
                 pages.append(page)

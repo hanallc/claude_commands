@@ -126,7 +126,13 @@ class ReviewPageTests(unittest.TestCase):
 
     def test_staff_owners_sources_and_log_names_have_role_colors(self) -> None:
         _ = self.question()
+        _ = self.investigation(False)
         snapshot = review_page.build_snapshot(self.root)
+        owner_menu = snapshot.render().decode().partition('id="list-owner"')[2].partition('</div>')[0]
+        entry = next(entry for entry in snapshot.entries if entry['type'] == review_items.ReviewType.INVESTIGATION)
+        for name, markup in ((entry['ownerName'], entry['ownerHtml']), (entry['sourceName'], entry['sourceHtml'])):
+            self.assertIn('class="staff-name"', markup)
+            self.assertIn(f'data-owner-name="{html.escape(name)}" aria-pressed="false">{markup} <b>', owner_menu)
         body = ''.join(snapshot.body(item.key).decode() for item in snapshot.records.values())
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
@@ -1856,6 +1862,14 @@ requestAnimationFrame(focusRow);
         for show, _ in review_page.SHOWS:
             with self.subTest(show=show):
                 source = review_page.render(self.root, show=show).decode()
+                for label, container in (
+                    ('Type', 'class="review-types"'),
+                    ('State', 'class="review-types review-shows" id="list-show"'),
+                    ('Owner', 'class="review-types" id="list-owner"'),
+                ):
+                    self.assertIn('<div class="record-filter-row">'
+                                  + f'<span aria-hidden="true">{label}</span>'
+                                  + f'<div {container} role="group" aria-label="{label}">', source)
                 group = source.partition('<div class="review-types review-shows"')[2].partition('</div>')[0]
                 self.assertTrue(group, 'Show has a second chip row')
                 self.assertNotIn('<select id="list-show"', source)
@@ -2042,6 +2056,15 @@ window.fetch=async(url,options)=>{
     [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
+  const labels=groups.map(group=>group.previousElementSibling);
+  check(labels.map(label=>label.textContent).join('|')==='Type|State|Owner' &&
+    groups.every((group,index)=>group.getAttribute('aria-label')===labels[index].textContent),
+    'The three filter rows have visible and accessible labels');
+  const narrow=matchMedia('(max-width:480px)').matches;
+  check(groups.every((group,index)=>{
+    const chips=group.getBoundingClientRect(),label=labels[index].getBoundingClientRect();
+    return narrow ? chips.left===label.left && chips.top>=label.bottom : chips.left>=label.right;
+  }),'Chips align to the right of the label on desktop and below it on narrow screens');
   check(groups.length===3 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom &&
     groups[2].getBoundingClientRect().top>=groups[1].getBoundingClientRect().bottom,
     'Show follows Type and Owner follows Show');
@@ -2073,7 +2096,15 @@ window.fetch=async(url,options)=>{
   const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
   chip('open').click();await flush();await flush();
   const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
-  chooseOwner(builder);chooseType('question');
+  const builderChip=ownerChip(builder),builderName=builderChip.querySelector('.staff-name');
+  check(builderName?.dataset.colorText==='role.unit-director' &&
+    getComputedStyle(builderName).color!==getComputedStyle(builderChip).color,
+    'An unselected Owner name uses its role color');
+  chooseOwner(builder);
+  check(builderChip.getAttribute('aria-pressed')==='true' &&
+    getComputedStyle(builderName).color===getComputedStyle(builderChip).color,
+    'A selected Owner name inherits the chip color');
+  chooseType('question');
   check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1' &&
     ownerChips().some(button=>button.textContent==='page-owner 1') &&
     ownerChip(builder).hidden,
@@ -3544,6 +3575,167 @@ window.fetch=async(url)=>{
         self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_card_actions_fade_and_slide(self) -> None:
+        source = browser_markup(self.root)
+        setup = r"""<script>
+const realFetch=fetch,posts=[];
+window.setInterval=()=>0;
+window.fetch=(url,options)=>options?.method==='POST'
+ ? (posts.push(new URLSearchParams(options.body).get('outcome')),new Promise(()=>{}))
+ : realFetch(url,options);
+if(REDUCED) window.matchMedia=()=>({matches:true});
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const top=row=>row.getBoundingClientRect().top;
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const [row,next]=document.querySelectorAll('[data-list-item][data-type="change"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const first=top(row),start=top(next);
+  const action=ACTION;
+  form.elements.feedback.value='Review these words.';
+  if(action==='later'){
+   form.querySelector('[data-later-toggle]').click();
+   form.querySelector('[data-later-preset="soon"]').click();
+  }else form.requestSubmit(form.querySelector('button[value="'+action+'"]'));
+  check(posts[0]===action && !row.isConnected,'The action posts and removes the record.');
+  const motion=()=>document.querySelector('[data-record-motion]');
+  if(REDUCED){
+   check(!motion() && Math.abs(top(next)-first)<2,'Reduced motion moves the next card at once.');
+  }else{
+   const clip=motion()?.querySelector('.record-motion-clip'),exit=clip?.getAnimations()[0];
+   if(!exit) throw new Error('The shared exit animation is missing.');
+   check(motion().querySelector('[data-detail]:not([hidden])'),'The motion copy includes the open card.');
+   check(exit.effect.getTiming().duration===200,'The motion lasts 200 ms.');
+   exit.pause();exit.currentTime=0;
+   const initialOpacity=Number(getComputedStyle(clip).opacity);
+   check(Math.abs(top(next)-start)<2,'The next card starts in its original position.');
+   exit.currentTime=100;
+   const opacity=Number(getComputedStyle(clip).opacity);
+   check(opacity>0 && opacity<initialOpacity,'The motion copy fades before it disappears.');
+   check(top(next)<start && top(next)>first,'The next card moves up during the fade.');
+   exit.finish();await exit.finished;
+   check(!motion() && Math.abs(top(next)-first)<2,'The next card fills the gap when the copy leaves.');
+  }
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        cases = [(action, False) for action in ('works', 'not works', 'validate', 'question', 'feedback', 'later')]
+        for action, reduced in [*cases, ('question', True)]:
+            with self.subTest(action=action, reduced_motion=reduced):
+                markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+                markup = markup.replace('REDUCED', json.dumps(reduced)).replace('ACTION', json.dumps(action))
+                self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_departing_card_keeps_its_place_in_the_scrolled_window(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}') for number in range(1, 181)]
+        with patch.object(review_items, 'read', return_value=records):
+            source = browser_markup(self.root)
+        self.check_card_motion(source, r"""
+ document.querySelector('[data-sort="0"]').click();
+ scrollTo(0,4800);await frame();
+ const row=rows().find(node=>top(node)>120 && top(node)<420);
+ if(!row) throw new Error('A card must be in the viewport.');
+ const panel=panelId(row),next=row.nextElementSibling;
+ row.querySelector('.list-toggle').click();
+ const form=await readyReviewCard(row);
+ row.querySelector('[data-detail]>td').style.height='1600px';
+ await frame();
+ scrollBy(0,top(next)-540);await frame();
+ const before=top(row),following=top(next);
+ check(scrollY>0 && before<0 && following>0 && following<innerHeight,'The tall card and next card share the scrolled viewport.');
+ send(form);
+ const clip=copy(panel);
+ check(clip && near(top(clip),before),'The tall copy starts at the original position.');
+ check(next.isConnected && near(top(next),following),'The visible next card keeps its position.');
+ const exit=clip.getAnimations()[0];
+ exit.currentTime=100;dispatchEvent(new Event('scroll'));await frame();
+ check(near(top(clip),before),'The shrinking copy keeps its place after a redraw.');
+ check(next.isConnected && top(next)<following,'The next card stays mounted while it moves up.');
+ exit.finish();await exit.finished;await frame();
+ check(!copy(panel),'The tall copy disappears when the fade ends.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
+        self.check_card_motion(browser_markup(self.root), r"""
+ const [first,second,next]=rows(),firstPanel=panelId(first),secondPanel=panelId(second);
+ const firstForm=await openCard(first);send(firstForm);
+ const firstClip=copy(firstPanel);firstClip.getAnimations()[0].currentTime=100;
+ const secondForm=await openCard(second);send(secondForm);
+ const secondClip=copy(secondPanel);secondClip.getAnimations()[0].currentTime=100;
+ const height=firstClip.getBoundingClientRect().height,opacity=Number(getComputedStyle(firstClip).opacity);
+ const following=top(next);
+ posts.get(first.dataset.key)({ok:false,json:async()=>({reason:'Try again.'})});
+ await frame();
+ const restored=copy(firstPanel);
+ check(restored && restored!==firstClip,'The refused card reverses its fade.');
+ check(restored && top(restored)<top(secondClip),'The first card returns above the departing second card.');
+ check(restored && near(restored.getBoundingClientRect().height,height) &&
+   near(Number(getComputedStyle(restored).opacity),opacity,0.01),'The reverse starts at the current height and opacity.');
+ check(near(top(next),following),'The next card does not jump when the fade reverses.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_saved_card_keeps_its_place_when_sorted_by_state(self) -> None:
+        self.check_card_motion(browser_markup(self.root), r"""
+ document.querySelector('[data-sort="4"]').click();
+ const [first,row,next]=rows(),panel=panelId(row);
+ check([first,row,next].every(node=>node.dataset.state==='Open'),'Three open cards are sorted by State.');
+ send(await openCard(row));
+ const clip=copy(panel),exit=clip.getAnimations()[0];
+ exit.currentTime=100;
+ const position=top(clip),following=top(next);
+ check(top(first)<position && position<following,'The departing card starts between its neighbors.');
+ posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ await frame();
+ check(copy(panel)===clip && near(top(clip),position),'The saved card keeps its position during the fade.');
+ check(near(top(next),following),'The next card keeps its position when the save completes.');
+ exit.finish();await exit.finished;await frame();
+ check(!copy(panel) && top(next)<following,'The next card fills the gap when the fade ends.');
+""")
+
+    def check_card_motion(self, source: str, steps: str) -> None:
+        setup = r"""<script>
+const realFetch=fetch,posts=new Map(),animate=Element.prototype.animate;
+window.setInterval=()=>0;
+window.fetch=(url,options)=>options?.method==='POST'
+ ? new Promise(resolve=>posts.set(new URLSearchParams(options.body).get('row'),resolve))
+ : realFetch(url,options);
+Element.prototype.animate=function(...args){
+ const motion=animate.apply(this,args);
+ if(this.classList.contains('record-motion-clip')){motion.pause();motion.currentTime=0;}
+ return motion;
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const rows=()=>[...document.querySelectorAll('[data-list-item]')];
+ const top=node=>node.getBoundingClientRect().top;
+ const near=(a,b,tolerance=2)=>Math.abs(a-b)<tolerance;
+ const panelId=row=>row.querySelector('.list-toggle').getAttribute('aria-controls');
+ const copy=panel=>document.querySelector('.record-motion-clip [aria-controls="'+CSS.escape(panel)+'"]')?.closest('.record-motion-clip');
+ const openCard=async row=>{row.querySelector('.list-toggle').click();return readyReviewCard(row);};
+ const send=form=>form.requestSubmit(form.querySelector('button[value="works"]'));
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  document.documentElement.style.overflowAnchor='none';
+  await frame();
+""" + steps + r"""
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
         _ = self.question()
         setup = r"""<script>
@@ -3615,8 +3807,20 @@ window.fetch=(url,options={})=>{
    form.requestSubmit(form.querySelector('button[value="works"]'));
    if(!form.dataset.sending) throw new Error('The save did not start for '+key+'.');
    if(key==='page-owner/C1'){
+    const clip=document.querySelector('.record-motion-clip [aria-controls="'+
+     CSS.escape(row.querySelector('.list-toggle').getAttribute('aria-controls'))+'"]')?.closest('.record-motion-clip');
+    const exit=clip?.getAnimations()[0];
+    if(!exit) throw new Error('The Change must fade during the save.');
+    exit.pause();exit.currentTime=100;
     await follow({show:'Done',owner});
     finishVerdict();
+    await saved;
+    check(clip.isConnected && exit.currentTime===100 && !change(key),
+     'The link waits for the fade after the save.');
+    if(clip.isConnected){
+     exit.finish();await exit.finished;
+     await new Promise(resolve=>requestAnimationFrame(resolve));
+    }
    }
    await saved;
    check(form.querySelector('[data-send-status]').textContent==='Saved: works',key+' saved.');
