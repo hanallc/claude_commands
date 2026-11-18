@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from scripts.direct.verify_scope_test_support import write_test_scope_launcher
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
 
@@ -223,9 +225,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
 
     def build_fixture(self) -> None:
         home = self.root / "home"
-        claude = home / ".claude"
-        claude.mkdir(parents=True)
-        (claude / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         bin_directory = self.root / "bin"
         bin_directory.mkdir()
         write_test_scope_launcher(bin_directory)

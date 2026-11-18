@@ -1094,10 +1094,6 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
             key, fixture.clock.now(), "the caller fixture has no provider transport")
 
     fixture.server.host_probe = provider
-    launcher = Path.home() / ".claude/scripts/lib/py"
-    launcher.parent.mkdir(parents=True, exist_ok=True)
-    if not launcher.exists():
-        launcher.symlink_to(Path(__file__).resolve().parents[1] / "lib/py")
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
     for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
                 "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):

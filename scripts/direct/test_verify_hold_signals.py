@@ -34,12 +34,14 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                          "the coordinator waits at admission before any step starts")
         started = time.monotonic()
         send_process_group(process.pid, signum)
-        survivors = self.wait_for_owned_exit(5)
-        code = process.poll()
+        # Drain the trace while verify runs its cleanup.
+        try:
+            code, output = self.finish(process, timeout=5)
+        except subprocess.TimeoutExpired as error:
+            trace = (error.stderr or b"").decode(errors="replace")
+            self.fail(f"{signum.name}: verify did not close its output within 5 s\n" + trace[-4000:])
+        survivors = self.wait_for_owned_exit(max(0, 5 - (time.monotonic() - started)))
         remaining = self.memory_queue_pids()
-        output = ""
-        if not survivors:
-            _, output = self.finish(process)
         diagnostic = (f"{signum.name}: exit={code}, elapsed={time.monotonic() - started:.3f}s, "
                       + f"queued={sorted(queued)}, remaining={sorted(remaining)}, survivors={sorted(survivors)}\n"
                       + "\n".join(output.splitlines()[-80:]))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -165,9 +167,7 @@ esac
                               + 'lint_config_skip_notice() { :; }\n')
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
-        claude = self.root / ".claude"
-        claude.mkdir()
-        (claude / "scripts").symlink_to(VERIFY.parent.parent, target_is_directory=True)
+        _ = copy_helpers(self.root, *VERIFY_HELPERS)
         for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup"):
             (self.root / name).mkdir()
         # This workspace's memory fixture must not inherit the host's PSI.

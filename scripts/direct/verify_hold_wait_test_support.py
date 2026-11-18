@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.lib.checkout_test_support import fixture_shim_source
 
 from scripts.lint.memory_test_support import write_pressure_reading
@@ -115,7 +117,7 @@ def change_cycle(path: Path, change: Callable[[build_hold.HoldCycle], None]) -> 
         "STAFF_FILE": str(release.parent / "staff.json"),
     }), build_hold.release_lock():
         cycle = build_hold.read_cycle()
-        assert cycle is not None
+        assert not isinstance(cycle, build_hold.NoCycle)
         change(cycle)
         build_hold.save_cycle(cycle)
 
@@ -196,6 +198,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         cls.addClassCleanup(builder.doCleanups)
         builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
         builder.build_fixture()
+        _ = copy_helpers(builder.home, "scripts/astra", "scripts/accounts")
         cls.fixture_root = builder.root
         seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
         cls.fixture_seed = Path(seed_directory) / "seed"
@@ -203,12 +206,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         # Version discovery is the lib/py suite's boundary. Preserve every
         # requested script and its real process, without a probe before each.
         library = builder.home / ".claude/scripts/lib"
-        source = library.resolve()
-        library.unlink()
-        library.mkdir()
-        for entry in source.iterdir():
-            if entry.name != "py":
-                (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+        _ = copy_helpers(builder.home, *VERIFY_HELPERS)
         builder.write_executable(library / "py", fixture_shim_source())
         (builder.root / "unit").mkdir()
         cls.fixture_environment = {
@@ -230,6 +228,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(self.assert_nothing_outlives)
         self.home: Path = self.root / "home"
+        self.verify_script: Path = self.home / ".claude/scripts/direct/verify.sh"
         self.bin_directory: Path = self.root / "bin"
         self.board: Path = self.root / "board"
         self.runner: Path = self.root / "runner.py"
@@ -426,8 +425,8 @@ exit "$status"
                         output += chunk.decode("utf-8")
                         self.wait_output[process.pid] = output
 
-    def finish(self, process: subprocess.Popen[str]) -> tuple[int, str]:
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+    def finish(self, process: subprocess.Popen[str], timeout: float = TEST_HANG_GUARD_SECS) -> tuple[int, str]:
+        output, errors = process.communicate(timeout=timeout)
         return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
     def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:

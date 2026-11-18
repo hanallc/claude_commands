@@ -1,4 +1,4 @@
-"""Keep token ownership correct between remote and local lint steps."""
+"""Check the boundary between remote and local lint steps."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -10,11 +10,41 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.build_folders_test_support import tool_folders
 
-from scripts.direct.verify_mac_offload_test_support import RUNNER_STUB, VerifyMacOffloadFixture
+from scripts.direct.verify_mac_offload_test_support import CARGO_STUB, RUNNER_STUB, VerifyMacOffloadFixture
 from scripts.direct.verify_step_routes_test_support import TARGETS
 
 
 class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
+    def record_local_mac_claims(self, stage: str) -> Path:
+        observed = self.runner_state / "local-mac-claims"
+        self.write_executable(self.bin_directory / "cargo", CARGO_STUB.replace(
+            "if arguments[:1] == [\"metadata\"]:",
+            f"if {stage}:\n"
+            + '    claims = sorted((Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims").glob("*.json"))\n'
+            + '    (Path(os.environ["TEST_RUNNER_STATE"]) / "local-mac-claims").write_text(json.dumps([p.name for p in claims]))\n'
+            + 'if arguments[:1] == ["metadata"]:'))
+        return observed
+
+    def test_local_mend_fix_runs_without_a_mac_reservation(self) -> None:
+        holders = Path(self.environment["BUILD_HOLD_DIR"])
+        holders.mkdir()
+        targets = self.root / "claim-targets.py"
+        _ = targets.write_text(TARGETS)
+        reader = self.root / "claim-lint-config.sh"
+        _ = reader.write_text(
+            'lint_config_enabled() { [[ "$1" == mend || "$1" == fmt ]]; }\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        events = self.root / "route-events"
+        observed = self.record_local_mac_claims('arguments[:1] == ["mend"] and "--fix" in arguments')
+        result = self.verify("lint", "sample", "--no-cache", extra={
+            "BUILD_TARGETS_SCRIPT": str(targets), "LINT_CONFIG_READER": str(reader),
+            "TEST_ROUTE_EVENTS": str(events), "TEST_FREE_NOW_FREE": "1",
+        })
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.runner_events(), [])
+        self.assertEqual(observed.read_text(), "[]")
+        self.assertNotIn('"command": "reserve"', events.read_text())
+
     def prepare_memory_lint(self) -> Path:
         Path(self.environment["BUILD_HOLD_DIR"]).mkdir()
         targets = self.root / "targets.py"
@@ -128,11 +158,15 @@ trap hold_before_mend_check DEBUG
 ''')
         self.write_executable(self.runner, RUNNER_STUB.replace(
             'raise SystemExit(runner_status)',
-            'for hold in Path(os.environ["BUILD_HOLD_DIR"]).iterdir():\n'
+            'claims = list((Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims").glob("*.json"))\n'
+            + 'assert len(claims) == 1, claims\n'
+            + '(root / "mac-stage-claim").write_text(claims[0].read_text())\n'
+            + 'for hold in Path(os.environ["BUILD_HOLD_DIR"]).iterdir():\n'
             + '    hold.unlink()\n'
             + 'raise SystemExit(runner_status)'))
+        observed = self.record_local_mac_claims('arguments == ["+nightly", "fmt", "--all", "--check"]')
         result = self.verify("lint", "--check", "--no-cache", extra={
-            "BUILD_TARGETS_SCRIPT": str(targets), "BASH_ENV": str(shell),
+            "BUILD_TARGETS_SCRIPT": str(targets), "LINT_CONFIG_READER": str(reader), "BASH_ENV": str(shell),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
         })
@@ -145,6 +179,9 @@ trap hold_before_mend_check DEBUG
         formats = [event for event in self.cargo_events()
                    if event["args"] == ["+nightly", "fmt", "--all", "--check"]]
         self.assertEqual(len(formats), 1)
+        self.assertTrue((self.runner_state / "mac-stage-claim").exists())
+        self.assertEqual(observed.read_text(), "[]")
+        self.assertIn('"command": "reserve"', (self.root / "route-events").read_text())
         self.assertFalse(formats[0]["token_held"])
         self.assertFalse((self.board / "locks/cargo.d").exists())
 

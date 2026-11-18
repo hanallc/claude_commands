@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from scripts.direct.verify_scope_test_support import write_test_scope_launcher
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import placement
 from scripts.lib.berth_test_support import write_unconfigured_berth
@@ -135,8 +137,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.repo = self.root / "workspace"
         self.repo.mkdir()
         home = self.root / "home"
-        (home / ".claude").mkdir(parents=True)
-        (home / ".claude/scripts").symlink_to(SCRIPTS, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         self.records = home / ".local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"

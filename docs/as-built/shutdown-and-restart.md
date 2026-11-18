@@ -235,7 +235,8 @@ dwight=claude:fable:high
 These model names are aliases that the shared model registry resolves.
 `member_account.producer_account(kind, *, to="")` selects the account before admission.
 Admitted producers use `member_account.resume_account`.
-Both functions select the workers account for Codex and the showrunners account for Claude.
+Both functions select the workers account for Codex.
+Claude uses the producers account, with the showrunners account as the fallback.
 An explicit `--to` overrides that selection.
 
 `accounts.eligible_producers(membership, family)` selects active, unpaused, local producers of the configured family.
@@ -243,7 +244,7 @@ An explicit `--to` overrides that selection.
 Invalid settings exclude that producer.
 `settings_report_scope` limits its warning to one per operation.
 A workers swap includes eligible Codex producers.
-A showrunners group move includes eligible Claude producers.
+A producers group move includes eligible Claude producers.
 Units and showrunners retain their existing group selection.
 
 A repeated move selects a stopped producer even when its recorded home already names the target.
@@ -320,7 +321,7 @@ The process arguments need no session ID.
 
 1. Refuse a caller that another staff row records. Refuse a producer on another machine.
 2. Prove the caller through `stop_resume.producer_adoption_launch`: native id, family, account home, folder, and pane.
-3. Refuse a Claude caller outside the showrunners account; the refusal names the `agents move` command.
+3. Refuse a Claude caller outside the selected producer account. Print the `agents move` command.
 4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
 5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
 6. Publish `[producers].NAME` through `models_registry.store_producer`.

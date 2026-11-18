@@ -30,14 +30,17 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 syste
 __PAGE_FRAME_STYLE__
 __STEP_TIP_STYLE__
 :where(.page-status) { position: relative; }
-.page-status { padding-right: 24px; }
-#measure-now { position: absolute; right: 0; top: 50%; transform: translateY(-50%);
-  display: inline-flex; align-items: center; justify-content: center; padding: 2px;
-  border: 0; border-radius: 4px; background: transparent; color: var(--ink-3); cursor: pointer; }
+.page-status { --measure-width: 7.75rem; padding-inline-end: calc(var(--measure-width) + 8px); }
+.page-status > span[data-status-reason] { white-space: normal; overflow-wrap: anywhere; }
+#measure-now { position: absolute; inset-inline-end: 0; top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  inline-size: var(--measure-width); padding: 1px 6px; white-space: nowrap;
+  font: inherit; line-height: 1; font-weight: 600;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--card); color: var(--ink); cursor: pointer; }
 #measure-now svg { width: 16px; height: 16px; }
 #measure-now:hover:enabled, #measure-now:focus-visible { color: var(--accent); }
 #measure-now:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-#measure-now:disabled { cursor: default; }
+#measure-now:disabled { color: var(--ink-3); cursor: default; }
 h2 { font-size: 1.05rem; margin: 0; }
 h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 /* A card title with a definition: the info mark shows that a hover tells what the card holds. */

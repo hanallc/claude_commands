@@ -529,6 +529,7 @@ class SweepStartupTests(unittest.TestCase):
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
                 env={**os.environ, **environment, "HOME": directory, "TMPDIR": directory,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
                      "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
                      "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
                      "LINT_CONFIG_READER": str(root / "missing-config"), "LINT_SKIP_SWEEP": switch,
