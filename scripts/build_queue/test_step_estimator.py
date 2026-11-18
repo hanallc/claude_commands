@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,9 +11,11 @@ from unittest import mock
 from typing import override
 
 from scripts.build_queue import step_estimator
-from scripts.build_queue.admission_records import RepositoryIdentity
+from scripts.build_queue.admission_records import NEXTEST_BUILD_STEP, NEXTEST_TEST_STEP, RepositoryIdentity
 from scripts.buildlog import record, repository
 from scripts.buildlog import store
+from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class GitIdentityCacheTests(unittest.TestCase):
@@ -138,3 +141,53 @@ class ManifestIdentityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class NextestStepPeakTests(unittest.TestCase):
+    def test_config_refuses_a_nextest_test_percentile_below_p90(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            configuration = Path(directory) / "build_admission.conf"
+            _ = write_config_fixture(configuration)
+            key = "nextest_test_peak_percentile"
+            conf.check(configuration, key, "90")
+            with self.assertRaisesRegex(conf.Unusable, "outside range"):
+                conf.check(configuration, key, "89")
+
+    def test_build_and_test_read_their_own_peak_in_the_same_repository(self) -> None:
+        instant = datetime(2026, 11, 17, tzinfo=UTC)
+        repo = RepositoryIdentity("origin:fixture", "fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "admission/anon_peaks.jsonl"
+            configuration = root / "build_admission.conf"
+            _ = write_config_fixture(configuration)
+
+            def sample(step: str, peak: int, *, project: str = repo.key, promise: int = 1000) -> None:
+                row = {"host": "fixture", "repo_identity": project, "step": step,
+                       "ended_at": (instant - timedelta(minutes=1)).isoformat(),
+                       "anon_peak_bytes": 1000, "need": promise}
+                field = "build_phase_peak_bytes" if step == NEXTEST_BUILD_STEP else "test_phase_peak_bytes"
+                store.append_line(history, {**row, field: peak})
+
+            def estimate(step: str) -> int:
+                with mock.patch.dict(os.environ, {"CONF_DIR": str(root)}):
+                    return step_estimator.expected_peak(repo, step, "fixture", instant, root,
+                                                        first_peak_bytes=3000, share_percent=50).bytes
+
+            self.assertEqual(estimate(NEXTEST_TEST_STEP), 3000)
+            sample(NEXTEST_BUILD_STEP, 800)
+            sample(NEXTEST_BUILD_STEP, 900, project="origin:other")
+            for peak in range(10, 101, 10):
+                sample("nextest", peak)
+            sample(NEXTEST_TEST_STEP, 1000, project="origin:other")
+            self.assertEqual(estimate(NEXTEST_BUILD_STEP), 800)
+            self.assertEqual(estimate(NEXTEST_TEST_STEP), 90)
+            default_config = configuration.read_text()
+            _ = write_config_fixture(configuration, "nextest_test_peak_percentile=100")
+            self.assertEqual(estimate(NEXTEST_TEST_STEP), 100)
+            _ = configuration.write_text(default_config)
+
+            sample(NEXTEST_TEST_STEP, 300, promise=90)
+            for _ in range(20):
+                sample(NEXTEST_TEST_STEP, 90)
+            self.assertEqual(estimate(NEXTEST_TEST_STEP), 300)

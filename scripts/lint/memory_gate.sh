@@ -165,7 +165,7 @@ buildlog_memory_event() { :; }
 
 buildlog_wait_for_memory() {
     buildlog_check_nested_step || return $?
-    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
+    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION="" BUILDLOG_MEM_NEXTEST_HANDOFF=0
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
         source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
         return 0
@@ -207,7 +207,8 @@ buildlog_wait_for_memory() {
 }
 
 buildlog_release_memory() {
-    local reservation="${BUILDLOG_MEM_RESERVATION:-}" prelaunch_outcome="${2:-${BUILDLOG_PRELAUNCH_OUTCOME:-retry}}"
+    local reservation="${BUILDLOG_MEM_RESERVATION:-}" release_status=0
+    local prelaunch_outcome="${2:-${BUILDLOG_PRELAUNCH_OUTCOME:-retry}}"
     BUILDLOG_MEM_RESERVATION=""
     export BUILDLOG_MEM_CLEANUP_TIMING
     [[ -n "$reservation" || "$prelaunch_outcome" == abandon ]] || return 0
@@ -225,8 +226,11 @@ buildlog_release_memory() {
         fi
         if [[ "$outcome" == abandon ]]; then
             cancel_reason=$prelaunch_reason
-        elif ! buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1; then
-            cancel_reason="finish-step failed"
+        else
+            buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" "${finish_args[@]}" >/dev/null 2>&1 || {
+                release_status=$?
+                cancel_reason="finish-step failed"
+            }
         fi
         if [[ -n "$cancel_reason" ]]; then
             if buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$episode" \
@@ -243,6 +247,10 @@ buildlog_release_memory() {
         rm -f "${BUILDLOG_SELECTED_LOCAL_GRANT:-/nonexistent}" || true
         BUILDLOG_SELECTED_LOCAL_GRANT="" BUILDLOG_PLACEMENT_FILE=""
     else
-        buildlog_memory_python "$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
+        buildlog_memory_python "$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || release_status=$?
+    fi
+    if (( release_status != 0 )) && [[ -n "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" ]]; then
+        build_check_stop "$release_status" 'cannot release the nextest memory grant'
+        return "$release_status"
     fi
 }

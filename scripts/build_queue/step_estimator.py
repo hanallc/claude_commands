@@ -16,6 +16,7 @@ from typing import Callable, Literal, cast
 from pathlib import Path
 
 
+from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue.admission_records import (
@@ -32,6 +33,9 @@ from scripts.build_queue.admission_records import (
     LegacyDevMultiplierHeadroom,
     MeasuredProgramPeak,
     MemoryConfig,
+    NEXTEST_BUILD_STEP,
+    NEXTEST_TEST_STEP,
+    NextestAdmissionStep,
     NoBuildHistoryGeneration,
     NoFloor,
     NoHeadroom,
@@ -320,7 +324,10 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                   shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE,
                   first_peak_bytes: int,
                   share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE) -> ExpectedPeak:
-    """Read the history once and select a fresh or compile promise."""
+    """Select a promise for the requested step from its history."""
+    if step in (NEXTEST_BUILD_STEP, NEXTEST_TEST_STEP):
+        return nextest_step_peak(repository, step, host, now, root, scope, package, filters,
+                                 first_peak_bytes, share_percent=share_percent)
     if step == "build":
         return build_expected_peak(repository, shape, host, now, root, first_peak_bytes, share_percent=share_percent)
     if isinstance(repository, UnknownRepository):
@@ -339,6 +346,44 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
                                      filters, package, history, share_percent=share_percent)
     return full_history_peak(repository, step, host, now, root, test_threads,
                              scope, package, first_peak_bytes, history, share_percent=share_percent)
+
+
+def nextest_step_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
+                      scope: TestScope, package: str, filters: tuple[str, ...], first_peak_bytes: int, *,
+                      share_percent: int | progress.ConfiguredPeakShare) -> ExpectedPeak:
+    """Use measured peaks for the same repository and nextest step."""
+    if isinstance(repository, UnknownRepository):
+        return ExpectedPeak(first_peak_bytes, "fallback", 0)
+    legacy_steps = filtered_steps("nextest") if step == NEXTEST_BUILD_STEP and scope == "filtered" and package else ("nextest",)
+    history = read_estimate_history(root, host, (step, *legacy_steps), now)
+    if step == NEXTEST_BUILD_STEP:
+        peaks = [value for row in repository_history(history.rows[step], repository)
+                 if row.get("package", "") == package and row.get("test_scope", "full") == scope
+                 and type(value := row.get("build_phase_peak_bytes")) is int and value > 0]
+        if peaks:
+            return ExpectedPeak(percentile(peaks, share_percent=share_percent), "measured", len(peaks))
+        if scope == "filtered" and package:
+            return filtered_history_peak(repository, "nextest", host, now, root, None,
+                                         filter_set(filters), package, history, share_percent=share_percent)
+        return full_history_peak(repository, "nextest", host, now, root, None, scope, package,
+                                 first_peak_bytes, history, share_percent=share_percent)
+
+    peaks: list[int] = []
+    exceeded: list[int] = []
+    for row in repository_history([*history.rows[step], *history.rows["nextest"]], repository):
+        peak = row.get("test_phase_peak_bytes")
+        if type(peak) is not int or peak <= 0:
+            continue
+        peaks.append(peak)
+        promise = row.get("need")
+        if row.get("step") == step and type(promise) is int and 0 < promise < peak:
+            exceeded.append(peak)
+    if not peaks:
+        return ExpectedPeak(first_peak_bytes, "fallback", 0)
+    percentile_floor = conf.read("build_admission").whole("nextest_test_peak_percentile")
+    tail = min(progress.peak_share_percent(share_percent), 100 - percentile_floor)
+    peak = percentile(peaks, share_percent=tail)
+    return ExpectedPeak(max(peak, max(exceeded, default=0)), "measured", len(peaks))
 
 
 def full_history_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
@@ -938,7 +983,8 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
                   first_peak_bytes: int,
                   share_percent: int | progress.ConfiguredPeakShare = progress.CONFIGURED_PEAK_SHARE,
                   build_history_generation: Callable[[], BuildHistoryGeneration | NoBuildHistoryGeneration] = no_build_history_generation,
-                  location: RepositoryLocation | ReadRepositoryAtUse = READ_REPOSITORY_AT_USE
+                  location: RepositoryLocation | ReadRepositoryAtUse = READ_REPOSITORY_AT_USE,
+                  nextest_step: NextestAdmissionStep = "nextest"
                   ) -> StepEstimate:
     """Resolve one estimate before admission connects."""
     estimate_time = now() if callable(now) else now
@@ -959,6 +1005,8 @@ def step_estimate(argv: list[str], cwd: str, profile: InferFromArgv | StepProfil
         repo = repository.name if isinstance(repository, RepositoryIdentity) else ""
         scope = test_scope(argv)
         step = parse.step_name(argv) if argv else "build"
+        if step == "nextest":
+            step = nextest_step
         host = store.host_name()
         worktree_path = ""
         if step == "nextest" and package and os.environ.get("BUILDLOG_TEST_BUILD_KEY"):

@@ -112,6 +112,28 @@ NO_RUN = NoRun()
 
 
 @dataclass(frozen=True)
+class NoNextestBuildGrant:
+    """The service has no build grant to convert."""
+
+
+@dataclass(frozen=True)
+class NextestBuildGrant:
+    """The build reservation that must supply memory for the test grant."""
+    reservation: str
+
+
+@dataclass(frozen=True)
+class UnsplitStep:
+    """The request follows the ordinary admission path."""
+
+
+@dataclass(frozen=True)
+class NextestTests:
+    """The nextest request runs binaries that the build already prepared."""
+    build: NextestBuildGrant | NoNextestBuildGrant = NoNextestBuildGrant()
+
+
+@dataclass(frozen=True)
 class AdmitRequest(CallerCode):
     """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
@@ -129,6 +151,7 @@ class AdmitRequest(CallerCode):
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    test_phase: NextestTests | UnsplitStep = field(default_factory=UnsplitStep, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -319,6 +342,7 @@ class Admitted:
     wave_path: str
     sampling_context: dict[str, object]
     cleanup_timing: CleanupTiming = PROTOCOL_CLEANUP_TIMING
+    supports_nextest_handoff: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -602,6 +626,8 @@ def _write_wire_record(value: object) -> object:
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]
+    if record.get("kind") == "AdmitRequest" and record.get("test_phase") == {"kind": "UnsplitStep"}:
+        del record["test_phase"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
     if record.get("kind") == "ShapeRankedPeak" and record.get("share_percent") == 10:
         record["kind"] = "ShapeP90"

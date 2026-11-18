@@ -3854,6 +3854,11 @@ release_token() {
     fi
 }
 
+buildlog_nextest_test_wait() {
+    sync_token_state
+    release_token
+}
+
 # A local attempt waits for memory without its cargo token, so the unit's other
 # calls keep building. After the grant it takes the token; the grant keeps its
 # reservation during that wait. A grant from placement already holds the token.

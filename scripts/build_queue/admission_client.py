@@ -246,7 +246,9 @@ def finish_step(path: Path, status: int, reason: str = "", *,
     if not isinstance(prerequisite, KeepPlacementPrerequisite):
         _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
-    _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
+    ended = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
+    if isinstance(ended, wire.Refused):
+        raise wire.AdmissionUnavailable(ended.reason)
     result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
         placement.ExecutionNotStarted() if reason else placement.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
         placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
@@ -1099,6 +1101,17 @@ def step_identity(step: str, worktree: str) -> wire.Identity:
                          identity["folder"], identity.get("unit", ""))
 
 
+def nextest_admission_step() -> records.NextestAdmissionStep:
+    from scripts.build_queue import admission_records as records
+
+    stage = os.environ.get("BUILDLOG_NEXTEST_ADMISSION_STEP")
+    if stage == records.NEXTEST_BUILD_STEP:
+        return records.NEXTEST_BUILD_STEP
+    if stage == records.NEXTEST_TEST_STEP:
+        return records.NEXTEST_TEST_STEP
+    return "nextest"
+
+
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
                  episode: str, profile: records.InferFromArgv | wire.Profile | InferProfileAtUse = INFER_PROFILE_AT_USE,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
@@ -1106,27 +1119,39 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
     from scripts.build_queue import step_estimator, admission_records as records
     from scripts.buildlog import store
 
+    nextest_step = nextest_admission_step()
     if isinstance(run, wire.NoRun):
         run = parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
+        if isinstance(run, wire.NoRun) and nextest_step != "nextest":
+            run = wire.RunIdentity(owner.pid, owner.start_time)
     if isinstance(profile, InferProfileAtUse):
         profile = records.INFER_FROM_ARGV
     config = records.read_memory_config()
     estimate = step_estimator.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
                                   store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
-                                  build_history_generation=lambda: build_history_generation(config))
+                                  build_history_generation=lambda: build_history_generation(config),
+                                  nextest_step=nextest_step)
     width_value = records.test_threads(argv)
     width_value = width_value or (int(os.environ["NEXTEST_TEST_THREADS"]) if os.environ.get("NEXTEST_TEST_THREADS", "").isdecimal() else None)
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
-        records.UnspecifiedTestWidth() if estimate.profile.step == "nextest" else records.NoTestWidth())
+        records.UnspecifiedTestWidth() if estimate.profile.step in ("nextest", records.NEXTEST_TEST_STEP)
+        else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = step_identity(estimate.profile.step, estimate.profile.worktree)
-    if isinstance(estimate.profile, records.ProgramProfile):
-        identity = replace(identity, folder=estimate.profile.worktree)
+    selected = estimate.profile
+    test_phase: wire.NextestTests | wire.UnsplitStep = wire.UnsplitStep()
+    if isinstance(selected, records.StepProfile) and selected.step == records.NEXTEST_TEST_STEP:
+        build = os.environ.get("BUILDLOG_NEXTEST_BUILD_GRANT", "")
+        test_phase = wire.NextestTests(wire.NextestBuildGrant(build) if build else wire.NoNextestBuildGrant())
+        # Older services identify GPU tests by the wire step name.
+        selected = replace(selected, step="nextest")
+    identity = step_identity(selected.step, selected.worktree)
+    if isinstance(selected, records.ProgramProfile):
+        identity = replace(identity, folder=selected.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
         identity,
-        records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, estimate.profile,
+        records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, selected,
         isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run,
-        route=records.direct_cargo_route())
+        route=records.direct_cargo_route(), test_phase=test_phase)
 
 
 def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, elapsed: int) -> None:
@@ -1136,6 +1161,8 @@ def write_shell_grant(path: Path, grant: wire.Admitted | wire.LaunchAdmitted, el
         values.update(BUILDLOG_MEM_RESERVATION=grant.reservation, BUILDLOG_MEM_MAX_PATH=grant.max_path,
             BUILDLOG_MEM_WAVE_PATH=grant.wave_path, BUILDLOG_MEM_SAMPLING_CONTEXT=wire.encode_record(grant.sampling_context),
             BUILDLOG_MEM_CLEANUP_TIMING=wire.encode_record(grant.cleanup_timing))
+        if grant.supports_nextest_handoff:
+            values["BUILDLOG_MEM_NEXTEST_HANDOFF"] = "1"
     _ = path.write_text("".join(f"{key}={shlex.quote(value)}\n" for key, value in values.items()))
 
 
@@ -1317,7 +1344,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         routing = (target_config.LocalRequired(args.local_reason) if args.local_reason else
                    target_config.LOCAL_CALLER if args.local_only else target_config.ANY_ELIGIBLE_TARGET)
         kind = args.kind or local.profile.step
-        if kind == "nextest":
+        if kind in ("nextest", records.NEXTEST_BUILD_STEP, records.NEXTEST_TEST_STEP):
             kind = "test"
         elif kind in ("clippy", "mend-check"):
             kind = "lint"

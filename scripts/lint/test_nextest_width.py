@@ -137,6 +137,31 @@ run() {{
 
         self.assert_success(result, "2\n2\n")
 
+    def test_test_memory_wait_keeps_or_releases_the_build_grant_by_service_capability(self) -> None:
+        script = shell_lines(
+            'export BUILDLOG_NEXTEST_ADMISSION_STEP=nextest-build',
+            'buildlog_release_memory() { echo "released $BUILDLOG_MEM_RESERVATION"; }',
+            'run_attempts() {',
+            '    case "$BUILDLOG_NEXTEST_ADMISSION_STEP" in',
+            '        nextest-build)',
+            '            printf "%s\\n" binaries > "$LINT_NEXTEST_BINARIES"',
+            '            BUILDLOG_MEM_RESERVATION=build-grant buildlog_finish_memory 0 "" ;;',
+            '        nextest-test)',
+            '            cat "$LINT_NEXTEST_BINARIES"',
+            '            echo "test grant requested with ${BUILDLOG_NEXTEST_BUILD_GRANT:-no build grant}"',
+            '            BUILDLOG_NEXTEST_BUILD_GRANT="" ;;',
+            '    esac',
+            '}',
+            'buildlog_nextest_test_wait() { echo "CPU token returned"; }',
+            'run_once cargo nextest run --workspace',
+        )
+        environment = {"TMPDIR": str(self.root), "ADMISSION_SOCKET": str(self.root / "private.sock")}
+        for capability, released, grant in (("1", "", "build-grant"), ("0", "released build-grant\n", "no build grant")):
+            with self.subTest(capability=capability):
+                result = self.run_shell(script, extra={**environment, "BUILDLOG_MEM_NEXTEST_HANDOFF": capability})
+                self.assert_success(result, f"{released}CPU token returned\nbinaries\ntest grant requested with {grant}\n")
+        self.assertEqual(list(self.root.glob("nextest-binaries.*")), [])
+
     def test_logical_cores_are_read_once_and_cached(self) -> None:
         result = self.run_shell(
             shell_lines(

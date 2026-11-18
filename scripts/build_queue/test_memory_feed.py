@@ -1558,6 +1558,19 @@ process.stdout.write(JSON.stringify({
                 self.assertTrue(page["walk"])
                 self.assertGreater(page["room"], 0)
 
+    def test_nextest_test_caption_identifies_the_resource_that_blocks_it(self) -> None:
+        for reason, caption in (
+                (admission_records.NeedsMemory(), "Built. Waits for memory to run tests."),
+                (admission_records.GpuSlotWait(2, 2), "Built. Waits for a GPU slot to run tests.")):
+            with self.subTest(reason=reason):
+                reading = with_wait_reason(reservation_reading(), reason)
+                reading = replace(reading, view=replace(reading.view,
+                    waiting=(replace(reading.view.waiting[0], step=admission_records.NEXTEST_TEST_STEP),)))
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    row = memory_feed.reading()["waiters"][0]
+                assert "test_grant_wait" in row
+                self.assertEqual(row["test_grant_wait"], caption)
+
     def test_a_schema_install_during_import_restarts_a_fresh_interpreter(self) -> None:
         cases = (("scripts.build_queue", "snapshot_codec", "codec"), ("scripts.buildlog", "charts", "charts"))
         for package, module, alias in cases:
@@ -2646,7 +2659,10 @@ def write_browser_fixture(folder: Path) -> None:
             members=(ScopeProcess(45, "python3"), ScopeProcess(46, "helper"))),
             leftover_step(19 * 60, small=True), leftover_step(2 * 24 * 60, small=True), live, compiler))
         base = gate.queue_read_from(inputs, admission_policy_fixture())
-        readings: dict[str, admission_records.QueueRead] = {"good": base}
+        test_wait = with_wait_reason(base, admission_records.GpuSlotWait(2, 2))
+        test_wait = replace(test_wait, view=replace(test_wait.view,
+            waiting=(replace(test_wait.view.waiting[0], step=admission_records.NEXTEST_TEST_STEP),)))
+        readings: dict[str, admission_records.QueueRead] = {"good": base, "test_grant_wait": test_wait}
         for name, available, swapped in (("head_memory", 8, 0), ("head_shortfall", 2, 0), ("head_swap_shortfall", 4, 6)):
             held = gate.queue_read_from(replace(inputs, pressure=admission_records.NoPressureHold(),
                 host=admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB,

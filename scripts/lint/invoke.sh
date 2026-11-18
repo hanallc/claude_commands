@@ -177,6 +177,10 @@ buildlog_exec() {
     if [[ -e "$BUILDLOG_PEAK" ]]; then
         return $status
     fi
+    if [[ -n "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" ]]; then
+        build_check_stop 2 'cannot start the nextest memory scope'
+        return 2
+    fi
     "$@"
 }
 
@@ -215,7 +219,8 @@ buildlog_sample_anon() {
     local phase_file=${4:-} sampling_context=${5:-} phase_context="" phase_started=null phase_peak=null
     local phase_temporary="$phase_file.tmp.${BASHPID:-$$}" membership pid executable
     local executables=()
-    if [[ -n "$phase_file" && -n "$sampling_context" ]]; then
+    # A split run has one scope and one maximum for each grant.
+    if [[ -n "$phase_file" && -n "$sampling_context" && -z "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" ]]; then
         phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$sampling_context" "${@:6}") || phase_context=""
         if [[ "$phase_context" == \{*\} ]]; then
             if printf '{"test_phase_peak_bytes":null,"test_phase_started_at":null,%s\n' "${phase_context#\{}" > "$phase_temporary"; then
@@ -323,10 +328,18 @@ buildlog_finish_memory() {
         kill "$sampler_pid" 2>/dev/null || true
         wait "$sampler_pid" 2>/dev/null || true
     fi
-    buildlog_release_memory "$status"
+    local release_status=0
+    if [[ "$status" == 0 && "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" == nextest-build
+          && "${BUILDLOG_MEM_NEXTEST_HANDOFF:-0}" == 1 ]]; then
+        BUILDLOG_NEXTEST_BUILD_GRANT=$BUILDLOG_MEM_RESERVATION
+        BUILDLOG_MEM_RESERVATION=""
+    else
+        buildlog_release_memory "$status" || release_status=$?
+    fi
     if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
         rm -f "$BUILDLOG_PEAK.cgroup" || true
     fi
+    return "$release_status"
 }
 
 # run() returns this when LINT_QUEUE_LEAVE_HOOK (memory_gate.sh) ended the
@@ -404,6 +417,9 @@ run_step_attempt() {
                 build_check_stop 2 'memory admission check did not allow the step'
                 return 2
             fi
+            if [[ "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" == nextest-test && -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+                BUILDLOG_NEXTEST_BUILD_GRANT=""
+            fi
             if build_hold_check_local; then
                 break
             else
@@ -430,17 +446,28 @@ run_step_attempt() {
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
     fi
-    local holder=() LINT_NEXTEST_WIDTH_FILE=""
-    if [[ -n "${LINT_NEXTEST_POOL:-}" && "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run
-          && "${4:-}" == --test-threads ]]; then
-        LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.$$.$RANDOM.width"
-        holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT" --pool "$LINT_NEXTEST_POOL"
-                --width-file "$LINT_NEXTEST_WIDTH_FILE" --reservation "${BUILDLOG_MEM_RESERVATION:-}" --)
-    elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
-        nextest_thread_report "$@"
+    local holder=() nextest_options=() LINT_NEXTEST_WIDTH_FILE="" LINT_PREBUILD_PREFIX=()
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
+        case "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" in
+            nextest-build) nextest_options+=(--prepare-binaries "$LINT_NEXTEST_BINARIES") ;;
+            nextest-test) nextest_options+=(--reuse-binaries "$LINT_NEXTEST_BINARIES") ;;
+        esac
+        if [[ "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" != nextest-test ]]; then
+            lint_prebuild_prefix
+        fi
+        if [[ "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" != nextest-build ]]; then
+            if [[ -n "${LINT_NEXTEST_POOL:-}" && "${4:-}" == --test-threads ]]; then
+                LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.$$.$RANDOM.width"
+                nextest_options+=(--pool "$LINT_NEXTEST_POOL" --width-file "$LINT_NEXTEST_WIDTH_FILE"
+                                  --reservation "${BUILDLOG_MEM_RESERVATION:-}")
+            else
+                nextest_thread_report "$@"
+            fi
+        fi
+        if (( ${#nextest_options[@]} )); then
+            holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT" "${nextest_options[@]}" --)
+        fi
     fi
-    local LINT_PREBUILD_PREFIX=()
-    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
@@ -480,7 +507,10 @@ run_step_attempt() {
         nextest_token_width "$LINT_NEXTEST_WIDTH_FILE"
         [[ -z "$LINT_NEXTEST_TOKEN_WIDTH" ]] || set -- "${@:1:4}" "$LINT_NEXTEST_TOKEN_WIDTH" "${@:6}"
     fi
-    buildlog_finish_memory "$status" "$sampler_pid"
+    buildlog_finish_memory "$status" "$sampler_pid" || {
+        local release_status=$?
+        if (( status == 0 )); then status=$release_status; fi
+    }
     if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
         rm -f -- "$BUILDLOG_PEAK.progress.log"
     fi
@@ -520,7 +550,7 @@ EOF
     return $status
 }
 
-run_once() {
+run_attempts() {
     local BUILDLOG_RETRY_STEP=0 status=0
     while :; do
         run_step_attempt "$@" || status=$?
@@ -529,6 +559,38 @@ run_once() {
         fi
         BUILDLOG_RETRY_STEP=0
     done
+}
+
+buildlog_nextest_test_wait() { :; }
+
+run_once() {
+    if [[ "${BUILDLOG_NEXTEST_ADMISSION_STEP:-}" != nextest-build ]]; then
+        run_attempts "$@"
+        return $?
+    fi
+    local -x BUILDLOG_NEXTEST_ADMISSION_STEP=nextest-build
+    local -x BUILDLOG_NEXTEST_BUILD_GRANT=""
+    local LINT_NEXTEST_BINARIES status=0
+    LINT_NEXTEST_BINARIES=$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/nextest-binaries.XXXXXX") || return $?
+    LINT_SKIP_SWEEP=1 run_attempts "$@" || status=$?
+    if (( status == 0 )); then
+        BUILDLOG_NEXTEST_ADMISSION_STEP=nextest-test
+        local BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_PLACEMENT_EPISODE=""
+        local -x LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
+        if buildlog_nextest_test_wait; then
+            run_attempts "$@" || status=$?
+        else
+            status=$?
+        fi
+    fi
+    if [[ -n "$BUILDLOG_NEXTEST_BUILD_GRANT" ]]; then
+        BUILDLOG_MEM_RESERVATION=$BUILDLOG_NEXTEST_BUILD_GRANT buildlog_release_memory 0 || {
+            local release_status=$?
+            if (( status == 0 )); then status=$release_status; fi
+        }
+    fi
+    rm -f -- "$LINT_NEXTEST_BINARIES"
+    return "$status"
 }
 
 run() {
@@ -722,6 +784,26 @@ lint_dev_shell_path() {
     [[ -z "$folders" ]] || PATH="$PATH:$folders"
 }
 
+run_nextest_step() {
+    local -x BUILDLOG_NEXTEST_ADMISSION_STEP=""
+    if [[ "$OSTYPE" == linux* && "${BUILDLOG_SCOPE:-1}" != 0 && "${BUILDLOG_OFF:-0}" != 1
+          && -S "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" ]] &&
+        command -v systemd-run >/dev/null 2>&1 && ! buildlog_target_admitted; then
+        BUILDLOG_NEXTEST_ADMISSION_STEP=nextest-build
+        local argument
+        for argument in "$@"; do
+            case "$argument" in
+                --) break ;;
+                --no-run|--binaries-metadata|--binaries-metadata=*|--archive-file|--archive-file=*|\
+                --rerun|--rerun=*|-R*|--unit-graph|--cargo-message-format|--cargo-message-format=*)
+                    BUILDLOG_NEXTEST_ADMISSION_STEP=""
+                    break ;;
+            esac
+        done
+    fi
+    run cargo nextest run "$@"
+}
+
 run_nextest() {
     if [[ "${LINT_QUEUE_PLACEMENT:-0}" != 1 ]]; then
         require_nextest
@@ -736,7 +818,7 @@ run_nextest() {
                     break
                     ;;
                 --test-threads|--test-threads=*|--jobs|--jobs=*|-j|-j*)
-                    run cargo nextest run "$@"
+                    run_nextest_step "$@"
                     return
                     ;;
             esac
@@ -763,11 +845,11 @@ run_nextest() {
         esac
         if [[ -n "$width" ]]; then
             [[ "$LINT_TEST_WIDTH" == trial ]] || nextest_token_pool
-            run cargo nextest run --test-threads "$width" "$@"
+            run_nextest_step --test-threads "$width" "$@"
             return
         fi
     fi
-    run cargo nextest run "$@"
+    run_nextest_step "$@"
 }
 
 # The rustfmt configuration in these workspaces uses nightly-only options.

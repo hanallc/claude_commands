@@ -19,6 +19,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.lint import memory_admit as gate
 
 
 DENIED_HOME_CLIENT = """
@@ -356,7 +357,7 @@ class RunnerHomeTests(unittest.TestCase):
             write_memory_config(fixture.root / "build_admission.conf", **{"program_first_peak_gib.cargo": "4"})
             _ = fixture.occupy_host()
             fixture.free(0)
-            request = fixture.service_request()
+            request = fixture.service_request(owner=fixture.proc.spawn(used=0))
             environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                            "HOME": str(fixture.root / "runner-home"), "PYTHONDONTWRITEBYTECODE": "1"}
             with fixture.serving():
@@ -383,15 +384,19 @@ class RunnerHomeTests(unittest.TestCase):
             self.assertEqual(child.returncode, 0, errors)
             replies = [wire.parse_reply(line) for line in output.splitlines() if line != "WAIT"]
             grant, released = replies
-            self.assertIsInstance(grant, wire.Admitted)
-            if isinstance(grant, wire.Admitted):
-                self.assertEqual(grant.need, 4 * GIB)
+            grant = only_admitted([grant])
+            self.assertEqual(grant.need, 4 * GIB)
             self.assertEqual(released, wire.Ok())
             self.assertIn("waiting for memory", errors)
             self.assertIn("starting", errors)
             self.assertNotIn(request.episode, fixture.server.reservations)
-            failed, = fixture.history()
-            self.assertEqual(failed["status"], 137)
+            with (fixture.state_dir / "queue_times.jsonl").open("rb") as stream:
+                events = [row for row in gate.queue_times_backward(stream)
+                          if row.get("kind") == "ended" and row.get("reservation_id") == grant.reservation]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["outcome"], "killed")
+            self.assertEqual(events[0]["peak"], {"kind": "NoPositiveSample"})
+            self.assertFalse(any(row.get("reservation_id") == grant.reservation for row in fixture.history()))
 
 
 class CiJobOrderTests(unittest.TestCase):

@@ -815,6 +815,7 @@ function stepTooltip(key, data) {
   rows.push(...ownerFields(row));
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
+    if (row.test_grant_wait) rows.push(field('', row.test_grant_wait, 'caption'));
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
@@ -1353,8 +1354,9 @@ function renderWalk(d) {
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${rowLabel(w.name, rowOwner(w, true))}` +
+    const name = w.test_grant_wait ? `${w.name} · ${w.test_grant_wait}` : w.name;
+    cells(place, name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${rowLabel(w.name, w.test_grant_wait || rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${w.key}`) : rowMemory(`wait:${w.key}`)) +
       `</div>`);
   });

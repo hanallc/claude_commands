@@ -57,7 +57,7 @@ sweep_after_step() { :; }
                 with self.subTest(status=status):
                     script = self.command_stubs() + "\n".join(self.function_body(name) for name in (
                         "buildlog_retry_unstarted_step", "without_progress_frames", "buildlog_exec_with_progress",
-                        "run_step_attempt", "run_once"))
+                        "run_step_attempt", "run_attempts", "run_once"))
                     script += f'\nexport PATH="$PWD/bin:$PATH"\nif run_once bash -c "exit {status}"; then result=0; else result=$?; fi\nexit "$result"\n'
                     result = self.shell(script, root)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)

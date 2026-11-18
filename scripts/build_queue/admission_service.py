@@ -391,6 +391,21 @@ class PendingLeft:
 
 
 @dataclass(frozen=True)
+class NextestTestHold:
+    """Record the handoff and any remaining build memory."""
+    owner: wire.Owner
+    run: wire.RunIdentity
+    test_episode: str
+    bytes: int
+    order_since: float
+
+    def slot(self, reservation: str) -> records.ContinuationSlot:
+        return records.ContinuationSlot(
+            records.BetweenStepsSlot(_live_run(self.run), reservation, self.bytes, 0),
+            records.run_owner(self.owner.pid, self.owner.start_time))
+
+
+@dataclass(frozen=True)
 class ServiceState:
     reservations: dict[str, ReservationRecord]
     places: dict[str, WaiterPlace]
@@ -405,6 +420,7 @@ class ServiceState:
     placement_requests: dict[str, wire.PlacementRequest] = field(default_factory=dict)
     assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
     current_assignments: dict[str, str] = field(default_factory=dict)
+    nextest_test_holds: dict[str, NextestTestHold] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1229,6 +1245,7 @@ class AdmissionServer:
         self.last_usable_configuration: records.MemoryConfig | NoPass = NoPass()
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, records.RunSlot] = {}
+        self.nextest_test_holds: dict[str, NextestTestHold] = {}
         self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
         self.progress_captures: progress.CaptureReader = progress.CaptureReader(capture_root)
         try:
@@ -1316,6 +1333,9 @@ class AdmissionServer:
             self.placement_requests = state.placement_requests
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
+            # Connections do not survive a restart. Keep the age for a retry.
+            self.nextest_test_holds = {key: replace(hold, bytes=0)
+                for key, hold in state.nextest_test_holds.items() if self._live(hold.owner)}
             self._persisted = wire.encode_record(state)
         self.persist()
         for episode, record in list(self.reservations.items()):
@@ -1346,11 +1366,24 @@ class AdmissionServer:
     def _live_reservation_ids(self) -> set[str]:
         return {record.reservation_id for record in self.reservations.values()}
 
+    def _memory_slots(self, test_holds: Mapping[str, NextestTestHold]) -> tuple[records.RunSlot, ...]:
+        return (*self.slots.values(), *(hold.slot(key) for key, hold in test_holds.items() if hold.bytes))
+
+    def _head_nextest_holds(self, inputs: records.QueueInputs) -> dict[str, NextestTestHold]:
+        if not any(hold.bytes for hold in self.nextest_test_holds.values()):
+            return self.nextest_test_holds
+        # A test hold cannot change the queue order that allows it to keep memory.
+        ordered = gate.ranked_queue_waiters(replace(inputs, slots=tuple(self.slots.values())))
+        head = gate.first_queued_waiter(row for _, row in ordered)
+        owner = records.waiter_owner(head.waiter) if isinstance(head, gate.QueuedWaiter) else ""
+        return {key: replace(hold, bytes=0) if hold.bytes and owner != records.run_owner(
+            hold.owner.pid, hold.owner.start_time) else hold for key, hold in self.nextest_test_holds.items()}
+
     def _inputs_with_current_slots(self, inputs: records.QueueInputs) -> records.QueueInputs:
         self._prune_runs()
         self._claim_slots()
         remaining = gate.inputs_after_reservations_end(inputs, self._live_reservation_ids())
-        return replace(remaining, slots=tuple(self.slots.values()))
+        return replace(remaining, slots=self._memory_slots(self.nextest_test_holds))
 
     def persist(self) -> None:
         now = self.clock.now()
@@ -1374,7 +1407,7 @@ class AdmissionServer:
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
-            self.placement_requests, self.assignments, self.current_assignments)
+            self.placement_requests, self.assignments, self.current_assignments, self.nextest_test_holds)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -1465,6 +1498,7 @@ class AdmissionServer:
 
     def _prune_watches(self) -> None:
         owners = {record.owner for record in self.reservations.values()}
+        owners.update(hold.owner for hold in self.nextest_test_holds.values())
         owners.update(waiting.request.owner for waiting in self.waiters.values())
         owners.update(place.owner for place in self.places.values())
         owners.update(wire.Owner(place.run.pid, place.run.start_time) for place in self.run_places.values())
@@ -1529,6 +1563,11 @@ class AdmissionServer:
 
     def _prune_runs(self) -> None:
         now = self.clock.now()
+        for key, hold in list(self.nextest_test_holds.items()):
+            if self._live(hold.owner):
+                self._watch_owner(hold.owner)
+            else:
+                del self.nextest_test_holds[key]
         for key, slot in list(self.slots.items()):
             if (not self._run_alive(gate.between_steps(slot).run)
                     or not gate.slot_in_force(slot, now)):
@@ -1550,6 +1589,7 @@ class AdmissionServer:
 
     def _claim_slots(self) -> None:
         claimed = {slot.owner for slot in self.slots.values() if isinstance(slot, records.ContinuationSlot)}
+        claimed.update(records.run_owner(hold.owner.pid, hold.owner.start_time) for hold in self.nextest_test_holds.values())
         for waiting in sorted(self.waiters.values(), key=lambda item: gate.waiter_order(item.row)):
             request = waiting.request
             placement_request = self.placement_requests.get(request.episode)
@@ -1963,9 +2003,7 @@ class AdmissionServer:
 
         # One pass reads the target list once; each placement check in the pass uses that read.
         with target_config.command_configuration():
-            result = self._pass(configuration)
-        self._answer_parked_placements()
-        return result
+            return self._pass(configuration)
 
     def _answer_parked_placements(self) -> None:
         parked, self.parked_placements = self.parked_placements, []
@@ -1973,6 +2011,7 @@ class AdmissionServer:
             if not item.connection.finished and item.connection.socket.fileno() >= 0:
                 self._send(item.connection, self._placement_reply(item.request,
                     self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
+                self._connection_event(item.connection, select.EPOLLOUT)
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
@@ -2002,6 +2041,7 @@ class AdmissionServer:
                 if isinstance(waiting.connection, Connection):
                     if self._detach_admission(waiting.connection):
                         self._prune_watches()
+            self._answer_parked_placements()
             return self.configuration
         config = self.configuration.config
         self.last_usable_configuration = config
@@ -2019,6 +2059,8 @@ class AdmissionServer:
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
         inputs = self._placement_pass(inputs, policy)
+        self.nextest_test_holds = self._head_nextest_holds(inputs)
+        inputs = replace(inputs, slots=self._memory_slots(self.nextest_test_holds))
         result = gate.admission_pass(inputs, inputs.now, policy)
         self._check_reading_alert(inputs, result, config)
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
@@ -2028,6 +2070,10 @@ class AdmissionServer:
         head_label = (wait_line_name(self.waiters[by_owner[records.waiter_owner(head.waiter)]])
                       if isinstance(head, gate.QueuedHead) else "")
         head_need = head.waiter["need"] if isinstance(head, gate.QueuedHead) else 0
+        room = result.policy.room
+        unused = ({item.memory.owner: (item.bytes if isinstance(item.memory.use, records.AnonymousRunUse) else None)
+                   for item in room.runs if item.memory.need or item.memory.held}
+                  if isinstance(room, records.MemoryRoom) else None)
         starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                         key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
         for decision in starts:
@@ -2081,11 +2127,26 @@ class AdmissionServer:
             # An old snapshot expires without changing the admission result.
             pass
         self._publish_replies()
+        self._answer_parked_placements()
+        self._append_pass_log({"kind": "admission_pass", "at": inputs.now, "head": head_label, "head_need_bytes": head_need,
+                               "unused_promise_bytes_by_holder": unused})
         if self.reader_requested:
             self.start_reader()
         if not isinstance(self.system_reader, NoSystemReader):
             self.system_reader.update(self._reading_plan(config))
         return result
+
+    def _append_pass_log(self, row: dict[str, object]) -> None:
+        """Append the diagnostic after sending the grant replies."""
+        data = (wire.encode_record(row) + "\n").encode()
+        try:
+            descriptor = os.open(self.state_dir / "admission_passes.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                _ = os.write(descriptor, data)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            pass
 
     def _cloud_waiters(self) -> list[WaitingAdmission]:
         return sorted((waiting for waiting in self.waiters.values()
@@ -2375,12 +2436,15 @@ class AdmissionServer:
                     and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
                 max(0.0, now - waiting.row["since"])))
             self.reservations[request.episode] = record
+            if isinstance(request.test_phase, wire.NextestTests) and isinstance(request.test_phase.build, wire.NextestBuildGrant):
+                del self.nextest_test_holds[request.test_phase.build.reservation]
             for key, slot in list(self.slots.items()):
                 if isinstance(slot, records.ContinuationSlot) and slot.owner == records.waiter_owner(waiting.row):
                     del self.slots[key]
             reply = wire.Admitted(stem.name, record.need, profile.peak.source, str(stem.with_suffix(".max")),
                                   str(stem.with_suffix(".wave")), {} if cloud else gate.sampling_context(reservation_row(record)),
-                                  wire.CleanupTiming(config.silence_seconds, config.reconnect_seconds))
+                                  wire.CleanupTiming(config.silence_seconds, config.reconnect_seconds),
+                                  supports_nextest_handoff=not cloud and profile.step == records.NEXTEST_BUILD_STEP)
             self.ledger[request.episode] = ReplayEntry(reply, LiveGrant())
             self._watch_owner(request.owner)
         self._save_place(waiting)
@@ -2388,6 +2452,8 @@ class AdmissionServer:
         self.persist()
         del self.waiters[request.episode]
         self._deliver(waiting, reply)
+        if isinstance(waiting.connection, Connection):
+            self._connection_event(waiting.connection, select.EPOLLOUT)
 
     def _end(self, episode: str, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting) -> None:
         record = self.reservations[episode]
@@ -2418,6 +2484,7 @@ class AdmissionServer:
             end_kind=end_kind)
         if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
+                and record.reservation_id not in self.nextest_test_holds
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
             slot = gate.ended_step_slot(row, ended_at, self.last_usable_configuration.policy)
             if isinstance(slot, records.BetweenStepsSlot):
@@ -3168,7 +3235,9 @@ done
                 if "token_back_at" in row:
                     del row["token_back_at"]
             preview_ordered.append((path, row))
-        preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy)
+        preview_inputs = replace(inputs, ordered=preview_ordered)
+        preview_holds = self._head_nextest_holds(preview_inputs)
+        preview = gate.admission_pass(replace(preview_inputs, slots=self._memory_slots(preview_holds)), inputs.now, policy)
         local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
         ordered, _priority = self._queue_order()
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
@@ -3244,7 +3313,7 @@ done
         self.placement_holds = holds
         self.placement_hold_answers = answers
         return replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
-            if records.waiter_owner(row) not in removed], slots=tuple(self.slots.values()))
+            if records.waiter_owner(row) not in removed])
 
     def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
                         answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
@@ -3699,14 +3768,27 @@ done
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
             if not self._live(request.owner):
                 return self._mutation_reply(key, wire.Refused("owner no longer exists"))
-            if any(record.owner == request.owner for record in self.reservations.values()):
-                return self._mutation_reply(key, wire.Refused("owner already has a reservation"))
             if any(waiting.request.owner == request.owner and episode != key
                    for episode, waiting in self.waiters.items()):
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
+            if isinstance(request, wire.AdmitRequest) and isinstance(request.test_phase, wire.NextestTests):
+                if isinstance(configuration, gate.UnusableAdmissionConfiguration):
+                    return self._mutation_reply(key, wire.Refused(configuration.reason))
+                tests = self._prepare_nextest_tests(request, request.test_phase)
+                if isinstance(tests, wire.Refused):
+                    return self._mutation_reply(key, tests)
+                request = tests
+            elif any(hold.owner == request.owner for hold in self.nextest_test_holds.values()):
+                return self._mutation_reply(key, wire.Refused("owner already has a nextest test hold"))
+            if any(record.owner == request.owner for record in self.reservations.values()):
+                return self._mutation_reply(key, wire.Refused("owner already has a reservation"))
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))
+            if isinstance(request, wire.AdmitRequest) and isinstance(request.test_phase, wire.NextestTests):
+                build_grant = request.test_phase.build
+                if isinstance(build_grant, wire.NextestBuildGrant):
+                    row["order_since"] = self.nextest_test_holds[build_grant.reservation].order_since
             place = waiter_place(row, key)
             self._run_place(request, place)
             self.waiters[key] = WaitingAdmission(request, row, connection)
@@ -3721,6 +3803,13 @@ done
             episode = next((episode for episode, record in self.reservations.items() if record.reservation_id == request.reservation), None)
             if episode is not None:
                 self._end(episode, ReleaseStatus(key, request.status))
+            if (hold := self.nextest_test_holds.pop(request.reservation, None)) is not None:
+                waiting = self.waiters.pop(hold.test_episode, None)
+                if waiting is not None:
+                    self._record_left(hold.test_episode, gate.queue_life_identity(waiting.row), "cancelled")
+                    _ = self.places.pop(_place_key(hold.owner, waiting.row["since"]), None)
+                    self._deliver(waiting, wire.Refused("nextest test grant was cancelled"))
+                self._prune_watches()
             self.ledger[key] = ReplayEntry(wire.Ok(), self.clock.now())
         elif isinstance(request, wire.WidthRequest):
             if request.width <= 0:
@@ -3759,6 +3848,38 @@ done
             replies = self._pending_replies.pop(key, [])
             return replies if ran else []
         return [self.ledger[key].reply]
+
+    def _prepare_nextest_tests(self, request: wire.AdmitRequest, phase: wire.NextestTests
+                               ) -> wire.AdmitRequest | wire.Refused:
+        """Convert a completed build before the next queue pass can grant memory."""
+        profile = request.profile
+        if (not isinstance(request.place, wire.LocalPlace) or not isinstance(profile, records.StepProfile)
+                or profile.step != "nextest" or request.identity.step != "nextest" or profile.peak.bytes <= 0):
+            return wire.Refused("invalid nextest test phase")
+        tests = replace(request, profile=replace(profile, step=records.NEXTEST_TEST_STEP),
+                        identity=replace(request.identity, step=records.NEXTEST_TEST_STEP))
+        build = phase.build
+        if not isinstance(build, wire.NextestBuildGrant):
+            if any(hold.owner == request.owner for hold in self.nextest_test_holds.values()):
+                return wire.Refused("nextest test request omitted its build grant")
+            return tests
+        hold = self.nextest_test_holds.get(build.reservation)
+        if hold is not None:
+            if (request.owner, request.run, request.episode) != (hold.owner, hold.run, hold.test_episode):
+                return wire.Refused("nextest test request does not match its retained grant")
+            if profile.peak.bytes < hold.bytes:
+                self.nextest_test_holds[build.reservation] = replace(hold, bytes=profile.peak.bytes)
+            return tests
+        record = next((record for record in self.reservations.values() if record.reservation_id == build.reservation), None)
+        if (record is None or record.step != records.NEXTEST_BUILD_STEP or record.owner != request.owner
+                or not isinstance(record.place, wire.LocalPlace) or not isinstance(record.run, wire.RunIdentity)
+                or record.run != request.run or record.worktree != profile.worktree or record.repo != profile.repo):
+            return wire.Refused("nextest build grant does not match the test request")
+        self.nextest_test_holds[build.reservation] = NextestTestHold(request.owner, record.run, request.episode,
+            min(record.need, profile.peak.bytes), record.queue_waiter.get("order_since", record.queue_waiter["since"]))
+        # The first build finalization write saves the retained charge with the ending build.
+        self._end(record.episode, ReleaseStatus(request.episode + ":build", 0))
+        return tests
 
     def _submit_queue_change(self, request: QueueChange,
                              connection: Connection | NoConnection) -> list[wire.Reply]:
@@ -3953,6 +4074,9 @@ done
                 self._record_left(episode, gate.queue_life_identity(waiting.row), "cancelled")
                 _ = self.places.pop(_place_key(waiting.request.owner, waiting.row["since"]), None)
                 self._free_claim(records.waiter_owner(waiting.row))
+                for key, hold in self.nextest_test_holds.items():
+                    if hold.test_episode == episode and hold.bytes:
+                        self.nextest_test_holds[key] = replace(hold, bytes=0)
                 del self.waiters[episode]
                 changed = True
         if changed:

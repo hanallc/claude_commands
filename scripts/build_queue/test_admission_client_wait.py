@@ -29,6 +29,18 @@ class CheckerCall(TypedDict):
     rows: dict[str, admission_records.Waiter]
 
 
+class NextestRunIdentityTests(unittest.TestCase):
+    def test_split_nextest_requests_use_the_owner_when_buildlog_run_is_absent(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.proc.spawn()
+            for step in (admission_records.NEXTEST_BUILD_STEP, admission_records.NEXTEST_TEST_STEP):
+                with self.subTest(step=step), mock.patch.dict(os.environ, {
+                        "BUILDLOG_RUN": "", "BUILDLOG_NEXTEST_ADMISSION_STEP": step}):
+                    request = client.step_request(["cargo", "nextest", "run"], str(fixture.root),
+                                                  owner, fixture.clock.now(), "", "nextest")
+                    self.assertEqual(request.run, wire.RunIdentity(owner.pid, owner.start_time))
+
+
 def wait_client_main() -> int:
     """Inject estimate failures while the real client uses the private socket."""
     root = Path(os.environ["TEST_WAIT_ROOT"])
@@ -40,8 +52,9 @@ def wait_client_main() -> int:
                  now: datetime | Callable[[], datetime], root: Path, policy: admission_records.AdmissionPolicy, *,
                  first_peak_bytes: int,
                  build_history_generation: Callable[[], admission_records.BuildHistoryGeneration | admission_records.NoBuildHistoryGeneration]
-                 = step_estimator.no_build_history_generation) -> step_estimator.StepEstimate:
-        _ = argv, cwd, profile, now, root, policy, first_peak_bytes, build_history_generation
+                 = step_estimator.no_build_history_generation,
+                 nextest_step: admission_records.NextestAdmissionStep = "nextest") -> step_estimator.StepEstimate:
+        _ = argv, cwd, profile, now, root, policy, first_peak_bytes, build_history_generation, nextest_step
         previous = calls.read_text().splitlines() if calls.exists() else []
         action = actions[min(len(previous), len(actions) - 1)]
         owner = int(sys.argv[sys.argv.index("--pid") + 1])

@@ -47,6 +47,38 @@ RUN_ONLY_FLAGS = frozenset({
 })
 
 
+CARGO_BUILD_VALUE_OPTIONS = frozenset({
+    "-p", "--package", "--exclude", "--bin", "--example", "--test", "--bench", "-F", "--features",
+    "--build-jobs", "--cargo-profile", "--target", "--target-dir", "--cargo-message-format", "-Z",
+})
+CARGO_BUILD_FLAGS = frozenset({
+    "--workspace", "--all", "--lib", "--bins", "--examples", "--tests", "--benches", "--all-targets",
+    "--all-features", "--no-default-features", "-r", "--release", "--unit-graph", "--timings",
+    "--frozen", "--locked", "--offline", "--cargo-quiet", "--cargo-verbose", "--ignore-rust-version",
+    "--future-incompat-report",
+})
+
+
+def reuse_selection(arguments: Sequence[str]) -> list[str]:
+    """Keep nextest options that apply to an existing binary list."""
+    kept: list[str] = []
+    skip_value = False
+    for index, argument in enumerate(arguments):
+        if skip_value:
+            skip_value = False
+            continue
+        if argument == "--":
+            kept.extend(arguments[index:])
+            break
+        name, equal, _ = argument.partition("=")
+        if name in CARGO_BUILD_VALUE_OPTIONS:
+            skip_value = not equal
+        elif name not in CARGO_BUILD_FLAGS and not (
+                len(argument) > 2 and argument[:2] in ("-p", "-F", "-Z")):
+            kept.append(argument)
+    return kept
+
+
 def build_selection(arguments: Sequence[str]) -> list[str]:
     """Keep the options that choose what to build; drop the run-only options and their values."""
     kept: list[str] = []
@@ -139,6 +171,16 @@ class TokenPool:
             os.close(self.fd)
 
 
+def prepare_binaries(argv: Sequence[str], binaries: Path) -> int:
+    """Build once and write the binary list before the build grant ends."""
+    args = argv[3:]
+    selection = args[:args.index("--")] if "--" in args else args
+    command = [*argv[:2], "list", "--list-type", "binaries-only", "--message-format", "json",
+               *build_selection(selection)]
+    with binaries.open("w", encoding="utf-8") as output:
+        return exit_status(subprocess.run(command, stdout=output, check=False).returncode)
+
+
 def exit_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
@@ -161,11 +203,12 @@ def thread_line(threads: int, width: int) -> str:
 
 
 def run_with_tokens(run: SizedTestRun, pool_path: Path, floor: int, width_file: Path | None,
-                    record_width: Callable[[int], None]) -> int:
-    """Build, take the tokens, then run the tests at one thread for each token."""
-    status = run_child(run.build_only())
-    if status != 0:
-        return status
+                    record_width: Callable[[int], None], *, reuse_prepared_binaries: bool = False) -> int:
+    """Take tokens after the build. Run one test thread for each token."""
+    if not reuse_prepared_binaries:
+        status = run_child(run.build_only())
+        if status != 0:
+            return status
     try:
         pool = TokenPool(os.open(pool_path, os.O_RDWR | os.O_CLOEXEC))
     except OSError as error:
@@ -191,7 +234,9 @@ def run_with_tokens(run: SizedTestRun, pool_path: Path, floor: int, width_file: 
 
 
 class Arguments(argparse.Namespace):
-    pool: Path = Path()
+    pool: Path | None = None
+    prepare_binaries: Path | None = None
+    reuse_binaries: Path | None = None
     width_file: Path | None = None
     reservation: str = ""
     command: list[str] = []
@@ -199,7 +244,10 @@ class Arguments(argparse.Namespace):
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Hold one jobserver token for each nextest test thread.")
-    _ = parser.add_argument("--pool", type=Path, required=True)
+    _ = parser.add_argument("--pool", type=Path)
+    phase = parser.add_mutually_exclusive_group()
+    _ = phase.add_argument("--prepare-binaries", type=Path)
+    _ = phase.add_argument("--reuse-binaries", type=Path)
     _ = parser.add_argument("--width-file", type=Path)
     _ = parser.add_argument("--reservation", default="")
     _ = parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -211,11 +259,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if reservation:
             record_reservation_width(reservation, threads)
 
+    if args.prepare_binaries is not None:
+        return prepare_binaries(command, args.prepare_binaries)
+    if args.reuse_binaries is not None:
+        selection = reuse_selection(command[3:])
+        # Keep the explicit width at the front for the token holder.
+        position = 5 if selection[:1] == ["--test-threads"] else 3
+        command = [*command[:3], *selection]
+        command[position:position] = ["--binaries-metadata", str(args.reuse_binaries)]
     run = test_run(command)
-    if isinstance(run, UnsizedCommand):
-        return run_child(run.argv)
+    if pool_path is None or isinstance(run, UnsizedCommand):
+        return run_child(command)
     floor = conf.read("build_admission").whole("test_token_floor")
-    return run_with_tokens(run, pool_path, floor, width_file, record_width)
+    return run_with_tokens(run, pool_path, floor, width_file, record_width,
+                           reuse_prepared_binaries=args.reuse_binaries is not None)
 
 
 if __name__ == "__main__":

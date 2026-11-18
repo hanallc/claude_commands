@@ -9,6 +9,7 @@
 // Add --identity as the fourth argument for the row hover identity block images.
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
+// Add --promisestep as the third argument for the dark desktop test-grant image.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
@@ -29,7 +30,8 @@ try {
     'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
+  const promiseStep = process.argv[3] === '--promisestep';
+  const beforePage = process.argv[3] && !promiseStep ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
@@ -152,7 +154,7 @@ try {
       };
       chrome.once('exit', () => rejectPending(new Error('Chrome closed during a debugger request.')));
       chrome.once('error', rejectPending);
-      try {
+      proof: try {
         const endpoint = await new Promise((resolve, reject) => {
           let output = '';
           chrome.stderr.on('data', chunk => {
@@ -221,6 +223,22 @@ try {
           fitLabels();
           })()`);
         };
+        if (promiseStep) {
+          servedReading = readings.test_grant_wait;
+          await navigate('memory_live.html');
+          const {caption, clip} = await evaluate(`(() => {
+            const row = document.querySelector('.wrow.wait');
+            row.scrollIntoView({block: 'center'});
+            const {x, y, width, height} = row.getBoundingClientRect();
+            return {caption: row.querySelector('.owner').textContent,
+                    clip: {x: x + scrollX, y: y + scrollY, width, height, scale: 1}};
+          })()`);
+          assert.match(caption, /Built\. Waits for a GPU slot to run tests\./);
+          const shot = await call('Page.captureScreenshot', {format:'png', clip});
+          await writeFile(join(folder,'test-grant-wait-dark-desktop.png'), Buffer.from(shot.data,'base64'));
+          console.log(JSON.stringify({pass:true,output:folder}));
+          break proof;
+        }
         await navigate('memory_live.html');
         // The user, 11-16: space pauses every update, a tooltip still opens, and space again resumes.
         const pressSpace = async () => {
