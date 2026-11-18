@@ -25,6 +25,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
+from scripts.lib import git_files
 from scripts.lib.boot_identity import boot_identity
 
 if TYPE_CHECKING:
@@ -34,6 +35,65 @@ if TYPE_CHECKING:
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
+BUSY = ".claude-busy"
+REMOVAL_RECORD_PREFIX = ".scratch-removing-"
+REMOVAL_RECORD_SUFFIX = ".json"
+
+
+def removal_mark(path: Path) -> Path:
+    """Locate the deletion intent beside the source."""
+    return path.parent / f"{REMOVAL_RECORD_PREFIX}{path.name}{REMOVAL_RECORD_SUFFIX}"
+
+
+def open_busy_mark(mark: Path, *, create: bool, exclusive: bool = False) -> int:
+    """Return a descriptor for a regular busy mark. The caller closes it."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if create:
+        flags |= os.O_CREAT | (os.O_EXCL if exclusive else 0)
+    descriptor = os.open(mark, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EINVAL, "busy mark must be a regular file", str(mark))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def require_no_removal_mark(path: Path) -> None:
+    """Refuse to use a source with a deletion intent on it or an ancestor."""
+    for folder in (path, *path.parents):
+        try:
+            _ = removal_mark(folder).lstat()
+        except FileNotFoundError:
+            continue
+        raise BlockingIOError(errno.EWOULDBLOCK, "source removal has already started", str(folder))
+
+
+@contextmanager
+def _linked_source_locks(source: Path) -> Generator[tuple[int, ...]]:
+    """Hold the checkout and its shared Git folder while Git creates a link."""
+    source = source.expanduser().resolve()
+    require_no_removal_mark(source)
+    try:
+        checkout = git_files.locate(source)
+    except git_files.NotACheckout:
+        yield ()
+        return
+    with ExitStack() as stack:
+        descriptors: list[int] = []
+        for folder in dict.fromkeys((checkout.common_dir, checkout.git_dir)):
+            mark = folder / BUSY
+            descriptor = open_busy_mark(mark, create=True)
+            _ = stack.callback(os.close, descriptor)
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            descriptors.append(descriptor)
+            require_no_removal_mark(folder)
+            locked, present = os.fstat(descriptor), mark.lstat()
+            if (locked.st_dev, locked.st_ino) != (present.st_dev, present.st_ino):
+                raise BlockingIOError(errno.EWOULDBLOCK, "source busy mark changed", str(mark))
+        require_no_removal_mark(source)
+        yield tuple(descriptors)
 
 
 class FolderPrefixes(Mapping[str, str]):
@@ -166,6 +226,10 @@ class SlotCheckout:
     """The checkout holds the source repository and required commit for a slot."""
     source: Path
     commit: str
+
+
+class SlotSourceBusy(BlockingIOError):
+    """The source lock prevents creation of a slot checkout."""
 
 
 @dataclass(frozen=True)
@@ -446,16 +510,26 @@ def _stable_folder(spec: BuildFolderSpec) -> bool:
 def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> Path:
     """Allocate a unique folder or retain an owner's folder."""
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
+    spec = _request_spec(original)
+    with ExitStack() as source_locks:
+        descriptors: tuple[int, ...] = ()
+        if isinstance(original, LinkedEditableRepository):
+            descriptors = source_locks.enter_context(_linked_source_locks(original.source))
+        return _create_build_folder(request, spec, descriptors)
+
+
+def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest,
+                         spec: BuildFolderSpec, source_descriptors: tuple[int, ...]) -> Path:
+    original = request.request if isinstance(request, _TemporaryFolderRequest) else request
     if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, ExistingWorktreeBranch):
         import subprocess
 
         branch = subprocess.run(["git", "-C", str(original.source), "show-ref", "--verify", "--quiet",
                                  f"refs/heads/{original.branch.name}"], capture_output=True,
-                                timeout=repository_git_timeout())
+                                 timeout=repository_git_timeout(), pass_fds=source_descriptors)
         if branch.returncode:
             raise ValueError(f"existing worktree branch {original.branch.name!r} does not exist in {original.source}")
     editable_repository = isinstance(original, (LinkedEditableRepository, RemoteEditableRepository))
-    spec = _request_spec(original)
     stable = _stable_folder(spec)
     # Only a name with a random part gets a new name on a clash; a tool name is fixed per request.
     renamed = not stable and not (spec.suffix or spec.work) and spec.kind != "tool"
@@ -508,23 +582,31 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                                 path.with_name(path.name + ".lease.json").read_text()))
                         except FileNotFoundError:
                             lease = {}
+                        if existing is None or lease.get("ready") is not True:
+                            try:
+                                source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
+                            except BlockingIOError as error:
+                                raise SlotSourceBusy(errno.EWOULDBLOCK, f"slot source is busy: {error}",
+                                                     str(spec.slot_checkout.source)) from error
                         if existing is not None and lease.get("ready") is not True:
                             if (path / ".git").exists():
-                                from scripts.lib import git_files, git_rescue
+                                from scripts.lib import git_rescue
 
                                 checkout = git_files.at(path)
                                 if checkout.common_dir != git_files.at(spec.slot_checkout.source).common_dir:
                                     raise ValueError(f"{path}: incomplete slot owns a different Git repository; retained")
                                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                                 _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"],
-                                                     pass_fds=(descriptor, *held_build_folder_descriptors()))
+                                                     pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors))
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
-                                               pass_fds=(descriptor, *held_build_folder_descriptors()), timeout=repository_git_timeout())
+                                               pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
+                                               timeout=repository_git_timeout())
                             _remove_folder(path, directory, existing)
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
-                                               pass_fds=(descriptor, *held_build_folder_descriptors()), timeout=repository_git_timeout())
+                                               pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
+                                               timeout=repository_git_timeout())
                             existing = None
                     new_folder = existing is None
                     if isinstance(spec.slot_checkout, SlotCheckout):
@@ -554,13 +636,15 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                             if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, NewWorktreeBranch):
                                 _ = subprocess.run(["git", "-C", str(original.source), "branch", "--",
                                                     original.branch.name, original.branch.start_point], check=True,
-                                                   capture_output=True, text=True, timeout=repository_git_timeout())
+                                                    capture_output=True, text=True, timeout=repository_git_timeout(),
+                                                    pass_fds=source_descriptors)
                                 start = subprocess.run(["git", "-C", str(original.source), "rev-parse", "--verify",
                                                         f"refs/heads/{original.branch.name}"], check=True,
-                                                       capture_output=True, text=True, timeout=repository_git_timeout())
+                                                       capture_output=True, text=True, timeout=repository_git_timeout(),
+                                                       pass_fds=source_descriptors)
                                 new_branch_start = start.stdout.strip()
                             _ = subprocess.run(command, check=True, capture_output=True, text=True,
-                                               timeout=repository_git_timeout())
+                                               timeout=repository_git_timeout(), pass_fds=source_descriptors)
                         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                             detail: str | bytes = (str(error) if isinstance(error, OSError)
                                                    else cast(str | bytes, error.stderr or str(error)))
@@ -574,7 +658,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                         _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
                                             str(path), spec.slot_checkout.commit], check=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                           pass_fds=(descriptor, *held_build_folder_descriptors()),
+                                            pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
                                            timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
                     os.set_inheritable(descriptor, True)
@@ -598,7 +682,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                             for cleanup_command in cleanup_commands:
                                 try:
                                     _ = subprocess.run(cleanup_command, capture_output=True,
-                                                       timeout=repository_git_timeout())
+                                                       timeout=repository_git_timeout(), pass_fds=source_descriptors)
                                 except (OSError, subprocess.TimeoutExpired):
                                     # Keep the creation error when a cleanup command fails.
                                     pass

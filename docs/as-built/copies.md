@@ -36,6 +36,7 @@ A damaged index is saved as `.rescue-index-*` with source edits in the rescue co
 Recovery rebuilds the index before reset.
 A failed rescue restores the damaged index.
 Incomplete slot recovery rescues linked worktrees before deletion.
+The allocator takes the source lock only to create or repair a slot checkout.
 Recovery retains a repository with a different object store.
 Acquisition removes a stale worktree index lock under the slot lease.
 Rust release trials retain Cargo mend output under `target/mend-target`.
@@ -51,14 +52,23 @@ When no local source remains, removal exports the rescue into a sibling bare rep
 Removal verifies the exported rescue before it deletes the workspace.
 Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
+Its Git children inherit the destination lease and busy lock.
+Removal retries take the busy lock again, even if an earlier attempt removed the mark.
+Recovery ignores the timestamps of busy marks that the current attempt creates.
+A removal retry keeps the checkout when its `.git` file, its `commondir` or an external `HEAD` is unreadable.
+A retry does not yet check the other metadata files inside the checkout's Git directory, such as an internal `HEAD` or the `index`.
+Linked checkout creation refuses a source with a removal mark.
+Recursive removal checks the busy locks and recorded borrowers of existing descendant clones.
+Busy marks and copy records must be regular files.
 Task cleanup removes the clone and clears the removal marks before it tries to remove the lease file and lock file.
 Cleanup holds the lock and checks the identities of those two files before it removes either file.
 Recovery leaves the files if the clone is already absent when recovery starts.
 
 The borrow check keeps sources with recorded borrowers or unreadable copy records.
-An unregistered folder keeps the source unless its parent is a Git checkout and the folder has no Git entries.
-The check uses `.git` on the parent and checks `.git`, `HEAD`, `objects`, and `commondir` on the folder.
-The check does not descend into an ordinary worktree subfolder or a registered copy to find nested clones.
+It checks the copy folders in the registry and the adopted copies in the holds file.
+It skips an unregistered folder if the folder's parent is directly under the copies root and contains `.git`.
+This exception applies only if the folder contains none of `.git`, `HEAD`, `objects`, or `commondir`.
+The check inspects these entries without following symbolic links.
 
 `copies.py list` reads slot leases and remote mirror rows.
 `copies.py remove` removes owned editable and remote copies; it never removes a shared slot.
