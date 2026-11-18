@@ -49,7 +49,8 @@ def safe_reason(error: Exception) -> str:
 
 
 def action_name(service: str, operation: str) -> str:
-    return ('s3' if service == 's3api' else service) + ':' + ''.join(word.capitalize() for word in operation.split('-'))
+    namespace = {'s3api': 's3', 'service-quotas': 'servicequotas'}.get(service, service)
+    return namespace + ':' + ''.join(word.capitalize() for word in operation.split('-'))
 
 
 PLAN_READS: frozenset[str] = frozenset((*plan_identity.READ_ACTIONS, *plan_identity.STACK_READS, *plan_identity.IAM_READS,

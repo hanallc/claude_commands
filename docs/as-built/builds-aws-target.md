@@ -1073,9 +1073,8 @@ It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each gate region from `regions`.
 A region in `spot_candidate_regions` only has no gate stack and gets no quota request.
-`deploy.py quota-status` reads the same gate regions.
-It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
-All three new keys are in `cloud_gate.conf`.
+The GPU quota request uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
+These settings are in `cloud_gate.conf`.
 Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.
 It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
@@ -1084,12 +1083,18 @@ A failed call prints only the AWS error code or Python error class and does not 
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
 Both quota codes use these same three IAM actions.
-`python3 scripts/aws_target/deploy.py quota-status` reads both quotas and their request history through the same administrator executor.
+`deploy.py quota-status` reads both quotas and their request history with the read-only plan identity.
+If the key is missing, the command names the plan identity setup command.
+If the key is locked, the command tells you to run `github-warmup` in a terminal on natedev.
+If AWS rejects the plan key during any call, the command stops and names `deploy.py plan-identity --check`.
 It shares the quota codes and region lists with `quota-request`.
 Each region starts one terminal block with its name as the heading.
-Each quota shows its applied vCPUs once, above an aligned request table.
-The table shows asked vCPUs, status, case ID, and update time, with the newest requests first.
-Dates use the user's zone and the last update time, with the creation time as a fallback.
+Each quota shows its applied vCPUs and the vCPUs needed from `cloud_gate.conf`.
+The newest request shows its status, requested vCPUs, and age.
+The command uses creation time to select the newest request and calculate its age.
+If a request has no creation time, the command uses its last update time.
+A request that has neither date shows `age unknown`.
+The report keeps unknown status text and counts the request as open.
 A quota with no requests prints `No requests.`
 The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
 The summary uses the trial's shared vCPU calculation over `gpu_size_trial_spot_max_usd_per_hour`.
@@ -1097,12 +1102,12 @@ It does not use the requested quota as proof of an applied quota.
 When every applied quota is too small, the summary says `no region has enough applied quota`.
 An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
 An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
-The report omits account IDs, ARNs, and request IDs.
-Regional failures print the AWS error code or Python error class and allow the remaining regions to continue.
+The report omits account IDs, case IDs, request IDs, and ARNs.
+Other regional failures print the AWS error code or Python error class and permit the remaining quota reads.
 Any regional failure makes the command exit with status 1.
 The command uses only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota`, including every history page.
 It makes no quota request, paid API call, or local state write.
-The administrator IAM action list in the runbook already includes both read actions.
+The plan identity policy grants both read actions in `ReadSetupInputs`.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.
