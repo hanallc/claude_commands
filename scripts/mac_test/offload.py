@@ -2814,8 +2814,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             hana_result.LogicalStepLink(request.call_id, assignment.episode),
             current_source_key=lambda: hana_source_key(request), environment=dict(request.environment),
             features=tuple(dict.fromkeys(features)))
-    except (OSError, ValueError, RuntimeError, ConnectionError):
-        prepared = execution.ExecutionPreparationRefused('The Hana source capture failed')
+    except (OSError, ValueError, RuntimeError, ConnectionError) as error:
+        prepared = execution.ExecutionPreparationRefused(f'The Hana source capture failed: {error}')
     if isinstance(prepared, execution.ExecutionPreparationRefused):
         closed = execution.settle_unpublished_claim(lifecycle.directory, claim.reserved.claim.reference,
             release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=prepared.reason)
