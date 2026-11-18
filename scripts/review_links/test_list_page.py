@@ -170,9 +170,7 @@ class ListPageTests(unittest.TestCase):
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const rows=[...document.querySelectorAll('[data-list-item]')];
 const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+value+'"]');
-const selectOwner=value=>{
- const menu=document.getElementById('list-owner');menu.value=value;menu.dispatchEvent(new Event('change'));
-};
+const selectOwner=value=>chip('owner',value ? 'staff:'+value : 'all').click();
 const isExpanded=(row,expanded)=>row.querySelector('[data-detail]').hidden===!expanded &&
  row.querySelector('.list-toggle').getAttribute('aria-expanded')===String(expanded);
 try{
@@ -632,10 +630,8 @@ frame.addEventListener('load',async()=>{
   const source=row(1),target=row(number),search=doc.querySelector('#list-search');
   const chip=(name,value)=>doc.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
   const selected=name=>doc.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
-  const menu=name=>doc.getElementById('list-'+name);
   const unread=doc.getElementById('list-unread');
-  const setMenu=(name,value)=>{const field=menu(name);field.value=value;field.dispatchEvent(new win.Event('change'));};
-  const filters=()=>[menu('owner').value,menu('producer').value,search.value,unread.checked];
+  const filters=()=>[selected('owner'),selected('producer'),search.value,unread.checked];
   const pendingWords=scenario==='pending-words' ? 'item' : '';
   const originalFilters=filters();
   if(pendingWords) originalFilters[2]=pendingWords;
@@ -703,8 +699,8 @@ frame.addEventListener('load',async()=>{
    }
   }
   const expected=originalFilters.slice();
-  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='';
-  if(scenario==='producer') expected[1]='';
+  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='all';
+  if(scenario==='producer') expected[1]='all';
   if(['open','unread-words'].includes(scenario) || pendingWords) expected[2]='';
   check(filters().every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters()));
   if(scenario==='repeat'){
@@ -730,7 +726,7 @@ frame.addEventListener('load',async()=>{
     check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
    }
    check(selected('show')===originalShow && !source.hidden && expanded(source),'Back restores the open source');
-   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the menus, search and switch.');
+   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the staff chips, search and switch.');
    check(!target || !expanded(target),'Back collapses the target row');
    if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
   }
@@ -745,8 +741,8 @@ frame.addEventListener('load',async()=>{
    const changes=[
     ['Show',()=>chip('show','all').click()],
     ['Unread only',()=>unread.click()],
-    ['Owner',()=>setMenu('owner','')],
-    ['Producer',()=>setMenu('producer','')],
+    ['Owner',()=>chip('owner','all').click()],
+    ['Producer',()=>chip('producer','all').click()],
     ['Search',clearSearch],
     ['sort',()=>doc.querySelector('[data-sort]').click()],
    ];
@@ -1185,20 +1181,22 @@ document.body.append(result);
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
         controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
-        self.assertEqual(controls.count('<select'), 2)
+        self.assertNotIn('<select', controls)
         self.assertEqual(controls.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
-                         ['show'])
-        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', controls),
+                         ['owner', 'producer', 'show'])
+        shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
+        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("morty-answering", "Morty answering"),
                           ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked"), ("closed", "Closed")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
-        owners = controls.split('<select id="list-owner">', 1)[1].split('</select>', 1)[0]
-        self.assertRegex(owners, f'value="{OWNER.id}"[^>]*>sdlc</option>')
-        self.assertRegex(owners, f'value="{OTHER.id}"[^>]*>builds</option>')
-        producers = controls.split('<select id="list-producer">', 1)[1].split('</select>', 1)[0]
-        self.assertEqual(re.findall(r'<option value="([^"]*)"[^>]*>([^<]+)</option>', producers),
-                         [('', 'All'), (DWIGHT.id, 'dwight'), (MORTY.id, 'morty')])
+        owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
+        producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
+        chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>(\d+)</b>'
+        self.assertEqual(re.findall(chip, owners),
+                         [('all', 'All', '6'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '5')])
+        self.assertEqual(re.findall(chip, producers),
+                         [('all', 'All', '6'), (f'staff:{DWIGHT.id}', 'dwight', '1'), (f'staff:{MORTY.id}', 'morty', '5')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 1)
         self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 5)
         self.assertIn(f'data-producer="{DWIGHT.id}"', body)
@@ -1349,9 +1347,9 @@ document.body.append(result);
         for owner in (missing, the_list.UnassignedOwner.NATE, the_list.UnassignedOwner.NOT_RECORDED):
             _ = self.add("Work for " + owner, owner=owner)
         body = list_page.render(self.root / "reviews").decode()
-        owners = body.split('<select id="list-owner">', 1)[1].split('</select>', 1)[0]
+        owners = body.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         for label in (str(missing), "nate", "Not recorded"):
-            self.assertIn('>' + label + '</option>', owners)
+            self.assertIn('>' + label + '<b>1</b></button>', owners)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
 
@@ -3093,10 +3091,10 @@ observer.observe(original.parentNode,{childList:true});
  check(changes.join()==='POST','The chip changes without a refresh.');
  check(count.textContent==='2 of 2 items shown · 0 need you · 1 unread','All counts the saved row.');
  const needsMe=document.getElementById('filter-show-needs-me');
- const option=(menu,value)=>[...document.getElementById('list-'+menu).options].find(choice=>choice.value===value);
- check(needsMe.dataset.filterCount==='0' && option('owner',row.dataset.owner).dataset.filterCount==='1',
+ const staffChip=(name,id)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
+ check(needsMe.dataset.filterCount==='0' && staffChip('owner',row.dataset.owner).dataset.filterCount==='1',
   'Needs me excludes the saved row and Owner includes it.');
- check(option('producer',row.dataset.producer).dataset.filterCount==='2','Producer counts the saved row.');
+ check(staffChip('producer',row.dataset.producer).dataset.filterCount==='2','Producer counts the saved row.');
  for(const view of ['needs-me','blocked','parked','closed','working']){
   show(view);check(row.hidden,view+' hides the saved row');
  }
@@ -3419,9 +3417,10 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence(r"""
  const search=document.getElementById('list-search');
  const target=document.querySelector('[data-number="2"]');
- const owner=document.getElementById('list-owner');
  show('working');
- owner.value=row.dataset.owner;owner.dispatchEvent(new Event('change'));
+ const staffChip=(name,id)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
+ staffChip('owner',row.dataset.owner).click();
+ staffChip('producer',row.dataset.producer).click();
  search.value='check';search.dispatchEvent(new CustomEvent('filterchange',{detail:search.value}));
  check(target.hidden,'The waiting item stays out of Working.');
  row.querySelector('a[data-record-jump]').click();
@@ -3430,6 +3429,10 @@ observer.observe(original.parentNode,{childList:true});
   !target.querySelector('[data-detail]').hidden,'The related link opens the waiting item outside the results.');
  check(place.get('show')==='working' && place.get('owner')===row.dataset.owner && search.value==='check',
   'The related link keeps Show, Owner and the search');
+ staffChip('producer',row.dataset.producer).click();
+ check(!target.hidden && !target.querySelector('[data-detail]').hidden &&
+  target.closest('[data-linked-item]:not([hidden])'),'Clicking the selected Producer keeps the linked item open.');
+ check(location.hash==='#'+place,'Clicking the selected Producer keeps the address.');
  const results=document.querySelector('table[aria-label="The List"]');
  check(results.querySelectorAll('[data-list-item]:not([hidden])').length===1 &&
   document.querySelector('[data-list-count]').textContent.startsWith('1 of 2'),
@@ -4466,6 +4469,65 @@ window.fetch=async(_path,options={})=>{
         _ = self.fixture_items()
         self.browser(list_page.render(self.root / "reviews").decode())
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_staff_chip_rows_wrap_and_fit(self) -> None:
+        for number in range(1, 13):
+            _ = self.add(f"Item {number}", owner=staff.StaffId(f"delivery-team-{number:02d}"), number=number)
+        all_staff = staff.StaffId("all")
+        item = self.add("Item for all", owner=all_staff, number=13)
+        _ = the_list.update(MORTY.id, item.id, {"producer": all_staff}, source="morty")
+        _ = self.add("Item for builds", owner=OTHER.id, number=14)
+        _ = self.add("Item for builds support", owner=staff.StaffId("builds-support"), number=15)
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            member.to_json() for member in (MORTY, DWIGHT, OWNER, replace(OTHER, name="builds-unit"))]}))
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = """<script>
+(async()=>{
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+try{
+const rows=[...document.querySelectorAll('[data-record-filters] [data-filter-row]')];
+const left=row=>row.querySelector('button').getBoundingClientRect().left;
+for(const row of rows){
+ const bounds=row.getBoundingClientRect();
+ for(const chip of row.querySelectorAll('button')){
+  const box=chip.getBoundingClientRect();
+  check(box.left>=bounds.left && box.right<=bounds.right+1,'The chip fits inside its row.');
+ }
+}
+const ownerChips=[...rows[0].querySelectorAll('button')];
+check(new Set(ownerChips.map(button=>button.getBoundingClientRect().top)).size>1,
+ 'The owner chips wrap onto more than one line.');
+check(rows.every(row=>Math.abs(left(row)-left(rows[0]))<1),'The three rows align.');
+check(document.documentElement.scrollWidth<=innerWidth,'The filter rows fit without horizontal scrolling.');
+const producerBox=rows[1].getBoundingClientRect(),words=document.getElementById('list-search').getBoundingClientRect();
+check(innerWidth>620 ? words.top<producerBox.bottom && words.left>=producerBox.right :
+ words.top>=producerBox.bottom,'The words box sits beside Producer on desktop and wraps below it on a phone.');
+const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
+const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
+check(allChips.every(chip=>chip.textContent==='All15') && staffChips.every(chip=>chip?.textContent==='all1'),
+ 'Each staff row has distinct All and all chips with separate counts.');
+check(ownerChips[2].textContent==='builds1' && ownerChips[3].textContent==='builds-support1',
+ 'The owner chips omit the suffix and sort by the displayed name.');
+const matchesAllStaff=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).join()==='13';
+staffChips.forEach(chip=>chip.click());
+const selectedPlace=new URLSearchParams(location.hash.slice(1));
+check(matchesAllStaff() && selectedPlace.get('owner')==='all' && selectedPlace.get('producer')==='all',
+ 'Selecting the staff ID all filters the items and stores the raw IDs.');
+allChips.forEach(chip=>chip.click());
+const restored=new Promise(done=>addEventListener('hashchange',done,{once:true}));
+location.hash='show=all&owner=all&producer=all';
+await restored;
+check(matchesAllStaff() && staffChips.every(chip=>chip.getAttribute('aria-pressed')==='true'),
+ 'An existing address with the staff ID all selects both staff chips.');
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>"""
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                self.browser_actions(markup, "", probe, window_size=(width, 900))
+
     def browser(self, markup: str) -> None:
         setup = r'''<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, errors=[], reads=[],posts=[];
@@ -4518,13 +4580,17 @@ const until=async (ready,label)=>{
 };
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
-const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+const filterRow=name=>document.querySelector('[data-filter-row="'+name+'"]');
+const staffChip=(name,value)=>filterRow(name).querySelector('[data-filter-value="'+
+ (name==='show' || value==='all' ? value : 'staff:'+value)+'"]');
+const chip=value=>staffChip('show',value);
 const show=value=>chip(value).click();
-const selectedShow=()=>document.querySelector('[data-filter-row="show"] [aria-pressed="true"]').dataset.filterValue;
-const menu=name=>document.getElementById('list-'+name);
-const select=(name,value)=>{const field=menu(name);field.value=value;field.dispatchEvent(new Event('change'));};
+const pressed=name=>filterRow(name).querySelector('[aria-pressed="true"]');
+const selectedFilter=name=>pressed(name).dataset.filterValue;
+const selectedShow=()=>selectedFilter('show');
+const select=(name,value)=>staffChip(name,value).click();
 const count=value=>Number(chip(value).querySelector('b').textContent);
-const menuCount=(name,value)=>Number([...menu(name).options].find(option=>option.value===value).dataset.filterCount);
+const staffCount=(name,value)=>Number(staffChip(name,value).dataset.filterCount);
 const unread=()=>document.getElementById('list-unread');
 const bulk=action=>document.querySelector('.list-table-tools [data-list-expansion="'+action+'"]');
 const search=value=>new Promise(done=>{
@@ -4603,13 +4669,13 @@ try{
   return .2126*r+.7152*g+.0722*b;
  };
  show('working');select('owner',OWNER);select('producer',MORTY);
- check(menu('owner').selectedOptions[0].textContent.startsWith('sdlc (') &&
-  menu('producer').selectedOptions[0].textContent.startsWith('morty ('),'The menus show the selected names and counts.');
+ check(pressed('owner').textContent==='sdlc1' && pressed('producer').textContent==='morty1',
+  'The selected staff chips show the names and counts.');
  for(const themeName of ['light','dark']){
   document.documentElement.dataset.theme=themeName;
   for(const view of ['working','blocked']){
    show(view);
-   for(const control of [chip(view),menu('owner'),menu('producer')]){
+   for(const control of [chip(view),pressed('owner'),pressed('producer')]){
     const background=luminance(getComputedStyle(control).backgroundColor);
     for(const element of [control,...control.querySelectorAll('b')]){
      const ink=luminance(getComputedStyle(element).color);
@@ -4622,33 +4688,41 @@ try{
  }
  if(theme===undefined) delete document.documentElement.dataset.theme;
  else document.documentElement.dataset.theme=theme;
- select('producer','');select('owner','');show('all');
+ select('producer','all');select('owner','all');show('all');
  select('owner',OWNER);check(visible().length===5,'Owner');
- select('owner','');
+ check(selectedFilter('owner')==='staff:'+OWNER && new URLSearchParams(location.hash.slice(1)).get('owner')===OWNER,
+  'The address keeps the selected owner.');
+ select('owner','all');
  select('producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
  check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'the address keeps the producer');
- select('producer','');
+ select('producer','all');
  check(visible().length===6 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
- check(showRow.querySelector('button').dataset.filterValue==='all' &&
-  menu('owner').options[0].value==='' && menu('producer').options[0].value==='','Each filter starts with All.');
+ check(['show','owner','producer'].every(name=>filterRow(name).querySelector('button').dataset.filterValue==='all'),
+  'Each filter row starts with All.');
  show('working');
  check(visible().length===2 && count('working')===2 && count('blocked')===0,
   'Working shows both matching records. Blocked counts zero.');
+ check(staffCount('owner',OWNER)===1 && staffCount('producer',DWIGHT)===1,
+  'The staff chips count the records in Working.');
  const zero=chip('blocked'),zeroPosition=zero.getBoundingClientRect();
  check(!zero.hidden && !zero.disabled && Number(getComputedStyle(zero).opacity)<1 && zeroPosition.width>0,
   'a zero chip stays in the row, dimmed and enabled');
  show('blocked');
  check(visible().length===0 && count('working')===2,'Selecting a zero chip keeps the other status counts.');
+ const zeroStaff=[staffChip('owner',OWNER),staffChip('producer',DWIGHT)];
+ check(zeroStaff.every(button=>button.dataset.filterCount==='0' && !button.hidden && !button.disabled &&
+  Number(getComputedStyle(button).opacity)<1 && button.getBoundingClientRect().width>0),
+  'The zero staff chips stay visible, enabled and dimmed.');
  show('closed');
  check(visible().map(row=>row.dataset.number).sort().join()==='54,63','Closed replaces the Blocked selection.');
  show('working');select('owner',OWNER);select('producer',DWIGHT);
- check(visible().length===0 && menuCount('owner','')===1 && menuCount('producer','')===1 && count('all')===0,
+ check(visible().length===0 && staffCount('owner','all')===1 && staffCount('producer','all')===1 && count('all')===0,
   'Each count ignores only its own filter.');
- select('producer','');await search('console');
+ select('producer','all');await search('console');
  check(visible().map(row=>row.dataset.number).join(',')==='106' && count('working')===1 &&
-  menuCount('producer',DWIGHT)===0 && menuCount('owner','')===2,'The search, menus and status chip combine.');
+  staffCount('producer',DWIGHT)===0 && staffCount('owner','all')===2,'The search and chip rows combine.');
  check(zero.getBoundingClientRect().left===zeroPosition.left,'a zero chip retains its place');
- await search('');show('all');select('owner','');
+ await search('');show('all');select('owner','all');
  await search('#106');
  check(visible().length===1 && visible()[0].dataset.number==='106','number search');
  await search('console');check(visible().length===2,'title search');
@@ -4744,23 +4818,23 @@ try{
  check(selectedShow()==='closed' && visible().map(row=>row.dataset.number).sort().join()==='54,63',
   'An old Done address opens Closed.');
  location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
- check(menu('producer').value===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
+ check(selectedFilter('producer')==='staff:'+DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
- check(menu('producer').value==='' && visible().length===6,'an unknown producer shows all items');
+ check(selectedFilter('producer')==='all' && visible().length===6,'an unknown producer shows all items');
  location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
- check(selectedShow()==='working' && menu('owner').value===OWNER && unread().checked &&
-  visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Working chip, switch, menu and search.');
+ check(selectedShow()==='working' && selectedFilter('owner')==='staff:'+OWNER && unread().checked &&
+  visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
-  check(selectedShow()==='all' && menu('owner').value==='' && !unread().checked &&
-    menu('producer').value==='' && document.getElementById('list-search').value==='','an item link clears filters');
+  check(selectedShow()==='all' && selectedFilter('owner')==='all' && !unread().checked &&
+    selectedFilter('producer')==='all' && document.getElementById('list-search').value==='','an item link clears filters');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
  location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'working',q:'106',sort:'#',dir:'desc'});await flush();
- check(menu('owner').value===retained.dataset.owner && selectedShow()==='working' &&
+ check(selectedFilter('owner')==='staff:'+retained.dataset.owner && selectedShow()==='working' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
