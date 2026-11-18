@@ -934,6 +934,20 @@ class PlacementWaitNotice:
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
 
 
+def first_hana_image_notice() -> bool:
+    """Share the notice with other clients that use the same verify run folder."""
+    hold_wait_file = os.environ.get("BUILDLOG_HOLD_WAIT_FILE", "")
+    if hold_wait_file:
+        try:
+            with Path(hold_wait_file).with_name("hana-image-stale").open("x"):
+                pass
+        except FileExistsError:
+            return False
+        except OSError:
+            pass
+    return True
+
+
 @dataclass
 class WaitOutput:
     started: float = field(default_factory=lambda: CLOCK.monotonic())
@@ -947,6 +961,7 @@ class WaitOutput:
     elapsed_memory_seconds: float = 0.0
     last_provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     announced_retries: set[str] = field(default_factory=set)
+    announced_hana_image_stale: bool = False
     status_open: bool = False
     local_reason: str = field(default_factory=lambda: os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
 
@@ -976,12 +991,20 @@ class WaitOutput:
 
     def placement_notices(self, reply: wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus,
                           *, placement_events: bool) -> None:
+        from scripts.build_queue import placement
+
         if isinstance(reply, (wire.PlacementWait, wire.Assignment, wire.LocalPlacementGranted)):
             self.provider_diagnostics(reply.provider_diagnostics)
             if reply.mac_disk_exclusions:
                 self.on_event("disk " + ",".join(reply.mac_disk_exclusions))
         if isinstance(reply, wire.PlacementWait):
             self.retry_notices(reply.retry_notices, placement_events=placement_events)
+        elif (isinstance(reply, (wire.Assignment, wire.LocalPlacementGranted)) and reply.hana_image_stale
+              and not self.announced_hana_image_stale):
+            self.announced_hana_image_stale = True
+            if first_hana_image_notice():
+                self.end_status()
+                print(placement.HANA_IMAGE_STALE, file=sys.stderr, flush=True)
 
     def resource_wait(self, reply: wire.PlacementResourceWait) -> None:
         from scripts.build_queue import placement

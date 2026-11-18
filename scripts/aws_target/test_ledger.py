@@ -1287,6 +1287,39 @@ class LedgerTests(CostFixture):
         self.assertEqual(len(cast(list[object], json.loads(self.book.path.read_text())["observations"])), 2)
 
 
+class SpotPlacementEvidenceTests(CostFixture):
+    def test_request_type_order_is_canonical_in_storage_and_in_older_readings(self) -> None:
+        now = 1768478400
+        types = ('c7a.8xlarge', 'm7a.8xlarge')
+        request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
+            ledger.SpotPlacementTypeSet.GATE_32_VCPU, 8, types[::-1], ('us-east-2',))
+        path = self.state / ledger.SPOT_PLACEMENT_FILE
+        reading = ledger.SpotPlacementSample(request, now, ())
+        ledger.write_spot_placement_scores(self.state, (reading,), now)
+        saved = path.read_text()
+        self.assertIn(json.dumps(types), saved)
+        _ = path.write_text(saved.replace(json.dumps(types), json.dumps(types[::-1])))
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (reading,))
+
+    def test_scores_and_failures_round_trip_with_only_the_last_72_hours(self) -> None:
+        now = 1768478400
+        first = now - 72 * 3600
+        region = 'us-east-2'
+        request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
+            ledger.SpotPlacementTypeSet.GATE_32_VCPU, 8, ('c7a.8xlarge', 'm7a.8xlarge'), (region,))
+        sample = ledger.SpotPlacementSample(request, first,
+            (ledger.SpotPlacementScore(ledger.SpotPlacementRegion(region), 5),))
+        zone_sample = ledger.SpotPlacementSample(replace(request, scope=ledger.SpotPlacementScope.ZONE), now,
+            (ledger.SpotPlacementScore(ledger.SpotPlacementZone(region, 'use2-az1'), 7),))
+        failed = ledger.SpotPlacementFailure(request, now, 'UnauthorizedOperation')
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), ())
+        ledger.write_spot_placement_scores(self.state, (replace(sample, at=first - 1), sample, zone_sample, failed), now)
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (sample, zone_sample, failed))
+        ledger.write_spot_placement_scores(self.state, (sample, zone_sample, failed), now + 1)
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (zone_sample, failed))
+        self.assertFalse((self.state / 'spot-prices.json').exists())
+
+
 class SpotPriceEvidenceTests(CostFixture):
     def test_regional_reply_selects_the_latest_price_for_each_requested_zone_and_type(self) -> None:
         first: dict[str, object] = dict(InstanceType='m7a.8xlarge', AvailabilityZone='eu-south-2a',

@@ -317,6 +317,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
 | `scripts/review_links/review_submissions.py` | read | snapshot and by_id find the active recipient and locate the saved record for retries and replies. |
+| `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
@@ -358,7 +359,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-191 accessor rows: 40 write, 150 read, 1 owner.
+192 accessor rows: 40 write, 151 read, 1 owner.
 
 ## Approved copies
 

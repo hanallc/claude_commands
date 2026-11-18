@@ -33,7 +33,7 @@ from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_replacement, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
@@ -401,8 +401,17 @@ def _save_hana_setup(path: Path, saved: dict[str, object]) -> None:
     write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
 
 
+def _save_hana_setup_image(path: Path, saved: dict[str, object], registered: hana_image.RegisteredImage) -> None:
+    saved.update(image=registered.image, guest_digest=registered.digest.value)
+    _save_hana_setup(path, saved)
+
+
 def _hana_parameter_hash(parameters: dict[str, str]) -> str:
     return sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()
+
+
+def _hana_setup_pending(saved: dict[str, object]) -> bool:
+    return any(key in saved for key in ('pending_launch', 'pending_volume', 'stop_pending'))
 
 
 def _hana_setup_ownership(saved: dict[str, object]) -> HanaBoxOwnership:
@@ -666,6 +675,11 @@ class Deployment:
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
             ownership = _hana_setup_ownership(saved)
+            if saved.get('instance') and _hana_setup_pending(saved):
+                registered_for_resume = self._require_current_hana_registration(workload.source)
+                configured_image = workload.values('ami_id').get('ami_id', '')
+                if configured_image and configured_image != registered_for_resume.image:
+                    raise DeploymentRefused('The configured Hana image differs from the registration. Review the saved deployment.')
             if ownership is HanaBoxOwnership.STACK:
                 return self._update_stack_owned_hana(path, saved, workload, limits)
             settings, parameters, template = self._hana_inputs(workload)
@@ -807,6 +821,11 @@ class Deployment:
             instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
             if len(instances) != 1 or instances[0].get('InstanceId') != instance:
                 raise DeploymentRefused('Hana instance confirmation differs')
+            registered = hana_image.saved(self.directory)
+            if isinstance(registered, hana_image.RegisteredImage) and registered.image == settings.ami_id:
+                if instances[0].get('ImageId') != registered.image:
+                    raise DeploymentRefused('Setup could not confirm the Hana instance image. Review the saved deployment.')
+                saved['guest_digest'] = registered.digest.value
             request = ledger.text(instances[0], 'SpotInstanceRequestId')
             if saved.get('spot_request', request) != request:
                 raise DeploymentRefused('The Hana Spot request differs from the saved request.')
@@ -864,8 +883,17 @@ class Deployment:
             yield
 
     def _refuse_hana_replacement(self) -> None:
-        if hana_replacement.held(self.directory):
-            raise DeploymentRefused(hana_replacement.HELD)
+        if hana_replacement_record.held(self.directory):
+            raise DeploymentRefused(hana_replacement_record.HELD)
+
+    def _require_current_hana_registration(self, configuration: Path) -> hana_image.RegisteredImage:
+        registered = hana_image.saved(self.directory)
+        if not isinstance(registered, hana_image.RegisteredImage):
+            raise DeploymentRefused('Hana has no verified image registration. ' + hana_replacement.REGISTER_IMAGE)
+        if not hana_image.guest_digest_is_current(registered.digest, configuration):
+            raise DeploymentRefused('The registered Hana image is older than the current guest files. '
+                                    + 'Build the Hana image from the current input. ' + hana_replacement.REGISTER_IMAGE)
+        return registered
 
     def _hana_root_replacement(self, workload: conf.ConfigRead, limits: hana_spend.PermitSettings) -> bool:
         """Check the registered image and converge on the same box."""
@@ -875,24 +903,27 @@ class Deployment:
             if isinstance(plan, plan_run.PlanRun):
                 raise plan_run.PlanRefused('Hana has no saved setup. Run deploy.py prepare --workload hana.')
             return False
-        if isinstance(plan, plan_run.ApprovedSetup) and not (
-                hana_replacement.held(self.directory) or (self.directory / hana_image.RECORD).is_file()):
-            return False
         try:
             with ExitStack() as hold:
                 with self._hana_setup_lock(wait=isinstance(plan, plan_run.ApprovedSetup)):
-                    attempt = hana_replacement.read(self.directory)
+                    attempt = hana_replacement_record.read(self.directory)
                     saved = remote.read_record(path)
-                    registered = hana_image.saved(self.directory)
-                    if not saved.get('instance') or any(key in saved for key in
-                            ('pending_launch', 'pending_volume', 'stop_pending')):
+                    has_instance = bool(saved.get('instance'))
+                    pending = _hana_setup_pending(saved)
+                    if not has_instance or (pending and isinstance(plan, plan_run.ApprovedSetup)):
                         if isinstance(plan, plan_run.PlanRun):
                             raise plan_run.unsupported('Hana setup has pending instance or volume work')
-                        if isinstance(attempt, hana_replacement.NoReplacement):
+                        if isinstance(attempt, hana_replacement_record.NoReplacement):
                             return False
                         raise DeploymentRefused('The saved Hana setup changed during replacement.')
-                    if not isinstance(registered, hana_image.RegisteredImage):
-                        raise DeploymentRefused('Hana has no verified image registration. ' + hana_replacement.REGISTER_IMAGE)
+                    if isinstance(plan, plan_run.PlanRun):
+                        self._print_hana_image_status(saved, workload.source)
+                    registered = self._require_current_hana_registration(workload.source)
+                    if pending:
+                        raise plan_run.unsupported('Hana setup has pending instance or volume work')
+                    if isinstance(attempt, hana_replacement_record.ReplacementAttempt) and (
+                            attempt.image != registered.image or attempt.guest_digest != registered.digest.value):
+                        raise DeploymentRefused('The Hana replacement inputs differ. Restore the approved registration.')
                     ownership = _hana_setup_ownership(saved)
                     box = hana_replacement.BoxIdentity.read(saved)
                     identity = hana_box.DeploymentIdentity(box.deployment, box.instance, box.spot_request, box.region)
@@ -903,21 +934,21 @@ class Deployment:
                     timeout = workload.whole('aws_timeout_s')
                     settings = replace(account, stack_name=stack, region=box.region, timeout_s=timeout)
                     api = self._api(settings)
-                    digest = hana_replacement.registered_digest(remote.read_record(self.directory / hana_image.RECORD))
-                    if isinstance(attempt, hana_replacement.NoReplacement):
+                    if isinstance(attempt, hana_replacement_record.NoReplacement):
                         self._require_idle_hana_lifecycle(path, identity)
-                    elif attempt.image != registered.image or attempt.digest != digest:
-                        raise DeploymentRefused('The Hana replacement inputs differ. Restore the approved registration.')
                     if isinstance(plan, plan_run.PlanRun):
                         self._check_credentials()
                         plan.confirm_account(limits.region, timeout)
                     else:
                         _ = hold.enter_context(hana_replacement.resource_hold(self.directory))
                     root = hana_replacement.RootReplacement(self.directory, api, box)
-                    preflight = root.preflight(registered, saved, limits.root_gib, digest, attempt)
-                    if isinstance(attempt, hana_replacement.NoReplacement):
+                    preflight = root.preflight(registered, saved, limits.root_gib, attempt)
+                    if isinstance(attempt, hana_replacement_record.NoReplacement):
                         if preflight.current:
-                            print('The Hana image is current.')
+                            if isinstance(plan, plan_run.ApprovedSetup):
+                                if saved.get('image') != registered.image or saved.get('guest_digest') != registered.digest.value:
+                                    _save_hana_setup_image(path, saved, registered)
+                                self._print_hana_image_status(saved, workload.source)
                             return True
                         view = self._hana_policy_stack(api, settings, saved, ownership)
                         policy = hana_replacement.scaler_policy(
@@ -926,37 +957,38 @@ class Deployment:
                             self._preview_hana_policy(api, view, policy, self._hana_provider(), identity)
                         else:
                             _ = self._install_hana_policy(api, view, policy)
-                            attempt = hana_replacement.new_attempt(self.directory, registered, preflight, digest)
+                            attempt = hana_replacement.new_attempt(self.directory, registered, preflight)
                     if isinstance(plan, plan_run.PlanRun):
                         hana_replacement.print_plan(attempt)
                         return True
 
-                def publish(proof: hana_replacement.ReplacementAttempt, stopped: bool) -> None:
+                def publish(proof: hana_replacement_record.ReplacementAttempt, stopped: bool) -> None:
                     current = remote.read_record(path)
                     if hana_replacement.BoxIdentity.read(current) != box:
                         raise DeploymentRefused('The Hana setup changed during replacement. ' + hana_replacement.RESUME)
-                    current['image'] = proof.image
-                    if isinstance(proof.digest, hana_replacement.RegisteredGuestDigest):
-                        current['guest_digest'] = proof.digest.value
-                    else:
-                        _ = current.pop('guest_digest', None)
-                    _save_hana_setup(path, current)
+                    _save_hana_setup_image(path, current, registered)
                     hana_box.record_replacement_stop(path.with_name('lifecycle.json'), proof.generation,
                                                      int(self.clock()), stopped=stopped)
 
-                assert isinstance(attempt, hana_replacement.ReplacementAttempt)
+                assert isinstance(attempt, hana_replacement_record.ReplacementAttempt)
                 spending = hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path, limits)
                 run_timeout = min(workload.whole('stop_wait_timeout_s'), limits.permit_max_seconds)
                 checks = self._hana_check_times(run_timeout, workload.whole('stop_poll_seconds'))
                 root = hana_replacement.RootReplacement(self.directory, self._hana_provider().api.in_region(box.region), box)
                 root.apply(attempt, spending, self.clock, run_timeout, checks, publish)
                 return True
-        except (hana_replacement.ReplacementRefused, plan_run.PlanRefused, plan_identity.PlanIdentityRefused, DeploymentRefused):
+        except (hana_image.ImageRefused, hana_replacement.ReplacementRefused, plan_run.PlanRefused,
+                plan_identity.PlanIdentityRefused, DeploymentRefused):
             raise
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             code = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
             detail = f' ({code})' if code else ''
             raise DeploymentRefused('Could not verify Hana root replacement' + detail + '. ' + hana_replacement.RESUME) from None
+
+    @staticmethod
+    def _print_hana_image_status(saved: dict[str, object], configuration: Path) -> None:
+        current = hana_image.setup_image_is_current(saved, configuration)
+        print('Hana image is current.' if current else hana_box.HANA_IMAGE_STALE)
 
     @staticmethod
     def _hana_scaler_policy() -> dict[str, object]:
@@ -1352,6 +1384,8 @@ class Deployment:
                            timeout_s=workload.whole('aws_timeout_s'))
         zone = workload.text('availability_zone')
         upload_timeout = workload.whole('image_upload_timeout_s')
+        digest = hana_image.artifact_digest(built.store, self.execute, upload_timeout)
+        description = 'Hana guest digest ' + digest.value
         wait_interval = max(workload.whole('image_wait_interval_s'),
                             (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
                             // hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS)
@@ -1368,7 +1402,10 @@ class Deployment:
             if not images:
                 tag = conf.read(self.settings_path)
                 cost_tag = 'Key=%s,Value=%s' % (tag.text('cost_explorer_tag_key'), tag.text('cost_explorer_tag_value'))
-                pending = hana_image.saved(self.directory)
+                try:
+                    pending = hana_image.saved(self.directory)
+                except hana_image.RegistrationDigestRefused:
+                    pending = hana_image.NoRegisteredImage()
                 resume = isinstance(pending, hana_image.PendingImageRegistration) and pending.name == built.name
                 if not resume:
                     snapshots = ledger.rows(api.call('describe-snapshots', '--owner-ids', 'self', '--filters',
@@ -1416,7 +1453,7 @@ class Deployment:
                         raise DeploymentRefused('the Hana snapshot wait failed: ' + waited.stderr.strip())
                 with step('hana-image', 'registering the image', self.settings_path):
                     image = ledger.text(api.call(
-                        'register-image', '--name', built.name, '--architecture', 'x86_64',
+                        'register-image', '--name', built.name, '--description', description, '--architecture', 'x86_64',
                         '--virtualization-type', 'hvm', '--ena-support', '--sriov-net-support', 'simple',
                         '--boot-mode', built.boot_mode, '--imds-support', 'v2.0',
                         '--root-device-name', settings.root_device_name, '--block-device-mappings',
@@ -1426,9 +1463,11 @@ class Deployment:
                 images = ledger.rows(api.call('describe-images', '--image-ids', image), 'Images')
             if len(images) != 1 or images[0].get('State') != 'available':
                 raise DeploymentRefused('the registered Hana image is not available')
+            if images[0].get('Description') != description:
+                raise DeploymentRefused('The registered Hana image lacks the matching guest digest. Build a fresh Hana image.')
             path = hana_image.save(self.directory, hana_image.RegisteredImage(
                 built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
-                settings.vpc_id, str(subnets[0]['id'])))
+                settings.vpc_id, str(subnets[0]['id']), digest))
         print(f'Hana image ready. The record is in {path}.')
         return True
 

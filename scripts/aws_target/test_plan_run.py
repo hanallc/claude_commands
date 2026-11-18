@@ -11,7 +11,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.aws_target.aws_cli import AwsUnavailable
-from scripts.aws_target import hana_image, hana_replacement, admin_secrets, deploy, hana_box, ledger, plan_identity, plan_run, test_deploy
+from scripts.aws_target import admin_secrets, deploy, hana_box, hana_image, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.controller_lock import control_lock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
@@ -83,6 +83,7 @@ class PlanSetupTests(CostFixture):
         self.parameters: dict[str, str] = {}
         self.live_template: dict[str, object] = {}
         self.expect_bucket_policy = True
+        self.image_description = ''
         self.credentials_path = Path()
         self.setup_path = Path()
 
@@ -144,8 +145,10 @@ class PlanSetupTests(CostFixture):
             'template_sha256': 'fixture',
         }))
         hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled()).register(identity)
+        digest = hana_render.guest_digest(workload)
+        self.image_description = 'Hana guest digest ' + digest.value
         _ = hana_image.save(self.state, hana_image.RegisteredImage(
-            'fixture-image', 'ami-fixture-next', OWNER.account, 'fixture-vpc', 'fixture-subnet'))
+            'fixture-image', 'ami-fixture-next', OWNER.account, 'fixture-vpc', 'fixture-subnet', digest))
 
     def run_change(self) -> tuple[int, str]:
         output = StringIO()
@@ -309,6 +312,7 @@ class PlanSetupTests(CostFixture):
         elif operation == 'describe-images':
             reply = {'Images': [{'ImageId': 'ami-fixture-next', 'OwnerId': OWNER.account, 'Name': 'fixture-image',
                 'State': 'available', 'RootDeviceType': 'ebs', 'RootDeviceName': '/dev/xvda', 'BootMode': 'uefi',
+                'Description': self.image_description,
                 'Architecture': 'x86_64', 'VirtualizationType': 'hvm',
                 'PlatformDetails': 'Linux/UNIX', 'UsageOperation': 'RunInstances',
                 'BlockDeviceMappings': [{'DeviceName': '/dev/xvda',
@@ -320,6 +324,15 @@ class PlanSetupTests(CostFixture):
         else:
             raise AssertionError(operation)
         return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+    def test_registered_current_image_keeps_the_stale_notice_and_policy_plan(self) -> None:
+        self.prepare_hana()
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 0, output)
+        self.assertTrue(output.startswith(hana_box.HANA_IMAGE_STALE + '\n'))
+        self.assertEqual(output.splitlines().count(hana_box.HANA_IMAGE_STALE), 1)
+        self.assertIn('Plan Hana: Keep the instance and the data volume.', output)
+        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS, *REPLACEMENT_SIMULATIONS])
 
     def test_stack_owned_plan_passes_with_the_current_allow_list(self) -> None:
         self.prepare_hana()
@@ -341,9 +354,9 @@ class PlanSetupTests(CostFixture):
         self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS, *REPLACEMENT_SIMULATIONS])
 
     def test_plan_blocks_claims_after_the_idle_check_and_through_the_last_simulation(self) -> None:
-        self.prepare_hana()
         workload = conf.path('hana_aws')
         text_setting(workload, 'enabled', 'on')
+        self.prepare_hana()
         controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
         blocked: list[str] = []
 
@@ -364,7 +377,8 @@ class PlanSetupTests(CostFixture):
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 0, output)
         self.assertEqual(blocked, ['get-template', 'simulate-principal-policy'])
-        self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
+        with mock.patch.object(controller, 'image_is_current', return_value=True):
+            self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
 
     def test_busy_controller_lock_refuses_before_aws(self) -> None:
         self.prepare_hana()
@@ -405,6 +419,7 @@ class PlanSetupTests(CostFixture):
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 1, output)
         self.assertEqual(self.calls, [*PLAN_CALLS, ('iam', 's3:PutObject')])
+        self.assertTrue(output.startswith(hana_box.HANA_IMAGE_STALE + '\n'))
         self.assertTrue(output.endswith('plan run: refused: Hana scaler s3:PutObject denied.\n'))
 
     def assert_unsupported(self, reason: str, *arguments: str) -> None:
@@ -432,9 +447,21 @@ class PlanSetupTests(CostFixture):
         (self.state / hana_image.RECORD).unlink()
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 1)
-        self.assertEqual(output, 'plan run: refused: Hana has no verified image registration. '
+        self.assertEqual(output, hana_box.HANA_IMAGE_STALE + '\n' +
+                         'plan run: refused: Hana has no verified image registration. '
                          + hana_replacement.REGISTER_IMAGE + '\n')
         self.assertEqual(self.calls, [])
+
+    def test_direct_owned_setup_without_image_registration_refuses_before_aws(self) -> None:
+        self.setup_path.parent.mkdir()
+        (self.state / 'controller.lock').touch()
+        _ = self.setup_path.write_text(json.dumps({'version': 2, 'instance': 'fixture-instance'}))
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(output, hana_box.HANA_IMAGE_STALE + '\n' +
+                         'plan run: refused: Hana has no verified image registration. '
+                         + hana_replacement.REGISTER_IMAGE + '\n')
 
     def test_credential_mode_refuses_before_aws(self) -> None:
         self.prepare_hana()
@@ -451,6 +478,17 @@ class PlanSetupTests(CostFixture):
         self.assertEqual(status, 1, output)
         self.assertEqual(self.calls, list(PLAN_CALLS[:7]))
         self.assertIn('STS did not confirm the configured Hana scaler user', output)
+
+    def test_hana_plan_refuses_a_stack_disk_change_without_a_change_set(self) -> None:
+        self.prepare_hana()
+        resources = ledger.mapping(self.live_template['Resources'])
+        ledger.mapping(resources['DataVolume'])['Type'] = 'AWS::S3::Bucket'
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1)
+        self.assertEqual(self.calls, list(PLAN_CALLS[:6]))
+        self.assertEqual(output, hana_box.HANA_IMAGE_STALE + '\n' +
+                         'plan run: refused: The live template does not match the saved Hana setup.\n')
+        self.assertFalse(self.change_exists)
 
     def test_plan_deletes_the_change_set_when_description_fails(self) -> None:
         self.failure = 'describe'

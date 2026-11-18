@@ -18,13 +18,12 @@ from unittest import mock
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
-from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY
+from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.build_targets import build_targets, target_config
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
 from scripts.buildlog import store
 from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import OwningSession
 
@@ -57,11 +56,10 @@ class HanaPlacementTests(CostFixture):
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.workload = self.root / 'hana_aws.conf'
         install_hana_spending_settings(self.workload)
-        _ = write_config_fixture(self.workload,
-            f'host=fixture-hana\nexecution_transport=hana-control\nrepository_identity={KEY}\nkinds=check,lint\n'
+        _ = self.workload.write_text(self.workload.read_text()
+            + f'execution_transport=hana-control\nrepository_identity={KEY}\nkinds=check,lint\n'
             + f'# whole: 1..5\npreview_max_age_s={PREVIEW_SECONDS}\n'
-            + 'max_steps=1\nfree_floor_gib=30\nidle_stop_seconds=600\nstart_timeout_seconds=120\n'
-            + 'tick_interval_s=5\ncontroller_tick_timeout_s=45\n')
+            + '# whole: 1..1\nmax_steps=1\n')
         self.clock = TestClock()
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private inventory', True))
@@ -69,6 +67,7 @@ class HanaPlacementTests(CostFixture):
         self.provider = FakeProvider(self.state, self.clock)
         self.controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
         self.controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         self.target = target_config.SshTarget('fixture', 'linux', self.workload)
         targets = (self.target, target_config.LocalTarget('natedev', 'linux'))
         _ = self.enterContext(mock.patch.object(target_config, 'read_targets', return_value=targets))
@@ -111,6 +110,11 @@ class HanaPlacementTests(CostFixture):
         evidence = self.evidence(self.request())
         assert isinstance(evidence, placement.FreshHostEvidence)
         return evidence.eligibility
+
+    def test_missing_image_digest_excludes_the_box_before_assignment(self) -> None:
+        (self.state / 'hana/setup.json').unlink()
+        self.assertEqual(self.eligibility(), placement.FixedExclusion(placement.HANA_IMAGE_STALE))
+        self.assertEqual(self.provider.calls, [])
 
     @contextmanager
     def preview_calls(self) -> Generator[list[int]]:
@@ -232,6 +236,45 @@ class HanaPlacementTests(CostFixture):
         with (mock.patch.object(self.controller, 'claim_status', return_value=box.ClaimRefused('boot failed')),
                 mock.patch.object(self.controller, 'request', side_effect=AssertionError('Do not restart the failed boot'))):
             self.assertEqual(self.claim(), hana.HanaClaimRefused('boot failed'))
+
+    def test_placement_releases_a_dead_claim_after_command_admission_refusal(self) -> None:
+        from scripts.aws_target import hana_execution as execution, test_hana_execution as fixtures
+
+        adopted = self.ready()
+        claim = adopted.reserved.claim.reference
+        template = fixtures.HanaExecutionTests().request
+        key = replace(template.key, claim_id=claim.claim_id, generation=adopted.generation)
+        self.assertEqual((key.episode, key.attempt), (claim.episode, claim.attempt))
+        source = self.assignment.source_key
+        assert isinstance(source, placement.SourceKeyKnown)
+        request = replace(template, key=key, source_key=source)
+        objects = fixtures.FakeExecutionObjects(request, terminated=True, lease_free=True, fail_fence=True)
+        permit = self.provider.published[-1]
+        _ = execution.dispatch_execution(self.state, request, adopted, objects,
+            consume=lambda selected: wire.FirstAuthorization(selected.assignment, selected.claim),
+            current_permission=lambda: self.controller.permission(claim.claim_id, key.generation.boot_id, permit.generation),
+            current_source_key=lambda: source)
+        reason = 'The data mount and a fresh permit are required'
+        observation = replace(objects.observe_execution(key), evidence=placement.ExecutionEvidenceUnavailable(reason, self.clock.now))
+        with mock.patch.object(objects, 'observe_execution', return_value=observation):
+            _ = execution.observe_execution(self.state, request, objects)
+        with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
+            settled = execution.settle_execution(self.state, request, objects,
+                release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost')
+        self.assertIsInstance(settled, execution.HanaAdmissionRefusalSettled)
+        release.assert_not_called()
+        other = replace(self.request(), episode='other')
+        evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            for state in (box.Lifecycle.STOPPING, box.Lifecycle.STOPPING, box.Lifecycle.IDLE_STOPPED):
+                self.clock.advance(1)
+                self.assertEqual(self.controller.tick(), state)
+            evidence = self.evidence(other)
+        assert isinstance(evidence, placement.FreshHostEvidence)
+        self.assertEqual(evidence.eligibility, placement.AllowedHost())
+        self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
 
     def test_settled_attempt_cannot_commit_another_lifecycle_claim(self) -> None:
         from scripts.aws_target import hana_execution

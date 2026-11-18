@@ -3154,7 +3154,7 @@ done
                         for report in (attempt.terminal_report,)
                         if isinstance(attempt.state, placement.ClosedAssignment)
                         and isinstance(report, placement.TerminalAttemptReport)
-                        and isinstance(report.outcome, placement.PrelaunchRefused)
+                        and isinstance(report.outcome, (placement.PrelaunchRefused, placement.HanaCommandAdmissionRefused))
                         and isinstance(attempt.provider, placement.ProviderClaimReference)
                         and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
                         and scopes_overlap(attempt.provider.scope, destination.scope))
@@ -3269,6 +3269,12 @@ done
                 delayed[target] = placement.ProviderRetryNotice(target, attempt.state.reason,
                     attempt.retry.deadline - report.received_at)
         retry_notices = tuple(delayed.values())
+        stale_hana = (any(isinstance(candidate.eligibility, placement.FixedExclusion)
+                          and candidate.eligibility.reason == placement.HANA_IMAGE_STALE
+                          for candidate in self.placement_eligibility.get(request.episode, ()))
+                      and not any(attempt.assignment.episode == request.episode
+                                  and attempt.retry == placement.DoNotRetry(placement.HANA_IMAGE_STALE)
+                                  for attempt in self.assignments.values()))
         saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
         if saved is not None:
             state = self._assignment_state(saved)
@@ -3284,13 +3290,13 @@ done
             if saved.assignment.destination.provider == "local":
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)
-                return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions)
+                return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
             if isinstance(saved.permission, placement.PermissionConsumed):
                 return wire.PlacementWait(request.episode, request.since, 1,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
-            return wire.Assignment(saved.assignment, diagnostics, disk_exclusions)
+            return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
         terminal = [saved for saved in self.assignments.values() if saved.assignment.episode == request.episode
                     and isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled")]
         if terminal:
@@ -3591,7 +3597,8 @@ done
                              report: placement.TerminalAttemptReport) -> bool:
         """Close a Hana refusal from a settled journal for an exact unlaunched attempt."""
         assignment = saved.assignment
-        if (assignment.destination.provider != "ssh" or not isinstance(report.outcome, placement.PrelaunchRefused)
+        if (assignment.destination.provider != "ssh"
+                or not isinstance(report.outcome, placement.PrelaunchRefused)
                 or not isinstance(saved.permission, placement.PermissionAvailable)):
             return False
         from scripts.aws_target import hana_placement
@@ -3663,6 +3670,9 @@ done
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
             self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
+        elif isinstance(outcome, placement.HanaCommandAdmissionRefused):
+            self._close_placement(saved, outcome.reason,
+                placement.retry_decision(saved.assignment.destination, outcome, report.received_at))
         elif not self._settle_hana_refusal(saved, report):
             self._close_placement(saved, outcome.reason,
                 saved.retry if isinstance(saved.retry, placement.RetryAt) else
@@ -3791,7 +3801,7 @@ done
                         self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
         elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
                 or isinstance(saved.permission, placement.PermissionAvailable)
-                and (isinstance(request.outcome, placement.PrelaunchRefused)
+                and (isinstance(request.outcome, (placement.PrelaunchRefused, placement.HanaCommandAdmissionRefused))
                     or isinstance(request.outcome, placement.AttemptCancelled)
                     and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
                     and saved.terminal_report.outcome == request.outcome)
@@ -3802,7 +3812,10 @@ done
             self.execution_evidence[key] = request.evidence
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
-                    or isinstance(outcome, placement.PrelaunchRefused) and isinstance(request.evidence, placement.ExecutionNotStarted)):
+                    or isinstance(outcome, placement.PrelaunchRefused) and isinstance(request.evidence, placement.ExecutionNotStarted)
+                    or isinstance(outcome, placement.HanaCommandAdmissionRefused)
+                    and isinstance(request.evidence, placement.ExecutionNotStarted)
+                    and isinstance(request.path, placement.DispatchPathSettled)):
                 previous = saved.terminal_report
                 if isinstance(previous, placement.NoTerminalReport):
                     terminal = placement.TerminalAttemptReport(outcome, request.path, self.clock.now())

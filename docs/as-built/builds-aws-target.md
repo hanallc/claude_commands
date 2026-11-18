@@ -102,10 +102,12 @@ deploy.py hana-setup --plan
 The plan checks root replacement for an existing Hana box with a registered image.
 It accepts stack-owned and direct-owned boxes.
 It refuses first-time setup and pending instance or data volume work.
-If a replacement is pending, the plan checks that the original instance still exists.
+It reports whether the deployed guest digest matches the current guest files.
 
-For a new replacement, the plan checks the stopped instance, data attachment, and registered image.
-It reads the live stack and previews the change to `ScalerPolicy` through IAM simulation.
+For a pending replacement, the plan checks the instance, original data attachment, and registered image.
+For a new replacement, the plan also checks that the instance is stopped.
+The policy preview checks the local credential file and reads the scaler identity with STS.
+It reads the live stack and previews one modification to `ScalerPolicy` through IAM simulation.
 The plan makes read calls only.
 
 The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
@@ -146,10 +148,8 @@ It passes when every region passes.
 
 ## Hana guest safety files
 
-`scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
-These files do not provision a machine or add a deployment command.
-Phase D must install and enable the units before the box accepts work.
-`config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
+`scripts/aws_target/hana_guest.py` renders safety files for the kept Hana box.
+`config/hana_aws.conf` supplies the image's admission setting, safety timing, and resource values.
 
 `scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
 It writes nine files by base name and applies each `GuestFile` mode.
@@ -160,6 +160,9 @@ The NixOS build uses the renderer from its pinned `claude-commands` input.
 `scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
 The filter excludes unrelated repository changes from the image inputs.
 The NixOS integration replaces the manually copied guest files.
+The image installs the rendered settings and guest code.
+User data supplies the boot descriptor and signed control access.
+A change to guest admission requires a rebuilt image and a box provisioned from that image.
 
 Run this command from the repository root:
 
@@ -191,6 +194,10 @@ An unchanged permit retains that deadline across later reads and service restart
 A renewal with a changed expiry records a new bounded deadline when safety next reads it.
 The watchdog stops at the earlier of wall-clock expiry and the boot-clock deadline.
 A backward wall-clock change cannot extend the boot-clock deadline.
+Command admission reports disabled guest settings, a missing data mount, or an invalid permit separately.
+The receiver sends a refusal code with the diagnostic text.
+The permit refusal names the failed identity, expiry, or deadline check.
+An invalid or missing expiry field in a permit with valid identity fields gets a specific expiry refusal.
 
 Safety, permit renewal, and command admission share `/run/hana-aws/permit.lock` through `fcntl.flock`.
 Safety holds the lock from the permit read through the shutdown decision.
@@ -440,6 +447,51 @@ If that history has no match, `down` reports it and continues with any disk or b
 After a failed ordinary setup update, setup deletes resources retained during rollback and keeps the stack and record.
 Run `prepare --workload hana` again before retrying with changed inputs.
 The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
+
+### Hana image freshness
+
+`hana_render` hashes the paths, modes, and bytes of the rendered guest files.
+It adds this digest to the rendered `safety.json` that the image installs during activation.
+The digest excludes its own field.
+The renderer copies only the Hana settings used by the guest.
+
+- Safety reads `enabled`, `guard_grace_seconds`, `watchdog_check_seconds`, and `permit_max_seconds`.
+- The guest also reads `step_cpu_limit`, `step_memory_gib`, and `mount_timeout_seconds`.
+- The receiver reads `aws_timeout_s` and `control_poll_seconds`.
+- The runner reads `execution_shell` and `free_floor_gib`.
+- Source materialization reads `source_max_bytes`, `source_download_timeout_s`, `source_git_timeout_s`, and `source_allowed_environment`.
+
+The renderer writes the resolved values under plain keys.
+The renderer selects overrides by the Hana target alias in `hana_aws.conf`.
+The renderer and runner use one list of timeout keys from `build_targets.conf`.
+The digest covers the guest files that this repository renders.
+NixOS sets the slot settings, compiler version, and runner environment outside those files.
+Changes to those NixOS settings take effect when a new image uses them.
+
+The guest uses `enabled` as an independent admission switch in addition to the live permit.
+Removing the guest switch would avoid an image rebuild for this setting.
+That change would leave an already issued permit usable until the guest revokes it or it expires.
+
+`hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
+Registration requires the build derivation and the renderer output to be present in the local store.
+The registered image description and the local registration record carry the same digest.
+Setup records the digest for the instance after EC2 confirms its image identity.
+Registering another image does not refresh the digest of an existing instance.
+A missing or mismatched digest makes the deployed image stale.
+
+The queue excludes a stale Hana box before assignment.
+The controller checks the image before accepting a claim, starting the box, or granting command permission.
+A stale image detected after assignment records `HanaCommandAdmissionRefused` with `DoNotRetry`.
+The queue can place that build on another eligible target after it settles the Hana attempt.
+The build and target status report this message.
+
+> The Hana image is stale. Run deploy.py hana-setup --plan to review replacement.
+
+After it saves an effective guest setting, `tune.py` reports this message.
+
+> The Hana image is now stale. Build and register a current Hana image.
+
+The root replacement procedure keeps the same instance and data volume. [Replace the Hana root image](#replace-the-hana-root-image)
 
 ## Ending persistent Spot boxes
 
@@ -1252,13 +1304,23 @@ Existing configuration values remain unchanged.
 
 ### Replace the Hana root image
 
-Register the reviewed image with `deploy.py hana-image --image RESULT --approve-resources`.
-Run `deploy.py hana-setup --plan` to check the registered image against the idle box.
+The NixOS configuration builds the guest files from its pinned `claude-commands` input.
+Use a reviewed pin that contains the current rendered guest files.
+
+1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
+2. Register the image with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
+3. Check the registered image with `scripts/aws_target/deploy.py hana-setup --plan`.
+4. Apply the root replacement with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
+
+The plan reports the deployed image freshness before it checks the registration or simulates the policy.
 The replacement plan reads AWS through the plan identity and does not write local state.
-Run `deploy.py hana-setup --approve-resources` to apply the root replacement.
+Setup replaces the root volume on the same instance and keeps the data volume.
 
 Before the first attempt, setup checks that the box is stopped and has no claims.
 It checks the lifecycle identity and the retained data attachment.
+Setup requires an image registration for an existing box.
+The registered guest digest must match the current guest files and the EC2 image description.
+A pending attempt requires the same image and guest digest as its saved record.
 On each invocation, setup checks the registered image owner, architecture, virtualization, boot mode, billing platform, and product codes.
 If the image root exceeds `root_gib`, setup refuses before it makes any change.
 
@@ -1286,7 +1348,8 @@ A failed task reports its state and the AWS message when one exists.
 The next invocation uses a new token after either task failure state.
 
 Setup completes when EC2 reports the registered image and the same data attachment.
-It requests a stop, closes the reservation, saves the image, and removes the hold.
+It requests a stop, closes the reservation, saves the image and guest digest, and removes the hold.
+If the box already uses the registered image, approved setup records its verified digest without replacing the root volume.
 The controller completes the stop if EC2 still reports a running box.
 If replacement execution exits early, setup requests a stop and leaves the reservation open.
 If preflight refuses a rerun, only the controller can request a stop.
@@ -1358,6 +1421,20 @@ Permit renewals retain that generation.
 F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
 Only an adopted claim can request the queue's first launch authorization.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
+An exact guest observation can settle an accepted execution that ended without a compiler result.
+The observation must confirm termination and lease release, and the sender must have issued no source update.
+The sender uses the guest cause when it is available and keeps a specific sender rejection if the guest reports a pending result.
+For other confirmed departures, the sender attempts to release the claim without another fence observation.
+The sender uses the refusal code from a new image to report `HanaCommandAdmissionRefused`.
+For the old image, the sender recognizes only the exact reason `The data mount and a fresh permit are required`.
+The refusal proves the command did not start.
+The sender reports the refusal before claim cleanup.
+The controller checks whether the holder exited in every lifecycle state, including after a Spot interruption.
+An unresolved start still requires provider recovery.
+The next Hana evidence read can remove the detached target claim.
+The queue excludes Hana for the refused build and continues in the configured candidate order.
+For a different build, the queue needs provider evidence at or after the refusal report before it can assign the same scope.
+For a pinned build, `verify.sh` prints one line with the refusal cause and exits with status 2.
 An ended local holder cannot settle an unresolved Hana dispatch.
 A failed boot needs a terminal `ExecutionReport`; pending settlement retains capacity and the live retry deadline.
 The queue permits fallback only after settlement.

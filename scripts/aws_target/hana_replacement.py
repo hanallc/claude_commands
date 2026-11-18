@@ -6,29 +6,24 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
 import fcntl
-import json
 import os
 import subprocess
 from pathlib import Path
-import re
 from typing import final
 from uuid import uuid4
 
-from scripts.aws_target import hana_image, hana_spend, ledger, plan_run, remote
+from scripts.aws_target import hana_image, hana_replacement_record, hana_spend, ledger, plan_run
 from scripts.aws_target.aws_cli import AwsCli, AwsUnavailable
 from scripts.aws_target.controller_lock import control_lock
-from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.aws_target.hana_replacement_record import (
+    RESUME as RESUME, NoReplacement, ReplacementAttempt, ReplacementRefused as ReplacementRefused,
+)
+from scripts.lib.atomic_file import sync_folder
 
 
-RESUME = 'Run deploy.py hana-setup --approve-resources again.'
-HELD = 'Hana root replacement holds the box. ' + RESUME
 REGISTER_IMAGE = 'Register the Hana image with deploy.py hana-image --image RESULT --approve-resources.'
 INTERRUPTED = 'AWS interrupted the Hana box. Run deploy.py hana-setup --approve-resources again later.'
 DATA_DEVICE = '/dev/sdf'
-
-
-class ReplacementRefused(ValueError):
-    """Hana root replacement requires more evidence or another approved run."""
 
 
 class TaskState(StrEnum):
@@ -55,54 +50,6 @@ class BoxIdentity:
                      ('deployment', 'region', 'instance', 'spot_request', 'data_volume')))
 
 
-@dataclass(frozen=True)
-class NoReplacement:
-    """No replacement holds the box."""
-
-
-@dataclass(frozen=True)
-class GuestDigestUnrecorded:
-    """The registration predates guest digest evidence."""
-
-
-@dataclass(frozen=True)
-class RegisteredGuestDigest:
-    value: str
-
-
-def registered_digest(row: dict[str, object]) -> GuestDigestUnrecorded | RegisteredGuestDigest:
-    if 'guest_digest' not in row:
-        return GuestDigestUnrecorded()
-    value = ledger.text(row, 'guest_digest')
-    if not re.fullmatch(r'[a-f0-9]{64}', value):
-        raise ReplacementRefused('The Hana image registration has an invalid guest digest. ' + REGISTER_IMAGE)
-    return RegisteredGuestDigest(value)
-
-
-@dataclass(frozen=True)
-class ReplacementAttempt:
-    """Keep the registration, attachment, token and reservation for one replacement."""
-    image: str
-    attached_at: str
-    token: str
-    generation: int
-    digest: GuestDigestUnrecorded | RegisteredGuestDigest = GuestDigestUnrecorded()
-
-
-def record_path(directory: Path) -> Path:
-    return directory / 'hana' / 'replacement.json'
-
-
-def held(directory: Path) -> bool:
-    try:
-        _ = record_path(directory).lstat()
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
-
-
 @contextmanager
 def resource_hold(directory: Path) -> Generator[None]:
     """Allow one command to replace the root."""
@@ -111,29 +58,10 @@ def resource_hold(directory: Path) -> Generator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ReplacementRefused(HELD) from None
+            raise ReplacementRefused(hana_replacement_record.HELD) from None
         yield
     finally:
         os.close(fd)
-
-
-def read(directory: Path) -> NoReplacement | ReplacementAttempt:
-    try:
-        row = remote.read_record(record_path(directory))
-    except FileNotFoundError:
-        return NoReplacement()
-    if type(row.get('version')) is not int or row['version'] != 2:
-        raise ReplacementRefused('The Hana replacement record has an unknown version. Review the saved deployment.')
-    return ReplacementAttempt(ledger.text(row, 'image'), ledger.text(row, 'attached_at'), ledger.text(row, 'token'),
-                              ledger.instant(row, 'generation'), registered_digest(row))
-
-
-def save(directory: Path, attempt: ReplacementAttempt) -> None:
-    row: dict[str, object] = dict(version=2, image=attempt.image, attached_at=attempt.attached_at,
-                                  token=attempt.token, generation=attempt.generation)
-    if isinstance(attempt.digest, RegisteredGuestDigest):
-        row['guest_digest'] = attempt.digest.value
-    write_text_atomic(record_path(directory), json.dumps(row, sort_keys=True) + '\n', new_file_mode=0o600)
 
 
 def _only(reply: dict[str, object], key: str) -> dict[str, object]:
@@ -175,14 +103,14 @@ class ReplacementImage:
 
 
 def _confirm_image(api: AwsCli, registered: hana_image.RegisteredImage, instance: dict[str, object],
-                   root_gib: int, digest: GuestDigestUnrecorded | RegisteredGuestDigest) -> ReplacementImage:
+                   root_gib: int) -> ReplacementImage:
     image = _only(api.call('describe-images', '--image-ids', registered.image, '--owners', registered.owner), 'Images')
     if any(image.get(key) != value for key, value in (
             ('ImageId', registered.image), ('OwnerId', registered.owner), ('Name', registered.name),
             ('State', 'available'), ('RootDeviceType', 'ebs'), ('Architecture', 'x86_64'),
             ('VirtualizationType', 'hvm'))):
         raise ReplacementRefused('AWS did not confirm the registered Hana image. ' + REGISTER_IMAGE)
-    if isinstance(digest, RegisteredGuestDigest) and image.get('Description') != 'Hana guest digest ' + digest.value:
+    if image.get('Description') != 'Hana guest digest ' + registered.digest.value:
         raise ReplacementRefused('AWS did not confirm the registered Hana guest digest. ' + REGISTER_IMAGE)
     boot_mode = instance.get('CurrentInstanceBootMode')
     compatible = (boot_mode in ('legacy-bios', 'uefi') and image.get('BootMode') in (boot_mode, 'uefi-preferred'))
@@ -251,13 +179,12 @@ class RootReplacement:
         return self._data(instance)
 
     def preflight(self, registered: hana_image.RegisteredImage, saved: dict[str, object], root_gib: int,
-                  digest: GuestDigestUnrecorded | RegisteredGuestDigest,
                   attempt: NoReplacement | ReplacementAttempt) -> RootPreflight:
         instance = self.instance()
         if _state(instance) in ('terminated', 'shutting-down'):
             raise ReplacementRefused('The Hana Spot box cannot resume root replacement. Review the saved deployment.')
         # EC2 uses the larger of the image root and the current root. The account already pays for the current root.
-        image = _confirm_image(self.api, registered, instance, root_gib, digest)
+        image = _confirm_image(self.api, registered, instance, root_gib)
         if isinstance(attempt, NoReplacement):
             attached_at = self.require_idle(instance)
             if 'image' in saved and saved['image'] != _image(instance):
@@ -283,7 +210,7 @@ class RootReplacement:
     def _reserve(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending, now: int,
                  timeout: int) -> ReplacementAttempt:
         def before_commit(exposure: ledger.HanaComputeExposure) -> None:
-            save(self.directory, replace(attempt, generation=exposure.generation))
+            hana_replacement_record.save(self.directory, replace(attempt, generation=exposure.generation))
 
         decision = spending.reserve_setup(now, now + timeout, expected_generation=attempt.generation,
                                           before_commit=before_commit)
@@ -323,7 +250,7 @@ class RootReplacement:
     def _refuse_failed_task(self, task: RootTask, attempt: ReplacementAttempt) -> None:
         if task.state not in (TaskState.FAILED, TaskState.FAILED_DETACHED):
             return
-        save(self.directory, replace(attempt, token=uuid4().hex))
+        hana_replacement_record.save(self.directory, replace(attempt, token=uuid4().hex))
         detail = task.message.rstrip('.') if task.message else 'AWS returned no status message'
         message = f'The Hana root task {task.state.value}. {detail}.'
         if task.state == TaskState.FAILED_DETACHED:
@@ -365,7 +292,7 @@ class RootReplacement:
                     with control_lock(self.directory):
                         spending.close_setup(int(clock()), attempt.generation)
                         publish(attempt, state == 'stopped')
-                        path = record_path(self.directory)
+                        path = hana_replacement_record.record_path(self.directory)
                         path.unlink()
                         sync_folder(path.parent)
                     stop_note = 'The box is stopped.' if state in ('stopped', 'stopping') else 'The controller stops the box.'
@@ -400,10 +327,9 @@ class RootReplacement:
                     pass
 
 
-def new_attempt(directory: Path, registered: hana_image.RegisteredImage, preflight: RootPreflight,
-                digest: GuestDigestUnrecorded | RegisteredGuestDigest) -> ReplacementAttempt:
-    attempt = ReplacementAttempt(registered.image, preflight.attached_at, uuid4().hex, 0, digest)
-    save(directory, attempt)
+def new_attempt(directory: Path, registered: hana_image.RegisteredImage, preflight: RootPreflight) -> ReplacementAttempt:
+    attempt = ReplacementAttempt(registered.image, preflight.attached_at, uuid4().hex, 0, registered.digest.value)
+    hana_replacement_record.save(directory, attempt)
     return attempt
 
 
