@@ -598,6 +598,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                     status, content = self.post(accounts_page.PAGE_PATH, "group=showrunners&clear=first")
                     self.assertEqual((status, json.loads(content)), (expected, body))
                     clear.assert_called_once_with("showrunners")
+                with self.subTest(model_color=result), patch.object(accounts_page, "save_color", return_value=result) as save:
+                    status, content = self.post(accounts_page.PAGE_PATH, "key=model.claude-opus-5-5&value=%23e08a5c")
+                    self.assertEqual((status, json.loads(content)), (expected, body))
+                    save.assert_called_once_with("model.claude-opus-5-5", "#e08a5c")
             for form in ("", "key=account.claude1", "label=claude1&value=x", "key=account.claude1&value=x&value=y",
                          "key=account.claude1&value=x&extra=y", "group=units", "group=units&to=claude2&value=x",
                          "key=account.claude1&to=claude2", "group=units&clear=all", "group=units&clear=",

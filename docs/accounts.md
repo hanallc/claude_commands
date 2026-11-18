@@ -138,6 +138,10 @@ Codex `use_credits` is true only when `codex_credit_accounts` in `config/account
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
 The accounts board orders its columns as account, left, role, busy, idle, paused, exited, total, resets, credits, enabled.
+The Models card below the accounts board counts the same sessions by full model ID, effort and role.
+The `unknown` row counts sessions with missing model or effort evidence.
+Select a Models header to sort its rows.
+Use a model swatch to add or change its `model.<id>` color in `config/statusline.conf`.
 Each role has a separate row with its own counts from natedev and the Mac.
 The first role row includes all account values.
 Later rows show only the role and its counts.

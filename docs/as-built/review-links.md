@@ -546,6 +546,11 @@ The arrow sits before a right-aligned label and after a left-aligned label.
 The arrow uses the column gap without adding to the table width.
 The column gap and arrow scale with the root font size.
 The viewer's sort choice stays through refreshes.
+The Models card below the accounts table uses the same sort controls.
+It stores the viewer's sort choice separately and starts in model order.
+The card shows the model ID and its swatch at the start of each consecutive group of that model.
+The model ID and swatch use the theme ink color when no model color is set.
+The two tables have the same total.
 A swatch shows for each board span with a `color_key`.
 An account has one when `config/statusline.conf` has a valid `account.<label>` color.
 The units, showrunners and workers roles use `role.unit-director`, `role.showrunner` and `role.worker`.
@@ -557,7 +562,11 @@ Cancel or Escape restores the saved color.
 The page pauses refresh while the popup is open or a save is pending.
 Save closes the popup at once and posts `key` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
 Saves of one key publish in order; saves of different keys run at the same time.
-The server accepts only an `account.` key or one of the three role keys, and only when the key is in the configuration.
+The server accepts configured `account.` keys, configured keys in `ROLE_COLOR_KEYS`, and valid `model.<id>` keys.
+Save can add a missing model color to `config/statusline.conf` for a full ID in the model catalog.
+A key that ends in a known host name is a host override.
+Save refuses a model ID with that suffix.
+The settings journal lets the Mac keep an accepted color during a pull after the model leaves the catalog.
 It runs this checkout's `scripts/lib/tune.py` through `scripts/lib/py` to publish the value.
 The tune command records the user's Save action and commits the configuration change through its normal publication path.
 Success clears the kept page and refreshes the board when no save is pending.
