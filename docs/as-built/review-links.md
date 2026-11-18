@@ -780,6 +780,8 @@ Each List record stores a `producer`: the fixed staff ID of a staff row with the
 The option refuses a name or ID that does not resolve to exactly one current producer row.
 A new item without the option, and an old record without the field, belong to the record keeper, morty.
 The terminal list shows a Producer column after Owner.
+The CLI shows producers only their assigned items. Morty can see every item.
+See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
 
 When List records have review links, the page reads review items once per render and indexes them by key.
 It stores no review states on the List record.
