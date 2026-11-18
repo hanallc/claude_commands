@@ -127,10 +127,16 @@ class StandingTests(unittest.TestCase):
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
         slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
+        configuration = Path(slot_configuration.environment["CONF_DIR"])
+        _ = write_config_fixture(configuration / "build_folders.conf",
+            "patterns.target={purpose}\npatterns.legacy-stable={purpose}\n"
+            + "patterns.editable={repository}-{owner}/{purpose}\n")
+        _ = write_config_fixture(configuration / "build_steps.conf", "names.integrate=integrate\n")
         home = self.base / "home"
         home.mkdir()
         self.configuration = self.base / "copies.conf"
         self.settings = {"root": str(self.base / "configured-gates"),
+                         "owner.verify": "verify",
                          "remote_registry": str(self.base / "remote-mirrors"),
                          "wait_seconds": "0.01", "git_timeout_seconds": "10",
                          "guard_timeout_seconds": "10"}
@@ -1491,7 +1497,7 @@ with patch.object(subprocess, 'run', pause_clone):
                                ("guard_timeout_seconds", "inf"))
         ]
         variants.extend({key: value for key, value in self.settings.items() if key != missing}
-                        for missing in self.settings if missing != "root")
+                        for missing in ("remote_registry", "wait_seconds", "git_timeout_seconds", "guard_timeout_seconds"))
         for settings in variants:
             with self.subTest(settings=settings):
                 self.write_config(settings)

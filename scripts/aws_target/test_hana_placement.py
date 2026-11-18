@@ -11,12 +11,13 @@ from unittest import mock
 
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY
 from scripts.build_targets import build_targets, target_config
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
 from scripts.buildlog import store
 from scripts.lib import conf, process_start
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import OwningSession
 
@@ -47,9 +48,9 @@ class HanaPlacementTests(CostFixture):
         super().setUp()
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.workload = self.root / 'hana_aws.conf'
-        _ = self.workload.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        text_setting(self.workload, 'enabled', 'on')
-        text_setting(self.workload, 'host', 'fixture-hana')
+        install_hana_spending_settings(self.workload)
+        _ = write_config_fixture(self.workload,
+            'host=fixture-hana\nexecution_transport=hana-control\nrepository_identity=' + KEY + '\nkinds=check,lint\n')
         self.clock = TestClock()
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private inventory', True))
