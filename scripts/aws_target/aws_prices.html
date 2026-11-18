@@ -388,7 +388,12 @@ const scopeFilters = [priceScope, document.getElementById("filter")];
 function drawScope() {
   const costs = scopeCosts();
   for (const group of scopeFilters) {
-    for (const button of group.children) button.setAttribute("aria-pressed", String(button.dataset.scope === costs.scope));
+    for (const button of group.children) {
+      const scope = button.dataset.scope;
+      const label = data.runs.find(entry => entry.scope === scope)?.label;
+      if (label !== undefined && button.textContent !== label) button.textContent = label;
+      button.setAttribute("aria-pressed", String(scope === costs.scope));
+    }
   }
   const cheapest = costs.estimates.find(entry => shown.has(entry.region));
   document.getElementById("cheapest").textContent = cheapest ? cheapest.summary : costs.no_estimate;

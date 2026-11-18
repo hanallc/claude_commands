@@ -2495,7 +2495,7 @@ process.stdout.write(JSON.stringify({
         approved = {"integrate", "test all", "test named", "test affected", "test nightly", "fast track",
                     "promote", "CI", "toolchain trial"}
         modes = {mode.value for mode in SuiteMode}
-        self.assertEqual(modes, memory_feed.GATE_STEPS)
+        self.assertEqual(modes | {"merge-gate", "targeted-test"}, memory_feed.GATE_STEPS)
         for mode in sorted(modes):
             cases = (("--affected",), ("--affected", "--full"), ("--affected", "--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
                 ("--unit", "devtools", "--merge-branch", "sdlc"),
@@ -2525,13 +2525,15 @@ process.stdout.write(JSON.stringify({
 
         copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
                   "python3", "/repo/scripts/production/merge_gate.py", "--tests-only", "--full")
-        page = self.gate_job_page("gate", copied)
-        local, = [row for row in page["walk"] if row.get("queued")]
-        waiting, = [row for row in page["waiters"] if not row.get("kind")]
-        for row in (local, waiting):
-            self.assertIn(row["title"]["step"], approved)
-            self.assertEqual(row["name"], "devtools test all")
-            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+        for step in ("gate", "merge-gate"):
+            with self.subTest(step=step):
+                page = self.gate_job_page(step, copied)
+                local, = [row for row in page["walk"] if row.get("queued")]
+                waiting, = [row for row in page["waiters"] if not row.get("kind")]
+                for row in (local, waiting):
+                    self.assertIn(row["title"]["step"], approved)
+                    self.assertEqual(row["name"], "devtools test all")
+                    self.assertEqual(row.get("about"), "Tests every module of devtools.")
 
         page = self.gate_job_page("gate", (), job=StepJob("test-all"))
         local, = [row for row in page["walk"] if row.get("queued")]

@@ -121,8 +121,6 @@ SHORT_OWNER_STEPS = {"gate": "merge", "test-affected": "targeted",
 GATE_PROGRAMS = {
     "gate": ("gate.py", "merge_gate.py"),
     "test-affected": ("gate.py", "merge_gate.py", "targeted_test.py"),
-}
-_LEGACY_GATE_PROGRAMS = {
     "merge-gate": ("merge_gate.py",),
     "targeted-test": ("targeted_test.py",),
 }
@@ -247,7 +245,7 @@ def live_process_arguments(process: Path, start_time: str) -> list[str] | Comman
 
 def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> StepJob | OtherCommand | CommandUnreadable:
     """Read the gate job from its process or the copies.py caller."""
-    expected = GATE_PROGRAMS.get(step) or _LEGACY_GATE_PROGRAMS.get(step, ())
+    expected = GATE_PROGRAMS.get(step, ())
     if not expected:
         return OTHER_COMMAND
     try:
