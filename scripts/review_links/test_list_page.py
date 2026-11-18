@@ -369,7 +369,7 @@ async function inspect(frame){
        'the generated link keeps the Review sort selected in the controls');
     }
     if(stage===1){
-     check(selected(doc,'owner')==='','the jump resets Owner to All when words or Show hide the card');
+     check(selected(doc,'owner')===ownerId,'The jump keeps the matching Owner.');
      check(search.value==='' && selected(doc,'type')==='change','the jump clears conflicting words and keeps the matching type');
     }
     if(stage===0 && !reloaded){
