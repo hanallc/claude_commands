@@ -915,9 +915,11 @@ run_step() {
         RUN_STEP_PID=$!
         BUILDLOG_PLACEMENT_PREPARED=0
         if [[ "$monitor" == 0 ]]; then set +m; fi
-        # The Mac copy watcher (copy_watch.py) reads the step's group and log here.
+        # The Mac watcher stops the step shell. The supervisor stops its scope.
         if [[ -n "${VERIFY_STEP_INFO_FILE:-}" ]]; then
-            printf 'pgid=%s\nlog=%s\n' "$RUN_STEP_PID" "$step_log" > "$VERIFY_STEP_INFO_FILE.new"
+            local copy_log=$step_log
+            if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then copy_log="$PLACEMENT_SCOPE_STATE.output"; fi
+            printf 'pgid=%s\nlog=%s\n' "$RUN_STEP_PID" "$copy_log" > "$VERIFY_STEP_INFO_FILE.new"
             mv -f "$VERIFY_STEP_INFO_FILE.new" "$VERIFY_STEP_INFO_FILE"
         fi
         if wait "$RUN_STEP_PID"; then
@@ -2750,8 +2752,18 @@ run_placed_scope() {
     printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
         "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
     export BUILDLOG_RESERVED_STEP
+    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0
+    # The scope writes to a file. Only the reader can write to the log pipeline.
+    : > "$output" || return 125
     "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
-        "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@"
+        "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@" > "$output" 2>&1 &
+    supervisor=$!
+    tail -n +1 --follow --pid="$supervisor" --sleep-interval=0.1 "$output" &
+    reader=$!
+    wait "$supervisor" || status=$?
+    wait "$reader" || true
+    rm -f -- "$output"
+    return "$status"
 }
 
 finish_placed_scope() {
@@ -3539,6 +3551,7 @@ fi
 
 stop_run_step() {
     if [[ -n "${RUN_STEP_PID:-}" ]]; then
+        # A scoped Cargo process is outside this shell group. Its supervisor stops it.
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""

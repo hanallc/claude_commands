@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from pathlib import Path
 from typing import final
 from scripts.direct.verify_mac_offload_test_support import VERIFY, VerifyMacOffloadFixture
 from scripts.lib.process_start import Gone, Zombie, process_start
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_admit import scope_members
 
 
 @final
@@ -15,6 +17,8 @@ class VerifyMacCopyResultsTests(VerifyMacOffloadFixture):
     def assert_local_cargo_exited(self) -> None:
         pid = int((self.runner_state / "cargo-compiling").read_text())
         self.assertIsInstance(process_start(pid), (Gone, Zombie))
+        scope = Path((self.runner_state / "cargo-scope").read_text().strip())
+        self.assertFalse(scope_members(scope), scope)
 
     def test_copy_pass_does_not_hide_a_local_scope_stop_error(self) -> None:
         state = self.root / "scope-release"
@@ -35,7 +39,8 @@ run_local_test
 
     def test_copy_failure_first_stops_natedev_and_exits_with_the_copy_status(self) -> None:
         process, _ = self.start_copy_call(copy={"TEST_COPY_MAC": "failed", "TEST_COPY_STATUS": "42"})
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        result = self.finish_verify(process)
+        output, errors = result.stdout, result.stderr
         self.assertEqual(process.returncode, 42, output + errors)
         self.assert_local_cargo_exited()
         self.assertEqual(self.saved_results(), [])
@@ -46,7 +51,8 @@ run_local_test
 
     def test_copy_filtered_pass_first_stops_natedev_and_records_a_mac_pass(self) -> None:
         process, _ = self.start_copy_call("--filter", "alpha", copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        result = self.finish_verify(process)
+        output, errors = result.stdout, result.stderr
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", output)
         self.assert_local_cargo_exited()
@@ -59,7 +65,8 @@ run_local_test
 
     def test_copy_full_pass_first_stops_natedev_and_ends_the_call(self) -> None:
         process, _ = self.start_copy_call(copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        result = self.finish_verify(process)
+        output, errors = result.stdout, result.stderr
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", output)
         self.assert_local_cargo_exited()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from enum import Enum, auto
 import errno
 import fcntl
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import select
 import subprocess
 import sys
+import time
 
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -20,7 +22,6 @@ from scripts.build_queue.admission_records import process_start_time
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
-SCOPE_TERM_GRACE_SECONDS = 5
 
 
 # The scope shell publishes its path before this check. A dead owner permits no start.
@@ -58,37 +59,51 @@ def scope_populated(events: int) -> bool:
         raise
 
 
-def drain_scope(sidecar: Path) -> None:
-    """Stop any remaining members before the shell releases the grant."""
+class ScopePublication(Enum):
+    UNPUBLISHED = auto()
+
+
+def published_scope(sidecar: Path, unit: str) -> Path | ScopePublication:
+    """Read the scope path that the launcher publishes before Cargo starts."""
     try:
-        scope = Path(sidecar.read_text().strip())
+        name = sidecar.read_text().strip()
+    except FileNotFoundError:
+        return ScopePublication.UNPUBLISHED
+    if not name:
+        return ScopePublication.UNPUBLISHED
+    scope = Path(name)
+    if not scope.is_absolute() or scope.name != unit:
+        raise ValueError(f"invalid build scope: {scope}")
+    return scope
+
+
+def drain_scope(scope: Path) -> None:
+    """Stop all scope members and confirm exit before release."""
+    try:
         events = os.open(scope / "cgroup.events", os.O_RDONLY)
     except FileNotFoundError:
+        if scope.exists():
+            raise
         return
     try:
         if not scope_populated(events):
             return
-        try:
-            result = subprocess.run(["systemctl", "--user", "stop", scope.name],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                    text=True, check=False, timeout=SCOPE_STOP_TIMEOUT_SECONDS)
-        except (OSError, subprocess.TimeoutExpired):
-            if scope_populated(events):
-                raise
-            return
-        if not scope_populated(events):
-            return
-        if result.returncode:
-            detail = result.stderr.strip() or f"systemctl exited with status {result.returncode}"
-            raise OSError(f"cannot stop scope {scope.name}: {detail}")
-        raise OSError(f"build scope {scope.name} is still populated after stop")
+        ready = select.poll()
+        ready.register(events, select.POLLPRI | select.POLLERR)
+        _ = (scope / "cgroup.kill").write_text("1\n")
+        deadline = time.monotonic() + SCOPE_STOP_TIMEOUT_SECONDS
+        while scope_populated(events):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"build scope {scope.name} is still populated")
+            _ = ready.poll(round(remaining * 1000))
     finally:
         os.close(events)
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                     scope_shell: str, command: list[str]) -> int:
-    # The supervisor survives a stop of the step group. The launcher stays in it.
+    # The supervisor and the scope survive the exit of the step shell.
     os.setpgid(0, 0)
     unit = f"verify-step-{os.getpid()}.scope"
     sidecar = Path(peak + ".cgroup")
@@ -111,11 +126,11 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             process = subprocess.Popen(
                 ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
                  "--slice=builds.slice", f"--unit={unit}",
-                 f"--property=TimeoutStopSec={SCOPE_TERM_GRACE_SECONDS}s", "--",
+                 "--",
                  "/bin/sh", "-c", 'exec 3>&1; ' + scope_shell, peak, "/bin/sh", "-c", CHECK_SCOPE_OWNER,
                  "verify-scope-owner", str(sidecar), unit, str(caller), caller_start, str(leader), leader_start,
                  *command],
-                stderr=subprocess.DEVNULL, process_group=leader,
+                stderr=subprocess.DEVNULL, process_group=0,
             )
             try:
                 owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
@@ -123,10 +138,16 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             except ProcessLookupError:
                 pass
             finally:
-                if process.poll() is None:
-                    process.kill()
+                scope = published_scope(sidecar, unit)
+                if isinstance(scope, ScopePublication):
+                    # The owner check prevents Cargo from starting after the step shell exits.
+                    if process.poll() is None:
+                        process.kill()
+                    _ = process.wait(timeout=SCOPE_STOP_TIMEOUT_SECONDS)
+                    scope = published_scope(sidecar, unit)
+                if isinstance(scope, Path):
+                    drain_scope(scope)
                 status = process.wait(timeout=SCOPE_STOP_TIMEOUT_SECONDS)
-                drain_scope(sidecar)
                 _ = release.truncate(0)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             # The step's log readers can die before the scope stops.
