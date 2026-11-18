@@ -29,10 +29,7 @@ from typing import ClassVar, cast, override
 
 from scripts.lint import memory_admit as gate
 
-from scripts.lint.memory_test_support import (
-    admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment,
-    write_pressure_reading,
-)
+from scripts.lint.memory_test_support import admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment, write_pressure_reading
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
@@ -48,7 +45,6 @@ GIB = records.GIB
 DEFAULT_WIDTH = records.RequestedTestWidth(8)
 DEFAULT_CALL = test_phase.CallRecord("call-1")
 FIXTURE_POLICY = admission_policy_fixture()
-FIXTURE_CLOUD_GATE_SLOTS = 9
 SERVING_POLL_SECONDS = 0.05
 
 
@@ -357,12 +353,9 @@ class AdmissionFixture(ExitStack):
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
-        config = self.root / "build_admission.conf"
-        if not config.exists():
-            write_memory_config(config, cloud_gate_slots=str(FIXTURE_CLOUD_GATE_SLOTS))
         if configuration := os.environ.get("CONF_DIR"):
             _ = config_environment(Path(configuration))
+        self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         self.temporary: Path = self.root / "tmp"
         self.temporary.mkdir(parents=True, exist_ok=True)
         # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
@@ -396,6 +389,8 @@ class AdmissionFixture(ExitStack):
             "HOME": str(self.root), "TMPDIR": str(self.temporary),
             **interpreter_cache_environment(self.root / "cache")}
         self.enter_context(mock.patch.dict(os.environ, environment))
+        if not (self.root / "build_admission.conf").exists():
+            write_memory_config(self.root / "build_admission.conf")
         self.readings: PrivateReadings = PrivateReadings(self.root)
         self.turn_gate: threading.Lock = threading.Lock()
         self.loop_access: threading.RLock = threading.RLock()

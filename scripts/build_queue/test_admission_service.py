@@ -7,7 +7,10 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_protocol_v1_fixture import parse_reply as decode_legacy
 from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, ScopeActivityReader
 
-from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
+from scripts.lint.memory_test_support import (
+    TEST_CLOUD_GATE_SLOTS, admission_configuration_fixture, admission_policy_fixture, fake_memory_readings,
+    write_pressure_reading,
+)
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
@@ -56,9 +59,7 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import (
-    AdmissionFixture, FIXTURE_CLOUD_GATE_SLOTS, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted,
-)
+from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
 
 
 def setUpModule() -> None:
@@ -3480,7 +3481,7 @@ class CloudAdmissionTests(unittest.TestCase):
     def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            slots = FIXTURE_CLOUD_GATE_SLOTS
+            slots = TEST_CLOUD_GATE_SLOTS
             requests = [self.cloud_request(fixture) for _ in range(slots + 2)]
             grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:slots]]
             first_waiting, second_waiting = requests[slots:]
