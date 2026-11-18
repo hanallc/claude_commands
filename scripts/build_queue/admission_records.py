@@ -887,7 +887,7 @@ class NatedevHeld:
     purpose: str
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission)
+             | BehindHead | GpuSlotWait | ReadyForAdmission | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -900,7 +900,7 @@ class HeadAdmissionStatus:
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
               | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld)
+              | NatedevHeld | placement.CargoFolderWait)
 
 
 def held_text(wait: NatedevHeld) -> str:
@@ -927,6 +927,8 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: " + gpu_slot_text(cause)
     if isinstance(cause, ReadyForAdmission):
         return "head: ready for admission"
+    if isinstance(cause, placement.CargoFolderWait):
+        return "head: " + placement.CARGO_FOLDER_WAIT_REASON
     return f"head: needs {reason.need / GIB:.1f} GiB; room {max(0, reason.decision.room.room) / GIB:.1f} GiB"
 
 
@@ -1159,6 +1161,8 @@ class QueueInputs:
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
+    cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
+    occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1559,6 +1563,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return "another step just started; the queue waits a few seconds between starts"
         case NeedsMemory():
             return "free memory"
+        case placement.CargoFolderWait():
+            return placement.CARGO_FOLDER_WAIT_REASON
         case GpuSlotWait():
             return "GPU test slot"
         case BehindHead():

@@ -269,6 +269,34 @@ class CommandKindNotSent:
 
 
 @dataclass(frozen=True)
+class NoCargoFolder:
+    """The step does not require exclusive use of a Cargo build folder."""
+
+
+@dataclass(frozen=True, order=True)
+class CargoFolder:
+    """The path identifies a Cargo build folder on the local host."""
+    path: Path
+
+    def __post_init__(self) -> None:
+        if self.path.anchor != "/" or ".." in self.path.parts or "\0" in str(self.path):
+            raise ValueError("the Cargo folder must be an absolute, resolved path")
+
+
+CARGO_FOLDER_WAIT_REASON = "waits for the build in the same Cargo folder"
+
+
+@dataclass(frozen=True)
+class CargoFolderWait:
+    """Another step holds the Cargo build folder."""
+
+
+@dataclass(frozen=True)
+class CargoFolderFree:
+    """The Cargo build folder does not prevent admission."""
+
+
+@dataclass(frozen=True)
 class PlacementConstraints:
     """The constraints hold source identity, command, caller, candidates, and selection rules."""
     source_key: SourceIdentity
@@ -279,6 +307,7 @@ class PlacementConstraints:
     candidates: tuple[PlacementCandidate, ...]
     selection: HostSelection = ConfiguredOrder()
     command_kind: CommandKind | CommandKindNotSent = CommandKindNotSent()
+    cargo_folder: CargoFolder | NoCargoFolder = NoCargoFolder()
 
 
 @dataclass(frozen=True)
