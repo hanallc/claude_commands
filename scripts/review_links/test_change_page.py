@@ -43,6 +43,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_link
 from scripts.review_links import question_record
+from scripts.review_links.paths import PAGE_PATH
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -701,13 +702,13 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.command(change_page, change_page.main, []).stdout, result.stdout)
         console = self.request(url.path, {})
         self.assertEqual(console.status, 200)
-        self.assertIn('data-url="/console/review.html" data-title="Review"', console.body)
+        self.assertIn(f'data-url="{PAGE_PATH}" data-title="Review"', console.body)
         self.assertIn('data-url="/console/rebuilds.html" data-title="Rebuilds needed"', console.body)
         manifest = self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST
         token = manifest.read_bytes()
         self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
         redirect = self.http_request("/console/changes.html", {})
-        self.assertEqual((redirect.status, redirect.location), (303, "/console/review.html?type=change"))
+        self.assertEqual((redirect.status, redirect.location), (303, f"{PAGE_PATH}?type=change"))
         changes = self.legacy_browser_reply("/console/changes.html")
         self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
         self.assertIn("const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)

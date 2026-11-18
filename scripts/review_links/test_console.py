@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 from typing import Literal, cast, override
 from unittest.mock import patch
+from urllib.parse import quote
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
@@ -24,6 +25,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, review_link
+from scripts.review_links.paths import PAGE_PATH
 
 
 class ConsoleMarkup(HTMLParser):
@@ -96,8 +98,10 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("const value = fresh.has(entry.dataset.page) && !entry.hasAttribute('aria-current');", source)
         self.assertIn("function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }", source)
         base = f"/{change_page.CONSOLE_FOLDER}"
-        changes = f"{base}/review.html"
-        self.assertIn(f'data-url="{changes}" data-title="Review"', source)
+        self.assertIn(f'data-url="{PAGE_PATH}" data-title="Review"', source)
+        self.assertIn(f'data-review-path="{PAGE_PATH}"', source)
+        self.assertIn(f'href="?page=review&amp;at.review={quote(PAGE_PATH, safe="")}%3Ftype%3Dfor-you%26show%3Dopen"',
+                      source)
         self.assertNotIn('data-page="questions"', source)
         self.assertNotIn('data-page="investigations"', source)
         self.assertIn('data-url="/console/list.html" data-title="The List"', source)
@@ -189,14 +193,14 @@ class ConsoleTests(unittest.TestCase):
                 self.assertIsInstance(pages[2].destination, console.UnavailablePage)
 
     def news_pages(self, changes: set[str], questions: set[str]) -> tuple[console.ConsolePage, ...]:
-        return (console.ConsolePage("changes", "Changes", "list-checks", "Changes", console.AvailablePage("/console/review.html"),
+        return (console.ConsolePage("changes", "Changes", "list-checks", "Changes", console.AvailablePage(PAGE_PATH),
                     lambda _request: frozenset(changes)),
-                console.ConsolePage("questions", "Questions", "list-checks", "Questions", console.AvailablePage("/console/review.html"),
+                console.ConsolePage("questions", "Questions", "list-checks", "Questions", console.AvailablePage(PAGE_PATH),
                     lambda _request: frozenset(questions)))
 
     def test_ready_investigation_answers_mark_the_page_until_a_visit(self) -> None:
         pages = (console.ConsolePage("investigations", "Investigations", "search", "Investigations",
-                    console.AvailablePage("/console/review.html"), investigations_page.waiting_investigations),)
+                    console.AvailablePage(PAGE_PATH), investigations_page.waiting_investigations),)
         root = self.root / "snapshots"
         owner = staff.StaffId("orphan-owner")
         self.assertEqual(console.news(root, pages, "changes"), ())
@@ -245,8 +249,8 @@ class ConsoleTests(unittest.TestCase):
             changes=(change,), queues={}, orders={}, questions=(question,), question_tabs=(), record=staff.StaffSnapshot(()))
         with patch.object(change_browser, "console_reviews", return_value=reviews) as read:
             self.assertEqual(console.news(self.root / "snapshots", (
-                console.ConsolePage("changes","Changes","list-checks","Changes",console.AvailablePage("/console/review.html"),change_browser.waiting_changes),
-                console.ConsolePage("questions","Questions","list-checks","Questions",console.AvailablePage("/console/review.html"),change_browser.waiting_questions)), "changes"), ())
+                console.ConsolePage("changes","Changes","list-checks","Changes",console.AvailablePage(PAGE_PATH),change_browser.waiting_changes),
+                console.ConsolePage("questions","Questions","list-checks","Questions",console.AvailablePage(PAGE_PATH),change_browser.waiting_questions)), "changes"), ())
         self.assertEqual(read.call_count, 1)
         seen = cast(dict[str, list[str]], json.loads((self.root / "snapshots" / change_page.CONSOLE_FOLDER / console.SEEN_NAME).read_text()))
         self.assertEqual((seen["changes"], seen["questions"]), (["a/C1"], ["question/q1"]))
@@ -272,7 +276,7 @@ class ForYouNotifierTests(unittest.TestCase):
         self.assertEqual(len(result["entries"]), 2)
         self.assertEqual(result["entries"][1]["machine"], "mac")
         self.assertEqual(result["entries"][0]["href"],
-                         "?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Ffixture")
+                         f"?page=review&at.review={quote(PAGE_PATH, safe='')}%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Ffixture")
 
     def test_zero_and_unavailable_counts_have_distinct_answers(self) -> None:
         for failures, available in (((), True), ((for_you.UnavailableSource("fixture", "Read failed."),), False)):
@@ -292,7 +296,7 @@ def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
     settings = Path(__file__).resolve().parents[2] / "config"
     pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
-             console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")))
+             console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(PAGE_PATH)))
     with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
         source = console.render(pages, console.UnavailablePage()).decode()
     setup = r'''<script>
@@ -302,8 +306,8 @@ Object.defineProperty(document,'visibilityState',{get:()=>visibility});
 window.setInterval=(run,ms)=>{const id=timers.size+1;timers.set(id,{run,ms});return id;};
 window.clearInterval=id=>timers.delete(id);
 const entries=[{key:'rebuild/natedev',kind:'rebuild',title:'Apply the new console settings',command:'rebuild',
- machine:'natedev',requested_by:'watcher',href:'?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Drebuild%252Fnatedev'},
- {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc',href:'?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Fdemo'}];
+ machine:'natedev',requested_by:'watcher',href:'?page=review&at.review=ENCODED_REVIEW_PATH%3Ftype%3Dfor-you%26show%3Dopen%26item%3Drebuild%252Fnatedev'},
+ {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc',href:'?page=review&at.review=ENCODED_REVIEW_PATH%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Fdemo'}];
 Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{copied=text;}}});
 window.fetch=async(url,options)=>{
  if(String(url).includes('for-you.json')){reads++;if(mode==='failed') throw Error('Read failed.');
@@ -316,7 +320,7 @@ window.fetch=async(url,options)=>{
  if(options?.method==='POST') return new Response('{"new":[]}');
  return nativeFetch(url,options);
 };
-</script>'''
+</script>'''.replace('ENCODED_REVIEW_PATH', quote(PAGE_PATH, safe=''))
     probe = r'''<script>
 (async()=>{
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};

@@ -12,12 +12,7 @@ import sys
 import time
 from typing import cast
 
-from scripts.lib.local_release_events import (
-    RELEASE_CHANGES as RELEASE_CHANGES,
-    IntervalReleasePolling as IntervalReleasePolling,
-    LocalReleaseEvents as LocalReleaseEvents,
-    local_release_waiter as local_release_waiter,
-)
+from scripts.lib import local_release_events
 
 
 def episode_is_assigned(state_file: Path, episode: str) -> bool:
@@ -63,7 +58,7 @@ def wait_for_local_release(seconds: float, call_id: str, episode: str = "",
     if provider_evidence_pending:
         wake_files += (state_file.with_name("queue.json"),)
     deadline = time.monotonic() + seconds
-    with local_release_waiter(holders, release, wake_files=wake_files) as events:
+    with local_release_events.local_release_waiter(holders, release, wake_files=wake_files) as events:
         while True:
             events.arm()
             # Arm before reading state: a release before this

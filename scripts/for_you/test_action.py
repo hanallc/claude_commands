@@ -196,12 +196,13 @@ class ActionTests(unittest.TestCase):
 
     def test_card_url_uses_existing_review_path_and_encoded_key(self) -> None:
         from scripts.review_links import review_link
+        from scripts.review_links.paths import PAGE_PATH
 
         key = "action/00000000-0000-0000-0000-000000000001"
         with patch.object(review_link, "review_root", return_value=self.folder), \
                 patch.dict(os.environ, {"REVIEW_LINKS_HOST": "fixture.invalid"}):
             url = action.card_url(key)
-        self.assertIn("/console/review.html?type=for-you&show=open&item=action%2F", url)
+        self.assertIn(f"{PAGE_PATH}?type=for-you&show=open&item=action%2F", url)
         self.assertFalse(self.folder.exists())
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from scripts.review_links import record_table, review_page
+from scripts.review_links.paths import PAGE_PATH
 from scripts.review_links.test_accounts_page import firefox_probe_results
 
 
@@ -161,6 +162,7 @@ class LinkedTableTests(unittest.TestCase):
         _, start, callbacks = review_page.SCRIPT.partition('function matchesOwner(')
         callbacks = start + callbacks.split('\nfunction loadBodies()', 1)[0]
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
+                  + 'const reviewPath=' + json.dumps(PAGE_PATH) + ';\n'
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
                   + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
@@ -199,7 +201,7 @@ const content={
  querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
 };
 const document={createElement:element};
-const location={search:'',hash:fragment,pathname:'/console/review.html'};
+const location={search:'',hash:fragment,pathname:reviewPath};
 const history={replaceState(_state,_title,url){this.url=url;}};
 const window={},parent=window,departures=new Map();
 let selectedShow='all',requestedShow='all';

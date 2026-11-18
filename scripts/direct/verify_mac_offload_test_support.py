@@ -38,7 +38,7 @@ from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib.local_release_events import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

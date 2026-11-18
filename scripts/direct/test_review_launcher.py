@@ -14,7 +14,7 @@ import unittest
 from scripts.direct import review_launcher_test_support as support
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
-from scripts.direct.local_release_wait import IntervalReleasePolling
+from scripts.lib.local_release_events import IntervalReleasePolling
 from pathlib import Path
 from typing import cast
 import json

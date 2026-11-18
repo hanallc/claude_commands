@@ -34,6 +34,7 @@ from scripts.review_links import change_browser, change_page, console, record_ta
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
+from scripts.review_links.paths import PAGE_PATH
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -1150,7 +1151,7 @@ window.fetch=async url=>{
         waiting = review_page.waiting_items(request)
         self.assertFalse(any(key.startswith('investigation/') for key in waiting))
         self.assertTrue(any(key.startswith('question/') for key in waiting))
-        self.assertEqual(review_page.legacy_url('/console/changes.html','type=questions'),'/console/review.html?type=question')
+        self.assertEqual(review_page.legacy_url('/console/changes.html','type=questions'),f'{PAGE_PATH}?type=question')
 
     def test_each_type_has_the_approved_action_groups_and_later(self) -> None:
         proposal, efficiency = self.decisions()
@@ -1532,7 +1533,7 @@ window.fetch=async url=>{
 
     def test_legacy_links_keep_filters(self) -> None:
         self.assertEqual(review_page.legacy_url('/console/changes.html', 'type=questions&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc'),
-            '/console/review.html?type=question&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc')
+            f'{PAGE_PATH}?type=question&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc')
 
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
@@ -1928,7 +1929,7 @@ window.fetch=async(_url,options={})=>{
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(target.hidden,'F010: a fragment change keeps the saved row hidden');
-  const reloaded=document.createElement('iframe');reloaded.src='/console/review.html#'+new URLSearchParams({item:target.dataset.key});
+  const reloaded=document.createElement('iframe');reloaded.src=REVIEW_PATH+'#'+new URLSearchParams({item:target.dataset.key});
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
   check(!linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
@@ -2103,7 +2104,7 @@ window.fetch=async(_url,options={})=>{
     showValue()==='Done','the refresh keeps the selected Show view');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();</script>"""
+})();</script>""".replace('REVIEW_PATH', json.dumps(PAGE_PATH))
         self_root = self.root
         body = source.replace('<head>','<head>'+setup,1).replace('</body>',probe+'</body>').encode()
         for width in (1440,390):
@@ -2124,7 +2125,7 @@ window.fetch=async(_url,options={})=>{
                             _ = complete.wait(20)
                         else:
                             _ = self.wfile.write(review_page.render(self_root, show=parse_qs(self.path.partition('?')[2]).get('show', ['open'])[0])
-                                if self.path.startswith('/console/review.html') else
+                                if self.path.startswith(PAGE_PATH) else
                                 body if self.path == '/page' else b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
                     def do_POST(self) -> None:
                         results.append(cast(list[str],json.loads(self.rfile.read(int(self.headers['Content-Length'])))))

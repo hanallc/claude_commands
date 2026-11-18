@@ -16,8 +16,10 @@ from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
 from scripts.review_links import change_page, for_you, page_frame, review_link, review_legacy
+from scripts.review_links.paths import PAGE_PATH
 
 PAGE_NAME = "console.html"
+FOR_YOU_PLACE = PAGE_PATH + "?" + urlencode({"type": "for-you", "show": "open"})
 # The console posts the open page here and reads which other pages hold new items.
 NEWS_NAME = "news"
 # The console script's placeKey uses the same prefix for the place it keeps for each page.
@@ -232,7 +234,7 @@ def for_you_payload() -> ForYouPayload:
     for row in (row for row in snapshot.rows if row.status == "open"):
         if len(entries) == 2:
             break
-        place = "/console/review.html?" + urlencode({"type": "for-you", "show": "open", "item": row.key})
+        place = FOR_YOU_PLACE + "&" + urlencode({"item": row.key})
         entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
                         "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
     return {**count, "entries": entries}
@@ -261,7 +263,8 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- REBUILDS -->", f'data-url="{html.escape(rebuilds_path, quote=True)}"')
     content = content.replace("<!-- SHELL -->", f'data-refresh-seconds="{settings.number("page_refresh_seconds")}" '
                               + f'data-frame-retry-seconds="{settings.number("frame_retry_seconds")}" '
-                              + f'data-news="/{change_page.CONSOLE_FOLDER}/{NEWS_NAME}"')
+                              + f'data-news="/{change_page.CONSOLE_FOLDER}/{NEWS_NAME}" '
+                              + f'data-review-path="{html.escape(PAGE_PATH)}"')
     content = content.replace("<!-- REBUILD -->", icon_svg("refresh-cw"))
     button = ('<button type="button" class="for-you-button" data-for-you-toggle data-state="unavailable" '
               + 'aria-controls="action-popover" aria-expanded="false" aria-label="For you: Unavailable">'
@@ -270,6 +273,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
     content = content.replace("<!-- FOR YOU STYLE -->", page_frame.COPY_STYLE + FOR_YOU_STYLE)
     content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + FOR_YOU_SCRIPT)
+    content = content.replace("<!-- FOR YOU LINK -->", html.escape(place_query("review", FOR_YOU_PLACE)))
     content = content.replace("<!-- FOR YOU COPY -->", page_frame.COPY_BUTTON)
     content = content.replace("<!-- FOR YOU REBUILD -->", icon_svg("refresh-cw"))
     content = content.replace("<!-- FOR YOU ACTION -->", icon_svg("list-checks"))
@@ -522,7 +526,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
 <p class="panel-note" role="status" data-for-you-note>The action count is unavailable.</p>
 <div data-for-you-entries></div>
-<footer><a data-for-you-card href="?page=review&amp;at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen">Open For you →</a></footer>
+<footer><a data-for-you-card href="<!-- FOR YOU LINK -->">Open For you →</a></footer>
 </section>
 <template id="for-you-entry"><article>
 <div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
@@ -648,7 +652,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       const filters=new URLSearchParams(previous.search);
       for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
       reviewPlace(filters,kind);filters.set('type',kind);
-      url.searchParams.set('at.review','/console/review.html#'+filters);
+      url.searchParams.set('at.review',shell.dataset.reviewPath+'#'+filters);
       history.replaceState(null,'',url);identity='review';
     }
     const selected = pages.find(entry => entry.dataset.page === identity) || entries[0];

@@ -37,7 +37,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import (
     VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
 )
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.lib.local_release_events import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS

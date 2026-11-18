@@ -21,6 +21,7 @@ from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
 from scripts.review_links import question_record
+from scripts.review_links.paths import PAGE_PATH
 
 
 class ReviewRepairsTests(unittest.TestCase):
@@ -294,7 +295,7 @@ class ReviewRepairsTests(unittest.TestCase):
                 self.end_headers()
                 if self.path == '/complete':
                     _ = complete.wait(25)
-                elif self.path.startswith('/fresh') or self.path.startswith('/console/review.html'):
+                elif self.path.startswith('/fresh') or self.path.startswith(PAGE_PATH):
                     _ = self.wfile.write(review_page.render(case.root, show=parse_qs(route.query).get('show', ['open'])[0]))
                 else:
                     _ = self.wfile.write(document)

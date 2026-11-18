@@ -35,6 +35,7 @@ from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review, investigation, staff, the_list
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, images, investigations_page, list_page, review_page, serve
+from scripts.review_links.paths import PAGE_PATH
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -110,7 +111,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         for query, show in (('', 'open'), ('?show=Done', 'Done'), ('?show=all', 'all'),
                             ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting')):
             with self.subTest(show=show), patch.object(review_page, 'render', return_value=b'Review') as render:
-                reply = self.request('/console/review.html'+query)
+                reply = self.request(PAGE_PATH + query)
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b'Review')
                 render.assert_called_once_with(self.root, show=show)
@@ -146,7 +147,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn("frame-src 'self'", headers["content-security-policy"])
         self.assertNotEqual(headers.get("x-frame-options"), "DENY")
         self.assertIn(b"<h1>Hana console</h1>", body)
-        self.assertIn(b'data-url="/console/review.html" data-title="Review"', body)
+        self.assertIn(f'data-url="{PAGE_PATH}" data-title="Review"'.encode(), body)
         self.assertIn(b'href="?page=rebuilds" data-page="rebuilds"\ndata-url="/console/rebuilds.html"', body)
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).is_file())
         for path in ("/console", "/console?page=questions"):

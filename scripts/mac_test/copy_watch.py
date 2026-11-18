@@ -595,7 +595,8 @@ class Watch:
 
     def run(self, wakeup: Wakeup) -> WatchReport:
         from scripts.buildlog import store
-        from scripts.direct.local_release_wait import LocalReleaseEvents, episode_is_assigned, local_release_waiter
+        from scripts.direct.local_release_wait import episode_is_assigned
+        from scripts.lib.local_release_events import LocalReleaseEvents, local_release_waiter
 
         tick = min(1.0, self.poll_s)
         state_file = store.root() / "admission/state.json"

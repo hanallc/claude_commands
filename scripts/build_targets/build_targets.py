@@ -11,7 +11,6 @@ except FileNotFoundError:
 
 import argparse
 import fcntl
-import importlib
 import io
 import json
 import os
@@ -26,11 +25,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
-from typing import Literal, Protocol, TypedDict, cast, final, get_args
+from typing import Literal, TypedDict, cast, final, get_args
 
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
+from scripts.lib.local_release_events import IntervalReleasePolling, LocalReleaseEvents, local_release_waiter
 from scripts.mac_test import claim_state
 from scripts.build_queue.placement import CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
 
@@ -1108,16 +1108,7 @@ class NoActiveLocalHoldWait:
         raise RuntimeError("local hold waiting requires an active wait")
 
 
-class LocalHoldWait(Protocol):
-    """A hold wait owns and closes its notification or polling mechanism."""
-
-    def arm(self) -> None: ...
-    def wait(self, seconds: float) -> None: ...
-    def __enter__(self) -> "LocalHoldWait": ...
-    def __exit__(self, *_arguments: object) -> None: ...
-
-
-LOCAL_HOLD_WAIT: ContextVar[LocalHoldWait | NoActiveLocalHoldWait] = ContextVar(
+LOCAL_HOLD_WAIT: ContextVar[LocalReleaseEvents | IntervalReleasePolling | NoActiveLocalHoldWait] = ContextVar(
     "local_hold_wait", default=NoActiveLocalHoldWait())
 
 
@@ -1261,10 +1252,6 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
     from scripts.build_hold import build_hold
     from scripts.build_targets.targets import Held, StateUnreadable
 
-    # This CLI's import root excludes the worker module.
-    # Use importlib at the typed provider boundary.
-    release_waiter = cast(Callable[[Path, Path], LocalHoldWait], getattr(
-        importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))
     _ = pid
     if not leave_hook and not caller:
         leave_hook = os.environ.get("BUILDLOG_MAC_IDLE_HOOK", "")
@@ -1292,7 +1279,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
-        release_events = notifications.enter_context(release_waiter(
+        release_events = notifications.enter_context(local_release_waiter(
             build_hold.holder_directory(), build_hold.release_directory()))
         context = LOCAL_HOLD_WAIT.set(release_events)
         _ = notifications.callback(LOCAL_HOLD_WAIT.reset, context)

@@ -75,7 +75,7 @@ from scripts.production.gate_modules import GateRefused, discover_test_modules, 
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
-from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
+from scripts.lib.local_release_events import local_release_waiter  # noqa: E402
 from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
