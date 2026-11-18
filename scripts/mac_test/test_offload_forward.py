@@ -13,7 +13,7 @@ from unittest import mock
 
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import placement
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import eligibility, nextest_log, offload
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
@@ -80,10 +80,11 @@ class OffloadForwardTests(OffloadCommandFixture):
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
             + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
             + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
+            + nextest_log.capture_function(config.values) + " && "
             + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
-            + '~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
+            + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
             + 'cd "$HOME"/.local/state/mac-test/test-mirror/hana && trim_started=$(date +%s); '
             + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
@@ -113,7 +114,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
         self.assertTrue(fetch.startswith("cd .local/state/mac-test/test-mirror/hana && { find "))
-        self.assertIn(" || :; } && rm -rf -- target/shots && PATH=", fetch)
+        self.assertIn(" || :; } && rm -rf -- target/shots && run_nextest_logged() ", fetch)
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)

@@ -285,6 +285,20 @@ class RunnerCompletionTests(unittest.TestCase):
                 }])
 
 
+    def test_split_utf8_tail_preserves_status_and_counts_raw_bytes(self) -> None:
+        wire = b"mac_test: tail fragment: \xa9\nmac_exit=42\nmac_cleanup=kept\n"
+        process = mock.Mock(stdout=io.BytesIO(wire), wait=mock.Mock(return_value=0))
+        controller = offload.ProcessController()
+        with mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO()) as output:
+            result = controller.stream_mac_run(["ssh", "fixture", "run"])
+        self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupKept()))
+        self.assertEqual(output.getvalue(), "mac_test: tail fragment: \ufffd\n")
+        self.assertEqual(controller.attempt_evidence.traffic.transfers, [{
+            "operation": "ssh_run", "sent_bytes": 3,
+            "received_bytes": len(wire), "complete": True,
+        }])
+
+
 class CompletedRunSyncTests(unittest.TestCase):
     def test_finished_runs_exchange_after_release_and_preserve_results(self) -> None:
         for target in ("linux", "mac"):

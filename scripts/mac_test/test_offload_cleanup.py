@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ import io
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
-from scripts.mac_test import eligibility, offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import test_hang_guard
@@ -177,11 +178,43 @@ exit "$CLEANUP_TEST_STATUS"
         )
 
     def cleanup_lines(self, answer: subprocess.CompletedProcess[str]) -> list[str]:
-        lines = answer.stdout.splitlines()
+        lines = [line for line in answer.stdout.splitlines()
+                 if not line.startswith("mac_test: full nextest log: ")]
         if lines[-1] == "mac_cleanup=skipped":
             return lines
         self.assertRegex(lines[2], r"^mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=(yes|no|unknown)$")
         return lines[:2] + lines[3:]
+
+    def test_nextest_replays_success_and_retains_bounded_failure_output(self) -> None:
+        summary = "     Summary [  0.1s] 1 test run: 1 failed, " + "detail " * 30
+        fragment = "mac_exit=99\nlast output"
+        output = "     Summary [  0.0s] 1 test run: 1 passed\n" + "\033[31m" + summary + "\033[0m\n"
+        output += "earlier output\n" * 8 + "earlier " + fragment
+        _ = (self.root / "nextest-out").write_text(output)
+        lint = self.home_directory / ".claude/scripts/lint/lint"
+        write_shell(lint, 'cat "$CLEANUP_TEST_DIR/nextest-out" >&2\nexit "$CLEANUP_TEST_STATUS"\n')
+        limits = ((nextest_log.TAIL_BYTES, str(len(fragment))), (nextest_log.SUMMARY_BYTES, "52"))
+        logs = self.home_directory / nextest_log.DIRECTORY
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                failed = self.run_remote(shell, 42, ("--target-dir=other-target",), budget_values=limits)
+                self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout)
+                self.assertEqual((failed.returncode, failed.stderr), (0, ""))
+                log, = logs.iterdir()
+                self.assertRegex(log.name, nextest_log.LOG_NAME)
+                self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+                self.assertEqual(log.read_text(), output)
+                self.assertEqual(failed.stdout, (
+                    f"mac_test: full nextest log: {log}\n"
+                    + f"mac_test: tail fragment: {fragment}\n{summary[:52]}\n"
+                    + "mac_exit=42\nmac_cleanup=skipped\n"
+                ))
+
+                passed = self.run_remote(shell, 0, ("--target-dir=other-target",), budget_values=limits)
+                self.assertEqual((passed.returncode, passed.stderr), (0, ""))
+                self.assertEqual(passed.stdout, output + "\nmac_exit=0\nmac_cleanup=skipped\n")
+                self.assertEqual(list(logs.iterdir()), [log])
+                log.unlink()
 
     def test_remote_text_removes_only_old_abandoned_sessions_before_building(self) -> None:
         minutes = 3
@@ -385,7 +418,7 @@ exit 1
                     with self.subTest(shell=shell, status=status, words=words):
                         answer = self.run_remote(shell, status, words)
                         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=skipped"])
+                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=skipped"])
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((other_target / "nextest-output").read_text(), "built\n")
                         self.assertEqual(cast(list[str], json.loads((self.root / "lint-arguments.json").read_text())), ["nextest", *words])

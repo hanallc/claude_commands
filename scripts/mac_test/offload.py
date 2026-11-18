@@ -64,7 +64,7 @@ from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
 from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
-from scripts.mac_test import eligibility
+from scripts.mac_test import eligibility, nextest_log
 from scripts.mac_test.eligibility import (
     MacVerb,
     NonBusyMacDeclineReason,
@@ -1058,7 +1058,7 @@ class ProcessController:
             for raw_line in output:
                 if isinstance(raw_line, bytes):
                     received_bytes += len(raw_line)
-                    line = raw_line.decode()
+                    line = raw_line.decode("utf-8", errors="replace")
                 else:
                     received_bytes += len(raw_line.encode("utf-8"))
                     line = raw_line
@@ -1996,9 +1996,11 @@ def remote_test_command(
         "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
         if isinstance(request.placement, AssignedOffloadRequest) else ""
     )
+    capture = nextest_log.capture_function(config.values) + " && " if request.verb == "nextest" else ""
+    runner = "run_nextest_logged " if capture else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
@@ -2011,7 +2013,7 @@ def remote_test_command(
         f"{forced_config}"
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
+        f"{runner}~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
     )
 
 
@@ -2512,6 +2514,11 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        try:
+            step_command = remote_test_command(config, request, repository, copied.tree_key)
+        except ValueError as error:
+            evidence.execution = placement.ExecutionNotStarted()
+            return DeclinedMacRun("state", elapsed_seconds(started), str(error))
         eligibility.mirror_busy_path(repository.name, request.target).unlink(missing_ok=True)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
@@ -2557,8 +2564,7 @@ def claimed_run(
             evidence.launch_authorized = True
         release_allowed = False
         identity = controller.claim_identity
-        command = copies.remote_use_command(request_mirror(config, request, repository),
-                                           remote_test_command(config, request, repository, copied.tree_key))
+        command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         remote_status = controller.stream_mac_run(

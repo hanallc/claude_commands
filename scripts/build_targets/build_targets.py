@@ -418,6 +418,10 @@ def fixed_placement_constraints(
             key = f"linux_only.{repository.name}"
             if key not in config.values:
                 host_eligibility = placement.FixedExclusion("repo")
+            elif selection == ROUTED and kind in eligibility.comma_values(
+                config.values.get(f"offload_exclude.{repository.name}", "")
+            ):
+                host_eligibility = placement.FixedExclusion("offload_exclude")
             else:
                 excluded = eligibility.comma_values(config.values[key])
                 if eligibility.linux_only_applies(kind) and eligibility.has_linux_only(repo_root, package, excluded):
