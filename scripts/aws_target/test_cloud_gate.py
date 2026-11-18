@@ -2164,7 +2164,8 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                     cloud_gate.save(folder / 'request.json', request)
                     cloud_gate.save(folder / 'deployment.json', self.deployment)
                 reply = subprocess.run([sys.executable, '-c', script, str(cohort), str(self.state), str(self.settings),
-                                        str(self.now), str(number)], capture_output=True, text=True, timeout=30)
+                                        str(self.now), str(number)], capture_output=True, text=True,
+                                        timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(reply.returncode, 1 if number == signal.SIGINT else -number, reply.stderr)
                 api = AwsCli('fixture', 'us-east-1', 1, execute=FakeGateAws())
                 with mock.patch.object(aws_trial, 'AwsCli', return_value=api):

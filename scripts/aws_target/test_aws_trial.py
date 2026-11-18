@@ -834,7 +834,9 @@ else:
         from scripts.aws_target import gate_box, cloud_gate
         box = self.root / 'box'
         box.mkdir()
-        request = trial.module_request(self.request(), 'fixture/test_sample.py', 'attempt', int(time.time()) + 600)
+        guest_deadline_s = 600
+        guest_delivery_margin_s = 60
+        request = trial.module_request(self.request(), 'fixture/test_sample.py', 'attempt', int(time.time()) + guest_deadline_s)
         request['module_time_limit_s'] = limit
         cloud_gate.save(box / 'request.json', request)
         cloud_gate.save(box / 'links.json', {'production': True, 'step': 'size', 'log': 'log', 'result': 'result',
@@ -849,7 +851,8 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
         curl.chmod(0o755)
         _ = (box / 'guest.py').write_text(gate_box.GUEST)
         trace = self.root / 'trace.jsonl'
-        result = subprocess.run([sys.executable, str(box / 'guest.py')], capture_output=True, text=True, timeout=30,
+        result = subprocess.run([sys.executable, str(box / 'guest.py')], capture_output=True, text=True,
+            timeout=guest_deadline_s + guest_delivery_margin_s,
             env={**os.environ, 'GATE_BOX_DIR': str(box), 'PAIRED_TRACE': str(trace),
                  'PATH': str(tools) + os.pathsep + os.environ['PATH'], 'HOME': str(box)})
         self.assertEqual(result.returncode, 0, result.stderr)
