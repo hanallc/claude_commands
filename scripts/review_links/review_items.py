@@ -640,6 +640,8 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                                                 strict=sources is not None, sources=sources)
             paths = [selection.path] if isinstance(selection, ExactReviewRecord) else store_paths(folders, sources)
             for path in paths:
+                if sources is not None and not isinstance(sources, ReviewSourceStamps):
+                    sources.append(path)
                 with guard_source(path, sources, skip=(FileNotFoundError, investigation.InvestigationError)):
                     if not path.is_file():
                         continue
@@ -704,6 +706,19 @@ def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.Staff
 def is_open_proposal(issue: Issue) -> bool:
     return (issue.value('record_type') != 'question' and issue.value('status') == 'open'
             and PROPOSAL_TAG in issue.fields.get('tags', []))
+
+
+def backlog_review_rows(path: Path, sources: list[Path] | None, *, exact: bool) -> Iterator[proposals_table.Row]:
+    """Read linked files when the caller requires complete source reads."""
+    if not exact and sources is not None and not isinstance(sources, ReviewSourceStamps):
+        yield from (row for row in proposals_table.ledger_rows(path, sources=sources)
+                    if row.state == proposals_table.REVIEW_STATE)
+        return
+    for line in proposals_table.read_lines(path, sources=sources):
+        match = proposals_table.BACKLOG_LINE.fullmatch(line)
+        if match is not None and match['state'] == 'proposed':
+            title = proposals_table.BACKLOG_FILE.sub('', match['title'])
+            yield proposals_table.Row('plan backlog', title, match['date'], proposals_table.REVIEW_STATE)
 
 
 def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
@@ -806,13 +821,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             if not selection.includes(path):
                 continue
             with guard_source(path, sources):
-                for line in proposals_table.read_lines(path, sources=sources):
-                    match = proposals_table.BACKLOG_LINE.fullmatch(line)
-                    if match is None or match['state'] != 'proposed':
-                        continue
-                    title = proposals_table.BACKLOG_FILE.sub('', match['title'])
-                    row = proposals_table.Row('plan backlog', title, match['date'], proposals_table.REVIEW_STATE)
-                    with guard_source(path, sources, entry=title):
+                for row in backlog_review_rows(path, sources, exact=exact):
+                    with guard_source(path, sources, entry=row.proposal):
                         since = proposals_table.day(row.date, sources=sources)
                         entry = urgency.Entry(f"{proposals_table.BACKLOG_KEY}{path}: {row.proposal}", row,
                                               since=since, value=(proposals_table.UNSCORED,))
