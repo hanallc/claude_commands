@@ -563,7 +563,8 @@ A failed publication returns 503 with tune's last stderr line.
 A failed save restores the prior color and shows `<name>: <reason>` in the status line.
 
 The `next` column follows the role color swatch.
-A selected Claude group (`units ✓` or `showrunners ✓`) shows its first target in that account's color and bold text.
+A selected Claude group shows its first target in bold text with the target account color.
+The same control serves units, showrunners, and producers.
 An empty group shows gray `none`.
 Its arrow button opens the move menu with a click, Enter, or Space.
 The button exposes its menu state through ARIA attributes.
