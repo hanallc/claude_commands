@@ -816,10 +816,9 @@ def proposal_store_folders(owner: staff.StaffId, member: staff.StaffRow | None, 
     current: tuple[Path, ...] = ()
     if member is not None and member.kind == 'producer' and isinstance(member.doc, staff.LiveDoc):
         with guard_source(member.doc.path, sources, skip=(FileNotFoundError,)):
-            if not member.doc.path.is_dir():
-                folder = review_submissions.proposal_folder(member)
-                if isinstance(folder, Path):
-                    current = (folder,)
+            folder = review_submissions.proposal_folder(member)
+            if isinstance(folder, Path):
+                current = (folder,)
     return record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, current, document=doc,
                                       strict=sources is not None, sources=sources)
 

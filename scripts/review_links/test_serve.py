@@ -204,6 +204,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.new_item_http(encoded(payload)).status, 503)
             self.assertEqual(cache.get().records, {})
 
+    def test_new_item_offers_a_producer_with_a_directory_document(self) -> None:
+        _ = self.review_fixture()
+        directory = self.root.parent / 'brain'
+        directory.mkdir()
+        producer = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
+        response = self.new_item_http()
+        self.assertEqual(response.status, 200)
+        fields = cast(dict[str, object], json.loads(response.body))
+        self.assertEqual(fields['recipients'], [{'id': producer.id, 'name': producer.name, 'proposal': False}])
+
     def test_new_item_publishes_native_records_before_success(self) -> None:
         from scripts.review_links.test_review_submissions import EVIDENCE, PNG, identify_fixture_image
 
