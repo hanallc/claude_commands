@@ -579,6 +579,8 @@ GATE_USER_ID = 'fixture-immutable-user'
 GATE_BUCKET = f'cloud-claude-gate-{DEPLOYMENT}'
 GATE_POLICY_NAMES = ('GateScalerPolicy', 'GateGpuTrialScalerPolicy')
 MANAGED_POLICY = 'AWS::IAM::ManagedPolicy'
+GATE_TRIAL_GPU_TYPE = 'g6.xlarge'
+GATE_HANA_GPU_TYPE = 'g6.2xlarge'
 
 
 @final
@@ -635,10 +637,32 @@ class GatePlanTests(CostFixture):
         _ = (self.state / 'deployment.json').write_text(json.dumps(saved | overrides))
 
     def run_plan(self, *arguments: str) -> tuple[int, str]:
-        gate = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
-        lines = ['regions=' + ' '.join(self.regions) if line.startswith('regions=') else line
-                 for line in gate.read_text().splitlines()]
-        _ = conf.path('cloud_gate').write_text('\n'.join(lines) + '\n')
+        _ = conf.path('cloud_gate').write_text(f"""regions={' '.join(self.regions)}
+credential_file={self.credentials_path}
+instance_types=m7a.8xlarge
+hana_gpu_instance_types={GATE_HANA_GPU_TYPE}
+gpu_size_trial_spot_max_usd_per_hour={json.dumps({GATE_TRIAL_GPU_TYPE: '0.25'})}
+gpu_size_trial_limit_usd=2
+gpu_size_trial_box_extra_usd=0.05
+# whole: 1..
+gpu_size_trial_lifetime_minutes=10
+# range: 1..
+api_timeout_s=5
+# whole: 1..
+root_gib=30
+# range: 0..
+spot_max_usd_per_hour=0.5
+# whole: 1..
+artifact_days=7
+# whole: 1..
+log_days=7
+# whole: 1..
+expiry_schedule_minutes=5
+# whole: 1..
+expiry_timeout_s=20
+# whole: 1..
+expiry_memory_mib=128
+""")
         before = {path: path.read_bytes() if path.is_file() else None for path in self.root.rglob('*')}
         output, errors = StringIO(), StringIO()
         argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--settings', str(self.settings),
@@ -817,7 +841,10 @@ class GatePlanTests(CostFixture):
         contexts = {ledger.text(row, 'ContextKeyName'): row
                     for row in ledger.rows({'rows': request['ContextEntries']}, 'rows')}
         self.assertEqual(contexts['aws:RequestedRegion']['ContextKeyValues'], [region])
-        if action == 'ec2:RunInstances' and ':instance/' in resource:
+        if action == 'ec2:GetSpotPlacementScores':
+            self.assertEqual(resource, '*')
+            self.assertEqual(contexts['ec2:Region']['ContextKeyValues'], [region])
+        elif action == 'ec2:RunInstances' and ':instance/' in resource:
             self.assertEqual(contexts['ec2:InstanceMarketType']['ContextKeyValues'], ['spot'])
             self.assertEqual(contexts['aws:RequestTag/GateDeployment']['ContextKeyValues'], [DEPLOYMENT])
             self.assertEqual(contexts['aws:RequestTag/GpuSizeTrial']['ContextKeyValues'], ['setup-probe'])
@@ -841,12 +868,6 @@ class GatePlanTests(CostFixture):
         decision = 'implicitDeny' if self.failure == action and self.failure_region == region else 'allowed'
         return {'EvaluationResults': [{'EvalActionName': action, 'EvalResourceName': resource, 'EvalDecision': decision}]}
 
-    @staticmethod
-    def gpu_types() -> set[str]:
-        from scripts.aws_target import cloud_gate, gpu_size_trial
-
-        return set(gpu_size_trial.settings().spot_max_usd_per_hour) | set(cloud_gate.settings().words('hana_gpu_instance_types'))
-
     def calls_in(self, region: str) -> list[tuple[str, str]]:
         return [(service, operation) for place, service, operation in self.calls if place == region]
 
@@ -866,14 +887,19 @@ class GatePlanTests(CostFixture):
                     ('ec2', 'describe-images'), ('cloudformation', 'describe-stacks')]
         reads = [('iam', action) for action in ('ec2:DescribeInstances', 'ec2:DescribeInstanceTypeOfferings',
                  'ec2:DescribeSpotPriceHistory', 'servicequotas:GetServiceQuota', 'ce:GetCostAndUsage')]
+        scores = [('iam', 'ec2:GetSpotPlacementScores')]
         launch = [('iam', action) for action in (
             *(['ec2:RunInstances'] * 6), 'ec2:CreateTags', 'ec2:RunInstances', 'ec2:CreateTags')]
         finish = [('iam', 'iam:PassRole'), ('iam', 'ec2:TerminateInstances')]
         s3 = [('iam', action) for action in ('s3:PutObject', 's3:GetObject', 's3:PutObject', 's3:GetObject',
                                            's3:ListBucket', 's3:AbortMultipartUpload')]
-        count = len(self.gpu_types())
-        self.assertEqual(self.calls_in(GATE_HOME), home + change + policies + reads + launch * count + finish + s3)
-        self.assertEqual(self.calls_in(GATE_REGION), regional + change + launch * count + finish)
+        count = len((GATE_TRIAL_GPU_TYPE, GATE_HANA_GPU_TYPE))
+        for region, calls in (
+            (GATE_HOME, home + change + policies + reads + scores + launch * count + finish + s3),
+            (GATE_REGION, regional + change + scores + launch * count + finish),
+        ):
+            with self.subTest(region=region):
+                self.assertEqual(self.calls_in(region), calls)
 
     def test_busy_gate_controller_refuses_before_aws(self) -> None:
         with control_lock(self.state / 'gate-up'):
@@ -1054,11 +1080,14 @@ class GatePlanTests(CostFixture):
 
     def test_regional_recovery_requires_a_passing_simulation(self) -> None:
         self.statuses[GATE_REGION] = 'ROLLBACK_COMPLETE'
-        self.failure, self.failure_region = 'ec2:TerminateInstances', GATE_REGION
-        status, output = self.run_plan()
-        self.assertEqual(status, 1, output)
-        self.assertIn('us-west-2: refused: Gate scaler ec2:TerminateInstances denied.', output)
-        self.assertNotIn(('cloudformation', 'create-change-set'), self.calls_in(GATE_REGION))
+        for action in ('ec2:TerminateInstances', 'ec2:GetSpotPlacementScores'):
+            with self.subTest(action=action):
+                self.calls.clear()
+                self.failure, self.failure_region = action, GATE_REGION
+                status, output = self.run_plan()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f'{GATE_REGION}: refused: Gate scaler {action} denied.', output)
+                self.assertNotIn(('cloudformation', 'create-change-set'), self.calls_in(GATE_REGION))
 
     def test_absent_regional_stack_never_creates_a_review_stack(self) -> None:
         self.statuses[GATE_REGION] = 'absent'

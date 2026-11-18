@@ -1778,7 +1778,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                         raise KeyboardInterrupt
                     resolve(attempt, state, instance_type=instance_type)
                 @contextmanager
-                def slot(_repo: Path, sidecar: Path, _mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
+                def slot(_repo: Path, sidecar: Path, job: object) -> Generator[cloud_gate.CloudReservation]:
+                    self.assertEqual(job, aws_trial.PAIRED_TRIAL_JOB)
                     try:
                         yield cloud_gate.CloudReservation(sidecar)
                     finally:
@@ -2862,6 +2863,17 @@ class CloudRouteTests(CostFixture):
                             record.need, admission_records.ReadyForAdmission(), unit=identity.get('unit', ''))
                         self.assertEqual(queue_evidence.step_labels(step, {'fixture-owner': owner}), owner)
                         self.assertEqual(read_step_names().for_owner(step.step, owner.unit, owner.role), 'fixture-unit merge')
+
+    def test_paired_trial_admission_records_its_named_test_job(self) -> None:
+        with cloud_gate.cloud_reservation(self.repo, self.root / 'trial.sidecar', aws_trial.PAIRED_TRIAL_JOB):
+            record, = self.admission.caller_reservations().values()
+            self.assertEqual(record.step, 'test-modules')
+            self.assertEqual(record.queue_waiter.get('step'), 'test-modules')
+            self.assertEqual(record.gate_job, aws_trial.PAIRED_TRIAL_JOB)
+            reading = admission_client.view()
+            assert isinstance(reading, wire.CloudQueueRead)
+            row, = reading.cloud
+            self.assertEqual(row.identity.job, aws_trial.PAIRED_TRIAL_JOB)
 
     def test_service_command_preserves_credential_override(self) -> None:
         credential = self.root / 'override-credentials'
