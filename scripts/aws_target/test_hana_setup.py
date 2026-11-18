@@ -301,6 +301,7 @@ class HanaSetupTests(CostFixture):
                 self.assert_root_replaced(aws, output)
                 self.assertEqual(remote.read_record(self.state / 'hana/setup.json')['version'], version)
                 aws.calls.clear()
+                text_setting(self.workload, 'execution_shell', 'ci')
                 self.assertTrue(subject.hana_setup(approve_resources=True))
                 self.assertTrue(output.getvalue().endswith('Hana image is current.\n'))
                 self.assertTrue(all(call.startswith('describe-') for call in aws.calls))

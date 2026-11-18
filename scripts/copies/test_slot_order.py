@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import unittest
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -653,7 +654,7 @@ placement_once
             started = self.next_step(process)
             grant = client.read_assignment(Path(started.get("assignment", "")))
             self.assertIsInstance(grant, wire.Assignment)
-            self.assertEqual(grant.assignment.source_key, placement.SourceKeyKnown(treekey.tree_key(started["cwd"]) or ""))
+            self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(treekey.tree_key(started["cwd"]) or ""))
             self.assertEqual((Path(started["cwd"]) / "src/lib.rs").read_text(), "pub fn changed() {}\n")
             self.assertEqual((Path(started["cwd"]) / "src/merged.rs").read_text(), "pub fn merged() {}\n")
             self.assertFalse((tools.root / "src/merged.rs").exists())
@@ -693,7 +694,7 @@ placement_once
                 self.assertEqual(request.constraints.command_kind, arguments[0])
                 self.assertEqual(request.constraints.package, "sample")
                 self.assertEqual(request.constraints.repository, str(tools.root))
-                self.assertEqual(request.constraints.source_key, placement.SourceKeyKnown(source_key))
+                self.assertEqual(request.constraints.source_key, execution_identity.SourceKeyKnown(source_key))
                 self.assertEqual(request.constraints.selection, selection)
                 self.assertEqual(request.route, route)
                 self.assertIsInstance(request.local, wire.LocalAdmissionContext)

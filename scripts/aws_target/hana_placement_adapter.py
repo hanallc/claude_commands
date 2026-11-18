@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from scripts.build_queue import execution_identity
 from scripts.aws_target.hana_placement import (
     ExecutionTransport, HanaControlTransport, HanaHostGeneration,
     DisabledHanaRoute, EnabledHanaRoute, HanaRouteSettings, HanaCheck, HanaClippyJudgment,
@@ -101,7 +102,6 @@ def controller_for(transport: HanaControlTransport, *, read_only: bool = False) 
 def validate_assignment(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity
                         ) -> HanaControlTransport | HanaClaimRefused:
     """Check the configured destination, scope, source, and live local holder."""
-    from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.lib import conf, process_start
     from scripts.mac_test import claim_state
@@ -118,7 +118,7 @@ def validate_assignment(assignment: placement.PlacementAssignment, holder: place
     if (destination.provider != 'ssh' or destination.host != transport.host or destination.slot != 1
             or not isinstance(destination.scope, claim_state.RepositoryScope)
             or destination.scope.slot != 1 or destination.scope.key != settings.repository_key
-            or not isinstance(assignment.source_key, placement.SourceKeyKnown)
+            or not isinstance(assignment.source_key, execution_identity.SourceKeyKnown)
             or not assignment.source_key.key or not assignment.episode or not assignment.attempt):
         return HanaClaimRefused('The assignment differs from the configured Hana scope')
     if (holder.host != store.host_name() or holder.pid <= 0
@@ -145,7 +145,7 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
     if controller.workload_path.resolve() != transport.settings.resolve():
         return HanaClaimRefused('The lifecycle controller differs from the assigned workload')
     destination = assignment.destination
-    execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+    execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
     reference = placement.ProviderClaimReference('ssh', destination.target, destination.scope,
         execution, assignment.episode, assignment.attempt)
     paths = claim_state.state_paths(destination.target)
@@ -202,12 +202,11 @@ def release_assigned(assignment: placement.PlacementAssignment, holder: placemen
                      controller: box.HanaController) -> bool:
     """Release the exact target claim after durable execution and lifecycle settlement."""
     from scripts.aws_target.hana_execution import execution_command_settled
-    from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.mac_test import claim_state
 
     destination = assignment.destination
-    execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+    execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
     if not execution_command_settled(controller.directory, execution):
         return False
     target = target_config.configured_ssh_target(destination.target)
@@ -310,7 +309,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
             record = claim.record
             execution = record['claim_id']
             if ('remote_host' not in record or record['remote_host'] != transport.host
-                    or execution != placement.assigned_claim_id(record['episode'], record['attempt'])
+                    or execution != execution_identity.assigned_claim_id(record['episode'], record['attempt'])
                     or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
                     or any(row.execution == execution for row in snapshot.claims)
                     or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution):
@@ -334,7 +333,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
         block = mac_test.blocking_claim_block(paths, key.session)
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
-    executions: list[tuple[placement.ProviderClaimReference, placement.ExecutionEvidence]] = []
+    executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
     generation = (generation_text(HanaHostGeneration(snapshot.deployment.deployment,
         snapshot.boot.start_token, snapshot.boot.boot_id)) if isinstance(snapshot.boot, box.VerifiedBoot) else '')
     holder: placement.ResourceHolder = placement.ResourceHolderUnknown()

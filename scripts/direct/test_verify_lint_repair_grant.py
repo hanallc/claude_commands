@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service, placement
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
@@ -185,7 +186,7 @@ wanted=rev-parse
                 if (stop in (PlacementStop.REPAIR_HOLD, PlacementStop.REPAIR_TOKEN_LOSS)
                         and grants and request.episode not in requested_episodes and not repair_followup):
                     first = grants[0].assignment
-                    saved = admission.server.assignments[placement.attempt_key(first.episode, first.attempt)]
+                    saved = admission.server.assignments[execution_identity.attempt_key(first.episode, first.attempt)]
                     repair_followup.extend((
                         first.episode not in admission.server.reservations,
                         first.episode not in admission.server.current_assignments,

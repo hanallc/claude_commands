@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
 from scripts.build_queue import admission_service, placement
@@ -184,14 +185,14 @@ def hana_remote_waiters(
             return frozenset()
         state = admission_service.read_state(store.root() / 'admission')
         record = claim.record
-        key = placement.attempt_key(record['episode'], record['attempt'])
+        key = execution_identity.attempt_key(record['episode'], record['attempt'])
         saved = state.assignments.get(key)
         if (saved is None or state.current_assignments.get(record['episode']) != key
                 or not isinstance(saved.state, placement.CurrentAssignment)):
             return frozenset()
         assignment = saved.assignment
         if (assignment.destination.target != target.name or assignment.destination.scope != claim.scope
-                or record['claim_id'] != placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                or record['claim_id'] != execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
                 or record['submitting_session'] != claim_state.session_id(assignment.session)):
             return frozenset()
         coordinator = build_hold.ProcessIdentity(assignment.owner.pid, assignment.owner.start_time)

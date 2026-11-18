@@ -14,6 +14,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.test_placement import (
     PlacementFixture, ManualEvidenceWorker, placement_request, publish_candidate, assignment_for, adopt_assignment,
@@ -67,13 +68,13 @@ class HanaQueueTests(unittest.TestCase):
             cause = placement.HANA_IMAGE_STALE
             claim = adopt_assignment(fixture, request, assignment)
             _ = fixture.connect(wire.ExecutionReport('image-refusal', assignment, claim,
-                placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
+                execution_identity.ExecutionNotStarted(), execution_identity.HanaCommandAdmissionRefused(cause),
                 placement.DispatchPathSettled())).replies()
-            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
             closed = fixture.server.assignments[key]
             self.assertEqual(closed.retry, placement.DoNotRetry(cause))
             assert isinstance(closed.terminal_report, placement.TerminalAttemptReport)
-            self.assertEqual(closed.terminal_report.outcome, placement.HanaCommandAdmissionRefused(cause))
+            self.assertEqual(closed.terminal_report.outcome, execution_identity.HanaCommandAdmissionRefused(cause))
             _ = publish_candidate(fixture, request)
             fallback = fixture.connect(request).replies()[-1]
             assert isinstance(fallback, wire.LocalPlacementGranted)
@@ -99,11 +100,11 @@ class HanaQueueTests(unittest.TestCase):
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
             reference = adopt_assignment(fixture, request, assignment)
-            report = wire.ExecutionReport('boot-failed', assignment, reference, placement.ExecutionNotStarted(),
+            report = wire.ExecutionReport('boot-failed', assignment, reference, execution_identity.ExecutionNotStarted(),
                 placement.PrelaunchRefused('boot failed'), placement.DispatchPathPending('start recovery'))
             reply = fixture.connect(report).replies()[-1]
             self.assertIsInstance(reply, wire.DispatchStatus)
-            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
             pending = fixture.server.assignments[key]
             self.assertIsInstance(pending.state, placement.CurrentAssignment)
             self.assertIsInstance(pending.terminal_report, placement.TerminalAttemptReport)
@@ -151,10 +152,10 @@ class HanaQueueTests(unittest.TestCase):
                         assignment.session, assignment.destination.host, 'host-generation-a')
                     _ = publish_candidate(fixture, other, claims=(provider,))
                 report = wire.ExecutionReport('admission-refused', assignment, claim,
-                    placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
+                    execution_identity.ExecutionNotStarted(), execution_identity.HanaCommandAdmissionRefused(cause),
                     placement.DispatchPathSettled())
                 _ = fixture.connect(report).replies()
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 saved = fixture.server.assignments[key]
                 self.assertEqual(saved.retry, placement.DoNotRetry(cause))
                 self.assertEqual(saved.state, placement.ClosedAssignment(cause))
@@ -188,11 +189,11 @@ class HanaQueueTests(unittest.TestCase):
                 assert isinstance(worker, ManualEvidenceWorker)
                 _ = worker.probe_next()
                 _ = fixture.run_pass()
-                saved = fixture.server.assignments[placement.attempt_key(assignment.episode, assignment.attempt)]
+                saved = fixture.server.assignments[execution_identity.attempt_key(assignment.episode, assignment.attempt)]
                 self.assertIsInstance(saved.state, placement.ClosedAssignment)
                 self.assertNotIn(request.episode, fixture.server.current_assignments)
                 self.assertFalse(hana_execution.execution_path(controller.directory,
-                    placement.assigned_claim_id(assignment.episode, assignment.attempt)).exists())
+                    execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)).exists())
 
     def test_dead_coordinator_keeps_a_bound_assignment_with_missing_or_unreadable_journal(self) -> None:
         for journal in ('missing', 'unreadable'):
@@ -209,7 +210,7 @@ class HanaQueueTests(unittest.TestCase):
                         mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
                     _ = publish_candidate(fixture, request)
                     assignment = assignment_for(fixture, request)
-                    execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                    execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
                     controller.bind_execution(execution)
                     if journal == 'unreadable':
                         _ = hana_execution.execution_path(controller.directory, execution).write_text('{')
@@ -219,7 +220,7 @@ class HanaQueueTests(unittest.TestCase):
                     assert isinstance(worker, ManualEvidenceWorker)
                     _ = worker.probe_next()
                     _ = fixture.run_pass()
-                    key = placement.attempt_key(assignment.episode, assignment.attempt)
+                    key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                     self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                     self.assertEqual(fixture.server.current_assignments[request.episode], key)
 
@@ -263,7 +264,7 @@ class HanaQueueTests(unittest.TestCase):
                     reply = fixture.connect(wire.ReleaseRequest('release-with-controller-lock', grant.reservation, 0)).replies()
                     self.assertEqual(reply, [wire.Ok()])
                     self.assertLess(time.monotonic() - began, 1)
-                    key = placement.attempt_key(assignment.episode, assignment.attempt)
+                    key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                     self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                 finally:
                     finish.set()
@@ -286,19 +287,19 @@ class HanaQueueTests(unittest.TestCase):
                     mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
-                execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
                 controller.bind_execution(execution)
                 reference = placement.ProviderClaimReference('ssh', target.name, assignment.destination.scope,
                     execution, assignment.episode, assignment.attempt)
                 _ = fixture.connect(wire.CancelPlacement('cancel-before-consume', request.episode, request.owner, 'cancelled')).replies()
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 pending = fixture.server.assignments[key]
                 self.assertIsInstance(pending.permission, placement.PermissionAvailable)
                 self.assertIsInstance(pending.terminal_report, placement.TerminalAttemptReport)
                 assert isinstance(pending.terminal_report, placement.TerminalAttemptReport)
                 self.assertIsInstance(pending.terminal_report.path, placement.DispatchPathPending)
                 self.assertIsInstance(pending.terminal_report.outcome, placement.AttemptCancelled)
-                report = wire.ExecutionReport('cancel-settled', assignment, reference, placement.ExecutionNotStarted(),
+                report = wire.ExecutionReport('cancel-settled', assignment, reference, execution_identity.ExecutionNotStarted(),
                     placement.AttemptCancelled('cancelled'), placement.DispatchPathSettled())
                 for invalid in (replace(report, claim=replace(reference, attempt='another-attempt')),
                         replace(report, outcome=placement.AttemptCompleted(0)),
@@ -333,7 +334,7 @@ class HanaQueueTests(unittest.TestCase):
                 assignment = assignment_for(fixture, request)
                 failure = wire.ClaimFailure('disabled-before-bind', assignment, 'disabled')
                 _ = fixture.server.handle_request(failure)
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 pending = fixture.server.assignments[key]
                 self.assertIsInstance(pending.state, placement.CurrentAssignment)
                 self.assertIsInstance(pending.terminal_report, placement.TerminalAttemptReport)
@@ -367,11 +368,11 @@ class HanaQueueTests(unittest.TestCase):
                     _ = publish_candidate(fixture, request)
                     assignment = assignment_for(fixture, request)
                     if bound:
-                        controller.bind_execution(placement.assigned_claim_id(assignment.episode, assignment.attempt))
+                        controller.bind_execution(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt))
                     retained = placement.ProviderClaimReference('ssh', target.name, assignment.destination.scope,
                         'retained-earlier-claim', assignment.episode, 'earlier-attempt')
                     _ = fixture.server.handle_request(wire.ClaimFailure('retained-before-bind', assignment, 'busy', retained))
-                    key = placement.attempt_key(assignment.episode, assignment.attempt)
+                    key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                     pending = fixture.server.assignments[key]
                     self.assertIsInstance(pending.state, placement.CurrentAssignment)
                     self.assertIsInstance(pending.permission, placement.PermissionAvailable)

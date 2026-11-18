@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from scripts.build_queue import execution_identity
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, TypeVar, cast
 
@@ -514,7 +515,7 @@ class ExecutionReport(CallerCode):
     request_id: str
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
-    evidence: placement.ExecutionEvidence
+    evidence: execution_identity.ExecutionEvidence
     outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
     path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
 

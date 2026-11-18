@@ -14,7 +14,8 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue import execution_identity
+from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
@@ -236,7 +237,7 @@ else:
         self.assertTrue(checkout.is_relative_to(self.root / "slots"))
         key = treekey.tree_key(str(checkout))
         assert key is not None
-        self.assertEqual(grant.assignment.source_key, placement.SourceKeyKnown(key))
+        self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key))
         rows = (cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog").glob("*/*.jsonl")
                 for line in path.read_text().splitlines())
