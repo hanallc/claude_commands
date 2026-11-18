@@ -372,7 +372,10 @@ When the user submits a Review action, the row and its open details fade and col
 The rows below slide into place as the row collapses.
 If the request fails, the row slides back into view and the current card stays selected.
 The animation updates when the user opens or closes a card during the transition.
-The status region above the table shows the result when the row or its details are hidden.
+A successful save adds no notice above the table.
+The status region above the table shows a failure only for the most recent submission.
+It shows that failure when the row or its details are hidden.
+The next save attempt or reload clears this notice.
 Filter and sort changes apply at once.
 The reduced motion preference disables row animations.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
@@ -408,8 +411,8 @@ The fresh index supplies each item's state and revision, including items outside
 The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
 An owner answer returns to Open after a refresh from Waiting or Done.
 Stable chip IDs retain keyboard focus after a Show load or refresh.
-The shared table owns the Show state for both chip groups and selects.
-The List keeps its Show select.
+Review and The List use Show chips.
+The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 The Type, Show and Owner chip rows wrap at phone width.
 All types that wait on the user have the state Open.
@@ -566,7 +569,8 @@ A failed publication returns 503 with tune's last stderr line.
 A failed save restores the prior color and shows `<name>: <reason>` in the status line.
 
 The `next` column follows the role color swatch.
-A selected Claude group (`units ✓` or `showrunners ✓`) shows its first target in that account's color and bold text.
+A selected Claude group shows its first target in bold text with the target account color.
+The same control serves units, showrunners, and producers.
 An empty group shows gray `none`.
 Its arrow button opens the move menu with a click, Enter, or Space.
 The move button leaves the sort order as it was.
@@ -621,6 +625,15 @@ The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
+The shared filter controls show the Show, State, Owner, and Producer rows in that order.
+Show selects a view such as Open or Parked.
+State selects an item state within that view.
+The four rows and the words box must all match the item.
+The words box at the upper right matches the item number, owner, title, or state.
+Each row starts with All.
+Each chip count reflects the other rows and the words box.
+A zero-count chip stays visible and dimmed.
+
 A link under Links opens the target item in the console.
 The table changes Show to All if the target is outside the current view.
 The table clears each filter that excludes the target and keeps each filter that matches it.
@@ -665,8 +678,23 @@ The open row repeats the line above its actions and shows each review's shown ID
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
 Review links use the console place query, so the navigator remains visible.
-A card link selects and opens that exact card, including Done and parked reviews.
-A summary link selects the linked review keys through the All view.
+A card link opens and highlights that card in the full Review list.
+The link uses the current Review filters. The same jump rule applies to List and Review.
+If the filters hide the target, the jump sets Show and Owner to All.
+The jump also clears other filters that hide the target.
+The linked parked card stays visible while its details are open, including after reload.
+A successful action that closes the linked card removes its target from the address.
+Back restores the List search text, scroll position, and surviving open rows for that history entry.
+The List saves the search text that is in the box when the user clicks the link.
+The List removes stale filters after it restores the open rows.
+The browser tab keeps at most eight return records for up to one hour.
+Repeated Back navigation can use the same record until it expires or the tab removes it.
+Reload keeps the Review card open with the current filters.
+A summary for one available review opens its card in the full list.
+A summary for multiple available reviews selects those reviews through the All view.
+The Linked reviews chip clears that selection with one click.
+A summary without an available review shows plain text.
+If the linked card disappears after the List renders, Review shows a missing-card message.
 An explicit item target joins the linked selection and opens its card.
 The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.
@@ -717,21 +745,24 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry without sending a message.
-Tell morty also marks an unread update read through the same path.
-It saves the feedback before it marks the update read.
-Each request keeps the identity of the update it saw.
+Ask question and Tell morty use the same path to mark the update read after the action saves.
+The form signature includes the identity of the unread update that the row shows.
+A new Ask question or Tell morty request can mark only that update read.
 A repeated request cannot mark a newer update read.
+An exact Tell morty retry uses the read target saved with the feedback.
 The store checks the update identity under its lock.
-This check also preserves an update that arrives between feedback storage and the read write.
+This check preserves an update that arrives between the action save and the read write.
 An update identity includes its time and log history.
 Two updates with the same time keep separate identities.
-Tell morty adds no read entry when the item has no unread update.
+Ask question and Tell morty add no read entry when the form shows no unread update.
 The POST response includes the current unread state.
+The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
-If the read write fails, the feedback remains saved and the sender can deliver it.
-The page shows “sent to morty; update remains unread” and keeps the unread controls.
-The same notice appears when a newer update remains unread.
+If the read write fails, the question or feedback remains saved and the sender can deliver it.
+The page keeps the unread controls when the read write fails or a newer update remains unread.
+Ask question shows “Question saved; update remains unread” in both cases.
+Tell morty shows “sent to morty; update remains unread” in both cases.
 It applies the current filter again, so a read item leaves the Unread view at once.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
@@ -757,7 +788,7 @@ A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove leaves Open at once when the user presses the button.
 Park leaves Open and enters Parked at once.
-The row leaves Unread as soon as the user presses Mark read or Tell morty.
+The row leaves Unread when the user presses Mark read, Ask question, or Tell morty.
 The row returns if the server reports an unread update.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
@@ -766,11 +797,11 @@ A second press sends no request.
 The page applies the saved state and parking status from the response.
 The page uses the saved date to update one parking label.
 A refusal restores the last state and parking status from the server.
-A failed Mark read or Tell morty request restores the unread state.
+A failed Mark read, Ask question, or Tell morty request restores the unread state.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
-The page keeps a separate failure notice for each row.
-The notice appears above the table while the row or its details hide the inline notice.
+Each row keeps its own inline failure notice.
+The List uses the same rules as Review for notices above the table.
 If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps each unconfirmed request ID for an exact retry, even after another action.

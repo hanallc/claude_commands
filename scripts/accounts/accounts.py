@@ -1733,8 +1733,8 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
 
 
 def _validate_role(role: str) -> None:
-    if role not in {"unit", "showrunner", "workers"}:
-        raise AccountsError(f"accounts: {role} is not a role; only unit, showrunner and workers are supported")
+    if role not in {"unit", "showrunner", "producer", "workers"}:
+        raise AccountsError(f"accounts: {role} is not a role; only unit, showrunner, producer and workers are supported")
 
 
 def read_role_map() -> RoleMap:
@@ -1766,7 +1766,7 @@ def _workers_home() -> Path:
 
 
 @overload
-def role_account(role: Literal["unit", "showrunner"]) -> ClaudeLaunchAccount: ...
+def role_account(role: Literal["unit", "showrunner", "producer"]) -> ClaudeLaunchAccount: ...
 
 
 @overload
@@ -1784,7 +1784,7 @@ def role_account(role: str) -> AccountSelection:
         home = _workers_home()
         label = agent_accounts.codex_home_role_label(home)
         return CodexWorkersAccount(label, home)
-    group: ClaudeGroup = "units" if role == "unit" else "showrunners"
+    group: ClaudeGroup = "units" if role == "unit" else "producers" if role == "producer" else "showrunners"
     selected = group_label(group_accounts(), group)
     if isinstance(selected, GroupNotConfigured):
         raise AccountsError("accounts: " + group_configuration_line(group))
@@ -2213,8 +2213,8 @@ def codex_destination_uses_credits(chosen: PickedAccount, now: datetime) -> bool
     return chosen.weekly_left <= 0
 
 
-ClaudeGroup = Literal["units", "showrunners"]
-CLAUDE_GROUPS: tuple[ClaudeGroup, ...] = ("units", "showrunners")
+ClaudeGroup = role_map.ClaudeGroup
+CLAUDE_GROUPS = role_map.CLAUDE_GROUPS
 
 
 @dataclass(frozen=True)
@@ -2240,6 +2240,7 @@ ACCOUNT_DECISION_NOW = AccountDecisionNow()
 class GroupAccounts(TypedDict, total=False):
     units: str
     showrunners: str
+    producers: str
 
 
 @dataclass(frozen=True)
@@ -2300,8 +2301,8 @@ class UnitsResetSoonest:
 
 
 @dataclass(frozen=True)
-class ShowrunnersMostLeft:
-    """Keep showrunners on the account with the most weekly allowance."""
+class MostWeeklyQuotaLeft:
+    """Select the account with the most weekly quota left."""
 
 
 @dataclass(frozen=True)
@@ -2315,7 +2316,7 @@ class GroupPlacement:
     group: ClaudeGroup
     label: str | GroupNotConfigured
     dir: Path | GroupNotConfigured
-    reason: UnitsResetSoonest | ShowrunnersMostLeft | GroupNoRoom
+    reason: UnitsResetSoonest | MostWeeklyQuotaLeft | GroupNoRoom
     reasons: tuple[PickReason, ...] = ()
 
 
@@ -2347,6 +2348,8 @@ def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["un
         return "units"
     if kind == "showrunner":
         return "showrunners"
+    if kind == "producer":
+        return "producers"
     return "ungrouped"
 
 
@@ -2442,10 +2445,11 @@ def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple
         return live, ()
     running = {session["sessionId"] for session in sessions.running_sessions()}
     running.update(member.session_id for member in live)
-    kind = "unit" if group == "units" else "showrunner"
-    candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
-    if group == "showrunners":
-        candidates.update((row.id, row) for row in eligible_producers(membership, "claude"))
+    if group == "producers":
+        candidates = {row.id: row for row in eligible_producers(membership, "claude")}
+    else:
+        kind = "unit" if group == "units" else "showrunner"
+        candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
     live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
             or owner.kind != "producer" or owner.id in candidates]
     verified = {member.session_id for member in live}
@@ -2495,12 +2499,14 @@ def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _N
         reset = candidate.weekly_reset.at if isinstance(candidate.weekly_reset, KnownReset) else datetime.max.replace(tzinfo=timezone.utc)
         return (reset, -candidate.weekly_left, f"{_label_number(candidate.label):020d}")
     selected = min(eligible, key=order) if group == "units" else min(eligible, key=lambda item: (-item.weekly_left, *order(item)))
-    reason = UnitsResetSoonest() if group == "units" else ShowrunnersMostLeft()
+    reason = UnitsResetSoonest() if group == "units" else MostWeeklyQuotaLeft()
     return GroupPlacement(group, selected.label, selected.dir, reason, chosen.reasons)
 
 
 def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConfigured:
-    """Convert the optional JSON key into its configuration meaning."""
+    """Use the showrunners account until the producers group has a selection."""
+    if group == "producers" and "producers" not in groups:
+        group = "showrunners"
     label = groups.get(group, GROUP_NOT_CONFIGURED)
     return note_file.canonical_label(label) if isinstance(label, str) else label
 
@@ -2510,11 +2516,11 @@ def group_configuration_line(group: ClaudeGroup) -> str:
 
 
 def group_status_line(groups: GroupAccounts) -> str:
-    return f"units: {group_label(groups, 'units')}, showrunners: {group_label(groups, 'showrunners')}"
+    return ", ".join(f"{group}: {group_label(groups, group)}" for group in CLAUDE_GROUPS)
 
 
 def group_note_labels() -> dict[ClaudeGroup, str]:
-    """The note labels serving each configured Claude launch group."""
+    """The note labels for the effective Claude group accounts."""
     groups = group_accounts()
     labels: dict[ClaudeGroup, str] = {}
     for group in CLAUDE_GROUPS:
@@ -2527,7 +2533,7 @@ def group_note_labels() -> dict[ClaudeGroup, str]:
 
 
 def group_accounts() -> GroupAccounts:
-    """Read only explicit group selections; an absent key stays unconfigured."""
+    """Read only explicit group selections."""
     result = GroupAccounts()
     stored = _stored_groups()
     for group in CLAUDE_GROUPS:
@@ -2736,7 +2742,7 @@ def _unit_role_history() -> list[UnitRoleAssignment]:
             if not isinstance(decoded, dict):
                 raise ValueError("expected a JSON object")
             values = cast(dict[str, object], decoded)
-            if values.get("group") in ("units", "showrunners"):
+            if values.get("group") in CLAUDE_GROUPS:
                 continue
             role = values.get("role")
             if role not in {"unit", "workers"}:
@@ -4313,6 +4319,7 @@ class StatusRow:
     selected_roles: tuple[str, ...] = ()
     sessions: tuple[AccountSessionDocument, ...] = ()
     login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
+    inherited_roles: tuple[ClaudeGroup, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4388,7 +4395,7 @@ class BoardColumn(TypedDict):
 class BoardGroup(TypedDict):
     """A Claude group that this account line serves; the console Accounts page sets its next move."""
     account: str
-    group: Literal["units", "showrunners"]
+    group: ClaudeGroup
 
 
 class BoardRow(TypedDict):
@@ -4662,8 +4669,10 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
                  **{key: [_span(value)] for key, value in counts.items()},
                  "resets": [_span(reset)], "credits": [_span(balance)],
                  "enabled": [_span("yes" if row.use_credits else "")]}
+        if role in row.inherited_roles:
+            cells["roles"].append(_span(" (inherited)"))
         line = BoardRow(cells=cells)
-        if row.tool == "claude" and role in row.selected_roles and (role == "units" or role == "showrunners"):
+        if row.tool == "claude" and role in row.selected_roles and role in CLAUDE_GROUPS:
             line["group"] = BoardGroup(account=row.label, group=role)
         lines.append(line)
     return lines
@@ -5400,6 +5409,10 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
         codex = [replace(status, role=NO_VALUE) for status in codex]
     group_directories: dict[ClaudeGroup, Path] = {}
     for group in CLAUDE_GROUPS:
+        if group == "producers" and group not in groups:
+            if "showrunners" in group_directories:
+                group_directories[group] = group_directories["showrunners"]
+            continue
         label = group_label(groups, group)
         if isinstance(label, GroupNotConfigured):
             error = f"accounts: {group} has no account; run accounts.py move {group} <claudeN>"
@@ -5422,6 +5435,9 @@ def _read_status(source: UsageSource, *, detail: bool, account_config: conf.Conf
     )
     local_sessions = _read_local_role_sessions(groups)
     rows, session_inputs = _count_role_sessions(rows, local_sessions)
+    if "producers" not in groups:
+        rows = tuple(replace(row, inherited_roles=("producers",)) if "producers" in row.selected_roles else row
+                     for row in rows)
     rows, count_problems = _machine_role_counts(rows, now, account_config=account_config)
     session_inputs = (*session_inputs, str(_session_counts_cache()))
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
@@ -5713,7 +5729,7 @@ def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, session_st
 
 
 def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
-    if role in CLAUDE_GROUPS:
+    if role in CLAUDE_GROUPS and (role != "producers" or role in groups):
         selected = group_label(groups, role)
         if isinstance(selected, str) and selected != label:
             return f"; moving to {selected}"
@@ -5770,7 +5786,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
         inputs.add(path)
     live = {session["sessionId"]: session for session in sessions.running_sessions()}
     session_lines: list[str] = []
-    members: dict[ClaudeGroup, list[LiveGroupMember]] = {"units": [], "showrunners": []}
+    members: dict[ClaudeGroup, list[LiveGroupMember]] = {group: [] for group in CLAUDE_GROUPS}
     for identity, session in live.items():
         owner = membership.by_current_session(identity)
         candidates = [launch for reference, launch in launches.items()
@@ -5797,12 +5813,10 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
         setting = _session_config_dir(session["pid"])
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
         label = claude_config_label(directory) if directory is not None else "account unreadable"
-        move_role = "showrunners" if role == "producers" else role
-        suffix = _moving_role_suffix(move_role, label, groups)
+        suffix = _moving_role_suffix(role, label, groups)
         session_lines.append(f"session {identity} ({session['name']}): {label}{suffix}")
-        if move_role in CLAUDE_GROUPS and directory is not None:
-            group = move_role
-            members[group].append(LiveGroupMember(identity, session["name"], group, directory))
+        if role in CLAUDE_GROUPS and directory is not None:
+            members[role].append(LiveGroupMember(identity, session["name"], role, directory))
         if role and directory is not None:
             if role == "workers":
                 state = session_state.classify(owner if owner is not None else session_state.UnrecordedStaff(),
@@ -5820,14 +5834,14 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> 
                      and settings.kind == "claude")):
         if member.current_session in live or not local_member(member):
             continue
-        group = "units" if member.kind == "unit" else "showrunners"
-        role = "producers" if member.kind == "producer" else group
-        selected = group_label(groups, group)
+        stopped_group: ClaudeGroup = ("units" if member.kind == "unit" else
+                             "producers" if member.kind == "producer" else "showrunners")
+        selected = group_label(groups, stopped_group)
         if not isinstance(selected, str):
             continue
         directory = account_dir(selected)
         state = session_state.classify(member, session_state.NoLiveSession(), detached=detached)
-        counts.setdefault((directory, role), {})[member.current_session] = state
+        counts.setdefault((directory, stopped_group), {})[member.current_session] = state
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
     if include_workers and (parents := session_staff.pane_parents(membership)):
@@ -6049,6 +6063,8 @@ def _machine_role_counts(
 def _role_count_text(row: StatusRow, role: str) -> str:
     """Render the same combined counts in the table and detail output."""
     selected = " ✓" if role in row.selected_roles else ""
+    if role in row.inherited_roles:
+        selected += " (from showrunners)"
     if role == "spare":
         return role
     index = row.roles.index(role)
@@ -6274,7 +6290,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
             if not role_map.is_role_map_host():
                 raise AccountsError("accounts: account moves belong on natedev")
             if options.action == "next-read":
-                print(next_moves.encode_next_moves(next_moves.read_next_moves()))
+                print(next_moves.read_next_move_log_text(), end="")
             else:
                 entries = next_moves.decode_next_moves(options.entries)
                 if len(entries) != 1:
@@ -6349,7 +6365,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                                      follow_role=options.follow_role, account_config=account_config)
             elif options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:
-                    raise AccountsError("move units|showrunners requires <claudeN>")
+                    raise AccountsError(f"move {'|'.join(CLAUDE_GROUPS)} requires <claudeN>")
                 moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why, alerts=options.alerts, account_config=account_config)
             else:
                 if not options.label or options.source or options.target:

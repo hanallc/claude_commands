@@ -140,13 +140,18 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
             del pane, terminal
             if len(shlex.join(command).encode()) > 4096:
                 raise herdr_types.HerdrFailure("fixture shell command exceeds the terminal input limit")
+            _, export, assignments = command[-1].rpartition("; export ")
+            if export:
+                for assignment in shlex.split(assignments):
+                    key, _, value = assignment.partition("=")
+                    world.environment[key] = value
 
         def activity(pane: str) -> herdr.PaneRunning | herdr.PaneAtShell:
             return (herdr.PaneRunning((kind,)) if pane == "w1:p2" or (pane == world.pane and world.active)
                     else herdr.PaneAtShell())
 
         def role_account(role: str) -> accounts.AccountSelection:
-            return (accounts.NamedAccount("claude3", world.home) if role == "showrunner" else
+            return (accounts.NamedAccount("claude3", world.home) if role == "producer" else
                     accounts.CodexWorkersAccount("codex3", world.home))
 
         def conversation(identity: str, family: str = "", *, codex: herdr.CodexConversations | None = None
@@ -157,7 +162,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
 
         def claude_home(pid: int) -> account.ConfiguredClaudeFolder:
             del pid
-            return account.ConfiguredClaudeFolder(world.home)
+            return account.ConfiguredClaudeFolder(Path(world.environment["CLAUDE_CONFIG_DIR"]))
 
         def codex_home(pid: int) -> account.ProcessCodexHome:
             del pid
@@ -411,6 +416,23 @@ class StopResumeTests(unittest.TestCase):
                     self.assertEqual(stop_resume.producer_conflicts(member.name, world.case.client),
                                      [(world.identity, "outside herdr")])
                     self.assertEqual(stop_resume.producer_conflicts("old-producer", world.case.client), [])
+
+    def test_reserved_producer_shell_retries_with_the_current_claude_group_account(self) -> None:
+        with producer_first_fixture("claude") as world:
+            with patch.object(world.case.client, "start_agent", side_effect=OSError("fixture launch failure")):
+                self.assertIsInstance(stop_resume.resume("dwight"), stop_resume.ResumeFailed)
+            self.assertEqual(staff.initial_snapshot().rows, ())
+            self.assertEqual(world.environment["CLAUDE_CONFIG_DIR"], str(world.home))
+            target = world.case.root / ".claude4"
+            with patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude4", target)) as select:
+                result = stop_resume.resume("dwight")
+            self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+            assert isinstance(result, stop_resume.ClaudeUp)
+            select.assert_called_once_with("producer")
+            self.assertEqual((result.session_id, result.pane_id, result.account), (world.identity, "w1:p3", "claude4"))
+            self.assertEqual(world.environment["CLAUDE_CONFIG_DIR"], str(target))
+            self.assertEqual(staff.initial_snapshot().rows[0].home, staff.SessionHome(target))
+            self.assertEqual(len(world.case.client.opened), 1)
 
     def test_interrupted_producer_admission_reuses_its_live_native_conversation(self) -> None:
         lost_stages = {"lost", "replaced", "unpublished", "foreign-recovery", "native-recovery"}
@@ -905,7 +927,7 @@ class StopResumeTests(unittest.TestCase):
                     else:
                         self.assertNotIn("config_dir", entry)
                     if target is None:
-                        role = "showrunner" if kind == "producer" else kind if kind in ("unit", "showrunner") else "unit"
+                        role = kind if kind in ("unit", "showrunner", "producer") else "unit"
                         selection.assert_called_once_with(role)
                     else:
                         selection.assert_not_called()

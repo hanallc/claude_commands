@@ -800,6 +800,87 @@ The test server joins its request handlers before fixture cleanup and gives each
 2. `scripts.buildlog.test_vault_pull` passes.
 3. The new checks fail without the fix.
 
+### Phase 60 — A failed write or Git launch keeps saved review work  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-17), from the admin-console reviewscroll reviews: four failure paths on main lose or misstate saved work when a disk write or a Git launch fails. Each failure must leave saved state true and the user told the truth.
+
+**Spec:**
+1. Change review verdict: `scripts/production/change_review.py` `_edit` (about line 566) writes the verdict, then `_commit` launches Git. An `OSError` from the Git launch escapes, and `scripts/review_links/change_page.py` (about line 1054) clears the delivery claim and returns 400. The saved verdict must stand, and the claim must not clear.
+2. Delivery metadata: `scripts/review_links/review_actions.py` (about line 202) leaves the delivery file at `saved: false` when the write after the save fails. Startup recovery in `change_page.py` (about line 1277) then drops the saved message. The message must not be lost.
+3. Later: `review_actions.py` `later()` writes the source log before `review_later.save` writes the deadline. A deadline write failure leaves a false log entry, and the request takes the 503 path (`serve.py` about line 671). Order the writes so that a failure leaves no false log entry.
+4. Nightly ledger: the nightly CLI efficiency ledger writer does not take the Review store write lock that Review saves use (`scripts/review_links/efficiency_reviews.py`). Make it share that one lock.
+
+**Files:**
+- `scripts/production/change_review.py`, `scripts/production/test_change_review.py`
+- `scripts/review_links/change_page.py`, `review_actions.py`, `review_later.py`, `serve.py`, `efficiency_reviews.py`
+- their tests: `test_change_page.py`, `test_review_actions.py`, `test_serve.py`, `test_review_page.py`
+- the nightly ledger writer under `scripts/nightly_review/` and its test
+
+**Workers:** 1 writer (`design`).
+
+**Order:** admin-console reviewscroll edits the same files and merges first. Build on main 121a03c90; merge the reviewscroll hash (about 22:00 EST) before this phase commits.
+
+**Acceptance gate:**
+1. A fault-injection test for each item fails without the fix.
+2. basedpyright on the changed Python files: 0 errors, 0 warnings.
+3. The suites of the changed modules pass.
+
+### Phase 61 — The Disks page refresh button shows on the live page  · status: done
+**Depends on:** none
+
+**Result:** the live natedev page held the button as a faint 20 px icon at the far right, easy to miss. The button now shows the words Measure now in a bordered box. The Mac console publishes the page on each full console load; no code defect there. A browser check covers the button in every status state.
+
+#### Work Order
+
+**Goal:** the user (2026-11-17 19:47, change review C1850) on the Disks page refresh button from phase 45: "not works: it's not here". The live published page `~/.local/share/review-links/ysbjmg/disks.html` holds `<button id="measure-now">` inside the status line, and live main 121a03c90 has the phase 45 code. The user still sees no button.
+
+**Spec:**
+1. Open the live Disks page in headless Firefox at desktop width, dark mode, from the console server (http://100.103.14.30:8765, the console's Disks link). Take a screenshot of the status line. Read only; do not press the button.
+2. Find why the button does not show: for example, status code that rewrites `.page-status-state`, a style that hides or clips it, or a page the console links that is not the published one.
+3. Fix it where the cause is. The button shows at the right of the status line in every status state, and it stays after each refresh.
+4. Add a check that fails without the fix: a browser check if the cause is in the page script, or a table row in the existing Disks page test.
+
+**Files:**
+- `scripts/disks/disks.html`, `scripts/disks/disks_page.py`, `scripts/disks/test_disks_page.py`
+- `scripts/review_links/page_frame.py`, `scripts/review_links/test_page_frame.py`
+
+**Workers:** 1 writer (`design`).
+
+**Acceptance gate:**
+1. A dark desktop screenshot of the fixed page, clipped to the status line, shows the button. A screenshot of the live page shows the cause.
+2. The new check fails without the fix.
+3. basedpyright on the changed Python files: 0 errors, 0 warnings. The Disks and page frame suites pass.
+
+### Phase 62 — Image answer buttons use the Review page groups  · status: done
+**Depends on:** none
+
+**Result:** `page_frame.review_action_groups` and one shared style render the labeled button groups on the Review and Images pages. Images: Approved, Not Approved and Send Feedback under Closes the item; Ask question under The item returns to you, after a separator bar. Phones stack the groups with no bar.
+
+#### Work Order
+
+**Goal:** the user (2026-11-17 19:56, change review C1854) on the Images page answer buttons: "it is there but i think that ou should use the same affordance you do here in the review - the text above that says "CLOSES THIS ITEM" a separator bar and a "THE ITEM RETURNS TO YOU" - i do see the button".
+
+**Spec:**
+1. The Images card groups its answer buttons as the Review page does (`review_page.py` `form`, the `review-action-group` markup and style): a small upper-case label above each group, and a separator bar between groups.
+2. Buttons that close the image item go under "Closes the item". Ask question goes under "The item returns to you". Read the Images code to place each button by what it does.
+3. One shared helper and one shared style make the groups for both pages. No copied markup or style.
+4. The phone layout keeps the Review page rule: groups stack with no bar.
+
+**Files:**
+- `scripts/review_links/images.py`, `scripts/review_links/review_page.py`, the shared module for the helper (for example `scripts/review_links/change_browser.py` or `page_frame.py`)
+- `scripts/review_links/test_images.py`, `scripts/review_links/test_review_page.py`
+
+**Workers:** 1 writer (`review4`).
+
+**Order:** admin-console reviewscroll edits `review_page.py` and `change_browser.py` and merges first. Keep the `review_page.py` edit to the call of the shared helper.
+
+**Acceptance gate:**
+1. One dark desktop shot of an Images card's answer buttons, before and after, clipped to the buttons.
+2. The Images and Review page suites pass. basedpyright: 0 errors, 0 warnings.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
