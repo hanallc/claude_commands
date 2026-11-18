@@ -95,7 +95,7 @@ The shared resume path reads the saved environment, arguments, and folder.
 The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Claude producers use the configured producers account.
+Claude producers use the configured producers account, or the showrunners account while the producers group has no selection.
 Other Claude sessions use the configured units account.
 A configured producer without a staff row uses the producer first-start account rule.
 When the account does not change, the resume message names no move.
@@ -236,8 +236,8 @@ The configured lines are:
 
 ```ini
 [producers]
-morty=codex:astra:high
-brain=codex:astra:medium
+morty=claude:fable:high
+brain=claude:fable:high
 dwight=claude:fable:high
 ```
 
@@ -245,7 +245,7 @@ These model names are aliases that the shared model registry resolves.
 `member_account.producer_account(kind, *, to="")` selects the account before admission.
 An admitted producer's same-family resume uses `member_account.resume_account`.
 Both functions select the workers account for Codex.
-Claude uses the producers account, with the showrunners account as the fallback.
+Claude uses the producers account, or the showrunners account while the producers group has no selection.
 An explicit `--to` overrides that selection.
 
 `accounts.eligible_producers(membership, family)` selects active, unpaused, local producers of the configured family.
@@ -285,7 +285,7 @@ A Claude compaction summary is one block. A Codex compaction summary is encrypte
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
 
-### Producer lifecycle commands
+### Create a producer
 
 `agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
 The create command validates the name and records its profile and README text before it writes them.
@@ -293,6 +293,8 @@ It creates the README from `templates/producer/README.md` when the README is abs
 The first conversation receives a prompt to read the README and run `/producer:produce`.
 The producer admission record keeps the time for prompt recovery after a failed start.
 The command reports the staff id, account and tab.
+
+### Rename or retire a producer
 
 `agents rename OLD NEW` moves the registry key and retains the staff id.
 If the old name no longer belongs to the saved staff id, the retry keeps the old key.

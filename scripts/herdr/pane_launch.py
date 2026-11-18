@@ -272,11 +272,24 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
     return sorted(retained_matches, key=lambda pane: entries[str(pane["pane_id"])]["written_at"], reverse=True)[:1]
 
 
-class NativePaneDecoder(Protocol):
-    def is_codex_process(self, arguments: Sequence[str]) -> bool: ...
-    def is_claude_process(self, arguments: Sequence[str]) -> bool: ...
-    def pane_native_process(self, info: dict[str, object], kind: str,
-                            pane: Mapping[str, object]) -> CurrentProcessEvidence: ...
+@dataclass(frozen=True)
+class ProvedPaneConversation:
+    identity: str
+    kind: Literal["claude", "codex"]
+    pid: int
+
+
+class NoForegroundConversation(Enum):
+    FOUND = "no foreground conversation"
+
+
+class NativePaneReader(Protocol):
+    def foreground_pane_conversation(
+        self, info: object, pane: Mapping[str, object],
+    ) -> ProvedPaneConversation | NoForegroundConversation: ...
+    def shared_session(self) -> str: ...
+    def Herdr(self, session: str) -> NativePaneServer: ...
+    def codex_resume_thread(self, pid: int) -> str: ...
 
 
 def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
@@ -294,14 +307,9 @@ def _process_info(client: NativePaneServer, pane: Mapping[str, object]) -> dict[
 
 
 def _native_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
-    decoder = cast(NativePaneDecoder, cast(object, import_module("scripts.herdr.herdr")))
-    identities: set[str] = set()
-    for process in cast(list[dict[str, object]], info.get("foreground_processes", [])):
-        arguments = cast(list[str], process.get("argv", []))
-        kind = "codex" if decoder.is_codex_process(arguments) else "claude" if decoder.is_claude_process(arguments) else ""
-        if kind:
-            identities.add(decoder.pane_native_process(info, kind, pane).current_identity)
-    return identities
+    reader = cast(NativePaneReader, cast(object, import_module("scripts.herdr.herdr")))
+    conversation = reader.foreground_pane_conversation(info, pane)
+    return {conversation.identity} if isinstance(conversation, ProvedPaneConversation) else set()
 
 
 def _retained_shell(client: NativePaneServer, pane: Mapping[str, object], *, strict: bool) -> bool:
@@ -359,48 +367,26 @@ def retained_launch(entry: PaneLaunch, record: staff.StaffSnapshot) -> PaneLaunc
     return cast(StaffPaneLaunch, cast(object, retained))
 
 
-class NativeBackendPanes(Protocol):
-    def panes(self) -> list[dict[str, object]]: ...
-    def result(self, *arguments: str) -> dict[str, object]: ...
-
-
 def native_kind(row: staff.StaffRow) -> str:
-    """Read the current backend from its native pane or Claude registry."""
-    module = import_module("scripts.herdr.herdr")
-    session = cast(Callable[[], str], module.shared_session)()
+    """Read the current backend from its proved pane owner or process registry."""
+    reader = cast(NativePaneReader, cast(object, import_module("scripts.herdr.herdr")))
     try:
-        client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
-        native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
-        codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
-        claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
+        client = reader.Herdr(reader.shared_session())
         for pane in client.panes():
             report = pane.get("agent_session")
             identity = pane.get("session_id", cast(dict[str, object], report).get("value") if isinstance(report, dict) else "")
             if identity != row.current_session:
                 continue
             reply = client.result("pane", "process-info", "--pane", str(pane["pane_id"]))
-            info = cast(dict[str, object], reply.get("process_info", {}))
-            for value in cast(list[dict[str, object]], info.get("foreground_processes", [])):
-                arguments = cast(list[str], value.get("argv", []))
-                family = "codex" if codex(arguments) else "claude" if claude(arguments) else ""
-                pid = value.get("pid")
-                if family and isinstance(pid, int):
-                    if family == "codex":
-                        resume_thread = cast(Callable[[int], str], module.codex_resume_thread)
-                        try:
-                            if resume_thread(pid) == row.current_session:
-                                return family
-                        except (OSError, ValueError):
-                            pass
-                    if native(pid, family).current_identity == row.current_session:
-                        return family
+            conversation = reader.foreground_pane_conversation(reply.get("process_info"), pane)
+            if isinstance(conversation, ProvedPaneConversation) and conversation.identity == row.current_session:
+                return conversation.kind
     except (OSError, ValueError, herdr_types.HerdrFailure):
         pass
     observed = sessions.session_liveness(row.current_session)
     if isinstance(observed, sessions.LiveSessionProcess):
-        resume_thread = cast(Callable[[int], str], module.codex_resume_thread)
         try:
-            if resume_thread(observed.pid) == row.current_session:
+            if reader.codex_resume_thread(observed.pid) == row.current_session:
                 return "codex"
         except (OSError, ValueError):
             pass

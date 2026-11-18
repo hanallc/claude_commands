@@ -5,6 +5,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 from urllib.parse import quote
@@ -75,6 +76,8 @@ def _profile(profiles: dict[str, str], name: str) -> models_registry.ProducerPro
 
 
 def _check_name(name: str) -> None:
+    if name.casefold() == "morty":
+        raise ValueError("morty: reserved producer name")
     staff.validate_name("producer", name)
     if name in {".", ".."} or any(mark in name for mark in "#[]="):
         raise ValueError(f"{name!r}: invalid producer name")
@@ -135,11 +138,14 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
     if len(job.splitlines()) > 1 or "\n" in job or "\r" in job:
         raise ValueError("--job must contain one line")
     folder = stop_resume.producer_folder(name)
-    path = _path("add", name)
+    path = stop_resume.producer_creation_path(name)
     with (staff.slot_operation("producer-lifecycle", name),
           staff.slot_operation("producer-first-" + name, name)):
         record = staff.initial_snapshot()
-        own = lookup(name, record)
+        matches = [row for row in record.find(kind="producer") if row.name == name]
+        if len(matches) > 1:
+            raise ValueError(f"{name}: several producer rows have this name")
+        own = matches[0] if matches else None
         saved = _read(path)
         profiles = _profiles()
         if saved:
@@ -149,13 +155,13 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
                     or effort and effort != profile.effort or job and job != _text(saved, "job")):
                 raise ValueError(f"{name}: retry the creation with its original options")
             if "staff" in saved:
-                if own is None or own.id != _text(saved, "staff") or isinstance(own.retirement, staff.RetiredProducer):
+                if own is None or own.id != _text(saved, "staff"):
                     raise ValueError(f"{name}: the saved creation belongs to another staff state")
-                _print_started(own, _text(saved, "account"), _text(saved, "tab"))
-                return 0
+                if isinstance(saved.get("opening_confirmed"), str):
+                    _print_started(own, _text(saved, "account"), _text(saved, "tab"))
+                    return 0
             if own is not None and (own.doc != staff.LiveDoc(remote.local_machine(), folder)
-                                    or own.worktree != staff.PresentWorktree(remote.local_machine(), folder)
-                                    or isinstance(own.retirement, staff.RetiredProducer)):
+                                    or own.worktree != staff.PresentWorktree(remote.local_machine(), folder)):
                 raise ValueError(f"{name}: another staff row has this name")
             reservation = _read(stop_resume.producer_admission_record(name))
             if name in profiles and profiles[name] != profile.value():
@@ -170,20 +176,20 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
             template = TEMPLATE.read_text(encoding="utf-8")
             values = {"name": name, "job": job}
             readme = re.sub(r"\{(name|job)\}", lambda match: values[match[1]], template)
-            saved = {"profile": profile.value(), "job": job, "readme": readme, "folder": str(folder)}
+            saved = {"profile": profile.value(), "job": job, "readme": readme, "folder": str(folder),
+                     "opening_since": datetime.now(timezone.utc).isoformat()}
             _write(path, saved)
         _ = models_registry.store_producer(name, *profile)
         _ = os.environ.pop(models_registry.OPERATION_ENVIRONMENT[0], None)
         _create_readme(folder / "README.md", _text(saved, "readme"))
-        opening = herdr.OpeningPrompt(f"Read ~/rust/hanadocs/{name}/README.md, then run /producer:produce.")
-        request = stop_resume.ProducerFirstStart(name, folder, opening=opening)
+        request = stop_resume.ProducerFirstStart(name, folder)
         result = stop_resume._locked_first_producer_resume(request, to="")  # pyright: ignore[reportPrivateUsage]
         if not isinstance(result, stop_resume.ClaudeUp):
             raise ValueError(result.reason if isinstance(result, stop_resume.ResumeFailed) else f"{name}: first start failed")
         admitted = staff.initial_snapshot().by_current_session(result.session_id)
         if admitted is None or admitted.name != name or admitted.kind != "producer":
             raise ValueError(f"{name}: the first start did not record the producer")
-        _write(path, {**saved, "staff": admitted.id, "account": result.account, "tab": result.pane_id})
+        _write(path, {**_read(path), "staff": admitted.id, "account": result.account, "tab": result.pane_id})
         _print_started(admitted, result.account, result.pane_id)
         return 0
 

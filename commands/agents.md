@@ -24,27 +24,12 @@ Use the `agents` program.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
 
-## Producer lifecycle
+## Create a producer
 
 Use `agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]` to create a producer.
 The command uses `producer_defaults.model` in `config/models.conf`.
 It creates the README if needed and prints the staff id, account and tab.
 Repeat the command with the same options after an interruption.
-
-Use `agents rename OLD NEW` to rename a producer.
-The command keeps the staff id and document folder.
-It reports the path of the document folder.
-
-Use `agents retire NAME [--to PRODUCER]` to retire a producer.
-The command requires the producer to close its open questions.
-If the producer has no `handoff.md`, the command requests the file.
-Repeat the command after the file exists.
-The command stops the conversation and closes its tab before it moves open List items.
-Open List items move to the selected producer, or to morty by default.
-Use `--to` only with a producer whose conversation is live.
-The command retains the conversation and document folder.
-Use `agents resume NAME --retired` to restore the profile and conversation.
-You cannot rename or retire morty.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
 It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
@@ -80,6 +65,23 @@ It saves the proved cleanup targets before the first change.
 A repeated command uses that record to complete failed steps.
 It deletes the cleanup record after every step completes.
 A repeated command prints `unchanged` when no cleanup record or selected resource remains.
+
+## Rename or retire a producer
+
+Use `agents rename OLD NEW` to rename a producer.
+The command keeps the staff id and document folder.
+It reports the path of the document folder.
+
+Use `agents retire NAME [--to PRODUCER]` to retire a producer.
+The command requires the producer to close its open questions.
+If the producer has no `handoff.md`, the command requests the file.
+Repeat the command after the file exists.
+The command stops the conversation and closes its tab before it moves open List items.
+Open List items move to the selected producer, or to morty by default.
+Use `--to` only with a producer whose conversation is live.
+The command retains the conversation and document folder.
+Use `agents resume NAME --retired` to restore the profile and conversation.
+You cannot rename or retire morty.
 
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
 Resume removes the record. A paused director receives one continuation message.
@@ -143,7 +145,7 @@ Transfer runs in a session that has no staff row, on the producer's machine.
 It stops the old conversation and closes its tab. It keeps the row id, the document, and the message queue.
 It sets the row's session, account home, and launch folder, then restarts the caller as the producer.
 `--model` and `--effort` replace `[producers].NAME`; the caller supplies the family.
-A Claude caller must use the producers account. The refusal gives the `agents move` command.
+A Claude caller must use the producers account, or the showrunners account while the producers group has no selection. The refusal gives the `agents move` command.
 After a failure, run the same command again.
 
 Before a power-off, run `agents stop --all`.
