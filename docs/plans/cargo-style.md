@@ -201,7 +201,15 @@ Provisional: S2 designs the API from the uses and can change these phases. The S
 | S7 | 11 | Timing, memory, Mac proof against the S1 targets | both | S6 |
 | S8 | 12 | Shadow comparison, switch with nate's go, removal of Python selection | `~/.claude` | S7 |
 
-S3 and S4 run at the same time. Each speed phase reports its result against its target: **milestone 7**.
+S3 and S4 run one after the other: a unit holds one Rust build-queue item at a time (nate, 2026-11-18). Each speed phase reports its result against its target: **milestone 7**.
+
+S3 runs as five phases in series, from the S3 inventory (2026-11-18). Each phase is one cargo-liner checkpoint:
+
+1. `s3-cache`: typed facts apart from their wire format; the blob fact cache in `selection.sqlite` by blob id and reader version; misses parse on all cores.
+2. `s3-ledger`: read-only ledger access and the `next` request and reply types (`NextOutcome`, `SelectedTicket`, `observed`). S5 builds the selection.
+3. `s3-declarations`: declaration outcomes and site evidence.
+4. `s3-rename`: rename permission and the applied check.
+5. `s3-footprint`: footprints, the `finding` subcommand, and the S3 measure (needed blobs, cold time, the stop point).
 
 ### `syn` and reuse
 
