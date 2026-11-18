@@ -2374,7 +2374,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
     fi
     case "$result_word" in
-        declined|lost)
+        declined|lost|hana_command_admission_refused)
             if [[ "$result_word" == declined && -n "$result_seconds" ]]; then
                 printf '%s\n' "$result_seconds" >> "$BUILDLOG_HOLD_WAIT_FILE"
             fi
