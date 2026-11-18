@@ -539,9 +539,14 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     seconds = conf.read("review_links").number("page_refresh_seconds")
     counts = counts_strip(members, names) if include_counts else ''
+    expansion = ''.join(f'<button type="button" id="list-{action}-all" data-list-expansion="{action}"'
+                        + f' aria-label="{label}" title="{label}">' + page_frame.icon_svg(icon) + '</button>'
+                        for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
+                                                    ("collapse", "Collapse all", "chevrons-down-up")))
     content = (STYLE + page_frame.title("The List", "list")
-               + f'<div data-list data-refresh-seconds="{seconds}"><div data-record-filters>'
+               + f'<div data-list data-refresh-seconds="{seconds}"><div data-record-filters><div class="list-toolbar">'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
+               + '<div class="list-expansion">' + expansion + '</div></div>'
                + record_table.chip_row('Show', shows, 'open')
                + record_table.chip_row('State', states, 'all')
                + record_table.chip_row('Owner', owners, 'all')
@@ -558,6 +563,11 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
 
 
 STYLE = record_table.STYLE + '''<style>
+.list-toolbar{display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-bottom:10px}
+.list-toolbar .record-filter-words{min-width:0;margin:0}
+.list-expansion{display:flex;gap:6px}
+.list-expansion button{justify-content:center;width:36px;padding:0;cursor:pointer}
+.list-expansion svg{width:18px;height:18px}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
@@ -629,6 +639,9 @@ const tableView=createRecordTable({content:()=>content,
 const apply=(write=true)=>tableView.apply(write),place=()=>tableView.place();
 function bind(){
  tableView.replace();
+ content.querySelectorAll('[data-list-expansion]').forEach(button=>button.addEventListener('click',()=>{
+  tableView.setShownExpanded(button.dataset.listExpansion==='expand');
+ }));
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');

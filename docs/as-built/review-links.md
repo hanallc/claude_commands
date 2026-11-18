@@ -626,6 +626,12 @@ Each row starts with All.
 Each chip count reflects the other rows and the words box.
 A zero-count chip stays visible and dimmed.
 
+The Expand all and Collapse all buttons sit next to the words box.
+They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.
+Each button applies to all items that match the current filters.
+Each button applies the current text in the words box before it selects the items.
+Hidden items keep their open or closed state.
+
 A link under Links opens the target item in the console.
 The table changes Show to All if the target is outside the current view.
 The table clears each filter that excludes the target and keeps each filter that matches it.

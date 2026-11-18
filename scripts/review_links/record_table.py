@@ -56,7 +56,7 @@ background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;b
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
-.record-filter-row button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
+.record-filter-row button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
 color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
 .record-filter-row button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
@@ -461,6 +461,18 @@ function jump(key,{pushPlace=true}={}){
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
 }
+function setRowsExpanded(items,expanded){
+ for(const item of items){
+  const key=item.dataset.key;
+  if(opened.has(key)===expanded) continue;
+  linkedItem='';
+  if(expanded){
+   if(options.single) opened.clear();
+   opened.add(key);
+  }else opened.delete(key);
+ }
+ apply(true,{animate:true});
+}
 function bind(){
  const changePlace=()=>apply(true,{dismissMissingItem:true});
  const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace();};
@@ -487,16 +499,22 @@ function bind(){
  }));
  content.querySelectorAll('.list-row').forEach(row=>row.addEventListener('click',event=>{
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
-  const key=row.parentElement.dataset.key;
-  linkedItem='';
-  if(opened.has(key)) opened.delete(key);else {if(options.single) opened.clear();opened.add(key);}
-  apply(true,{animate:true});
+  const item=row.parentElement;
+  setRowsExpanded([item],!opened.has(item.dataset.key));
  }));
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
   type=button.dataset.typeChip;changePlace();
  }));
 }
 return {place,apply,bind,opened,restorePlace,jump,saveDeparturePlace,get linkedItem(){return linkedItem;},
+ setShownExpanded(expanded){
+  const currentQuery=words().value;
+  if(query!==currentQuery){
+   query=currentQuery;
+   apply(false,{dismissMissingItem:true});
+  }
+  setRowsExpanded(content.querySelectorAll('[data-list-item]:not([hidden])'),expanded);
+ },
  closeCard(key){
   const wasOpen=opened.delete(key);
   if(linkedItem===key) linkedItem='';
