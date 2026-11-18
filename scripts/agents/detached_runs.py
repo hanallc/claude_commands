@@ -235,17 +235,16 @@ def stop_with_reason(
         record = worker_lifecycle.read_json_object(path)
         if not _is_run_record(record) or path.name != f"{record['run_id']}.json":
             return False
+        if not still_current():
+            return False
         stopping = {**record, "stop_reason": reason}
-        sent = False
         try:
             write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
-            if still_current():
-                signal_run()
-                sent = True
-            return sent
-        finally:
-            if not sent:
-                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            signal_run()
+        except BaseException:
+            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            raise
+        return True
 
 
 @dataclass(frozen=True)
@@ -346,7 +345,7 @@ def _orphaned(path: Path, raw: Mapping[str, object], now: float) -> bool:
         return False
     pid = _integer(raw.get("pid"))
     if pid > 0:
-        if detached_run_process.supervisor_match(pid, path) is not False:
+        if detached_run_process.supervises(pid, path):
             return False
         command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
         if isinstance(command, (process_start.Started, process_start.Unreadable)):
@@ -428,7 +427,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
         if worker and raw.get("worker") != worker:
             continue
         if raw.get("status") == "finished" and raw.get("completion_pending"):
-            if detached_run_process.supervisor_match(raw["pid"], path) is False:
+            if not detached_run_process.supervises(raw["pid"], path):
                 result.queue_completion(path, _read_record(path))
             continue
         if not _orphaned(path, raw, now):

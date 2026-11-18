@@ -1140,10 +1140,27 @@ sys.exit(status)
             send.assert_not_called()
             self.assertNotIn("stop_reason", cast(dict[str, object], json.loads(path.read_text())))
 
+        with self.subTest(case="supervisor timeout never publishes a stop reason"):
+            saved_bytes = path.read_bytes()
+
+            def time_out(_pid: int) -> detached_run_process.ProcessArgumentsUnavailable:
+                self.assertEqual(path.read_bytes(), saved_bytes)
+                return detached_run_process.ProcessArgumentsUnavailable()
+
+            with (patch.object(detached_run_process, "process_args", side_effect=time_out) as observe,
+                  patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
+                  patch.object(process_group, "send_process_group") as send):
+                self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
+            observe.assert_called_once_with(os.getpid())
+            write.assert_not_called()
+            send.assert_not_called()
+            self.assertEqual(path.read_bytes(), saved_bytes)
+
         with self.subTest(case="directory sync fails after the stop reason replaces the record"):
             self.update_record(path, stop_reason="earlier stop")
             saved = cast(dict[str, object], json.loads(path.read_text()))
             with (patch.object(atomic_file, "sync_folder", side_effect=[OSError("fixture sync failure"), None]),
+                  patch.object(detached_run_process, "supervisor_match", return_value=True),
                   patch.object(process_group, "send_process_group") as send,
                   self.assertRaisesRegex(atomic_file.AtomicDurabilityUnconfirmed, "fixture sync failure")):
                 _ = detached_runs.stop_command(path, "new stop")
