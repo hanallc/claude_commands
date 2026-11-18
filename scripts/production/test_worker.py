@@ -636,7 +636,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(states[busy.row.id].row.current_session, busy.row.current_session)
         self.assertEqual(states[idle.row.id].row.current_session, idle.row.current_session)
 
-    def test_not_restored_names_each_worker_that_restore_never_starts(self) -> None:
+    def test_restart_prefilter_leaves_worker_completion_to_restore(self) -> None:
         from scripts.whoami import quota_state
 
         idle = self.opened("review", "review")
@@ -645,21 +645,22 @@ class WorkerCommandTests(unittest.TestCase):
             worker_name=busy.row.name, worker_id=busy.row.id, launcher_command=["assign.sh", "--to", "impl"],
             prompt=self.prompt, kind="impl", lens="")
         record = staff.snapshot()
-        self.assertEqual(worker.not_restored(idle.row, record), worker.NotRestored("worker with no active dispatch"))
+        self.assertIsNone(worker.not_restored(idle.row, record))
         self.assertIsNone(worker.not_restored(busy.row, record))
         with patch.object(quota_state, "no_worker_mode", return_value=True):
-            self.assertEqual(worker.not_restored(busy.row, record), worker.NotRestored("Codex worker in no-worker mode"))
+            self.assertIsNone(worker.not_restored(busy.row, record))
 
-    def test_closing_a_worker_removes_its_id_from_the_restart_record(self) -> None:
+    def test_closing_a_worker_preserves_its_restart_entry(self) -> None:
         from scripts.agents import shutdown_record
 
         idle = self.opened("review", "review")
         self.assertTrue(shutdown_record.record_path().is_relative_to(self.fixture.root))
-        shutdown_record.save([str(self.fixture.parent.id), str(idle.row.id)])
+        saved = [str(self.fixture.parent.id), str(idle.row.id)]
+        shutdown_record.save(saved)
         _ = self.fixture.world.stop(idle.row, self.fixture.world)
         self.assertIsInstance(worker_panes.close(self.fixture.parent.id, staff.WorkerName.parse(idle.row.name)),
                               worker_panes.Closed)
-        self.assertEqual(shutdown_record.read(), [str(self.fixture.parent.id)])
+        self.assertEqual(shutdown_record.read(), saved)
 
     def test_restore_keeps_a_busy_codex_worker_stopped_in_no_worker_mode(self) -> None:
         self.assert_held_in_no_worker_mode(refused=False)
@@ -1224,7 +1225,8 @@ class WorkerCommandTests(unittest.TestCase):
             def sleep(self, seconds: float) -> None:
                 self.seconds += seconds
 
-        for outcome in ("compacted", "no proof", "timeout", "no receipt", "first staff read", "hook write",
+        for outcome in ("compacted", "timeout with proof", "no proof", "timeout", "no receipt", "first staff read",
+                        "hook write",
                         "reply write", "notice failure", "attached"):
             with self.subTest(outcome=outcome):
                 current = self.opened("detached-" + outcome.replace(" ", "-"))
@@ -1264,7 +1266,7 @@ class WorkerCommandTests(unittest.TestCase):
                             _ = stream.write(json.dumps({"type": "compacted"}) + "\n")
                         self.agent.compact_inputs[pane] = ""
                         order.append("compacted")
-                    return ended
+                    return herdr.WaitTimedOut() if outcome == "timeout with proof" else ended
 
                 send_keys = self.fixture.world.send_keys
 
@@ -1345,7 +1347,7 @@ class WorkerCommandTests(unittest.TestCase):
                         if outcome == "reply write":
                             _ = failures.enter_context(patch.object(worker, "save_reply", side_effect=OSError("reply write failed")))
                         code = worker.main(commands[0][2:])
-                if outcome == "compacted":
+                if outcome in {"compacted", "timeout with proof"}:
                     self.assertEqual(code, worker.ExitCode.OK)
                     self.assertEqual(order, ["returned", "compacted", "prompt"])
                     self.assertEqual(len(self.agent.submitted), before + 1)
@@ -1916,16 +1918,97 @@ class WorkerCommandTests(unittest.TestCase):
                          (worker.ExitCode.REFUSED, "", "foreign: no worker staff row\n"))
         self.assertEqual(len(self.agent.answers), 2)
 
+    def test_answer_refuses_without_an_accepted_pass(self) -> None:
+        opened = self.opened()
+        name = opened.row.name
+        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
+        self.agent.questions[opened.pane] = "Which format?"
+        with self.subTest(pass_state="no active pass"):
+            with (patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt,
+                  patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as answer):
+                code, output, error = self.command("answer", name, "--text", "Use JSON.")
+                self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+                self.assertIn("no active pass", error)
+                self.assertIn("assign.sh", error)
+                self.assertEqual(len(error.splitlines()), 1)
+            prompt.assert_not_called()
+            answer.assert_not_called()
+            self.assertEqual(self.agent.answers, [])
+
+        instance = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
+            worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.prompt, kind="impl", lens="")
+        for delivery in (progress_history.DispatchDelivery("", "", ""),
+                         progress_history.DispatchDelivery("fixture prompt", "", str(self.reply)),
+                         progress_history.DispatchDelivery("fixture prompt", instance, str(self.reply))):
+            progress_history.save_dispatch_delivery(self.run_dir, instance, delivery)
+            for state in ("idle", "blocked"):
+                with (self.subTest(delivery=delivery, state=state),
+                      patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt,
+                      patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as answer):
+                    self.fixture.world.locations[opened.pane]["agent_status"] = state
+                    saved = (self.run_dir / "progress_history_state.json").read_bytes()
+                    code, output, error = self.command("answer", name, "--text", "Use JSON.")
+                    self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+                    self.assertIn("assign.sh", error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), saved)
+                    prompt.assert_not_called()
+                    answer.assert_not_called()
+
+    def test_answer_refuses_after_done_before_the_hook_updates_the_pass(self) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        row = self.agent.row(pane)
+        self.agent.append(pane, "assistant", "A later assistant message.")
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.ActiveDispatch)
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        with (patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt,
+              patch.object(self.fixture.world, "answer_question") as answer):
+            code, output, error = self.command("answer", row.name, "--text", "Use JSON.")
+        self.assertEqual((code, output), (worker.ExitCode.REFUSED, ""))
+        self.assertIn("already has a DONE reply", error)
+        prompt.assert_not_called()
+        answer.assert_not_called()
+
+    def test_answer_refuses_during_detached_compaction(self) -> None:
+        opened = self.opened()
+        backend = staff.backend(opened.row)
+        assert isinstance(backend, staff.CodexBackend)
+        with worker_admission.transcript_source(opened.row, backend).open("a") as stream:
+            _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 43001, "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
+        commands: list[list[str]] = []
+
+        def queue(command: list[str], **_options: object) -> int:
+            commands.append(command)
+            return 123
+
+        with (patch.object(detached, "start_detached", side_effect=queue), redirect_stdout(io.StringIO())):
+            self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        command, = commands
+        wait = self.fixture.world.wait_turn_end
+        self.agent.compact_proof = "compacted"
+        refusal: list[tuple[int, str, str]] = []
+
+        def answer_during_compaction(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+            self.agent.questions[pane] = "Which format?"
+            refusal.append(self.command("answer", opened.row.name, "--text", "Use JSON."))
+            return wait(pane, timeout_ms)
+
+        with (patch.object(self.fixture.world, "wait_turn_end", side_effect=answer_during_compaction),
+              patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt,
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(worker.main(command[2:]), worker.ExitCode.OK)
+        prompt.assert_not_called()
+        (code, output, error), = refusal
+        self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+        self.assertIn("assign.sh", error)
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertEqual(self.agent.answers, [])
+        self.assertEqual(len(self.agent.submitted), 1)
+
     def test_answer_uses_prompt_for_an_idle_worker(self) -> None:
         opened = self.opened()
-        self.agent.questions[opened.pane] = "Which format?"
-        self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
-        with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as answer:
-            self.assertEqual(self.command("answer", "impl", "--text", "Use JSON."), (0, "done\n", ""))
-        answer.assert_not_called()
-        self.assertEqual(len(self.agent.answers), 1)
-        self.assertIn("Use JSON.", self.agent.answers[0][1])
-
         with self.subTest(answer="resubmit after compaction"):
             self.agent.finish_after = 1
             self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
@@ -1967,28 +2050,11 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertIn(f"DONE {delivery.completion_id}", self.reply.read_text())
             self.assertEqual(status.read_text(), "done\n")
 
-        opened = self.opened()
-        for saved_delivery in (False, True):
-            with self.subTest(answer="empty completion id" if saved_delivery else "no saved delivery"):
-                dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
-                    worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
-                    prompt=self.prompt, kind="impl", lens="")
-                if saved_delivery:
-                    progress_history.save_dispatch_delivery(self.run_dir, dispatch_id,
-                        progress_history.DispatchDelivery("fixture prompt", "", str(self.reply)))
-                self.fixture.world.locations[opened.pane]["agent_status"] = "idle"
-                self.agent.questions[opened.pane] = "Which format?"
-                text = "Use JSON."
-                with patch.object(self.fixture.world, "prompt", wraps=self.fixture.world.prompt) as prompt:
-                    self.assertEqual(self.command("answer", "impl", "--text", text), (0, "done\n", ""))
-                prompt.assert_called_once_with(opened.pane, text, target=str(opened.row.current_session))
-                self.assertEqual(self.agent.answers[-1], (opened.pane, script_prompt(text)))
-                self.assertNotIn("DONE", self.agent.answers[-1][1])
-                progress_history.complete_dispatch(self.run_dir, "impl", dispatch_id)
-
     def test_answer_keeps_prompt_for_a_blocked_claude_worker(self) -> None:
         _ = write_registry(self.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
         opened = self.opened()
+        self.agent.finish_after = 1
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
         self.agent.questions[opened.pane] = "Which format?"
         self.fixture.world.locations[opened.pane]["agent_status"] = "blocked"
         with patch.object(self.fixture.world, "answer_question", wraps=self.fixture.world.answer_question) as answer:
@@ -1996,6 +2062,7 @@ class WorkerCommandTests(unittest.TestCase):
         answer.assert_not_called()
         self.assertEqual(len(self.agent.answers), 1)
         self.assertIn("Use JSON.", self.agent.answers[0][1])
+        self.assertIn("DONE ", self.agent.answers[0][1])
 
     def test_claude_without_a_transcript_receives_its_first_dispatch_prompt(self) -> None:
         _ = write_registry(self.fixture.root / "conf/models.conf", {"assignments": {"direct": "claude"}})

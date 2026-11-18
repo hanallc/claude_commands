@@ -25,9 +25,10 @@ The [daily simplify run](simplify-lens.md) uses a fresh Claude review.
 Workers compact between assignments when their recorded context exceeds the configured limit.
 The launcher returns when a child accepts that dispatch through `scripts.lib.detached.start_detached`.
 The child uses a separate session, so a signal to the caller's process group does not stop it.
-A compaction must write its transcript record within `WORKER_COMPACT_SECONDS`.
-The same deadline bounds `/compact --wait --timeout` and the following turn-end wait.
-Only the compaction record proves completion; a turn-start record does not.
+`WORKER_COMPACT_SECONDS` sets the deadline for `/compact --wait --timeout` and the following turn-end wait.
+Only a new compaction record in the transcript proves completion.
+If the deadline expires, the worker checks for this record before it reports a timeout.
+A complete compaction record lets the worker send the assignment.
 The child then sends the prompt and confirms its transcript receipt within `WORKER_SETTLE_SECONDS`.
 It writes its output to `compact-<dispatch id>.log` in the run folder.
 A compaction failure sends no prompt and clears only matching `/compact` composer text.
@@ -116,10 +117,17 @@ An incomplete final scan names the state, the scan reason, and membership in the
 Every worker operation takes the name lock before the fixed-id lock.
 The launcher holds both locks from publication through dispatch recording and submission.
 The first `ready` hook waits for these locks before it checks the dispatch.
-An ignored turn closes the pane when no dispatch holds the worker.
+An ignored turn can close the pane when no dispatch holds the worker.
+A matching DONE for an ended pass follows the late DONE rule if the hook has no completion for that reply.
+The hook saves the late reply in a file named for the pass.
+It sends one notice with the earlier pass state and reply path.
+The hook records delivery before it tries to close the pane.
+A repeat of a DONE that the hook already handled sends no second notice.
 
 `worker.dispatch_receipt` reads the transcript and detached run evidence.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
+A later assistant message preserves the matching DONE.
+A detached result after DONE requires a new matching reply.
 A pending run reply keeps the pass active without another prompt.
 Run events preserve the last worker reply while a result awaits a reply.
 A live run reports `waiting on runs`, including when an earlier result awaits a reply.
@@ -131,24 +139,44 @@ The notice includes the worker's last reply and leaves the pass active.
 A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
 An empty turn without that compaction evidence stays ignored.
 Resubmit that work with `worker.py answer <name> --text "Read the assigned prompt and do the work."`.
-For an active pass, `answer` adds the saved completion id to the normal DONE instruction.
-The pass and saved delivery stay unchanged, and the normal hook handles the matching DONE reply.
+`answer` takes the same worker lock as `assign`.
+It requires an active pass, a saved delivery, and transcript proof that the worker accepted the delivery.
+If compaction holds the lock or the pass lacks proof, `answer` refuses to send input.
+A matching DONE in the transcript blocks input before the completion hook updates the pass.
+Use `assign.sh` for new work.
 A blocked Codex question receives only the supplied answer text.
-The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
-The completion rule accepts the saved DONE hook completion for the same dispatch.
-Live detached work prevents completion before pane closure.
+Other answers include the saved completion ID in the DONE instruction.
+The normal hook handles DONE for the same pass.
+If the reply ends with a different DONE ID, the no DONE notice names both IDs.
+The pass stays active and the pane stays open until the reply contains the matching DONE.
+The completion hook saves the reply and records the pending notice for the exact pass.
+Live detached work delays normal and late DONE notices.
+The hook runs saved completion actions and records delivery before it closes the pane.
+A failed delivery keeps the notice pending and the pane open.
+The hook, restore, and assignment use the same completion recovery under the worker lock.
+Recovery continues a saved completion or checks for matching DONE in the transcript.
+The restart prefilter sends each saved worker to restore, including workers with no active pass.
+Unavailable completion evidence keeps the restart entry.
+Pane closure alone keeps the restart entry.
+Completion removes the entry after it saves the final result.
+Restore reports incomplete recovery if pane closure fails.
+The next restore retries closure without sending the completion notice again.
+The hook records closure diagnostic delivery separately from the diagnostic text.
+A later recovery retries an undelivered diagnostic with the same delivery key.
 The hook ends `scratch.worker_task(row.id)` before it closes the pane.
 This removes the worker's `scratch.py new --worker` folders and keeps other workers' folders.
-A failed cleanup adds one line to the director notice and permits pane closure.
+A failed cleanup adds a diagnostic to the director notice and permits pane closure.
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
-A later DONE reply corrects a launcher error for the same pass and permits pane closure.
+When DONE arrives during launcher error recovery, the hook records `completed` and finishes the saved actions.
+The director's notice names the earlier state.
+A DONE that arrives after recovery has finished sends a late notice and preserves the recorded outcome.
 The review trial uses the latest completion duration for each pass.
 Named adversary and contract reviews use the same completion hook.
 Their DONE reply records `done` and sends one notice.
 The hook also saves an assigned style review result.
-A close anomaly retains the completed outcome and reaches the director in the hook message.
+A close anomaly retains the completed outcome and sends a separate diagnostic to the director.
 A held reviewer role remains held after submission. Completion ends that reviewer and releases the role.
 The close matches the pane's terminal identity and closes it without a foreground-process wait.
 Uncertain ownership or failed closure produces a retained-pane diagnostic.
