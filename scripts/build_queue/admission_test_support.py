@@ -31,7 +31,7 @@ from scripts.lint import memory_admit as gate
 
 from scripts.lint.memory_test_support import (
     admission_policy_fixture, config_environment, fake_memory_readings, gate_isolation_environment,
-    write_config_fixture, write_pressure_reading,
+    write_pressure_reading,
 )
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import admission_records as records
@@ -360,7 +360,7 @@ class AdmissionFixture(ExitStack):
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         config = self.root / "build_admission.conf"
         if not config.exists():
-            _ = write_config_fixture(config, f"cloud_gate_slots={FIXTURE_CLOUD_GATE_SLOTS}\n")
+            write_memory_config(config, cloud_gate_slots=str(FIXTURE_CLOUD_GATE_SLOTS))
         if configuration := os.environ.get("CONF_DIR"):
             _ = config_environment(Path(configuration))
         self.temporary: Path = self.root / "tmp"
