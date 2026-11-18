@@ -596,6 +596,7 @@ class GatePlanTests(CostFixture):
         self.enable_gates = True
         self.displaced_policies: dict[str, dict[str, str]] = {}
         self.unresolved_policy = ''
+        self.cleanup_timeouts: list[tuple[float, float]] = []
 
     @override
     def setUp(self) -> None:
@@ -610,7 +611,7 @@ class GatePlanTests(CostFixture):
         self.template = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_bytes())))
         account = DeploymentSettings(GATE_HOME, 'fixture-admin', 'fixture-home', 'ami-home',
             'fixture-owner', 'fixture-release', GATE_HOME + 'a', 'vpc-' + GATE_HOME, 'subnet-' + GATE_HOME,
-            '/dev/xvda', 1, 2, 3, 1, 300, 'fixture-scaler')
+            '/dev/xvda', 1, 2, 3, 30, 300, 'fixture-scaler')
         self.replace('stack_wait_timeout_s', '15')
         _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=account))
         _ = self.enterContext(mock.patch.object(plan_identity, 'plan_credentials', return_value=CREDENTIAL))
@@ -649,7 +650,8 @@ class GatePlanTests(CostFixture):
         for secret in (OWNER.account, CREDENTIAL.access_key_id, CREDENTIAL.secret_access_key,
                        'fixture-scaler-key', 'fixture-scaler-secret', 'fixture-stack', 'fixture-private-physical'):
             self.assertNotIn(secret, printed + errors.getvalue())
-        self.assertEqual(self.change_sets, {})
+        if self.failure != 'cleanup-fails':
+            self.assertEqual(self.change_sets, {})
         return status, printed
 
     def execute(self, arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
@@ -728,6 +730,8 @@ class GatePlanTests(CostFixture):
             self.assertTrue(name.startswith(plan_identity.CHANGE_SET_PREFIX))
             failure = self.failure if region == self.failure_region else ''
             reads = self.calls_in(region).count(CONFIRM_REMOVAL)
+            if operation == 'delete-change-set' or (operation == 'describe-change-set' and reads > 1):
+                self.cleanup_timeouts.append((time.monotonic(), timeout))
             if operation == 'create-change-set':
                 self.assertNotIn(region, self.change_sets)
                 self.assertEqual(option('--change-set-type'), 'UPDATE')
@@ -759,12 +763,19 @@ class GatePlanTests(CostFixture):
             else:
                 self.assertEqual(self.change_sets[region], name)
                 if operation == 'delete-change-set':
-                    if failure == 'delete-not-ready' and reads == 1:
+                    if failure == 'cleanup-fails':
+                        return error('AccessDenied', 'DeleteChangeSet', 'fixture-private-physical')
+                    if failure == 'preview-interrupted' and reads == 1:
+                        del self.change_sets[region]
+                        raise KeyboardInterrupt
+                    if failure == 'delete-ready-last' and reads == 1:
                         return error('InvalidChangeSetStatus', 'DeleteChangeSet', 'fixture-private-physical')
                     del self.change_sets[region]
                     reply = {}
-                elif failure == 'delete-not-ready' and reads == 2:
+                elif failure == 'delete-ready-last' and 1 < reads <= len(plan_identity.PROOF_RETRY_DELAYS):
                     reply = {'Status': 'CREATE_IN_PROGRESS'}
+                elif failure == 'cleanup-fails' and reads > 1:
+                    reply = {'Status': 'DELETE_FAILED'}
                 elif failure == 'no changes':
                     reply = {'Status': 'FAILED', 'StatusReason': 'No updates are to be performed.', 'Changes': []}
                 else:
@@ -785,6 +796,7 @@ class GatePlanTests(CostFixture):
         self.assertEqual(request['PolicySourceArn'], GATE_USER)
         active = GATE_POLICY_NAMES if self.enable_gates else ()
         exclusions = dict.fromkeys((*active, *(name for place in self.regions
+                                               if self.failure != 'cleanup-fails' or place != self.failure_region
                                                for name in self.displaced_policies.get(place, {}))))
         if exclusions:
             self.assertEqual(request['PolicyExclusionList'],
@@ -894,17 +906,85 @@ class GatePlanTests(CostFixture):
         self.assertEqual(output.count('plan stack: change set removal confirmed'), 1)
         self.assertIn('plan gate: us-east-2: refused: Id: expected nonempty text', output)
 
-    def test_delete_retries_after_the_change_set_becomes_deletable(self) -> None:
+    def test_last_cleanup_check_can_retry_delete_and_confirm_removal(self) -> None:
         self.regions = (GATE_HOME,)
-        self.failure, self.failure_region = 'delete-not-ready', GATE_HOME
-        status, output = self.run_plan()
+        self.failure, self.failure_region = 'delete-ready-last', GATE_HOME
+        self.replace('stack_wait_timeout_s', '20')
+        now = 0.0
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with mock.patch.object(time, 'monotonic', side_effect=lambda: now), \
+                mock.patch.object(time, 'sleep', side_effect=advance):
+            status, output = self.run_plan()
         self.assertEqual(status, 0, output)
         cleanup = [operation for service, operation in self.calls_in(GATE_HOME)
                    if service == 'cloudformation' and operation.endswith('-change-set')]
         self.assertEqual(cleanup, ['create-change-set', 'describe-change-set', 'delete-change-set',
-                                   'describe-change-set', 'describe-change-set', 'delete-change-set',
+                                   *(['describe-change-set'] * len(plan_identity.PROOF_RETRY_DELAYS)), 'delete-change-set',
                                    'describe-change-set'])
         self.assertIn('plan stack: change set removal confirmed', output)
+        self.assertEqual(self.cleanup_timeouts[-1], (15.0, 5.0))
+        self.assertTrue(all(start + duration <= 20 for start, duration in self.cleanup_timeouts))
+
+    def test_cleanup_deadline_includes_delete_and_confirmation_calls(self) -> None:
+        now = 0.0
+        calls: list[tuple[str, float]] = []
+        name = ''
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal now, name
+            self.assertTrue(capture_output and text and not check)
+            self.assertEqual((env or {}).get('AWS_ACCESS_KEY_ID'), CREDENTIAL.access_key_id)
+            operation = arguments[4]
+            calls.append((operation, timeout))
+            if operation == 'create-change-set':
+                name = arguments[arguments.index('--change-set-name') + 1]
+                return subprocess.CompletedProcess(arguments, 0, '{"Id": "fixture-change-id"}', '')
+            if len(calls) == 2:
+                reply = '{"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}'
+                return subprocess.CompletedProcess(arguments, 0, reply, '')
+            now += timeout
+            if operation == 'delete-change-set':
+                return subprocess.CompletedProcess(arguments, 0, '{}', '')
+            raise subprocess.TimeoutExpired(operation, timeout)
+
+        plan = plan_run.PlanRun(lambda: CREDENTIAL, execute, lambda _seconds: None)
+        output = StringIO()
+        with mock.patch.object(time, 'monotonic', side_effect=lambda: now), redirect_stdout(output):
+            with self.assertRaisesRegex(plan_run.PlanRefused, '^change set not removed$'):
+                with plan.change(plan.api(GATE_HOME, 30), self.stack_id(GATE_HOME), b'{}', [], 4) as change:
+                    self.assertEqual(change['Status'], 'CREATE_COMPLETE')
+        self.assertEqual(calls, [('create-change-set', 30), ('describe-change-set', 30),
+                                 ('delete-change-set', 2), ('describe-change-set', 2)])
+        self.assertEqual(now, 4)
+        self.assertIn('plan stack: change set may remain: ' + name, output.getvalue())
+        self.assertNotIn('plan stack: change set removal confirmed', output.getvalue())
+
+    def test_cleanup_failure_keeps_legacy_policy_evidence_and_blocks_every_region(self) -> None:
+        self.failure, self.failure_region = 'cleanup-fails', GATE_REGION
+        self.displaced_policies = {GATE_REGION: {'GateLegacyPolicy': 'Remove'}}
+        status, output = self.run_plan()
+        self.assertEqual(status, 1, output)
+        self.assertEqual(list(self.change_sets), [GATE_REGION])
+        self.assertIn('plan stack: change set may remain: ' + self.change_sets[GATE_REGION], output)
+        self.assertIn('plan gate: us-west-2: refused: change set not removed', output)
+        self.assertIn('plan gate: us-east-2: refused: Gate policy exclusions are incomplete '
+                      + 'because the preview in us-west-2 did not pass. Policies found there: GateLegacyPolicy.', output)
+        self.assertNotIn('pass (', output)
+        self.assertFalse(any(service == 'iam' for _, service, _ in self.calls))
+
+    def test_interrupted_preview_refuses_every_region(self) -> None:
+        self.failure, self.failure_region = 'preview-interrupted', GATE_REGION
+        status, output = self.run_plan()
+        self.assertEqual(status, 1, output)
+        self.assertIn('plan gate: us-east-2: refused: Gate policy exclusions are incomplete', output)
+        self.assertIn('plan gate: us-west-2: refused: The gate preview was interrupted.', output)
+        self.assertTrue(output.endswith('plan run: refused: interrupted\n'))
+        self.assertFalse(any(service == 'iam' for _, service, _ in self.calls))
 
     def test_preview_excludes_removed_and_replaced_policies_from_every_simulation(self) -> None:
         self.displaced_policies = {GATE_HOME: {'GateLegacyPolicy': 'Remove'},
@@ -1023,6 +1103,7 @@ class GatePlanTests(CostFixture):
                 status, output = self.run_plan()
                 self.assertEqual(status, 1, output)
                 self.assertIn(reason, output)
-                self.assertIn('plan gate: eu-north-1: pass (UPDATE', output)
+                outcome = 'pass (UPDATE' if failure == 'ec2:TerminateInstances' else 'refused: Gate policy exclusions'
+                self.assertIn(f'plan gate: eu-north-1: {outcome}', output)
                 lines = [line for line in output.splitlines() if line.startswith('plan gate:')]
                 self.assertEqual([line.split()[2].rstrip(':') for line in lines], list(self.regions))

@@ -30,6 +30,14 @@ class PlanRefused(ValueError):
     """The available evidence does not permit the setup plan."""
 
 
+class GateStackAbsent(PlanRefused):
+    """CloudFormation confirmed that the named gate stack does not exist."""
+
+
+class _ChangeSetCleanupDeadline(Exception):
+    """The time for change set cleanup has expired."""
+
+
 def unsupported(state: str) -> PlanRefused:
     return PlanRefused(f'no plan run exists for this state ({state})')
 
@@ -141,6 +149,19 @@ class GatePolicyResources:
 class GateUpdatePreview:
     summary: str
     displaced_policy_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GateDisplacedPolicies:
+    stack_id: str
+    logical_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GatePolicyExclusions:
+    """The policy ARNs from the complete set of gate previews."""
+
+    live_arns: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -406,9 +427,11 @@ class PlanRun:
                 GatePolicyResources(bucket, profile, role,
                                     json.dumps(document, separators=(',', ':'))))
 
-    def probe_gate_scaler(self, api: AwsCli, principal: str, policy: ScalerPolicyPlan, shared: GatePolicyResources,
-                          launch: GateLaunchProbe, *, home: bool) -> None:
+    def probe_gate_scaler(self, api: AwsCli, principal: str, exclusions: GatePolicyExclusions,
+                          documents: tuple[str, ...], shared: GatePolicyResources, launch: GateLaunchProbe,
+                          *, home: bool) -> None:
         owner = self.credential.owner
+        policy = ScalerPolicyPlan(exclusions.live_arns, documents)
 
         def simulate(action: str, resource: str = '*', *, context: Mapping[str, str] | None = None) -> None:
             self._simulate(api, principal, policy, action, resource, context or {},
@@ -457,7 +480,9 @@ class PlanRun:
             reply = api.call('describe-stacks', '--stack-name', name, service='cloudformation')
         except AwsUnavailable as error:
             if aws_error_code(error) == 'ValidationError' and str(error).endswith(': Stack does not exist'):
-                raise unsupported('the gate stack is absent; its CREATE preview can leave a review stack') from None
+                raise GateStackAbsent(
+                    'no plan run exists for this state (the gate stack is absent; its CREATE preview can leave a review stack)'
+                ) from None
             raise
         stacks = ledger.rows(reply, 'Stacks')
         owner = self.credential.owner
@@ -467,8 +492,9 @@ class PlanRun:
             raise PlanRefused('CloudFormation did not confirm the gate stack identity.')
         return stacks[0]
 
+    @contextmanager
     def gate_update(self, api: AwsCli, stack: str, template: bytes, values: list[dict[str, object]],
-                    timeout: int) -> GateUpdatePreview:
+                    timeout: int) -> Generator[GateUpdatePreview]:
         with self.change(api, stack, template, values, timeout) as change:
             reason = str(change.get('StatusReason', '')).lower()
             empty = change.get('Status') == 'FAILED' and any(text in reason for text in (
@@ -477,25 +503,39 @@ class PlanRun:
                 raise PlanRefused('The gate change set has more than one page.')
             changes = ledger.rows({'Changes': change.get('Changes', [])}, 'Changes')
             if empty and not changes:
-                return GateUpdatePreview('UPDATE has no changes; scaler permissions passed', ())
+                yield GateUpdatePreview('UPDATE has no changes; scaler permissions passed', ())
+                return
             if change.get('Status') != 'CREATE_COMPLETE':
                 raise PlanRefused('CloudFormation did not provide an available gate change set.')
             if not changes:
                 raise PlanRefused('CloudFormation returned an empty successful gate change set.')
-            displaced: list[str] = []
-            for item in changes:
-                resource = ledger.mapping(item['ResourceChange'])
+            resources = tuple(ledger.mapping(item['ResourceChange']) for item in changes)
+            displaced = tuple(ledger.text(resource, 'LogicalResourceId') for resource in resources
+                              if ledger.text(resource, 'ResourceType') == 'AWS::IAM::ManagedPolicy'
+                              and ledger.text(resource, 'Action') != 'Add')
+            # Keep the policy IDs if validation or cleanup fails.
+            yield GateUpdatePreview('UPDATE preview and scaler permissions passed', displaced)
+            for resource in resources:
                 logical_id = ledger.text(resource, 'LogicalResourceId')
                 if not logical_id.startswith('Gate'):
                     raise PlanRefused('The gate change set changes a non-gate resource.')
                 action = ledger.text(resource, 'Action')
                 if action not in ('Add', 'Modify', 'Remove'):
                     raise PlanRefused(f'The gate change set has an unsupported action for {logical_id}.')
-                if ledger.text(resource, 'ResourceType') == 'AWS::IAM::ManagedPolicy' and action != 'Add':
-                    displaced.append(logical_id)
-            return GateUpdatePreview('UPDATE preview and scaler permissions passed', tuple(displaced))
 
-    def gate_displaced_policies(self, api: AwsCli, stack: str, policy_ids: Sequence[str]) -> tuple[str, ...]:
+    def gate_policy_exclusions(self, api: AwsCli, regions: Sequence[str], covered_regions: set[str],
+                               displaced: Mapping[str, GateDisplacedPolicies]) -> GatePolicyExclusions:
+        for region in regions:
+            if region in covered_regions:
+                continue
+            policy_ids = displaced[region].logical_ids if region in displaced else ()
+            detail = f' Policies found there: {", ".join(dict.fromkeys(policy_ids))}.' if policy_ids else ''
+            raise PlanRefused(f'Gate policy exclusions are incomplete because the preview in {region} did not pass.' + detail)
+        arns = (arn for region, policies in displaced.items()
+                for arn in self._gate_displaced_policies(api.in_region(region), policies.stack_id, policies.logical_ids))
+        return GatePolicyExclusions(tuple(dict.fromkeys(arns)))
+
+    def _gate_displaced_policies(self, api: AwsCli, stack: str, policy_ids: Sequence[str]) -> tuple[str, ...]:
         arns: list[str] = []
         for logical_id in dict.fromkeys(policy_ids):
             try:
@@ -551,7 +591,8 @@ class PlanRun:
             raise
         finally:
             try:
-                removed = self._remove_change_set(api, writer, target, name, create_confirmed=create_confirmed)
+                removed = self._remove_change_set(api, writer, target, name, timeout,
+                                                  create_confirmed=create_confirmed)
                 if not removed and not interrupted:
                     raise PlanRefused('change set not removed') from None
             except KeyboardInterrupt:
@@ -562,10 +603,10 @@ class PlanRun:
                     print(f'plan stack: interrupted with change set {name}', flush=True)
 
     @staticmethod
-    def _delete_change_set(writer: AwsCli, target: tuple[str, ...], name: str) -> bool:
+    def _delete_change_set(writer: AwsCli, target: tuple[str, ...], name: str, timeout: float) -> bool:
         """Return whether CloudFormation asks the plan to wait before it deletes again."""
         try:
-            _ = writer.call('delete-change-set', *target, service='cloudformation')
+            _ = writer.call('delete-change-set', *target, service='cloudformation', timeout_s=timeout)
         except AwsUnavailable as error:
             print(f'plan stack: delete call did not confirm removal of {name}', flush=True)
             return aws_error_code(error, operation='DeleteChangeSet') == 'InvalidChangeSetStatus'
@@ -573,26 +614,47 @@ class PlanRun:
             print(f'plan stack: delete call did not confirm removal of {name}', flush=True)
         return False
 
-    def _remove_change_set(self, api: AwsCli, writer: AwsCli, target: tuple[str, ...], name: str,
+    def _remove_change_set(self, api: AwsCli, writer: AwsCli, target: tuple[str, ...], name: str, timeout: int,
                            *, create_confirmed: bool) -> bool:
-        delete_when_ready = self._delete_change_set(writer, target, name)
-        for delay in plan_identity.PROOF_RETRY_DELAYS:
-            if delay:
-                self.pause(delay)
-            try:
-                change = api.call('describe-change-set', *target, '--no-paginate', service='cloudformation')
-            except AwsUnavailable as error:
-                if create_confirmed and aws_error_code(error) in CHANGE_SET_ABSENT:
-                    print('plan stack: change set removal confirmed', flush=True)
-                    return True
-            except (OSError, ValueError, subprocess.SubprocessError):
-                continue
-            else:
-                if not create_confirmed and change.get('ChangeSetName') == name:
-                    create_confirmed = True
-                    delete_when_ready = self._delete_change_set(writer, target, name)
-                elif delete_when_ready and change.get('Status') in ('CREATE_COMPLETE', 'FAILED', 'DELETE_FAILED'):
-                    delete_when_ready = self._delete_change_set(writer, target, name)
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise _ChangeSetCleanupDeadline
+            return seconds
+
+        def delete() -> bool:
+            # Give the confirmation read part of the remaining time.
+            return self._delete_change_set(writer, target, name, min(writer.timeout_s, remaining() / 2))
+
+        def describe() -> dict[str, object]:
+            return api.call('describe-change-set', *target, '--no-paginate', service='cloudformation',
+                            timeout_s=min(api.timeout_s, remaining()))
+
+        try:
+            delete_when_ready = delete()
+            for delay in plan_identity.PROOF_RETRY_DELAYS:
+                # Check immediately if the delay would use all the time that remains.
+                if 0 < delay < remaining():
+                    self.pause(delay)
+                try:
+                    change = describe()
+                    appeared = not create_confirmed and change.get('ChangeSetName') == name
+                    ready = delete_when_ready and change.get('Status') in ('CREATE_COMPLETE', 'FAILED', 'DELETE_FAILED')
+                    if appeared or (create_confirmed and ready):
+                        create_confirmed = True
+                        delete_when_ready = delete()
+                        _ = describe()
+                except AwsUnavailable as error:
+                    if create_confirmed and aws_error_code(error, operation='DescribeChangeSet') in CHANGE_SET_ABSENT:
+                        _ = remaining()
+                        print('plan stack: change set removal confirmed', flush=True)
+                        return True
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    continue
+        except _ChangeSetCleanupDeadline:
+            pass
         state = 'may remain' if create_confirmed else 'may still appear'
         print(f'plan stack: change set {state}: {name}', flush=True)
         return False

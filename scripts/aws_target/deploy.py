@@ -2532,8 +2532,10 @@ class Deployment:
 
         home_policy_ids = tuple(logical_id for logical_id in plan_run.GATE_SCALER_POLICY_IDS
                                 if live_parameters.get('EnableGates') == 'true' and logical_id in live_resources)
-        displaced = {settings.region: (stack_id, home_policy_ids)}
+        displaced = {settings.region: plan_run.GateDisplacedPolicies(stack_id, home_policy_ids)}
+        covered_regions: set[str] = set()
         pending_probes: dict[str, plan_run.GateLaunchProbe] = {}
+        interrupted = False
         for region in regions:
             if region in failures:
                 continue
@@ -2542,9 +2544,10 @@ class Deployment:
                 network = networks[region]
                 if region == settings.region:
                     changes = gate_update_values(stack, parameters, definitions)
-                    preview = plan.gate_update(target, stack_id, source, changes, wait_s)
-                    displaced[region] = (stack_id, home_policy_ids + preview.displaced_policy_ids)
-                    change_kind = preview.summary
+                    with plan.gate_update(target, stack_id, source, changes, wait_s) as preview:
+                        displaced[region] = plan_run.GateDisplacedPolicies(
+                            stack_id, home_policy_ids + preview.displaced_policy_ids)
+                        change_kind = preview.summary
                     regional_outputs = outputs
                 else:
                     name = settings.stack_name + '-gates-' + region
@@ -2561,9 +2564,9 @@ class Deployment:
                         changes = gate_update_values(regional, {key: value for key, value in regional_parameters.items()
                                                                 if key in regional_definitions}, regional_definitions)
                         regional_id = ledger.text(regional, 'StackId')
-                        preview = plan.gate_update(target, regional_id, regional_source, changes, wait_s)
-                        displaced[region] = (regional_id, preview.displaced_policy_ids)
-                        change_kind = preview.summary
+                        with plan.gate_update(target, regional_id, regional_source, changes, wait_s) as preview:
+                            displaced[region] = plan_run.GateDisplacedPolicies(regional_id, preview.displaced_policy_ids)
+                            change_kind = preview.summary
 
                 pending_probes[region] = plan_run.GateLaunchProbe(deployment, network.image, network.vpc,
                     ledger.text(network.subnets[0], 'id'), regional_outputs.get('GateLaunchTemplate', 'lt-00000000000000000'),
@@ -2573,20 +2576,27 @@ class Deployment:
                     gpu_size_trial.GPU_TRIAL_ARTIFACT_PREFIX + 'setup-probe.json',
                     gpu_size_trial.GPU_TRIAL_REQUEST_PREFIX + 'setup-probe.json')
                 results[region] = change_kind
+                covered_regions.add(region)
+            except plan_run.GateStackAbsent as error:
+                covered_regions.add(region)
+                failures[region] = plan_run.safe_reason(error)
+            except KeyboardInterrupt:
+                covered_regions.discard(region)
+                failures[region] = 'The gate preview was interrupted.'
+                interrupted = True
+                break
             except plan_run.PLAN_ERRORS as error:
                 failures[region] = plan_run.safe_reason(error)
 
         try:
-            exclusions = tuple(dict.fromkeys(arn for region, (stack, ids) in displaced.items()
-                                            for arn in plan.gate_displaced_policies(api.in_region(region), stack, ids)))
+            exclusions = plan.gate_policy_exclusions(api, regions, covered_regions, displaced)
         except plan_run.PlanRefused as error:
             for region in regions:
                 _ = failures.setdefault(region, plan_run.safe_reason(error))
         else:
-            policy = plan_run.ScalerPolicyPlan(exclusions, documents)
             for region, launch in pending_probes.items():
                 try:
-                    plan.probe_gate_scaler(api.in_region(region), principal, policy, shared, launch,
+                    plan.probe_gate_scaler(api.in_region(region), principal, exclusions, documents, shared, launch,
                                            home=region == settings.region)
                 except plan_run.PLAN_ERRORS as error:
                     failures[region] = plan_run.safe_reason(error)
@@ -2594,6 +2604,8 @@ class Deployment:
         for region in regions:
             result = f'refused: {failures[region]}' if region in failures else f'pass ({results[region]})'
             print(f'plan gate: {region}: {result}', flush=True)
+        if interrupted:
+            raise KeyboardInterrupt
         if failures:
             raise DeploymentRefused('one or more gate regions failed')
 

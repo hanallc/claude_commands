@@ -127,6 +127,7 @@ If the controller lock is busy, the plan refuses before it contacts AWS.
 It builds the same template and parameter values as approved gate setup.
 The plan previews updates in the home region and in each configured gate region.
 It removes each change set and confirms removal before it checks scaler permissions.
+Each removal has one deadline for all deletion and confirmation calls.
 An absent stack refuses because a CREATE change set can leave a stack in `REVIEW_IN_PROGRESS`.
 The plan identity has no permission to delete a stack.
 An existing stack in `REVIEW_IN_PROGRESS` also refuses.
@@ -134,9 +135,10 @@ In a region with a rolled-back first create, the plan checks scaler permissions.
 Approved setup must delete and recreate that regional stack.
 
 The plan reads the change sets for managed policies that the updates remove or replace.
+If a preview fails or its removal is unconfirmed, all regions that share the scaler policies refuse.
 The simulations exclude those policies and the live versions of the proposed gate scaler policies.
 If the plan cannot identify a policy to exclude, it names the policy and refuses.
-They include the proposed gate policies and the proposed S3 bucket policy.
+The simulations include the proposed gate policies and the proposed S3 bucket policy.
 The simulations use the regional VPC, image, and Spot request conditions.
 The plan reports each region in configuration order.
 It passes when every region passes.
