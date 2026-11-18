@@ -130,14 +130,6 @@ class HanaQueueTests(unittest.TestCase):
             with (self.subTest(next_target=next_target, stale_absence=stale_absence, stale_image=stale_image),
                   PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker)):
                 target = hana_target(fixture)
-                mac_settings = fixture.root / 'fixture-mac.conf'
-                _ = mac_settings.write_text('# range: 1..60\nprobe_timeout_s=7\n')
-                registry = (target, target_config.SshTarget('mac', 'macos', mac_settings),
-                            target_config.LocalTarget('natedev', 'linux'))
-
-                def read_targets(*, selected: str = '', **_options: object) -> tuple[target_config.Target, ...]:
-                    return tuple(entry for entry in registry if not selected or entry.name == selected)
-
                 request = placement_request(fixture)
                 mac = request.constraints.candidates[0]
                 remote = replace(mac, destination=replace(mac.destination,
@@ -146,43 +138,48 @@ class HanaQueueTests(unittest.TestCase):
                 candidates = (remote, mac, local) if next_target == 'mac' else (remote, local)
                 request = replace(request, prerequisite=placement.TokenNotRequired(),
                     constraints=replace(request.constraints, candidates=candidates))
-                with mock.patch.object(target_config, 'read_targets', side_effect=read_targets):
-                    _ = publish_candidate(fixture, request)
-                    assignment = assignment_for(fixture, request)
-                    claim = adopt_assignment(fixture, request, assignment)
-                    self.assertIsInstance(fixture.connect(consume_permission('consume', assignment, claim)).replies()[-1],
-                                          wire.FirstAuthorization)
-                    if next_target == 'mac':
-                        _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(mac,))))
-                    other = replace(placement_request(fixture), prerequisite=placement.TokenNotRequired(),
-                        constraints=replace(request.constraints, candidates=(remote,)))
-                    if stale_absence:
-                        _ = publish_candidate(fixture, other)
-                        fixture.clock.advance(1)
-                    cause = placement.HANA_IMAGE_STALE if stale_image else 'The data mount and a fresh permit are required'
-                    if stale_image:
-                        provider = placement.AdoptedProviderClaim(claim, placement.ClaimHolderIdentity(
-                            assignment.owner.host, assignment.owner.pid, assignment.owner.start_time),
-                            assignment.session, assignment.destination.host, 'host-generation-a')
-                        _ = publish_candidate(fixture, other, claims=(provider,))
-                    report = wire.ExecutionReport('admission-refused', assignment, claim,
-                        placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
-                        placement.DispatchPathSettled())
-                    _ = fixture.connect(report).replies()
-                    key = placement.attempt_key(assignment.episode, assignment.attempt)
-                    saved = fixture.server.assignments[key]
-                    self.assertEqual(saved.retry, placement.DoNotRetry(cause))
-                    self.assertEqual(saved.state, placement.ClosedAssignment(cause))
-                    fallback = fixture.connect(request).replies()[-1]
-                    self.assertIsInstance(fallback, wire.Assignment if next_target == 'mac' else wire.LocalPlacementGranted)
-                    assert isinstance(fallback, (wire.Assignment, wire.LocalPlacementGranted))
-                    self.assertEqual(fallback.assignment.destination.target, next_target)
-                    self.assertEqual(fallback.assignment.episode, assignment.episode)
-                    self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
-                    if stale_absence or stale_image:
-                        self.assertIsInstance(fixture.connect(other).replies()[-1], wire.PlacementWait)
-                        _ = publish_candidate(fixture, other)
-                        self.assertEqual(assignment_for(fixture, other).destination, remote.destination)
+                _ = (fixture.root / 'build_targets.conf').write_text(
+                    f'targets={target.name},mac,natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
+                    + f'settings.{target.name}={target.settings.name}\n'
+                    + 'kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n'
+                    + 'kind.natedev=local\nplatform.natedev=linux\n')
+                _ = (fixture.root / 'mac_test.conf').write_text('# range: 0.01..\nprobe_timeout_s=5\n')
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                self.assertIsInstance(fixture.connect(consume_permission('consume', assignment, claim)).replies()[-1],
+                                      wire.FirstAuthorization)
+                if next_target == 'mac':
+                    _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(mac,))))
+                other = replace(placement_request(fixture), prerequisite=placement.TokenNotRequired(),
+                    constraints=replace(request.constraints, candidates=(remote,)))
+                if stale_absence:
+                    _ = publish_candidate(fixture, other)
+                    fixture.clock.advance(1)
+                cause = placement.HANA_IMAGE_STALE if stale_image else 'The data mount and a fresh permit are required'
+                if stale_image:
+                    provider = placement.AdoptedProviderClaim(claim, placement.ClaimHolderIdentity(
+                        assignment.owner.host, assignment.owner.pid, assignment.owner.start_time),
+                        assignment.session, assignment.destination.host, 'host-generation-a')
+                    _ = publish_candidate(fixture, other, claims=(provider,))
+                report = wire.ExecutionReport('admission-refused', assignment, claim,
+                    placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
+                    placement.DispatchPathSettled())
+                _ = fixture.connect(report).replies()
+                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                saved = fixture.server.assignments[key]
+                self.assertEqual(saved.retry, placement.DoNotRetry(cause))
+                self.assertEqual(saved.state, placement.ClosedAssignment(cause))
+                fallback = fixture.connect(request).replies()[-1]
+                self.assertIsInstance(fallback, wire.Assignment if next_target == 'mac' else wire.LocalPlacementGranted)
+                assert isinstance(fallback, (wire.Assignment, wire.LocalPlacementGranted))
+                self.assertEqual(fallback.assignment.destination.target, next_target)
+                self.assertEqual(fallback.assignment.episode, assignment.episode)
+                self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
+                if stale_absence or stale_image:
+                    self.assertIsInstance(fixture.connect(other).replies()[-1], wire.PlacementWait)
+                    _ = publish_candidate(fixture, other)
+                    self.assertEqual(assignment_for(fixture, other).destination, remote.destination)
 
     def test_dead_coordinator_releases_an_assignment_that_never_bound(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker):

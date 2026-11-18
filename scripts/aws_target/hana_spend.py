@@ -46,11 +46,9 @@ def _positive_amount(value: str) -> Decimal:
 def read_permit_settings(configuration: conf.ConfigRead) -> StartPermitSettings:
     """Read the limits for a projected or reserved start."""
     instance_type = configuration.text('instance_type')
-
     fallback = tuple(item.strip() for item in configuration.text('fallback_instance_types').split(','))
     if not all(fallback) or len(set((instance_type, *fallback))) != 1 + len(fallback):
         raise ValueError('fallback_instance_types must contain distinct types and no empty items')
-
     return StartPermitSettings(
         enabled=configuration.value('enabled', conf.on_off),
         region=configuration.text('region'),
@@ -77,8 +75,7 @@ def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
         guest[key] = configuration.whole(key)
     _ = hana_guest.decode_settings(guest)
     return PermitSettings(start.enabled, start.region, start.instance_type, start.fallback_instance_types,
-        start.spot_max_usd_per_hour,
-        start.root_gib, start.data_gib, start.daily_budget_usd, start.gp3_usd_per_gib_month,
+        start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd, start.gp3_usd_per_gib_month,
         start.permit_max_seconds, grace)
 
 

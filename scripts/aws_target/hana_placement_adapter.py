@@ -281,7 +281,9 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) 
     from functools import partial
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
-    from scripts.aws_target.hana_execution import HanaSettled, claim_admission_refused, read_claim_execution, settle_unpublished_claim
+    from scripts.aws_target.hana_execution import (
+        HanaSettled, claim_admission_refused, read_claim_execution, settle_unpublished_claim,
+    )
     from scripts.build_queue import admission_records, placement
     from scripts.build_targets import target_config
     from scripts.lib import conf, process_start
