@@ -14,7 +14,7 @@ import re
 import shlex
 import sys
 
-from scripts.lib import conf, conf_reads, live_settings, main_publish
+from scripts.lib import conf, live_settings, main_publish
 from scripts.lib.conf import Unusable
 from scripts.build_hold.override_guard import refuse_overrides
 
@@ -50,21 +50,26 @@ def _forward(arguments: list[str], ssh_program: str) -> int:
 def change(args: RequestedValueChange) -> int:
     """Make the value live here and on the Mac at once; main and the Mac pull follow."""
     source = conf.path(args.file).resolve()
-    setting = live_settings.editable_setting(args.file, args.key, args.value)
-    old = setting.value if isinstance(setting, live_settings.ExistingSetting) else "<missing>"
     checkout = main_publish.checkout_of(source)
-    if old == args.value:
+
+    def describe(old: str) -> str:
+        return (f"{SUBJECT}{args.file}): {args.key} {old} -> {args.value}\n\n"
+                + f"{args.why}\n\nUser-Approved: {args.user_words}")
+
+    saved = live_settings.stage_save(live_settings.WaitingChange(args.file, args.key, args.value, ""),
+                                     describe=describe)
+    if isinstance(saved, live_settings.UnchangedSave):
         print(f"already {args.key}={args.value}")
     else:
-        conf_reads.record(source.stem)
-        message = (f"{SUBJECT}{args.file}): {args.key} {old} -> {args.value}\n\n"
-                   + f"{args.why}\n\nUser-Approved: {args.user_words}")
-        _ = live_settings.stage(live_settings.WaitingChange(args.file, args.key, args.value, message),
-                                accepted=isinstance(setting, live_settings.NewModelColor))
         print(f"live now: {args.key}={args.value}")
+        if args.file == "hana_aws":
+            from scripts.aws_target import hana_render
+
+            if hana_render.affects_guest_config(args.key, source):
+                print("The Hana image is now stale. Build and register a current Hana image.")
         for line in live_settings.start_readers(args.file):
             print(line)
-        print(live_settings.write_mac(args.file, args.key, args.value))
+        print(live_settings.write_mac(args.file, args.key, args.value, order=saved.order))
     try:
         lines = live_settings.publish(checkout, wait=True) or []
     except (main_publish.Refusal, OSError) as error:
@@ -73,7 +78,7 @@ def change(args: RequestedValueChange) -> int:
               file=sys.stderr)
         return 2
     for line in lines:
-        if old != args.value or line.startswith("mac: queued"):
+        if isinstance(saved, live_settings.StagedSave) or line.startswith("mac: queued"):
             print(line)
     return 0
 

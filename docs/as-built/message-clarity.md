@@ -324,7 +324,16 @@ New escalate holds retain their registered template and values.
 
 `repeat_guard` counts a resolved recipient once across send.py and detached result routes. A director fallback counts at the director boundary. The first two exact copies pass. Later exact copies to the same receiver are held. Arbitrary prose compares literally, including times, timestamps, PIDs, socket paths, message IDs and placeholders: these may be meaningful. Counter identity version 2 retires the old masked counters without dropping unfinished notices. Exact-text replay retained all 746 historical watchdog holds, so no producer-specific repeat key is needed.
 
-`config/send_repeat_guard.conf` owns holding policy and notice deadlines. The caller has a fixed I/O-free 250 ms safety ceiling; it reads no configuration at import. Policy reads, state I/O, nonblocking locks and publication run inside an isolated checker. Errors, busy locks, corrupt state and timeout admit the message and print a diagnostic. Person and phone exemptions precede worker launch. Lock identity is independent of reloadable capacity; records and previews are bounded.
+`config/send_repeat_guard.conf` owns holding policy and notice deadlines.
+The caller uses a fixed 750 ms deadline for checks and events.
+The caller reads no configuration file.
+The check and event workers use Python `-I -S` to skip site hooks.
+They load local modules from the checkout that contains the worker.
+The worker reads policy and state, takes nonblocking locks, and publishes state.
+Errors, busy locks, corrupt state, and timeouts admit the message and print a diagnostic.
+Person and phone exemptions precede worker launch.
+Lock identity is independent of reloadable capacity.
+The guard limits record and preview sizes.
 
 Recipient counters and aggregate `(sender, literal text)` episodes expire after a full window without a copy.
 The sender record holds one owner notice per literal-repeat flood across receivers.

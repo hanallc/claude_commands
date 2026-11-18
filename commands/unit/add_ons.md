@@ -73,7 +73,7 @@ check, when `${NEXT_ITEMS_PENDING}` holds an item not yet sent, send the
 showrunner one message and keep working:
 
 ```
-From <unit>: <n> add-ons for your call.
+<n> add-ons for your call.
 1. <title> — recommend current|next|drop: <reason>
 ```
 

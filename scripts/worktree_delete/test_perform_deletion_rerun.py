@@ -1,6 +1,7 @@
 """Preserve work during deletion and complete deletion retries."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shlex
@@ -13,6 +14,39 @@ from typing import cast
 
 
 class DeletionRerunTests(unittest.TestCase):
+    def test_confirmed_removal_releases_the_pair_when_the_lock_is_free(self) -> None:
+        scripts = Path(__file__).resolve().parent
+        for held in (False, True):
+            with self.subTest(held=held), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = root / "repo"
+                caller, tree = root / "trees" / "caller", root / "trees" / "topic"
+                _ = subprocess.run(["git", "init", "-q", "--initial-branch=main", str(repo)], check=True)
+                _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c",
+                                    "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                                    "commit", "--allow-empty", "-qm", "fixture"], check=True)
+                for path in (caller, tree):
+                    _ = subprocess.run(["git", "-C", str(repo), "worktree", "add", "-qb", path.name, str(path)],
+                                       check=True)
+                lease, lock = tree.with_suffix(".lease.json"), tree.with_suffix(".lock")
+                _ = lease.write_text("{}\n")
+                lock.touch()
+                relative = os.path.relpath(tree, caller)
+                _ = subprocess.run(["bash", str(scripts / "record_confirmation.sh"), relative, "topic"],
+                                   cwd=caller, capture_output=True, text=True, check=True)
+
+                with lock.open("r+") as descriptor:
+                    if held:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    result = subprocess.run(["bash", str(scripts / "perform_deletion.sh"), relative, "topic"],
+                                            cwd=caller, capture_output=True, text=True, check=False)
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(tree.exists())
+                self.assertEqual(lease.exists(), held)
+                self.assertEqual(lock.exists(), held)
+                self.assertEqual(result.stderr.count("Worktree pair kept"), int(held))
+
     def test_branch_lookup_error_stops_before_remote_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -214,10 +214,15 @@ class ReadNativePanes(Enum):
     CURRENT = "read the current native processes"
 
 
+class PaneProcessUnreadable(ValueError):
+    """The retained pane's current process could not be read."""
+
+
 def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
                     record: staff.StaffSnapshot, client: NativePaneServer,
                     entries: Mapping[str, PaneLaunch], *,
-                    evidence: NativePaneEvidence | ReadNativePanes = ReadNativePanes.CURRENT) -> list[dict[str, object]]:
+                    evidence: NativePaneEvidence | ReadNativePanes = ReadNativePanes.CURRENT,
+                    strict_retained_reads: bool = False) -> list[dict[str, object]]:
     """Select the current native pane, or its newest retained shell after the process stops."""
     owner = record.by_id(reference.id) if isinstance(reference, StaffLaunchReference) else None
     if isinstance(reference, StaffLaunchReference) and owner is None:
@@ -248,14 +253,22 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
     candidates = [pane for pane in panes
                   if str(pane["pane_id"]) in retained and str(pane["pane_id"]) not in occupied
                   and (owner is None or owner.kind != "worker" or str(pane["pane_id"]) not in unknown)]
-    if owner is not None:
-        retained_matches = [dict(pane) for pane in candidates
-                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
-                                _retained_native_owner(client, pane, owner, record))]
-    else:
-        retained_matches = [dict(pane) for pane in candidates
-                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
-                                not decoded[str(pane["pane_id"])])]
+    retained_matches: list[dict[str, object]] = []
+    for pane in candidates:
+        identity = str(pane["pane_id"])
+        try:
+            if identity in unknown:
+                matches_retained = _retained_shell(client, pane, strict=strict_retained_reads)
+            elif owner is not None:
+                matches_retained = _retained_native_owner(client, pane, owner, record)
+            else:
+                matches_retained = not decoded[identity]
+        except (herdr_types.HerdrFailure, OSError, ValueError) as error:
+            if strict_retained_reads:
+                raise PaneProcessUnreadable(f"{identity}: {error}") from error
+            continue
+        if matches_retained:
+            retained_matches.append(dict(pane))
     return sorted(retained_matches, key=lambda pane: entries[str(pane["pane_id"])]["written_at"], reverse=True)[:1]
 
 
@@ -280,36 +293,40 @@ class NativePaneReader(Protocol):
 
 
 def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
-    reply = client.result("pane", "process-info", "--pane", str(pane["pane_id"]))
-    return _native_sessions(reply.get("process_info"), pane)
+    return _native_sessions(_process_info(client, pane), pane)
 
 
-def _native_sessions(info: object, pane: Mapping[str, object]) -> set[str]:
+def _process_info(client: NativePaneServer, pane: Mapping[str, object]) -> dict[str, object]:
+    info = client.result("pane", "process-info", "--pane", str(pane["pane_id"])).get("process_info")
+    if not isinstance(info, dict):
+        raise ValueError("expected pane process information")
+    process = cast(dict[str, object], info)
+    pids = (process.get("shell_pid"), process.get("foreground_process_group_id"))
+    if any(isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids):
+        raise ValueError("expected positive pane process ids")
+    return process
+
+
+def _native_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
     reader = cast(NativePaneReader, cast(object, import_module("scripts.herdr.herdr")))
     conversation = reader.foreground_pane_conversation(info, pane)
     return {conversation.identity} if isinstance(conversation, ProvedPaneConversation) else set()
 
 
-def _retained_shell(client: NativePaneServer, pane: Mapping[str, object]) -> bool:
+def _retained_shell(client: NativePaneServer, pane: Mapping[str, object], *, strict: bool) -> bool:
     """Refresh a retained unknown pane once after its agent can exit."""
-    try:
-        info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
-        shell = info.get("shell_pid")
-        return (isinstance(shell, int) and shell > 0 and info.get("foreground_process_group_id") == shell
-                and not _native_sessions(info, pane))
-    except (OSError, ValueError, herdr_types.HerdrFailure):
-        return False
+    info = _process_info(client, pane)
+    at_shell = info["foreground_process_group_id"] == info["shell_pid"]
+    if strict or at_shell:
+        return not _native_sessions(info, pane) and at_shell
+    return False
 
 
 def _retained_native_owner(client: NativePaneServer, pane: Mapping[str, object],
                            owner: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
     """Keep readable retained panes unless another staffed owner runs there."""
-    try:
-        identities = native_sessions(client, pane)
-    except (herdr_types.HerdrFailure, OSError, ValueError):
-        return False
     return all(current is None or current.id == owner.id
-               for identity in identities
+               for identity in native_sessions(client, pane)
                for current in (record.by_member_reference(identity),))
 
 

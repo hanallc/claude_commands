@@ -24,6 +24,7 @@ RECIPIENTS = [{"id": str(OWNER), "name": "builds", "proposal": True}] + [
     {"id": name, "name": name, "proposal": False}
     for name in ("cargo-liner", "hana", "natedev", "sdlc", "spacetime", "brain", "dwight", "morty")]
 FORM_TOKEN = "fixture-form-token"
+RESTARTED_TOKEN = "fixture-after-restart"
 NO_CLIP_TEXT = "Last tooltip detail <strong> & all of its text"
 DISPLAY_WORDS = "The nextest row stops updating during shard 2."
 
@@ -146,6 +147,7 @@ function untilError() {
    check(dialog.querySelectorAll('[data-previews] img').length === 2, 'Pasting adds image previews.');
    dialog.querySelector('[data-previews] button').click();
    check(dialog.querySelectorAll('[data-previews] img').length === 1, 'Remove deletes one preview.');
+   await fetch('/restart', {method:'POST'});
    const failed = untilError();
    send.click();
    send.click();
@@ -154,6 +156,12 @@ function untilError() {
    check(textarea.value === 'Check <index>\nAgain' && dialog.querySelectorAll('[data-previews] img').length === 1,
          'A failed send keeps words and images.');
    check(document.activeElement === send, 'Focus returns to Send on failure.');
+   dialog.requestClose();
+   await open({kind:'question', evidence:{kind:'none'}});
+   check(textarea.value === 'Check <index>\nAgain' && !evidence.hidden && recipient().checked &&
+         dialog.querySelectorAll('[data-previews] img').length === 1 &&
+         error.textContent === 'Fixture rejected the first send.' && !send.disabled,
+         'Reopen keeps the failed draft and its error.');
    const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
    send.click();
    check((await created).detail.id === 'I1', 'The event reports the saved item ID.');
@@ -181,7 +189,14 @@ function untilError() {
      return Promise.resolve(new Response(
        JSON.stringify({reason:'builds has finished; choose another recipient'}), {status:409}));
     }
-    return Promise.resolve(new Response(JSON.stringify({reason:'Try again.'}), {status:503}));
+    if (attempted.length === 2) {
+     return Promise.resolve(new Response(JSON.stringify({error:'Send is forbidden.'}), {status:403}));
+    }
+    if (attempted.length <= 4) {
+     return Promise.resolve(new Response(
+       JSON.stringify({code:'stale_token', error:'The token expired again.'}), {status:403}));
+    }
+    throw new Error('The dialog attempted an extra Send.');
    };
    const trySend = async () => {
     const rejected = untilError();
@@ -195,9 +210,13 @@ function untilError() {
          error.textContent === 'builds has finished; choose another recipient', 'A conflict keeps the draft and shows its reason.');
    to()[1].click();
    await trySend();
+   check(attempted.length === 2 && error.textContent === 'Send is forbidden.',
+         'An unrelated HTTP 403 uses the server message and does not retry.');
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    await trySend();
    window.fetch = originalFetch;
+   check(attempted.length === 4 && attempted[2].request_id === attempted[3].request_id &&
+         error.textContent === 'The token expired again.', 'The dialog retries an expired token once.');
    check(new Set(attempted.map(post => post.request_id)).size === 3 &&
          attempted.every(post => post.request_id.endsWith('-' + post.kind + '-' + post.recipient_id)),
          'Changing the recipient or type makes a new request ID.');
@@ -232,6 +251,8 @@ class DialogFixture:
     root: Path
     results: list[str] = field(default_factory=list)
     posts: list[review_submissions.NewItemRequest] = field(default_factory=list)
+    wire_posts: list[dict[str, object]] = field(default_factory=list)
+    token: str = FORM_TOKEN
     recipient_reads: int = 0
     completed: bool = False
 
@@ -277,8 +298,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture]) -> None:
 
         def do_GET(self) -> None:
             if self.path == ENDPOINT:
-                self.fixture().recipient_reads += 1
-                self.send_json(200, {"token": FORM_TOKEN, "recipients": RECIPIENTS})
+                fixture = self.fixture()
+                fixture.recipient_reads += 1
+                self.send_json(200, {"token": fixture.token, "recipients": RECIPIENTS})
             elif self.path == "/complete":
                 _ = finished.wait(10)
                 self.response(204, "image/png", b"")
@@ -291,6 +313,10 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture]) -> None:
                 self.response(404, "text/plain", b"Unknown fixture path")
 
         def do_POST(self) -> None:
+            if self.path == "/restart":
+                self.fixture().token = RESTARTED_TOKEN
+                self.response(204, "text/plain", b"")
+                return
             data = self.rfile.read(int(self.headers["Content-Length"]))
             if self.path == "/results":
                 fixture = self.fixture()
@@ -308,8 +334,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture]) -> None:
                 return
             fixture = self.fixture()
             fields = cast(dict[str, object], json.loads(data))
-            if fields.get("token") != FORM_TOKEN:
-                self.send_json(403, {"reason": "The form token does not match."})
+            fixture.wire_posts.append(fields)
+            if fields.get("token") != fixture.token:
+                self.send_json(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
                 return
             try:
                 request = review_submissions.read_request(fields)
@@ -323,7 +350,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture]) -> None:
                 self.send_json(400, {"reason": str(error)})
                 return
             if len(fixture.posts) == 1:
-                self.send_json(503, {"reason": "Fixture rejected the first send."})
+                self.send_json(503, {"error": "Fixture rejected the first send."})
                 return
             self.send_json(201, {"id": item.id, "key": item.key, "state": "Waiting"})
 
@@ -373,7 +400,11 @@ class NewItemDialogTests(unittest.TestCase):
         for width, fixture in fixtures.items():
             with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
                 self.assertEqual(fixture.results, [])
-                self.assertEqual(fixture.recipient_reads, 3)
+                self.assertEqual(fixture.recipient_reads, 6)
+                expired, refreshed, reopened = fixture.wire_posts
+                self.assertEqual(expired["token"], FORM_TOKEN)
+                self.assertEqual(refreshed, {**expired, "token": RESTARTED_TOKEN})
+                self.assertEqual(reopened, refreshed)
                 first, retry = fixture.posts
                 self.assertEqual(first, retry)
                 self.assertEqual(first.kind, review_submissions.SubmissionKind.BUG)

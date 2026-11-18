@@ -41,6 +41,8 @@ P = ParamSpec('P')
 
 # Reuse fake calls. The source check identifies uncovered call sites.
 SCENARIOS = {
+    'test_aws_target.SpotPlacementTests': (
+        'test_refusals_pause_growth_until_the_next_hour_and_keep_partial_scores',),
     'test_measurement.MeasurementTests': (
         'test_controller_schedules_one_account_charge_query_and_local_reports_never_repeat_it',),
     'test_deploy.DeploymentTests': (
@@ -84,6 +86,7 @@ SCENARIOS = {
         'test_expired_pending_sweep_searches_both_regions',
         'test_expired_uncertain_launch_keeps_reservation_until_reconciliation',
         'test_stopped_instance_reports_a_confirmed_spot_interruption',
+        'test_reconcile_closes_the_missing_box_in_a_batch',
     ),
     'test_gpu_size_trial.GpuOnlineTests': (
         'test_upload_uses_s3_cp_at_the_multipart_limit',
@@ -104,6 +107,10 @@ SCENARIOS = {
     ),
     'test_plan_run.PlanSetupTests': (
         'test_stack_owned_plan_passes_with_the_current_allow_list',),
+    'test_plan_run.GatePlanTests': (
+        'test_existing_stacks_pass_in_configured_order',
+        'test_plan_reuses_saved_regional_image_by_id',
+    ),
 }
 
 type Operation = tuple[str, str]
@@ -358,6 +365,8 @@ def run_fixtures(names: Sequence[str], collection: CommandCollection, endpoint: 
                               new=collection.fixture_executor(test_plan_identity.Commands.execute)),
             mock.patch.object(test_plan_run.PlanSetupTests, 'execute',
                               new=collection.fixture_executor(test_plan_run.PlanSetupTests.execute)),
+            mock.patch.object(test_plan_run.GatePlanTests, 'execute',
+                              new=collection.fixture_executor(test_plan_run.GatePlanTests.execute)),
             redirect_stdout(output), redirect_stderr(output)):
         for name in names:
             collection.fixture = name

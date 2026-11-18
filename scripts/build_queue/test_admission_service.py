@@ -43,6 +43,7 @@ from scripts.build_hold import override_guard
 
 from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
+from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_send
@@ -2565,6 +2566,43 @@ class WaitHolderServiceTests(unittest.TestCase):
                 self.assertTrue(waits)
                 self.assertEqual(waits[-1].snapshot.holder, records.SessionHolder("gap-session", "gap-worker"))
 
+    def test_gate_hold_keeps_the_admitted_job_after_restart_and_command_loss(self) -> None:
+        job = StepJob("test-all")
+        for source, expected in (("request", "test-all"), ("process", "test-all"), ("old record", "merge-gate")):
+            with self.subTest(source=source), AdmissionFixture() as fixture:
+                run = fixture.run_owner()
+                request = fixture.request(step="merge-gate", run=run)
+                cmdline = fixture.proc.path / str(request.owner.pid) / "cmdline"
+                argv = ("python3", "copies.py", "run", "--repo", str(fixture.root), "--",
+                        "python3", "merge_gate.py", "--tests-only", "--full")
+                if source == "request":
+                    request = replace(request, identity=replace(request.identity, job=job))
+                else:
+                    _ = cmdline.write_bytes(b"\0".join(map(os.fsencode, argv)) + b"\0")
+                with fixture.loop_turn():
+                    granted = only_admitted(fixture.server.handle_request(request))
+                cmdline.unlink(missing_ok=True)
+                if source == "old record":
+                    path = fixture.state_dir / "state.json"
+                    state = cast(dict[str, object], json.loads(path.read_text()))
+                    reservations = cast(dict[str, dict[str, object]], state["reservations"])
+                    del reservations[request.episode]["gate_job"]
+                    _ = path.write_text(json.dumps(state))
+                fixture.restart()
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                running, = [step for step in reply.reading.view.running if step.pid == request.owner.pid]
+                expected_job = GateJobNotRecorded() if source == "old record" else job
+                self.assertEqual(running.job, expected_job)
+                fixture.release(granted)
+                hold, = fixture.server.slots.values()
+                assert isinstance(hold, records.BetweenStepsSlot)
+                assert isinstance(hold.identity, records.EndedStepFacts)
+                self.assertEqual(hold.identity.step, expected)
+                self.assertEqual(hold.identity.job, expected_job)
+                self.assertEqual(wire.parse_record(wire.encode_record(hold), records.BetweenStepsSlot), hold)
+
     def test_a_released_unit_steps_held_slot_keeps_its_unit_without_a_session(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
@@ -3478,6 +3516,7 @@ class CloudAdmissionTests(unittest.TestCase):
     def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
+            fixture.configure(cloud_gate_slots=9)
             requests = [self.cloud_request(fixture) for _ in range(11)]
             grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:9]]
             for request in requests[9:]:
