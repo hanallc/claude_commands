@@ -472,6 +472,20 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(listed_after_answer.returncode, 0, listed_after_answer.stdout + listed_after_answer.stderr)
         self.assertEqual(listed_after_answer.stdout.strip(), "no open questions")
 
+    def test_ask_refuses_to_replace_an_open_legacy_question_from_the_same_asker(self) -> None:
+        title = "Choose the layout"
+        legacy = self.outstanding()
+        original = {"since": "2026-10-06T08:00", "text": title,
+                    "question": "Keep this layout?", "asked_by": "alpha"}
+        _ = legacy.write_text(json.dumps([original]) + "\n")
+
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Use the new layout?")):
+            result = self.run_command("ask", "--text", title, "--ask", "Use the new layout?", "--unit", "alpha")
+
+        self.assertEqual(json.loads(legacy.read_text()), [original])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"{title}: a legacy question from this asker is already open", result.stdout)
+
     def test_question_migration_without_a_proposals_line_preserves_records_on_a_rerun(self) -> None:
         _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
                                          if not line.startswith("- **Proposals:**")) + "\n")
