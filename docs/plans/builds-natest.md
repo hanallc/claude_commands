@@ -4817,24 +4817,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - AWS pair (3 rounds, c7a.4xlarge): 131.8 -> 41.9 CPU s, a saving of 89.9 s; 113 tests pass.
 - Floor: Python starts and jq. Architecture proposal: one Python entry point reads the For you count and the assignment before it starts jq.
 
-### Phase 346 — the crate run tests use less aws CPU  · status: todo
+### Phase 346 — the crate run tests use less aws CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `style/test_crate_run.py` costs at most half its AWS CPU (47.7 s median, 98 tests) with every assertion kept.
-
-**Spec:**
-1. Base: origin/main 23b4483cb, worktree `~/worktrees/claude-natedev-natest-craterun`, branch `natest-craterun346`.
-2. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> style/test_crate_run.py --tests 20 --commands 20`. Name the costs by test and by command.
-3. The slowest kept test is `CrateRunTests.test_crate_trees_keep_ownership_and_use_two_standing_caches` (5.2 s).
-4. Cut repeated process starts and Git calls: share one fixture build per class, call Python in process where the test checks Python output, and keep real subprocess runs only where the test proves process behavior.
-5. Tests read no value /tune can change. No signal handlers, no lazy imports, no test-count goals.
-6. If the floor stays above half, name the architecture change that would cut it.
-
-**Files:** `scripts/style/test_crate_run.py` and its test support; production code only where a defect lives.
-
-**Acceptance gate:** the module passes; AWS pair (3 rounds) shows the saving; basedpyright clean on changed files.
+- Hash 68031448857f6f4afa03cd3cc5120052cf4690c2 on branch `natest-craterun346`, parent origin/main 23b4483cb.
+- `style/test_crate_run.py` uses a pinned fixture config with private build, scratch and Git paths. The class seed holds two prepared slots and the base ids. The three tests that need empty slots start from a cold seed. Cleanup uses the in-process Cargo metadata fixture.
+- The fixture clears inherited `GIT_*` variables for the test class.
+- AWS pair (3 rounds, c7a.4xlarge): 48.12 -> 45.50 CPU s, a saving of 2.64 s; 98 tests pass.
+- Floor: Git, 20.6 s over 21,303 starts on natedev. Architecture proposal: one Git read for each repository and revision, shared by planning, validation and integration.
 
 ### Phase 347 — two red tests on main pass again  · status: done
 **Depends on:** none
@@ -4845,3 +4837,22 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `staff_test_support.fixture_unit_saved_name` also accepts the private staff file that `isolated_staff_file` set up, and reads `STAFF_FILE` before `STAFF_TEST_OWNER_FILE`. A leased tmpfs staff file outside the Python temporary folder failed before.
 - `test_verify_token_wait.test_no_token_records_zero` uses a warm build folder. Cargo seeding (7f9f08a71) adds a valid metadata call on a cold folder.
 - The AWS gate passed both modules: its TMPDIR holds the staff fixture, and Cargo seeding is off on AWS. Only natedev showed the red.
+
+### Phase 348 — the verify wait holder tests use less aws CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_wait_holder.py` costs at most half its AWS CPU (45.4 s median, 26 tests) with every assertion kept.
+
+**Spec:**
+1. Base: origin/main 3f0894230, worktree `~/worktrees/claude-natedev-natest-waitholder`, branch `natest-waitholder348`.
+2. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> direct/test_verify_wait_holder.py --tests 20 --commands 20`. Name the costs by test and by command.
+3. The slowest kept test is `VerifyTokenHolderTests.test_token_wait_names_the_owner_and_updates_it_on_the_next_pass` (8.0 s).
+4. Cut repeated process starts and Git calls: share one fixture build per class, call Python in process where the test checks Python output, and keep real subprocess runs only where the test proves process behavior.
+5. Tests read no value /tune can change. No signal handlers, no lazy imports, no test-count goals.
+6. If the floor stays above half, name the architecture change that would cut it.
+
+**Files:** `scripts/direct/test_verify_wait_holder.py` and its test support; production code only where a defect lives.
+
+**Acceptance gate:** the module passes; AWS pair (3 rounds) shows the saving; basedpyright clean on changed files.
