@@ -733,6 +733,11 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
     return CloseAllowed()
 
 
+class RecordedCompletionEvidence(Protocol):
+    def completion_close_evidence(self, row: staff.StaffRow, line: str, completion_id: str, *,
+                                  run: Path) -> CloseAllowed | Kept: ...
+
+
 def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
     messages = _transcript_messages(row)
     if isinstance(messages, Kept):
@@ -869,7 +874,13 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
         passed = worker_pass(worker.row, directory)
         hook = progress_history.hook_completion(passed)
         if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "done":
-            completion = _completed_turn(worker.row, passed.get("instance_id"))
+            delivery = progress_history.dispatch_delivery(passed)
+            if delivery.line:
+                receipts = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
+                completion = receipts.completion_close_evidence(
+                    worker.row, delivery.line, delivery.completion_id, run=directory)
+            else:
+                completion = _completed_turn(worker.row, passed.get("instance_id"))
         else:
             return (CloseAllowed() if worker.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
                     else Kept(f"agent state is {worker.status.value}"))
@@ -1549,7 +1560,6 @@ def close(parent: StaffId, name: WorkerName, *,
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
-            forget_restart(row)
             return Closed()
 
 
