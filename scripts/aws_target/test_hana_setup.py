@@ -569,6 +569,16 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(fake.calls, [])
         self.assertIsInstance(hana_image.saved(self.state), hana_image.NoRegisteredImage)
 
+    def test_image_preview_reads_placement_with_invalid_spending_settings(self) -> None:
+        fake = FakeAws(self.clock)
+        text_setting(self.workload, 'enabled', 'on')
+        text_setting(self.workload, 'fallback_instance_types', 'c7a.4xlarge,c7a.4xlarge')
+        with mock.patch('sys.stdout', new_callable=StringIO) as output:
+            self.assertFalse(self.subject(fake).hana_image(self.built_image()))
+        self.assertIn('Hana placement is enabled. This command does not change it.', output.getvalue())
+        self.assertEqual(fake.calls, [])
+        self.assertIsInstance(hana_image.saved(self.state), hana_image.NoRegisteredImage)
+
     def test_image_upload_registers_imds_v2_root_disk_and_saves_the_zone_subnet(self) -> None:
         calls, local, uploads = self.run_image(existing=False)
         self.assertEqual(local[0][:5], ['qemu-img', 'convert', '-f', 'vpc', '-O'])

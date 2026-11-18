@@ -123,7 +123,10 @@ def fixture_reservation(pid: int, need: int, *, step: str = "check", folder: str
 
 def blocking_slot(now: float, held: int = 0) -> admission_records.BetweenStepsSlot:
     """Prevent the first-run exception without another active step."""
-    return admission_records.BetweenStepsSlot(LiveBuildRun(999, "fixture", now), "fixture", held, now + 10)
+    absent = admission_records.EndedStepFactNotRecorded()
+    identity = admission_records.EndedStepFacts("check", admission_records.PackageNotRecorded(),
+                                                absent, absent, admission_records.NoEndedStepStaff())
+    return admission_records.BetweenStepsSlot(LiveBuildRun(999, "fixture", now), "fixture", held, now + 10, identity)
 
 
 def queue_read_fixture(view: admission_records.QueueView, policy: admission_records.AdmissionPolicy) -> admission_records.QueueRead:

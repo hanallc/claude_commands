@@ -1070,12 +1070,41 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         return ActiveDispatchUnavailable(f"worker {worker_id}: {error}")
 
 
+@dataclass(frozen=True)
+class ValidatedDispatchReply:
+    text: str
+
+
+@dataclass(frozen=True)
+class NoValidatedDispatchReply:
+    """The saved file does not supply a valid reply for a retained pass."""
+
+
+def read_completed_reply(run: Path, reply: Path) -> ValidatedDispatchReply | NoValidatedDispatchReply:
+    """Read the saved DONE reply for a pass retained in current state."""
+    from scripts.production import worker_admission
+
+    completion_ids = {
+        delivery.completion_id
+        for item in _pass_slots(_read_state(run)).values()
+        if isinstance(completion := hook_completion(item), HookCompletion)
+        and completion.reply_file and Path(completion.reply_file) == reply
+        and (delivery := dispatch_delivery(item)).completion_id
+    }
+    if not completion_ids:
+        return NoValidatedDispatchReply()
+    try:
+        text = reply.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return NoValidatedDispatchReply()
+    if any(worker_admission.reply_ends_dispatch(text, completion_id) for completion_id in completion_ids):
+        return ValidatedDispatchReply(text)
+    return NoValidatedDispatchReply()
+
+
 def reply_completed(run: Path, reply: Path) -> bool:
-    """Read a saved reply only after the hook completes its recorded pass."""
-    state = _read_state(run)
-    return any(item.get("status") == "completed" and
-               Path(dispatch_delivery(item).reply_file) == reply
-               for item in _pass_slots(state).values())
+    """Check whether the saved reply has a matching DONE."""
+    return isinstance(read_completed_reply(run, reply), ValidatedDispatchReply)
 
 
 class DispatchDetailNotRecorded(Enum):
@@ -2159,16 +2188,13 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
 
 def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                       status: Literal["completed", "error"] = "completed") -> None:
-    """Record completion for the exact dispatch, including DONE after a launcher error."""
+    """Record completion for the exact open dispatch."""
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             state = _read_state(session_dir)
-            opened = _pass_slots(state).get(slot)
+            opened = _open_passes(state).get(slot)
             if opened is not None and opened.get("instance_id") == instance_id:
-                if opened.get("status") == "error" and status == "completed":
-                    # Close the corrected pass through the existing recorder event.
-                    opened["status"] = "active"
                 _ = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -6241,6 +6267,12 @@ class PostmasterReplyRecord:
     body: str
     targets: tuple[str, ...]
 
+    def matches_forward(self, text: str) -> bool:
+        answer_to = ", ".join(self.senders)
+        if len(self.senders) > 1:
+            answer_to = f"one of {answer_to}"
+        return text == f"{self.name} (answer to {answer_to}): {self.body}"
+
     @classmethod
     def from_fields(cls, fields: dict[str, object]) -> PostmasterReplyRecord:
         """Validate the postmaster schema at the JSON boundary."""
@@ -6302,11 +6334,10 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
         body = body.removeprefix("\r\n").removesuffix("\r\n")
     elif body.startswith("\n"):
         body = body.removeprefix("\n").removesuffix("\n")
-    forward = re.fullmatch(
-        r'Message from [^\r\n]+ \(their answer to [^\r\n]+, passed on by postmaster\) '
-        + r'\[([0-9]+)-[0-9]+\]:\n\n(.*)', body, re.DOTALL)
-    if forward is None:
+    tag = re.search(r'\n\nTag: ([0-9]+)-[0-9]+\Z', body)
+    if tag is None:
         return UnverifiedSupplierMessage(SupplierMessageRejection.INVALID_FORWARD)
+    timestamp, forwarded_text = tag[1], body[:tag.start()]
 
     # Resolve the outer sender before reading reply records. A name in the
     # message, or a reply record alone, cannot establish the forward's origin.
@@ -6320,21 +6351,21 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     records: list[PostmasterReplyRecord] = []
     if root.is_absolute():
         # replyCount names files; forwardCount names deliveries. They need not agree.
-        for path in (root / "message/postmaster/replies").glob(f"{forward[1]}-*.json"):
+        for path in (root / "message/postmaster/replies").glob(f"{timestamp}-*.json"):
             if path.is_symlink() or re.fullmatch(r'[0-9]+-[0-9]+\.json', path.name) is None:
                 continue
             try:
                 record = _read_postmaster_reply_record(path)
             except (OSError, ValueError):
                 continue
-            if str(record.at_ms) == forward[1]:
+            if str(record.at_ms) == timestamp:
                 records.append(record)
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.NO_RECORD)
     records = [record for record in records if record.socket == address.address]
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.SOCKET_MISMATCH)
-    records = [record for record in records if record.body == forward[2]]
+    records = [record for record in records if record.matches_forward(forwarded_text)]
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.BODY_MISMATCH)
     records = [record for record in records if owner_session in record.targets]
@@ -6343,7 +6374,7 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     if len(records) != 1:
         return UnverifiedSupplierMessage(SupplierMessageRejection.SEVERAL_RECORDS)
     # The write-once reply record's targets establish the intended recipients.
-    return VerifiedSupplierMessage(forward[2], SupplierMessageRoute.POSTMASTER_REPLY)
+    return VerifiedSupplierMessage(records[0].body, SupplierMessageRoute.POSTMASTER_REPLY)
 
 
 def _turn_waits_for_marker(marker: dict[str, object], waits: dict[str, dict[str, object]]) -> list[dict[str, object]]:
@@ -6440,7 +6471,9 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         from_supplier = isinstance(message, VerifiedSupplierMessage)
         user_wait = wait.get("wait_kind") == "WaitingForUser"
         body = message.body if isinstance(message, VerifiedSupplierMessage) else ""
-        body = re.sub(r'^Message from [^\n]+ via postmaster: [^\n]* \[[a-fA-F0-9]{8}\]\r?\n\r?\n', "", body, count=1)
+        body = re.sub(r'^[^\r\n]*: [^\r\n]*\r?\nSender native id: [^\r\n]+\r?\n'
+                      + r'(?:Shown sender: [^\r\n]+\r?\n)?Tag: [a-fA-F0-9]{8}\r?\n\r?\n',
+                      "", body, count=1)
         relay = from_supplier and body.lstrip().startswith("From the user (via the showrunner):")
         if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
             return
