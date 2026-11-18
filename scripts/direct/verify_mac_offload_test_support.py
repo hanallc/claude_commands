@@ -495,7 +495,7 @@ fi
 '''
 
 
-ASSIGNED_RUNNER_SETUP = r'''
+ASSIGNED_RUNNER_SETUP = rf'''
 if "--assignment-file" in arguments:
     import atexit
     import io
@@ -503,7 +503,7 @@ if "--assignment-file" in arguments:
     from contextlib import redirect_stdout
 
     with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
-        exec(package_root.read(), {"__file__": package_root.name})
+        exec(package_root.read(), {{"__file__": package_root.name}})
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
     from scripts.mac_test import mac_test as assigned_mac_test, claim_state
     from scripts.lib import process_start
@@ -532,7 +532,7 @@ if "--assignment-file" in arguments:
     start = process_start.process_start(os.getpid())
     assert isinstance(start, process_start.Started)
     holder = placement.ClaimHolderIdentity(assignment.owner.host, os.getpid(), start.start)
-    permission_deadline = time.monotonic() + 10
+    permission_deadline = time.monotonic() + {TEST_HANG_GUARD_SECS}
     while True:
         permission = admission_client.consume_permission(wire.ConsumePermission(uuid.uuid4().hex, assignment, reference, holder))
         if isinstance(permission, wire.FirstAuthorization):
