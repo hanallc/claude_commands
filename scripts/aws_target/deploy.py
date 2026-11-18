@@ -33,7 +33,7 @@ from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
+from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
@@ -43,6 +43,7 @@ from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf, user_zone
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
+from scripts.lib.file_lock import LockResult
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
 HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
@@ -192,7 +193,8 @@ class HanaControlRefused(DeploymentRefused):
     """Another command holds exclusive control of Hana."""
 
     def __init__(self, command: str) -> None:
-        super().__init__(f'{command}: another command holds exclusive control of Hana.')
+        super().__init__(f'{command}: Another command is using the Hana resources. '
+                         + 'Run the same command again when that command ends.')
 
 
 class HanaSetupTimingRefused(DeploymentRefused):
@@ -885,6 +887,14 @@ class Deployment:
             return self._probe_hana_scaler(provider, identity)
 
     @contextmanager
+    def _require_account_stack(self, command: str) -> Generator[None]:
+        with account_stack_lock(self.directory) as access:
+            if access is LockResult.BUSY:
+                raise DeploymentRefused(f'{command}: Another command is using the AWS account stack. '
+                                        + 'Run the same command again when that command ends.')
+            yield
+
+    @contextmanager
     def _require_hana_control(self, command: str) -> Generator[None]:
         with hana_command_lock(self.directory) as access:
             if access is not HanaCommandAccess.ACQUIRED:
@@ -937,7 +947,8 @@ class Deployment:
             if access is HanaCommandAccess.RESOURCES_HELD:
                 raise HanaControlRefused('hana-setup --plan')
             if access is HanaCommandAccess.CONTROLLER_BUSY:
-                raise DeploymentRefused(HANA_BUSY)
+                raise DeploymentRefused('The Hana controller holds the lock. '
+                                        + 'Run the same command again when the controller releases it.')
             path = self.directory / 'hana' / 'setup.json'
             try:
                 saved = remote.read_record(path)
@@ -2090,7 +2101,7 @@ class Deployment:
 
     def apply(self, *, approve_resources: bool = False) -> dict[str, str]:
         self._authorize(approve_resources)
-        with self._require_hana_control('apply'):
+        with self._require_account_stack('apply'), self._require_hana_control('apply'):
             settings, parameters = self._load(read_budget_notification_address(self.settings_path))
             stack = self._stack(settings)
             previous_path = self.directory / 'deployment.json'
@@ -2206,7 +2217,7 @@ class Deployment:
             return True
         self._check_credentials()
         settings = read_deployment_settings(self.settings_path)
-        with self._require_hana_control('remove-images'):
+        with self._require_account_stack('remove-images'):
             api = self._api(settings)
             deployment = gate_deployment(self.directory / 'gate-deployment.json', settings.region)
             home = ledger.rows(deployment, 'regions')[0]
@@ -2520,13 +2531,7 @@ class Deployment:
         """Preview the approved gate update in configured region order."""
         if not isinstance(self.mode, plan_run.PlanRun):
             raise DeploymentRefused('The gate plan requires the plan identity.')
-        with hana_command_lock(self.directory, wait_for_controller=False, existing_controller=True) as access:
-            if access is HanaCommandAccess.CONTROLLER_BUSY:
-                raise DeploymentRefused('The Hana controller lock is busy.')
-            if access is HanaCommandAccess.CONTROLLER_MISSING:
-                raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
-            if access is not HanaCommandAccess.ACQUIRED:
-                raise HanaControlRefused('up --workload merge-gates --plan')
+        with self._require_account_stack('up --workload merge-gates --plan'):
             self._gate_plan_locked(self.mode)
 
     def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
@@ -2706,7 +2711,7 @@ class Deployment:
         """Add the gate resources and preserve every Rust parameter."""
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
-        with self._require_hana_control('up --workload merge-gates'):
+        with self._require_account_stack('up --workload merge-gates'):
             settings = read_deployment_settings(self.settings_path)
             regions = gate_regions(settings.region)
             api = self._api(settings)
@@ -2977,7 +2982,8 @@ class Deployment:
             return True
         self._check_credentials()
         settings = read_deployment_settings(self.settings_path)
-        with self._require_hana_control('down'), step('down', 'removing local and cloud resources', self.settings_path):
+        with (self._require_account_stack('down'), self._require_hana_control('down'),
+              step('down', 'removing local and cloud resources', self.settings_path)):
             return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 

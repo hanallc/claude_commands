@@ -1,4 +1,4 @@
-"""Share the existing controller lock across lifecycle and account commands."""
+"""Lock the account stack and coordinate control of the Hana box."""
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from enum import Enum
@@ -7,6 +7,16 @@ import os
 from pathlib import Path
 
 from scripts.lib.file_lock import LockResult, exclusive
+
+
+# Commands that need both locks take the account stack lock before the Hana resource hold.
+@contextmanager
+def account_stack_lock(directory: Path) -> Generator[LockResult]:
+    """Take the account stack lock without waiting."""
+    gate = directory / 'gate-up'
+    gate.mkdir(parents=True, exist_ok=True)
+    with exclusive(gate / 'controller.lock', wait=False) as access:
+        yield access
 
 
 @contextmanager

@@ -1,21 +1,24 @@
 """Check the Hana setup plan with private fixtures and a restricted AWS fake."""
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import cast, final, override
+from typing import Literal, cast, final, override
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, deploy, hana_box, ledger, plan_identity, plan_run, test_deploy
+from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
-from scripts.aws_target.controller_lock import HanaCommandAccess, control_lock, hana_command_lock
+from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
+from scripts.aws_target.test_hana_box import IDENTITY, FakeProvider, write_lifecycle_configuration
 from scripts.lib import conf
+from scripts.lib.file_lock import LockResult
 
 
 OWNER = plan_identity.PlanAccount('aws', '0' * 12)
@@ -325,6 +328,8 @@ class PlanSetupTests(CostFixture):
             def check_claim() -> None:
                 claim = worker.submit(controller.request, 'fixture-claim')
                 self.assertIsInstance(claim.result(timeout=5), hana_box.HanaResourcesHeld)
+                tick = worker.submit(controller.tick)
+                self.assertIsInstance(tick.result(timeout=5), hana_box.HanaResourcesHeld)
                 blocked.append(self.calls[-1][1])
 
             self.check_claim = check_claim
@@ -341,7 +346,8 @@ class PlanSetupTests(CostFixture):
         def check_teardown() -> None:
             before = list(self.calls)
             with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.HanaControlRefused,
-                    '^hana-down: another command holds exclusive control of Hana'):
+                    r'^hana-down: Another command is using the Hana resources\. '
+                    + r'Run the same command again when that command ends\.$'):
                 _ = subject.hana_down(approve_destroy=True)
             self.assertEqual(self.calls, before)
             refused.append(before[-1][1])
@@ -357,8 +363,8 @@ class PlanSetupTests(CostFixture):
             status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 1, output)
         self.assertEqual(self.calls, [])
-        self.assertTrue(output.endswith('plan run: refused: The Hana lifecycle is busy. '
-                                        + 'Run hana-setup again when the box is idle.\n'))
+        self.assertTrue(output.endswith('plan run: refused: The Hana controller holds the lock. '
+                                        + 'Run the same command again when the controller releases it.\n'))
 
     def test_claimed_box_refuses_without_waiting_or_creating_a_change_set(self) -> None:
         self.prepare_hana()
@@ -632,12 +638,13 @@ class GatePlanTests(CostFixture):
         self.displaced_policies: dict[str, dict[str, str]] = {}
         self.unresolved_policy = ''
         self.cleanup_timeouts: list[tuple[float, float]] = []
+        self.on_aws_call: Callable[[str, str, str], None] = lambda _region, _service, _operation: None
 
     @override
     def setUp(self) -> None:
         super().setUp()
         self.regions = (GATE_HOME, GATE_REGION)
-        with control_lock(self.state):
+        with account_stack_lock(self.state):
             pass
         self.credentials_path = self.root / '.config/aws-build/credentials'
         self.credentials_path.parent.mkdir(parents=True)
@@ -669,11 +676,40 @@ class GatePlanTests(CostFixture):
                  'scaler_user': {'name': 'fixture-scaler', 'arn': GATE_USER, 'user_id': GATE_USER_ID}}
         _ = (self.state / 'deployment.json').write_text(json.dumps(saved | overrides))
 
+    def write_gate_configuration(self) -> None:
+        _ = conf.path('cloud_gate').write_text(f'''\
+regions={' '.join(self.regions)}
+instance_types=m7a.8xlarge
+credential_file={self.credentials_path}
+hana_gpu_instance_types=g4dn.2xlarge
+hana_gpu_spot_max_usd_per_hour={{"g4dn.2xlarge": "0.5"}}
+gpu_size_trial_spot_max_usd_per_hour={{"g6.8xlarge": "0.8"}}
+gpu_size_trial_limit_usd=3
+gpu_size_trial_box_extra_usd=0.2
+# whole: 1..
+gpu_size_trial_lifetime_minutes=60
+# range: 0.01..
+api_timeout_s=1
+# range: 0.01..
+spot_max_usd_per_hour=0.8
+# whole: 1..
+root_gib=64
+# whole: 1..
+artifact_days=7
+# whole: 1..
+log_days=7
+# whole: 1..
+expiry_schedule_minutes=5
+# whole: 1..
+expiry_timeout_s=60
+# whole: 1..
+expiry_memory_mib=128
+# range: 0..
+shared_usd_per_month=1
+''')
+
     def run_plan(self, *arguments: str) -> tuple[int, str]:
-        gate = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
-        lines = ['regions=' + ' '.join(self.regions) if line.startswith('regions=') else line
-                 for line in gate.read_text().splitlines()]
-        _ = conf.path('cloud_gate').write_text('\n'.join(lines) + '\n')
+        self.write_gate_configuration()
         before = {path: path.read_bytes() if path.is_file() else None for path in self.root.rglob('*')}
         output, errors = StringIO(), StringIO()
         argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--settings', str(self.settings),
@@ -697,8 +733,8 @@ class GatePlanTests(CostFixture):
             return arguments[arguments.index(name) + 1]
 
         region = option('--region')
-        with hana_command_lock(self.state, wait_for_controller=False, existing_controller=True) as access:
-            self.assertIs(access, HanaCommandAccess.RESOURCES_HELD)
+        with account_stack_lock(self.state) as access:
+            self.assertIs(access, LockResult.BUSY)
         if '--profile' in arguments:
             self.assertEqual(option('--profile'), 'build-scaler')
             self.assertEqual((env or {}).get('AWS_SHARED_CREDENTIALS_FILE'), str(self.credentials_path))
@@ -718,6 +754,7 @@ class GatePlanTests(CostFixture):
         self.assertIn(plan_run.action_name(service, operation), ALLOWED)
         self.assertTrue(set(arguments).isdisjoint(('--dry-run', '--template-url', '--role-arn')))
         self.calls.append((region, service, operation))
+        self.on_aws_call(region, service, operation)
 
         def error(code: str, action: str, reason: str) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(arguments, 1, '',
@@ -910,27 +947,164 @@ class GatePlanTests(CostFixture):
         self.assertEqual(self.calls_in(GATE_HOME), home + change + policies + reads + launch * count + finish + s3)
         self.assertEqual(self.calls_in(GATE_REGION), regional + change + launch * count + finish)
 
-    def test_busy_gate_controller_refuses_before_aws(self) -> None:
-        with control_lock(self.state):
+    def test_busy_account_stack_lock_refuses_the_plan_before_aws(self) -> None:
+        with account_stack_lock(self.state) as access:
+            self.assertIs(access, LockResult.ACQUIRED)
             status, output = self.run_plan()
         self.assertEqual(status, 1, output)
-        self.assertEqual(output, 'plan run: refused: The Hana controller lock is busy.\n')
+        self.assertEqual(output, 'plan run: refused: up --workload merge-gates --plan: '
+                                 + 'Another command is using the AWS account stack. '
+                                 + 'Run the same command again when that command ends.\n')
         self.assertEqual(self.calls, [])
 
-    def test_gate_plan_refuses_a_resource_hold_before_aws(self) -> None:
+    def test_gate_plan_can_run_during_a_hana_resource_hold(self) -> None:
         with hana_command_lock(self.state) as access:
             self.assertIs(access, HanaCommandAccess.ACQUIRED)
             status, output = self.run_plan()
-        self.assertEqual(status, 1, output)
-        self.assertIn('another command holds exclusive control of Hana', output)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(status, 0, output)
 
-    def test_gate_plan_with_no_controller_lock_leaves_state_untouched(self) -> None:
-        (self.state / 'controller.lock').unlink()
+    @contextmanager
+    def hana_activity(
+        self, directory: Path, claim: str, *, renew_on: str, release_on: str,
+    ) -> Generator[tuple[TestClock, Callable[[str], None]]]:
+        clock = TestClock()
+        workload = conf.path('hana_aws')
+        write_lifecycle_configuration(workload)
+        book = ledger.CostLedger(directory)
+        book.record_inventory(ledger.ResourceInventory(clock.now, (), 'private inventory', True))
+        book.observe(ledger.InstanceObservation(clock.now, 'terminated', 'private account inventory'))
+        provider = FakeProvider(directory, clock)
+        controller = hana_box.HanaController(directory, self.settings, workload, provider, clock=clock)
+        controller.register(IDENTITY)
+        self.assertIsInstance(controller.request(claim), hana_box.ClaimCommitted)
+        for _step in range(4):
+            clock.advance(1)
+            _ = controller.tick()
+        initial = controller.inspect_for_settlement()
+        assert isinstance(initial, hana_box.HanaLifecycleEvidence)
+        permit = initial.permit
+        assert isinstance(permit, hana_box.DeliveredPermit)
+        settled: list[str] = []
+
+        def renew_and_settle(operation: str) -> None:
+            if operation == renew_on:
+                clock.now = permit.expires - 100
+                self.assertEqual(controller.tick(), hana_box.Lifecycle.READY)
+                clock.advance(1)
+                self.assertEqual(controller.tick(), hana_box.Lifecycle.READY)
+                current = controller.inspect_for_settlement()
+                assert isinstance(current, hana_box.HanaLifecycleEvidence)
+                assert isinstance(current.permit, hana_box.DeliveredPermit)
+                self.assertGreater(current.permit.expires, permit.expires)
+                self.assertEqual(provider.published[-1].expected_generation, permit.generation)
+                settled.append('renewed')
+            if operation == release_on:
+                self.assertTrue(controller.release(claim))
+                self.assertIsInstance(controller.claim_status(claim), hana_box.ClaimRefused)
+                settled.append('released')
+
+        yield clock, renew_and_settle
+        self.assertEqual(settled, ['renewed', 'released'])
+
+    def test_gate_plan_renews_a_hana_permit_and_settles_the_claim_during_aws_calls(self) -> None:
+        with self.hana_activity(self.state, 'gate-plan-claim', renew_on='create-change-set',
+                                release_on='delete-change-set') as (_clock, observe):
+            def on_aws_call(region: str, service: str, operation: str) -> None:
+                if (region, service) == (GATE_HOME, 'cloudformation'):
+                    observe(operation)
+
+            self.on_aws_call = on_aws_call
+            self.write_gate_configuration()
+            plan = plan_run.PlanRun(lambda: CREDENTIAL, self.execute, lambda _seconds: None)
+            subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=self.execute, mode=plan)
+            with redirect_stdout(StringIO()):
+                subject.gate_plan()
+        self.assertEqual(self.change_sets, {})
+
+    def test_account_stack_lock_excludes_writes_and_allows_hana_activity(self) -> None:
+        unexpected = mock.Mock(side_effect=AssertionError('Unexpected AWS call'))
+        approved = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=unexpected)
+        operations: tuple[tuple[str, Callable[[], object]], ...] = (
+            ('up --workload merge-gates', lambda: approved.gate_up(approve_resources=True)),
+            ('remove-images', lambda: approved.remove_images(approve_destroy=True)),
+            ('apply', lambda: approved.apply(approve_resources=True)),
+            ('down', lambda: approved.down(approve_destroy=True)),
+        )
+        refused: list[str] = []
+
+        def check_exclusion(region: str, service: str, operation: str) -> None:
+            if (region, service, operation) != (GATE_HOME, 'sts', 'get-caller-identity'):
+                return
+            for command, run in operations:
+                with self.subTest(command=command), self.assertRaises(deploy.DeploymentRefused) as error:
+                    _ = run()
+                self.assertEqual(str(error.exception), f'{command}: Another command is using the AWS account stack. '
+                                 + 'Run the same command again when that command ends.')
+                refused.append(command)
+
+        self.on_aws_call = check_exclusion
         status, output = self.run_plan()
-        self.assertEqual(status, 1, output)
-        self.assertIn('The Hana controller lock is missing.', output)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(status, 0, output)
+        self.assertEqual(refused, [command for command, _run in operations])
+        unexpected.assert_not_called()
+
+        self.regions = (GATE_HOME,)
+        self.write_gate_configuration()
+        self.replace('deploy_progress_interval_s', '60')
+        self.text_setting('admin_secret_file', str(self.root / 'admin.gpg'))
+        self.text_setting('deployment_profile', 'fixture-admin')
+        approved_rows: tuple[tuple[Literal['gate-up', 'remove-images'], str, str], ...] = (
+            ('gate-up', 'create-change-set', 'execute-change-set'),
+            ('remove-images', 'get-template', 'delete-snapshot snap-old'),
+        )
+        for command, renew_on, release_on in approved_rows:
+            with self.subTest(command=command):
+                self.check_approved_gate_command(command, renew_on, release_on)
+
+    def check_approved_gate_command(
+        self, command: Literal['gate-up', 'remove-images'], renew_on: str, release_on: str,
+    ) -> None:
+        directory = self.root / 'approved' / command
+        directory.mkdir(parents=True)
+        _ = (directory / 'deployment.json').write_bytes((self.state / 'deployment.json').read_bytes())
+        images = test_deploy.GateImageAws()
+        images.manifest = directory / 'gate-deployment.json'
+        if command == 'remove-images':
+            _ = images.manifest.write_text(json.dumps({'regions': [{'region': GATE_HOME, 'image': 'ami-old'}]}))
+            (directory / 'gate-image').mkdir()
+
+        with self.hana_activity(directory, command, renew_on=renew_on, release_on=release_on) as (clock, observe):
+            def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                with account_stack_lock(directory) as access:
+                    self.assertIs(access, LockResult.BUSY)
+                operation = arguments[arguments.index('--region') + 3]
+                observe(operation + ' ' + arguments[arguments.index('--snapshot-id') + 1]
+                        if operation == 'delete-snapshot' else operation)
+                if operation == 'get-caller-identity':
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps({'Account': OWNER.account}), '')
+                reply = images(arguments)
+                if operation == 'describe-stacks':
+                    body = ledger.mapping(cast(object, json.loads(reply.stdout)))
+                    stack, = ledger.rows(body, 'Stacks')
+                    stack['StackId'] = self.stack_id(GATE_HOME)
+                    outputs = {'GateBucket': GATE_BUCKET, 'GateLaunchTemplate': 'lt-fixture',
+                               'GateLaunchVersion': str(images.version), 'GateSecurityGroup': 'sg-fixture',
+                               'GateRoleId': 'fixture-role', 'ScalerUserName': 'fixture-scaler'}
+                    stack['Outputs'] = [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]
+                    reply.stdout = json.dumps(body)
+                return reply
+
+            subject = deploy.Deployment(self.settings, directory, self.root / command, execute=execute, clock=clock)
+            credentials = admin_secrets.AdminCredentials('fixture-key', 'fixture-secret', 'fixture-id', 'fixture-oauth')
+            with (mock.patch.object(subject.admin, 'get', return_value=credentials), redirect_stdout(StringIO())):
+                if command == 'gate-up':
+                    with (mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'),
+                          mock.patch.object(deploy, 'gate_subnets', return_value=[{'id': 'subnet-fixture', 'zone': GATE_HOME + 'a'}]),
+                          mock.patch.object(subject, '_fill_prices'),
+                          mock.patch.object(subject, '_probe_gate_gpu', return_value=True)):
+                        self.assertTrue(subject.gate_up(approve_resources=True))
+                else:
+                    self.assertTrue(subject.remove_images(approve_destroy=True))
 
     def test_missing_home_image_refuses_all_regions(self) -> None:
         self.regions = (GATE_HOME, GATE_REGION, GATE_LAST)

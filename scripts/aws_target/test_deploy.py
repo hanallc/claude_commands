@@ -2,9 +2,9 @@
 from __future__ import annotations
 from scripts.lint.memory_test_support import write_config_fixture
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import lru_cache
@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_spend, ledger, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -1491,6 +1492,7 @@ class HanaSetupFailureTests(CostFixture):
             def check_claim(provider: AwsHanaProvider, identity: hana_box.DeploymentIdentity) -> bool:
                 claim = worker.submit(controller.request, 'fixture-late-claim')
                 self.assertIsInstance(claim.result(timeout=5), hana_box.HanaResourcesHeld)
+                self.assertIsInstance(worker.submit(controller.tick).result(timeout=5), hana_box.HanaResourcesHeld)
                 self.assertEqual(path.read_bytes(), idle)
                 return original_probe(provider, identity)
 
@@ -1523,9 +1525,6 @@ class HanaSetupFailureTests(CostFixture):
             ('prepare --workload hana', subject.prepare_hana),
             ('prepare', subject.prepare),
             ('apply', lambda: subject.apply(approve_resources=True)),
-            ('up --workload merge-gates', lambda: subject.gate_up(approve_resources=True)),
-            ('up --workload merge-gates --plan', planned.gate_plan),
-            ('remove-images', lambda: subject.remove_images(approve_destroy=True)),
             ('down', lambda: subject.down(approve_destroy=True)),
         )
 
@@ -1535,7 +1534,8 @@ class HanaSetupFailureTests(CostFixture):
                     mock.patch.object(hana_image, 'read_built', return_value=image)):
                 for name, operation in operations:
                     with self.subTest(command=name), self.assertRaisesRegex(deploy.HanaControlRefused,
-                            f'^{name}: another command holds exclusive control of Hana'):
+                            f'^{name}: Another command is using the Hana resources. '
+                            + r'Run the same command again when that command ends\.$'):
                         _ = operation()
                 api.assert_not_called()
                 unexpected_aws.assert_not_called()
@@ -2354,6 +2354,32 @@ sys.exit(7)
         _ = self.enterContext(mock.patch.object(subject, '_api', return_value=aws_target.AwsCli(
             'fixture-admin', 'us-east-1', 1, execute=fake)))
         return subject, fake
+
+    def test_account_apply_takes_the_account_stack_lock_before_the_hana_hold(self) -> None:
+        subject = self.deployment()
+
+        @contextmanager
+        def take_hana_hold(directory: Path) -> Generator[HanaCommandAccess]:
+            with account_stack_lock(directory) as account:
+                self.assertIs(account, file_lock.LockResult.BUSY)
+            with hana_command_lock(directory) as access:
+                yield access
+
+        def check_holds(*_arguments: object) -> None:
+            with account_stack_lock(self.state) as account:
+                self.assertIs(account, file_lock.LockResult.BUSY)
+            with hana_command_lock(self.state) as hana:
+                self.assertIs(hana, HanaCommandAccess.RESOURCES_HELD)
+            raise ValueError('Fixture stops apply before AWS')
+
+        with (mock.patch.object(deploy, 'hana_command_lock', new=take_hana_hold),
+              mock.patch.object(subject, '_load', side_effect=check_holds) as load,
+              self.assertRaisesRegex(ValueError, 'Fixture stops apply before AWS')):
+            _ = subject.apply(approve_resources=True)
+        load.assert_called_once()
+        with account_stack_lock(self.state) as account, hana_command_lock(self.state) as hana:
+            self.assertIs(account, file_lock.LockResult.ACQUIRED)
+            self.assertIs(hana, HanaCommandAccess.ACQUIRED)
 
     def test_remove_gate_image_dry_run_needs_no_credentials_and_writes_nothing(self) -> None:
         self.credentials.unlink()

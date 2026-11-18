@@ -123,8 +123,11 @@ deploy.py up --workload merge-gates --plan
 ```
 
 The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
-The plan, approved gate setup, and image removal take the shared Hana resource hold.
-The plan refuses before it contacts AWS if it cannot take the hold immediately.
+The gate plan, approved gate setup, and image removal take the account stack lock at `gate-up/controller.lock`.
+This lock protects the account stack, regional gate stacks, and `gate-deployment.json`.
+Account apply and teardown take the account stack lock before the Hana resource hold.
+A command refuses before it contacts AWS if another command holds the account stack lock.
+The gate commands leave Hana build claims and permit renewal available.
 It builds the same template and parameter values as approved gate setup.
 The plan previews updates in the home region and in each configured gate region.
 It removes each change set and confirms removal before it checks scaler permissions.
@@ -420,7 +423,9 @@ The `setup_idle_heartbeat_s` setting reports the lifecycle state every 15 second
 Setup checks the lifecycle again at the wait limit.
 If the box is still busy, setup reports the lifecycle state and the claim holder kind.
 Setup takes exclusive control of the box under the controller lock.
-The setup plan and other commands that manage Hana use the same hold.
+The setup plan, Hana image registration, and Hana teardown use the same hold.
+Account prepare, Hana prepare, account apply, and account teardown also use the hold.
+The controller skips its tick while a command holds Hana resources.
 A competing command refuses before it calls AWS.
 Build claims and queue evidence report the box as busy during the hold.
 The kernel releases the hold when the command closes it or the process exits.
