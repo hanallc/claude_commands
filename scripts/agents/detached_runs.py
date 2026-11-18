@@ -41,7 +41,7 @@ from typing import IO, Literal, NotRequired, TypedDict, TypeGuard, cast, overrid
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import conf, process_group, process_start, unit_runs
+from scripts.lib import atomic_file, conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
@@ -224,6 +224,8 @@ def _read_record(path: Path) -> RunRecord:
     raw = worker_lifecycle.read_json_object(path)
     if not _is_run_record(raw):
         raise SystemExit(f"detached_runs: {path} is not a run record")
+    if path.name != f"{raw['run_id']}.json":
+        raise SystemExit(f"detached_runs: {path} does not match run ID {raw['run_id']}")
     return raw
 
 
@@ -231,25 +233,28 @@ def stop_with_reason(
     path: Path, reason: str, *, verify_group: Callable[[], CommandGroup | CommandGroupUnverified],
     signal_group: Callable[[int, int], None],
 ) -> bool:
-    """Save the reason and signal the verified group under one record lock."""
+    """Publish the stop reason after signaling the verified group."""
     with record_lock(path):
-        record = worker_lifecycle.read_json_object(path)
-        if not _is_run_record(record) or path.name != f"{record['run_id']}.json":
+        try:
+            record = _read_record(path)
+        except SystemExit:
             return False
         if isinstance(verify_group(), CommandGroupUnverified):
             return False
+        pending = path.with_suffix(".stop-pending")
         stopping = {**record, "stop_reason": reason}
-        stopped = False
         try:
-            write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
+            write_text_atomic(pending, json.dumps(stopping, indent=2, sort_keys=True),
+                              new_file_mode=path.stat().st_mode & 0o777)
             command = verify_group()
-            if isinstance(command, CommandGroup):
-                signal_group(command.group, signal.SIGTERM)
-                stopped = True
+            if isinstance(command, CommandGroupUnverified):
+                return False
+            signal_group(command.group, signal.SIGTERM)
+            _ = pending.replace(path)
+            atomic_file.sync_folder(path.parent)
         finally:
-            if not stopped:
-                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
-        return stopped
+            pending.unlink(missing_ok=True)
+        return True
 
 
 @dataclass(frozen=True)
@@ -335,13 +340,18 @@ def _group_is_live(group: int) -> bool:
     return False
 
 
-def _saved_process(pid: object, started: object) -> process_start.ProcessStart:
-    """Read the saved process identity and reject a reused PID."""
+@dataclass(frozen=True)
+class SavedProcessIdReused:
+    """A different process now owns the saved PID."""
+
+
+def _saved_process(pid: object, started: object) -> process_start.ProcessStart | SavedProcessIdReused:
+    """Read the saved process identity and identify a reused PID."""
     if not isinstance(started, str) or not started or _integer(pid) <= 0:
         return process_start.Gone()
     observed = process_start.process_start(_integer(pid))
     if isinstance(observed, (process_start.Started, process_start.Zombie)) and observed.start != started:
-        return process_start.Gone()
+        return SavedProcessIdReused()
     return observed
 
 
@@ -358,8 +368,13 @@ def _orphaned(path: Path, raw: Mapping[str, object], now: float) -> bool:
             return False
         group = _integer(raw.get("command_group"))
         if group > 0:
-            # POSIX reuses no PID while a process group of that ID has members, so live members are this command's.
-            return not _group_is_live(group)
+            leader = group == _integer(raw.get("command_pid"))
+            if leader and isinstance(command, SavedProcessIdReused):
+                return True
+            if not _group_is_live(group):
+                return True
+            # The group ID can be reused after the last member exits.
+            return leader and isinstance(_saved_process(group, raw.get("command_started")), SavedProcessIdReused)
         supervisor = _saved_process(pid, raw.get("supervisor_started"))
         owns_group = isinstance(supervisor, (process_start.Started, process_start.Zombie))
         if not owns_group and isinstance(command, process_start.Zombie):
@@ -398,9 +413,12 @@ class OrphanReapResult:
                     fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     continue
-                current = worker_lifecycle.read_json_object(path)
+                try:
+                    current = _read_record(path)
+                except SystemExit:
+                    continue
                 if current.get("completion_pending") is True:
-                    _finish_record(path, cast(RunRecord, cast(object, current)))
+                    _finish_record(path, current)
 
 
 def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
@@ -434,7 +452,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             continue
         if raw.get("status") == "finished" and raw.get("completion_pending"):
             if not detached_run_process.supervises(raw["pid"], path):
-                result.queue_completion(path, _read_record(path))
+                result.queue_completion(path, raw)
             continue
         if not _orphaned(path, raw, now):
             continue
@@ -444,7 +462,8 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
         except FileExistsError:
             continue
         try:
-            record = _read_record(path)
+            with record_lock(path):
+                record = _read_record(path)
             if record["status"] != "running":
                 continue
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
@@ -466,6 +485,8 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             record = _write_record(path, record)
             result.queue_completion(path, record)
             result.run_ids.append(record["run_id"])
+        except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
+            print(" ".join(str(error).splitlines()), file=sys.stderr)
         finally:
             claim.unlink(missing_ok=True)
     return result
@@ -493,7 +514,8 @@ def _complete_worker_dispatch(record: RunRecord) -> None:
 
 
 # Keep the record lock at its path until the record is gone.
-_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.json", "{}.record.lock")
+_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-pending",
+              "{}.json", "{}.record.lock")
 
 
 def prune_finished(runs: Path) -> list[str]:
