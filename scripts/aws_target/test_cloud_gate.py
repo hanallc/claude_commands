@@ -468,8 +468,14 @@ class CloudGateTests(CostFixture):
             if 'describe-spot-price-history' in arguments:
                 _ = barrier.wait()
             return self.fake(arguments, **options)
+
+        def wait_for_reads(futures: Iterable[Future[cloud_gate.RegionalLiveSpotRead]], **_options: float):
+            return wait(futures, timeout=TEST_HANG_GUARD_SECS)
+
         worker.api = AwsCli('fixture', 'us-east-2', 1, execute=transport)
-        reads = worker.live_spot_prices(variants)
+        with (mock.patch.object(cloud_gate, 'time', SimpleNamespace(monotonic=lambda: 0.0)),
+              mock.patch.object(cloud_gate, 'wait', new=wait_for_reads)):
+            reads = worker.live_spot_prices(variants)
         self.assertTrue(completed.is_set())
         self.assertEqual(len(reads), 4)
         self.assertTrue(all(row.used for row in reads))

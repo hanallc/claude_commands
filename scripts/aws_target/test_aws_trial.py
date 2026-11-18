@@ -34,6 +34,7 @@ from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -168,9 +169,10 @@ class GuestTests(unittest.TestCase):
 
 
     def test_guest_uses_whole_machine_without_types_with_timeout_and_counts(self) -> None:
+        socket_folder = self.enterContext(short_socket_directory())
         with tempfile.TemporaryDirectory() as folder, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as ready:
             root = Path(folder)
-            ready_path = root / 'stalled'
+            ready_path = Path(socket_folder) / 'stalled'
             ready.bind(str(ready_path))
             ready.settimeout(TEST_HANG_GUARD_SECS)
             module_limit_s = TEST_HANG_GUARD_SECS
@@ -709,11 +711,16 @@ class Sample(unittest.TestCase):
         tools = self.root / 'network-tools'
         tools.mkdir()
         pids = self.root / 'git-processes.json'
+        group_record = self.root / 'git-process-group'
         fake = tools / 'git'
         _ = fake.write_text(f'''#!{sys.executable}
 import json, os, pathlib, signal, subprocess, sys
 arguments = sys.argv[1:]
 if 'push' in arguments and '--delete' not in arguments:
+    group_record = pathlib.Path({str(group_record)!r})
+    pending_record = group_record.with_suffix('.tmp')
+    pending_record.write_text(str(os.getpgrp()))
+    pending_record.replace(group_record)
     subprocess.run([{git!r}, *arguments], check=True, stdout=subprocess.DEVNULL)
     child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])
     blocked = sorted(int(number) for number in signal.pthread_sigmask(signal.SIG_BLOCK, []))
@@ -738,7 +745,7 @@ repo, base, changed, state, settings, pids, interrupted = sys.argv[1:]
 class FixtureGitProcess(subprocess.Popen):
     def communicate(self, input=None, timeout=None):
         if 'push' in self.args and '--delete' not in self.args and timeout is not None:
-            assert select.select([self.stdout], [], [], TEST_HANG_GUARD_SECS)[0], 'Git did not record its group'
+            assert select.select([self.stdout], [], [], TEST_HANG_GUARD_SECS)[0], 'Git did not report readiness'
             assert os.read(self.stdout.fileno(), 1) == b'R'
             timeout = TEST_HANG_GUARD_SECS if interrupted == '1' else 0
         return super().communicate(input=input, timeout=timeout)
@@ -769,10 +776,9 @@ else:
                 self.assertIn('timed out', reply.stderr)
             self.assertEqual(self.remote_branches(), branches)
         finally:
-            if pids.exists():
-                processes = ledger.mapping(cast(object, json.loads(pids.read_text())))
+            if group_record.exists():
                 try:
-                    send_process_group(processes['group'], signal.SIGKILL)
+                    send_process_group(int(group_record.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 
