@@ -9,6 +9,7 @@ from typing import cast
 
 from scripts.aws_target import hana_render, ledger, remote
 from scripts.aws_target.aws_cli import AwsExecutor
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -110,19 +111,20 @@ def artifact_digest(store: Path, execute: AwsExecutor, timeout: float) -> hana_r
     raise ImageRefused('The Hana image has no verified guest digest. Build the Hana image from the current input.')
 
 
-def guest_digest_is_current(digest: hana_render.GuestDigest, configuration: Path) -> bool:
+def guest_digest_is_current(digest: hana_render.GuestDigest, configuration: Path | conf.ConfigRead) -> bool:
     try:
         return digest == hana_render.guest_digest(configuration)
     except (OSError, ValueError):
         return False
 
 
-def setup_image_is_current(setup: dict[str, object], configuration: Path) -> bool:
+def setup_image_is_current(setup: dict[str, object], configuration: Path | conf.ConfigRead) -> bool:
     digest = hana_render.decode_guest_digest(setup.get('guest_digest'))
     return isinstance(digest, hana_render.GuestDigest) and guest_digest_is_current(digest, configuration)
 
 
-def deployed_image_is_current(directory: Path, deployment: str, instance: str, configuration: Path) -> bool:
+def deployed_image_is_current(directory: Path, deployment: str, instance: str,
+                              configuration: Path | conf.ConfigRead) -> bool:
     """Check the image setup confirmed for the lifecycle's exact box."""
     try:
         setup = remote.read_record(directory / 'hana/setup.json')
