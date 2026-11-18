@@ -6,7 +6,7 @@ from __future__ import annotations
 from scripts.buildlog import repository
 from scripts.lib import test_phase
 
-from scripts.build_queue import admission_records, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records, placement, snapshot_codec as codec, step_estimator
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture
 
@@ -6022,6 +6022,50 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertIsInstance(result.rows[1].blocker, gate.NoSingleBlocker)
         pressure_held = gate.admission_pass(replace(requested, pressure=admission_records.MemoryPressure(8, condition="full")), NOW_EPOCH, policy=admission_policy_fixture())
         self.assertTrue(all(isinstance(row.blocker, gate.NoSingleBlocker) for row in pressure_held.rows))
+
+    def test_a_folder_waiter_holds_the_local_line_even_for_a_continuation(self) -> None:
+        _ = self.running(100, 2)
+        _ = self.waiting(300, 4 * GIB, 2)
+        _ = self.waiting(400, 4 * GIB, 1)
+        busy = placement.CargoFolder(self.root / "busy")
+        free = placement.CargoFolder(self.root / "free")
+        run = LiveBuildRun(900, "900", NOW_EPOCH - 60)
+        slot = admission_records.BetweenStepsSlot(run, "previous", 4 * GIB, NOW_EPOCH + 10)
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB),
+            slots=(admission_records.ContinuationSlot(slot, "400-warmup"),),
+            cargo_folders={"300-head": busy, "400-warmup": free}, occupied_cargo_folders=frozenset({busy}))
+
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+
+        self.assertEqual({row.owner: row.decision.state for row in result.rows},
+                         {"300-head": "hold", "400-warmup": "hold"})
+        head, follower = result.rows
+        assert isinstance(head.reason, admission_records.HeadAdmissionStatus)
+        self.assertIsInstance(head.reason.cause, placement.CargoFolderWait)
+        self.assertIsInstance(follower.reason, admission_records.BehindHead)
+
+    def test_waiters_for_a_free_folder_report_start_spacing(self) -> None:
+        _ = self.waiting(300, 4 * GIB, 2)
+        _ = self.waiting(400, 4 * GIB, 1)
+        folder = placement.CargoFolder(self.root / "target")
+        spacing = admission_records.NextStartAt(NOW_EPOCH + 5)
+        inputs = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB),
+            spacing=spacing, cargo_folders={"300-head": folder, "400-warmup": folder})
+
+        result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
+
+        head, follower = result.rows
+        assert isinstance(head.reason, admission_records.HeadAdmissionStatus)
+        self.assertEqual(head.reason.cause, admission_records.StartSpacingWait(spacing.at))
+        self.assertEqual(follower.reason, admission_records.StartSpacingWait(spacing.at))
+
+        with self.subTest(spacing="elapsed", recovery_start_seconds=0):
+            policy = admission_policy_fixture()
+            policy = replace(policy, timing=replace(policy.timing, recovery_start_seconds=0))
+            head, follower = gate.admission_pass(inputs, spacing.at, policy).rows
+            self.assertIsInstance(head.admission, gate.ProposedAdmission)
+            self.assertIsInstance(follower.admission, gate.NotAdmitted)
+            self.assertIsInstance(follower.reason, admission_records.BehindHead)
 
     def test_two_proposals_charge_the_first_need_to_the_second(self) -> None:
         _ = self.waiting(300, 4 * GIB, 1)
