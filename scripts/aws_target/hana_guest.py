@@ -30,6 +30,17 @@ SYSTEM_BIN = '/run/current-system/sw/bin'
 
 
 @dataclass(frozen=True)
+class PermitWindow:
+    enabled: bool
+    permit_max_seconds: int
+
+
+def read_permit_window(configuration: conf.ConfigRead) -> PermitWindow:
+    return PermitWindow(configuration.value('enabled', conf.on_off),
+                        configuration.value('permit_max_seconds', conf.positive_whole))
+
+
+@dataclass(frozen=True)
 class SafetySettings:
     enabled: bool
     guard_grace_seconds: int
@@ -57,13 +68,11 @@ def decode_settings(values: Mapping[str, object]) -> SafetySettings:
 
 def read_settings(configuration: conf.ConfigRead) -> SafetySettings:
     """Read Hana settings without reading deployment or credential files."""
-    enabled = configuration.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise ValueError('enabled must be on or off')
-    values: dict[str, object] = {'enabled': enabled == 'on'}
-    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds', 'step_cpu_limit',
+    permit = read_permit_window(configuration)
+    values: dict[str, object] = {'enabled': permit.enabled, 'permit_max_seconds': permit.permit_max_seconds}
+    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'step_cpu_limit',
                 'step_memory_gib', 'mount_timeout_seconds'):
-        values[key] = configuration.whole(key)
+        values[key] = configuration.value(key, conf.positive_whole)
     return decode_settings(values)
 
 

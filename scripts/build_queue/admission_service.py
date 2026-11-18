@@ -2840,7 +2840,7 @@ class AdmissionServer:
 
                 return read_gpu_evidence(transport, key, request, configuration=configuration)
             if isinstance(transport, hana_placement.HanaControlTransport):
-                return hana_placement.read_evidence(key, request)
+                return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
