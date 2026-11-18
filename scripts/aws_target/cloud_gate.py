@@ -928,6 +928,14 @@ def outcome_result(folder: Path, outcome: dict[str, object]) -> dict[str, object
     return read(folder / RESULT_FILE) if outcome.get('result_file') == RESULT_FILE else ledger.mapping(outcome['result'])
 
 
+def _outcome_imported(folder: Path) -> bool:
+    # The attempt fixes the record ID. The import can remove the result file.
+    try:
+        return read(folder / 'imported.json').get('id') == 'gate-' + folder.name
+    except (FileNotFoundError, ValueError):
+        return False
+
+
 def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
     if request.get('task') == 'paired':
         gate_box.validate_paired_result(row, request, instance)
@@ -1089,17 +1097,11 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
     directory = attempt.directory
     deployment_path = directory / 'gate-deployment.json'
-    if not deployment_path.exists():
-        return LocalFallback('image or stack is absent')
-    home = conf.read(account_settings_path()).text('region')
-    _ = gate_regions(home)
-    deployment = gate_deployment(deployment_path, home)
-    regional = ledger.rows(deployment, 'regions')[0]
-    if not regional.get('image') or not regional.get('template'):
-        return LocalFallback('image or stack is absent')
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
         current = root / 'current.json'
+        if not current.exists() and not deployment_path.exists():
+            return LocalFallback('image or stack is absent')
         tree, _dirty = working_tree(repo)
         previous = read(current) if current.exists() else {}
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
@@ -1110,6 +1112,30 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         folder = root / ledger.text(previous, 'attempt') if same_request else root / uuid4().hex
         result_path = folder / 'outcome.json'
         saved_result = read(result_path) if result_path.exists() else {}
+        if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
+            try:
+                request = read(folder / 'request.json')
+                saved_attempt = request.setdefault('attempt', folder.name)
+                if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
+                        or saved_attempt != folder.name):
+                    raise ValueError('The saved request differs from the current cloud attempt')
+                row = outcome_result(folder, saved_result)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            else:
+                attempt.identifier = folder.name
+                with cloud_reservation(repo, folder / 'reservation.cgroup', mode) as reservation:
+                    outcome = _complete_outcome(repo, folder, request, row)
+                    reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
+                    return outcome
+        if not deployment_path.exists():
+            return LocalFallback('image or stack is absent')
+        home = conf.read(account_settings_path()).text('region')
+        _ = gate_regions(home)
+        deployment = gate_deployment(deployment_path, home)
+        regional = ledger.rows(deployment, 'regions')[0]
+        if not regional.get('image') or not regional.get('template'):
+            return LocalFallback('image or stack is absent')
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
             bool(previous.get('retry_launch')) or saved_result.get('status') == 'interrupted'
             and saved_result.get('interruption_code') in SPOT_INTERRUPTION_CODES)
@@ -1213,16 +1239,23 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
     if not (folder / 'outcome.json').exists():
         return LocalFallback('The scaler service has no final result')
     outcome = read(folder / 'outcome.json')
-    if outcome.get('status') == 'fallback':
-        return LocalFallback(ledger.text(outcome, 'reason'))
     if outcome.get('status') != 'complete':
         return LocalFallback(ledger.text(outcome, 'reason'))
     try:
         row = outcome_result(folder, outcome)
-        validate_result(row, request)
     except (OSError, ValueError, KeyError, TypeError) as error:
         return LocalFallback(str(error))
-    if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['head']:
+    return _complete_outcome(repo, folder, request, row)
+
+
+def _complete_outcome(repo: Path, folder: Path, request: dict[str, object],
+                      row: dict[str, object]) -> LocalFallback | CloudCompleted:
+    try:
+        validate_result(row, request)
+        head = ledger.text(request, 'head')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return LocalFallback(str(error))
+    if gate.checked_git(repo, 'rev-parse', 'HEAD') != head:
         return LocalFallback('The checkout changed during the cloud attempt')
     import_record(folder, row)
     print((folder / 'gate.log').read_text(), end='', flush=True)
