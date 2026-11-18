@@ -273,6 +273,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
+| `scripts/agents/producer_lifecycle.py` | read | initial_snapshot, slot_operation, validate_name; StaffRow, StaffSnapshot, LiveDoc and PresentWorktree types; add-producer checks the name and the free row before first start |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |

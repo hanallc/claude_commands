@@ -222,6 +222,15 @@ Each producer uses its own tab in the `producers` workspace of the shared herdr 
 It takes the family, model, and effort from the current producer settings.
 `pane_launch` reads `--effort` as an option with a value.
 
+When the configured family matches the current session, a named resume uses that session.
+When the family changes, `stop_resume._resume_once` uses the first-start path.
+It stops the old conversation and closes its pane before it starts a fresh conversation in a new tab.
+If the old process exits before the `ended` write, a retry can use the saved binding to identify its family.
+The retry checks that the old process has stopped before it writes `ended`.
+First admission binds the new conversation to the existing producer row.
+A retry uses the saved admission record to complete the launch or bind the live conversation.
+If an interruption occurs after tab creation and before the admission write, a retry can leave an extra shell tab open.
+
 `models_registry.launch_settings("producers", name)` validates each `family:model:effort` value in `config/models.conf`.
 The configured lines are:
 
@@ -234,7 +243,7 @@ dwight=claude:fable:high
 
 These model names are aliases that the shared model registry resolves.
 `member_account.producer_account(kind, *, to="")` selects the account before admission.
-Admitted producers use `member_account.resume_account`.
+An admitted producer's same-family resume uses `member_account.resume_account`.
 Both functions select the workers account for Codex.
 Claude uses the producers account, or the showrunners account while the producers group has no selection.
 An explicit `--to` overrides that selection.
@@ -275,6 +284,15 @@ A block is one user message, assistant message, tool call or tool result. A tool
 A Claude compaction summary is one block. A Codex compaction summary is encrypted, so only its time shows.
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
+
+### Create a producer
+
+`agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
+The create command validates the name and records its profile and README text before it writes them.
+It creates the README from `templates/producer/README.md` when the README is absent.
+The first conversation receives a prompt to read the README and run `/producer:produce`.
+The producer admission record keeps the time for prompt recovery after a failed start.
+The command reports the staff id, account and tab.
 
 ### First start
 
@@ -317,6 +335,8 @@ The shared native process reader uses Claude's session registry to prove a plain
 The process arguments need no session ID.
 
 `agents transfer NAME [--model MODEL --effort EFFORT]` gives a producer role to the conversation that runs it.
+`producer_transfer.transfer` checks for a pending admission while it holds the `producer-first-NAME` slot.
+If an admission is pending, transfer asks the user to run `agents resume NAME` first.
 `producer_transfer.transfer` holds the `producer-first-NAME` slot and the row lock for these steps:
 
 1. Refuse a caller that another staff row records. Refuse a producer on another machine.
@@ -370,7 +390,7 @@ A repeated command prints `unchanged` when no cleanup record or selected resourc
 
 The record path is `<pane record directory>/.producer-admission-<name>`.
 The saved record also holds the folder.
-A repeated resume completes an interrupted admission without opening another conversation.
+A repeated resume uses the saved record to complete the admission.
 Later resumes use the admitted row's `current_session`.
 The pending record retains the original account.
 A conflicting `--to`, family, or folder returns failure and preserves that record.

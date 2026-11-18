@@ -241,6 +241,18 @@ class LaunchSettingsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return tuple(result.stdout.splitlines())
 
+    def test_new_producer_defaults_require_one_valid_profile(self) -> None:
+        for value, valid in (("claude:sonnet:high", True), ("codex:gpt-test:high", True),
+                             (None, False), ("codex:unknown:invalid", False), ("sonnet:high", False)):
+            with self.subTest(value=value):
+                _ = write_registry(self.path, {"producer_defaults": {"model": value}})
+                if valid:
+                    assert isinstance(value, str)
+                    self.assertEqual(models_registry.producer_defaults().value(), value)
+                else:
+                    with self.assertRaisesRegex(ValueError, f"{self.path}: producer_defaults.model: [^\n]+$"):
+                        _ = models_registry.producer_defaults()
+
     def test_launch_settings_match_shell_role_resolution_and_tier_precedence(self) -> None:
         from scripts.lib import models_registry
 
