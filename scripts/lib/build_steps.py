@@ -2,13 +2,13 @@
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import os
 from pathlib import Path, PurePath
 from types import MappingProxyType
 
 from scripts.build_queue.admission_jobs import StepJob as StepJob
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text
 from scripts.message.owner_role import OwnerRole
 
 
@@ -221,14 +221,14 @@ def copies_run_command(argv: Sequence[str]) -> CopiesRunCommand | OtherCommand:
 
 def process_arguments(process: Path) -> list[str]:
     """Read the arguments of a process from procfs."""
-    return [os.fsdecode(word) for word in (process / "cmdline").read_bytes().split(b"\0") if word]
+    return [word for word in read_proc_text(process / "cmdline").split("\0") if word]
 
 
 def live_process_arguments(process: Path, start_time: str) -> list[str] | CommandUnreadable:
     """Read arguments from the recorded process lifetime."""
     try:
         argv = process_arguments(process)
-        fields = (process / "stat").read_text().rsplit(") ", 1)[1].split()
+        fields = read_proc_text(process / "stat").rsplit(") ", 1)[1].split()
         if fields[19] == start_time and fields[0] not in ("Z", "X"):
             return argv
     except (OSError, ValueError, IndexError) as error:

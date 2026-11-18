@@ -97,6 +97,8 @@ class HanaRenderTests(unittest.TestCase):
                 + '# whole: 1..\npermit_max_seconds=1800\n# whole: 1..\nstep_cpu_limit=4\n'
                 + '# whole: 1..\nstep_memory_gib=24\n# whole: 1..\nmount_timeout_seconds=15\n'
                 + '# whole: 1..\naws_timeout_s=10\n# whole: 1..\ncontrol_poll_seconds=2\n'
+                + '# whole: 1..\nresult_transfer_timeout_s=120\n'
+                + '# whole: 1..\nresult_transfer_timeout_s.fixture-guest=83\n'
                 + 'execution_shell=default\n# whole: 1..\nfree_floor_gib=30\n'
                 + '# whole: 1..\nsource_max_bytes=1048576\n# whole: 1..\nsource_download_timeout_s=60\n'
                 + '# whole: 1..\nsource_git_timeout_s=60\n'
@@ -123,8 +125,9 @@ class HanaRenderTests(unittest.TestCase):
             }
             self.assertEqual({path.name for path in output.iterdir()}, {*expected_modes, 'runtime'})
             configuration = conf.read(configuration_path)
-            files = (*hana_guest.render_files(hana_guest.read_settings(configuration), device=Path('/dev/sdf')),
-                     *hana_receiver.render_files(hana_receiver.read_settings(configuration)))
+            with mock.patch('socket.gethostname', return_value='fixture-guest'):
+                files = (*hana_guest.render_files(hana_guest.read_settings(configuration), device=Path('/dev/sdf')),
+                         *hana_receiver.render_files(hana_receiver.read_settings(configuration)))
             for file in files:
                 actual = output / file.path.name
                 with self.subTest(name=file.path.name):
@@ -146,7 +149,14 @@ class HanaRenderTests(unittest.TestCase):
             self.assertEqual((runtime / 'config/copies.conf').read_text(), 'remote_registry=/tmp/mirrors\n')
             self.assertIn('Environment=CONF_DIR=/var/lib/hana-runtime/config',
                           (output / 'hana-receiver.service').read_text())
-            self.assertNotIn('spot_max_usd_per_hour', conf.settings((runtime / 'config/hana_aws.conf').read_text()))
+            runtime_configuration = runtime / 'config/hana_aws.conf'
+            runtime_settings = conf.settings(runtime_configuration.read_text())
+            self.assertNotIn('spot_max_usd_per_hour', runtime_settings)
+            self.assertNotIn('result_transfer_timeout_s.fixture-guest', runtime_settings)
+            self.assertEqual(hana_receiver.read_settings(conf.read(runtime_configuration)).result_transfer_timeout_s, 83)
+            self.assertTrue(hana_render.affects_guest_config(
+                'result_transfer_timeout_s.fixture-guest', configuration_path))
+            self.assertFalse(hana_render.affects_guest_config('result_transfer_timeout_s', configuration_path))
             original = configuration_path.read_text()
             digest = hana_render.guest_digest(configuration_path, checkout=checkout)
             _ = targets.write_text(target_values.replace('sync.rsync_timeout_s=60', 'sync.rsync_timeout_s=90'))
@@ -174,6 +184,10 @@ class HanaRenderTests(unittest.TestCase):
             sender = checkout / 'scripts/aws_target/deploy.py'
             _ = sender.write_text('# Sender code\n')
             self.assertEqual(hana_render.guest_digest(configuration_path, checkout=checkout), digest)
+            with self.subTest('Change the effective result transfer timeout'):
+                _ = configuration_path.write_text(original.replace(
+                    'result_transfer_timeout_s.fixture-guest=83', 'result_transfer_timeout_s.fixture-guest=89'))
+                self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=checkout), digest)
             _ = configuration_path.write_text(original.replace('enabled=on', 'enabled=off'))
             self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=checkout), digest)
             self.assertEqual({str(path.relative_to(runtime)) for path in runtime.rglob('*') if path.is_file()},

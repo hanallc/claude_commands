@@ -35,6 +35,7 @@ from scripts.agents import detached_run_process, shutdown_record, worker_lifecyc
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
+    from scripts.direct import progress_history
     from scripts.accounts import accounts
 
 StaffId = staff.StaffId
@@ -734,8 +735,24 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
 
 
 class RecordedCompletionEvidence(Protocol):
-    def completion_close_evidence(self, row: staff.StaffRow, line: str, completion_id: str, *,
-                                  run: Path) -> CloseAllowed | Kept: ...
+    def completion_close_evidence(self, row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+                                  run: Path, reply_file: str) -> CloseAllowed | Kept: ...
+
+    def detached_reply_hold(self, row: staff.StaffRow, line: str, completion_id: str, *,
+                            run: Path) -> CloseAllowed | Kept: ...
+
+
+def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object]) -> CloseAllowed | Kept:
+    """Require the saved stage and its reply before a pass can release its evidence."""
+    from scripts.direct import progress_history
+
+    delivery = progress_history.dispatch_delivery(passed)
+    if not delivery.line or not delivery.completion_id:
+        return Kept("the dispatch has no saved completion id")
+    completion = progress_history.hook_completion(passed)
+    reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
+    receipts = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
+    return receipts.completion_close_evidence(row, delivery, run=run, reply_file=reply_file)
 
 
 def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
@@ -820,6 +837,14 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
     passed = worker_pass(row, run)
     if passed:
         status, dispatch = passed.get("status"), passed.get("instance_id")
+        delivery = progress_history.dispatch_delivery(passed)
+        completion = progress_history.hook_completion(passed)
+        if (delivery.line and delivery.completion_id
+                and not (isinstance(completion, progress_history.HookCompletion) and completion.finished)):
+            evidence = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
+            hold = evidence.detached_reply_hold(row, delivery.line, delivery.completion_id, run=run)
+            if isinstance(hold, Kept):
+                return DispatchHoldsWorker(hold.blocker)
     else:
         latest = progress_history.last_dispatch(row.id)
         if (not isinstance(latest, progress_history.RecordedDispatch)
@@ -833,7 +858,7 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
         return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "active":
         if progress_history.dispatch_delivery(passed).line:
-            if isinstance(_completed_turn(row, dispatch), CloseAllowed):
+            if isinstance(recorded_completion_close(row, run, passed), CloseAllowed):
                 return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
             return DispatchHoldsWorker("submitted pass awaits completion")
         pid, command = passed.get("launcher_pid"), passed.get("launcher_command")
@@ -871,32 +896,38 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     if parent is None:
         return Kept("worker parent is unavailable")
     directory = run.directory if isinstance(run, DispatchRun) else worker_run(worker.row, record=record)
-    if isinstance(worker, (StoppedWorker, ClosedWorker)):
+    if isinstance(worker, ClosedWorker):
         return _idle_checks(worker.row, directory, lock)
     state = worker_dispatch_state(worker.row, directory, lock)
     if isinstance(state, DispatchHoldsWorker):
         return Kept(state.blocker)
-    if isinstance(state, CompletedWorkerPass):
-        completion = _completed_turn(worker.row, state.dispatch_id)
-    elif state is ReleasedWorkerPass.ENDED:
-        from scripts.direct import progress_history
+    from scripts.direct import progress_history
 
+    if isinstance(state, CompletedWorkerPass):
+        passed = worker_pass(worker.row, directory)
+        if progress_history.dispatch_delivery(passed).line:
+            completion = recorded_completion_close(worker.row, directory, passed)
+        elif isinstance(worker, StoppedWorker):
+            return CloseAllowed()
+        else:
+            completion = _completed_turn(worker.row, state.dispatch_id)
+    elif state is ReleasedWorkerPass.ENDED:
         passed = worker_pass(worker.row, directory)
         hook = progress_history.hook_completion(passed)
-        if isinstance(hook, progress_history.HookCompletion) and hook.outcome == "done":
-            delivery = progress_history.dispatch_delivery(passed)
-            if delivery.line:
-                receipts = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
-                completion = receipts.completion_close_evidence(
-                    worker.row, delivery.line, delivery.completion_id, run=directory)
-            else:
-                completion = _completed_turn(worker.row, passed.get("instance_id"))
+        delivery = progress_history.dispatch_delivery(passed)
+        if delivery.line:
+            completion = recorded_completion_close(worker.row, directory, passed)
+        elif isinstance(worker, StoppedWorker):
+            return CloseAllowed()
+        elif isinstance(hook, progress_history.HookCompletion) and hook.outcome in ("done", "late DONE"):
+            completion = _completed_turn(worker.row, passed.get("instance_id"))
         else:
-            return (CloseAllowed() if worker.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
-                    else Kept(f"agent state is {worker.status.value}"))
+            return (CloseAllowed() if worker.status.idle else Kept(f"agent state is {worker.status.value}"))
+    elif isinstance(worker, StoppedWorker):
+        return CloseAllowed()
     else:
         return _final_reply(worker.row)
-    if worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+    if isinstance(worker, OpenWorker) and worker.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         if isinstance(completion, Kept):
             return Kept(f"agent state is {worker.status.value}")
     return completion

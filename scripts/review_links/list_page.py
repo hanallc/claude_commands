@@ -730,13 +730,14 @@ def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) ->
             + ''.join(chips) + '</aside>') if chips else ''
 
 
-def staff_filter(name: Literal["Owner", "Producer"], labels: Mapping[str, str]) -> str:
-    """Build one menu option for each staff ID, in name order."""
-    options = ['<option value="" data-filter-label="All">All</option>']
-    for value, label in sorted(labels.items(), key=lambda pair: (pair[1].casefold(), pair[0])):
-        escaped = html.escape(label, quote=True)
-        options.append(f'<option value="{html.escape(value, quote=True)}" data-filter-label="{escaped}">{escaped}</option>')
-    return f'<label>{name} <select id="list-{name.lower()}">' + ''.join(options) + '</select></label>'
+def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner]) -> list[record_table.Chip]:
+    """Build a counted chip for each staff ID, in name order."""
+    choices = [(owner_name(members, identity).removesuffix("-unit"), identity, count)
+               for identity, count in counts.items()]
+    choices.sort(key=lambda choice: (choice[0].casefold(), choice[1]))
+    return [record_table.Chip("all", "All", counts.total()),
+            *(record_table.Chip(f"staff:{identity}", html.escape(label), count)
+              for label, identity, count in choices)]
 
 
 def render(root: Path, *, include_counts: bool = True,
@@ -752,11 +753,13 @@ def render(root: Path, *, include_counts: bool = True,
     zone = user_zone()
     today = datetime.fromtimestamp(read_at, zone)
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
-    owners = {str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}
-    producers = {str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items}
+    owners: Counter[the_list.ItemOwner] = Counter()
+    producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
     chip_counts: Counter[ListChip] = Counter()
     for index, entry in enumerate(items):
+        owners[entry.item.owner] += 1
+        producers[entry.item.producer] += 1
         until = entry.item.parked_until
         parked = isinstance(until, datetime) and until > today
         open_question = has_open_question(entry.item)
@@ -785,8 +788,10 @@ def render(root: Path, *, include_counts: bool = True,
     content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
-               + '<div data-record-filters><div class="list-toolbar">'
-               + '<div class="list-staff-filters">' + staff_filter("Owner", owners) + staff_filter("Producer", producers) + '</div>'
+               + '<div data-record-filters>'
+               + record_table.chip_row('Owner', staff_chips(members, owners), 'all')
+               + '<div class="list-producer-filter">'
+               + record_table.chip_row('Producer', staff_chips(members, producers), 'all')
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, 'all')
@@ -808,14 +813,12 @@ def render(root: Path, *, include_counts: bool = True,
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
-.list-toolbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px}
-.list-toolbar .record-filter-words{min-width:0;margin:0}
-.list-staff-filters{display:flex;flex-wrap:wrap;gap:8px 14px}
-.list-staff-filters label{display:flex;align-items:center;gap:6px;color:var(--ink-2);font-size:13px}
-.list-staff-filters select{font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);
-border-radius:8px;min-height:36px;padding:4px 8px;max-width:min(180px,55vw)}
+[data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
+.list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
+.list-producer-filter .record-filter-row{flex:1 1 auto;min-width:0;max-width:100%;margin:0}
+.list-producer-filter .record-filter-words{flex:0 1 300px;min-width:0;margin:0 0 0 auto}
 .list-show-controls{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;margin-bottom:8px}
-.list-show-controls .record-filter-row{margin-bottom:0}
+.list-show-controls .record-filter-row{min-width:0;margin-bottom:0}
 .list-unread-switch{display:inline-flex;align-items:center;gap:7px;min-height:34px;color:var(--ink-2);
 font-size:13px;cursor:pointer;margin-inline-start:auto}
 .list-unread-switch input{appearance:none;position:relative;width:32px;height:18px;margin:0;border:1px solid var(--ink-3);
@@ -832,7 +835,7 @@ background:var(--ink-2);border-radius:50%}
 .list-unread-switch{order:1}
 }
 @media(max-width:620px) and (max-height:260px){
-.list-show-controls .record-filter-row{grid-template-columns:minmax(0,1fr)}
+[data-record-filters] .record-filter-row{grid-template-columns:minmax(0,1fr)}
 .list-show-filter [data-hidden-action-status]{margin-inline-start:0}
 }
 .list-table-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
@@ -1032,6 +1035,7 @@ const tableView=createRecordTable({content:()=>content,
    params.set('show',stateChip);
  },
  filters:['producer','unread'],
+ staffChipFilters:['owner','producer'],
  beforeApply:rememberLogPositions,
  applied:(_items,{show,filters})=>{
   const nextUnreadShow=filters.unread ? show : '';
