@@ -80,7 +80,7 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
             "production": production.name, "unit": unit.name, "owner_staff_id": unit.id,
         }))
-        renamed = staff.rename(unit.id, "renamed-unit")
+        renamed = staff.rename(unit.id, "renamed")
         self.assertEqual(worker_admission.parent(staff.snapshot(), run=run), renamed)
 
     def test_worker_caller_resolves_its_fixed_parent_after_session_replacement(self) -> None:

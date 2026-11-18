@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Literal, cast
@@ -27,23 +28,35 @@ from scripts.production.staff_test_support import fixture_member
 
 
 class RegistrationTests(RegistrationFixture):
-    def test_native_reply_selects_the_open_followup_among_same_title_records(self) -> None:
+    def test_native_reply_requires_a_key_when_two_same_title_records_are_open(self) -> None:
         for earlier_status in ('closed', 'open'):
             with self.subTest(earlier_status=earlier_status):
                 self.write_open_for('example', {'since': '2026-10-06T08:00', 'text': 'retry?',
-                                               'question': 'Retry it?', 'asked_by': 'alpha'})
+                                               'question': 'Retry it?', 'asked_by': 'alpha', 'review_id': 'Q1'})
                 current_path = self.question_record_path('retry?')
-                earlier_text = current_path.read_text().replace('status: open\n', 'status: '+earlier_status+'\n', 1)
                 with mock.patch.dict(os.environ, self.env):
                     scope = read_production('example')
                     identities = registration.QuestionStaff.read()
-                    _ = registration.followup(scope, 'retry?', 'Check the current case.', identities=identities)
-                earlier_path = current_path.with_name('question-000-earlier.md')
-                _ = earlier_path.write_text(earlier_text)
+                    current, = registration.selected_question_records([current_path], (), None)
+                    earlier_path = current_path.with_name('question-000-earlier.md')
+                    registration.write_question_record(replace(current, path=earlier_path, status=earlier_status,
+                                                                item={**current.item, 'review_id': 'Q2'}))
+                    _ = registration.followup(scope, registration.ByQuestionKey(
+                        registration.open_item_key(current)), 'Check the current case.', identities=identities)
                 before = earlier_path.read_bytes()
-                result = self.run_command('reply', '--item', 'retry?', '--text', 'The current case passes.',
-                                          env={**self.env, 'REVIEW_LINKS_ROOT': str(self.state/'reviews')})
-                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                env = {**self.env, 'REVIEW_LINKS_ROOT': str(self.state/'reviews')}
+                pending = current_path.read_bytes()
+                result = self.run_command('reply', '--item', 'retry?', '--text', 'The current case passes.', env=env)
+                if earlier_status == 'open':
+                    owner = self.fixture_staff_id(name='example')
+                    key = f'question/{owner}/Q1'
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(f'question/{owner}/Q2', result.stdout)
+                    self.assertIn(key, result.stdout)
+                    self.assertEqual(current_path.read_bytes(), pending)
+                    self.assertEqual(earlier_path.read_bytes(), before)
+                    result = self.run_command('reply', '--key', key, '--text', 'The current case passes.', env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('reply: ok', result.stdout)
                 self.assertEqual(earlier_path.read_bytes(), before)
                 current = registration.selected_question_records([current_path], (), None)[0]
@@ -231,8 +244,10 @@ class RegistrationTests(RegistrationFixture):
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         result = self.run_command("withdraw", "--item", "sync decision")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(),
-                         "withdraw: failed — 2 open items match 'sync decision'; name one by its exact text")
+        own, child = (self.fixture_staff_id(name=name) for name in ("example", "kid"))
+        self.assertRegex(result.stdout.strip(),
+                         rf"^withdraw: failed — 2 open items match 'sync decision'\. Matching keys: " +
+                         rf"reminder/{own}/[0-9a-f]{{64}}, reminder/{child}/[0-9a-f]{{64}}$")
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
 
     def test_ask_files_a_units_question_with_its_review_and_shows_the_asker(self) -> None:

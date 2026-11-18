@@ -194,7 +194,7 @@ class ShutdownStatusTests(ShutdownTestCase):
 
     def test_retired_resume_clears_only_a_proven_native_session(self) -> None:
         owner = fixture_member("showrunner", name="recovery-owner")
-        row = fixture_member("unit", name="recovery-unit", parent=owner.id,
+        row = fixture_member("unit", name="recovery", parent=owner.id,
                              worktree=staff.PresentWorktree("natedev", self.root / "unit"))
         production = Production(self.root / "production.md", owner.name, "production", self.root,
                                 self.root / "log.md", ZoneInfo("UTC"), owner)

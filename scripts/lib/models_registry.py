@@ -189,6 +189,7 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
 
 class SharedRegistry(NamedTuple):
     repository: Path
+    git_directory: Path
 
 
 class UnpublishedRegistry(NamedTuple):
@@ -249,10 +250,11 @@ def _git(repo: Path, *arguments: str, input_text: str | None = None,
 def _publish_repository(path: Path) -> SharedRegistry | UnpublishedRegistry:
     if os.environ.get("MODELS_CONFIG_PUBLISH") == "0" or path.resolve() != DEFAULT_PATH.resolve():
         return UnpublishedRegistry()
-    repo = Path(_git(DEFAULT_PATH.parent, "rev-parse", "--show-toplevel"))
+    top_level, git_directory = _git(DEFAULT_PATH.parent, "rev-parse", "--show-toplevel", "--absolute-git-dir").splitlines()
+    repo = Path(top_level)
     if path.resolve() != (repo.resolve() / REGISTRY_PATH):
         return UnpublishedRegistry()
-    return SharedRegistry(repo)
+    return SharedRegistry(repo, Path(git_directory))
 
 
 def _fetch(repo: Path, branch: str) -> str:
@@ -266,22 +268,21 @@ def _preflight_fast_forward(repo: Path, target: str, *, replace_registry: bool,
                             base: str = "HEAD") -> AlreadyContained | FastForward:
     """Refuse unfinished merges; preserve the publishing parent before checking a move."""
     registry_entry = ""
-    merge_head = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"))
-    if merge_head.exists():
+    merge_head, index, parent = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD",
+                                     "--git-path", "index", base).splitlines()
+    if Path(merge_head).exists():
         raise OSError("an unfinished merge must be completed first")
     if _git(repo, "ls-files", "--unmerged"):
         raise OSError("unmerged index entries must be resolved first")
-    parent = _git(repo, "rev-parse", base)
     ancestor = _git(repo, "merge-base", parent, target)
     if ancestor == target:
         return AlreadyContained()
     if ancestor != parent:
         raise OSError("the target diverges from the publishing parent; cannot fast-forward")
     waiting = waiting_rows.hold(repo, target, skip=(REGISTRY_PATH,))
-    index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     with build_folders.tool_folder("models-ff-index") as directory:
         trial_index = Path(directory) / "index"
-        git_index.private_copy(index, trial_index)
+        git_index.private_copy(Path(index), trial_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(trial_index)}
         if waiting.entries:
             _ = _git(repo, "update-index", "--index-info", input_text=waiting.entries, environment=environment)
@@ -347,8 +348,10 @@ def _registry_commit(repo: Path, parent: str, contents: str, description: str) -
 
 def _publish(repo: Path, path: Path, changes: list[registry_rows.RowChange], description: str,
              additive_catalog: bool) -> bool:
-    branch = _git(repo, "symbolic-ref", "--short", "HEAD")
-    base = _git(repo, "rev-parse", "HEAD")
+    base, reference = _git(repo, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").splitlines()
+    if not reference.startswith("refs/heads/"):
+        raise OSError("registry publication refused: HEAD is not on a branch")
+    branch = reference.removeprefix("refs/heads/")
     local = registry_text(path)
     # A previous invocation may have written the file and stopped before push.
     # Keep *all* unshared rows, including edits preceding this operation.
@@ -419,7 +422,7 @@ def _publish(repo: Path, path: Path, changes: list[registry_rows.RowChange], des
 
 def _publish_lock_path(target: SharedRegistry | UnpublishedRegistry, path: Path) -> Path:
     if isinstance(target, SharedRegistry):
-        return Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
+        return target.git_directory / "models-config.publish.lock"
     return path.with_name(path.name + ".lock")
 
 

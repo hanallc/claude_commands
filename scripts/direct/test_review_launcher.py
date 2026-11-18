@@ -151,7 +151,8 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                                + repr(str(real_command)) + ", *sys.argv[1:]])\n")
         agent = self.root / "scripts/agents/agent_exec.sh"
         with agent.open("a") as output:
-            _ = output.write('cp "$4" "$FAST_TRACK_REVIEW_PROMPT"\n')
+            # Concurrent reviews write this file; cp can fail with "File exists" when two create it at once.
+            _ = output.write('cat "$4" > "$FAST_TRACK_REVIEW_PROMPT"\n')
         return session, environment, tip
 
     def fast_track_review_rows(self) -> list[dict[str, object]]:
@@ -175,32 +176,27 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                 self.assertIn("1", str(row["review_pass"]))
 
     def test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot(self) -> None:
-        for restricted_path in (False, True):
-            with self.subTest(restricted_path=restricted_path):
-                self.assert_shared_fast_fix_snapshot(restricted_path)
-
-    def assert_shared_fast_fix_snapshot(self, restricted_path: bool) -> None:
-        session, environment, tip = self.prepare_fast_track_review("shared-fast-track-pass-" + str(restricted_path))
-        if restricted_path:
-            tools = self.root / "snapshot-tools"
-            tools.mkdir()
-            for name in ("awk", "bash", "cat", "cp", "cut", "date", "dirname", "env", "git", "grep",
-                         "head", "id", "ln", "mkdir", "mktemp", "mv", "ps", "python3", "readlink", "rm", "sed",
-                         "sleep", "sort", "stat", "tail", "touch", "tr", "uname", "wc"):
-                command_path = shutil.which(name)
-                self.assertIsNotNone(command_path, name)
-                assert command_path is not None
-                (tools / name).symlink_to(command_path)
-            environment["PATH"] = str(tools)
-            self.assertIsNone(shutil.which("flock", path=environment["PATH"]))
-            self.assertIsNone(shutil.which("perl", path=environment["PATH"]))
+        # The lock finds perl past PATH, so a full PATH runs the same path as this restricted one.
+        session, environment, tip = self.prepare_fast_track_review("shared-fast-track-pass")
+        tools = self.root / "snapshot-tools"
+        tools.mkdir()
+        for name in ("awk", "bash", "cat", "cp", "cut", "date", "dirname", "env", "git", "grep",
+                     "head", "id", "ln", "mkdir", "mktemp", "mv", "ps", "python3", "readlink", "rm", "sed",
+                     "sleep", "sort", "stat", "tail", "touch", "tr", "uname", "wc"):
+            command_path = shutil.which(name)
+            self.assertIsNotNone(command_path, name)
+            assert command_path is not None
+            (tools / name).symlink_to(command_path)
+        environment["PATH"] = str(tools)
+        self.assertIsNone(shutil.which("flock", path=environment["PATH"]))
+        self.assertIsNone(shutil.which("perl", path=environment["PATH"]))
         calls = session / "snapshot-calls"
         script = self.root / "scripts/production/fast_track.py"
         _ = script.write_text("from pathlib import Path\nimport sys\n"
                               + "if '--pending' in sys.argv:\n"
                               + "    with Path(" + repr(str(calls)) + ").open('a') as output:\n"
                               + "        output.write('pending\\n')\n" + script.read_text())
-        lenses = ("contract", "adversary") if restricted_path else ("contract",)
+        lenses = ("contract", "adversary")
         with ThreadPoolExecutor(max_workers=len(lenses)) as executor:
             reviews = [executor.submit(subprocess.run, self.review_command(session, lens, ""),
                                        env=environment, capture_output=True, text=True,
@@ -215,7 +211,7 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         records = self.root / "fast-track-state/records.jsonl"
         with records.open("a") as output:
             _ = output.write(json.dumps(later) + "\n")
-        for lens in ("adversary", "contract"):
+        for lens in ("craft", "adversary", "contract"):
             with self.subTest(lens=lens):
                 result = subprocess.run(self.review_command(session, lens, ""), env=environment,
                                         capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
