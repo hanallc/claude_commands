@@ -336,9 +336,11 @@ The question form for every question to the user is defined by this import:
   ~/.claude/scripts/production/update_registration.py questions --production
   <showrunner name> --state SHOWRUNNER_STATE`. It stores the list in
   `OUTSTANDING` and reviews each new question; paste each `reviewed question:`
-  line it prints into the reply that asks it. Keep each item complete enough
-  to stand alone when the user asks for the list: what is asked, where, why
-  and the choices. Remove an item only when the user addresses it and tells
+  line it prints into the reply that asks it. Each `open_for_user` item is a
+  one-line title with at most `question_title_max_chars` characters.
+  File new questions with `update_registration.py ask` and its parts:
+  `--ask`, `--context`, `--item`, `--choice` and `--recommend` (see `docs/question_template.md`).
+  The page and `/next` show these parts. Remove an item only when the user addresses it and tells
   you; defer an item with `after` when the user asks. Build holds come from
   holder files in `~/.local/state/build-hold/`, and identify each held unit. A pending or active Mac block comes from
   `~/.local/state/mac-test/`.
