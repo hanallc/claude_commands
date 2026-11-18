@@ -842,6 +842,158 @@ frame.addEventListener('load',async()=>{
         self.assertEqual(log.count("<dl>"), 1)
         self.assertIn("State</dt><dd>Done</dd>", log)
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_log_fits_the_left_column_and_keeps_each_scroll_position(self) -> None:
+        for number in (1, 2):
+            item = self.add(f"Log for item {number}", number=number)
+            for update in range(18):
+                _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        _ = the_list.add(MORTY.id, "Short log", number=3, owner=OWNER.id, source="nate", changes={})
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+        setup = r'''<script>
+const freshList=MARKUP;
+let reads=0;
+window.fetch=async()=>{reads++;return {ok:true,text:async()=>freshList};};
+</script>'''.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
+        probe = r'''<script>
+(async()=>{
+const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+const panel=number=>document.querySelector('[data-number="'+number+'"] .list-panel');
+const open=number=>document.querySelector('[data-number="'+number+'"] .list-toggle').click();
+const scrollArea=right=>right.querySelector('.list-log-scroll') ?? right.querySelector('.list-log');
+const height=node=>node.getBoundingClientRect().height;
+try{
+ for(const number of [1,2,3]) open(number);
+ const [left,right]=panel(1).children,log=scrollArea(right),heading=right.querySelector('h3');
+ right.style.display='none';
+ const naturalHeight=height(left);
+ right.style.display='';
+ check(height(right)===naturalHeight && height(left)===naturalHeight,'The left column sets the height of a long log.');
+ const headingTop=heading.getBoundingClientRect().top;
+ log.scrollTop=90;
+ check(log.scrollTop===90 && log.scrollHeight>log.clientHeight &&
+  heading.getBoundingClientRect().top===headingTop,'The long log scrolls below its fixed heading.');
+ const secondLog=scrollArea(panel(2).lastElementChild);
+ secondLog.scrollTop=45;
+ const shortLog=scrollArea(panel(3).lastElementChild);
+ check(shortLog.scrollHeight===shortLog.clientHeight && getComputedStyle(shortLog).overflowY==='auto',
+  'The short log fits without a scroll bar.');
+ const original=document.querySelector('[data-list]');
+ const replaced=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(!original.isConnected){observer.disconnect();resolve();}});
+  observer.observe(original.parentNode,{childList:true});
+ });
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await replaced;
+ check(reads===1 && scrollArea(panel(1).lastElementChild).scrollTop===90 &&
+  scrollArea(panel(2).lastElementChild).scrollTop===45 && scrollArea(panel(3).lastElementChild).scrollTop===0,
+  'The shared refresh restores each open log position.');
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+})();</script>'''
+        self.browser_actions(markup, setup, probe, window_size=(1440, 900))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_log_refresh_preserves_the_visible_entry_and_keeps_the_top_at_zero(self) -> None:
+        self.browser_log_refresh('''
+ open(1);open(2);
+ log(1).scrollTop=239;
+ const before=firstVisible(log(1));
+ check(before.offset<0 && log(1).scrollTop>0,'The first item starts partway through an entry.');
+ check(log(2).scrollTop===0,'The second item starts at the top.');
+ await refresh();
+ const after=firstVisible(log(1));
+ check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
+  'The first item keeps the same entry and offset after the new entry arrives.');
+ check(log(2).scrollTop===0 && firstVisible(log(2)).text.includes('New result for item 2.'),
+  'The second item stays at the top and shows the new entry.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_log_refresh_restores_the_position_when_a_filter_reveals_the_item(self) -> None:
+        self.browser_log_refresh('''
+ open(1);
+ log(1).scrollTop=239;
+ const before=firstVisible(log(1));
+ const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
+ show('closed');
+ check(row(1).hidden,'The filter hides the expanded row.');
+ await refresh();
+ await refresh();
+ check(row(1).hidden,'The row stays hidden after both refreshes.');
+ show('open');
+ check(!row(1).hidden && !row(1).querySelector('[data-detail]').hidden,'The filter reveals the expanded row.');
+ const after=firstVisible(log(1));
+ check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
+  'The revealed log restores its entry and offset after two hidden refreshes.');
+''')
+
+    def browser_log_refresh(self, steps: str) -> None:
+        for number in (1, 2):
+            item = self.add(f"Log for item {number}", number=number)
+            for update in range(18):
+                _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        with patch.object(list_page, "counts_strip", return_value=""):
+            markup = list_page.render(self.root / "reviews").decode()
+            for number in (1, 2):
+                _ = the_list.update(MORTY.id, f"L{number}", {"next_step": f"New result for item {number}."}, source="morty")
+            fresh = list_page.render(self.root / "reviews").decode()
+        setup = r'''<script>
+const freshList=MARKUP;
+window.fetch=async()=>({ok:true,text:async()=>freshList});
+</script>'''.replace('MARKUP', json.dumps(fresh).replace('</', '<\\/'))
+        probe = r'''<script>
+(async()=>{
+const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+const row=number=>document.querySelector('[data-number="'+number+'"]');
+const open=number=>row(number).querySelector('.list-toggle').click();
+const log=number=>row(number).querySelector('.list-log-scroll');
+function firstVisible(log){
+ const top=log.getBoundingClientRect().top;
+ const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
+ return {text:entry.textContent,offset:entry.getBoundingClientRect().top-top};
+}
+function refresh(){
+ const original=document.querySelector('[data-list]');
+ return new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(!original.isConnected){observer.disconnect();resolve();}});
+  observer.observe(original.parentNode,{childList:true});
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ });
+}
+try{
+''' + steps + '''
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+})();</script>'''
+        self.browser_actions(markup, setup, probe, window_size=(1440, 900))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_log_uses_the_configured_height_at_narrow_width(self) -> None:
+        item = self.add("Long log for a narrow view", number=1)
+        for update in range(18):
+            _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        for limit in (8, 12):
+            with self.subTest(limit=limit):
+                _ = write_config_fixture(self.root / "config/review_links.conf", f"list_log_max_height_rem={limit}\n")
+                with patch.object(list_page, "counts_strip", return_value=""):
+                    markup = list_page.render(self.root / "reviews").decode()
+                probe = r'''<script>
+document.querySelector('.list-toggle').click();
+const [left,right]=document.querySelector('.list-panel').children;
+const log=right.querySelector('.list-log-scroll') ?? right.querySelector('.list-log');
+const expected=LIMIT*parseFloat(getComputedStyle(document.documentElement).fontSize);
+const fits=right.getBoundingClientRect().top>=left.getBoundingClientRect().bottom &&
+ log.clientHeight===expected && log.scrollHeight>log.clientHeight;
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(fits ? [] : ['The narrow log uses the configured height.']);
+document.body.append(result);
+</script>'''.replace('LIMIT', str(limit))
+                self.browser_actions(markup, "", probe, window_size=(500, 900))
+
     def test_log_entries_share_one_label_column(self) -> None:
         self.assertIn(".list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr)", list_page.STYLE)
 
@@ -1095,7 +1247,7 @@ frame.addEventListener('load',async()=>{
         _ = the_list.close(MORTY.id, item.id, "## Closing\n\n**Closing field:** Closed.\n1. First\n2. Second", source="nate")
         body = list_page.render(self.root / "reviews").decode()
         next_step = body.split('<td data-label="Next step">', 1)[1].split('</td>', 1)[0]
-        details = body.split('<div class="list-panel"><div>', 1)[1].split('<section><h3>Log · newest first', 1)[0]
+        details = body.split('<div class="list-panel"><div>', 1)[1].split('<section class="list-log-panel"><h3>Log · newest first', 1)[0]
         self.assertNotIn('<h3>Evidence</h3>', details)
         self.assertNotIn('<h2>Evidence</h2>', details)
         self.assertEqual(the_list.load(MORTY.id, item.id).evidence, text("Evidence"))
@@ -1889,11 +2041,13 @@ window.fetch=async(_path,options={})=>{
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion)
 
     def browser_actions(self, markup: str, setup: str, probe: str, *,
-                        reduced_motion: bool = False, virtual_time_ms: int = 1500) -> None:
+                        reduced_motion: bool = False, virtual_time_ms: int = 1500,
+                        window_size: tuple[int, int] | None = None) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
         result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
             *(['--force-prefers-reduced-motion'] if reduced_motion else []),
+            *([f'--window-size={window_size[0]},{window_size[1]}'] if window_size else []),
             '--user-data-dir=' + str(self.root / 'chrome-actions'), f'--virtual-time-budget={virtual_time_ms}',
             '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
