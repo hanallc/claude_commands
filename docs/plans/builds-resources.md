@@ -2763,3 +2763,24 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `31056b27e`.
 
 **Files:** `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_protocol.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/first_step.py`, `scripts/build_queue/test_admission_service.py`, `scripts/build_queue/test_first_step.py`.
+
+### Phase 147 — Build queue and Mac tests write their own build_targets.conf  · status: todo
+
+Builds assigned this on 11-18 (reported by accounts via natedev on main ce7733f59). `scripts/build_queue/test_target_availability.py` and `scripts/mac_test/test_offload_lifecycle.py` fail when the scratch home has no `build_targets.conf`: they read the live config. Rule: a test writes its own fixture config and never reads live or tunable config.
+
+1. Reproduce first and name the exact condition. Tonight's merge gates passed.
+2. Repair both modules with a fixture config.
+3. Search `scripts/build_queue` and `scripts/mac_test` for other tests that read `build_targets.conf` from the home, and repair them the same way.
+
+**Files:** to be named by the work order.
+
+### Phase 148 — The warm-seed tests start no real Cargo  · status: done
+
+Builds 11-18: warmseed (Phase 144 row 2b8823670) failed its merge test. Cause, a branch fault: `test_real_cargo_reuses_a_registry_unit_and_rebuilds_local_inputs` in `scripts/lib/test_cargo_seed.py` starts real rustup and Cargo. The merge gate puts tripwire `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH for each test module (`scripts/production/merge_gate.py` `test_module_environment`, since 10-28); they exit 99 and the gate reports "a test started real rustup". The row check ran the module outside the gate, so it passed.
+
+1. Remove the real-Cargo test and the helpers only it uses. The copy, lock, stage and recovery tests stay. The Phase 144 Hana measurement keeps the real-Cargo evidence.
+2. Prove the module passes with the gate tripwires first on PATH.
+3. Fold the change into the Phase 144 row, replay on main, run the merge tests, send a new hash.
+
+**Files:** `scripts/lib/test_cargo_seed.py`.
+

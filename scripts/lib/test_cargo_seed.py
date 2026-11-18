@@ -1,4 +1,4 @@
-"""Exercise seed selection, publication, and Cargo's use of a seed."""
+"""Test Cargo seed selection and publication."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Generator, Mapping
+from collections.abc import Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import replace
@@ -349,81 +349,6 @@ class CargoSeedTests(unittest.TestCase):
         locks = list((self.cargo_root / ".cargo-seed-locks").iterdir())
         self.assertGreater(len(locks), 1)
         self.assertLessEqual(len(locks), count)
-
-    def fixture_cargo(self) -> tuple[str, str]:
-        rustup = shutil.which("rustup")
-        if rustup:
-            tools = [subprocess.run([rustup, "which", name], capture_output=True, text=True, timeout=10, check=False)
-                     for name in ("cargo", "rustc")]
-            if all(tool.returncode == 0 for tool in tools):
-                return tools[0].stdout.strip(), tools[1].stdout.strip()
-        cargo, rustc = shutil.which("cargo"), shutil.which("rustc")
-        if cargo and rustc:
-            return cargo, rustc
-        self.skipTest("Cargo and rustc are required")
-
-    @staticmethod
-    def write_crate(root: Path, value: str) -> None:
-        (root / "src").mkdir(parents=True)
-        (root / "local/src").mkdir(parents=True)
-        _ = (root / "Cargo.toml").write_text(
-            '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n'
-            + '[dependencies]\nlocal={path="local"}\nportable="1"\n')
-        _ = (root / "local/Cargo.toml").write_text(
-            '[package]\nname="local"\nversion="0.1.0"\nedition="2021"\n')
-        _ = (root / "local/src/lib.rs").write_text(f'pub fn value() -> &\'static str {{ "{value}" }}\n')
-        _ = (root / "build.rs").write_text(
-            'fn main() { let dir = std::env::var("OUT_DIR").unwrap(); '
-            + 'std::fs::write(std::path::Path::new(&dir).join("generated"), '
-            + f'"{value}").unwrap(); }}\n')
-        _ = (root / "src/main.rs").write_text(
-            'fn main() { println!("{} {} {}", local::value(), portable::VALUE, '
-            + 'include_str!(concat!(env!("OUT_DIR"), "/generated"))); }\n')
-
-    def build_crate(self, cargo: str, roots: CargoOutputRoots, environment: Mapping[str, str]
-                    ) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run([cargo, "build", "--offline", "-v"], cwd=roots.workspace_root,
-                                env={**environment, "CARGO_BUILD_BUILD_DIR": str(roots.build_directory),
-                                     "CARGO_TARGET_DIR": str(roots.target_directory)},
-                                capture_output=True, text=True, check=False, timeout=45)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return result
-
-    def test_real_cargo_reuses_a_registry_unit_and_rebuilds_local_inputs(self) -> None:
-        cargo, rustc = self.fixture_cargo()
-        package = self.registry / "fixture/portable-1.0.0"
-        (package / "src").mkdir(parents=True)
-        _ = (package / "Cargo.toml").write_text(
-            '[package]\nname="portable"\nversion="1.0.0"\nedition="2021"\n')
-        _ = (package / "src/lib.rs").write_text('pub const VALUE: &str = "registry";\n')
-        _ = (package / ".cargo-checksum.json").write_text('{"package":null,"files":{}}\n')
-        home = self.registry.parent.parent
-        _ = (home / "config.toml").write_text(
-            '[source.crates-io]\nreplace-with="fixture"\n[source.fixture]\n'
-            + f'directory={json.dumps(str(package.parent))}\n')
-        env = {"HOME": str(self.root), "PATH": os.environ.get("PATH", os.defpath), "CARGO_HOME": str(home),
-               "RUSTC": rustc, "LANG": "C", "CARGO_TERM_COLOR": "never"}
-        donor_workspace = self.root / "donor"
-        donor = CargoOutputRoots(donor_workspace, donor_workspace / "target", self.cargo_root / "donor")
-        self.write_crate(donor.workspace_root, "old")
-        self.write_crate(self.roots.workspace_root, "new")
-        before = self.build_crate(cargo, donor, env)
-        self.assertIn("Compiling portable", before.stderr)
-        self.assertTrue(list(donor.build_directory.glob("debug/build/*/out/generated")))
-        sibling = cargo_seed.Sibling(donor_workspace, donor.build_directory, donor.target_directory, "1234567", "")
-        self.limits = replace(self.limits, max_bytes=16 << 20)
-        copied = cargo_seed.seed(self.roots, self.profile, self.registry, self.limits,
-                                  [cargo_seed.RankedSibling(sibling, 0)], set)
-        self.assertIsInstance(copied, cargo_seed.Seeded)
-        self.assertFalse(list(self.roots.build_directory.glob("debug/build/*/out")))
-        self.assertFalse(list(self.roots.build_directory.glob("debug/deps/liblocal*")))
-        self.assertTrue(list(self.roots.build_directory.glob("debug/deps/libportable*")))
-        after = self.build_crate(cargo, self.roots, env)
-        self.assertIn("Fresh portable", after.stderr)
-        self.assertIn("Compiling local", after.stderr)
-        program = self.roots.target_directory / "debug/fixture"
-        ran = subprocess.run([str(program)], capture_output=True, text=True, check=True, timeout=5)
-        self.assertEqual(ran.stdout, "new registry new\n")
 
 
 if __name__ == "__main__":
