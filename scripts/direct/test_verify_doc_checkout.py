@@ -2,16 +2,277 @@
 """Exercise doc verification against real Git trees and fake Cargo."""
 from __future__ import annotations
 
-from pathlib import Path
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import json
 import os
+from pathlib import Path
+import subprocess
+from threading import Event
+from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.direct.verify_doc_test_support import CARGO_STUB, VerifyDocFixture
+from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.buildlog import treekey
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
+from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
+from scripts.direct.wait_for_test_state import wait_for_pid
 from scripts.lib import build_folders, build_slots
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
+
+
+DOC_COMMAND = ("bash", str(VERIFY), "doc")
 
 
 class VerifyDocCheckoutTests(VerifyDocFixture):
+    def start_doc(self, *, command: tuple[str, ...] = DOC_COMMAND) -> tuple[subprocess.Popen[bytes], Path, str]:
+        log = self.root / "verify.log"
+        marker = f"TEST_DOC_CHECKOUT={self.root}"
+        with log.open("wb") as output:
+            process = subprocess.Popen(
+                command, cwd=self.repo, stdout=output, stderr=output,
+                env={**self.environment, "TEST_DOC_CHECKOUT": str(self.root)}, start_new_session=True,
+            )
+        self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(reap, marker)
+        return process, log, marker
+
+    @contextmanager
+    def hold_cargo_token(self) -> Generator[None]:
+        board = self.root / "board"
+        self.environment.update({"UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "doc"})
+        helper = VERIFY.with_name("board.sh")
+        token = [str(board), "other", "cargo", "--pid", str(os.getpid())]
+        _ = subprocess.run(["bash", str(helper), "acquire", *token], env=self.environment,
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            yield
+        finally:
+            _ = subprocess.run(["bash", str(helper), "release", *token], env=self.environment,
+                               check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+
+    @contextmanager
+    def occupy_doc_slot(self) -> Generator[None]:
+        admission = caller_admission(self, self.root, self.environment)
+        settings = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        _ = write_config_fixture(settings, f"# whole: 1..\nslots.{admission.server.host}.workspace.max=1\n")
+        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+                self.repo, "HEAD", showrunner="builds", unit="doc-test", work="competing copy", purpose="doc"):
+            yield
+
+    def test_doc_finishes_while_another_caller_holds_the_cargo_token(self) -> None:
+        with self.hold_cargo_token():
+            result = self.verify()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(self.cargo_calls()), 1)
+            self.assertEqual(len(self.pass_records()), 1)
+
+    def test_doc_refuses_a_tree_staged_during_the_copy_slot_wait(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        waiting = Event()
+
+        def observe_wait(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.RepositorySlotWaiting):
+                waiting.set()
+            return reply
+
+        with (self.occupy_doc_slot(),
+              mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait)):
+            process, log, _ = self.start_doc()
+            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), log.read_text())
+            reservation, = admission.caller_reservations().values()
+            self.assertEqual(reservation.owner.pid, process.pid)
+            self.assertFalse(self.events.exists())
+            _ = (self.repo / "alpha/src/lib.rs").write_text("pub fn staged_while_waiting() {}\n")
+            _ = self.git("add", "alpha/src/lib.rs")
+        self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 77, log.read_text())
+        self.assertIn("the staged tree changed", log.read_text())
+        self.assertFalse(self.events.exists())
+        self.assertEqual(self.pass_records(), [])
+        self.assertFalse(admission.caller_reservations())
+
+    def test_sigterm_reaps_the_copy_holder_during_the_slot_wait(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        waiting = Event()
+
+        def observe_wait(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.RepositorySlotWaiting):
+                waiting.set()
+            return reply
+
+        with (self.occupy_doc_slot(),
+              mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait)):
+            process, log, marker = self.start_doc()
+            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), log.read_text())
+            with admission.loop_turn():
+                waiter, = admission.server.repository_slot_waiters.values()
+                self.assertIn(waiter.request.owner.pid, processes_carrying(marker))
+            process.terminate()
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 143, log.read_text())
+            self.assertEqual(processes_carrying(marker), set())
+            with admission.loop_turn():
+                _ = admission.server.run_pass()
+                self.assertFalse(admission.server.repository_slot_waiters)
+            self.assertFalse(admission.caller_reservations())
+        self.assertFalse(self.events.exists())
+        self.assertEqual(self.pass_records(), [])
+
+    def test_doc_records_a_pass_while_the_background_sweep_waits(self) -> None:
+        release = self.root / "sweep-release"
+        started = self.root / "sweep-pid"
+        sweep_events = self.root / "sweep-events"
+        os.mkfifo(release)
+        wrapper = self.root / "sweep-interpreter"
+        self.executable(wrapper, f'''import os, sys
+from pathlib import Path
+if sys.argv[1].endswith("/sweep.py"):
+    for descriptor in (8, 74):
+        try:
+            os.write(descriptor, f"sweep started on {{descriptor}}\\n".encode())
+        except OSError:
+            pass
+    Path({str(started)!r}).write_text(str(os.getpid()))
+    with open({str(release)!r}) as gate:
+        gate.read()
+else:
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+''')
+        self.executable(self.root / "bin/systemd-cat", "#!/bin/sh\nexec cat\n")
+        self.environment.update({"LINT_SKIP_SWEEP": "0", "CLAUDE_PYTHON": str(wrapper)})
+        process, log, marker = self.start_doc(command=(
+            "bash", "-c", 'exec 8>"$1" 74>&8; shift; exec bash "$@"',
+            "doc-sweep", str(sweep_events), str(VERIFY), "doc",
+        ))
+        sweep_pid = wait_for_pid(started, processes=(process,))
+        self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
+        self.assertIn(sweep_pid, processes_carrying(marker))
+        self.assertEqual(len(self.pass_records()), 1)
+        with release.open("w"):
+            pass
+        self.assertEqual(sweep_events.read_text().splitlines(), ["sweep started on 8", "sweep started on 74"])
+
+    def test_doc_waits_for_admission_without_a_slot_or_lease(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        waiting = Event()
+        grants: list[wire.LocalPlacementGranted] = []
+        reservation = self.root / "doc-reservation"
+        self.environment.update({"BUILDLOG_OFF": "0", "BUILDLOG_SYNC": "1"})
+        member = self.repo / "alpha/src/lib.rs"
+        staged = "pub fn staged() {}\n"
+        _ = member.write_text(staged)
+        _ = self.git("add", "alpha/src/lib.rs")
+        _ = member.write_text("pub fn unstaged() {}\n")
+        _ = (self.repo / "notes.md").write_text("untracked")
+        self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
+            'elif arguments[:1] == ["doc"]:', 'elif arguments[:1] == ["doc"]:\n' +
+            f'    Path({str(reservation)!r}).write_text(os.environ["BUILDLOG_RESERVED_STEP"].split("\\t")[0])'))
+
+        def observe_reply(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait):
+                waiting.set()
+            if isinstance(reply, wire.LocalPlacementGranted):
+                grants.append(reply)
+            return reply
+
+        admission.hold_starts()
+        with (mock.patch.object(admission.server, "reply_filter", side_effect=observe_reply),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            result = executor.submit(self.verify)
+            try:
+                self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), "doc did not wait for admission")
+                self.assertFalse(admission.caller_reservations())
+                self.assertEqual(list((self.root / "slots").glob("*")), [])
+                self.assertFalse(self.events.exists())
+            finally:
+                write_pressure_reading(self.root / "pressure")
+            finished = result.result(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        grant, = grants
+        self.assertEqual(reservation.read_text(), grant.grant.reservation)
+        self.assertFalse(admission.caller_reservations())
+        call, = self.cargo_calls()
+        self.assertEqual(call["sources"]["alpha/src/lib.rs"], staged)
+        self.assertFalse(call["notes_present"])
+        checkout = Path(call["cwd"])
+        self.assertTrue(checkout.is_relative_to(self.root / "slots"))
+        key = treekey.tree_key(str(checkout))
+        assert key is not None
+        self.assertEqual(grant.assignment.source_key, placement.SourceKeyKnown(key))
+        rows = (cast(dict[str, object], json.loads(line))
+                for path in (self.root / "buildlog").glob("*/*.jsonl")
+                for line in path.read_text().splitlines())
+        row, = (row for row in rows if row.get("kind") == "step" and row.get("step") == "doc")
+        self.assertEqual(row["tree_key"], key)
+        self.assertIs(row["tree_changed"], False)
+        self.assertEqual(len(self.pass_records()), 1)
+
+    def test_hold_after_grant_releases_doc_checkout_without_waiting(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        holders = Path(self.environment["BUILD_HOLD_DIR"])
+        holders.mkdir()
+        holder = holders / "hana"
+        grants: list[wire.LocalPlacementGranted] = []
+        later_requests: list[wire.PlacementRequest] = []
+        handle_request = admission.server.handle_request
+
+        def observe_request(request: wire.Request, connection: service.Connection | service.NoConnection
+                            = service.NO_CONNECTION) -> list[wire.Reply]:
+            if grants and isinstance(request, wire.PlacementRequest):
+                later_requests.append(request)
+            return handle_request(request, connection)
+
+        def start_hold(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.LocalPlacementGranted):
+                grants.append(reply)
+                _ = holder.write_text(json.dumps({
+                    "holder": "hana", "since": "2026-11-17T20:00:00+00:00", "for": "review", "release_eta": "unknown",
+                }))
+            return reply
+
+        with (mock.patch.object(admission.server, "reply_filter", side_effect=start_hold),
+              mock.patch.object(admission.server, "handle_request", side_effect=observe_request)):
+            result = self.verify()
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertIn("natedev is held by hana for review", result.stdout + result.stderr)
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(later_requests, [])
+        self.assertTrue(holder.exists())
+        self.assertFalse(self.events.exists())
+        self.assertEqual(self.pass_records(), [])
+        self.assertFalse(admission.caller_reservations())
+        checkout, = (self.root / "slots").glob("workspace-slot*/")
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+
+    def test_doc_refuses_a_tree_staged_during_admission(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        waiting = Event()
+
+        def observe_wait(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait) and isinstance(reply.wait, wire.Wait):
+                waiting.set()
+            return reply
+
+        admission.hold_starts()
+        with (mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            result = executor.submit(self.verify)
+            try:
+                self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), "doc did not wait for admission")
+                _ = (self.repo / "alpha/src/lib.rs").write_text("pub fn staged_while_waiting() {}\n")
+                _ = self.git("add", "alpha/src/lib.rs")
+            finally:
+                write_pressure_reading(self.root / "pressure")
+            finished = result.result(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(finished.returncode, 77, finished.stdout + finished.stderr)
+        self.assertIn("the staged tree changed", finished.stderr)
+        self.assertFalse(self.events.exists())
+        self.assertEqual(self.pass_records(), [])
+        self.assertFalse(admission.caller_reservations())
+
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         original = self.repo
         with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(

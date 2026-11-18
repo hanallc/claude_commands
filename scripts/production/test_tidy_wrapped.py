@@ -213,6 +213,23 @@ class TidyWrappedTests(unittest.TestCase):
                 self.assertIs(owner, identities.record.by_id(owner.id))
         self.assertFalse(any(path.exists() for path in paths))
 
+    def test_f059_wrap_retains_a_question_in_the_former_default_folder(self) -> None:
+        doc = self.doc("done", "wrapped")
+        owner = self.owner("done")
+        _ = doc.write_text(doc.read_text() + f"\n- **Proposals:** {self.root / 'external'}\n")
+        fields = {"since": "2026-11-17T08:00", "text": "Retain this Question", "question": "Which way?",
+                  "asked_by": str(owner.id), "review_id": "Q1"}
+        path = self.write(self.state / owner.id / "questions/question-layout.md",
+                          f"---\nrecord_type: question\nstatus: closed\nproduction_id: {owner.id}\n"
+                          + f"asked_by: {owner.id}\nregistration: {json.dumps(fields)}\n---\nAnswer.\n")
+        before = path.read_bytes()
+        temporary = self.write(self.state / owner.id / "log-backups/old.md", "Remove this backup.\n")
+        result = self.run_tidy(doc)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(temporary.exists())
+
     def test_wrap_closes_and_retains_questions_without_a_proposals_line(self) -> None:
         from scripts.production import tidy_wrapped
 

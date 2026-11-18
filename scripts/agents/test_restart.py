@@ -634,6 +634,35 @@ class MixedRestartTests(ShutdownTestCase):
     def test_failed_worker_stop_keeps_the_live_process_pending(self) -> None:
         self.run_commands(("restart",), frozenset({991104}))
 
+    def test_restart_discards_pane_evidence_from_the_stop_phase(self) -> None:
+        pane = "w1:p5"
+        late_reads: list[tuple[herdr.PaneIdentity, dict[str, object]]] = []
+        signal_process = stop_resume._signal_process  # pyright: ignore[reportPrivateUsage]
+        restore_server = herdr.restore_server
+
+        def stop(pid: int, number: int) -> None:
+            if pid == 991105 and number == signal.SIGTERM:
+                client = herdr.Herdr(herdr.shared_session())
+                location = next(row for row in client.panes() if row["pane_id"] == pane)
+                foreground = client.result("pane", "process-info", "--pane", pane)
+                late_reads.append((location, foreground))
+            signal_process(pid, number)
+
+        def restore(name: str, timeout_ms: int, *, session_kind: herdr.SecuritySession
+                    ) -> herdr.ServerCreated | herdr.ServerAdopted | herdr.WindowServerCreated:
+            server = restore_server(name, timeout_ms, session_kind=session_kind)
+            client = herdr.Herdr(name)
+            (location, foreground), = late_reads
+            # Complete a stop-phase read after its reported process has exited.
+            herdr.forget_pane_evidence(name, pane)
+            with patch.object(client, "result", return_value=foreground):
+                scan = client.scan_row_panes(staff.initial_snapshot(), [dict(location)])
+            self.assertEqual([(item.pane, item.reason) for item in scan.unknown], [(pane, "starting or exiting")])
+            return server
+
+        with (patch.object(stop_resume, "_signal_process", stop), patch.object(herdr, "restore_server", restore)):
+            self.run_commands(("restart",), frozenset())
+
     def test_count_fixture_selects_linux_readers_on_macos(self) -> None:
         inherited = (sys.platform, herdr._PLATFORM)  # pyright: ignore[reportPrivateUsage]
         self.addCleanup(lambda: self.assertEqual((sys.platform, herdr._PLATFORM), inherited))  # pyright: ignore[reportPrivateUsage]

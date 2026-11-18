@@ -5,14 +5,14 @@ import io
 import os
 import unittest
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
 from unittest.mock import Mock, patch
 
 from scripts.accounts import accounts
-from scripts.agents import pane_record, producer_transfer, remote, restart
+from scripts.agents import pane_record, producer_transfer, remote, restart, shutdown
 from scripts.agents.test_stop_resume import ProducerAdmissionWorld, producer_first_fixture
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import models_registry
@@ -187,6 +187,19 @@ class ProducerTransferTests(unittest.TestCase):
                 self.assertEqual(fixture.steps, steps)
                 self.assertEqual(fixture.state(), before)
                 self.assertNotIn(world.pane, pane_record.read("agents"))
+
+    def test_transfer_refuses_the_reserved_suffix_before_stopping_the_producer(self) -> None:
+        with transfer_fixture("claude", "codex:gpt-test:high") as fixture:
+            name = "dwight-unit"
+            _ = staff.rename(fixture.producer().id, name)
+            _ = write_registry(fixture.registry, {"producers": {name: "codex:gpt-test:high"}}, update=True)
+            before = fixture.state()
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error:
+                code = shutdown.main(["transfer", name, "--model", "opus", "--effort", "high"])
+            self.assertEqual((code, output.getvalue(), error.getvalue()),
+                             (2, "", "shutdown: StaffRefused: unit name 'dwight-unit' must not end in -unit\n"))
+            self.assertEqual(fixture.state(), before)
+            self.assertEqual(fixture.steps, [])
 
     def test_a_failed_transfer_completes_when_it_runs_again(self) -> None:
         for stage in ("close", "staff", "publication"):

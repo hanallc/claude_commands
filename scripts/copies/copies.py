@@ -687,9 +687,13 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         }, scratch_settings=scratch_settings)
         try:
             # The task folder is the checkout, so its cargo build folder has the task folder's name.
-            with claim_tree(path, create=False) as state:
+            descriptors = [build_folders.build_folder_lock_fd(path)]
+            with ExitStack() as locks:
+                state = locks.enter_context(claim_tree(path, create=False, inherited_fds=descriptors))
                 if state is not ClaimState.ACQUIRED:
                     raise CopyError(f"{path}: task folder is busy")
+                token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *descriptors))
+                _ = locks.callback(COMMAND_LOCKS.reset, token)
                 initialize_git(path, source.resolve())
                 scratch.exclude_copy_metadata(path)
                 _ = git(path, "reset", "--hard", "--quiet")

@@ -419,6 +419,18 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
 The `board` is `accounts.status_board()`: the table the console Accounts page draws.
+`accounts.models_board()` groups the same role counts by full model ID and effort.
+The reader finds the Claude transcript by session ID across project folders.
+Claude model and effort come from the latest real assistant message.
+Codex model and effort come from the latest `turn_context`.
+The model reader scans at most 128 KiB from the end of a plain file.
+For a compressed file, it streams the records and caches the result in memory by path, size, and modification time.
+`session_model_cache_entries` in `config/accounts.conf` sets the limit for each process.
+The cache evicts the least recently used result when a new result exceeds the limit.
+A missing Claude transcript gives `unknown`.
+Live process options apply when the reader can establish that no turn was recorded.
+The peer count document carries known model counts by account and role.
+The Models table puts the remainder of each role count in the `unknown` row.
 `config/statusline.conf` holds each account color under `account.<label>`.
 `ROLE_COLOR_KEYS` maps each role group to its color key:
 
@@ -473,6 +485,7 @@ The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
+A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.
 The Accounts page adds a `next` column after the role color swatch.

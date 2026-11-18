@@ -2,6 +2,7 @@
 from __future__ import annotations
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -223,7 +224,8 @@ class AccountsPageTests(unittest.TestCase):
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
         _ = write_config_fixture(configuration / "review_links.conf", "page_refresh_seconds=15\naccounts_page_seconds=30\n")
         _ = (configuration / "statusline.conf").write_text(
-            "account.claude1=#af875f\naccount.claude2=#b294bb\naccount.codex2=#123456\nrole.unit-director=#d7af00\n",
+            "account.claude1=#af875f\naccount.claude2=#b294bb\naccount.codex2=#123456\nrole.unit-director=#d7af00\n"
+            + "model.claude-opus-5-5=#e08a5c\n",
             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
@@ -371,7 +373,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   if(direction!=='none'){
    const icon=arrow.getBoundingClientRect();
    check(right ? icon.right<text.left : icon.left>text.right,name+': the arrow fits beside the text');
-   const labels=[...document.querySelectorAll('.sort-label')].map(labelText);
+   const labels=[...cell.closest('table').querySelectorAll('.sort-label')].map(labelText);
    check(labels.every(other=>{
     const box=bounds(other);
     return icon.right<=box.left || icon.left>=box.right;
@@ -455,6 +457,160 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
+        page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_models_table_sorts_and_previews_and_saves_a_model_color(self) -> None:
+        opus = "claude-opus-5-5"
+        models = (accounts.ObservedSessionModel(opus, "low"),
+                  accounts.ObservedSessionModel("gpt-6.2-sol", "medium"),
+                  accounts.ObservedSessionModel(opus, "high"),
+                  accounts.ObservedSessionModel("claude-fable-5-1", "max"))
+        role_counts = {
+            "producers": (5, 0, 2, 4, 1),
+            "showrunners": (2, 6, 4, 0, 3),
+            "units": (3, 2, 0, 7, 1),
+            "workers": (0, 8, 3, 1, 2),
+        }
+        fixture = replace(status_row("claude1"), roles=tuple(role_counts),
+                          role_counts=tuple(accounts.RoleSessionCounts(sum(values), 0, 0, 0)
+                                            for values in role_counts.values()),
+                          models_by_role={role: Counter({model: count for model, count in zip(models, values) if count})
+                                          for role, values in role_counts.items()})
+        reading = accounts.StatusReading((fixture,), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
+        setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(rendered).replace("</", "<\\/"))
+        probe = """<script>
+(async()=>{
+ const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const table=()=>document.querySelector('table[aria-label="Models"]');
+ const headings=()=>[...table().tHead.rows[0].cells];
+ const header=key=>table().querySelector('[data-model-sort="'+key+'"]');
+ const account=key=>document.querySelector('[data-account-sort="'+key+'"]');
+ const rows=()=>[...table().tBodies[0].rows];
+ const cellText=row=>[...row.cells].map(cell=>cell.textContent);
+ const swatch=()=>table().querySelector('[data-color-key="model.claude-opus-5-5"]');
+ const word=()=>table().querySelector('[data-color-text="model.claude-opus-5-5"]');
+ const picker=document.querySelector('#account-color-value');
+ const action=name=>document.querySelector('[data-color-'+name+']');
+ const box=node=>{
+  const range=document.createRange();range.selectNodeContents(node);
+  return range.getBoundingClientRect();
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='520px';await flush();
+  check(headings().map(cell=>cell.dataset.modelSort || '').join(',')===
+   'model,,effort,producers,showrunners,units,workers,total','the Models columns are in order');
+  check(rows().map(row=>cellText(row).slice(0,3).join(':')).join(',')===
+   'claude-fable-5-1::max,claude-opus-5-5::low,::high,gpt-6.2-sol::medium,unknown::-,total::',
+   'model IDs and efforts are grouped');
+  check(rows().at(-1).cells[7].textContent===document.querySelector('[data-sort-table=accounts] tbody')
+   .lastElementChild.cells[11].textContent,'both tables show the same total');
+  check(rows()[0].cells[4].querySelector('.inactive').textContent==='0','zero has a muted tone');
+  check(table().querySelectorAll('[data-color-key="model.claude-opus-5-5"]').length===1,'each model has one swatch');
+  check(header('model').getAttribute('aria-sort')==='ascending','model ascending is the default');
+  const layout=key=>{
+   const cell=header(key), right=cell.classList.contains('right');
+   const label=box([...cell.querySelector('.sort-label').childNodes].find(node=>node.nodeType===Node.TEXT_NODE));
+   const value=box(rows().map(row=>row.cells[cell.cellIndex]).find(item=>item.textContent));
+   const arrow=cell.querySelector('.sort-arrow').getBoundingClientRect();
+   const edge=right ? 'right' : 'left';
+   check(Math.abs(label[edge]-value[edge])<=1,key+' header aligns with the values');
+   check(right ? arrow.right<label.left : arrow.left>label.right,key+' arrow is on the correct side');
+   const labels=[...table().querySelectorAll('.sort-label')].map(span=>box(
+    [...span.childNodes].find(node=>node.nodeType===Node.TEXT_NODE)));
+   check(labels.every(other=>arrow.right<=other.left || arrow.left>=other.right),key+' arrow clears the labels');
+   const scroll=table().parentElement;
+   check(scroll.scrollWidth===scroll.clientWidth,key+' fits at 1280px');
+  };
+  layout('model');
+  const total=rows().at(-1).outerHTML;
+  const names={low:'claude-opus-5-5', medium:'gpt-6.2-sol', high:'claude-opus-5-5',
+   max:'claude-fable-5-1','-':'unknown'};
+  const expectedOrders={
+   model:['max,low,high,medium,-','medium,low,high,max,-'],
+   effort:['low,medium,high,max,-','max,high,medium,low,-'],
+   producers:['low,max,high,-,medium','medium,-,high,max,low'],
+   showrunners:['medium,high,-,low,max','max,low,-,high,medium'],
+   units:['max,low,medium,-,high','high,-,medium,low,max'],
+   workers:['medium,high,-,max,low','low,max,-,high,medium'],
+   total:['medium,max,low,high,-','-,high,low,max,medium'],
+  };
+  const checkOrder=(key,reverse)=>{
+   const ordered=rows().slice(0,-1);
+   check(ordered.map(row=>row.cells[2].textContent).join(',')===expectedOrders[key][Number(reverse)],
+    key+' shows the expected order');
+   let previous='';
+   for(const row of ordered){
+    const model=names[row.cells[2].textContent], start=model!==previous;
+    check(row.cells[0].textContent===(start ? model : ''),key+' labels each consecutive model group');
+    check((row.cells[1].querySelector('button')?.dataset.colorKey || '')===
+     (start && model!=='unknown' ? 'model.'+model : ''),key+' shows a swatch for each consecutive model group');
+    previous=model;
+   }
+  };
+  checkOrder('model',false);
+  header('model').click();checkOrder('model',true);
+  header('model').click();
+  for(const key of ['effort','producers','showrunners','units','workers','total']){
+   const cell=header(key), direction=key==='effort' ? 'ascending' : 'descending';
+   check(cell.tabIndex===0,key+' supports focus');
+   cell.focus();
+   cell.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+   check(cell.getAttribute('aria-sort')===direction,key+' sorts on Enter');
+   checkOrder(key,false);
+   layout(key);
+   cell.click();
+   check(cell.getAttribute('aria-sort')===(direction==='ascending' ? 'descending' : 'ascending'),key+' reverses on click');
+   checkOrder(key,true);
+   layout(key);
+   check(rows().at(-1).outerHTML===total,key+' keeps the total at the end');
+  }
+  header('workers').click();
+  check(rows()[0].cells[0].textContent==='gpt-6.2-sol','worker count sorts numerically');
+  account('left').click();
+  check(JSON.parse(localStorage.getItem('accounts-sort')).column==='left' &&
+   JSON.parse(localStorage.getItem('models-sort')).column==='workers','each table stores its own choice');
+  const prior=table();
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  check(table()!==prior && header('workers').getAttribute('aria-sort')==='descending' &&
+   rows()[0].cells[0].textContent==='gpt-6.2-sol','refresh retains the Models sort');
+  swatch().click();
+  picker.value='#102030';action('try').click();
+  check(word().style.color==='rgb(16, 32, 48)' && swatch().style.background==='rgb(16, 32, 48)',
+   'Try previews the model name and swatch');
+  action('cancel').click();
+  check(word().style.color==='rgb(224, 138, 92)' && saves.length===0,'Cancel restores the configured color');
+  swatch().click();picker.value='#203040';action('save').click();
+  const form=new URLSearchParams(saves[0].options.body);
+  check(form.get('key')==='model.claude-opus-5-5' && form.get('value')==='#203040','Save sends the model color key');
+  saves[0].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+  const defaultSwatch=table().querySelector('[data-color-key="model.gpt-6.2-sol"]');
+  const defaultWord=table().querySelector('[data-color-text="model.gpt-6.2-sol"]');
+  const popup=document.querySelector('[data-color-picker]');
+  for(const [theme,ink] of [['light','#0b0b0b'],['dark','#f0efec']]){
+   document.documentElement.dataset.theme=theme;
+   check(defaultSwatch.dataset.savedColor==='' &&
+    getComputedStyle(defaultSwatch).backgroundColor===getComputedStyle(defaultWord).color,
+    'a model without a color uses the theme ink for its name and swatch');
+   defaultSwatch.click();
+   check(popup.open && picker.value===ink,'the unconfigured swatch opens the picker with the theme ink');
+   picker.value='#123456';action('try').click();action('cancel').click();
+   check(defaultWord.style.color==='' && defaultSwatch.style.background==='',
+    'Cancel restores the theme ink');
+  }
+  defaultSwatch.click();picker.value='#304050';action('save').click();
+  const newColor=new URLSearchParams(saves[1].options.body);
+  check(newColor.get('key')==='model.gpt-6.2-sol' && newColor.get('value')==='#304050',
+   'Save sends the missing model color key');
+  saves[1].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
@@ -633,10 +789,11 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
     def test_color_save_validates_the_request_and_uses_this_checkouts_tune(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"CONF_DIR": temporary}):
             _ = (Path(temporary) / "statusline.conf").write_text(
-                "account.claude1=brown\nrole.units=teal\nrole.worker=white\nlevel.ok=green\n")
+                "account.claude1=brown\nrole.units=teal\nrole.worker=white\nlevel.ok=green\nmodel.claude-opus-5-5=#e08a5c\n")
             for key, value in (("account.unknown", "#af875f"), ("claude1", "#af875f"), ("role.units", "#af875f"),
                                ("role.showrunner", "#af875f"), ("level.ok", "#af875f"), ("account.claude1", "brown"),
-                               ("account.claude1", "#AF875F"), ("account.claude1", "#fff"), ("account.claude1", "#af875f\n")):
+                               ("account.claude1", "#AF875F"), ("account.claude1", "#fff"), ("account.claude1", "#af875f\n"),
+                               ("model.sol", "#af875f"), ("model.unknown", "#af875f")):
                 with self.subTest(key=key, value=value), patch.object(subprocess, "run") as run:
                     self.assertIsInstance(accounts_page.save_color(key, value), accounts_page.Refused)
                     run.assert_not_called()
@@ -655,9 +812,25 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, "", "")) as run:
                 self.assertEqual(accounts_page.save_color("role.worker", "#123456"), accounts_page.Saved())
                 self.assertEqual(cast(tuple[str, ...], run.call_args.args[0])[2:5], ("statusline", "role.worker", "#123456"))
+            for key in ("model.claude-opus-5-5", "model.gpt-6.2-sol"):
+                with (self.subTest(model_key=key),
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, "", "")) as run):
+                    self.assertEqual(accounts_page.save_color(key, "#123456"), accounts_page.Saved())
+                    self.assertEqual(cast(tuple[str, ...], run.call_args.args[0])[2:5], ("statusline", key, "#123456"))
             with patch.object(subprocess, "run", side_effect=OSError("runner unavailable")):
                 self.assertEqual(accounts_page.save_color("account.claude1", "#af875f"),
                                  accounts_page.SaveFailed("runner unavailable"))
+
+    def test_color_save_refuses_a_catalog_model_with_a_known_host_suffix(self) -> None:
+        config = Path(os.environ["CONF_DIR"])
+        key = "model.gpt-6.2-sol.natedev"
+        models = config / "models.conf"
+        _ = models.write_text("[codex.agents]\ngpt-6.2-sol.natedev=high\n")
+        with (patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(models)}),
+              patch.object(subprocess, "run") as run):
+            self.assertEqual(accounts_page.save_color(key, "#123456"),
+                             accounts_page.Refused(".natedev is a host override, not a model color."))
+            run.assert_not_called()
 
     def test_board_marks_the_selected_claude_group_lines_and_lists_the_claude_targets(self) -> None:
         rows = (replace(status_row("claude1"), selected_roles=("units",)), replace(status_row("claude2"), weekly_left_percent=12.4),
@@ -839,6 +1012,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                         page = accounts_page.page().decode()
                     source: object = status.call_args.kwargs["source"]  # pyright: ignore[reportAny]
                     self.assertIsInstance(source, accounts.StoredUsageOnly)
+                    status.assert_called_once_with(source=accounts.StoredUsageOnly(), include_models=True)
                     self.assertIn("<div data-accounts>", page)
                     self.assertIn(console_theme.CSS, page)
                     self.assertIn(page_frame.STYLE, page)

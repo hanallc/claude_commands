@@ -76,6 +76,10 @@ class VerifyAdmissionSignalsTests(VerifyDocFixture):
                 output, errors = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, output + errors)
                 self.assertEqual(processes_carrying(marker), set())
+                self.assertEqual(list((self.root / "slots").glob("*")), [])
+                with admission.loop_turn():
+                    self.assertFalse(any(request.owner.pid == process.pid
+                                         for request in admission.server.placement_requests.values()))
                 self.assertEqual(self.cargo_calls() if self.events.exists() else [], [])
                 self.assertNotEqual(process.pid, os.getpid())
 

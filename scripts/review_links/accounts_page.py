@@ -5,14 +5,13 @@ from dataclasses import dataclass
 import html
 import json
 from pathlib import Path
-import re
 from statistics import median
 import subprocess
 import sys
 import time
 
 from scripts.accounts import accounts, next_moves
-from scripts.lib import conf
+from scripts.lib import conf, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, review_link
 
 PAGE_NAME = "accounts.html"
@@ -42,14 +41,17 @@ class SaveFailed:
 
 
 def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
-    """Validate an account or role color and publish it through this checkout's tune."""
+    """Validate the color and publish it through this checkout's tune."""
     try:
+        if host := waiting_rows.model_color_host(key):
+            return Refused(f".{host} is a host override, not a model color.")
         colors = conf.read("statusline").values()
     except (OSError, ValueError) as error:
         return SaveFailed(" ".join(str(error).split()))
-    if not (key.startswith("account.") or key in accounts.ROLE_COLOR_KEYS.values()) or key not in colors:
+    configured = key in colors and (key.startswith(("account.", "model.")) or key in accounts.ROLE_COLOR_KEYS.values())
+    if not configured and not waiting_rows.model_color_key("statusline", key):
         return Refused("The page has no configured color for that key.")
-    if not re.fullmatch(r"#[0-9a-f]{6}", value):
+    if not waiting_rows.model_color_value(value):
         return Refused("Use a color in #rrggbb format.")
     try:
         done = subprocess.run((*TUNE, "statusline", key, value,
@@ -156,6 +158,31 @@ def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: 
     return content
 
 
+def _swatch(spans: list[accounts.BoardSpan]) -> str:
+    if not spans or "color_key" not in spans[0]:
+        return ""
+    name = html.escape(spans[0]["text"], quote=True)
+    color = accounts.account_color(spans[0].get("color", ""))
+    css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
+    background = f' style="background:{css}"' if css else ""
+    return (f'<button type="button" class="color-swatch" data-color-key="{html.escape(spans[0]["color_key"], quote=True)}" '
+            + f'data-color-name="{name}" data-saved-color="{css}"{background} '
+            + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
+
+
+def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns: tuple[str, ...]) -> str:
+    key = column["heading"]
+    if not key:
+        return f'<th class="{column["align"]}"></th>'
+    direction = "ascending" if key == default else "none"
+    descending = " data-sort-descending" if key in descending_columns else ""
+    label = html.escape(key)
+    arrow = '<span class="sort-arrow" aria-hidden="true">▲</span>'
+    content = arrow + label if column["align"] == "right" else label + arrow
+    return (f'<th class="{column["align"]}" data-{default}-sort="{label}" tabindex="0" aria-sort="{direction}"{descending}>'
+            + f'<span class="sort-label">{content}</span></th>')
+
+
 def board(reading: accounts.StatusReading) -> str:
     """Render the accounts table and its problems."""
     table = accounts.status_board(reading)
@@ -169,27 +196,9 @@ def board(reading: accounts.StatusReading) -> str:
     targets = [target(spans, row["cells"]["left"]) for row in table["rows"]
                if (spans := row["cells"]["label"]) and spans[0]["text"] in claude]
     percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
-    def swatch(spans: list[accounts.BoardSpan]) -> str:
-        if not spans or "color_key" not in spans[0]:
-            return ""
-        name = html.escape(spans[0]["text"], quote=True)
-        color = accounts.account_color(spans[0].get("color", ""))
-        css = color.css.lower() if isinstance(color, accounts.AccountColor) else ""
-        return (f'<button type="button" class="color-swatch" data-color-key="{html.escape(spans[0]["color_key"], quote=True)}" '
-                + f'data-color-name="{name}" data-saved-color="{css}" style="background:{css}" '
-                + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
     # A headerless swatch column follows each column whose first span can carry a configured color.
     def heading(column: accounts.BoardColumn) -> str:
-        key = column["heading"]
-        if not key:
-            return f'<th class="{column["align"]}"></th>'
-        direction = "ascending" if key == "account" else "none"
-        descending = " data-sort-descending" if key in accounts.ACCOUNT_BOARD_DESCENDING_SORTS else ""
-        label = html.escape(key)
-        arrow = '<span class="sort-arrow" aria-hidden="true">▲</span>'
-        content = arrow + label if column["align"] == "right" else label + arrow
-        return (f'<th class="{column["align"]}" data-account-sort="{label}" tabindex="0" aria-sort="{direction}"{descending}>'
-                + f'<span class="sort-label">{content}</span></th>')
+        return _sort_heading(column, "account", accounts.ACCOUNT_BOARD_DESCENDING_SORTS)
     next_heading = heading(accounts.BoardColumn(key="next", heading="next", align="left"))
     head = "".join(heading(column)
                    + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "")
@@ -198,21 +207,37 @@ def board(reading: accounts.StatusReading) -> str:
         _row_open(row)
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
                   + f'{_spans(row["cells"][column["key"]])}</td>'
-                  + (f'<td class="left">{swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
+                  + (f'<td class="left">{_swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
                   + (f'<td class="left next-cell">{_next_cell(row, reading, labels)}</td>' if column["key"] == "roles" else "")
                   for column in table["columns"])
         + "</tr>" for row in table["rows"])
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
-    return (f'<section class="card" data-move-percent="{percent}" '
+    return (f'<section class="card" data-move-percent="{percent}" data-sort-table="accounts" '
             + f'data-sort-orders="{html.escape(json.dumps(accounts.account_board_sort_orders(reading, table)), quote=True)}" '
             + f'data-move-targets="{html.escape(json.dumps(targets), quote=True)}"><div class="scroll"><table>'
             + f"<thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>"
             + (f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "") + "</section>")
 
 
+def models_board(reading: accounts.StatusReading) -> str:
+    table = accounts.models_board(reading, accounts.role_colors())
+    head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS)
+                   + ('<th class="left"></th>' if column["key"] == "model" else "")
+                   for column in accounts.MODEL_COLUMNS)
+    rows = "".join("<tr>" + "".join(
+        f'<td class="{column["align"]}">{_spans(row["cells"][column["key"]])}</td>'
+        + (f'<td class="left">{_swatch(row["cells"]["model"])}</td>' if column["key"] == "model" else "")
+        for column in accounts.MODEL_COLUMNS) + "</tr>" for row in table.rows)
+    orders = html.escape(json.dumps(table.orders), quote=True)
+    return (f'<section class="card models-card" data-sort-table="models" data-sort-orders="{orders}">'
+            + f'<div class="scroll"><table aria-label="Models"><thead><tr>{head}</tr></thead>'
+            + f'<tbody>{rows}</tbody></table></div></section>')
+
+
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
-    body = board(accounts.read_status(source=accounts.StoredUsageOnly()))
+    reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
+    body = board(reading) + models_board(reading)
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
@@ -250,12 +275,14 @@ def main() -> int:
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
+.models-card{margin-top:24px}
 table{border-collapse:collapse;font-size:var(--table-font-size);font-variant-numeric:tabular-nums}
 /* Let the last sort arrow use the right padding of the card. */
 .card .scroll{margin-right:calc(-1 * var(--column-gap));padding-right:var(--column-gap)}
 th,td{padding:5px 0 5px var(--column-gap);white-space:nowrap}th:first-child,td:first-child{padding-left:0}
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
-th[data-account-sort]{cursor:pointer}th[data-account-sort]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+th:is([data-account-sort],[data-model-sort]){cursor:pointer}
+th:is([data-account-sort],[data-model-sort]):focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 .sort-label{position:relative}
 .sort-arrow{--sort-arrow-gap:calc(var(--table-font-size) * .25);position:absolute;top:50%;
 left:calc(100% + var(--sort-arrow-gap));transform:translateY(-50%);width:var(--table-font-size);text-align:center;visibility:hidden}
@@ -266,7 +293,7 @@ tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
-.color-swatch{width:18px;height:18px;vertical-align:middle;border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
+.color-swatch{width:18px;height:18px;vertical-align:middle;background:var(--ink);border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
 .color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:280px;box-sizing:border-box;max-width:calc(100vw - 16px);
 max-height:calc(100vh - 16px);overflow:auto;
 border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge)}
@@ -415,60 +442,69 @@ let menuRow=null, menuButton=null;
 const pendingMoves=new Set();
 const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
  : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
-const sortColumns=[...view.querySelectorAll('[data-account-sort]')].map(header=>header.dataset.accountSort);
+const sortSelector='[data-account-sort],[data-model-sort]';
+const sortKey=header=>header.dataset.accountSort ?? header.dataset.modelSort;
 const sortTables=new WeakMap();
-let chosenSort={column:'account',reverse:false};
-try{
- const saved=JSON.parse(localStorage.getItem('accounts-sort'));
- if(saved && sortColumns.includes(saved.column) && typeof saved.reverse==='boolean') chosenSort=saved;
-}catch{}
-function applySort(){
- const card=view.querySelector('[data-sort-orders]');
- if(!card) return;
+const sortChoices=new Map();
+function applySort(card){
+ const name=card.dataset.sortTable, models=name==='models';
+ const headers=[...card.querySelectorAll(sortSelector)];
+ if(!sortChoices.has(name)){
+  let choice={column:models ? 'model' : 'account',reverse:false};
+  try{
+   const saved=JSON.parse(localStorage.getItem(name+'-sort'));
+   if(saved && headers.some(header=>sortKey(header)===saved.column) && typeof saved.reverse==='boolean') choice=saved;
+  }catch{}
+  sortChoices.set(name,choice);
+ }
+ const chosenSort=sortChoices.get(name), nameCell=models ? 0 : 1;
  const table=card.querySelector('table'), body=table.tBodies[0];
  if(!sortTables.has(table)){
-  let account='';
+  let group='';
   sortTables.set(table,[...body.rows].slice(0,-1).map(node=>{
-   account=node.cells[1].textContent || account;
-   return {node,account};
+   group=node.cells[nameCell].textContent || group;
+   return {node,group};
   }));
  }
  const sources=sortTables.get(table), details=new Map();
- // Account details occupy the first four and last three cells.
  const width=table.tHead.rows[0].cells.length;
- const columns=[0,1,2,3,width-3,width-2,width-1];
- for(const {node,account} of sources) if(node.cells[1].textContent){
-  details.set(account,columns.map(index=>node.cells[index].innerHTML));
+ const columns=models ? [0,1] : [0,1,2,3,width-3,width-2,width-1];
+ for(const {node,group} of sources) if(node.cells[nameCell].textContent){
+  details.set(group,columns.map(index=>node.cells[index].innerHTML));
  }
  const order=JSON.parse(card.dataset.sortOrders)[chosenSort.column+(chosenSort.reverse ? '-reverse' : '')];
  const total=body.lastElementChild;
  for(const place of order){
-  const {node,account}=sources[place.index];
-  columns.forEach((index,offset)=>{node.cells[index].innerHTML=place.details ? details.get(account)[offset] : '';});
+  const {node,group}=sources[place.index];
+  columns.forEach((index,offset)=>{node.cells[index].innerHTML=place.details ? details.get(group)[offset] : '';});
   node.classList.toggle('account',place.details);body.insertBefore(node,total);
  }
- for(const header of table.querySelectorAll('[data-account-sort]')){
-  const selected=header.dataset.accountSort===chosenSort.column;
+ for(const header of headers){
+  const selected=sortKey(header)===chosenSort.column;
   const descending=header.hasAttribute('data-sort-descending')!==(selected && chosenSort.reverse);
   header.setAttribute('aria-sort',selected ? descending ? 'descending' : 'ascending' : 'none');
   header.querySelector('.sort-arrow').textContent=descending ? '▼' : '▲';
  }
 }
-function chooseSort(column){
+function applySorts(){view.querySelectorAll('[data-sort-table]').forEach(applySort);}
+function chooseSort(header){
  if(hold()) return;
- chosenSort={column,reverse:chosenSort.column===column ? !chosenSort.reverse : false};
- try{localStorage.setItem('accounts-sort',JSON.stringify(chosenSort));}catch{}
- applySort();
+ const card=header.closest('[data-sort-table]'), name=card.dataset.sortTable;
+ const column=sortKey(header), prior=sortChoices.get(name);
+ const chosenSort={column,reverse:prior.column===column ? !prior.reverse : false};
+ sortChoices.set(name,chosenSort);
+ try{localStorage.setItem(name+'-sort',JSON.stringify(chosenSort));}catch{}
+ applySort(card);
 }
 document.addEventListener('click',event=>{
- const header=event.target instanceof Element ? event.target.closest('[data-account-sort]') : null;
- if(header) chooseSort(header.dataset.accountSort);
+ const header=event.target instanceof Element ? event.target.closest(sortSelector) : null;
+ if(header) chooseSort(header);
 });
 document.addEventListener('keydown',event=>{
- const header=event.target instanceof Element ? event.target.closest('[data-account-sort]') : null;
- if(header && event.key==='Enter'){event.preventDefault();chooseSort(header.dataset.accountSort);}
+ const header=event.target instanceof Element ? event.target.closest(sortSelector) : null;
+ if(header && event.key==='Enter'){event.preventDefault();chooseSort(header);}
 });
-applySort();
+applySorts();
 async function refresh(supersede=false,current=()=>true) {
   if (hold()) return;
   const request = ++newestRequest;
@@ -480,7 +516,7 @@ async function refresh(supersede=false,current=()=>true) {
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   view.replaceWith(fresh);view = fresh;
-  applySort();
+  applySorts();
   scrollTo({top, behavior: 'instant'});
   return pageRefreshFacts(page);
 }
@@ -499,6 +535,7 @@ function queue(key){
  return queues.get(key);
 }
 function savedColor(key){return swatches(key)[0]?.dataset.savedColor || '';}
+function pickerColor(button,value){return value || getComputedStyle(button).getPropertyValue('--ink').trim();}
 function paint(key,value){
  for(const button of swatches(key)) button.style.background=value;
  for(const word of words(key)) word.style.color=value;
@@ -517,7 +554,7 @@ document.addEventListener('click',event=>{
  if(!button) return;
  if(selected) close(true);
  selected=button;
- picker.value=queue(button.dataset.colorKey).at(-1)?.value || button.dataset.savedColor;
+ picker.value=pickerColor(button,queue(button.dataset.colorKey).at(-1)?.value || button.dataset.savedColor);
  readHex();
  popup.querySelector('#color-title').textContent='Change '+button.dataset.colorName+' color';
  popup.showModal();position();area.focus();updates.abandon();
@@ -540,7 +577,7 @@ async function publish(save){
  }catch(error){
   for(const button of swatches(save.key)) button.dataset.savedColor=save.oldColor;
   paint(save.key,save.oldColor);
-  if(selected?.dataset.colorKey===save.key){picker.value=save.oldColor;readHex();}
+  if(selected?.dataset.colorKey===save.key){picker.value=pickerColor(selected,save.oldColor);readHex();}
   message.textContent=save.name+': '+(error.message || 'The color could not be saved.');message.hidden=false;
  }finally{
   pending.shift();pendingSaves.delete(save);

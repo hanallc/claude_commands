@@ -122,7 +122,7 @@ class ImageQuestionStore:
 
 
 def register_file(image: Path, folder: Path, caption: str = "", owner: str = "", subject: str = "",
-                  *, before: Path | None = None) -> ImageRecord:
+                  *, before: Path | None = None, identity: str = "", private: bool = False) -> ImageRecord:
     """Publish one image or a pair with one record and one atomic folder rename."""
     sources = (("before", before), ("after", image)) if before is not None else (("image", image),)
     for _, source in sources:
@@ -130,10 +130,12 @@ def register_file(image: Path, folder: Path, caption: str = "", owner: str = "",
             raise ValueError(f"{source}: use one of {', '.join(sorted(SUFFIXES))}")
         if not source.is_file():
             raise ValueError(f"{source}: no such image file")
-    folder.mkdir(parents=True, exist_ok=True)
-    identity = secrets.token_hex(6)
+    identity = identity or secrets.token_hex(6)
+    if not IDENTITY.fullmatch(identity):
+        raise ValueError("Invalid image ID.")
+    folder.mkdir(mode=0o700 if private else 0o777, parents=True, exist_ok=True)
     draft = folder / (DRAFT_PREFIX + identity)
-    draft.mkdir(mode=0o755)
+    draft.mkdir(mode=0o700 if private else 0o755)
     try:
         files = {stem: stem + source.suffix.casefold() for stem, source in sources}
         # The last source is the after image of a pair, or the single image.
@@ -143,7 +145,11 @@ def register_file(image: Path, folder: Path, caption: str = "", owner: str = "",
         if "before" in files:
             record["before"] = files["before"]
         for stem, source in sources:
-            _ = shutil.copyfile(source, draft / files[stem])
+            target = draft / files[stem]
+            if private:
+                atomic_file.write_bytes_atomic(target, source.read_bytes(), mode=0o600)
+            else:
+                _ = shutil.copyfile(source, target)
         write_record(draft, record)
         # The page shows a folder only after its images and record are complete.
         _ = draft.rename(folder / identity)

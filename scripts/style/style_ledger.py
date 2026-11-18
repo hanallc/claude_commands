@@ -23,7 +23,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from functools import lru_cache, wraps
@@ -2903,10 +2903,19 @@ class HeldFindingReads:
     footprints_prepared: bool = False
 
 
+@dataclass(frozen=True)
+class UnresolvedGitCommonDirectory:
+    """The ledger must resolve the checkout's Git common directory."""
+
+
+_UNRESOLVED_GIT_COMMON_DIRECTORY = UnresolvedGitCommonDirectory()
+
+
 class Ledger:
     def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE,
                  access: LedgerAccess = LedgerAccess.READ_WRITE,
-                 resolver: session_staff.RowResolver | None = None) -> None:
+                 resolver: session_staff.RowResolver | None = None,
+                 common_directory: Path | UnresolvedGitCommonDirectory = _UNRESOLVED_GIT_COMMON_DIRECTORY) -> None:
         self.repo: Path = repo
         self._reader_source: style_config.ReaderSource = style_config.refill_reader()
         self._reader_word_class: style_reader.NameWordClass = style_reader.names_word_class(self._search_locale())
@@ -2933,7 +2942,9 @@ class Ledger:
         self._judgment_read_failures: int = 0
         self._finding_reads: list[HeldFindingReads] = []
         self._refill_changes: int = 0
-        self._refill_object_store: str = ""
+        self._git_common_directories: dict[Path, Path] = {}
+        if isinstance(common_directory, Path):
+            self._git_common_directories[repo.resolve()] = common_directory
         self._listed_site_observation: ListedSiteObservation | UnobservedListedSites = UnobservedListedSites()
         self._refill_available_blobs: set[str] = set()
         self._git_operation_depth: int = 0
@@ -3192,12 +3203,19 @@ class Ledger:
             self._inputs[key] = _inputs(tip, scope, path)
         return self._inputs[key]
 
+    def git_common_directory(self, directory: Path) -> Path:
+        """Resolve each Git directory once per ledger command."""
+        directory = directory.resolve()
+        if directory not in self._git_common_directories:
+            self._git_common_directories[directory] = Path(_git(directory, "rev-parse", "--path-format=absolute",
+                                                                "--git-common-dir"))
+        return self._git_common_directories[directory]
+
     def _judgment_facts(self) -> RefillFacts:
-        if not self._refill_object_store:
-            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        objects = Path(self._refill_object_store) / "objects"
+        common = self.git_common_directory(self.repo)
+        objects = common / "objects"
         status = objects.stat()
-        store = input_identity((self._refill_object_store, status.st_dev, status.st_ino))
+        store = input_identity((str(common), status.st_dev, status.st_ino))
         writes = self._refill_write_batches[-1] if self._refill_write_batches else ImmediateRefillWrites()
         return RefillFacts(self._connection, store, "", on_derived_write=self._note_refill_changes, writes=writes)
 
@@ -3736,7 +3754,7 @@ class Ledger:
         from scripts.agents import remote
 
         resolver = self.staff_resolver()
-        common = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        common = self.git_common_directory(self.repo)
         holders: list[staff.StaffRow] = []
         for row in resolver.record.find(kind="showrunner"):
             if not isinstance(row.doc, staff.LiveDoc) or row.doc.machine != remote.local_machine():
@@ -3748,7 +3766,7 @@ class Ledger:
                 kind = production_field(document.path.read_text().splitlines(), "Kind")
             except Refusal:
                 continue
-            if kind == "style" and _git(document.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir") == common:
+            if kind == "style" and self.git_common_directory(document.path.parent) == common:
                 holders.append(row)
         if len(holders) != 1:
             raise LedgerError("the style production's showrunner ownership is unavailable or ambiguous")
@@ -5609,9 +5627,7 @@ class Ledger:
             return {}
         tip = self._tip(commit)
         blobs = {path: tip.blobs[path] for path in paths if path in tip.blobs}
-        if not self._refill_object_store:
-            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        store = self._refill_object_store
+        store = str(self.git_common_directory(self.repo))
         counts: dict[str, int] = {}
         unread: dict[str, str] = {}
         for blob in dict.fromkeys(blobs.values()):
@@ -8638,9 +8654,7 @@ class Ledger:
 
         # Pre-filter rules share the Rust and generator path universe.
         sites: set[ListedSite] = set()
-        if not self._refill_object_store:
-            self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        facts = RefillFacts(self._connection, self._refill_object_store, catalog)
+        facts = RefillFacts(self._connection, str(self.git_common_directory(self.repo)), catalog)
         with self._connection:
             inputs = RefillInputs(self.repo, tip.tree, facts, reader_source=self.reader_source)
             ignored: list[str] = []
@@ -9387,6 +9401,7 @@ class Ledger:
 class LedgerLocation:
     repo: Path
     database: Path
+    common_directory: Path | UnresolvedGitCommonDirectory = field(default=_UNRESOLVED_GIT_COMMON_DIRECTORY, compare=False)
 
 
 def ledger_location(repo: Path) -> LedgerLocation:
@@ -9396,13 +9411,14 @@ def ledger_location(repo: Path) -> LedgerLocation:
     repo, common = Path(root), Path(common_directory)
     main_repo = common.parent
     state = Path(os.environ.get("STYLE_LEDGER_STATE_DIR", str(Path.home() / ".local/state/style"))).expanduser()
-    return LedgerLocation(repo, state / main_repo.name / "ledger.sqlite")
+    return LedgerLocation(repo, state / main_repo.name / "ledger.sqlite", common)
 
 
 def open_ledger(repo: Path, *, access: LedgerAccess = LedgerAccess.READ_WRITE,
                 resolver: session_staff.RowResolver | None = None) -> Ledger:
     location = ledger_location(repo)
-    return Ledger(location.repo, location.database, access=access, resolver=resolver)
+    return Ledger(location.repo, location.database, access=access, resolver=resolver,
+                  common_directory=location.common_directory)
 
 
 def record_refill(repo: Path, unit: str, outcome: str) -> None:
@@ -9493,7 +9509,7 @@ def preview_ledger(repo: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO
                                           timeout=BUSY_TIMEOUT_SECONDS)) as source,
                   closing(sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)) as destination):
                 source.backup(destination)
-        with Ledger(location.repo, database, git_cache=git_cache) as ledger:
+        with Ledger(location.repo, database, git_cache=git_cache, common_directory=location.common_directory) as ledger:
             yield ledger
 
 
