@@ -378,9 +378,11 @@ Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the ow
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
-When the user submits a Review action, the row and its open details fade and collapse together in 200 ms.
-The rows below slide into place as the row collapses.
+When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
+The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
+If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
 A successful save adds no notice above the table.
 The status region above the table shows a failure only for the most recent submission.

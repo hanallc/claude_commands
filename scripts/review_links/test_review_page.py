@@ -3228,6 +3228,167 @@ window.fetch=async(url)=>{
         self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_card_actions_fade_and_slide(self) -> None:
+        source = browser_markup(self.root)
+        setup = r"""<script>
+const realFetch=fetch,posts=[];
+window.setInterval=()=>0;
+window.fetch=(url,options)=>options?.method==='POST'
+ ? (posts.push(new URLSearchParams(options.body).get('outcome')),new Promise(()=>{}))
+ : realFetch(url,options);
+if(REDUCED) window.matchMedia=()=>({matches:true});
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const top=row=>row.getBoundingClientRect().top;
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const [row,next]=document.querySelectorAll('[data-list-item][data-type="change"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const first=top(row),start=top(next);
+  const action=ACTION;
+  form.elements.feedback.value='Review these words.';
+  if(action==='later'){
+   form.querySelector('[data-later-toggle]').click();
+   form.querySelector('[data-later-preset="soon"]').click();
+  }else form.requestSubmit(form.querySelector('button[value="'+action+'"]'));
+  check(posts[0]===action && !row.isConnected,'The action posts and removes the record.');
+  const motion=()=>document.querySelector('[data-record-motion]');
+  if(REDUCED){
+   check(!motion() && Math.abs(top(next)-first)<2,'Reduced motion moves the next card at once.');
+  }else{
+   const clip=motion()?.querySelector('.record-motion-clip'),exit=clip?.getAnimations()[0];
+   if(!exit) throw new Error('The shared exit animation is missing.');
+   check(motion().querySelector('[data-detail]:not([hidden])'),'The motion copy includes the open card.');
+   check(exit.effect.getTiming().duration===200,'The motion lasts 200 ms.');
+   exit.pause();exit.currentTime=0;
+   const initialOpacity=Number(getComputedStyle(clip).opacity);
+   check(Math.abs(top(next)-start)<2,'The next card starts in its original position.');
+   exit.currentTime=100;
+   const opacity=Number(getComputedStyle(clip).opacity);
+   check(opacity>0 && opacity<initialOpacity,'The motion copy fades before it disappears.');
+   check(top(next)<start && top(next)>first,'The next card moves up during the fade.');
+   exit.finish();await exit.finished;
+   check(!motion() && Math.abs(top(next)-first)<2,'The next card fills the gap when the copy leaves.');
+  }
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        cases = [(action, False) for action in ('works', 'not works', 'validate', 'question', 'feedback', 'later')]
+        for action, reduced in [*cases, ('question', True)]:
+            with self.subTest(action=action, reduced_motion=reduced):
+                markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+                markup = markup.replace('REDUCED', json.dumps(reduced)).replace('ACTION', json.dumps(action))
+                self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_departing_card_keeps_its_place_in_the_scrolled_window(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}') for number in range(1, 181)]
+        with patch.object(review_items, 'read', return_value=records):
+            source = browser_markup(self.root)
+        self.check_card_motion(source, r"""
+ document.querySelector('[data-sort="0"]').click();
+ scrollTo(0,4800);await frame();
+ const row=rows().find(node=>top(node)>120 && top(node)<420);
+ if(!row) throw new Error('A card must be in the viewport.');
+ const panel=panelId(row),next=row.nextElementSibling;
+ row.querySelector('.list-toggle').click();
+ const form=await readyReviewCard(row);
+ row.querySelector('[data-detail]>td').style.height='1600px';
+ await frame();
+ scrollBy(0,top(next)-540);await frame();
+ const before=top(row),following=top(next);
+ check(scrollY>0 && before<0 && following>0 && following<innerHeight,'The tall card and next card share the scrolled viewport.');
+ send(form);
+ const clip=copy(panel);
+ check(clip && near(top(clip),before),'The tall copy starts at the original position.');
+ check(next.isConnected && near(top(next),following),'The visible next card keeps its position.');
+ const exit=clip.getAnimations()[0];
+ exit.currentTime=100;dispatchEvent(new Event('scroll'));await frame();
+ check(near(top(clip),before),'The shrinking copy keeps its place after a redraw.');
+ check(next.isConnected && top(next)<following,'The next card stays mounted while it moves up.');
+ exit.finish();await exit.finished;await frame();
+ check(!copy(panel),'The tall copy disappears when the fade ends.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
+        self.check_card_motion(browser_markup(self.root), r"""
+ const [first,second,next]=rows(),firstPanel=panelId(first),secondPanel=panelId(second);
+ const firstForm=await openCard(first);send(firstForm);
+ const firstClip=copy(firstPanel);firstClip.getAnimations()[0].currentTime=100;
+ const secondForm=await openCard(second);send(secondForm);
+ const secondClip=copy(secondPanel);secondClip.getAnimations()[0].currentTime=100;
+ const height=firstClip.getBoundingClientRect().height,opacity=Number(getComputedStyle(firstClip).opacity);
+ const following=top(next);
+ posts.get(first.dataset.key)({ok:false,json:async()=>({reason:'Try again.'})});
+ await frame();
+ const restored=copy(firstPanel);
+ check(restored && restored!==firstClip,'The refused card reverses its fade.');
+ check(restored && top(restored)<top(secondClip),'The first card returns above the departing second card.');
+ check(restored && near(restored.getBoundingClientRect().height,height) &&
+   near(Number(getComputedStyle(restored).opacity),opacity,0.01),'The reverse starts at the current height and opacity.');
+ check(near(top(next),following),'The next card does not jump when the fade reverses.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_saved_card_keeps_its_place_when_sorted_by_state(self) -> None:
+        self.check_card_motion(browser_markup(self.root), r"""
+ document.querySelector('[data-sort="4"]').click();
+ const [first,row,next]=rows(),panel=panelId(row);
+ check([first,row,next].every(node=>node.dataset.state==='Open'),'Three open cards are sorted by State.');
+ send(await openCard(row));
+ const clip=copy(panel),exit=clip.getAnimations()[0];
+ exit.currentTime=100;
+ const position=top(clip),following=top(next);
+ check(top(first)<position && position<following,'The departing card starts between its neighbors.');
+ posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ await frame();
+ check(copy(panel)===clip && near(top(clip),position),'The saved card keeps its position during the fade.');
+ check(near(top(next),following),'The next card keeps its position when the save completes.');
+ exit.finish();await exit.finished;await frame();
+ check(!copy(panel) && top(next)<following,'The next card fills the gap when the fade ends.');
+""")
+
+    def check_card_motion(self, source: str, steps: str) -> None:
+        setup = r"""<script>
+const realFetch=fetch,posts=new Map(),animate=Element.prototype.animate;
+window.setInterval=()=>0;
+window.fetch=(url,options)=>options?.method==='POST'
+ ? new Promise(resolve=>posts.set(new URLSearchParams(options.body).get('row'),resolve))
+ : realFetch(url,options);
+Element.prototype.animate=function(...args){
+ const motion=animate.apply(this,args);
+ if(this.classList.contains('record-motion-clip')){motion.pause();motion.currentTime=0;}
+ return motion;
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const rows=()=>[...document.querySelectorAll('[data-list-item]')];
+ const top=node=>node.getBoundingClientRect().top;
+ const near=(a,b,tolerance=2)=>Math.abs(a-b)<tolerance;
+ const panelId=row=>row.querySelector('.list-toggle').getAttribute('aria-controls');
+ const copy=panel=>document.querySelector('.record-motion-clip [aria-controls="'+CSS.escape(panel)+'"]')?.closest('.record-motion-clip');
+ const openCard=async row=>{row.querySelector('.list-toggle').click();return readyReviewCard(row);};
+ const send=form=>form.requestSubmit(form.querySelector('button[value="works"]'));
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  document.documentElement.style.overflowAnchor='none';
+  await frame();
+""" + steps + r"""
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
         question_key = self.question()
         question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
