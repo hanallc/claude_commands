@@ -2109,7 +2109,7 @@ def main(argv: list[str] | None = None) -> int:
                         raise CopyError("the checkout scope path must be absolute")
                     build_folders.write_checkout_lease(checkout, build_folders.CheckoutScopeBinding(scope, os.getpid()),
                                                        build_folders.build_folder_lock_fd(checkout))
-                    print("bound", flush=True)
+                    _ = os.write(sys.stdout.fileno(), b"bound\n")
                 _ = sys.stdin.read()
             return 0
         if args.action == "mirror-remove":

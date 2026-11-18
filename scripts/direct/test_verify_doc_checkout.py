@@ -90,6 +90,17 @@ if not script.endswith({scripts!r}):
 ''' + supervisor_code)
         self.environment["CLAUDE_PYTHON"] = str(wrapper)
 
+    def instrument_scope_supervisor(self, setup: str, patches: str) -> None:
+        self.install_scope_interpreter(f'''
+from unittest.mock import patch
+
+sys.path.insert(0, {str(VERIFY.parents[2])!r})
+from scripts.direct import verify_scoped_step
+{setup}
+with {patches}:
+    raise SystemExit(verify_scoped_step.main(script_arguments[1:]))
+''')
+
     def test_doc_finishes_while_another_caller_holds_the_cargo_token(self) -> None:
         with self.hold_cargo_token():
             result = self.verify()
@@ -227,13 +238,9 @@ with patch.object(verify_scoped_step.subprocess, "Popen", start_after_publicatio
         self.assertFalse(self.pass_records())
 
     def test_doc_refuses_checkout_confirmation_after_the_deadline(self) -> None:
-        self.install_scope_interpreter(f'''
+        self.instrument_scope_supervisor('''
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
-
-sys.path.insert(0, {str(VERIFY.parents[2])!r})
-from scripts.direct import verify_scoped_step
 
 read = os.read
 elapsed = 0
@@ -246,9 +253,43 @@ def receive_reply(descriptor, size):
     return reply
 
 clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
-with patch.object(os, "read", receive_reply), patch.object(verify_scoped_step, "time", clock):
-    raise SystemExit(verify_scoped_step.main(script_arguments[1:]))
-''')
+''', 'patch.object(os, "read", receive_reply), patch.object(verify_scoped_step, "time", clock)')
+        self.assert_doc_publication_timeout()
+
+    def test_doc_refuses_launch_when_the_final_owner_check_passes_the_deadline(self) -> None:
+        self.instrument_scope_supervisor('''
+import select
+import time
+from types import SimpleNamespace
+
+real_poll = select.poll
+elapsed = 0
+
+class OwnerPoll:
+    def __init__(self):
+        self.poller = real_poll()
+        self.confirmed = False
+
+    def __getattr__(self, name):
+        return getattr(self.poller, name)
+
+    def unregister(self, descriptor):
+        self.poller.unregister(descriptor)
+        if descriptor == 8:
+            self.confirmed = True
+
+    def poll(self, timeout=-1):
+        global elapsed
+        ready = self.poller.poll(timeout)
+        if self.confirmed and timeout == 0:
+            elapsed = 60
+        return ready
+
+clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
+''', 'patch.object(select, "poll", OwnerPoll), patch.object(verify_scoped_step, "time", clock)')
+        self.assert_doc_publication_timeout()
+
+    def assert_doc_publication_timeout(self) -> None:
         result = self.verify()
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 125, output)
@@ -256,6 +297,18 @@ with patch.object(os, "read", receive_reply), patch.object(verify_scoped_step, "
         self.assertIn("keeping the reservation", output)
         self.assertFalse(self.events.exists())
         self.assertFalse(self.pass_records())
+
+    def test_doc_accepts_a_checkout_confirmation_split_across_reads(self) -> None:
+        self.instrument_scope_supervisor('''
+read = os.read
+
+def split_reply(descriptor, size):
+    return read(descriptor, min(size, 5) if descriptor == 8 else size)
+''', 'patch.object(os, "read", split_reply)')
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.cargo_calls()), 1)
+        self.assertEqual(len(self.pass_records()), 1)
 
     def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
         recorded_failure = self.root / "recorded-scope-failure"
@@ -587,18 +640,29 @@ exec "$@"'''
             "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
         ))
 
-    def test_prepared_doc_lock_does_not_reach_the_background_sweep(self) -> None:
+    def assert_prepared_lock_stays_out_of_the_sweep(self, command: tuple[str, ...]) -> None:
         with self.hold_background_sweep() as started:
             with self.prepared_doc_slot() as checkout:
                 descriptor = build_folders.build_folder_lock_fd(checkout)
                 lock = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
-                process, log, marker = self.start_doc(pass_fds=(descriptor,))
+                process, log, marker = self.start_doc(command=command, pass_fds=(descriptor,))
                 sweep_pid = wait_for_pid(started, processes=(process,))
                 self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
                 self.assertIn(sweep_pid, processes_carrying(marker))
                 descriptors = Path(f"/proc/{sweep_pid}/fd")
                 self.assertNotIn(lock, [entry.resolve() for entry in descriptors.iterdir()])
             self.assertEqual(build_folders.build_folder_state(checkout, wait=False), "free")
+
+    def test_prepared_doc_lock_does_not_reach_the_background_sweep(self) -> None:
+        self.assert_prepared_lock_stays_out_of_the_sweep(DOC_COMMAND)
+
+    def test_prepared_doc_lock_aliases_do_not_reach_the_background_sweep(self) -> None:
+        handoff = '''exec {descriptor}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"
+export BUILDLOG_PREPARED_COPY_LOCK_FD=$descriptor
+exec "$@"'''
+        self.assert_prepared_lock_stays_out_of_the_sweep((
+            "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
+        ))
 
     def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")

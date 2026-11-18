@@ -2005,12 +2005,17 @@ doc_checkout() {
             return "$TREE_CHANGED_STATUS"
         fi
     else
-        local inherited=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
+        local inherited=${BUILDLOG_PREPARED_COPY_LOCK_FD:-} reserved="/dev/fd/$VERIFY_PREPARED_CHECKOUT_FD"
+        local alias_path descriptor
         if [[ "$inherited" =~ ^[0-9]+$ && -e "/dev/fd/$inherited" ]] &&
                 eval "exec $VERIFY_PREPARED_CHECKOUT_FD>&$inherited"; then
-            if [[ "$inherited" != "$VERIFY_PREPARED_CHECKOUT_FD" ]]; then
-                eval "exec $inherited>&-"
-            fi
+            # A caller can pass more than one descriptor for the checkout lock.
+            for alias_path in "/dev/fd/$inherited" /dev/fd/*; do
+                if [[ "$alias_path" != "$reserved" && "$alias_path" -ef "$reserved" ]]; then
+                    descriptor=${alias_path##*/}
+                    exec {descriptor}>&- || return $?
+                fi
+            done
             BUILDLOG_PREPARED_COPY_LOCK_FD=$VERIFY_PREPARED_CHECKOUT_FD
         else
             BUILDLOG_PREPARED_COPY_LOCK_FD=""

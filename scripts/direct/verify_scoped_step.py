@@ -156,30 +156,39 @@ def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit
         owners.unregister(watch)
 
 
+def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: float) -> None:
+    expected = b"bound\n"
+    confirmation = b""
+    owners.register(reply, select.POLLIN)
+    try:
+        while len(confirmation) < len(expected) and b"\n" not in confirmation:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not (ready := owners.poll(math.ceil(remaining * 1000))) or time.monotonic() >= deadline:
+                raise TimeoutError("the copy owner did not confirm the checkout scope")
+            if any(descriptor != reply for descriptor, _ in ready):
+                raise ValueError("a scope owner exited before launch")
+            chunk = os.read(reply, len(expected) - len(confirmation))
+            if not chunk:
+                break
+            confirmation += chunk
+        if confirmation != expected:
+            raise ValueError("the copy owner did not bind the checkout scope")
+    finally:
+        owners.unregister(reply)
+
+
 def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path, owners: select.poll, deadline: float) -> None:
     owner_start = process_start_time(checkout.lease_owner)
     if owner_start is None:
         raise ValueError("the checkout lease owner exited before scope publication")
     if stat.S_ISFIFO(os.fstat(9).st_mode):
         # The copy owner publishes while it holds the checkout lock.
-        owners.register(8, select.POLLIN)
-        try:
-            _ = os.write(9, os.fsencode(scope) + b"\n")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not (ready := owners.poll(math.ceil(remaining * 1000))):
-                raise TimeoutError("the copy owner did not confirm the checkout scope")
-            if any(descriptor != 8 for descriptor, _ in ready):
-                raise ValueError("a scope owner exited before launch")
-            if os.read(8, 6) != b"bound\n":
-                raise ValueError("the copy owner did not bind the checkout scope")
-        finally:
-            owners.unregister(8)
+        _ = os.write(9, os.fsencode(scope) + b"\n")
+        wait_for_checkout_confirmation(owners, 8, deadline)
     else:
         build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner), 9)
     if process_start_time(checkout.lease_owner) != owner_start:
         raise ValueError("the checkout lease owner exited during scope publication")
-    if time.monotonic() >= deadline:
-        raise TimeoutError("the checkout scope publication timed out")
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
@@ -240,6 +249,8 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                         raise ValueError("a scope owner exited before launch")
                     assert process.stdin is not None
                     with process.stdin as permission:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("the checkout scope publication timed out")
                         _ = os.write(permission.fileno(), b"launch\n")
                 _ = owners.poll()
             except ProcessLookupError:
