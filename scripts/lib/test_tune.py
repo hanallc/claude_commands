@@ -46,6 +46,27 @@ class TuneTests(PublicationTestCase):
             (repo.checkout / ".git/index").read_bytes(),
         )
 
+    def test_only_a_saved_guest_key_prints_the_hana_image_notice(self) -> None:
+        source = self.repository.checkout / 'hana_aws.conf'
+        _ = source.write_text('host=fixture-hana\nenabled=on\nspot_max_usd_per_hour=0.35\n')
+        for key, saved, expected in (
+            ('host', live_settings.StagedSave('fixture-hana', 1), 1),
+            ('enabled', live_settings.StagedSave('off', 1), 1),
+            ('spot_max_usd_per_hour', live_settings.StagedSave('0.25', 2), 0),
+            ('enabled', live_settings.UnchangedSave(), 0),
+        ):
+            with (self.subTest(key=key, saved=saved), mock.patch.object(conf, 'path', return_value=source),
+                    mock.patch.object(main_publish, 'checkout_of', return_value=self.repository.checkout),
+                    mock.patch.object(live_settings, 'stage_save', return_value=saved),
+                    mock.patch.object(live_settings, 'publish', return_value=[]),
+                    mock.patch.object(live_settings, 'start_readers', return_value=[]),
+                    mock.patch.object(live_settings, 'write_mac', return_value='Mac updated'),
+                    redirect_stdout(io.StringIO()) as output):
+                args = tune.RequestedValueChange(file='hana_aws', key=key, value='on')
+                self.assertEqual(tune.change(args), 0)
+            self.assertEqual(output.getvalue().splitlines().count(
+                'The Hana image is now stale. Build and register a current Hana image.'), expected)
+
     def test_invalid_file_key_value_or_empty_approval_refuses_without_changing_anything(self) -> None:
         cases = (
             ("missing", "amount", "3", "valid reason", "approved"),

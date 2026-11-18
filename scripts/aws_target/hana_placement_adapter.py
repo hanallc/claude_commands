@@ -361,7 +361,9 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
     if any(not any(row.record['claim_id'] == claim.execution for row in held) for claim in snapshot.claims):
         return placement.HostEvidenceUnavailable(key, snapshot.observed_at, 'A lifecycle claim has no readable target claim')
     eligibility: placement.HostEligibility = placement.AllowedHost()
-    if not isinstance(block, mac_test.NoMacBlock):
+    if not controller.image_is_current(snapshot.deployment, workload=workload):
+        eligibility = placement.FixedExclusion(placement.HANA_IMAGE_STALE)
+    elif not isinstance(block, mac_test.NoMacBlock):
         eligibility = placement.TemporaryExclusion('blocked')
     elif (held or snapshot.claims) and not own_claim:
         eligibility = placement.TemporaryExclusion('busy')

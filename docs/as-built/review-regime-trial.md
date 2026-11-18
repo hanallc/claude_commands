@@ -39,10 +39,11 @@ review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux 
 The checkpoint script passes the fields to `review_regime.py add`.
 The reader ignores unknown keys in old rows, including former simplify fields.
 
-`review_regime.Row` holds the unit, plan, phase, regime, times, holds, merge defects, findings, review minutes, and optional notes.
+`review_regime.Row` holds the unit, plan, phase, checkpoint, regime, times, holds, merge defects, findings, review minutes, and optional notes.
 The regime is `before`, `trial`, or `after`.
 `add` requires times with UTC offsets and refuses a merge time before the start time.
-It keeps an existing row for the same unit, plan, and phase.
+`add` resolves `--checkpoint` to a full commit hash in the current repository.
+It keeps an existing row for the same unit, plan, phase and checkpoint. An older row with no checkpoint matches only when its start time is also the same.
 
 `report [--since <ISO date>]` excludes rows with an `excluded` reason.
 It reports means for findings, holds, defects, and review times.
