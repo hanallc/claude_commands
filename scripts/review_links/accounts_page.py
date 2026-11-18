@@ -79,6 +79,19 @@ def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
     return Saved()
 
 
+def clear_next_move(group: str) -> Saved | Refused | SaveFailed:
+    """Remove the group's first entry and retain later entries."""
+    if group != "units" and group != "showrunners":
+        return Refused("Choose units or showrunners.")
+    try:
+        if not any(entry.group == group for entry in next_moves.read_next_moves()):
+            return Refused("The group has no next move.")
+        next_moves.remove_next_move(group, next_moves.FIRST_GROUP_POSITION)
+    except (OSError, ValueError) as error:
+        return SaveFailed(" ".join(str(error).split()))
+    return Saved()
+
+
 @dataclass(frozen=True)
 class AccountsRender:
     content: bytes
@@ -117,10 +130,40 @@ def _row_open(row: accounts.BoardRow) -> str:
     return f'<tr class="account"{move}>' if row["cells"]["label"] else f"<tr{move}>"
 
 
+def _next_cell(row: accounts.BoardRow, reading: accounts.StatusReading, labels: dict[str, accounts.BoardSpan]) -> str:
+    """Render the selected group's target or the reason this line has no target."""
+    if row["cells"]["label"] and row["cells"]["label"][0]["text"] == "total":
+        return ""
+    editable = row.get("group")
+    role = "".join(span["text"] for span in row["cells"]["roles"])
+    workers = role == "workers ✓"
+    if not editable and not workers:
+        return ('<span class="next-muted next-minus" title="Not the selected account for a role">'
+                + page_frame.icon_svg("minus") + '</span>')
+    group = editable["group"] if editable else "workers"
+    first = reading.first_next_moves
+    target = first.targets.get(group, "") if isinstance(first, accounts.FirstNextMoveTargets) else ""
+    if isinstance(first, accounts.NextMovesUnavailable):
+        content = '<span class="next-muted" title="' + html.escape(first.reason, quote=True) + '">unavailable</span>'
+    elif target:
+        content = _spans([labels.get(target, accounts.BoardSpan(text=target, tone="default", kind="bold"))])
+    elif editable:
+        content = '<span class="next-muted">none</span>'
+    else:
+        content = ('<span class="next-muted" title="Codex workers move between the Codex accounts by themselves">auto</span>')
+    if editable:
+        content += (f'<button type="button" class="next-button" data-next-button data-next-target="{html.escape(target, quote=True)}" '
+                    + f'aria-label="Choose the next account for {group}" aria-haspopup="menu" aria-expanded="false">'
+                    + page_frame.icon_svg("chevron-down") + '</button>')
+    return content
+
+
 def board(reading: accounts.StatusReading) -> str:
     """The accounts board table, then the upcoming moves and the problems."""
     table = accounts.status_board(reading)
     claude = {row.label for row in reading.rows if row.tool == "claude"}
+    labels = {line["cells"]["label"][0]["text"]: line["cells"]["label"][0]
+              for line in table["rows"] if line["cells"]["label"]}
     def target(spans: list[accounts.BoardSpan], left: list[accounts.BoardSpan]) -> list[str]:
         color = accounts.account_color(spans[0].get("color", ""))
         return [spans[0]["text"], "".join(span["text"] for span in left),
@@ -139,12 +182,14 @@ def board(reading: accounts.StatusReading) -> str:
                 + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
     # A headerless swatch column follows each column whose first span can carry a configured color.
     head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
-                   + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "") for column in table["columns"])
+                   + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "")
+                   + ('<th class="left">next</th>' if column["key"] == "roles" else "") for column in table["columns"])
     rows = "".join(
         _row_open(row)
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
                   + f'{_spans(row["cells"][column["key"]])}</td>'
                   + (f'<td class="left">{swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
+                  + (f'<td class="left next-cell">{_next_cell(row, reading, labels)}</td>' if column["key"] == "roles" else "")
                   for column in table["columns"])
         + "</tr>" for row in table["rows"])
     moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
@@ -232,7 +277,12 @@ background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* A thin red or amber digit falls under 4.5:1; the heavier stroke keeps it at the token contrast. */
 .error,.warning{font-weight:600}
-tr[data-move-group]{cursor:context-menu}
+.next-cell{white-space:nowrap}.next-muted{color:var(--ink-2)}
+.next-button{display:inline-flex;vertical-align:middle;margin-left:5px;padding:2px;border:0;border-radius:4px;
+background:transparent;color:var(--ink-2);cursor:pointer}
+.next-button:hover,.next-button:focus-visible{background:var(--hover)}
+.next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
+.move-menu button[aria-checked=true]{background:var(--hover)}
 .move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
 border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
 font-size:.86rem;font-variant-numeric:tabular-nums}
@@ -344,7 +394,7 @@ message.setAttribute('role','status');message.setAttribute('aria-live','polite')
 document.querySelector('[data-page-status]').append(message);
 let selected=null;
 const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
-let menuRow=null;
+let menuRow=null, menuButton=null;
 const pendingMoves=new Set();
 const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
  : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
@@ -440,40 +490,48 @@ popup.querySelector('[data-color-save]').addEventListener('click',()=>{
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
 function closeMenu(){
  if(!menuRow) return;
- menuRow=null;menu.hidden=true;menuItems.replaceChildren();updates.changed();
+ const button=menuButton;menuRow=null;menuButton=null;
+ menu.hidden=true;menuItems.replaceChildren();button.setAttribute("aria-expanded","false");
+ button.focus({preventScroll:true});updates.changed();
 }
 function menuItem([label,left,color,tone]){
  const item=document.createElement('button');
- item.type='button';item.setAttribute('role','menuitem');item.dataset.moveTarget=label;
+ item.type='button';item.setAttribute('role','menuitemradio');item.dataset.moveTarget=label;
+ item.setAttribute('aria-checked',String(label===menuButton.dataset.nextTarget));
  const name=document.createElement('span'), room=document.createElement('span');
  name.className='move-name';name.textContent=label;if(color) name.style.color=color;
  room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left && left!=='—' ? left+' left' : '';
  item.append(name,room);return item;
 }
-function openMenu(row,x,y){
+function openMenu(button){
+ const row=button.closest("tr"), box=button.getBoundingClientRect();
  if(selected) close(true);
  const card=view.querySelector('[data-move-targets]');
  const account=row.dataset.moveAccount, group=row.dataset.moveGroup;
  const targets=JSON.parse(card.dataset.moveTargets).filter(([label])=>label!==account);
- menuRow=row;
+ menuRow=row;menuButton=button;button.setAttribute("aria-expanded","true");
  menu.querySelector('[data-move-title]').textContent='When '+account+' reaches '+card.dataset.movePercent+'%, move '+group+' to';
  const empty=document.createElement('div');
  empty.className='move-empty';empty.textContent='No other Claude account';
  menuItems.replaceChildren(...(targets.length ? targets.map(menuItem) : [empty]));
+ if(button.dataset.nextTarget){
+  const clear=document.createElement('button');clear.type='button';clear.dataset.moveClear='first';
+  clear.setAttribute('role','menuitem');clear.textContent='No next move';menuItems.append(clear);
+ }
  menu.hidden=false;
  const size=menu.getBoundingClientRect();
- menu.style.left=Math.max(8,Math.min(x,innerWidth-size.width-8))+'px';
- menu.style.top=Math.max(8,Math.min(y,innerHeight-size.height-8))+'px';
+ menu.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
+ menu.style.top=Math.max(8,Math.min(box.bottom,innerHeight-size.height-8))+'px';
  (menuItems.querySelector('button') || menu).focus({preventScroll:true});
  updates.abandon();
 }
-async function saveMove(group,target){
- const save={group,target};
+async function saveMove(form){
+ const group=form.group, save={form};
  pendingMoves.add(save);message.textContent='';message.hidden=true;
  try{
   const response=await fetch(location.pathname,{method:'POST',
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-   body:new URLSearchParams({group,to:target}).toString()});
+   body:new URLSearchParams(form).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
  }catch(error){
@@ -483,18 +541,25 @@ async function saveMove(group,target){
   if(!hold()) void updates.refresh(true);
  }
 }
-document.addEventListener('contextmenu',event=>{
- const row=event.target instanceof Element ? event.target.closest('tr[data-move-group]') : null;
- if(!row){closeMenu();return;}
- event.preventDefault();closeMenu();openMenu(row,event.clientX,event.clientY);
+document.addEventListener('click',event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
+ if(!button) return;
+ const wasOpen=menuButton===button;closeMenu();if(!wasOpen) openMenu(button);
+});
+document.addEventListener('keydown',event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
+ if(!button || !['Enter',' '].includes(event.key)) return;
+ event.preventDefault();button.click();
 });
 document.addEventListener('pointerdown',event=>{
- if(menuRow && !(event.target instanceof Node && menu.contains(event.target))) closeMenu();
+ if(menuRow && !(event.target instanceof Node && (menu.contains(event.target) || menuButton.contains(event.target)))) closeMenu();
 });
 menu.addEventListener('click',event=>{
- const item=event.target instanceof Element ? event.target.closest('[data-move-target]') : null;
+ const item=event.target instanceof Element ? event.target.closest('[data-move-target],[data-move-clear]') : null;
  if(!item || !menuRow) return;
- void saveMove(menuRow.dataset.moveGroup,item.dataset.moveTarget);closeMenu();
+ const form=item.dataset.moveClear ? {group:menuRow.dataset.moveGroup,clear:'first'}
+  : {group:menuRow.dataset.moveGroup,to:item.dataset.moveTarget};
+ void saveMove(form);closeMenu();
 });
 menu.addEventListener('keydown',event=>{
  const items=[...menuItems.querySelectorAll('button')], at=items.indexOf(document.activeElement);
