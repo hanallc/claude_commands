@@ -314,7 +314,12 @@ Setup continues the update if the first probe run fails.
 Setup returns exit status 1 if any operation in the last probe run fails.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
-Setup refuses a stack that owns the instance or data disk. Run approved Hana teardown first.
+For a registered version-1 box, setup reads the original stack template and replaces only `ScalerPolicy`.
+The change set uses the previous value of every live parameter.
+The instance, data disk, and attachment stay in the stack.
+Setup saves the updated template hash and keeps the version-1 record.
+If the policy is current, setup runs the probe without executing a change set.
+Setup refuses a stack-owned box if it cannot confirm the saved resource identities.
 Setup refuses a change set that replaces or removes an instance, volume, or attachment.
 When a policy update fails, setup prints the failed step and the update error.
 When an ordinary stack change fails, setup reads failed stack events from the current change before cleanup.

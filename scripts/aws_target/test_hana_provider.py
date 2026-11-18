@@ -503,6 +503,6 @@ class HanaProviderTests(CostFixture):
                 mock.patch('sys.stdout', new_callable=StringIO) as output:
             self.assertFalse(subject.hana_setup())
         self.assertIn('persistent Spot', output.getvalue())
-        self.assertIn('placement remains disabled', output.getvalue())
+        self.assertIn('Hana placement is enabled. This command does not change it.', output.getvalue())
         self.assertEqual(self.fake.calls, [])
         self.assertFalse((self.state / 'hana/setup.json').exists())
