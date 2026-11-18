@@ -2849,9 +2849,12 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 154 — A buildlog report day never falls back to UTC by itself  · status: done
 
-`scripts/buildlog/report.py:1571` and `cli.py:253` set the user zone through `TZ` and `tzset()`. With `TZDIR` unset (NixOS), the zone name does not resolve, and the report day is UTC without a warning.
+#### As-built
 
-1. Resolve the zone without `TZDIR` (`zoneinfo`), or fail with a clear error. Never use UTC by itself.
-2. Test with `TZDIR` unset and with a wrong zone name.
+- Cause: `run_in_user_zone()` set `TZ` to the zone name. With `TZDIR` unset (NixOS), glibc did not resolve it and used UTC without a warning, so report days and SQL `localtime` days were wrong.
+- `scripts/buildlog/cli.py` gives glibc the absolute zone file (`TZ=":<path>"`) from `zoneinfo.TZPATH`, then from the `tzdata` package. It checks the process offset against `zoneinfo` at 12:00 UTC on 15 January and 15 July. A zone it cannot load exits 2 with the zone named.
+- Tests set `TZDIR` to an empty folder; the New York row fails on the old code. Rows cover a zone found only in `tzdata`, London, a wrong zone and an offset mismatch.
+- Blind review: 4 findings, all fixed in 1 round.
+- Checkpoint `4d730e56f`; row `64e6cb9bf` on main `d26b82cff`.
 
-**Files:** `scripts/buildlog/report.py`, `scripts/buildlog/cli.py`, and their tests.
+**Files:** `scripts/buildlog/cli.py`, `scripts/buildlog/test_report.py`.
