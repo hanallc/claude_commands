@@ -2625,7 +2625,7 @@ class AccountsTests(unittest.TestCase):
         inventory = import_module("scripts.agents.inventory")
         stale = showrunners.Showrunner(session="", socket="", name="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
-        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+        with (patch.object(accounts, "group_move_members", return_value=accounts.GroupMoveMembers((), (), False, frozenset())),
               patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations((
                   ShowrunnerRegistration("missing", stale["name"], stale["doc"]),))),
               patch.object(accounts, "move_sessions") as moved):
@@ -2649,7 +2649,7 @@ class AccountsTests(unittest.TestCase):
         inventory = import_module("scripts.agents.inventory")
         stale = [showrunners.Showrunner(session="", socket="", name=name, zone="America/New_York",
                                        doc=f"/w/doc-{name}-production.md") for name in ("first", "second")]
-        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+        with (patch.object(accounts, "group_move_members", return_value=accounts.GroupMoveMembers((), (), False, frozenset())),
               patch.object(inventory, "showrunner_registrations", return_value=ShowrunnerRegistrations(tuple(
                   ShowrunnerRegistration(runner["name"], runner["name"], runner["doc"]) for runner in stale))),
               patch.object(accounts, "move_sessions") as moved):
@@ -2664,6 +2664,57 @@ class AccountsTests(unittest.TestCase):
             self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
             self.assertIn(f"--production {runner['name']}", line)
         moved.assert_not_called()
+
+    def test_showrunner_timer_uses_running_session_with_unreadable_account(self) -> None:
+        from scripts.agents.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "other@example.invalid")
+        runner = fixture_member("showrunner", name="timer-runner")
+        inventory = import_module("scripts.agents.inventory")
+        registrations = ShowrunnerRegistrations((
+            ShowrunnerRegistration(runner.current_session, runner.name, "plan.md"),))
+        evidence = accounts.LocalRoleSessions({}, {group: [] for group in accounts.CLAUDE_GROUPS},
+            (), (), (), False, frozenset({runner.current_session}))
+        with (patch("scripts.accounts.accounts._read_local_role_sessions", return_value=evidence),
+              patch.object(inventory, "showrunner_registrations", return_value=registrations),
+              patch.object(accounts, "move_sessions", return_value=()) as moved):
+            for flags in (("--dry-run",), ()):
+                with self.subTest(flags=flags):
+                    code, output, error = self.run_cli("move", "showrunners", "claude3", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    self.assertNotIn("no session runs under the id", output)
+            moved.assert_called_once()
+            self.assertEqual(moved.call_args.args[0], (runner.current_session,))
+
+    def test_group_move_and_preview_report_an_incomplete_member_list(self) -> None:
+        from scripts.agents.inventory import ShowrunnerRegistration, ShowrunnerRegistrations
+
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "other@example.invalid")
+        inventory = import_module("scripts.agents.inventory")
+        registrations = ShowrunnerRegistrations((ShowrunnerRegistration("unseen", "runner", "plan.md"),))
+        for cause in ("missing folder", "unreadable record"):
+            registry = self.root / cause
+            if cause == "unreadable record":
+                registry.mkdir()
+                _ = (registry / "unfinished.json").write_text("{")
+            with (self.subTest(cause=cause), patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+                  patch.object(sessions, "read_registry", wraps=sessions.read_registry) as read,
+                  patch.object(inventory, "showrunner_registrations", return_value=registrations),
+                  patch.object(accounts, "set_group_account") as select,
+                  patch.object(accounts, "move_sessions") as moved):
+                for flags in (("--dry-run",), ()):
+                    with self.subTest(flags=flags):
+                        read.reset_mock()
+                        code, output, error = self.run_cli("move", "showrunners", "claude3", *flags)
+                        self.assertEqual((code, error), (0, ""))
+                        self.assertIn("showrunners: member list is incomplete", output)
+                        self.assertNotIn("no live session moves", output)
+                        self.assertNotIn("no session runs under the id", output)
+                        read.assert_called_once_with(dependencies=ANY)
+                select.assert_called_once()
+                moved.assert_not_called()
 
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)

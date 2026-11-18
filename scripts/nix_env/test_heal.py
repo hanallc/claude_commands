@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext, redirect_stderr
 from dataclasses import replace
+import errno
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -56,7 +59,7 @@ class HealTests(NixFixture):
 
         with (patch.object(heal, "state_directory", side_effect=configured_directory),
               patch.object(fcntl, "flock", side_effect=lock),
-              patch.object(heal, "list_sessions", return_value=[self.session]),
+              patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((self.session,))),
               patch.object(heal, "inspect", return_value=heal.Unavailable("fixture metadata"))):
             self.assertEqual(heal.sweep(), 0)
             self.assertEqual(locked_paths, [first / "state.lock"])
@@ -81,7 +84,7 @@ class HealTests(NixFixture):
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = write_config_fixture(settings,
             "command_timeout_seconds=550\nrelaunch_launch_seconds=25\nrelaunch_confirmation_seconds=15\n")
-        with (patch.object(heal, "list_sessions", return_value=[]),
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())),
               patch.object(time, "time", return_value=1100.0), patch.object(heal, "alert") as alert):
             self.assertEqual(heal.sweep(), 0)
             alert.assert_not_called()
@@ -122,7 +125,7 @@ class HealTests(NixFixture):
             self.assertFalse(heal.broken(self.session))
         self.assertEqual(self.direnv_calls(), [])
 
-    def test_registry_reads_all_config_dirs_and_ignores_corrupt_or_reused_entries(self) -> None:
+    def test_registry_reads_all_config_dirs_and_retains_unreadable_paths(self) -> None:
         _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "nix_env.conf",
                                  "session_directory_glob=.claude*/sessions\n")
         for number, name in enumerate((".claude", ".claude3"), 1):
@@ -135,10 +138,12 @@ class HealTests(NixFixture):
             _ = (directory / "corrupt.json").write_text("{half written")
         with patch.object(sessions, "process_start", return_value="fixture-start"):
             found = heal.list_sessions()
-        self.assertEqual({item.session_id for item in found}, {"sid-1", "sid-2"})
-        self.assertEqual({item.config_dir.name for item in found}, {".claude", ".claude3"})
+        self.assertEqual({item.session_id for item in found.sessions}, {"sid-1", "sid-2"})
+        self.assertEqual({item.config_dir.name for item in found.sessions}, {".claude", ".claude3"})
+        unreadable = tuple(self.home / name / "sessions/corrupt.json" for name in (".claude", ".claude3"))
+        self.assertEqual(found.unreadable, unreadable)
         with patch.object(sessions, "process_start", return_value="reused"):
-            self.assertEqual(heal.list_sessions(), [])
+            self.assertEqual(heal.list_sessions(), heal.HealSessionRead((), unreadable))
         self.assertNotIn("NOTIFIER_SESSIONS_DIR", os.environ)
 
     def test_mac_process_arguments_cannot_pose_as_nix_environment(self) -> None:
@@ -157,7 +162,7 @@ class HealTests(NixFixture):
         def observation(session: heal.HealSession) -> heal.Healthy | heal.Broken:
             return heal.Healthy() if (session.session_id, session.pid) in healthy else heal.Broken()
 
-        _ = self.enterContext(patch.object(heal, "list_sessions", side_effect=lambda: list(registry)))
+        _ = self.enterContext(patch.object(heal, "list_sessions", side_effect=lambda: heal.HealSessionRead(tuple(registry))))
         _ = self.enterContext(patch.object(heal, "inspect", side_effect=observation))
         held = cast(Mock, self.enterContext(patch.object(heal, "hold_reason", return_value="")))
         ensure = cast(Mock, self.enterContext(patch.object(nix_env, "ensure", return_value=nix_env.Loaded({"IN_NIX_SHELL": "impure"}, self.work / ".envrc"))))
@@ -247,7 +252,7 @@ class HealTests(NixFixture):
                     _ = heal.sweep()
                 run.reset_mock()
                 run.side_effect = complete
-                with (patch.object(heal, "list_sessions", return_value=[]),
+                with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())),
                       patch.object(heal, "stop_completion", return_value=heal.StopPending()),
                       patch.object(sessions, "process_start", return_value=identity)):
                     self.assertEqual(heal.sweep(), 0)
@@ -296,7 +301,7 @@ class HealTests(NixFixture):
         run.assert_not_called()
         self.assertEqual(len(self.records()), 1)
         held.return_value = ""
-        with patch.object(heal, "list_sessions", return_value=[replace(self.session, status="busy")]):
+        with patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((replace(self.session, status="busy"),))):
             self.assertEqual(heal.sweep(), 0)
         ensure.assert_not_called()
         run.assert_not_called()
@@ -380,7 +385,7 @@ class HealTests(NixFixture):
         with patch.object(time, "time", return_value=10000):
             self.assertEqual(heal.sweep(), 0)
         replacement = replace(self.session, pid=812, proc_start="replacement")
-        with (patch.object(heal, "list_sessions", return_value=[replacement]),
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((replacement,))),
               patch.object(time, "time", return_value=10030)):
             self.assertEqual(heal.sweep(), 0)
             self.assertEqual(heal.sweep(), 0)
@@ -464,9 +469,10 @@ class HealTests(NixFixture):
         self.assertEqual(self.records()[-1]["action"], "pending")
         # The stopped process has left the registry; recovery must use the journal.
         held.return_value = ""
-        with patch.object(heal, "list_sessions", return_value=[]) as registry:
+        with patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())) as registry:
             self.assertEqual(heal.sweep(), 0)
-            registry.return_value = [replace(self.session, pid=10811, proc_start="restarted-start-811")]
+            replacement = replace(self.session, pid=10811, proc_start="restarted-start-811")
+            registry.return_value = heal.HealSessionRead((replacement,))
             self.assertEqual(heal.sweep(), 0)
         commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
         self.assertEqual([command[2] for command in commands], ["stop", "resume"])
@@ -550,7 +556,7 @@ class HealTests(NixFixture):
                 # Delayed success after a timeout must clear the reservation,
                 # rather than start another copy of the session.
                 replacement = replace(self.session, pid=912, proc_start="late-replacement")
-                with (patch.object(heal, "list_sessions", return_value=[replacement]),
+                with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((replacement,))),
                       patch.object(heal, "inspect", return_value=heal.Healthy())):
                     self.assertEqual(heal.sweep(), 0)
                 self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
@@ -568,24 +574,123 @@ class HealTests(NixFixture):
         self.assertEqual(heal.sweep(), 0)
         self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
         replacement = replace(self.session, pid=913, proc_start="confirmed-replacement")
-        with (patch.object(heal, "list_sessions", return_value=[replace(replacement, config_dir=self.home / ".claude-wrong")]) as registry,
+        path = self.root / "unreadable.json"
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((), (path,))) as registry,
               patch.object(heal, "inspect", return_value=heal.Healthy())):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(heal.sweep(), 0)
+            self.assertEqual(self.records()[-1]["reason"], f"session registry unreadable: {path}")
+            self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
+            registry.return_value = heal.HealSessionRead((replace(replacement, config_dir=self.home / ".claude-wrong"),))
             self.assertEqual(heal.sweep(), 0)
             self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "launching")
-            registry.return_value = [replacement]
+            registry.return_value = heal.HealSessionRead((replacement,))
             self.assertEqual(heal.sweep(), 0)
         self.assertEqual(heal.read_history(heal.state_directory())[self.session.session_id]["pending"]["kind"], "none")
         self.assertEqual(run.call_count, 2)
         self.assertEqual(ensure.call_count, 2)
         self.assertEqual(self.records()[-1]["action"], "restart")
 
+    def test_registry_discovery_keeps_a_denied_account_directory(self) -> None:
+        configured = self.root / "configured-sessions"
+        configured.mkdir()
+        denied = self.home / ".claude7" / "sessions"
+        denied.parent.mkdir(parents=True)
+        stat = Path.stat
+
+        def stat_path(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path == denied:
+                raise PermissionError(path)
+            return stat(path, follow_symlinks=follow_symlinks)
+
+        with (patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(configured)}),
+              patch.object(Path, "stat", stat_path), redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(heal.sweep(check=True), 1)
+        self.assertIn(f"session registry unreadable: {denied}", errors.getvalue())
+
+    def test_recursive_registry_discovery_keeps_nested_records_and_denied_paths(self) -> None:
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "nix_env.conf",
+                                 "session_directory_glob=.claude*/**/sessions\n")
+        configured = self.root / "configured-sessions"
+        configured.mkdir()
+        nested = self.home / ".claude3" / "nested" / "account" / "sessions"
+        nested.mkdir(parents=True)
+        _ = (nested / "live.json").write_text(json.dumps({
+            "pid": 811, "procStart": "start-811", "sessionId": "nested", "name": "worker",
+            "messagingSocketPath": "", "updatedAt": 1, "cwd": str(self.work), "status": "idle",
+        }))
+        denied = self.home / ".claude3" / "denied"
+        denied.mkdir()
+        scandir = os.scandir
+        denied_is_dir = Mock(side_effect=PermissionError(errno.EACCES, "denied"))
+        denied_entry = Mock(spec=os.DirEntry, is_dir=denied_is_dir)
+        denied_entry.name = denied.name
+
+        for operation in ("scandir", "is_dir"):
+            def scan(path: Path | str) -> object:
+                if operation == "scandir" and Path(path) == denied:
+                    raise PermissionError(errno.EACCES, "denied", str(denied))
+                if operation == "is_dir" and Path(path) == denied.parent:
+                    with scandir(path) as entries:
+                        return nullcontext(iter([denied_entry if entry.name == denied.name else entry for entry in entries]))
+                return scandir(path)
+
+            with (self.subTest(operation=operation),
+                  patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(configured)}),
+                  patch.object(os, "scandir", side_effect=scan),
+                  patch.object(sessions, "headless", return_value=False),
+                  patch.object(sessions, "process_start", return_value="start-811"),
+                  patch.object(heal, "inspect", return_value=heal.Healthy()),
+                  redirect_stderr(io.StringIO()) as errors):
+                found = heal.list_sessions()
+                self.assertEqual(tuple(item.session_id for item in found.sessions), ("nested",))
+                self.assertEqual(found.unreadable, (denied,))
+                self.assertEqual(heal.find_session("missing"),
+                                 heal.Unavailable(f"session registry unreadable: {denied}"))
+                self.assertEqual(heal.sweep(check=True), 1)
+                self.assertEqual(errors.getvalue(), f"nix-heal: session registry unreadable: {denied}\n")
+
+    def test_unreadable_fresh_registry_prevents_a_stop_after_loading_the_environment(self) -> None:
+        held, ensure, run = self.install_sweep([self.session])
+        held.return_value = ""
+        path = self.root / "unreadable.json"
+        with patch.object(heal, "list_sessions", side_effect=[
+                heal.HealSessionRead((self.session,)), heal.HealSessionRead((), (path,))]):
+            self.assertEqual(heal.sweep(), 0)
+        ensure.assert_called_once()
+        run.assert_not_called()
+        self.assertEqual(self.records()[-1]["reason"], f"session registry unreadable: {path}")
+
+    def test_incomplete_registry_cannot_prove_absence_or_health(self) -> None:
+        for cause in ("missing folder", "unreadable record", "readable empty folder"):
+            registry = self.root / cause
+            if cause != "missing folder":
+                registry.mkdir()
+            unreadable = registry
+            if cause == "unreadable record":
+                unreadable = registry / "unfinished.json"
+                _ = unreadable.write_text("{")
+            with (self.subTest(cause=cause), patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+                  patch.object(sessions, "process_start", side_effect=AssertionError("unexpected process probe")),
+                  redirect_stderr(io.StringIO()) as errors):
+                found = heal.find_session("missing")
+                if cause == "readable empty folder":
+                    self.assertEqual(found, heal.Gone())
+                    self.assertEqual(heal.sweep(check=True), 0)
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    reason = f"session registry unreadable: {unreadable}"
+                    self.assertEqual(found, heal.Unavailable(reason))
+                    self.assertEqual(heal.sweep(check=True), 1)
+                    self.assertEqual(errors.getvalue(), f"nix-heal: {reason}\n")
+
     def test_check_requires_a_live_healthy_session_to_clear_alert(self) -> None:
-        with patch.object(heal, "list_sessions", return_value=[]):
+        with patch.object(heal, "list_sessions", return_value=heal.HealSessionRead(())):
             self.assertEqual(heal.sweep("missing", check=True), 1)
-        with (patch.object(heal, "list_sessions", return_value=[self.session]),
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((self.session,))),
               patch.object(heal, "inspect", return_value=heal.Unavailable("metadata unreadable"))):
             self.assertEqual(heal.sweep("fixture", check=True), 1)
-        with (patch.object(heal, "list_sessions", return_value=[self.session]),
+        with (patch.object(heal, "list_sessions", return_value=heal.HealSessionRead((self.session,))),
               patch.object(heal, "inspect", return_value=heal.Healthy())):
             self.assertEqual(heal.sweep("fixture", check=True), 0)
 

@@ -84,7 +84,7 @@ else:
         return send.Result('sent','fake sink')
     def transport(command,stdin,timeout):
         options=send.parse(command[2:])._replace(shown_sender=send.ShownSender(g.NOTICE_SENDER))
-        with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'codex_session',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
+        with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'deliver_codex',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
             result=send.send(options)
         return send_result.EXIT[result.outcome],result.outcome.upper()+': '+result.detail,''
     sys.stdin=io.StringIO(json.dumps(request))
