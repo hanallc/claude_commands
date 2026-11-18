@@ -3287,8 +3287,10 @@ if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item
    const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
    await refreshed;
+   row().querySelector('.list-toggle').click();
    content.querySelector('[data-show-chip="Done"]').click();
-   check(row()?.dataset.state==='Done' && !row().hidden,'The confirmed Change appears in the Done list.');
+   check(row()?.dataset.state==='Done' && !row().hidden && row().querySelector('[data-detail]').hidden,
+    'The confirmed Change appears in the Done list after its linked card closes.');
   }else{
    check(content.dataset.show==='open' && !row(),'A reload restores Open when the address names a Done Change.');
   }
@@ -3310,11 +3312,11 @@ if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item
         _ = self.question()
         setup = r"""<script>
 const sendProbe=fetch;
-let finishSave;
+let finishSave,savedState;
 window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
  if(options.method!=='POST') return sendProbe(url,options);
- return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',state:'Done'}));});
+ return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',state:savedState}));});
 };
 </script>"""
         probe = r"""<script>
@@ -3323,9 +3325,14 @@ window.fetch=(url,options={})=>{
  const content=document.querySelector('[data-review]');
  const row=key=>content.querySelector('[data-key="'+key+'"]');
  const fetchCard=fetch;
- window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
-  ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
-  : fetchCard(url,options);
+ let snapshot;
+ window.fetch=(url,options)=>{
+  const params=new URL(url,location.href).searchParams;
+  if(params.has('index') && snapshot) return Promise.resolve(Response.json(snapshot));
+  if(params.has('version') && !params.has('body'))
+   return Promise.resolve(Response.json({version:snapshot?.version ?? content.dataset.version,facts:pageRefreshFacts()}));
+  return fetchCard(url,options);
+ };
  const afterHash=()=>new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
  const follow=async key=>{
   const changed=afterHash();
@@ -3334,7 +3341,7 @@ window.fetch=(url,options={})=>{
  };
  try{
   const question=content.querySelector('[data-type="question"][data-list-item]').dataset.key;
-  for(const [key,action] of [['page-owner/C1','works'],[question,'answer']]){
+  for(const [key,action] of [['page-owner/C1','works'],[question,'answer'],['page-owner/C3','validate']]){
    await follow(key);
    const form=await readyReviewCard(row(key));
    form.elements.feedback.value='The saved words.';
@@ -3351,8 +3358,20 @@ window.fetch=(url,options={})=>{
    history.replaceState(previous.state,'',previous.href);
    dispatchEvent(new PopStateEvent('popstate',{state:previous.state}));
    dispatchEvent(new HashChangeEvent('hashchange',{oldURL,newURL:previous.href}));
+   savedState=action==='validate' ? 'Validating' : 'Done';
+   const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
+   if(action==='validate'){
+    const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+    snapshot={index,version:'handoff-publication-pending',facts:pageRefreshFacts()};
+   }
    finishSave();await saved;
    const target=row(key),item=new URLSearchParams(location.hash.slice(1)).get('item');
+   if(action==='validate'){
+    await refreshed;
+    if(item!==key || content.dataset.version!==snapshot.version || row(key))
+     failures.push('The deferred link keeps the Validating marker when a new snapshot still shows the old Change.');
+    continue;
+   }
    if(item!==key || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
     failures.push('Back keeps the link and opens the Done card for '+key+'.');
   }

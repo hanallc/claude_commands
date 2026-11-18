@@ -1239,7 +1239,8 @@ const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 function followItemLink(options){
  return view.followItemLink({...options,beforeJump:key=>{
   if(pendingSaves.has(key)) return false;
-  if(!saved.get(key)?.closes && !saved.get(key)?.question) saved.delete(key);
+  const marker=saved.get(key);
+  if(marker && !marker.closes && !marker.question && !marker.handed) saved.delete(key);
   return true;
  }});
 }
