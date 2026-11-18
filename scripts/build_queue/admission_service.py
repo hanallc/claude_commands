@@ -352,6 +352,7 @@ class ReservationRecord:
     charge_use: test_phase.TestPhaseChargeUse | test_phase.NoTestPhaseChargeUse = test_phase.NoTestPhaseChargeUse()
     run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
     place: wire.LocalPlace | wire.CloudPlace = wire.LocalPlace()
+    cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
 
 
 def reservation_row(record: ReservationRecord) -> records.Reservation:
@@ -1413,7 +1414,8 @@ class AdmissionServer:
     def _restore(self) -> None:
         path = self.state_dir / "state.json"
         if path.exists():
-            state = read_state(self.state_dir)
+            self._persisted = path.read_text()
+            state = parse_service_state(self._persisted, warn_missing_folders=True)
             for record in state.reservations.values():
                 self.writes.register(record)
             self.reservations, self.places = state.reservations, state.places
@@ -1426,7 +1428,6 @@ class AdmissionServer:
             self.placement_requests = state.placement_requests
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
-            self._persisted = wire.encode_record(state)
         self.persist()
         for episode, record in list(self.reservations.items()):
             if not self._end_if_finished(episode, record):
@@ -1460,7 +1461,19 @@ class AdmissionServer:
         self._prune_runs()
         self._claim_slots()
         remaining = gate.inputs_after_reservations_end(inputs, self._live_reservation_ids())
-        return replace(remaining, slots=tuple(self.slots.values()))
+        occupied = self._occupied_local_cargo_folders()
+        local_owners = {records.waiter_owner(row) for _, row in remaining.ordered}
+        folders = {owner: request.constraints.cargo_folder
+                   for episode, waiting in self.waiters.items()
+                   if (owner := records.waiter_owner(waiting.row)) in local_owners
+                   and (request := self.placement_requests.get(episode)) is not None
+                   and isinstance(request.constraints.cargo_folder, placement.CargoFolder)}
+        if occupied:
+            for key, slot in list(self.slots.items()):
+                if isinstance(slot, records.ContinuationSlot) and folders.get(slot.owner) in occupied:
+                    del self.slots[key]
+        return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
+                       occupied_cargo_folders=occupied)
 
     def persist(self) -> None:
         now = self.clock.now()
@@ -2132,6 +2145,8 @@ class AdmissionServer:
                                              if records.waiter_owner(row) not in held_owners])
         inputs = self._placement_pass(inputs, policy)
         result = gate.admission_pass(inputs, inputs.now, policy)
+        for reservation in result.policy.returned_claims:
+            del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
         cloud_started = self._cloud_pass(inputs, self.configuration)
@@ -2147,6 +2162,7 @@ class AdmissionServer:
             waiting = self.waiters.get(episode)
             if waiting is None:
                 continue
+            cargo_folder = inputs.cargo_folders.get(decision.owner, placement.NoCargoFolder())
             placement_request = self.placement_requests.get(episode)
             if placement_request is not None:
                 candidate = next(candidate for candidate in self.placement_eligibility[episode]
@@ -2154,19 +2170,29 @@ class AdmissionServer:
                 assignment = self._new_assignment(placement_request, candidate.destination)
                 key = placement.attempt_key(episode, assignment.attempt)
                 self.assignments[key] = replace(self.assignments[key], permission=placement.PermissionConsumed(inputs.now))
+                if isinstance(cargo_folder, placement.CargoFolder):
+                    for slot_key, slot in list(self.slots.items()):
+                        if isinstance(slot, records.ContinuationSlot) and inputs.cargo_folders.get(slot.owner) == cargo_folder:
+                            del self.slots[slot_key]
             proposed = cast(gate.ProposedAdmission, decision.admission)
             self.spacing = proposed.spacing
-            self._admit(waiting, config, self.configuration.peak_history_share_percent)
+            self._admit(waiting, config, self.configuration.peak_history_share_percent, cargo_folder=cargo_folder)
         self.persist()
         waiting_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
             row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
             for (_, row), decision in zip(inputs.ordered, result.rows, strict=True))
+        positions = {row.owner: position for position, row in enumerate(result.rows, 1)}
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
             if episode in self.waiters:
                 waiting = self.waiters[episode]
                 reason = decision.reason
-                reply = wire.Wait(reason, position, head_label, reason_phrase(reason, waiting_steps),
+                cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+                order = decision.decision.order_hold
+                text = (f"behind #{positions[records.waiter_owner(order.waiter)]}"
+                        if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead)
+                        else reason_phrase(reason, waiting_steps))
+                reply = wire.Wait(reason, position, head_label, text,
                     self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder,
                                         head_label, head_need))
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
@@ -2188,7 +2214,9 @@ class AdmissionServer:
         try:
             ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority), policy)
+                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority,
+                        slots=tuple(slot for slot in inputs.slots
+                            if gate.between_steps(slot).reservation not in result.policy.returned_claims)), policy)
         except OSError:
             # An old snapshot expires without changing the admission result.
             pass
@@ -2217,7 +2245,7 @@ class AdmissionServer:
             if self.waiters.get(waiting.request.episode) is not waiting:
                 continue
             if used < slots:
-                self._admit(waiting, config, configuration.peak_history_share_percent)
+                self._admit(waiting, config, configuration.peak_history_share_percent, cargo_folder=placement.NoCargoFolder())
                 used += 1
                 started = True
                 continue
@@ -2454,7 +2482,8 @@ class AdmissionServer:
             history_path=self.state_dir / "anon_peaks.jsonl", config=config, share_percent=share_percent)
         return replace(record, test_phase_need=need)
 
-    def _admit(self, waiting: WaitingAdmission, config: records.MemoryConfig, share_percent: int) -> None:
+    def _admit(self, waiting: WaitingAdmission, config: records.MemoryConfig, share_percent: int, *,
+               cargo_folder: placement.CargoFolder | placement.NoCargoFolder) -> None:
         request, profile = waiting.request, waiting.request.profile
         now = self.clock.now()
         if isinstance(request, wire.LaunchRequest):
@@ -2477,7 +2506,7 @@ class AdmissionServer:
                 request.test_width, request.call, stem.name, records.stored_waiter(waiting.row),
                 profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
                 profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
-                shape, run=request.run, place=request.place)
+                shape, run=request.run, place=request.place, cargo_folder=cargo_folder)
             self.writes.register(record)
             if not cloud:
                 record = self._freeze_test_phase_need(record, config, share_percent)
@@ -3258,9 +3287,15 @@ done
         owner = records.waiter_owner(self._placement_row(request))
         position = next((index for index, (_, row) in enumerate(ordered, 1)
                          if records.waiter_owner(row) == owner), len(ordered) + 1)
+        waiting = self.waiters.get(request.episode)
+        if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
+            reason = waiting.last_reply.reason
+            cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+            if isinstance(cause, placement.CargoFolderWait):
+                return wire.PlacementWait(request.episode, request.since, position, candidates,
+                    waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
         if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
             return wire.PlacementWait(request.episode, request.since, position, candidates, provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
-        waiting = self.waiters.get(request.episode)
         blocked = [candidate for candidate in candidates
             if isinstance(candidate.eligibility, placement.TemporaryExclusion)
             and candidate.eligibility.reason in ("blocked", "busy", "starting")]
@@ -3286,6 +3321,15 @@ done
         return wire.PlacementWait(request.episode, request.since, position,
             self.placement_eligibility.get(request.episode, ()), provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
 
+    def _occupied_local_cargo_folders(self) -> frozenset[placement.CargoFolder]:
+        """Keep each local folder occupied until its reservation ends."""
+        # Automatic cleanup waits for owner exit and an empty or absent scope.
+        # ReleaseRequest and TokenWaitRequest skip the scope check. The caller must stop Cargo first.
+        # Verify drains the scope before a normal release.
+        return frozenset(record.cargo_folder for record in self.reservations.values()
+                         if isinstance(record.place, wire.LocalPlace)
+                         and isinstance(record.cargo_folder, placement.CargoFolder))
+
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy) -> records.QueueInputs:
         """Remove remote selections before the local planner commits any effects."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
@@ -3294,6 +3338,7 @@ done
             return inputs
         owners = {records.waiter_owner(self._placement_row(request)): request
                   for request in self.placement_requests.values() if self._placement_waiting(request)}
+        local_occupied = inputs.occupied_cargo_folders
         preview_ordered: list[tuple[Path, records.Waiter]] = []
         for path, row in inputs.ordered:
             request = owners.get(records.waiter_owner(row))
@@ -3332,7 +3377,10 @@ done
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
             for candidate in self.placement_eligibility.get(request.episode, ()):
-                if (initial_readiness_unchecked and candidate.destination.provider == "local"
+                destination = candidate.destination
+                if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
+                    continue
+                if (initial_readiness_unchecked and destination.provider == "local"
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
@@ -3350,17 +3398,17 @@ done
                         cast(placement.SpeculativeCopy, copy.purpose), copy.episode))
                     if newest.episode != request.episode:
                         continue
-                if candidate.destination.provider == "local":
+                if destination.provider == "local":
                     if owner in local_starts:
                         break
                     continue
-                if candidate.destination.provider == "scaler":
+                if destination.provider == "scaler":
                     continue
-                if (any(same_remote_resource(destination, candidate.destination) for destination in taken)
-                        or self._held_for_older(request, candidate.destination, held, holds)):
+                if (any(same_remote_resource(other, destination) for other in taken)
+                        or self._held_for_older(request, destination, held, holds)):
                     continue
-                _ = self._new_assignment(request, candidate.destination)
-                taken.append(candidate.destination)
+                _ = self._new_assignment(request, destination)
+                taken.append(destination)
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     held_copy_destinations.append(candidate.destination)
                 _ = self.waiters.pop(request.episode, None)
@@ -3612,6 +3660,13 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+            elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
+                    and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
+                try:
+                    canonical = placement.CargoFolder(folder.path.resolve())
+                except (OSError, ValueError) as error:
+                    return [wire.Refused(f"cannot resolve the Cargo folder: {error}")]
+                request = replace(request, constraints=replace(request.constraints, cargo_folder=canonical))
             if (isinstance(connection, Connection) and previous == request
                     and not isinstance(self.system_reader, NoSystemReader)
                     and self.system_reader.latest.started_monotonic <= self.last_pass_started
@@ -4459,8 +4514,10 @@ ADMISSION_CALLERS = {
 }
 
 def read_state(directory: Path) -> ServiceState:
-    text = (directory / "state.json").read_text()
+    return parse_service_state((directory / "state.json").read_text())
 
+
+def parse_service_state(text: str, *, warn_missing_folders: bool = False) -> ServiceState:
     def check_placement_shape(value: object) -> None:
         if isinstance(value, list):
             for child in cast(list[object], value):
@@ -4474,8 +4531,31 @@ def read_state(directory: Path) -> ServiceState:
             for child in row.values():
                 check_placement_shape(child)
 
-    check_placement_shape(cast(object, json.loads(text)))
-    return wire.parse_record(text, ServiceState)
+    raw_state = cast(dict[str, object], json.loads(text))
+    check_placement_shape(raw_state)
+    state = wire.parse_record(text, ServiceState)
+    saved_reservations = cast(dict[str, dict[str, object]], raw_state["reservations"])
+    legacy_episodes = {episode for episode, record in saved_reservations.items() if "cargo_folder" not in record}
+    if not legacy_episodes:
+        return state
+    # A consumed local assignment proves that the service granted this owner a local start.
+    local_grants = {(assignment.episode, assignment.owner.pid, assignment.owner.start_time)
+                    for saved in state.assignments.values() for assignment in (saved.assignment,)
+                    if assignment.destination.provider == "local"
+                    and isinstance(saved.permission, placement.PermissionConsumed)}
+    for episode in legacy_episodes:
+        record = state.reservations[episode]
+        if not isinstance(record.place, wire.LocalPlace):
+            continue
+        submitted = state.placement_requests.get(episode)
+        grant = (episode, record.owner.pid, record.owner.start_time)
+        if (submitted is not None and grant in local_grants
+                and (submitted.owner.pid, submitted.owner.start_time) == (record.owner.pid, record.owner.start_time)):
+            state.reservations[episode] = replace(record, cargo_folder=submitted.constraints.cargo_folder)
+        elif warn_missing_folders:
+            print(f"memory admission: cannot recover the Cargo folder for reservation {record.reservation_id}",
+                  file=sys.stderr)
+    return state
 
 
 def state_check(directory: Path) -> int:

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from scripts.production import showrunners, staff, unit_lookup  # noqa: E402
+from scripts.production import record_store, showrunners, staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
 from scripts.production.proposals_folder import issues_folder  # noqa: E402
@@ -79,15 +79,30 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
             copies.remove_trees(owner)
     except copies.CopyError as error:
         raise TidyRefused(str(error)) from error
+    roots = {root for kind in record_store.RecordKind
+             for root in record_store.staff_store_folders(kind, members=identities.record)}
+    protected = roots.union(record_store.archive_folders(roots))
     removed: list[Path] = []
-    for path in paths:
+
+    def clean(path: Path) -> None:
+        location = path.resolve()
+        if any(location.is_relative_to(root) for root in protected):
+            return
+        if any(root.is_relative_to(location) and root.exists() for root in protected):
+            if path.is_dir() and not path.is_symlink():
+                for child in path.iterdir():
+                    clean(child)
+            return
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path)
         elif path.exists() or path.is_symlink():
             path.unlink()
         else:
-            continue
+            return
         removed.append(path)
+
+    for path in paths:
+        clean(path)
     return removed
 
 

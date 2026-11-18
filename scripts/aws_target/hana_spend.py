@@ -9,7 +9,7 @@ from threading import Lock
 import time
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import hana_guest, ledger
+from scripts.aws_target import hana_guest, ledger, remote
 from scripts.lib import conf
 
 
@@ -18,6 +18,7 @@ class PermitSettings:
     enabled: bool
     region: str
     instance_type: str
+    fallback_instance_types: tuple[str, ...]
     spot_max_usd_per_hour: Decimal
     root_gib: int
     data_gib: int
@@ -34,8 +35,13 @@ class PermitSettings:
 def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
     """Read workload limits without reading AWS credentials or deployment state."""
     safety = hana_guest.read_settings(configuration)
-    values = PermitSettings(safety.enabled, configuration.text('region'), configuration.text('instance_type'),
-        conf.decimal(configuration.text('spot_max_usd_per_hour')), configuration.whole('root_gib'), configuration.whole('data_gib'),
+    instance_type = configuration.text('instance_type')
+    fallback = tuple(item.strip() for item in configuration.text('fallback_instance_types').split(','))
+    if not all(fallback) or len(set((instance_type, *fallback))) != 1 + len(fallback):
+        raise ValueError('fallback_instance_types must contain distinct types and no empty items')
+    values = PermitSettings(safety.enabled, configuration.text('region'), instance_type, fallback,
+        conf.decimal(configuration.text('spot_max_usd_per_hour')),
+        configuration.whole('root_gib'), configuration.whole('data_gib'),
         conf.decimal(configuration.text('daily_budget_usd')), conf.decimal(configuration.text('gp3_usd_per_gib_month')),
         safety.permit_max_seconds, safety.guard_grace_seconds)
     if (not values.region or not values.instance_type or min(values.root_gib, values.data_gib) <= 0
@@ -204,6 +210,29 @@ class HanaSpending:
         """Reserve approved setup without enabling placement or command permission."""
         return self._reserve_compute(now, expires, expected_generation=0, approved_setup=True)
 
+    def record_setup_instance_type(self, generation: int, instance_type: str) -> None:
+        """Set the machine type on the exposure for the launched instance."""
+        with self.book.transaction() as state:
+            state.hana_compute = [replace(row, instance_type=instance_type)
+                                  if row.generation == generation else row for row in state.hana_compute]
+
+    def close_unlaunched_setup(self, now: int, generation: int) -> None:
+        """Release compute when every request in this setup failed before launch."""
+        with self.book.transaction() as state:
+            state.hana_compute = [replace(row, state=ledger.HanaExposureClosed(now))
+                                  if row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen)
+                                  else row for row in state.hana_compute]
+
+    def _provisioned_instance_type(self) -> str:
+        path = self.book.directory / 'hana' / 'setup.json'
+        try:
+            saved = remote.read_record(path)
+        except FileNotFoundError:
+            return self.settings.instance_type
+        if saved.get('instance') and 'instance_type' in saved:
+            return ledger.text(saved, 'instance_type')
+        return self.settings.instance_type
+
     def reserve_start(self, now: int, expires: int) -> StartReserved | PermitRefused:
         """Reserve a demand start before its boot identity exists."""
         return self._reserve_compute(now, expires, expected_generation=0)
@@ -230,7 +259,7 @@ class HanaSpending:
         generation = max((row.generation for row in state.hana_compute), default=0) + 1
         proposed = ledger.HanaComputeExposure(active[0].at if active else now, expires, generation,
             max(active[0].usd_per_hour, self.settings.spot_max_usd_per_hour) if active else self.settings.spot_max_usd_per_hour,
-            instance_type=active[0].instance_type if active else self.settings.instance_type,
+            instance_type=active[0].instance_type if active else self._provisioned_instance_type(),
             region=active[0].region if active else self.settings.region)
         compute = [row for row in state.hana_compute if isinstance(row.state, ledger.HanaExposureClosed)]
         storage = list(state.hana_storage)
@@ -322,7 +351,7 @@ class HanaSpending:
                     current_generation += 1
                     state.hana_compute.append(ledger.HanaComputeExposure(now, now + self.settings.guard_grace_seconds,
                         current_generation, self.settings.spot_max_usd_per_hour,
-                        instance_type=self.settings.instance_type, region=self.settings.region))
+                        instance_type=self._provisioned_instance_type(), region=self.settings.region))
                 if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_storage):
                     state.hana_storage.append(ledger.HanaStorageExposure(now, self.settings.storage_usd_per_month))
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, current_generation)
