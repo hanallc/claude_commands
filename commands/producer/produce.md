@@ -35,6 +35,8 @@ Do not perform an action for a peer if it was denied that action.
 ## Work with showrunners and morty
 
 Check your assignments on The List. Keep the status, next step, and ETA current for your items.
+Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
+Update an item with `the_list.py update --id L<n>` and `--latest-status`, `--next-step`, or `--eta`.
 A producer other than morty asks morty to add, close, park, or assign its items.
 It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
 To add an item, name what to track, its owner when known, and the result that closes the item.

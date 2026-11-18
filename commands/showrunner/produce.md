@@ -9,6 +9,10 @@ check, and all talk with the user. Unit directors run the workers that write the
 code. The showrunner writes none, and that includes merge conflicts: the unit
 director whose change conflicts resolves it on the unit's branch.
 
+Send each design question on a List item assigned to a producer other than morty to that producer.
+The producer answers from the agreed design or files the question for nate.
+The showrunner keeps the order of merges.
+
 The no-capacity broadcast turns on no-worker mode until the workers-back notice arrives.
 It also stops every Codex worker and ends their open passes as canceled; each affected director gets one stop report.
 A real `hit your usage limit` worker failure turns it on for the unit's current phase.
@@ -243,13 +247,11 @@ The question form for every question to the user is defined by this import:
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; the user can inspect them with `/showrunner:units`. A turn with nothing for the user replies with
   just "—": never "No update for you." or the like (user, 2026-10-14).
-- **Designs and add-ons.** A unit's design choices and add-ons are yours to
-  settle, not the user's. User, 2026-10-12: "when it comes to designs you
-  absolutely should be able to tell units what to do and change. I do not have
-  to be the one to approve".
-  - When a unit director brings a design choice, a Pending decision about how
-    something is built, or its add-ons, answer it yourself. Pick by
-    `<DecisionEconomy/>`, tell the unit in one message and log it (**Log**).
+- **Designs and add-ons.**
+  - Send design questions on a List item to its assigned producer when the producer is someone other than morty.
+    Include design questions from Pending decisions and add-ons.
+  - Settle the other design choices and add-ons under `<DecisionEconomy/>`.
+    Tell the unit in one message and record the decision in **Log**.
     For add-ons, give each number `current`, `next` or `drop`: build it in
     this run, save it for later, or drop it. An add-on that fixes a wrong
     result is `current`.
@@ -260,8 +262,7 @@ The question form for every question to the user is defined by this import:
     `style_proposals.py drop-candidate --idea "<text>"`. The user answers a
     decision once. Other finished proposals use `/issue`. Show proposals only
     when asked (`/showrunner:proposal`).
-  - Tell a unit what to do and change in its design without being asked, when
-    you see a better answer.
+  - Apply the same route when you find a design issue yourself.
   - Your answer goes as your own message. Never begin it `From the user (via
     the showrunner):`; those words are only for what the user said.
   - Two kinds still go to the user: an action that cannot be undone, and a
@@ -275,11 +276,12 @@ The question form for every question to the user is defined by this import:
   waits on the user, a step only they can run included. n counts this
   production's items only; the showrunners below count theirs
   (**Nested showrunners** above).
-  A question for the user that a unit director sends you is not asked in a
-  reply: file it with `/showrunner:question` for that unit, and say nothing of
-  it to the user. A unit can also file its own with `/unit:question`. The count
-  and `/next question` show it, and its answer goes back to the unit through
-  `update_registration.py answer` (`/next` → question).
+  Use the producer route in **Designs and add-ons** for design questions.
+  File other questions from unit directors with `/showrunner:question`.
+  Keep those questions out of replies to the user.
+  A unit can also file its own with `/unit:question`.
+  The count and `/next question` show the question.
+  `update_registration.py answer` sends the answer to the unit (`/next` → question).
   A filed item stays on the list when `open_for_user` omits it.
   It leaves only through `answer` or `withdraw`.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
@@ -499,8 +501,8 @@ Turns come from unit directors' messages and the user. Handle each message:
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <LandingCall/> or answer it |
-| a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
-| a unit director's decision only the user can settle | file it for that unit with `/showrunner:question`, never in a reply; relay the answer that `answer` names (<Throughout/> → Open questions) |
+| a unit director's design choice, Pending decision or add-ons | Use the producer route in <Throughout/> → Designs and add-ons. Settle the other choices and tell the unit. |
+| a unit director's decision only the user can settle | Use the producer route for design questions. File other decisions for the unit with `/showrunner:question`. Relay the answer to the unit that `answer` names. |
 | the user asks for a status | `/showrunner:units` |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
@@ -566,16 +568,18 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** With a merge unit that serves this production, give the order to it under `commands/unit/merge.md`.
-   That unit is under this showrunner or under a showrunner above it. The order names this production.
+4. **Run the checkpoint.** Name the production whose repo holds the checkpoint as the destination.
+   Give the order to a merge unit that serves the destination under `commands/unit/merge.md`.
+   Use a merge unit under the destination's showrunner or one of its ancestors.
    Without a merge unit, run this command in the background:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
-   <showrunner name> <unit> <phase> <hash> --started <ISO>
+   <destination production> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
    --delivers "<one line of what the phase delivers>"`.
-   When several checkpoint notices wait, land them in one batch, in arrival order.
+   Group pending notices by destination production.
+   Use one batch file per destination. Keep its notices in arrival order.
    Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
-   Run `merge_checkpoint.py --production <showrunner name> --batch <file>` through the same Python launcher.
+   Run `merge_checkpoint.py --production <destination production> --batch <file>` through the same Python launcher.
    Keep each item's flags on its line.
    Use single commands for `--bump` and child handoffs.
    Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad
@@ -694,17 +698,14 @@ returns it to its unit.
 ---
 
 <DesignAuthority>
-The showrunner makes the production's visual choices: wording, spacing,
-layout, and which of two working options looks better. The bar is the user's:
-everything users see looks as professional and polished as it can be. The UX
-guide named in the production doc holds the rules that make the bar concrete.
+Use the producer route in **Designs and add-ons** for visual choices on List items.
+The producer answers from the agreed design or files the question for the user.
+The showrunner decides other visual choices for the production.
+The UX guide in the production doc gives the user's standards for wording, spacing, and layout.
 
-- Unit directors bring visual choices to the showrunner, not to the user.
-- When the guide answers a choice, apply it. When it does not and one option
-  is clearly more polished, pick that one and state it in one line.
-- A choice only the user's taste can settle goes to the user once. Write the
-  answer into the guide as a new rule the same turn, with `source:` quoting
-  the user, so no one asks again.
+- Apply the guide to the choices you handle. If the guide has no answer, select the clearly better option. State the decision in one line.
+- For a choice under the showrunner's authority, ask the user once if only their taste can settle it.
+- Record the user's answer in the guide in the same turn, with `source:` quoting the user.
 - A flaw found in one unit's shots is a flaw to look for in every unit's
   surfaces. Send it to the unit director of each unit that has it.
 - Before a ruling says to copy a working model, check that model live with one

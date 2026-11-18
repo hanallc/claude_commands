@@ -42,7 +42,7 @@ from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.transcripts import open_transcript, transcript_paths
-from scripts.message import session_send
+from scripts.message import session_records, session_send
 from scripts.agents import member_account, pane_record, shutdown_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
@@ -234,8 +234,13 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
         for pane in pane_launch.reference_panes(reference, membership, client, entries, evidence=evidence):
             if pane_launch.native_sessions(client, pane):
                 conflicts.append((identity, str(pane["pane_id"])))
+    registry = session_records.enumerate_running_sessions()
+    if isinstance(registry, session_records.RunningSessionDiscoveryFailed):
+        raise ValueError(registry.reason)
+    if registry.unreadable:
+        raise ValueError(session_records.registry_unreadable_reason(registry.unreadable))
     named: list[tuple[str, tuple[int, ...]]] = [
-        (row["sessionId"], (row["pid"],)) for row in sessions.running_sessions()
+        (row["sessionId"], (row["pid"],)) for row in registry.records
         if member is not None and row["sessionId"] == member.current_session]
     if member is not None:
         codex = herdr.codex_conversations()
@@ -296,7 +301,12 @@ def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> p
         if native.current_identity != identity:
             raise ValueError("producer process runs another conversation")
         if observed.kind == "claude":
-            records = [row for row in sessions.running_sessions() if row["sessionId"] == identity]
+            registry = session_records.enumerate_running_sessions()
+            if isinstance(registry, session_records.RunningSessionDiscoveryFailed):
+                raise ValueError(registry.reason)
+            if registry.unreadable:
+                raise ValueError(session_records.registry_unreadable_reason(registry.unreadable))
+            records = [row for row in registry.records if row["sessionId"] == identity]
             if len(records) != 1 or records[0]["pid"] != pid:
                 raise ValueError("producer registry has no unique native process")
             folder = records[0].get("cwd", "")
@@ -817,24 +827,36 @@ def stop(session: str, kind: str = "", *, deadline: float = math.inf,
         return StopFailed(session, reason if "deadline passed" in reason else f"deadline passed; {reason}")
 
 
+def _stop_staff_row(record: StaffSnapshot, reference: str) -> StaffRow | None:
+    row = record.by_member_reference(reference)
+    if row is not None:
+        return row
+    matches = [item for item in record.rows if item.name == reference]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _stop_recorded(session: str, kind: str = "", *,
                    codex: herdr.CodexConversations | None = None) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     from scripts.herdr import worker_panes
-    from scripts.production import staff
+    from scripts.production import session_staff, staff
 
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError):
         record = staff.StaffSnapshot(())
-    row = record.by_member_reference(session)
-    pane_worker = row is not None and row.kind == "worker"
-    before = next((item for item in worker_panes.observe(row.parent.id, record) if item.row.id == row.id), None
-                  ) if pane_worker and row is not None and isinstance(row.parent, staff.ReportsTo) else None
+    row = _stop_staff_row(record, session)
+    before = None
+    if row is not None and row.kind == "worker":
+        worker = session_staff.worker_backend(record, row.id)
+        if isinstance(worker, session_staff.RecordedWorker):
+            kind = worker.backend.family
+        if isinstance(row.parent, staff.ReportsTo):
+            before = next((item for item in worker_panes.observe(row.parent.id, record) if item.row.id == row.id), None)
     if isinstance(before, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
         return StopFailed(str(before.row.current_session), before.reason)
-    if isinstance(before, worker_panes.StoppedWorker) and isinstance(_worker_stopped(
-            before, **({"codex": codex} if codex is not None else {})), NotRunning):
+    if isinstance(before, worker_panes.StoppedWorker) and isinstance(
+            _worker_stopped(before, kind, codex=codex), NotRunning):
         result: StopResult = NotRunning(str(before.row.current_session))
     else:
         _record_launches([session])
@@ -842,8 +864,8 @@ def _stop_recorded(session: str, kind: str = "", *,
         after = (None if codex is None else herdr.CodexConversations(
             {identity: pids for identity, pids in codex.live.items() if identity != result.session_id},
             codex.unknown)) if isinstance(result, (Stopped, NotRunning)) else codex
-        if before is not None and isinstance(result, (Stopped, NotRunning)):
-            proof = _worker_stopped(before, **({"codex": after} if after is not None else {}))
+        if isinstance(before, (worker_panes.OpenWorker, worker_panes.StoppedWorker)) and isinstance(result, (Stopped, NotRunning)):
+            proof = _worker_stopped(before, kind, codex=after)
             if isinstance(proof, StopFailed):
                 return proof
     if isinstance(result, (Stopped, NotRunning)):
@@ -860,32 +882,39 @@ def _stop_recorded(session: str, kind: str = "", *,
     return result
 
 
-def _worker_stopped(before: worker_panes.WorkerPane, *,
-                    codex: herdr.CodexConversations | None = None) -> NotRunning | StopFailed:
-    """Prove the worker stop and retain the observed pane processes on failure."""
-    from scripts.herdr import worker_panes
+def _stop_backend(identity: str) -> Literal["claude", "codex", ""]:
+    """Read the backend of the retained launch if it is available."""
+    try:
+        publication = pane_record.publication_for_session(identity)
+        return pane_launch.agent_kind(publication.entry) if publication is not None else ""
+    except (OSError, ValueError) as error:
+        print(f"{identity}: launch record anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        return ""
 
+
+def _worker_stopped(before: worker_panes.OpenWorker | worker_panes.StoppedWorker, kind: str, *,
+                    codex: herdr.CodexConversations | None = None) -> NotRunning | StopFailed:
+    """Prove the conversation stopped and check the retained pane."""
     identity = str(before.row.current_session)
-    if isinstance(before, worker_panes.ClosedWorker):
-        return NotRunning(identity)
-    details = "pane unobserved; foreground processes not read"
-    if isinstance(before, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
-        client = herdr.Herdr(herdr.shared_session())
-        details = f"pane {before.pane}; foreground processes not read"
-        try:
-            panes = client.panes()
-            closed = not any(pane["pane_id"] == before.pane or pane.get("terminal_id") == before.terminal for pane in panes)
-            at_shell = False
-            if any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in panes):
-                activity = client.pane_activity(before.pane)
-                at_shell = isinstance(activity, herdr.PaneAtShell)
-                details = (f"pane {before.pane}; foreground processes: {', '.join(activity.commands) or 'none'}"
-                           if isinstance(activity, herdr.PaneRunning) else f"pane {before.pane}; at its shell")
-            if ((closed or at_shell)
-                    and not isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation)):
+    client = herdr.Herdr(herdr.shared_session())
+    details = f"pane {before.pane}; foreground processes not read"
+    try:
+        panes = client.panes()
+        closed = not any(pane["pane_id"] == before.pane or pane.get("terminal_id") == before.terminal for pane in panes)
+        at_shell = False
+        if any(pane["pane_id"] == before.pane and pane.get("terminal_id") == before.terminal for pane in panes):
+            activity = client.pane_activity(before.pane)
+            at_shell = isinstance(activity, herdr.PaneAtShell)
+            details = (f"pane {before.pane}; foreground processes: {', '.join(activity.commands) or 'none'}"
+                       if isinstance(activity, herdr.PaneRunning) else f"pane {before.pane}; at its shell")
+        if closed or at_shell:
+            observed = herdr.read_conversation(identity, kind or _stop_backend(identity), codex=codex)
+            if isinstance(observed, herdr.StoppedConversation):
                 return NotRunning(identity)
-        except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-            details += f"; {error}"
+            if isinstance(observed, herdr.UnknownConversation):
+                return StopUnproved(identity, observed.reason)
+    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+        details += f"; {error}"
     return StopFailed(identity, f"worker stop has no fresh shell or closed-pane proof; {details}")
 
 
@@ -911,11 +940,7 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
         except (OSError, ValueError) as error:
             print(f"{session}: staff anomaly: {error}", file=sys.stderr)
             record = staff.StaffSnapshot(())
-        member = record.by_member_reference(session)
-        if member is None:
-            members = [row for row in record.rows if row.name == session]
-            if len(members) == 1:
-                member = members[0]
+        member = _stop_staff_row(record, session)
         if member is not None:
             return member.current_session
         registry = sessions.read_registry()
@@ -962,13 +987,7 @@ def _stop(session: str, kind: str = "", *,
         if isinstance(target, (SessionNotFound, StopFailed)):
             return target
         identity = target
-        if not kind:
-            try:
-                publication = pane_record.publication_for_session(identity)
-                kind = pane_launch.agent_kind(publication.entry) if publication is not None else ""
-            except (OSError, ValueError) as error:
-                print(f"{identity}: launch record anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
-                kind = ""
+        kind = kind or _stop_backend(identity)
         observed = herdr.read_conversation(identity, kind, **({"codex": codex} if codex is not None else {}))
         if isinstance(observed, herdr.StoppedConversation):
             return NotRunning(identity)

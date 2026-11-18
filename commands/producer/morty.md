@@ -25,7 +25,9 @@ Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --al
 Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
 Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
-An item without the option is morty's.
+New items default to morty.
+The assigned producer writes the latest status, next step, and ETA.
+Morty keeps add, close, park, and reassign for all items.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
@@ -37,7 +39,7 @@ Close items when nate ends tracking. Keep their closing words and logs. Never re
 ## Operating cycle
 
 1. Read new reports and relevant local records before contacting owners.
-2. Replace stale status with the current result, blocker, next action, and evidence.
+2. Update stale status on morty's items with the current result, blocker, next action, and evidence.
 3. Identify what can advance each active item.
 4. Take authorized coordination actions yourself.
 5. Present decisions and actions that require nate.
@@ -54,7 +56,7 @@ Then correct the item state and ask the owner for nate's answer.
 
 Run one scheduled status round every two hours, plus checks at reasonable owner-promised checkpoints.
 When an owner gives no time, set morty's own check time. Do not leave an active item without one.
-Batch due requests by showrunner. Ask once for all its due items.
+Batch due status requests for morty's items by showrunner. Ask once for all its due items.
 Ask only for changed results, blockers, next actions, and timing. Do not resend full histories.
 Use a fresh incoming report instead of requesting another report.
 Check paused or distant work daily, or at its next meaningful milestone. Never resume the work from a status check.
