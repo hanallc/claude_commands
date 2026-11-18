@@ -91,6 +91,30 @@ Run this command in the same terminal to remove the key, user, and policy.
 deploy.py down --workload plan-identity --approve-destroy
 ```
 
+## Run a setup plan
+
+Run this command in a terminal on natedev.
+
+```sh
+deploy.py hana-setup --plan
+```
+
+The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
+It refuses first-time setup, pending instance or volume work, direct-owned boxes, and merge gate setup.
+
+The plan checks the local credential file and reads the scaler identity with STS.
+It uses the same stack, instance, disk, and parameter checks as approved setup.
+It previews one modification to `ScalerPolicy` without resource replacement.
+The plan deletes the change set and confirms its removal with CloudFormation.
+If removal stays unconfirmed, the plan prints the change set name and refuses.
+
+The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
+The plan simulates the EC2 probes without reading user data or starting the box.
+The S3 simulation uses the control bucket policy from the stack template.
+If the template has no policy or the plan cannot resolve it, the plan prints a note.
+The plan then simulates S3 without a bucket policy.
+Bucket policies added outside the stack are out of scope.
+
 ## Hana guest safety files
 
 `scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
