@@ -4887,3 +4887,82 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Hash aa398e529e6186138c6d56c30b5c0550e19f8718 on branch `natest-statusline345`; it replaces 2954b844c and holds main 64a123c5f.
 - `status_lines` moved to `scripts/statusline/statusline_test_support.py`. Each call makes its own private zone file and pane folder, so `review_links/test_accounts_page.py` calls it without the `test_statusline` module setup. Both modules import it at the top.
 - Full suite: 858 modules pass. `test_statusline` keeps the 345 saving (38.8 CPU s on natedev).
+
+### Phase 352 — poll loops cost no extra aws CPU under gate load  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the modules with the largest gap between gate CPU and alone CPU on AWS lose most of that gap, with every assertion kept.
+
+**Spec:**
+1. Measure: for the top 20 AWS modules, compare the gate median CPU (`show.py top --host aws`) with the alone CPU from one AWS trial round on main e53fc303a. Rank by gap, worst first.
+2. Already measured alone: `direct/test_verify_wait_holder.py` 43.6 (gate 53.5), `review_links/test_list_page.py` 23.5 (gate 50.1), `style/test_crate_run.py` 48.1 (gate 48.4), `direct/test_verify_mac_only.py` 28.7 (gate 46.4).
+3. In the worst-gap modules, find each loop that polls on a timer (sleep and check) and cut its CPU under load: wait on an event, a file descriptor or a process exit instead, or poll less often. Fix the loop where it lives, in test support or in production code.
+4. Tests read no value /tune can change. No signal handlers, no lazy imports, no test-count goals.
+
+**Files:** the worst-gap modules, their test support, and the production wait loops they run.
+
+**Acceptance gate:** the changed modules pass; an AWS gate-load comparison shows the gap cut; basedpyright clean on changed files.
+
+### Phase 353 — the hold signal test passes under load  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_hold_signals.py` `test_group_signals_end_memory_wait_and_all_children` passes under full-suite load; the cause of the SIGINT survivors is fixed where it lives.
+
+**Spec:**
+1. Base: origin/main e53fc303a, worktree `~/worktrees/claude-natedev-natest-holdsignals`, branch `natest-holdsignals353`.
+2. Evidence: SIGINT left survivors in the memory wait twice on 11-18 under load (natest 349 suite; builds sessionmove merge test); it passed alone each time. The test waits `wait_for_owned_exit(5)` (test_verify_hold_signals.py:37).
+3. Reproduce under load (for example a CPU-bound stress beside the module, inside `systemd-run MemoryMax=2G`). Name each surviving process and why it outlives the signal: a slow but correct exit beyond the 5 s window, or a real leak in `verify.sh` or the admission wait.
+4. A real leak is fixed in production code. A slow correct exit uses the shared test wait limit and an event wait, not a longer fixed sleep. Keep every assertion.
+5. Tests read no value /tune can change. No signal handlers, no lazy imports.
+
+**Files:** `scripts/direct/test_verify_hold_signals.py`, `scripts/direct/verify_hold_wait_test_support.py`, and the production wait code where the cause lives.
+
+**Acceptance gate:** the module passes 20 times in a row under load; the full suite passes; basedpyright clean on changed files.
+### Phase 354 — the status line reads the For you count in its one process  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Hash 838af9ea510abd8ff0a142ae25f58d2533ca2b93 on branch `natest-foryou354` (base main 936da31a7); first commit 1ea1af5b6, review fix 838af9ea5.
+- Cause: 2b7e107c9 (foryou-notifier) made `statusline.sh` start `counts_row.py --for-you` as a second Python process on each render; its imports cost about 0.45 s CPU.
+- `scripts/statusline/for_you_count.py` holds `global_action_count` and `console_action_count`; each returns `unavailable` on any failure. `assignment.py` reads the count before the rebuild refresh and passes `--arg for_you` to jq. The dead `--arg rebuild` is gone. Each count test uses a private action store; `STATUSLINE_SYSTEM` selects the platform in tests.
+- AWS pair: 138.5 to 49.9 CPU s (saving 88.6 s, 64%). One render on natedev: 0.686 to 0.078 CPU s. Full suite: 860 modules pass.
+
+### Phase 355 — the gate chain merges with main and resources 149  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** branch `natest-chainmerge` holds origin/main af771b3fb and `builds-resources-p149` (a2fedffde), passes the full suite, and keeps every gate chain change.
+
+**Spec:**
+1. Worktree `~/worktrees/claude-natedev-natest-chainmerge`. A merge of origin/main is in progress. `scripts/lib/build_steps.py` is resolved: `parse_command_program` takes `keep_path`.
+2. Resolve the other four conflicts: `scripts/direct/progress_history.py`, `scripts/herdr/turn_end.py`, `scripts/production/worker.py`, `scripts/production/test_worker.py`. The gate chain moved dispatch pass records from `progress_history` to `scripts/direct/pass_recorder.py`. Main rewrote completion recovery in `worker.py` and the `answer` command. Keep main's behavior and tests. Use the gate chain's module split: each name lives in one module.
+3. Check every auto-merged file that uses names the gate chain moved (grep for `progress_history.` names that now live in `pass_recorder`).
+4. Then merge `origin/builds-resources-p149` and resolve `scripts/build_queue/test_queue_place.py`.
+5. Keep every assertion. No signal handlers, no lazy imports.
+
+**Files:** the conflicted files and any auto-merged file that uses a moved name.
+
+**Acceptance gate:** the modules for each changed file pass; basedpyright clean on changed files; the full suite passes.
+### Phase 356 — rows and prose say "gate" and "the gate"  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `config/build_steps.conf` holds `names.merge-gate=gate` and `prose.merge-gate=the gate` on main, and no test reads those live values.
+
+**Spec:**
+1. Base: origin/main 6847e4d6a, worktree `~/worktrees/claude-natedev-natest-tunecheck`, branch `natest-tunecheck`.
+2. Evidence: a full suite with the two new values failed `build_queue/test_queue_view.py` `test_page_step_names_use_roles_and_configured_owner_templates`: it reads the checkout's `build_steps.conf` names and prose ('gate' != 'merge gate'; 'the gate' != 'merge gate').
+3. Give that test a pinned fixture `build_steps.conf`, so it passes with any live value. Check the module for other reads of live step names. Keep every assertion.
+4. After the test fix is on main, run `/tune` for both values with the user's words "3. \"the gate\" is fine" (2026-11-16 13:47 EST, via morty).
+5. `build_queue/test_admission_service.py` `test_tenth_cloud_gate_waits_and_starts_after_a_release` also failed; it reads the live cloud slot count, not the gate words. It is outside this phase.
+
+**Files:** `scripts/build_queue/test_queue_view.py`.
+
+**Acceptance gate:** `test_queue_view.py` passes with the old values and with the new values in the checkout conf; basedpyright clean.
