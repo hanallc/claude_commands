@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import queue_view, queue_evidence
+from scripts.build_queue import admission_service as service
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
 from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -584,6 +585,38 @@ class QueueViewFixtureTests(unittest.TestCase):
 
 
 class QueueViewTests(QueueViewFixtureTests):
+    def test_service_queries_keep_repository_and_step_separate_after_admission(self) -> None:
+        for repository in ("hana", "repository nextest"):
+            with self.subTest(repository=repository), AdmissionFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                original = fixture.request(step="nextest")
+                assert isinstance(original.profile, admission_records.StepProfile)
+                request = replace(original, profile=replace(original.profile, repo=repository,
+                    repository=admission_records.RepositoryIdentity("https://example.org/project", repository)))
+                _ = fixture.server.handle_request(request)
+                waiter, = fixture.server.waiters.values()
+                self.assertEqual((waiter.row.get("repository_name"), waiter.row.get("step")), (repository, "nextest"))
+                fixture.restart()
+                _ = fixture.server.handle_request(request)
+                model = self.service_model(fixture)
+                waiting, = model.reading.view.waiting
+                self.assertEqual((waiting.project, waiting.step), (repository, "nextest"))
+                shown, = queue_view.waiting_builds(model)
+                assert isinstance(shown, queue_view.WaitingBuild)
+                self.assertEqual((shown.step.project, shown.step.step), (repository, "nextest"))
+                fixture.free(60 * admission_records.GIB)
+                write_pressure_reading(fixture.root / "pressure")
+                fixture.allow_next_start()
+                _ = fixture.server.run_pass()
+                _ = fixture.server.run_pass()
+                model = self.service_model(fixture)
+                running, = [step for step in model.reading.view.running if step.pid == request.owner.pid]
+                self.assertEqual((running.project, running.step), (repository, "nextest"))
+                saved = service.read_state(fixture.state_dir).reservations[request.episode]
+                self.assertEqual((saved.repo, saved.step), (repository, "nextest"))
+                self.assertEqual((saved.queue_waiter.get("repository_name"), saved.queue_waiter.get("step")),
+                                 (repository, "nextest"))
 
 
     def test_snapshot_without_project_fields_reads_with_empty_projects(self) -> None:
