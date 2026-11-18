@@ -4849,24 +4849,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - AWS pair (3 rounds, c7a.4xlarge): 43.57 -> 26.50 CPU s, a saving of 17.03 s; 26 tests pass.
 - Floor: ten live tests use 25.1 CPU s on natedev. Architecture proposal: move the placement and repair decisions in `verify.sh` into a callable Python coordinator.
 
-### Phase 349 — the verify Mac-only tests use less aws CPU  · status: todo
+### Phase 349 — the verify Mac-only tests use less aws CPU  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_mac_only.py` costs at most half its AWS CPU (46.0 s median, 21 tests) with every assertion kept.
-
-**Spec:**
-1. Base: origin/main f22102f37, worktree `~/worktrees/claude-natedev-natest-maconly`, branch `natest-maconly349`.
-2. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> direct/test_verify_mac_only.py --tests 20 --commands 20`. Name the costs by test and by command.
-3. The slowest kept test is `VerifyMacOnlyTests.test_runner_refusals_never_fall_back_or_retry` (6.0 s).
-4. Cut repeated process starts and Git calls: share one fixture build per class, call Python in process where the test checks Python output, and keep real subprocess runs only where the test proves process behavior.
-5. Tests read no value /tune can change. Fixtures drop inherited `GIT_*` variables. No signal handlers, no lazy imports, no test-count goals.
-6. If the floor stays above half, name the architecture change that would cut it.
-
-**Files:** `scripts/direct/test_verify_mac_only.py` and its test support; production code only where a defect lives.
-
-**Acceptance gate:** the module passes; AWS pair (3 rounds) shows the saving; basedpyright clean on changed files.
+- Hash 123e1f784c01cd88a5b7196cfaee964734e5df33 on branch `natest-maconly349`, parent origin/main f22102f37.
+- `direct/test_verify_mac_only.py` pins every config it reads, shares one bytecode cache and one parser repository for the class, drops inherited `GIT_*` variables, and runs the Cargo reference in process.
+- The shared runner fixture in `verify_mac_offload_test_support.py` waits `TEST_HANG_GUARD_SECS` for authorization.
+- AWS pair (3 rounds, c7a.4xlarge): 28.68 -> 27.72 CPU s, a saving of 0.96 s; 21 tests pass. The natedev profile showed 60.0 -> 37.4 s, mostly from bytecode that AWS already has.
+- The gate median (46.0 s) is 17 s above the alone base (28.7 s): load adds CPU. Floor: 29 `verify_helper.py` starts, 10.2 s on natedev.
 
 ### Phase 350 — the list page tests share one browser for each class  · status: todo
 **Depends on:** none
