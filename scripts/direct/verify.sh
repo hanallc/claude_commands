@@ -3214,6 +3214,9 @@ cache_lookup() {
         record+=.fail outcome=replayed word=FAIL
     fi
     [[ -n "${outcome}" ]] || return 1
+    if [[ "$CMD" == lint && "${1:-}" == --after-wait ]]; then
+        verify_helper "$TREE_WATCH_SCRIPT" --recheck-mend </dev/null 2>/dev/null || return 1
+    fi
     LOOKUP_STATUS="$(sed -n 's/^status=//p' "${record}")"
     LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
     note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" \
@@ -4012,7 +4015,7 @@ build_hold_wait_local() {
 
 # Again before the first step: a peer running this same call on this tree may
 # have recorded its result since the first lookup.
-if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
+if [[ "$MAC_ONLY" == 0 ]] && cache_lookup --after-wait; then
     if ! release_token && (( LOOKUP_STATUS == 0 )); then
         LOOKUP_STATUS=1
     fi

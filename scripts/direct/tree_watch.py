@@ -4,6 +4,7 @@
 --key [--with-tree-content] [--watch-start FILE] [--recheck-mend] [tree_key args]
 prints the cache key.
 --with-tree-content also prints the key without script files or lint tool identities.
+--recheck-mend checks the current mend identity against the saved identity.
 --watch-key [tree_key args] prints only the watched input key.
 START FIRED PARENT [--signal-parent] [tree_key args] watches until changed (0)
 or the parent exits (3). Cargo metadata is supplied once on stdin.
@@ -70,7 +71,7 @@ def cargo_mend_build_info() -> bytes:
 
 
 def lint_tool_versions(*, recheck_mend: bool = False) -> bytes:
-    """Read lint tool identities once per call and check mend before publication."""
+    """Read lint tool identities and recheck mend when requested."""
     saved = os.environ.get("VERIFY_LINT_VERSIONS_FILE", "")
     if saved and Path(saved).exists():
         versions = Path(saved).read_bytes()
@@ -322,6 +323,12 @@ def parent_alive(pid: int) -> bool:
 
 
 def main(args: list[str]) -> int:
+    if args[:1] == ["--recheck-mend"]:
+        try:
+            _ = lint_tool_versions(recheck_mend=True)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 1
+        return 0
     metadata = sys.stdin.read()
     if args[0] in ("--key", "--watch-key"):
         mode, args = args[0], args[1:]

@@ -70,6 +70,14 @@ mkdir -p "$CACHE_DIR"
 set_verdict_keys
 RUN_LOG="$PACKAGE_ROOT/direct-lint.log"
 EXIT_STATUS=0
+if [[ -n "${TEST_REPLACEMENT_MEND:-}" ]]; then
+    printf 'peer lint passed\n' > "$RUN_LOG"
+    cache_record pass 0
+    mv "$TEST_REPLACEMENT_MEND" "$PACKAGE_ROOT/bin/cargo-mend"
+fi
+if cache_lookup --after-wait; then
+    exit "$LOOKUP_STATUS"
+fi
 invoke_clippy --workspace --all-targets --all-features --keep-going > "$RUN_LOG" 2>&1 || EXIT_STATUS=$?
 cat "$RUN_LOG"
 kind=pass
@@ -117,6 +125,22 @@ exit "$EXIT_STATUS"
     def test_mend_replacement_rechecks_each_verdict_with_the_same_version(self) -> None:
         mend = self.root / "bin/cargo-mend"
         self.check_identity_change(lambda build_id: write_fixture_cargo_mend(mend, build_id))
+
+    def test_second_lookup_rejects_a_peer_pass_after_mend_is_replaced(self) -> None:
+        cache = self.dirty_cache()
+        replacement = self.root / "bin/cargo-mend-new"
+        write_fixture_cargo_mend(replacement, "replacement")
+        self.environment.update({
+            "TEST_REPLACEMENT_MEND": str(replacement),
+            "TEST_CLIPPY_STATUS": "43",
+        })
+
+        result = self.invoke_cache_functions()
+
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+        self.assertEqual(result.returncode, 43, result.stdout + result.stderr)
+        self.assertNotIn("(recorded)", result.stdout)
+        self.assertTrue(self.clippy_ran())
 
     def test_rustfmt_version_invalidates_passes_and_failures(self) -> None:
         self.check_version_change("RUSTFMT")
