@@ -2007,7 +2007,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 write_text_atomic(self.run_dir / unit_runs.STATE_FILE, json.dumps({
                     "owner_staff_id": self.fixture.parent.id,
                     "history_file": str(self.fixture.root / "history.jsonl"),
-                    "phase": {"id": "40", "instance_id": "private-phase", "status": "active"},
+                    "open_phases": [{"id": "40", "instance_id": "private-phase", "status": "active"}],
                 }))
                 dispatch_id = progress_history.begin_dispatch(self.run_dir, slot="test", phase="40", role="test",
                     worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
@@ -2069,7 +2069,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(state, json.dumps({
             "owner_staff_id": self.fixture.parent.id,
             "history_file": str(self.fixture.root / "history.jsonl"),
-            "phase": {"id": "40", "instance_id": "private-phase", "status": "active"},
+            "open_phases": [{"id": "40", "instance_id": "private-phase", "status": "active"}],
         }))
         dispatch = progress_history.begin_dispatch(self.run_dir, slot=row.name, phase="40", role="impl",
             worker_name=row.name, worker_id=row.id, launcher_command=["private-launcher"], prompt=prompt,
@@ -2300,7 +2300,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(state, json.dumps({
             "owner_staff_id": self.fixture.parent.id,
             "history_file": str(other_run / "history.jsonl"),
-            "phase": {"id": "40", "instance_id": "other-phase", "status": "active"},
+            "open_phases": [{"id": "40", "instance_id": "other-phase", "status": "active"}],
         }))
         prompt = reply.with_name("other-assignment.txt")
         write_text_atomic(prompt, "Run the other private command.")

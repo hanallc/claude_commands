@@ -774,7 +774,7 @@ class MixedRestartTests(ShutdownTestCase):
         write_text_atomic(other_run / "progress_history_state.json", json.dumps({"owner_staff_id": other.id,
             "main_agent": {"session_id": other.current_session}, "pass": {}, "events": []}))
         write_text_atomic(run / "progress_history_state.json", json.dumps({"owner_staff_id": owner.id,
-            "phase": {"id": "work", "instance_id": "active", "status": "active", "started_at": 1},
+            "open_phases": [{"id": "work", "instance_id": "active", "status": "active", "started_at": 1}],
             "main_agent": {"session_id": owner.current_session, "family": "claude"},
             "history_file": str(run / "history.jsonl"), "pass": {}, "events": []}))
         prompt = run / "prompt.md"
@@ -3937,8 +3937,8 @@ class RetainedSplitRestartTests(RestartTestCase):
         run = root / "run"
         write_text_atomic(run / "progress_history_state.json", json.dumps({
             "main_agent": {"session_id": str(holder.current_session)},
-            "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
-                      "started_at": 1, "status": "active"},
+            "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase",
+                             "started_at": 1, "status": "active"}],
             "pass": {}, "history_file": str(run / "history.jsonl")}))
         prompt = run / "prompt.md"
         write_text_atomic(prompt, "Preserve the source behavior.\n")

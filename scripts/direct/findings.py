@@ -351,7 +351,11 @@ def _read_state(
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
     instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
-    return read_phase_ledger(session_dir, instance_id, phase_id, now)
+    state = read_phase_ledger(session_dir, instance_id, phase_id, now)
+    if not closed_phase_ok and not instance_id and _string(state.get("phase_instance_id")):
+        ledger_phase = _string(state.get("phase_id"))
+        raise SystemExit(f"Phase {ledger_phase} is not open (open phases: none)")
+    return state
 
 
 def read_phase_ledger(
