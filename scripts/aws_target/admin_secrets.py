@@ -125,6 +125,11 @@ def credentials_file() -> Path:
     return Path(value).expanduser()
 
 
+def scaler_service_credentials_file() -> Path:
+    """Return the credential file configured for aws-target.service."""
+    return Path.home() / '.config/aws-build/credentials'
+
+
 def read_profiles(path: Path) -> ConfigParser:
     profiles = ConfigParser(interpolation=None)
     try:
@@ -209,7 +214,7 @@ class AdminSecretSession:
         secrets = self.credentials.secret_values() if isinstance(self.credentials, AdminCredentials) else ()
         return redact(message, secrets)
 
-    def executor(self, execute: AdminExecutor) -> AdminExecutor:
+    def executor(self, execute: AdminExecutor, *, single_attempt: bool = False) -> AdminExecutor:
         def authorized(arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             if env is not None:
@@ -219,6 +224,8 @@ class AdminSecretSession:
                 index = command.index('--profile')
                 del command[index:index + 2]
             environment = self.environment()
+            if single_attempt:
+                environment['AWS_MAX_ATTEMPTS'] = '1'
             try:
                 result = execute(command, capture_output=capture_output, text=text, timeout=timeout,
                                  check=check, env=environment)
