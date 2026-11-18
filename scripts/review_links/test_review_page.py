@@ -3019,6 +3019,58 @@ window.fetch=async(url)=>{
         self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
+        setup = r"""<script>
+const nativeFetch=fetch;
+history.replaceState(null,'','#show=all');
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method!=='POST') return nativeFetch(url,options);
+ const fields=new URLSearchParams(options.body);
+ if(fields.get('row')!=='page-owner/C1' || fields.get('outcome')!=='works')
+  throw new Error('The form did not close Change C1.');
+ return Promise.resolve(new Response(JSON.stringify({answer:'works',state:'Done'})));
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const change=()=>document.querySelector('[data-key="page-owner/C1"]');
+ try{
+  const row=change();
+  check(!row.hidden,'Change C1 is visible before the save.');
+  row.querySelector('.list-toggle').click();
+  const form=row.querySelector('[data-review-form]');
+  const saved=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(form.dataset.sending) return;
+    observer.disconnect();resolve();
+   });
+   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+  });
+  form.requestSubmit(form.querySelector('button[value="works"]'));
+  if(!form.dataset.sending) throw new Error('The save of Change C1 did not start.');
+  await saved;
+  check(form.querySelector('[data-send-status]').textContent==='Saved: works','The save succeeded.');
+  check(row.hidden,'The save hides Change C1.');
+
+  const link=document.createElement('a');
+  link.href='#'+new URLSearchParams({show:'all',item:row.dataset.key});
+  link.textContent='Open Change C1';
+  document.body.append(link);
+  const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  link.click();
+  await navigated;
+  check(change() && !change().hidden,'The same-tab link shows the closed Change C1.');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = review_page.render(self.root, show='all').decode()
+        page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
         question_key = self.question()
         question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
