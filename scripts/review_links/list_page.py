@@ -120,7 +120,7 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
     return html.escape(cast(str, value)) or "Not recorded"
 
 
-def log_entry_html(change: the_list.ItemChange, today: datetime, names: staff_names.StaffNames) -> str:
+def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames) -> str:
     content = change.what
     by = " <small>— " + names.html(change.source, owner_name(names.members, staff.StaffId(change.source))) + "</small>"
     if isinstance(content, the_list.FieldChange):
@@ -146,7 +146,7 @@ def log_entry_html(change: the_list.ItemChange, today: datetime, names: staff_na
         body = html.escape(content) + by
     else:
         return ""
-    return ('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
+    return (f'<li data-log-index="{index}"><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
             + '</time><div>' + body + '</div></li>')
 
 
@@ -258,10 +258,14 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
     sections += ''.join(page_question.open_question_html(question) if question.answer is None
                         else page_question.answered_question_html(question) for question in item.questions)
-    log = ''.join(log_entry_html(change, today, names) for change in reversed(item.log)
-                  if not the_list.is_page_request_receipt(change))
+    # The log appends entries in storage order. Each index stays stable when new entries arrive.
+    log = ''.join(reversed([log_entry_html(change, index, today, names) for index, change in enumerate(item.log)
+                            if not the_list.is_page_request_receipt(change)]))
+    log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
-            + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>')
+            + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
+            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
+            + '<ol class="list-log">' + log + '</ol></div></section></div>')
 
 
 def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str,
@@ -541,10 +545,13 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
     shows = [record_table.Chip(value, label) for value, label in SHOWS if value != 'all']
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
-    seconds = conf.read("review_links").number("page_refresh_seconds")
+    settings = conf.read("review_links")
+    seconds = settings.number("page_refresh_seconds")
+    log_max_height = settings.whole("list_log_max_height_rem")
     counts = counts_strip(members, names) if include_counts else ''
     content = (STYLE + page_frame.title("The List", "list")
-               + f'<div data-list data-refresh-seconds="{seconds}"><div data-record-filters>'
+               + f'<div data-list data-refresh-seconds="{seconds}" style="--list-log-max-height:{log_max_height}rem">'
+               + '<div data-record-filters>'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + record_table.chip_row('Show', shows, 'open')
                + record_table.chip_row('State', states, 'all')
@@ -586,6 +593,34 @@ SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
 let saving=0;
 const drafts=new Map();
+/** @type {Map<string, {index: string, offset: number}>} */
+const logPositions=new Map();
+function visibleLogs(){
+ return content.querySelectorAll('[data-list-item]:not([hidden]) [data-detail]:not([hidden]) .list-log-scroll');
+}
+function rememberLogPositions(){
+ for(const log of visibleLogs()){
+  if(!log.clientHeight) continue;
+  const key=log.closest('[data-list-item]').dataset.key;
+  if(!log.scrollTop){logPositions.delete(key);continue;}
+  const top=log.getBoundingClientRect().top;
+  for(const entry of log.querySelector('.list-log').children){
+   const bounds=entry.getBoundingClientRect();
+   if(bounds.bottom<=top) continue;
+   logPositions.set(key,{index:entry.dataset.logIndex,offset:bounds.top-top});
+   break;
+  }
+ }
+}
+function restoreLogPositions(){
+ if(!logPositions.size) return;
+ for(const log of visibleLogs()){
+  const position=logPositions.get(log.closest('[data-list-item]').dataset.key);
+  if(!position || !log.clientHeight) continue;
+  const entry=log.querySelector('[data-log-index="'+position.index+'"]');
+  if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-position.offset;
+ }
+}
 function matchesWords(data,search){
  if(!search) return true;
  const number=search.replace(/^#?l?(?=\d)/,'');
@@ -614,6 +649,8 @@ function syncUnread(item,form,unread,unreadSort){
 const tableView=createRecordTable({content:()=>content,
  shows:['open','needs-me','unread','done','parked','closed','all'],
  filters:['state','producer'],
+ beforeApply:rememberLogPositions,
+ applied:restoreLogPositions,
  missingItem:key=>{
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
   return number ? 'Item #'+number+' is not on the List' : '';
@@ -633,9 +670,7 @@ const tableView=createRecordTable({content:()=>content,
   items.filter(item=>item.dataset.state==='Waiting for nate' && item.dataset.parked!=='true').length+' need you · '+
   items.filter(item=>item.dataset.unread==='true').length+' unread',
 });
-const apply=(write=true)=>tableView.apply(write),place=()=>tableView.place();
-function bind(){
- tableView.replace();
+function bindForms(){
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
@@ -750,7 +785,11 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || !current()) return;
  const top=scrollY,focus=document.activeElement?.id;
  const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;
- content.replaceWith(fresh);content=fresh;bind();apply(false);
+ rememberLogPositions();
+ const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
+ for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
+ content.replaceWith(fresh);content=fresh;
+ bindForms();tableView.replace();
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
@@ -833,16 +872,16 @@ function restoreListRows(record){
 function restoreListScroll(top){
  requestAnimationFrame(()=>requestAnimationFrame(()=>scrollTo({top,behavior:'instant'})));
 }
-place();
+tableView.place();
 const listReturn=parent.performance.getEntriesByType('navigation')[0]?.type==='back_forward' ? listReturnForEntry() : undefined;
 if(listReturn) restoreListRows(listReturn);
-bind();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
+tableView.bind();bindForms();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
 if(listReturn) restoreListScroll(listReturn.top);
 addEventListener('pageshow',event=>{
  if(!event.persisted) return;
  const record=listReturnForEntry();
  if(!record) return;
- place();restoreListRows(record);
+ tableView.place();restoreListRows(record);
  tableView.apply(true,{top:record.top,dismissMissingItem:true});
  restoreListScroll(record.top);
 });
