@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone
-from scripts.production import record_store, staff
+from scripts.production import delivery_state, record_store, staff
 from scripts.review_links import change_page, page_question, question_record
 
 
@@ -134,7 +134,7 @@ class PageRequest:
     """Identify the action and its input for a retry."""
 
     request: str
-    action: Literal["tell", "remove", "park", "read", "question"]
+    action: Literal["tell", "remove", "park", "unpark", "read", "question"]
     words: str
     form_words: str = ""
     parked_until: Timestamp = NoTimestamp.UNSET
@@ -150,6 +150,17 @@ class QuestionRequestReceipt:
     question_id: str
 
 
+class UnparkNoChangeReason(StrEnum):
+    EXPIRED = "expired"
+    NO_ACTIVE_PARKING = "no_active_parking"
+
+
+@dataclass(frozen=True)
+class UnparkNoChangeReceipt:
+    request: PageRequest
+    reason: UnparkNoChangeReason
+
+
 @dataclass(frozen=True)
 class PageFeedback:
     request: str
@@ -157,7 +168,7 @@ class PageFeedback:
     state: Literal["pending", "sent", "alerted"] = "pending"
     alerted_to: str = ""
     read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
-    action: Literal["tell", "remove", "park"] = "tell"
+    action: Literal["tell", "remove", "park", "unpark"] = "tell"
     form_words: str = ""
     parked_until: Timestamp = NoTimestamp.UNSET
 
@@ -171,7 +182,7 @@ class PageItemNotice:
 
     request: str
     words: str
-    action: Literal["remove", "park"]
+    action: Literal["remove", "park", "unpark"]
     form_words: str = ""
     parked_until: Timestamp = NoTimestamp.UNSET
 
@@ -278,6 +289,11 @@ class Reopened:
 
 
 @dataclass(frozen=True)
+class Unparked:
+    pass
+
+
+@dataclass(frozen=True)
 class ReviewLinksChanged:
     action: Literal["Linked reviews", "Unlinked reviews"]
     keys: tuple[str, ...]
@@ -288,8 +304,8 @@ class EvidenceCopyRemoved:
     copy: Literal["checkins.json", "the List row"]
 
 
-PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt
-ListEvent = FieldChange | QuestionAnswered | MarkedRead | Reopened | ReviewLinksChanged | EvidenceCopyRemoved | PageActivity
+PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
+ListEvent = FieldChange | QuestionAnswered | MarkedRead | Reopened | Unparked | ReviewLinksChanged | EvidenceCopyRemoved | PageActivity
 LogContent = str | ListEvent
 
 
@@ -484,7 +500,7 @@ def _validate(item: ListItem) -> None:
     for change in item.log:
         if isinstance(change.what, str):
             _log_line(change.what, "log text")
-        if isinstance(change.what, (PageFeedback, PageRequest, QuestionRequestReceipt)):
+        if isinstance(change.what, (PageFeedback, PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt)):
             _validate_page_source(change.source)
         _log_line(change.source, "source")
         if " — " in change.source or change.time.utcoffset() is None:
@@ -521,16 +537,6 @@ def _review_keys(value: object) -> tuple[str, ...]:
     if any(not isinstance(entry, str) for entry in entries):
         raise ListError("reviews must be a list of keys")
     return tuple(cast(list[str], entries))
-
-
-def _read_questions(text: str) -> tuple[question_record.Question, ...]:
-    value = cast(object, json.loads(text))
-    if not isinstance(value, list):
-        raise ListError("invalid List questions")
-    questions = tuple(question_record.read(question) for question in cast(list[object], value))
-    if len({question.question_id for question in questions}) != len(questions):
-        raise ListError("duplicate question id")
-    return questions
 
 
 def _log_fields(fields: LogFields) -> dict[str, object]:
@@ -730,6 +736,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": "Marked read"}
     if isinstance(content, Reopened):
         return {"action": "Reopened"}
+    if isinstance(content, Unparked):
+        return {"action": "Unparked"}
     if isinstance(content, ReviewLinksChanged):
         return {"action": content.action, "keys": content.keys}
     if isinstance(content, EvidenceCopyRemoved):
@@ -742,6 +750,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
         return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
+    if isinstance(content, UnparkNoChangeReceipt):
+        return {"receipt": {**_request_fields(content.request), "unpark_no_change": content.reason.value}}
     return {"receipt": _request_fields(content)}
 
 
@@ -783,6 +793,8 @@ def _read_log_line(line: str, number: int) -> ItemChange:
                 content = MarkedRead()
             case {"action": "Reopened"} if len(fields) == 1:
                 content = Reopened()
+            case {"action": "Unparked"} if len(fields) == 1:
+                content = Unparked()
             case {"action": action, "keys": values} if len(fields) == 2 and action in ("Linked reviews", "Unlinked reviews"):
                 keys = _review_keys(values)
                 _validate_review_keys(keys)
@@ -832,7 +844,7 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
                         time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
                         fields["closing_words"], texts[0], texts[1], texts[2], texts[3], changes,
                         _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
-                        _read_questions(fields.get("questions", "[]")))
+                        delivery_state.read_list_questions(fields.get("questions", "[]")))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -871,6 +883,38 @@ def records(keeper: staff.StaffId, *, include_closed: bool = False,
             sources: list[Path] | None = None) -> list[ListItem]:
     items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
+
+
+@dataclass(frozen=True)
+class WaitingForAnswer:
+    """Each unanswered question reached the producer or has a live or scheduled send."""
+
+
+@dataclass(frozen=True)
+class QuestionResend:
+    question: question_record.Question
+    delivery: change_page.QuestionDeliveryView
+
+
+@dataclass(frozen=True)
+class QuestionResends:
+    questions: tuple[QuestionResend, ...]
+
+
+def question_visibility(keeper: staff.StaffId, item: ListItem,
+                        status: change_page.DeliveryStatus) -> WaitingForAnswer | QuestionResends:
+    """Read the delivery state of each unanswered question."""
+    unanswered = tuple(question for question in item.questions if question.answer is None)
+    if not unanswered:
+        return QuestionResends(())
+    target = _list_question_target(keeper, item)
+    resends: list[QuestionResend] = []
+    with status.locked():
+        for question in unanswered:
+            delivery = change_page.question_delivery_view(status, target.saved(question))
+            if not delivery.state.waits:
+                resends.append(QuestionResend(question, delivery))
+    return QuestionResends(tuple(resends)) if resends else WaitingForAnswer()
 
 
 def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChanges) -> None:
@@ -967,6 +1011,10 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
                                        form_words=request.form_words, parked_until=request.parked_until)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
+            elif request.action == "unpark":
+                reason = (UnparkNoChangeReason.EXPIRED if isinstance(item.parked_until, datetime)
+                          else UnparkNoChangeReason.NO_ACTIVE_PARKING)
+                entries.insert(0, ItemChange(moment, UnparkNoChangeReceipt(request, reason), PAGE_SOURCE))
             else:
                 entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
         if not entries:
@@ -1092,6 +1140,17 @@ def park(keeper: staff.StaffId, identity: str, until: Timestamp, *, source: str,
     return _change(keeper, identity, edit, event, source, page_action=notice)
 
 
+def unpark(keeper: staff.StaffId, identity: str, *, source: str,
+           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+    """Clear an active parking time and save its notice in the same write."""
+    def edit(item: ListItem, moment: datetime) -> ListItem:
+        if not isinstance(item.parked_until, datetime) or item.parked_until <= moment:
+            return item
+        _open(item)
+        return replace(item, parked_until=NoTimestamp.UNSET)
+    return _change(keeper, identity, edit, Unparked(), source, page_action=notice)
+
+
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
     _validate_closing_words(words)
@@ -1141,7 +1200,7 @@ def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
 
 
 def is_page_request_receipt(entry: ItemChange) -> bool:
-    return entry.source == PAGE_SOURCE and (isinstance(entry.what, (PageRequest, QuestionRequestReceipt))
+    return entry.source == PAGE_SOURCE and (isinstance(entry.what, (PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt))
         or isinstance(entry.what, str) and entry.what.startswith(_LEGACY_RECEIPT))
 
 
@@ -1166,17 +1225,24 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     if not isinstance(parking_time, str) or (parking_time and action != "park"):
         raise ListError("invalid List request parking time")
     parked_until = _required_time(parking_time).astimezone(UTC) if parking_time else NoTimestamp.UNSET
+    if "unpark_no_change" in fields and (not receipt or action != "unpark"):
+        raise ListError("invalid Unpark receipt")
     if receipt:
-        if action not in ("read", "remove", "park", "question") or (action != "read" and not words.strip()):
+        if action not in ("read", "remove", "park", "unpark", "question") or (action != "read" and not words.strip()):
             raise ListError("invalid List request receipt")
         received = PageRequest(request, action, words, form_words, parked_until)
         if action == "question":
             return QuestionRequestReceipt(received, _question_id(fields.get("question_id")))
+        if "unpark_no_change" in fields:
+            reason = fields["unpark_no_change"]
+            if reason not in (UnparkNoChangeReason.EXPIRED, UnparkNoChangeReason.NO_ACTIVE_PARKING):
+                raise ListError("invalid Unpark outcome")
+            return UnparkNoChangeReceipt(received, UnparkNoChangeReason(reason))
         return received
     state, alerted_to, target = fields.get("state"), fields.get("alerted_to", ""), fields.get("read_update", "")
     if state not in ("pending", "sent", "alerted") or not isinstance(alerted_to, str) or not isinstance(target, str):
         raise ListError("invalid List feedback log")
-    if action not in ("tell", "remove", "park") or not words.strip():
+    if action not in ("tell", "remove", "park", "unpark") or not words.strip():
         raise ListError("invalid List feedback action")
     return PageFeedback(request, words, state, alerted_to,
                         UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words, parked_until)
@@ -1186,8 +1252,9 @@ def _page_requests(item: ListItem) -> dict[str, PageActivity]:
     requests: dict[str, PageActivity] = {}
     for entry in item.log:
         content = entry.what
-        if entry.source == PAGE_SOURCE and isinstance(content, (PageRequest, PageFeedback, QuestionRequestReceipt)):
-            identity = content.request.request if isinstance(content, QuestionRequestReceipt) else content.request
+        if entry.source == PAGE_SOURCE and isinstance(content, (PageRequest, PageFeedback, QuestionRequestReceipt, UnparkNoChangeReceipt)):
+            identity = (content.request.request if isinstance(content, (QuestionRequestReceipt, UnparkNoChangeReceipt))
+                        else content.request)
             requests[identity] = content
     return requests
 
@@ -1197,13 +1264,24 @@ def feedback_requests(item: ListItem) -> dict[str, PageFeedback]:
     return {request: saved for request, saved in _page_requests(item).items() if isinstance(saved, PageFeedback)}
 
 
+def unpark_no_change_reason(item: ListItem, request: str) -> UnparkNoChangeReason:
+    """Read the original reason from an Unpark receipt."""
+    saved = _page_requests(item).get(_request_id(request))
+    if isinstance(saved, UnparkNoChangeReceipt):
+        return saved.reason
+    if isinstance(saved, PageRequest) and saved.action == "unpark":
+        # Older receipts do not record why the request made no change.
+        return UnparkNoChangeReason.NO_ACTIVE_PARKING
+    raise ListError("the List item has no Unpark receipt for this request")
+
+
 def _previous_page_request(
-        item: ListItem, request: PageRequest) -> PageFeedback | PageRequest | QuestionRequestReceipt | NoPageRequest:
+        item: ListItem, request: PageRequest) -> PageActivity | NoPageRequest:
     previous = _page_requests(item).get(_request_id(request.request), NoPageRequest.ABSENT)
     if previous is not NoPageRequest.ABSENT:
         if isinstance(previous, PageFeedback):
             key = previous.key()
-        elif isinstance(previous, QuestionRequestReceipt):
+        elif isinstance(previous, (QuestionRequestReceipt, UnparkNoChangeReceipt)):
             key = previous.request
         else:
             key = previous
@@ -1239,9 +1317,11 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
 class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
+    resend_id: str = ""
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
-        return load(self.keeper, item).questions
+        questions = load(self.keeper, item).questions
+        return tuple(question for question in questions if question.question_id == self.resend_id) if self.resend_id else questions
 
     def add(self, item: str, question: question_record.Question) -> None:
         # ask_question holds the List lock from the receipt check through this write.
@@ -1279,7 +1359,6 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
         raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
-    source = store.path(identity)
     questions = _ListQuestionStore(keeper, request)
     with store.locked():
         item = load(keeper, identity)
@@ -1291,10 +1370,29 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
                 return change_page.NoMessageDelivery()
         elif open_question is not None:
             questions.save_request(item, request, open_question)
-        command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
-                   + 'answer {item} --question {question_id} --text "<answer>"')
-        return page_question.ask(questions, identity, keeper, source, f"List item {item.number}", item.title,
-                                 request.words, command, status)
+        return _claim_question(questions, item, request.words, status)
+
+
+def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
+                    status: change_page.DeliveryStatus, *, resend_request: str = "") -> change_page.MessageDelivery:
+    return page_question.ask(questions, _list_question_target(questions.keeper, item), words, status,
+                             resend_unknown=bool(questions.resend_id), resend_request=resend_request)
+
+
+def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
+    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title, keeper)
+
+
+def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
+                    request: str, status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Claim delivery for the saved question with this ID."""
+    with _store(keeper).locked():
+        item = load(keeper, identity)
+        for question in item.questions:
+            if question.question_id == question_id and question.answer is None:
+                return _claim_question(_ListQuestionStore(keeper, resend_id=question_id), item, question.words, status,
+                                       resend_request=request)
+        return change_page.NoMessageDelivery()
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
