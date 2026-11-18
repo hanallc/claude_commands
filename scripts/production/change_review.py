@@ -446,6 +446,18 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else BODY
 
 
+def review_list_source(path: Path) -> Path:
+    """Resolve a review list path and reject existing paths that are not files."""
+    source = path.resolve()
+    try:
+        mode = source.stat().st_mode
+    except FileNotFoundError:
+        return source
+    if not stat.S_ISREG(mode):
+        raise ChangeReviewError(f"{source}: the review list must be a regular file")
+    return source
+
+
 def list_file(showrunner: str, *, sources: list[Path] | None = None) -> Path:
     """The list of the top-level showrunner called `showrunner`."""
     folder = lists_directory() if sources is None else lists_directory(sources=sources)
@@ -2051,17 +2063,23 @@ class PendingVerdictCleanup:
         return cls(path, row, root / name.replace('.review-link-delivery-', VERDICT_CLEANUP_PREFIX, 1))
 
     @classmethod
-    def load(cls, intent: Path, lists: Path) -> PendingVerdictCleanup:
-        """Read the exact list, row and verdict for restart cleanup."""
-        fields = cast(dict[str, object], json.loads(intent.read_text(encoding='utf-8')))
+    def load(cls, intent: Path, expected_directory: Path | None = None) -> PendingVerdictCleanup:
+        """Read the exact list, row and verdict from a private cleanup record."""
+        with os.fdopen(os.open(intent, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding='utf-8') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise ChangeReviewError(f"{intent}: scratch cleanup record must be private")
+            fields = cast(dict[str, object], json.load(source))
         path = Path(cast(str, fields['list']))
         row = _row_id('row', cast(str, fields['row']))
+        if path != review_list_source(path) or (expected_directory is not None and path.parent != expected_directory):
+            raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         cleanup = replace(cls.for_row(intent.parent, path, row),
                           verdict=_words('verdict', cast(str, fields['verdict'])),
                           feature_review=cast(str, fields.get('feature_review', '')),
                           superseded_wait=cast(str, fields.get('superseded_wait', '')),
                           require_git_commit=fields.get('require_git_commit') is not False)
-        if path.parent != lists or path.is_symlink() or not path.match(PREFIX+'*.md') or cleanup.intent != intent:
+        if cleanup.intent != intent:
             raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         if 'wait_log' in fields:
             cleanup = replace(cleanup, wait_log=WaitSupersessionDestination.from_fields(

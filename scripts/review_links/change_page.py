@@ -1135,7 +1135,8 @@ def publish_next(page: ReviewPage, body: str) -> str:
 
 
 def publish(production: Path, review_list: Path, rows: list[str]) -> str:
-    page = ReviewPage(review_list.resolve(), production.resolve(), tuple(dict.fromkeys(rows)), secrets.token_urlsafe())
+    listing = change_review.review_list_source(review_list)
+    page = ReviewPage(listing, production.resolve(), tuple(dict.fromkeys(rows)), secrets.token_urlsafe())
     if not page.rows or any(re.fullmatch(r"C\d+", row) is None for row in page.rows):
         raise ValueError("name one or more row IDs such as C27")
     _ = shown_rows(page)
@@ -1581,7 +1582,7 @@ def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, sour
     return reached
 
 
-def recover_verdict_cleanups(status: DeliveryStatus, lists: Path, intents: tuple[Path, ...],
+def recover_verdict_cleanups(status: DeliveryStatus, intents: tuple[Path, ...],
                              unreadable: set[Path]) -> set[Path]:
     """Finish each durable verdict and return the deliveries that must wait."""
     unready: set[Path] = set()
@@ -1590,7 +1591,7 @@ def recover_verdict_cleanups(status: DeliveryStatus, lists: Path, intents: tuple
             continue
         try:
             with status.locked():
-                cleanup = change_review.PendingVerdictCleanup.load(intent, lists)
+                cleanup = change_review.PendingVerdictCleanup.load(intent)
                 listing = cleanup.path
                 if listing in unreadable:
                     continue
@@ -1634,9 +1635,8 @@ def recover_pending(status: DeliveryStatus, *,
     intents = (only.intent,) if targeted else tuple(sorted(status.root.glob(change_review.VERDICT_CLEANUP_PREFIX+'*')))
     if not intents and not status.read_view().paths:
         return
-    lists = change_review.lists_directory().resolve()
     unreadable: set[Path] = set()
-    unready = recover_verdict_cleanups(status, lists, intents, unreadable)
+    unready = recover_verdict_cleanups(status, intents, unreadable)
     if not targeted:
         recover_question_answers(status)
         recover_review_messages(status)
@@ -1645,7 +1645,7 @@ def recover_pending(status: DeliveryStatus, *,
         listings: Iterable[Path] = (only.path,)
     else:
         paths = status.read_view().paths
-        listings = lists.glob(change_review.PREFIX+"*.md")
+        listings = change_review.lists_directory().resolve().glob(change_review.PREFIX+"*.md")
     if not paths:
         return
     snapshots: dict[Path, change_review.ReviewListSnapshot] = {}

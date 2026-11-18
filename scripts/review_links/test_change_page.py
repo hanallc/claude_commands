@@ -3983,6 +3983,14 @@ class ChangePageTests(unittest.TestCase):
 
     def test_a_feature_log_project_saves_when_the_writer_skips_an_absent_proposal(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        configured = self.temporary / "configured-lists"
+        configured.mkdir()
+        _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=configured))
+        published = self.command(change_page, change_page.main,
+                                 ["--production", "page-owner", "--list", str(self.review_list), "C1"])
+        self.assertEqual((published.returncode, published.stderr), (0, ""))
+        path = urlsplit(published.stdout.strip()).path
+        page = change_page.page_at(self.root, path)
         cleanup = replace(change_review.PendingVerdictCleanup.for_row(self.root, self.review_list, "C1"),
                           verdict="works", require_git_commit=False)
         with (patch.object(subprocess, "run", wraps=subprocess.run) as commands,
@@ -3990,8 +3998,8 @@ class ChangePageTests(unittest.TestCase):
               patch.object(feature_log, "land_review", wraps=feature_log.land_review) as land,
               patch.object(change_review, "save_verdict", wraps=change_review.save_verdict) as save,
               patch.object(scratch, "end", side_effect=conf.Unusable("scratch settings unavailable"))):
-            reply = self.request(self.page_path, self.answer())
-        self.assertEqual((reply.status, reply.location), (303, self.page_path))
+            reply = self.request(path, dict(self.answer(), token=page.token))
+        self.assertEqual((reply.status, reply.location), (303, path))
         invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
         self.assertTrue(invocations)
         self.assertTrue(all(args[0] == "git" for args in invocations), invocations)
@@ -4001,13 +4009,19 @@ class ChangePageTests(unittest.TestCase):
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
         self.assertEqual(saved["Verdict"], "works")
         self.assertEqual([row["#"] for row in change_review.pending(self.review_list)], ["C2", "C3"])
-        self.assertIn("Saved: works", self.request(self.page_path, {}).body)
+        self.assertIn("Saved: works", self.request(path, {}).body)
         self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
         self.assertIn("C1 landed", self.messages[0][2])
         self.assertFalse((feature_log.state_dir() / "proposals/page-owner/C1.json").exists())
         self.assertEqual(change_review.PendingVerdictCleanup.load(cleanup.intent, self.temporary), cleanup)
+        shutil.rmtree(self.root / path.split("/")[1])
         before = self.review_list.read_bytes()
         with patch.object(scratch, "end", wraps=scratch.end) as end:
+            cleanup.intent.chmod(0o644)
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+            end.assert_not_called()
+            self.assertTrue(cleanup.intent.exists())
+            cleanup.intent.chmod(0o600)
             change_page.recover_pending(change_page.DeliveryStatus(self.root))
             end.assert_called_once_with("row:page-owner-C1")
         self.assertFalse(cleanup.intent.exists())
