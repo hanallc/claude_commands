@@ -1446,13 +1446,15 @@ class StopResumeTests(unittest.TestCase):
             login = label + "@example.invalid"
             write_codex_auth(home, login)
             atomic_file.write_text_atomic(self.root / "notes" / f"{label}.md", f"---\nlogin: {login}\n---\n")
-        identity = self.entry["session_id"]
-        cases: tuple[tuple[staff.Kind, str, str, str], ...] = (
-            ("unit", "alpha", "claude", "claude3"),
-            ("producer", "own-codex", "codex", "codex1"))
+        recorded_identity = self.entry["session_id"]
+        cases: tuple[tuple[staff.Kind, str, str, str, str], ...] = (
+            ("unit", "alpha", "claude", "claude3", recorded_identity),
+            ("producer", "own-codex", "codex", "codex1", recorded_identity),
+            ("producer", "alpha", "claude", "claude3", fixture_runtime_id("producer-without-claude-history")),
+            ("producer", "own-codex", "codex", "codex1", fixture_runtime_id("producer-without-codex-history")))
         pane_record.save("agents", {})
-        for row_kind, name, family, selected in cases:
-            if family == "codex":
+        for row_kind, name, family, selected, identity in cases:
+            if family == "codex" and identity == recorded_identity:
                 fixture_launch_transcript(self.root, {**self.entry, "kind": "codex",
                     "config_dir": str(self.root / ".codex1")}, staff.StaffSnapshot(()))
             row = staff.StaffRow(staff.StaffId("fixed-row"), row_kind, name, staff.StaffRoot(),
@@ -1477,10 +1479,14 @@ class StopResumeTests(unittest.TestCase):
                         return sessions.LiveSessionProcess(456) if family == "claude" and started else sessions.SessionNotLive()
 
                     def codex_live(reference: str, kind: str = "") -> herdr.LiveConversation | herdr.StoppedConversation:
+                        if identity != recorded_identity and not kind:
+                            self.assertEqual(reference, identity)
+                            self.assertFalse(started)
+                            return herdr.StoppedConversation()
                         self.assertEqual((reference, kind), (identity, "codex"))
                         return herdr.LiveConversation("codex", (456,)) if started else herdr.StoppedConversation()
 
-                    with (self.subTest(family=family, target=target, panes=bool(panes)),
+                    with (self.subTest(family=family, target=target, panes=bool(panes), transcript=identity == recorded_identity),
                           patch.object(staff, "initial_snapshot", return_value=record),
                           patch.object(self.client, "rows", panes),
                           patch.object(restart, "start_row", side_effect=start_staff) as start,

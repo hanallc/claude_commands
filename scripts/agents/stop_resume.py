@@ -489,12 +489,18 @@ def _stop_producer_for_family_change(change: ProducerFamilyChange) -> None:
         raise ValueError(f"{change.session}: the old producer pane {pane} did not close")
 
 
-def _producer_current_kind(row: StaffRow, entry: pane_record.PaneLaunch | None) -> Literal["claude", "codex"]:
+@dataclass(frozen=True)
+class ProducerFamilyUnavailable:
+    """The observed session and its saved binding do not supply a family."""
+
+
+def _producer_current_kind(row: StaffRow, entry: pane_record.PaneLaunch | None
+                           ) -> Literal["claude", "codex"] | ProducerFamilyUnavailable:
     try:
         return pane_launch.current_kind(row)
     except ValueError:
         if entry is None or not entry.get("producer_binding", False):
-            raise
+            return ProducerFamilyUnavailable()
         # A Codex launch records its policy even when it has no policy arguments.
         return "codex" if "codex_policy" in entry else "claude"
 
@@ -1293,8 +1299,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = recovered
         if row is not None and row.kind == "producer":
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            kind = _producer_current_kind(row, entry)
-            if kind != restart.producer_launch(row)[0]:
+            kind = restart.producer_launch(row)[0]
+            current_kind = _producer_current_kind(row, entry)
+            if isinstance(current_kind, str) and current_kind != kind:
                 request = _producer_start_request(row)
                 old_pane: herdr.PaneIdentity | herdr.NoPane = herdr.NoPane(row.name)
                 if isinstance(tab, herdr.TabSession):
@@ -1302,13 +1309,16 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     old_pane = client.pane_row(tab.pane_id)
                 elif isinstance(source_pane, pane_launch.ResumeSourcePane):
                     old_pane = source_client.pane_row(source_pane.pane)
-                change = ProducerFamilyChange(request.name, request.folder, row.current_session, kind, source_client, old_pane)
+                change = ProducerFamilyChange(request.name, request.folder, row.current_session, current_kind, source_client, old_pane)
                 return _locked_first_producer_resume(change, to=to or "", client=client)
-        else:
-            kind = pane_launch.current_kind(row) if entry is None and row is not None else "claude"
-        if entry is not None:
+            if entry is not None:
+                entry = names.resume(entry)
+                entry["kind"] = kind
+        elif entry is not None:
             entry = names.resume(entry)
             kind = pane_launch.saved_kind(entry)
+        else:
+            kind = pane_launch.current_kind(row) if row is not None else "claude"
         pane_id = tab.pane_id if isinstance(tab, herdr.TabSession) else ""
         running = running_on_account(identity, pane_id, kind=kind)
         if not isinstance(running, sessions.SessionNotLive):
