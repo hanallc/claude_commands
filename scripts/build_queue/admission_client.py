@@ -900,10 +900,18 @@ def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
     if isinstance(cause, records.MemoryPressure) and cause.condition == "some":
         return ("some memory pressure",)
     if isinstance(cause, records.BehindHead):
-        return (f"queue head {cause.head_name}",)
+        return (f"behind {cause.head_name}",)
     if isinstance(cause, records.ReadyForAdmission):
         return ("admission refresh",)
     return (records.reason_phrase(cause, ()),)
+
+
+def blocking_waiter_text(place: str, name: str, step: str, unit: str, need_gib: float) -> str:
+    """Name the step that holds the row and give its position."""
+    label = " · ".join(part for part in (name, step) if part)
+    if place == "behind #1":
+        label = f"head {label} needs {need_gib:.1f} GiB"
+    return " · ".join(part for part in (place, label, unit if unit != name else "") if part)
 
 
 @dataclass(frozen=True)
@@ -1031,7 +1039,18 @@ class WaitOutput:
                 self.status(reply.text)
                 self.last_reasons = reasons
             return
-        reasons = wait_reasons(reply.snapshot)
+        snapshot = reply.snapshot
+        cause = snapshot.head_reason
+        if isinstance(cause, records.HeadAdmissionStatus):
+            cause = cause.cause
+        order = snapshot.decision.order_hold
+        if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead):
+            blocker = order.waiter
+            reasons = (blocking_waiter_text(reply.text, blocker.get("session_name") or cause.head_name,
+                blocker.get("step", ""), blocker.get("unit", ""), blocker["need"] / records.GIB),)
+        else:
+            reasons = wait_reasons(snapshot)
+        behind = isinstance(cause, records.BehindHead)
         if first:
             self.held = True
             self.on_event("first")
@@ -1045,18 +1064,17 @@ class WaitOutput:
         if not first and reasons == self.last_reasons and reply.position == self.last_position:
             return
         self.last_reasons, self.last_position = reasons, reply.position
-        snapshot = reply.snapshot
         prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
                   if first else f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)")
         place = ("this build is the queue head" if reply.position == 1 else
                  f"place {reply.position} in line" if reply.position > 1 else "")
         subject = f"{snapshot.repo} {snapshot.step}".strip()
-        reason = (records.head_wait_text(snapshot.head_reason, user_zone())
+        reason = ("reason: " + reasons[0] if behind else records.head_wait_text(snapshot.head_reason, user_zone())
             if isinstance(snapshot.head_reason, records.HeadAdmissionStatus) else
             records.pressure_text(snapshot.decision.pressure)
             if isinstance(snapshot.decision.pressure, records.MemoryPressure) else "reason: " + "; ".join(reasons))
         head = (" ".join(word for word in ("head", snapshot.head_label, f"needs {snapshot.head_need / records.GIB:.1f} GiB") if word)
-                if snapshot.head_need and reply.position != 1 else "")
+                if not behind and snapshot.head_need and reply.position != 1 else "")
         parts = (place, f"{subject} needs {snapshot.peak.bytes / records.GIB:.1f} GiB",
                  f"{snapshot.available / records.GIB:.1f} GiB free", reason, head,
                  f"runs on natedev: {self.local_reason}" if self.local_reason else "",
@@ -1253,6 +1271,7 @@ class ClientArguments(argparse.Namespace):
     episode: str = ""
     attempt: str = ""
     repo_root: str = ""
+    cargo_folder: Path | None = None
     package: str = ""
     kind: str = ""
     source_key: str = ""
@@ -1333,6 +1352,12 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             return step_request(step_argv, os.getcwd(), wire.Owner(args.pid, start), args.since,
                                 args.sidecar, episode, run=parse_run_identity(args.run))
 
+        cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
+        if args.cargo_folder is not None:
+            if not args.cargo_folder.is_absolute():
+                raise CheckerFailure("the Cargo folder must be an absolute path")
+            cargo_folder = placement.CargoFolder(args.cargo_folder.resolve())
+
         local = refresh_local()
         session = OwningSession(args.session_id) if args.session_id else NoOwningSession()
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
@@ -1352,6 +1377,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             placement.SourceKeyKnown(args.source_key) if args.source_key else placement.SourceKeyUnavailable("source key is unavailable"),
             routing, selection,
             writes_tree=args.writes_tree)
+        constraints = replace(constraints, cargo_folder=cargo_folder)
         if args.mac_only and not args.writes_tree:
             constraints = replace(constraints, selection=placement.MacOnlyHost())
         prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())
@@ -1451,6 +1477,7 @@ def main(argv: list[str] | None = None) -> int:
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
         _ = placement_parser.add_argument("--" + name, default="")
+    _ = placement_parser.add_argument("--cargo-folder", type=Path)
     _ = placement_parser.add_argument("--pid", type=int, default=os.getppid())
     _ = placement_parser.add_argument("--since", type=float, required=True)
     _ = placement_parser.add_argument("--call-started", type=float, default=0.0)
