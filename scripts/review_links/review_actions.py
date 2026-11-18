@@ -266,7 +266,7 @@ def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words
                 return change_page.NoMessageDelivery()
         intent = slots.verdict
         if isinstance(intent, change_page.DeliveryIntent):
-            if status.owns_live_attempt(page, row, intent):
+            if status.owns_live_claim(page, row, intent.attempt):
                 return change_page.NoMessageDelivery()
         else:
             recipient = staff.StaffId(page.saved['owner'])

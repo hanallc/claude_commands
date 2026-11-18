@@ -53,6 +53,32 @@ Removal verifies the exported rescue before it deletes the workspace.
 Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
 Its Git children inherit the destination lease and busy lock.
+The saved-work check trusts cached remote-tracking refs when they cover all local commits.
+Otherwise, removal runs `git ls-remote` in the clone once per named remote.
+Git uses the named remote's configured transport.
+Git resolves URL rewrites before the publication check reads a remote.
+The check keeps the clone if a local remote uses Git directories or alternate object directories inside the removal tree.
+It keeps the clone if it cannot verify that the local remote's Git storage is independent.
+The check trusts the configured transport programs to use the named remote.
+Only advertised IDs that exist locally can cover commits in the second check.
+This check reads current HEAD, branches, and tags after the remote commands.
+Peeled tag IDs can cover commits.
+Removal keeps the clone if the check cannot prove publication of every commit.
+Terminal workspace cleanup can remove an unpublished workspace after it verifies a rescue outside the workspace.
+A newer remote tip that is absent locally cannot supply ancestry evidence.
+The remote evidence applies at the time of the advertisement.
+The `removal_remote_timeout_seconds` setting gives all remote queries for one repository the same deadline.
+The caller stops reading output at the deadline.
+The portable runner stops the Git process group when the command completes or reaches the deadline.
+The runner stops the group even if the direct command or the removal caller has exited.
+The query disables credential prompts.
+The Git reads discard inherited trace settings and disable configured Trace2 targets.
+The query leaves the clone's objects, refs, and `FETCH_HEAD` unchanged.
+Cargo recovery reuses advertised IDs for the same repository only while the removal locks remain held.
+It checks current local work again when recovery requires revalidation.
+Dry runs, lifetime scans, and linked worktree checks use local Git evidence.
+Actual removal of a landed clone can query the remotes under the removal locks.
+When a task lists a folder and holds it, one removal attempt supplies the result for both.
 Removal retries take the busy lock again, even if an earlier attempt removed the mark.
 Recovery ignores the timestamps of busy marks that the current attempt creates.
 A removal retry checks `.git`, `commondir`, and `HEAD` at the removal path and in descendant checkouts.
@@ -72,7 +98,7 @@ For a legacy intent, it keeps an empty ref directory outside `refs`, `refs/heads
 At those paths, it keeps an empty directory if a regular reflog or `packed-refs` names the exact ref.
 Without that evidence, a legacy intent cannot distinguish an empty standard namespace from a loose ref that a directory replaced.
 The retry accepts the empty standard namespace in that case.
-Deletion is safe only when writers honor the removal locks until deletion completes.
+Writers must honor the removal locks through deletion, including during the remote queries.
 `save_cargo_outputs` reads Cargo metadata with `--locked` to preserve source lockfiles.
 `clean_cargo_outputs` deletes only build output outside the source tree.
 A retry with Cargo work validates the source again after these helpers.

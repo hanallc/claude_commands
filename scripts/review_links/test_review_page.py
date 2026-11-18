@@ -3220,6 +3220,86 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_bug_opens_after_refresh_and_keeps_the_matching_owner_filter(self) -> None:
+        owner = self.ready_submission_recipient()
+        _ = self.question('Keep this question')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        before = cache.get()
+        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id))
+        fresh = cache.get()
+        values = {
+            'owner': owner.id, 'key': created.key, 'id': created.saved.id,
+            'body': fresh.body(created.key).decode(), 'snapshot': cast(object, json.loads(fresh.index_response())),
+        }
+        setup = r'''<script>
+const fixture=FIXTURE, nativeFetch=fetch;
+let sent=false;
+history.replaceState(null,'','#'+new URLSearchParams({
+ owner:fixture.owner,type:'question',show:'open',q:'keep this question'
+}));
+window.fetch=async(url,options={})=>{
+ const route=new URL(url,location.href);
+ if(route.pathname==='/console/review/new-item'){
+  if(options.method==='POST'){
+   sent=true;
+   return Response.json({id:fixture.id,key:fixture.key,version:fixture.snapshot.version});
+  }
+  return Response.json({token:'fixture',recipients:[{id:fixture.owner,name:'page-owner'}]});
+ }
+ if(sent && route.searchParams.has('body')) return new Response(fixture.body,{
+  headers:{'X-Review-Version':fixture.snapshot.version}
+ });
+ if(sent && (route.searchParams.has('index') || route.searchParams.has('version')))
+  return Response.json(fixture.snapshot);
+ return nativeFetch(url,options);
+};
+</script>'''.replace('FIXTURE', json.dumps(values).replace('</', '<\\/'))
+        probe = r'''<script>(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const review=document.querySelector('[data-review]'), dialog=document.querySelector('#review-new-item');
+ const params=()=>new URLSearchParams(location.hash.slice(1));
+ try {
+  const previous=history.length;
+  check(params().get('owner')===fixture.owner, 'The original owner filter is active.');
+  const recipients=dialog.querySelector('[data-recipients]');
+  const ready=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    const recipient=recipients.querySelector('input');
+    if(recipient){observer.disconnect();resolve(recipient);}
+   });
+   observer.observe(recipients,{childList:true});
+  });
+  review.querySelector('[data-review-new]').click();
+  if(!dialog.open) throw new Error('New must open the dialog.');
+  dialog.querySelector('[name="kind"][value="bug"]').click();
+  (await ready).click();
+  const words=dialog.querySelector('[name="words"]');
+  words.value='Check the Bug record.';
+  words.dispatchEvent(new Event('input',{bubbles:true}));
+  const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
+  dialog.querySelector('[type="submit"]').click();
+  await refreshed;
+  const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
+  check(row?.dataset.type==='bug' && !row.hidden && row.querySelector('[data-detail]').hidden===false,
+        'The refreshed index reveals and opens the new Bug.');
+  check(params().get('item')===fixture.key && params().get('show')==='all' &&
+        !params().get('type') && !params().get('q') && params().get('owner')===fixture.owner,
+        'The jump keeps the matching owner and clears the filters that hide the new Bug.');
+  check(history.length===previous+1, 'The jump adds one history entry.');
+  if(history.length===previous+1){
+   const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   history.back();
+   await restored;
+   check(params().get('type')==='question' && params().get('show')==='open' &&
+         params().get('q')==='keep this question', 'Back restores the former filters.');
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        markup = before.render().decode().replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
         _ = self.investigation(False)
@@ -3464,6 +3544,133 @@ window.fetch=async(url)=>{
         self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
+        _ = self.question()
+        setup = r"""<script>
+const nativeFetch=fetch;
+let finishVerdict;
+history.replaceState(null,'','#show=all');
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method!=='POST') return nativeFetch(url,options);
+ const fields=new URLSearchParams(options.body);
+ if(fields.get('row').startsWith('question/') && fields.get('outcome')==='answer')
+  return Promise.resolve(Response.json({answer:'answered',state:'Done'}));
+ if(!['page-owner/C1','page-owner/C2'].includes(fields.get('row')) || fields.get('outcome')!=='works')
+  throw new Error('The form did not submit a verdict for the expected Change.');
+ const result=()=>Response.json({answer:'works',state:'Done'});
+ if(fields.get('row')==='page-owner/C1') return new Promise(resolve=>{finishVerdict=()=>resolve(result());});
+ return Promise.resolve(result());
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const change=key=>document.querySelector('[data-key="'+key+'"]');
+ const read=fetch;
+ window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
+  ? Promise.resolve(Response.json({version:document.querySelector('[data-review]').dataset.version,facts:pageRefreshFacts()}))
+  : read(url,options);
+ const review=document.querySelector('[data-review]');
+ const selectShow=value=>document.querySelector('[data-show-chip="'+value+'"]').click();
+ const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip;
+ const follow=async(params,key='page-owner/C1')=>{
+  const link=document.createElement('a');
+  link.href='#'+new URLSearchParams({item:key,...params});
+  link.textContent='Open review item';
+  document.body.append(link);
+  const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  link.click();
+  await navigated;
+  link.remove();
+  return change(key);
+ };
+ const savedForm=form=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(form.dataset.sending) return;
+   observer.disconnect();resolve();
+  });
+  observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+ });
+ const expanded=(row,state)=>row?.dataset.state===state && !row.hidden && !row.querySelector('[data-detail]').hidden;
+ try{
+  const owner=change('page-owner/C1').dataset.owner;
+  document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
+  selectShow('Done');
+  check(expanded(await follow({show:'Done'}),'Open') && review.dataset.show==='all' && selectedOwner()===owner,
+   'F003: A link with Done selected shows the Open Change C1.');
+  selectShow('open');
+  if(selectedOwner()!==owner) document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
+  check(expanded(await follow({}),'Open') && review.dataset.show==='open' && selectedOwner()===owner,
+   'F003: A bare link preserves the matching Show and Owner filters.');
+  change('page-owner/C1').querySelector('.list-toggle').click();
+
+  for(const key of ['page-owner/C2','page-owner/C1']){
+   const row=change(key);
+   check(row && !row.hidden,key+' is visible before the save.');
+   row.querySelector('.list-toggle').click();
+   const form=await readyReviewCard(row);
+   const saved=savedForm(form);
+   form.requestSubmit(form.querySelector('button[value="works"]'));
+   if(!form.dataset.sending) throw new Error('The save did not start for '+key+'.');
+   if(key==='page-owner/C1'){
+    await follow({show:'Done',owner});
+    finishVerdict();
+   }
+   await saved;
+   check(form.querySelector('[data-send-status]').textContent==='Saved: works',key+' saved.');
+   check(row.hidden,'The save hides '+key+'.');
+  }
+  check(expanded(change('page-owner/C1'),'Done') && review.dataset.show==='Done' && selectedOwner()===owner,
+   'F006: A link during the save opens the Done Change and keeps the matching filters.');
+
+  const linked=await follow({show:'all'});
+  check(expanded(linked,'Done'),'The same-tab link shows the closed Change C1.');
+  check(linked?.querySelector('[data-review-body]'),'The reopened card keeps its cached details.');
+  check(!linked?.querySelector('[data-review-form]'),'The reopened card hides stale actions until the snapshot arrives.');
+  selectShow('open');
+  check(review.dataset.show==='open','Open is selected before the link.');
+  check(expanded(await follow({show:'open'}),'Done') && review.dataset.show==='all',
+   'A link from Open selects All and shows the closed Change C1.');
+  check(!change('page-owner/C2'),'The unlinked Change C2 stays hidden.');
+
+  const question=document.querySelector('[data-type="question"][data-list-item]');
+  question.querySelector('.list-toggle').click();
+  const answerForm=await readyReviewCard(question),answered=savedForm(answerForm);
+  answerForm.elements.feedback.value='Use the wide layout.';
+  answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));
+  if(!answerForm.dataset.sending) throw new Error('The Question save did not start.');
+  await answered;
+  selectShow('Done');
+  const answeredQuestion=await follow({},question.dataset.key);
+  check(expanded(answeredQuestion,'Done') && review.dataset.show==='Done' &&
+    answeredQuestion.querySelector('[data-review-body]') && !answeredQuestion.querySelector('[value="answer"]'),
+   'F007: A link opens the Done Question without the old Answer action.');
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root, show='all')
+        page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        with self.subTest(navigation='same tab'):
+            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+        fixture = self.fixture
+        _ = change_review.record_verdict(fixture.review_list, 'C1', 'works', datetime.now(user_zone()).date(),
+                                         fixture.production)
+        markup = browser_markup(self.root)
+        initial_link = '<script>history.replaceState(null, "", "#show=open&item=page-owner%2FC1");</script>'
+        initial_probe = r"""<script>
+const review=document.querySelector('[data-review]'),row=review.querySelector('[data-key="page-owner/C1"]');
+const opened=row?.dataset.state==='Done' && !row.hidden && !row.querySelector('[data-detail]').hidden;
+void fetch('/results',{method:'POST',body:JSON.stringify(opened && review.dataset.show==='all' ? [] :
+ ['F004: A fresh link with Open selected shows the Done Change C1.'])});
+</script>"""
+        page = markup.replace('<head>', '<head>'+initial_link, 1).replace('</body>', initial_probe+'</body>', 1)
+        with self.subTest(navigation='fresh load'):
+            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
         question_key = self.question()
         question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
@@ -3592,13 +3799,17 @@ window.fetch=async(_url,options={})=>{
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
-  check(target.hidden,'F010: a fragment change keeps the saved row hidden');
+  const reopened=liveRow(target.dataset.key);
+  check(reopened && !reopened.hidden && !reopened.querySelector('[data-detail]').hidden,
+   'A same-tab link shows and opens the saved Change.');
+  check(!liveRow(allTarget.dataset.key),'F010: the unlinked saved Change stays hidden in All.');
   const reloaded=document.createElement('iframe');reloaded.src='/console/review.html#'+new URLSearchParams({item:target.dataset.key});
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
-  check(!linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,'a Review item link shows the saved row');
-  check(showValue(reloaded.contentDocument)==='all' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
-    reloaded.contentDocument.getElementById('list-search').value==='','a Review item link clears filters');
+  check(linkedTarget.dataset.state==='Open' && !linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,
+   'The fixture still shows the Change as Open on a fresh load.');
+  check(showValue(reloaded.contentDocument)==='open' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
+    reloaded.contentDocument.getElementById('list-search').value==='','A bare link keeps the default filters for an Open Change.');
   reloaded.remove();
   const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'open',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();
