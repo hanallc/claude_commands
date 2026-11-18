@@ -262,7 +262,7 @@ For a private checkout, the supervisor asks the copy owner to write the scope an
 The copy owner writes the confirmation line in one pipe write.
 The supervisor reads to the end of the line.
 For a prepared checkout, the supervisor writes the scope while it holds the inherited slot lock.
-Verify moves the descriptor named by the caller to the reserved descriptor.
+Verify moves the descriptor named by the caller to an unused descriptor before it starts its helpers.
 The background sweep closes the checkout lock and the private copy pipes before it starts its scope.
 `VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline for publication and confirmation in `config/direct.conf`.
 The supervisor divides long waits into intervals that fit the kernel's poll limit.

@@ -352,6 +352,11 @@ without_progress_frames() {
 }
 
 buildlog_exec_with_progress() {
+    if [[ -n "${MAC_LOG_FD:-}" ]]; then
+        local log_fd=$MAC_LOG_FD
+        MAC_LOG_FD="" buildlog_exec_with_progress "$@" {log_fd}>&-
+        return $?
+    fi
     CARGO_TERM_PROGRESS_WHEN=always \
         CARGO_TERM_PROGRESS_WIDTH=${CARGO_TERM_PROGRESS_WIDTH:-${COLUMNS:-80}} \
         buildlog_exec "$@"
@@ -506,7 +511,7 @@ run_step_attempt() {
         tty=1
         set +e
         buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
-            ${holder[@]+"${holder[@]}"} "$@" 9>&-
+            ${holder[@]+"${holder[@]}"} "$@"
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
@@ -518,7 +523,7 @@ run_step_attempt() {
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
         buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
-            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
+            ${holder[@]+"${holder[@]}"} "$@" 2>&1 | tee -a "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e

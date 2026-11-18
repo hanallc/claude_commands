@@ -11,7 +11,6 @@ import math
 import os
 from pathlib import Path
 import select
-import stat
 import subprocess
 import sys
 import time
@@ -31,9 +30,20 @@ POLL_MAX_MILLISECONDS = (1 << 31) - 1
 
 
 @dataclass(frozen=True)
-class OwnedDocCheckout:
+class PreparedDocCheckout:
     path: Path
     lease_owner: int
+    lock_fd: int
+
+
+@dataclass(frozen=True)
+class PrivateDocCheckout:
+    lease_owner: int
+    request_fd: int
+    reply_fd: int
+
+
+OwnedDocCheckout = PreparedDocCheckout | PrivateDocCheckout
 
 
 class NoOwnedDocCheckout(Enum):
@@ -192,12 +202,13 @@ def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path, owners: select.
     owner_start = process_start_time(checkout.lease_owner)
     if owner_start is None:
         raise ValueError("the checkout lease owner exited before scope publication")
-    if stat.S_ISFIFO(os.fstat(9).st_mode):
+    if isinstance(checkout, PrivateDocCheckout):
         # The copy owner publishes while it holds the checkout lock.
-        _ = os.write(9, os.fsencode(scope) + b"\n")
-        wait_for_checkout_confirmation(owners, 8, deadline)
+        _ = os.write(checkout.request_fd, os.fsencode(scope) + b"\n")
+        wait_for_checkout_confirmation(owners, checkout.reply_fd, deadline)
     else:
-        build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner), 9)
+        build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner),
+                                           checkout.lock_fd)
     if process_start_time(checkout.lease_owner) != owner_start:
         raise ValueError("the checkout lease owner exited during scope publication")
 
@@ -228,11 +239,18 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             if owners.poll(0):
                 raise ValueError("a scope owner exited before launch")
             owner_pid = os.environ.pop("VERIFY_DOC_CHECKOUT_OWNER", "")
-            checkout = OwnedDocCheckout(Path.cwd(), int(owner_pid)) if owner_pid else NoOwnedDocCheckout.NOT_REQUIRED
+            lock_fd = os.environ.pop("BUILDLOG_PREPARED_COPY_LOCK_FD", "")
+            request_fd = os.environ.pop("DOC_COPY_LEASE_FD", "")
+            reply_fd = os.environ.pop("DOC_COPY_REPLY_FD", "")
+            checkout: OwnedDocCheckout | NoOwnedDocCheckout = NoOwnedDocCheckout.NOT_REQUIRED
+            if owner_pid:
+                if request_fd:
+                    checkout = PrivateDocCheckout(int(owner_pid), int(request_fd), int(reply_fd))
+                else:
+                    checkout = PreparedDocCheckout(Path.cwd(), int(owner_pid), int(lock_fd))
             watch = None
             deadline = 0.0
             if isinstance(checkout, OwnedDocCheckout):
-                _ = os.fstat(9)
                 seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
                 deadline = time.monotonic() + seconds
                 watch = inotify.open_watch()

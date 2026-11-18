@@ -546,6 +546,16 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
 fi
 unset VERIFY_NIX_ENV_REEXEC
 
+# Move the caller's checkout lock before Verify starts its helpers.
+if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
+    if [[ "$BUILDLOG_PREPARED_COPY_LOCK_FD" =~ ^[0-9]+$ ]] &&
+            { exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-; } 2>/dev/null; then
+        export BUILDLOG_PREPARED_COPY_LOCK_FD
+    else
+        unset BUILDLOG_PREPARED_COPY_LOCK_FD
+    fi
+fi
+
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
@@ -583,21 +593,28 @@ verify_helper() {
         local script="$VERIFY_START_DIR/verify_helper.py" input output
         [[ -f "$script" ]] || return 0
         VERIFY_HELPER_LOCK="$(mktemp 2>/dev/null)" || return 0
-        coproc VERIFY_CALLS { exec "$VERIFY_START_DIR/../lib/py" "$script" "$VERIFY_HELPER_LOCK"; } 2>/dev/null
+        coproc VERIFY_CALLS {
+            if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
+                exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&-
+                unset BUILDLOG_PREPARED_COPY_LOCK_FD
+            fi
+            exec "$VERIFY_START_DIR/../lib/py" "$script" "$VERIFY_HELPER_LOCK"
+        } 2>/dev/null
         VERIFY_HELPER_PID=${VERIFY_CALLS_PID:-}
         input=${VERIFY_CALLS[1]:-}
         output=${VERIFY_CALLS[0]:-}
         [[ -n "$input" && -n "$output" ]] || return 0
-        # Bash places coprocess and process-substitution descriptors at 63 and below, so the helper uses 70-73.
-        if { exec 70>&"$input" 71<&"$output"; } 2>/dev/null; then
-            VERIFY_HELPER_INPUT=70
-            VERIFY_HELPER_OUTPUT=71
-            eval "exec $input>&- $output<&-"
+        # Move the coprocess pipes so Bash can use them in subshells.
+        if { exec {VERIFY_HELPER_INPUT}>&"$input"-; } 2>/dev/null; then
+            if ! { exec {VERIFY_HELPER_OUTPUT}<&"$output"-; } 2>/dev/null; then
+                exec {VERIFY_HELPER_INPUT}>&-
+                VERIFY_HELPER_INPUT=""
+            fi
         fi
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry name
+    local input="" has_input=0 status output errors entry name lock_fd
     local names=()
     local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
@@ -616,8 +633,8 @@ verify_helper() {
                 [[ -z "$entry" ]] || forwarded+=("$entry")
             done
         fi
-        exec 72>"$VERIFY_HELPER_LOCK"
-        if compgen -V names -e 2>/dev/null && lock_file_descriptor 72 2>/dev/null && (
+        exec {lock_fd}>"$VERIFY_HELPER_LOCK"
+        if compgen -V names -e 2>/dev/null && lock_file_descriptor "$lock_fd" 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
             for name in "${names[@]}"; do
                 [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
@@ -630,19 +647,19 @@ verify_helper() {
             && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then
-            exec 72>&-
+            exec {lock_fd}>&-
             if [[ "$status" =~ ^[0-9]+$ ]]; then
                 printf '%s' "$output"
                 printf '%s' "$errors" >&2
                 return "$status"
             fi
         else
-            exec 72>&-
+            exec {lock_fd}>&-
         fi
     fi
     if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" && ${#forwarded[@]} -gt 0 ]]; then
-        exec 73< <(printf '%s\0' "${forwarded[@]}")
-        export VERIFY_RESULT_ENVIRONMENT_FD=73
+        exec {VERIFY_RESULT_ENVIRONMENT_FD}< <(printf '%s\0' "${forwarded[@]}")
+        export VERIFY_RESULT_ENVIRONMENT_FD
     fi
     if [[ "$has_input" == 1 ]]; then
         printf '%s' "$input" | "$PY" "$@"
@@ -1758,7 +1775,8 @@ interrupt_hold_wait() {
                 kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
                 VERIFY_HELPER_PID=""
             fi
-            exec 70>&- 71<&-
+            if [[ -n "${VERIFY_HELPER_INPUT:-}" ]]; then exec {VERIFY_HELPER_INPUT}>&-; fi
+            if [[ -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then exec {VERIFY_HELPER_OUTPUT}<&-; fi
             VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
             PLACEMENT_CLIENT_ACTIVE=0
         else
@@ -1869,11 +1887,13 @@ tree_key() {
     if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
         key_options+=(--without-lint-versions)
     fi
-    VERIFY_RESULT_ENVIRONMENT_FD=3 \
-    VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
-    verify_helper --stdin "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
-        3< <(printf '%s\0' ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"}) \
-        <<< "${GATE_METADATA}" 2>/dev/null || true
+    (
+        exec {VERIFY_RESULT_ENVIRONMENT_FD}< <(printf '%s\0' ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"})
+        export VERIFY_RESULT_ENVIRONMENT_FD
+        VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
+        verify_helper --stdin "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
+            <<< "${GATE_METADATA}"
+    ) 2>/dev/null || true
 }
 
 set_verdict_keys() {
@@ -1922,7 +1942,7 @@ cancel_tree_run() {
         MAC_RUNNER_PID=""
     fi
     stop_run_step KILL
-    exec 9>&-
+    close_mac_log
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
     local changed_path=""
@@ -1972,29 +1992,18 @@ else:
 PYDOC
 }
 
-readonly VERIFY_PREPARED_CHECKOUT_FD=69
-
 # The copy owner holds the lease until the last writer closes the pipe.
 doc_checkout() {
     local checkout="$DOC_REPO_TOP"
     if [[ "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
-        local copy_script writer reply_fd checkout_tree current_tree status lease_fd=74
+        local copy_script checkout_tree current_tree status
         copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
         coproc DOC_COPY { exec "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP" --bind-scope; }
         DOC_COPY_OWNER_PID=$DOC_COPY_PID
-        writer=${DOC_COPY[1]}
-        # Start above verify's fixed descriptors.
-        while [[ -e "/dev/fd/$lease_fd" || -L "/dev/fd/$lease_fd" ]]; do
-            lease_fd=$((lease_fd + 1))
-        done
-        eval "exec $lease_fd>&$writer" || return $?
-        DOC_COPY_LEASE_FD=$lease_fd
-        eval "exec $writer>&-"
-        exec {reply_fd}<&"${DOC_COPY[0]}" || return $?
-        DOC_COPY_REPLY_FD=$reply_fd
-        eval "exec ${DOC_COPY[0]}<&-"
-        if ! IFS= read -r checkout_tree <&"$reply_fd" ||
-           ! IFS= read -r checkout <&"$reply_fd"; then
+        if ! exec {DOC_COPY_LEASE_FD}>&"${DOC_COPY[1]}"- ||
+           ! exec {DOC_COPY_REPLY_FD}<&"${DOC_COPY[0]}"- ||
+           ! IFS= read -r checkout_tree <&"$DOC_COPY_REPLY_FD" ||
+           ! IFS= read -r checkout <&"$DOC_COPY_REPLY_FD"; then
             doc_close_checkout
             return 1
         fi
@@ -2003,15 +2012,6 @@ doc_checkout() {
             doc_close_checkout
             echo 'verify.sh: the staged tree changed before doc ran; no doc pass record was written.' >&2
             return "$TREE_CHANGED_STATUS"
-        fi
-    else
-        local inherited=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
-        if [[ "$inherited" =~ ^[0-9]+$ && -e "/dev/fd/$inherited" ]] &&
-                { [[ "$inherited" == "$VERIFY_PREPARED_CHECKOUT_FD" ]] ||
-                    eval "exec $VERIFY_PREPARED_CHECKOUT_FD>&$inherited-"; }; then
-            BUILDLOG_PREPARED_COPY_LOCK_FD=$VERIFY_PREPARED_CHECKOUT_FD
-        else
-            BUILDLOG_PREPARED_COPY_LOCK_FD=""
         fi
     fi
     cd "$checkout" || { doc_close_checkout; return 1; }
@@ -2022,11 +2022,11 @@ doc_close_checkout() {
     local owner=${DOC_COPY_OWNER_PID:-${DOC_COPY_PID:-}}
     if [[ -n "$owner" ]]; then
         if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-            eval "exec $DOC_COPY_LEASE_FD>&-"
+            exec {DOC_COPY_LEASE_FD}>&-
             DOC_COPY_LEASE_FD=""
         fi
         if [[ -n "${DOC_COPY_REPLY_FD:-}" ]]; then
-            eval "exec $DOC_COPY_REPLY_FD<&-"
+            exec {DOC_COPY_REPLY_FD}<&-
             DOC_COPY_REPLY_FD=""
         fi
         if [[ "${1:-}" == stop ]]; then
@@ -2130,6 +2130,7 @@ VERIFY_STEP_INFO_FILE=""
 COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
 MAC_RESULT_FILE=""
 MAC_LOG_FILE=""
+MAC_LOG_FD=""
 MAC_RUNNER_PID=""
 MAC_RUNNER_LAUNCHING=0
 MAC_RUNNER_PRIOR_JOB=""
@@ -2153,6 +2154,13 @@ MAC_FIX_RESULT=""
 LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET=""
 LINT_COPY_ARGS=()
 
+close_mac_log() {
+    if [[ -n "${MAC_LOG_FD:-}" ]]; then
+        exec {MAC_LOG_FD}>&-
+        MAC_LOG_FD=""
+    fi
+}
+
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2 runner_pid
     # TERM stops the child even while Bash ignores INT.
@@ -2173,7 +2181,7 @@ forward_mac_runner_signal() {
         fi
     fi
     if [[ -n "$MAC_LOG_FILE" ]]; then
-        exec 9>&-
+        close_mac_log
         rm -f "$MAC_LOG_FILE"
     fi
     note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
@@ -2259,7 +2267,7 @@ try_mac_test() {
     fi
     MAC_LOG_FILE="$(mktemp "$HOLD_WAIT_DIR/mac-output.XXXXXX")"
     # Both tee processes inherit this descriptor before a signal removes the file.
-    exec 9>>"$MAC_LOG_FILE"
+    exec {MAC_LOG_FD}>>"$MAC_LOG_FILE" || return $?
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
         step_state on_ssh "$selected_target"
     fi
@@ -2270,12 +2278,12 @@ import os
 import runpy
 import sys
 
-with open(3, "rb") as handoff:
+with open(int(sys.argv[1]), "rb") as handoff:
     for entry in handoff.read().split(b"\0"):
         if entry:
             name, value = entry.split(b"=", 1)
             os.environb[name] = value
-sys.argv = sys.argv[1:]
+sys.argv = sys.argv[2:]
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
     MAC_RUNNER_PRIOR_JOB=${!:-}
@@ -2284,9 +2292,10 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         if [[ -z ${VERIFY_MAC_ENVIRONMENT[0]+set} ]]; then
             exec "$PY" "$MAC_RUNNER" "${runner_args[@]}"
         fi
-        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$MAC_RUNNER" "${runner_args[@]}" \
-            3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
-    ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
+        local mac_environment_fd
+        exec {mac_environment_fd}< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
+        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$mac_environment_fd" "$MAC_RUNNER" "${runner_args[@]}"
+    ) > >(tee -a "/dev/fd/$MAC_LOG_FD") 2> >(tee -a "/dev/fd/$MAC_LOG_FD" >&2) &
     MAC_RUNNER_PID=$!
     MAC_RUNNER_LAUNCHING=0
     if wait "$MAC_RUNNER_PID"; then
@@ -2330,7 +2339,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
         BUILDLOG_MAC_HOLDER=""
-        exec 9>&-
+        close_mac_log
         rm -f "$MAC_LOG_FILE"
         MAC_LOG_FILE=""
         export BUILDLOG_TARGET=""
@@ -2358,7 +2367,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$result_word" == declined && -n "$result_seconds" ]]; then
                 printf '%s\n' "$result_seconds" >> "$BUILDLOG_HOLD_WAIT_FILE"
             fi
-            exec 9>&-
+            close_mac_log
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
@@ -2366,7 +2375,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             return
             ;;
         failed)
-            exec 9>&-
+            close_mac_log
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then return "$runner_status"; fi
@@ -2377,7 +2386,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$MAC_FETCH_GIVEN" == 1 && "$result_fetch" != fetched ]]; then
                 if [[ "$FILTER_RUN" == 1 ]]; then BUILDLOG_MAC=passed_filter; else BUILDLOG_MAC=passed_full; fi
                 printf 'verify.sh: FAIL: the tests passed on the Mac, but --fetch %s brought nothing back (%s).\n' "$MAC_FETCH" "$result_fetch" >&2
-                exec 9>&-
+                close_mac_log
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 note_event failed "$SECONDS" 0 "" 0 2
@@ -2385,7 +2394,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             fi
             MAC_PASSED=1
             if [[ "$MAC_FINISH_CALL" == 0 ]]; then
-                exec 9>&-
+                close_mac_log
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 return 0
@@ -2772,13 +2781,12 @@ run_placed_scope() {
     printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
         "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
     export BUILDLOG_RESERVED_STEP
-    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_fd=- checkout_pipe="" checkout_owner=""
+    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_owner=""
     # Keep the checkout lease while the supervisor binds the scope.
     if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-        checkout_pipe="/dev/fd/$DOC_COPY_LEASE_FD"
         checkout_owner=$DOC_COPY_OWNER_PID
     elif [[ "$CMD" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
-        checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
+        local checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
         checkout_owner=${BUILDLOG_RUN:-}
         checkout_owner=${checkout_owner%%:*}
         if [[ ! "$checkout_fd" =~ ^[0-9]+$ || ! -e "/dev/fd/$checkout_fd" || -z "$checkout_owner" ]]; then
@@ -2792,10 +2800,11 @@ run_placed_scope() {
         return 125
     fi
     (
-        if [[ -n "$checkout_pipe" ]]; then
-            exec 9>"$checkout_pipe" 8<"/dev/fd/$DOC_COPY_REPLY_FD" || exit 125
-        else
-            exec 9>&"$checkout_fd" || exit 125
+        if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
+            # Bash closes descriptors copied from a coprocess pipe when it executes Python.
+            exec {DOC_COPY_LEASE_FD}>"/dev/fd/$DOC_COPY_LEASE_FD" \
+                {DOC_COPY_REPLY_FD}<"/dev/fd/$DOC_COPY_REPLY_FD" || exit 125
+            export DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD
         fi
         export VERIFY_DOC_CHECKOUT_OWNER="$checkout_owner"
         exec "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
@@ -2826,13 +2835,15 @@ finish_placed_scope() {
 
 # Serialize release with the supervisor, even if the step shell died.
 close_scope_launch() (
-    flock -x -w 35 8 || return 1
+    local release_fd
+    exec {release_fd}<"$PLACEMENT_SCOPE_STATE" || return 1
+    flock -x -w 35 "$release_fd" || return 1
     if [[ ! -s "$PLACEMENT_SCOPE_STATE" ]]; then
         printf 'closed\n' > "$PLACEMENT_SCOPE_STATE"
     else
         [[ "$(< "$PLACEMENT_SCOPE_STATE")" == closed ]]
     fi
-) 8<"$PLACEMENT_SCOPE_STATE"
+)
 
 settle_placed_scope() {
     if (( ${PLACEMENT_SCOPE_UNRESOLVED:-0} )); then return 125; fi
@@ -3365,7 +3376,7 @@ cache_record() {
 # seconds, what a reuse saves.
 record_mac_pass() {
     local log=$1 mac_seconds=${2%%.*}
-    exec 9>&-
+    close_mac_log
     if [[ -z "${CACHE_DIR}" ]] || ! mkdir -p "${CACHE_DIR}"; then
         rm -f "$log" "${RUN_LOG}"
         RUN_LOG=""

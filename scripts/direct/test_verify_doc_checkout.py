@@ -244,11 +244,12 @@ from types import SimpleNamespace
 
 read = os.read
 elapsed = 0
+reply_fd = int(os.environ["DOC_COPY_REPLY_FD"])
 
 def receive_reply(descriptor, size):
     global elapsed
     reply = read(descriptor, size)
-    if descriptor == 8 and reply == b"bound\\n":
+    if descriptor == reply_fd and reply == b"bound\\n":
         elapsed = 60
     return reply
 
@@ -264,6 +265,7 @@ from types import SimpleNamespace
 
 real_poll = select.poll
 elapsed = 0
+reply_fd = int(os.environ["DOC_COPY_REPLY_FD"])
 
 class OwnerPoll:
     def __init__(self):
@@ -275,7 +277,7 @@ class OwnerPoll:
 
     def unregister(self, descriptor):
         self.poller.unregister(descriptor)
-        if descriptor == 8:
+        if descriptor == reply_fd:
             self.confirmed = True
 
     def poll(self, timeout=-1):
@@ -301,9 +303,10 @@ clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
     def test_doc_accepts_a_checkout_confirmation_split_across_reads(self) -> None:
         self.instrument_scope_supervisor('''
 read = os.read
+reply_fd = int(os.environ["DOC_COPY_REPLY_FD"])
 
 def split_reply(descriptor, size):
-    return read(descriptor, min(size, 5) if descriptor == 8 else size)
+    return read(descriptor, min(size, 5) if descriptor == reply_fd else size)
 ''', 'patch.object(os, "read", split_reply)')
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -386,11 +389,12 @@ with patch.object(os, "replace", owner_exits_before_replace):
 
     def test_doc_scope_command_does_not_inherit_checkout_pipe(self) -> None:
         _ = self.use_real_scope()
-        lease_pipe = self.root / "lease-pipe"
+        lease_pipes = self.root / "lease-pipes"
         cargo_pipes = self.root / "cargo-pipes"
         self.install_scope_interpreter(f'''
 from pathlib import Path
-Path({str(lease_pipe)!r}).write_text(os.readlink("/proc/self/fd/9"))
+descriptors = (os.environ["DOC_COPY_LEASE_FD"], os.environ["DOC_COPY_REPLY_FD"])
+Path({str(lease_pipes)!r}).write_text("\\n".join(os.readlink(f"/proc/self/fd/{{fd}}") for fd in descriptors))
 os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 ''')
         self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
@@ -406,9 +410,11 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 '''))
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        pipe = lease_pipe.read_text()
-        self.assertTrue(pipe.startswith("pipe:["))
-        self.assertNotIn(pipe, cargo_pipes.read_text().splitlines())
+        pipes = lease_pipes.read_text().splitlines()
+        self.assertEqual(len(pipes), 2)
+        for pipe in pipes:
+            self.assertTrue(pipe.startswith("pipe:["))
+            self.assertNotIn(pipe, cargo_pipes.read_text().splitlines())
 
     def test_doc_refuses_a_tree_staged_during_the_copy_slot_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
@@ -640,15 +646,36 @@ for descriptor in (8, 74):
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         self.assert_doc_uses_the_prepared_copy(DOC_COMMAND)
 
-    def test_prepared_doc_keeps_the_slot_lock_inherited_on_descriptor_nine(self) -> None:
-        handoff = '''if [[ "$BUILDLOG_PREPARED_COPY_LOCK_FD" != 9 ]]; then
-    exec 9>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-
+    def assert_prepared_lock_on_descriptor(self, descriptor: int) -> None:
+        self.install_scope_interpreter('''
+from pathlib import Path
+
+tree = Path.cwd()
+lock = tree.with_name(tree.name + ".lock")
+inherited = int(os.environ["BUILDLOG_PREPARED_COPY_LOCK_FD"])
+if not os.path.samestat(os.fstat(inherited), lock.stat()):
+    raise SystemExit("Verify replaced the handed-off checkout lock")
+os.execv(sys.executable, [sys.executable, *arguments])
+''')
+        handoff = '''target=$1
+shift
+if [[ "$BUILDLOG_PREPARED_COPY_LOCK_FD" != "$target" ]]; then
+    eval "exec $target>&$BUILDLOG_PREPARED_COPY_LOCK_FD-"
 fi
-export BUILDLOG_PREPARED_COPY_LOCK_FD=9
+export BUILDLOG_PREPARED_COPY_LOCK_FD=$target
 exec "$@"'''
         self.assert_doc_uses_the_prepared_copy((
-            "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
+            "bash", "-c", handoff, "prepared-doc", str(descriptor), *DOC_COMMAND,
         ))
+
+    def test_prepared_doc_keeps_the_slot_lock_inherited_on_descriptor_nine(self) -> None:
+        self.assert_prepared_lock_on_descriptor(9)
+
+    def test_prepared_doc_keeps_the_slot_lock_inherited_on_descriptor_seventy(self) -> None:
+        self.assert_prepared_lock_on_descriptor(70)
+
+    def test_prepared_doc_keeps_the_slot_lock_inherited_on_descriptor_seventy_one(self) -> None:
+        self.assert_prepared_lock_on_descriptor(71)
 
     def assert_prepared_lock_stays_out_of_the_sweep(self, command: tuple[str, ...]) -> None:
         with self.hold_background_sweep() as started:
@@ -674,23 +701,38 @@ exec "$@"'''
             "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
         ))
 
-    def test_prepared_doc_preserves_an_independent_open_of_the_lock_file(self) -> None:
+    def assert_doc_preserves_independent_open(self, handoff: str) -> None:
         self.install_scope_interpreter('''
+import fcntl
+
 try:
     descriptor = int(os.environ["TEST_INDEPENDENT_CHECKOUT_FD"])
-    matches = os.path.samestat(os.fstat(descriptor), os.fstat(9))
+    lock_fd = int(os.environ["BUILDLOG_PREPARED_COPY_LOCK_FD"])
+    matches = os.path.samestat(os.fstat(descriptor), os.fstat(lock_fd))
+    read_only = (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) == os.O_RDONLY
 except OSError:
-    matches = False
-if not matches:
-    raise SystemExit("Verify closed the independent lock file descriptor")
+    matches = read_only = False
+if not matches or not read_only:
+    raise SystemExit("Verify did not preserve the independent lock file descriptor")
 os.execv(sys.executable, [sys.executable, *arguments])
 ''')
-        handoff = '''exec {independent}<"/dev/fd/$BUILDLOG_PREPARED_COPY_LOCK_FD"
+        command = handoff + '''
 export TEST_INDEPENDENT_CHECKOUT_FD=$independent
 exec "$@"'''
         self.assert_doc_uses_the_prepared_copy((
-            "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
+            "bash", "-c", command, "prepared-doc", *DOC_COMMAND,
         ))
+
+    def test_prepared_doc_preserves_an_independent_open_of_the_lock_file(self) -> None:
+        self.assert_doc_preserves_independent_open('exec {independent}<"/dev/fd/$BUILDLOG_PREPARED_COPY_LOCK_FD"\n')
+
+    def test_prepared_doc_preserves_an_independent_open_on_descriptor_sixty_nine(self) -> None:
+        self.assert_doc_preserves_independent_open('''
+exec {source}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-
+export BUILDLOG_PREPARED_COPY_LOCK_FD=$source
+exec 69<"/dev/fd/$BUILDLOG_PREPARED_COPY_LOCK_FD"
+independent=69
+''')
 
     def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")
