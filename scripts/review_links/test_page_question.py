@@ -375,11 +375,17 @@ class PageQuestionTests(unittest.TestCase):
     def test_question_and_answer_html_escape_words_and_keep_both_texts(self) -> None:
         _ = self.ask(words='Use <wide> & tall?')
         question = self.store.questions('image-1')[0]
-        self.assertIn('Use &lt;wide&gt; &amp; tall?', page_question.open_question_html(question))
-        self.assertIn('waiting for an answer', page_question.open_question_html(question))
+        opened = page_question.open_question_html(question)
+        self.assertIn('Use &lt;wide&gt; &amp; tall?', opened)
+        self.assertIn('waiting for an answer', opened)
+        self.assertNotIn('<time ', opened)
         result = page_question.answer(self.store, 'image-1', 'Q1', '<Yes> & checked')
         assert isinstance(result, page_question.Answered)
-        rendered = page_question.answered_question_html(result.question)
+        answer = result.question.answer
+        assert answer is not None
+        rendered = page_question.answered_question_html(result.question, answer)
+        self.assertIn('<h3>Answer</h3>', rendered)
+        self.assertNotIn('<time ', rendered)
         self.assertIn('Use &lt;wide&gt; &amp; tall?', rendered)
         self.assertIn('&lt;Yes&gt; &amp; checked', rendered)
         self.assertNotIn('waiting for an answer', rendered)
