@@ -1,5 +1,8 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
+
+from scripts.production.change_review_test_support import pictured_changes
 
 import shutil
 import html
@@ -69,8 +72,16 @@ class ReviewPageTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         config = self.fixture.temporary / 'config'
-        _ = (config/'production.conf').write_text('# whole: 20..\nquestion_title_max_chars=100\n')
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/console.conf',config/'console.conf')
+        _ = write_config_fixture(config / "production.conf", "question_title_max_chars=100\n")
+        _ = write_config_fixture(config / "console.conf",
+            "page.review.url=python:scripts.review_links.review_page:page_url\n"
+            + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
+            + "page.review.icon=inbox\npage.review.title=Review\n"
+            + "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
+            + "status.reading_delay_seconds=1\nstatus.review.age_limit_seconds=45\n")
+        _ = write_config_fixture(config / "review_links.conf",
+            "review_words_rows=4\nlater_soon_minutes=60\nlater_evening=18:00\n"
+            + "later_evening_until=17:00\nlater_morning=09:00\nlater_week_day=Monday\nlater_week_time=09:00\n")
         self.root = self.fixture.root
         self.status = change_page.DeliveryStatus(self.root)
         document = self.fixture.production.read_text()
@@ -1286,8 +1297,8 @@ window.fetch=async url=>{
                     else:
                         proposal, efficiency = case.decisions()
                         key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
-                        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
-                                            case.fixture.temporary/'config/nightly_review.conf')
+                        _ = write_config_fixture(case.fixture.temporary / 'config/nightly_review.conf',
+                            'state_folder=nightly-review\n')
                     old_id = ''
                     if wait in ('question', 'validate'):
                         delivery, _ = review_page.submit(case.root, case.body(key, wait, 'Check the old case.'), case.status)
@@ -1381,7 +1392,7 @@ window.fetch=async url=>{
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
-            [change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')],
+            pictured_changes([change_review.Visible('Unrouted change', 'Read the log.', 'The result is present.')]),
             datetime.now(user_zone()).date(), '', self.fixture.production,
             producers=[staff.StaffId('missing-producer')], record=staff.snapshot())
         decisions = self.decisions()
@@ -1463,8 +1474,7 @@ window.fetch=async url=>{
             self.assertEqual(review_later.times()[key], until)
 
     def test_approve_and_decline_close_proposals_and_efficiencies(self) -> None:
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2]/'config/nightly_review.conf',
-                            self.fixture.temporary/'config/nightly_review.conf')
+        _ = write_config_fixture(self.fixture.temporary / 'config/nightly_review.conf', 'state_folder=nightly-review\n')
         proposal, efficiency = self.decisions()
         folder = self.fixture.temporary / 'decision-proposals'
         ledger = self.fixture.temporary / 'decision-efficiency.md'

@@ -2710,7 +2710,7 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
     if not isinstance(repository, KnownRepository):
         return declined('repo', started)
     kind = request.kind or eligibility.verb_kind(request.verb)
-    policy = hana.fixed_policy(transport, repository.key, kind)
+    policy = hana.fixed_policy(transport, str(request.repo_root), kind)
     if isinstance(policy, hana.HanaStepRefused):
         return DeclinedMacRun('off', elapsed_seconds(started), policy.reason)
     command = ('cargo', request.verb, *request.nextest_words)

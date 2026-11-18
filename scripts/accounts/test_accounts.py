@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import sys
 from pathlib import Path
 
@@ -181,11 +183,10 @@ class AccountsConfigurationTests(unittest.TestCase):
         self.assertIn("usage_stale_minutes", str(result.failures[0][0]))
 
     def test_usage_age_changes_without_a_module_reload(self) -> None:
-        root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "accounts.conf"
-            contents = (root / "config/accounts.conf").read_text()
-            _ = config.write_text(contents)
+            _ = write_config_fixture(config, "usage_stale_minutes=10\n")
+            contents = config.read_text()
             with patch.dict(os.environ, {"CONF_DIR": temporary}):
                 now = datetime(2026, 11, 2, tzinfo=timezone.utc)
                 self.assertTrue(cast(Callable[[datetime, datetime], bool], getattr(accounts, "_reading_is_old"))(now - timedelta(minutes=11), now))
@@ -9606,6 +9607,14 @@ class PickerTests(unittest.TestCase):
 
 class SharedStatusDocumentTests(unittest.TestCase):
     """The stored JSON adds access and spending signals without changing its text view."""
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = config_environment(folder)
+        _ = write_config_fixture(folder / "accounts.conf", "usage_stale_minutes=10\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+
 
     def test_staff_kind_uses_the_board_role_color_keys(self) -> None:
         from scripts.production import staff

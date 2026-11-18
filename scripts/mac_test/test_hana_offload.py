@@ -195,6 +195,13 @@ class HanaOffloadTests(unittest.TestCase):
         claim.assert_not_called()
         ssh.assert_not_called()
 
+    def test_policy_reads_the_worktree_path(self) -> None:
+        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        with mock.patch.object(eligibility, 'repository_identity', return_value=repository), \
+                mock.patch.object(hana, 'fixed_policy', return_value=hana.HanaStepRefused('off')) as policy:
+            _ = offload.run_offload(self.controller, self.transport, self.request, time.monotonic())
+        self.assertEqual(policy.call_args.args[1], str(self.request.repo_root))
+
     def test_disabled_unbound_assignment_reports_claim_failure_without_retaining_dispatch(self) -> None:
         from scripts.build_queue import admission_client
 
