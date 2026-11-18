@@ -710,6 +710,15 @@ The address retains the owner, producer, view, search, column, and direction.
 A row opens to show its latest status, completion condition, item links, and log.
 The record keeps Evidence, and the open row has no separate Evidence section.
 The log shows its newest entry first.
+On a wide page, the log column fits the height of the left column, including the feedback controls.
+The log entries scroll below the heading when they exceed the available height.
+A short log has no scroll bar.
+On a narrow page, `list_log_max_height_rem` in `config/review_links.conf` limits the height of the entries.
+The setting starts at 16 rem.
+Refresh keeps the first visible log entry at the same offset when new entries arrive.
+A log at the top stays at the top to show the newest entry.
+The List keeps the position by item while a filter hides the row.
+The log restores that position when the row returns.
 Each log writer saves a typed event.
 The table and log use the same format for staff names, local ETAs, and field values.
 The table, log, and Park response show parking times in the user zone.

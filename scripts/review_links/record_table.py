@@ -118,6 +118,10 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 .list-panel h3{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:var(--ink-3);margin:16px 0 5px}
 .list-panel p,.list-panel ul,.list-panel ol{margin:0 0 8px}.list-panel section+section{border:0;margin:0;padding:0}
 .list-panel a,.list-counts a{color:var(--accent)}.list-panel ol.list-log{list-style:none;padding:0;font-size:13px}
+.list-log-panel{contain:size;display:flex;flex-direction:column;min-width:0;min-height:0}
+.list-log-panel h3{flex:none}
+.list-log-scroll{min-height:0;overflow-y:auto}
+.list-log-scroll .list-log{margin-bottom:0}
 .list-log li{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .list-log time,.list-log small{color:var(--ink-3)}.list-log small{display:inline;font-size:inherit}
 [data-feedback-form]{margin-top:20px;border-top:1px solid var(--line);padding-top:16px}
@@ -155,6 +159,7 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-table .list-row td:nth-child(5)::before,.list-table .list-row td:nth-child(6)::before{content:attr(data-label) ': ';color:var(--ink-3)}
 .list-table .list-row td:last-child{text-align:left;padding-bottom:14px}.list-table .list-row td:last-child::before{content:'Update: ';color:var(--ink-3)}
 [data-detail]{display:block}[data-detail]>td{display:block}.list-panel{grid-template-columns:1fr;padding:0 14px 16px;gap:4px}
+.list-log-panel{contain:none}.list-log-scroll{max-height:var(--list-log-max-height)}
 .list-log li{grid-template-columns:105px minmax(0,1fr)}[data-list-count]{width:100%;margin-left:0}
 }
 @media(prefers-reduced-motion:reduce){.list-chevron{transition:none}}
@@ -380,7 +385,11 @@ function matches(item,selection,counts){
 function currentSelection(overrides={}){
  return {owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...overrides};
 }
-function apply(write=true,{animate=false,dismissMissingItem=false,pushPlace=false,top}={}){
+function apply(write=true,layout={}){
+ options.beforeApply?.();
+ applyRows(write,layout);
+}
+function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false,top}={}){
  const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
  if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
  const rows=[...content.querySelectorAll('[data-list-item]')];
@@ -576,7 +585,7 @@ return {place,apply,bind,opened,restorePlace,jump,saveDeparturePlace,get linkedI
   const previous=words(),previousQuery=query;
   content=contentProxy();
   if(sharedWords()){query=previous.value;words().value=query;}
-  bind();apply(query!==previousQuery);
+  bind();applyRows(query!==previousQuery);
  }};
 }
 '''
