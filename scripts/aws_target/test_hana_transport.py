@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from pathlib import Path
 import json
 import os
+import re
 import subprocess
 import tempfile
 from typing import cast
@@ -23,7 +24,11 @@ class HanaTransportPolicyTests(unittest.TestCase):
             root = Path(temporary)
             private = private_slot_config(root, repository='hana')
             with mock.patch.dict(os.environ, private.environment):
-                configuration = conf.read(Path(private.environment['CONF_DIR']) / 'hana_aws.conf')
+                settings = Path(private.environment['CONF_DIR']) / 'hana_aws.conf'
+                # Private values keep the two limits distinct whatever the repository defaults are.
+                _ = settings.write_text(re.sub(r'(?m)^source_upload_timeout_s=.*$', 'source_upload_timeout_s=77',
+                    re.sub(r'(?m)^aws_timeout_s=.*$', 'aws_timeout_s=7', settings.read_text())))
+                configuration = conf.read(settings)
                 calls: list[tuple[str, float]] = []
                 objects: dict[str, bytes] = {}
                 def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
@@ -55,10 +60,7 @@ class HanaTransportPolicyTests(unittest.TestCase):
                 self.assertEqual(objects['source/fixture-deployment/' + digest], b'fixture bundle')
                 url = transport.signed_get(digest)
                 self.assertIn('/source/fixture-deployment/' + digest, url)
-                self.assertNotEqual(configuration.whole('source_upload_timeout_s'), configuration.whole('aws_timeout_s'))
-                self.assertTrue(all(timeout == configuration.whole(
-                    'source_upload_timeout_s' if operation == 'put-object' else 'aws_timeout_s')
-                    for operation, timeout in calls))
+                self.assertTrue(all(timeout == (77 if operation == 'put-object' else 7) for operation, timeout in calls))
                 def stalled(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
                             check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                     _ = capture_output, text, check, env
