@@ -589,7 +589,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare(sortValue(a),sortValue(b)) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0;
+ const table=content.querySelector('table');let count=0,expandedOutsideFilter=false;
  if(options.mount){
   const visibleKeys=new Set(items.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
@@ -624,9 +624,13 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   if(linkedSection) linkedSection.hidden=!linked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const matched=matches(item,active,counts),showRow=matched || item===linked,wasShown=!item.hidden;
+   const matched=matches(item,active,counts);
+   const selection=expanded && !matched && item!==linked && options.expandedSelection?.(item.dataset,active);
+   const keepExpanded=selection && matches(item,selection);
+   const showRow=matched || item===linked || keepExpanded,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(table,item,false);
    item.hidden=!showRow;if(matched) count++;
+   if(keepExpanded) expandedOutsideFilter=true;
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
    if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(item.parentElement,item,true);
@@ -649,7 +653,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || missing.length>0;
+ empty.hidden=count>0 || expandedOutsideFilter || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -663,7 +667,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
  if(!options.mount) showHiddenActionResults(items);
- options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
+ options.applied?.(selection,active);
  if(write || location.hash===placeHash &&
   (owner!==previousOwner || show!==previousShow || filterNames.some(name=>filters[name]!==previousFilters[name])))
   writePlace(pushPlace,top);
@@ -735,6 +739,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
  row.dataset.recordHighlight='';
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
+ options.itemOpened?.(mountedTarget);
 }
 function setRowsExpanded(items,expanded){
  for(const item of items){
@@ -777,7 +782,9 @@ function bind(){
  content.addEventListener('click',event=>{
   const item=event.target.closest('.list-row')?.closest('[data-list-item]');if(!item) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
-  setRowsExpanded([item],!opened.has(item.dataset.key));
+  const expanded=!opened.has(item.dataset.key);
+  setRowsExpanded([item],expanded);
+  if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
   type=button.dataset.typeChip;changePlace();

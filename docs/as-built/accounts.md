@@ -487,6 +487,16 @@ The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
+Save records the value and its order in the settings journal before it writes the live value.
+Natedev issues the orders from a persistent counter. The published commit carries them in `config/settings-orders.json`.
+Each pull holds the journal lock from the ancestry check through restore.
+The Mac accepts an SSH live write only when its order is greater than the accepted order.
+The journal retains the accepted order after the tree includes that order and the pending value clears.
+Restore changes only the keys with pending values in the live files.
+The move marker records the planned writes before Git changes the checkout.
+Recovery reverses the move at the source commit or completes each write at the target commit.
+When you remove a key by hand in Git, keep its entry in `config/settings-orders.json`.
+A peer commit with the saved value and no order still needs a commit that records the order.
 A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.

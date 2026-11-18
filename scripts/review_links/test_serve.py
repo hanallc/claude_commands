@@ -1404,7 +1404,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "deliver", side_effect=complete_delivery),
               patch.object(change_page, "send_to_staff", side_effect=send) as delivery):
-            request = uuid4().hex
+            request = list_page.ListFormRequestPrefix(uuid4().hex, the_list.unread_update(item)).format()
             fields = {"keeper": morty.id, "id": item.id, "request": request,
                     "token": list_page.request_token(self.root, morty.id, item.id, request),
                     "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
@@ -1426,6 +1426,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     fields["request"] = f"{request}.{uuid4().hex}"
                     if action == "read":
                         delivery.assert_not_called()
+                        self.assertEqual(response["unread"], "false")
                     else:
                         self.assertTrue(sent.wait(TEST_HANG_GUARD_SECS))
                         expected = ("nate's words for item 1" if action == "tell" else

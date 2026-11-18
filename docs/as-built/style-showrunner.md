@@ -600,14 +600,20 @@ Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrun
   On failure, report the error and leave the ticket assigned.
   Record the committed-awaiting-release state with that HEAD and `--ticket <id>`.
   Run `ticket checkpoint --commit HEAD --session-dir <run> --phase <id>`, then `ticket merge` to confirm reservation release.
-  Report `From <unit>: ticket <id> closed with no code change; <n> held.`, then refill.
+  Report `ticket <id> closed with no code change; <n> held.`
+  Refill the unit.
 - Refill writes a `sync_waits` row before its last check.
   `ticket merge` runs `style_sync.py wake-waiters`.
   This command finds each waiting unit director through `message/roster.py --json` and sends `ticket <id> merged; refill.`.
   After delivery, `acknowledge_sync_wait` clears the wait by its token.
   If the message goes to the queue, the next merge sends a notice to the director's current roster address.
 
-**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` (two copies; 30 s subprocess timeout; one-line failure) call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges. It is silent with no style production on `b`; else `send.py --timeout 10` of `From <caller>: branch point <b> moved to <sha7>; sync.` keyed `style-sync:<showrunner name>`, bounded at 35 s. A failure prints one line and exits 0.
+**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges.
+Both callers use a 30 s subprocess timeout and print one line on failure.
+When branch `b` has a style production, `send.py --timeout 10` sends `branch point <b> moved to <sha7>; sync.`
+The send uses the key `style-sync:<showrunner name>` and has a 35 s limit.
+`notify` stays silent when branch `b` has no style production.
+On failure, `notify` prints one line and exits with status 0.
 
 **Direct sync.** `notify` reads the configured units and sends each direct director a sync notice.
 `resume` reconciles the parent's receiving branch without replaying hand-offs.
