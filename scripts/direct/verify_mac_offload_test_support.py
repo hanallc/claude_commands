@@ -47,7 +47,7 @@ from scripts.lib.shell_test_support import shell_functions
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
-_REACHABLE_SSH_STUB = '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
+_REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
 
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -1096,9 +1096,9 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def ssh_probe_reaches(self, host: str) -> bool:
         ssh = self.bin_directory / "ssh"
         try:
-            if ssh.read_text() == _REACHABLE_SSH_STUB and os.access(ssh, os.X_OK):
+            if ssh.read_bytes() == _REACHABLE_SSH_STUB and os.access(ssh, os.X_OK):
                 return True
-        except (OSError, UnicodeError):
+        except OSError:
             pass
         try:
             probe = subprocess.run([str(ssh), host, "true"], env=self.environment,
@@ -1141,7 +1141,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
-        self.write_executable(self.bin_directory / "ssh", _REACHABLE_SSH_STUB)
+        self.write_executable(self.bin_directory / "ssh", _REACHABLE_SSH_STUB.decode("utf-8"))
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -1274,8 +1274,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         private = copies_environment(self.root)
         configuration = Path(self.environment["CONF_DIR"])
-        if configuration != Path(private["CONF_DIR"]):
-            _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", configuration / "build_folders.conf")
+        settings_source = Path(private["CONF_DIR"]) / "build_folders.conf"
+        settings_lines = [
+            line for line in settings_source.read_text(encoding="utf-8").splitlines()
+            if (key := line.partition("=")[0].strip()) != "patterns.tool" and not key.startswith("patterns.tool.")
+        ]
+        settings_lines.append("patterns.tool={purpose}{suffix}")
+        _ = (configuration / settings_source.name).write_text("\n".join(settings_lines) + "\n", encoding="utf-8")
         self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)

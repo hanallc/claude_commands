@@ -2751,7 +2751,7 @@ placement_failed() {
 }
 
 placement_once() {
-    local repository="${1:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}"
+    local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     local token=none reply line route="" status=0 monitor=0
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
@@ -2952,12 +2952,11 @@ route_test() {
     done <<< "$STEP_TARGET_TABLE"
     # A placement wait holds no cargo token, also after an earlier step; a local grant takes it again.
     release_token || return $?
-    local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     while :; do
         local placement_status=0 admission=0
         check_routing_hold || admission=$?
         (( admission == 0 || admission == 10 )) || return "$admission"
-        placement_once "$repository" || placement_status=$?
+        placement_once || placement_status=$?
         if (( placement_status == 78 )); then
             if [[ "${LINT_MEND_WAIT:-0}" == 1 && "$STEP_WRITES_TREE" == 1 \
                     && "$PLACEMENT_WAIT_MEMORY" == 1 && -n "$MAC_LEAVE_SETTINGS" ]] \
@@ -3019,7 +3018,7 @@ route_test() {
         local claim_status=0
         # reserve and recover-reservation take the same words.
         local -a reservation_words=(--assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
-            --repo-root "$repository" --package "$PKG"
+            --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
             --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation"
             --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity")
         verify_helper "$BUILD_TARGETS_SCRIPT" reserve "${reservation_words[@]}" || claim_status=$?
@@ -3082,7 +3081,7 @@ route_test() {
             PLACEMENT_OWNER_PID=$$
             export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
             PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key \
-                --repo-root "${MAC_SOURCE_ROOT:-$repository}") || return $?
+                --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
             PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
             PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
         fi
