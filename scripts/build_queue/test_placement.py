@@ -1574,6 +1574,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         from scripts.mac_test import eligibility
 
         _ = fixture.enter_context(mock.patch.object(hana_placement_adapter, "controller_for", return_value=controller))
+        _ = fixture.enter_context(mock.patch.object(controller, "image_is_current", return_value=True))
         _ = fixture.enter_context(mock.patch.object(eligibility, "repository_identity",
             return_value=eligibility.KnownRepository("hana", "https://github.com/example/hana")))
         return settings, request
