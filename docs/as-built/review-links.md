@@ -543,7 +543,13 @@ A cached Accounts response carries its render failure to the status line.
 
 The table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
-The role swatch column is between **role** and **busy**.
+The role swatch column is between **role** and **next**.
+All named headers sort on click or Enter.
+The dot and swatch headers have no sort control.
+The arrow sits before a right-aligned label and after a left-aligned label.
+The arrow uses the column gap without adding to the table width.
+The column gap and arrow scale with the root font size.
+The viewer's sort choice stays through refreshes.
 A swatch shows for each board span with a `color_key`.
 An account has one when `config/statusline.conf` has a valid `account.<label>` color.
 The units, showrunners and workers roles use `role.unit-director`, `role.showrunner` and `role.worker`.
@@ -568,12 +574,13 @@ A selected Claude group shows its first target in bold text with the target acco
 The same control serves units, showrunners, and producers.
 An empty group shows gray `none`.
 Its arrow button opens the move menu with a click, Enter, or Space.
+The move button leaves the sort order as it was.
 The button exposes its menu state through ARIA attributes.
 A selected Codex workers line shows its first target, or gray `auto`, without a button.
 The `auto` title explains that Codex workers move between Codex accounts by themselves.
 Other lines show a gray Lucide minus icon; the total cell stays empty.
 An unavailable queue shows gray `unavailable`; selected Claude groups retain their buttons.
-One status read supplies both the first targets and the upcoming list.
+The page uses the first targets from the status read.
 The menu title is **When <account> reaches <percent>%, move <group> to**.
 `next_move_percent` in `config/accounts.conf` sets the percent.
 The menu lists the other Claude accounts in board order, each with its weekly percent left when known.
@@ -590,13 +597,13 @@ When the group has an entry, **No next move** posts `group` and `clear=first`.
 The server calls `next_moves.remove_next_move()` at `FIRST_GROUP_POSITION`.
 It refuses a clear for an empty group.
 The cell then shows the next queued target, or `none`.
-Success clears the kept page and refreshes the board, so the upcoming moves show the new entry.
+Success clears the cached page and refreshes the `next` cell.
 A refused request returns 400 and a failed write returns 503, each with its reason.
 A failed move shows `<group>: <reason>` in the status line.
 Codex workers keep their own moves; the menu shows no Codex account.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
-- The upcoming moves and the problems follow the table.
+- The problems follow the table.
 - The page reads the stored usage only, as `accounts.py status --stored` does.
 
 The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.

@@ -51,6 +51,10 @@ class FakeAws:
         value: dict[str, object] = {}
         if self.failure == operation:
             return subprocess.CompletedProcess(list(arguments), 1, '', self.failure_stderr)
+        if '--dry-run' in arguments:
+            action = ''.join(word.title() for word in operation.split('-'))
+            return subprocess.CompletedProcess(arguments, 1, '',
+                f'An error occurred (DryRunOperation) when calling the {action} operation: Fixture permission')
         if operation == 'describe-instances':
             if self.stop_during_instance_read_seconds:
                 self.clock.advance(self.stop_during_instance_read_seconds)
