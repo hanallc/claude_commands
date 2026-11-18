@@ -146,8 +146,9 @@ Ledger estimates include accrued Hana compute and storage.
 | New setting | Value | Reason |
 | --- | --- | --- |
 | `region` | `us-east-2` | Use Ohio for the box and retained storage. |
-| `instance_type` | `m7a.2xlarge` | Provide 32 GiB of memory. |
-| `spot_max_usd_per_hour` | `0.25` | Bound reserved compute exposure and refuse higher Spot prices during setup. |
+| `instance_type` | `m7a.4xlarge` | Provide 64 GiB of memory. |
+| `fallback_instance_types` | `c7a.4xlarge,m7i.4xlarge,m6a.4xlarge` | Try these types when the first choice cannot launch. |
+| `spot_max_usd_per_hour` | `0.35` | Bound the compute reservation and skip higher Spot prices during setup. |
 | `spot_ceiling_margin` | `0.25` | Add this positive fraction of the current Spot price when setup suggests a new ceiling. |
 | `root_gib` | `40` | Reserve the retained root volume. |
 | `data_gib` | `300` | Reserve the retained data volume. |
@@ -235,33 +236,42 @@ The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
 Without approval, `hana-setup` prints only its local plan.
 The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
-It creates a retained data volume, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
-Its Spot interruption behavior is `stop`.
-Setup uses the Hana instance type and price ceiling from `config/hana_aws.conf`.
-Before it creates or changes the stack, setup reads Spot prices for the Hana instance type in all zones in the configured region.
-Setup refuses the change if the read fails, the configured zone has no price, or the price exceeds the ceiling.
-If the price exceeds the ceiling, setup shows the cheapest zone.
-Setup gives a `/tune` command when the effective ceiling key is editable.
+The stack creates the launch template, security group, private control bucket, and scaler policy.
+The launch template uses persistent Spot and stops the instance when AWS interrupts it.
+Before a launch, setup reads Spot prices for the configured type and its fallback types.
+If the instance is already recorded, setup resumes without a Spot price check.
+It checks the registered subnet and each available default subnet in another zone of the same VPC.
+Setup prints one reason for each candidate with no price or a price above the ceiling.
+If the price read fails or no candidate qualifies, setup exits before it changes the stack.
+If all priced candidates exceed the ceiling, setup shows the cheapest candidate.
+Setup shows a `/tune` command when the effective ceiling key is editable.
 If the configuration rejects the command, setup reports the error and the suggested ceiling.
-To change zones, use a subnet in the new zone.
-The suggested ceiling includes `spot_ceiling_margin` and rounds up to the next cent when necessary.
-Setup reads the margin only for a stack change.
-If the price is at or below the ceiling, setup prints both values and continues.
-
-If setup gives a `/tune` command:
-
-1. Run the displayed `/tune` command.
-2. Run `deploy.py prepare --workload hana`.
-3. Run `deploy.py hana-setup --approve-resources`.
-
+The suggested ceiling includes `spot_ceiling_margin` and rounds up to a cent.
 It reserves setup costs within both account and workload limits before the stack request.
 `reserve_setup()` permits only approved resource setup while placement remains disabled.
 It does not permit demand starts or guest command admission.
-Setup resumes an already requested stack without a Spot price check.
-It refuses changed resource inputs or an expired reservation before another stack request.
-If AWS confirms that the stack is missing, setup checks the local record for resource identities.
-If the record names an instance, data disk, or bucket, setup asks the user to run `down --workload hana --approve-destroy`.
-If the record names none of these resources, setup searches the deleted stack history for the saved stack name.
+Setup uses the existing stack after a launch failure.
+After all launch requests receive a refusal, prepared setup can change the ceiling on that stack.
+Setup reserves compute at the new ceiling and saves the launch template version before it attempts the next launch.
+It tries the configured type and registered subnet first if their price qualifies.
+It tries the other candidates in order of price, starting with the lowest.
+Setup prints the type, zone, price, and ceiling for each launch attempt.
+A capacity or price refusal moves setup to the next candidate.
+If all attempts fail, setup reports each reason and keeps the stack for the next run.
+An unexpected error stops setup.
+Setup saves a client token before each launch and reuses it if the outcome is unknown.
+It refuses changed resource inputs or an expired reservation for a pending launch.
+Setup saves the returned instance identity, Spot request identity, and zone in `hana/setup.json` before it waits.
+Setup saves a client token before it creates an encrypted gp3 data disk in the launch zone.
+The AWS CLI makes one attempt per launch or disk creation command.
+Setup clears a new intent when EC2 confirms that it rejected the first request.
+Setup keeps the intent when the outcome of an earlier attempt is unknown.
+Setup saves the disk ID before it waits for the disk to become available.
+Setup reads the instance state again before it attaches the disk at `/dev/sdf`.
+Setup permits attachment when the instance is running or stopped.
+If AWS confirms that the stack is missing, setup checks the record for resources or pending requests.
+If the record names either, setup asks the user to run `down --workload hana --approve-destroy`.
+Otherwise, setup searches the deleted stack history for the saved stack name.
 It uses stacks that AWS created at or after the saved reservation time.
 Setup reads the events of each matching stack by ID to find retained disks and buckets.
 It ends Spot boxes with the saved deployment tag and deletes the retained resources before it clears the reservation and record.
@@ -276,7 +286,7 @@ Setup keeps the pending stop and accepts the saved preparation after its age lim
 It registers the deployment after it confirms the stopped state.
 Setup adds no route, target, or slot capacity.
 Setup uses a change set to change the stack.
-It refuses changes that replace or remove an instance, volume, or volume attachment.
+If the old stack owns the instance or data disk, setup tells the user to run approved Hana teardown first.
 When a create or update fails, setup reads failed stack events from the current change before cleanup.
 The error gives the name, type, status, and AWS reason for each failed resource.
 If setup cannot read the events, it reports that they are unavailable and continues cleanup.
@@ -302,9 +312,13 @@ The request then launches a new box with no tags.
 4. Terminate the boxes and wait until they are terminated.
 5. Read again. `SpotEndIncomplete` names any request or box that stays live.
 A failed cancel raises before any terminate.
-`deploy.py down --workload hana --approve-destroy` ends Hana boxes before and after it deletes the Hana stack.
-The second check ends any box that CloudFormation kept during deletion.
-The command then deletes the data disk and the control bucket.
+`deploy.py down --workload hana --approve-destroy` cancels the Spot request and confirms that the instance terminates.
+Before deletion, teardown searches for a pending launch by client token and a pending disk creation by tag.
+Teardown repeats each search for up to `intent_lookup_timeout_s` (120 seconds by default).
+If a search expires, teardown preserves the stack, charges, and setup record.
+It deletes the data disk before it deletes the stack.
+It then deletes the retained control bucket.
+For a legacy stack, it deletes the stack first to remove the managed disk attachment.
 It closes the compute and storage charges before it removes the local Hana records.
 The `--approve-destroy` flag authorizes deletion of the disk and bucket data.
 `test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
@@ -1061,7 +1075,7 @@ Existing configuration values remain unchanged.
 | New key | Value | Reason |
 | --- | --- | --- |
 | `stack_name` | `hana-build` | Keep Hana resources separate from gate resources. |
-| `availability_zone` | `us-east-2b` | Keep the retained disk in one zone. |
+| `availability_zone` | `us-east-2c` | Use this zone for the first launch candidate. |
 | `ami_id` | Empty | Require the reviewed Hana safety image. |
 | `ami_owner_id` | Empty | Require the reviewed image owner. |
 | `vpc_id` | Empty | Require an explicit network. |

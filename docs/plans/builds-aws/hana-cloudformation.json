@@ -8,16 +8,7 @@
     "Image": {
       "Type": "String"
     },
-    "InstanceType": {
-      "Type": "String"
-    },
-    "AvailabilityZone": {
-      "Type": "String"
-    },
     "VpcId": {
-      "Type": "String"
-    },
-    "SubnetId": {
       "Type": "String"
     },
     "RootDevice": {
@@ -32,40 +23,9 @@
     "RootGiB": {
       "Type": "Number",
       "MinValue": 1
-    },
-    "DataGiB": {
-      "Type": "Number",
-      "MinValue": 1
     }
   },
   "Resources": {
-    "DataVolume": {
-      "Type": "AWS::EC2::Volume",
-      "DeletionPolicy": "Retain",
-      "UpdateReplacePolicy": "Retain",
-      "Properties": {
-        "AvailabilityZone": {
-          "Ref": "AvailabilityZone"
-        },
-        "Size": {
-          "Ref": "DataGiB"
-        },
-        "VolumeType": "gp3",
-        "Encrypted": true,
-        "Tags": [
-          {
-            "Key": "HanaDeployment",
-            "Value": {
-              "Ref": "DeploymentId"
-            }
-          },
-          {
-            "Key": "Workload",
-            "Value": "hana"
-          }
-        ]
-      }
-    },
     "SecurityGroup": {
       "Type": "AWS::EC2::SecurityGroup",
       "Properties": {
@@ -177,9 +137,6 @@
           "ImageId": {
             "Ref": "Image"
           },
-          "InstanceType": {
-            "Ref": "InstanceType"
-          },
           "InstanceInitiatedShutdownBehavior": "stop",
           "InstanceMarketOptions": {
             "MarketType": "spot",
@@ -211,20 +168,6 @@
             "HttpPutResponseHopLimit": 1,
             "InstanceMetadataTags": "disabled"
           },
-          "NetworkInterfaces": [
-            {
-              "DeviceIndex": 0,
-              "SubnetId": {
-                "Ref": "SubnetId"
-              },
-              "AssociatePublicIpAddress": true,
-              "Groups": [
-                {
-                  "Ref": "SecurityGroup"
-                }
-              ]
-            }
-          ],
           "TagSpecifications": [
             {
               "ResourceType": "instance",
@@ -275,51 +218,6 @@
           "UserData": {
             "Fn::Base64": "{\"version\":1,\"setup_only\":true}"
           }
-        }
-      }
-    },
-    "Instance": {
-      "Type": "AWS::EC2::Instance",
-      "DeletionPolicy": "Retain",
-      "UpdateReplacePolicy": "Retain",
-      "Properties": {
-        "AvailabilityZone": {
-          "Ref": "AvailabilityZone"
-        },
-        "LaunchTemplate": {
-          "LaunchTemplateId": {
-            "Ref": "LaunchTemplate"
-          },
-          "Version": {
-            "Fn::GetAtt": [
-              "LaunchTemplate",
-              "LatestVersionNumber"
-            ]
-          }
-        },
-        "Tags": [
-          {
-            "Key": "HanaDeployment",
-            "Value": {
-              "Ref": "DeploymentId"
-            }
-          },
-          {
-            "Key": "Workload",
-            "Value": "hana"
-          }
-        ]
-      }
-    },
-    "DataAttachment": {
-      "Type": "AWS::EC2::VolumeAttachment",
-      "Properties": {
-        "Device": "/dev/sdf",
-        "InstanceId": {
-          "Ref": "Instance"
-        },
-        "VolumeId": {
-          "Ref": "DataVolume"
         }
       }
     },
@@ -405,16 +303,6 @@
     }
   },
   "Outputs": {
-    "Instance": {
-      "Value": {
-        "Ref": "Instance"
-      }
-    },
-    "DataVolume": {
-      "Value": {
-        "Ref": "DataVolume"
-      }
-    },
     "ControlBucket": {
       "Value": {
         "Ref": "ControlBucket"
@@ -423,6 +311,22 @@
     "LaunchTemplate": {
       "Value": {
         "Ref": "LaunchTemplate"
+      }
+    },
+    "LaunchTemplateVersion": {
+      "Value": {
+        "Fn::GetAtt": [
+          "LaunchTemplate",
+          "LatestVersionNumber"
+        ]
+      }
+    },
+    "SecurityGroup": {
+      "Value": {
+        "Fn::GetAtt": [
+          "SecurityGroup",
+          "GroupId"
+        ]
       }
     }
   }

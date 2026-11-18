@@ -26,10 +26,10 @@ from zoneinfo import ZoneInfo
 
 from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
-from scripts.aws_target.test_spot_end import FakeEc2, TAG as HANA_TAG
+from scripts.aws_target.test_spot_end import Disk, FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
 from scripts.mac_test import mac_test
@@ -442,6 +442,10 @@ class HanaSetupFailureTests(CostFixture):
         _ = self.workload.write_bytes((deploy.TEMPLATE.parents[3] / 'config/hana_aws.conf').read_bytes())
         for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id'):
             text_setting(self.workload, key, 'fixture-' + key)
+        text_setting(self.workload, 'availability_zone', 'us-east-2b')
+        text_setting(self.workload, 'instance_type', 'm7a.4xlarge')
+        text_setting(self.workload, 'fallback_instance_types', 'c7a.4xlarge')
+        numeric_settings(self.workload, {'intent_lookup_timeout_s': '15', 'stop_poll_seconds': '10'})
         self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
         self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
         original = conf.read_or_repository
@@ -450,6 +454,12 @@ class HanaSetupFailureTests(CostFixture):
             return conf.read(self.workload) if name == 'hana_aws' else original(name)
 
         _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
+        original_path = conf.path
+
+        def config_path(name: str | Path) -> Path:
+            return self.workload if name == 'hana_aws' else original_path(name)
+
+        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=config_path))
         settings = aws_config.DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gate', 'image',
             'owner', 'fixture-release', 'us-east-2b', 'vpc', 'subnet', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
         _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=settings))
@@ -457,10 +467,14 @@ class HanaSetupFailureTests(CostFixture):
         _ = self.enterContext(mock.patch.object(deploy.Deployment, '_validate_inputs'))
 
     def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False,
-                spot_prices: tuple[tuple[str, str], ...] = (('us-east-2b', '0.10'),)) -> deploy.Deployment:
-        status = 'CREATE_IN_PROGRESS'
+                spot_prices: tuple[tuple[str, str], ...] = (('us-east-2b', '0.10'),),
+                launch_errors: tuple[str, ...] = (), volume_errors: tuple[str, ...] = (),
+                legacy_stack: bool = False) -> deploy.Deployment:
+        status = 'CREATE_COMPLETE' if fake.stack else 'CREATE_IN_PROGRESS'
         created = self.clock.now
         stack_id = 'active-stack'
+        errors = iter(launch_errors)
+        disk_errors = iter(volume_errors)
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
                     check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -468,6 +482,11 @@ class HanaSetupFailureTests(CostFixture):
             self.calls.append(list(arguments))
             offset = arguments.index('--region') + 2
             operation = arguments[offset + 1]
+            if operation == 'describe-subnets':
+                self.assertIn('Name=vpc-id,Values=fixture-vpc_id', arguments)
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Subnets': [
+                    {'SubnetId': 'fixture-subnet-' + suffix, 'AvailabilityZone': 'us-east-2' + suffix,
+                     'VpcId': 'fixture-vpc_id', 'State': 'available', 'DefaultForAz': True} for suffix in ('a', 'c')]}), '')
             if operation == 'describe-spot-price-history':
                 if fake.fail == operation:
                     return subprocess.CompletedProcess(arguments, 1, '', 'fixture Spot read failed')
@@ -482,8 +501,30 @@ class HanaSetupFailureTests(CostFixture):
                 status = 'CREATE_IN_PROGRESS'
             if operation == 'describe-stacks' and fake.stack:
                 fake.operations.append(operation)
-                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [
-                    {'StackStatus': status, 'StackId': stack_id}]}), '')
+                stack: dict[str, object] = {'StackStatus': status, 'StackId': stack_id}
+                if status == 'CREATE_COMPLETE':
+                    outputs = {'ControlBucket': 'control-bucket', 'LaunchTemplate': 'fixture-template',
+                               'LaunchTemplateVersion': '1', 'SecurityGroup': 'fixture-group'}
+                    if legacy_stack:
+                        outputs.update(Instance='fixture-instance', DataVolume='fixture-disk')
+                    stack['Outputs'] = [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [stack]}), '')
+            if operation == 'run-instances':
+                fake.operations.append(operation)
+                if fake.raise_once == operation:
+                    fake.raise_once = ''
+                    raise subprocess.TimeoutExpired('fixture launch', timeout)
+                if launch_errors:
+                    return subprocess.CompletedProcess(arguments, 1, '', next(errors))
+                instance = fake.launch(tagged=True)
+                reply = {'Instances': [{'InstanceId': instance, 'SpotInstanceRequestId': fake.boxes[instance].request}]}
+                return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+            if operation == 'create-volume':
+                fake.operations.append(operation)
+                if fake.raise_once == operation:
+                    fake.raise_once = ''
+                    raise subprocess.TimeoutExpired('fixture volume creation', timeout)
+                return subprocess.CompletedProcess(arguments, 1, '', next(disk_errors))
             if operation == 'list-stacks':
                 self.assertIn('DELETE_COMPLETE', arguments)
                 fake.operations.append(operation)
@@ -502,10 +543,13 @@ class HanaSetupFailureTests(CostFixture):
                 self.clock.advance(1)
                 if waiter_timeout:
                     raise subprocess.TimeoutExpired('fixture stack create waiter', timeout)
-                status = 'ROLLBACK_COMPLETE'
-                fake.events.append({'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
-                    'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'No capacity in this zone',
-                    'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat()})
+                if fake.fail_wait == 'stack-create-complete':
+                    status = 'ROLLBACK_COMPLETE'
+                    fake.events.append({'LogicalResourceId': 'Instance', 'ResourceType': 'AWS::EC2::Instance',
+                        'ResourceStatus': 'CREATE_FAILED', 'ResourceStatusReason': 'No capacity in this zone',
+                        'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat()})
+                else:
+                    status = 'CREATE_COMPLETE'
             if operation == 'delete-stack' and fake.stack:
                 if retain_on_delete:
                     fake.create_retained()
@@ -536,11 +580,15 @@ class HanaSetupFailureTests(CostFixture):
         _ = subject.prepare_hana()
         return generation
 
+    def advance_pause(self, seconds: float) -> None:
+        self.clock.advance(int(seconds))
+
     def assert_spot_price_refusal(self, subject: deploy.Deployment) -> str:
         _ = subject.prepare_hana()
         with redirect_stdout(StringIO()), self.assertRaises(deploy.DeploymentRefused) as failure:
             _ = subject.hana_setup(approve_resources=True)
-        call, = self.calls
+        subnets, call = self.calls
+        self.assertIn('describe-subnets', subnets)
         self.assertIn('describe-spot-price-history', call)
         self.assertIn('us-east-2', call)
         self.assertIn('--instance-types', call)
@@ -553,12 +601,11 @@ class HanaSetupFailureTests(CostFixture):
         text_setting(self.workload, 'spot_max_usd_per_hour', '0.15')
         text_setting(self.workload, 'spot_ceiling_margin', '0.27')
         subject = self.subject(FakeEc2(), spot_prices=(
-            ('us-east-2a', '0.1610'), ('us-east-2b', '0.1828'), ('us-east-2c', '0.1210')))
+            ('us-east-2a', '0.2010'), ('us-east-2b', '0.1928'), ('us-east-2c', '0.1828')))
         message = self.assert_spot_price_refusal(subject)
-        self.assertIn('The current Spot price for m7a.2xlarge in us-east-2b is 0.1828 USD/hour.', message)
-        self.assertIn('The ceiling is 0.15 USD/hour.', message)
-        self.assertIn('The cheapest zone is us-east-2c at 0.1210 USD/hour.', message)
-        self.assertIn('use a subnet in the new zone', message)
+        self.assertIn('No Hana Spot candidate meets the 0.15 USD/h ceiling.', message)
+        size = conf.read(self.workload).text('instance_type')
+        self.assertIn(f'The cheapest candidate is {size} in us-east-2c at 0.1828 USD/h.', message)
         self.assertEqual(message.splitlines()[-3:], [
             '1. Run /tune hana_aws spot_max_usd_per_hour 0.24',
             '2. Run deploy.py prepare --workload hana',
@@ -572,7 +619,7 @@ class HanaSetupFailureTests(CostFixture):
         with mock.patch('socket.gethostname', return_value='hana-test.example'):
             message = self.assert_spot_price_refusal(subject)
             _ = conf.editable_line(self.workload, key)
-        self.assertIn('The ceiling is 0.15 USD/hour.', message)
+        self.assertIn('No Hana Spot candidate meets the 0.15 USD/h ceiling.', message)
         self.assertIn(f'1. Run /tune hana_aws {key} 0.23', message.splitlines())
 
     def test_hana_setup_reports_another_host_override_that_blocks_tune(self) -> None:
@@ -612,19 +659,252 @@ class HanaSetupFailureTests(CostFixture):
         with redirect_stdout(output), self.assertRaises(deploy.HanaCreateRolledBack):
             _ = subject.hana_setup(approve_resources=True)
         self.assertIn('create-change-set', fake.operations)
-        self.assertIn('hana-setup: The current Spot price for m7a.2xlarge in us-east-2b is 0.15 USD/hour. '
-                      + 'The ceiling is 0.15 USD/hour.', output.getvalue().splitlines())
+        self.assertIn('updating the separate Hana stack', output.getvalue())
 
-    def test_hana_setup_refuses_a_zone_with_no_price_and_lists_priced_zones(self) -> None:
-        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2c', '0.14'), ('us-east-2a', '0.15')))
+    def test_hana_setup_refuses_when_no_eligible_subnet_has_a_price(self) -> None:
+        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2d', '0.14'),))
         message = self.assert_spot_price_refusal(subject)
-        self.assertIn('AWS lists no Spot price for m7a.2xlarge in us-east-2b.', message)
-        self.assertIn('Zones with a price in us-east-2: us-east-2a, us-east-2c.', message)
+        self.assertIn('AWS lists no Spot prices for Hana instance types in the eligible subnets of us-east-2.', message)
 
     def test_hana_setup_refuses_when_the_price_read_fails(self) -> None:
         subject = self.subject(FakeEc2(fail='describe-spot-price-history'))
         message = self.assert_spot_price_refusal(subject)
-        self.assertIn('Could not read Spot prices for m7a.2xlarge in us-east-2.', message)
+        self.assertIn('Could not read Spot prices for Hana instance types in us-east-2.', message)
+
+    def test_hana_setup_keeps_the_stack_after_all_launches_fail_and_reuses_it(self) -> None:
+        fake = FakeEc2()
+        failures = ('aws: [ERROR]: An error occurred (SpotMaxPriceTooLow) when calling the RunInstances operation: price increased',
+                    'no Spot capacity in this zone')
+        subject = self.subject(fake, spot_prices=(('us-east-2b', '0.14'), ('us-east-2c', '0.10')),
+                               launch_errors=failures * 2)
+        _ = subject.prepare_hana()
+        for run in (1, 2):
+            with self.subTest(run=run), redirect_stdout(StringIO()) as output, self.assertRaises(deploy.DeploymentRefused) as raised:
+                _ = subject.hana_setup(approve_resources=True)
+            self.assertIn('No Hana Spot candidate launched.', str(raised.exception))
+            self.assertIn('us-east-2b: attempt 1 failed:', str(raised.exception))
+            self.assertIn('us-east-2c: attempt 2 failed:', str(raised.exception))
+            self.assertEqual(sum(line.startswith('attempt ') for line in output.getvalue().splitlines()), 4)
+            self.assertEqual(fake.operations.count('create-change-set'), 1)
+            self.assertNotIn('delete-stack', fake.operations)
+            self.assertNotIn('pending_launch', remote.read_record(self.setup_path))
+            self.assertTrue(fake.stack)
+        self.assertEqual(len(self.book.read_snapshot().hana_compute), 2)
+        self.assertTrue(all(isinstance(row.state, ledger.HanaExposureClosed) for row in self.book.read_snapshot().hana_compute))
+
+    def test_hana_down_completes_after_the_first_launch_is_denied(self) -> None:
+        fake = FakeEc2()
+        subject = self.subject(fake, spot_prices=(('us-east-2b', '0.12'), ('us-east-2c', '0.10')), launch_errors=(
+            'aws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the RunInstances operation: denied',))
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'attempt 1 failed: .*denied'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations.count('run-instances'), 1)
+        self.assertNotIn('delete-stack', fake.operations)
+        self.assertNotIn('pending_launch', remote.read_record(self.setup_path))
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+
+    def test_hana_down_completes_after_the_first_launch_hits_a_full_subnet(self) -> None:
+        fake = FakeEc2()
+        subject = self.subject(fake, spot_prices=(('us-east-2b', '0.12'), ('us-east-2c', '0.10')), launch_errors=(
+            'aws: [ERROR]: An error occurred (InsufficientFreeAddressesInSubnet) '
+            + 'when calling the RunInstances operation: subnet full',))
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'InsufficientFreeAddressesInSubnet'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations.count('run-instances'), 1)
+        self.assertNotIn('pending_launch', remote.read_record(self.setup_path))
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+
+    def test_hana_setup_keeps_the_launch_token_if_a_retry_after_timeout_is_refused(self) -> None:
+        fake = FakeEc2(raise_once='run-instances')
+        failures = (
+            'no Spot capacity',
+            'aws: [ERROR]: An error occurred (InsufficientFreeAddressesInSubnet) '
+            + 'when calling the RunInstances operation: subnet full',
+        )
+        subject = self.subject(fake, launch_errors=failures)
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaises(subprocess.TimeoutExpired):
+            _ = subject.hana_setup(approve_resources=True)
+        pending = ledger.mapping(remote.read_record(self.setup_path)['pending_launch'])
+        for error in ('no Spot capacity', 'InsufficientFreeAddressesInSubnet'):
+            with self.subTest(error=error):
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, error):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(remote.read_record(self.setup_path)['pending_launch'], pending)
+        calls = [call for call in self.calls if 'run-instances' in call]
+        self.assertEqual([call[call.index('--client-token') + 1] for call in calls], [pending['token']] * 3)
+        self.assertEqual(fake.operations.count('create-change-set'), 1)
+
+    def test_hana_setup_keeps_the_launch_token_after_an_internal_error(self) -> None:
+        fake = FakeEc2()
+        subject = self.subject(fake,
+            launch_errors=('An error occurred (InternalFailure) when calling the RunInstances operation: unknown outcome',))
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'unknown outcome'):
+            _ = subject.hana_setup(approve_resources=True)
+        pending = ledger.mapping(remote.read_record(self.setup_path)['pending_launch'])
+        launch, = [call for call in self.calls if 'run-instances' in call]
+        self.assertEqual(pending['token'], launch[launch.index('--client-token') + 1])
+
+    def test_hana_down_completes_after_the_first_disk_creation_is_denied(self) -> None:
+        fake = FakeEc2()
+        subject = self.subject(fake, volume_errors=(
+            'aws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the CreateVolume operation: denied',))
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'denied'):
+            _ = subject.hana_setup(approve_resources=True)
+        saved = remote.read_record(self.setup_path)
+        self.assertIn('instance', saved)
+        self.assertNotIn('pending_volume', saved)
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+
+    def test_hana_setup_keeps_the_disk_intent_if_a_retry_after_timeout_is_denied(self) -> None:
+        fake = FakeEc2(raise_once='create-volume')
+        subject = self.subject(fake, volume_errors=(
+            'aws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the CreateVolume operation: denied',))
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaises(subprocess.TimeoutExpired):
+            _ = subject.hana_setup(approve_resources=True)
+        token = ledger.text(remote.read_record(self.setup_path), 'pending_volume')
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'denied'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(remote.read_record(self.setup_path)['pending_volume'], token)
+        calls = [call for call in self.calls if 'create-volume' in call]
+        self.assertEqual([call[call.index('--client-token') + 1] for call in calls], [token] * 2)
+
+    def test_hana_create_commands_use_one_cli_attempt(self) -> None:
+        execute = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{}', ''))
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=execute)
+        settings, _, _ = subject._hana_inputs()  # pyright: ignore[reportPrivateUsage]
+        api = subject._api(settings)  # pyright: ignore[reportPrivateUsage]
+        environment = {'AWS_MAX_ATTEMPTS': '3'}
+        with mock.patch.object(subject.admin, 'environment', return_value=environment):
+            _ = api.call('run-instances')
+            _ = api.call('create-volume')
+            _ = api.call('describe-volumes')
+        self.assertEqual([call.kwargs['env']['AWS_MAX_ATTEMPTS'] for call in execute.call_args_list], ['1', '1', '3'])
+
+    def test_hana_down_deletes_a_direct_volume_before_it_deletes_the_stack(self) -> None:
+        fake = FakeEc2(stack=True)
+        instance = fake.launch(tagged=True)
+        request = fake.boxes[instance].request
+        fake.requests[request].tags.clear()
+        fake.boxes[instance].tags.clear()
+        fake.disks['fixture-data'] = Disk('available', {})
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = remote.read_record(self.setup_path)
+        saved.update(version=2, instance=instance, spot_request=request, data_volume='fixture-data')
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        actions = ('cancel-spot-instance-requests', 'terminate-instances', 'wait instance-terminated',
+                   'delete-volume', 'wait volume-deleted', 'delete-stack')
+        positions = [fake.operations.index(action) for action in actions]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        self.assertIsInstance(self.book.read_snapshot().hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_down_waits_for_a_disk_hidden_after_aws_accepts_creation(self) -> None:
+        fake = FakeEc2(stack=True, hidden_volume_reads=1)
+        instance = fake.launch(tagged=True)
+        token = 'fixture-volume-token'
+        fake.disks['fixture-data'] = Disk('available', {'HanaDeployment': HANA_TAG[1], 'HanaVolumeToken': token})
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = remote.read_record(self.setup_path)
+        saved.update(version=2, instance=instance, spot_request=fake.boxes[instance].request, pending_volume=token)
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        subject.pause = self.advance_pause
+        with redirect_stdout(StringIO()), mock.patch.object(time, 'monotonic', self.clock):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        lookups = [call for call in self.calls if 'describe-volumes' in call]
+        self.assertEqual(len(lookups), 2)
+        self.assertTrue(all(f'Name=tag:HanaVolumeToken,Values={token}' in call for call in lookups))
+        self.assertLess(fake.operations.index('delete-volume'), fake.operations.index('delete-stack'))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        self.assertIsInstance(self.book.read_snapshot().hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_down_resolves_a_pending_launch_before_teardown(self) -> None:
+        fake = FakeEc2(stack=True, hidden_launch_reads=1)
+        instance = fake.launch(tagged=False)
+        request = fake.boxes[instance].request
+        fake.requests[request].tags.clear()
+        fake.launch_tokens[instance] = 'fixture-launch-token'
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = remote.read_record(self.setup_path)
+        saved.update(version=2, pending_launch={'instance_type': 'm7a.4xlarge', 'zone': 'us-east-2b',
+                                                'subnet': 'fixture-subnet', 'token': fake.launch_tokens[instance]})
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        subject.pause = self.advance_pause
+        with redirect_stdout(StringIO()), mock.patch.object(time, 'monotonic', self.clock):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertEqual(sum('Name=client-token,Values=fixture-launch-token' in call for call in self.calls), 2)
+        actions = ('cancel-spot-instance-requests', 'terminate-instances', 'delete-stack')
+        positions = [fake.operations.index(action) for action in actions]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+
+    def test_hana_down_keeps_the_stack_and_charges_when_an_intent_stays_unresolved(self) -> None:
+        fake = FakeEc2(stack=True)
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = remote.read_record(self.setup_path)
+        evidence = self.book.read_snapshot()
+        subject.pause = self.advance_pause
+        intent = {'instance_type': 'm7a.4xlarge', 'zone': 'us-east-2b', 'subnet': 'fixture-subnet', 'token': 'missing-launch'}
+        for kind, pending in (('launch', {'pending_launch': intent}), ('disk creation', {'pending_volume': 'missing-disk'})):
+            with self.subTest(kind=kind):
+                record = {**saved, **pending, 'version': 2}
+                write_text_atomic(self.setup_path, json.dumps(record))
+                with redirect_stdout(StringIO()), mock.patch.object(time, 'monotonic', self.clock), \
+                        self.assertRaisesRegex(deploy.DeploymentRefused, f'AWS did not confirm the pending Hana {kind}'):
+                    _ = subject.hana_down(approve_destroy=True)
+                self.assertNotIn('delete-stack', fake.operations)
+                self.assertTrue(fake.stack)
+                self.assertEqual(remote.read_record(self.setup_path), record)
+                self.assertEqual(self.book.read_snapshot(), evidence)
+
+    def test_hana_down_reports_missing_direct_ids_and_continues(self) -> None:
+        fake = FakeEc2(stack=True)
+        subject = self.subject(fake)
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()) as output:
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        for missing in ('Spot request', 'instance', 'data disk'):
+            self.assertIn(f'no saved {missing} ID', output.getvalue())
+        self.assertIn('delete-stack', fake.operations)
+        self.assertFalse(self.setup_path.exists())
+
+    def test_hana_setup_refuses_a_stack_with_legacy_instance_outputs(self) -> None:
+        fake = FakeEc2(stack=True)
+        subject = self.subject(fake, legacy_stack=True)
+        _ = self.write_leftover(subject)
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy first'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks'])
+
+    def test_hana_setup_refuses_a_legacy_stack_instance_even_without_its_output(self) -> None:
+        fake = FakeEc2(stack=True, resources={'Instance': ('AWS::EC2::Instance', 'fixture-instance')})
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy first'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(fake.operations, ['describe-stacks', 'describe-stack-resources'])
 
     def test_failed_hana_create_reports_resource_failure_and_retries_with_changed_ceiling(self) -> None:
         fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
@@ -809,7 +1089,7 @@ class HanaSetupFailureTests(CostFixture):
 
         with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy'):
             _ = subject.hana_setup(approve_resources=True)
-        self.assertEqual(fake.operations, ['describe-stacks'])
+        self.assertEqual(fake.operations, [])
         self.assertEqual(self.setup_path.read_bytes(), saved)
         self.assertEqual(self.book.read_snapshot(), evidence)
 
