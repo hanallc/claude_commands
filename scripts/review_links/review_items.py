@@ -20,8 +20,8 @@ from scripts.lib import urgency
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
-from scripts.production import proposals_folder, proposals_table
-from scripts.production.issues import Issue, PROPOSAL_TAG, open_issues
+from scripts.production import proposal_issue, proposals_folder, proposals_table, record_store
+from scripts.production.issues import Issue, PROPOSAL_TAG
 from scripts.production.proposal_issue import DeclinedDecision, InProgress, decision_answer, proposal_progress
 from scripts.production.proposal_issue import REVIEW_MARK_FIELD, review_log, review_mark
 from scripts.production.production_doc import production_field, Refusal
@@ -46,7 +46,7 @@ class ReviewState(StrEnum):
 
 REVIEW_TYPES = tuple(ReviewType)
 REVIEW_STATES = tuple(ReviewState)
-PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "style_answer_words", "proposed_by", "record_type",
+PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "style_answer_words", "proposed_by", "production_id", "record_type",
                                    REVIEW_MARK_FIELD))
 # Approve and Decline close the item; Send feedback closes it; Ask question returns it.
 DECISION_ACTIONS = ('approve', 'decline', 'feedback', 'question')
@@ -342,7 +342,8 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
     return found
 
 
-def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *, unowned: bool = False) -> ReviewItem:
+def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *,
+                  unowned: bool = False, assign_ids: bool = False) -> ReviewItem:
     owner, fields, path = record.owner, record.item, record.path
     parsed = update_registration.parse_outstanding_entries([fields], path)[0]
     filed = moment(fields['since'])
@@ -365,7 +366,14 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     logs.extend(saved_log)
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
     key = 'question/'+owner+'/'+path.name
-    identity = name(owner, members)+'/'+fields.get('review_id',path.stem)
+    review_id = fields.get('review_id', path.stem)
+    if assign_ids:
+        try:
+            review_id = update_registration.question_review_id(record)
+            fields['review_id'] = review_id
+        except (OSError, ValueError, staff.StaffRefused, update_registration.RegistrationFailure):
+            review_id = ''
+    identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
@@ -376,34 +384,37 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
 
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    owners: tuple[staff.StaffRow, ...] = (), sources: list[Path] | None = None,
-                   assign_ids: bool = False, include_unowned: bool = True,
+                   include_unowned: bool = True, assign_ids: bool = False,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
                    owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
     identities = update_registration.QuestionStaff.for_record(members)
     selected = owners or tuple(member for member in members.rows if member.kind == 'producer' or
-        member.kind == 'showrunner' and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents)
+        member.kind == 'showrunner' and (include_unowned or
+            isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents))
     found: list[ReviewItem] = []
     seen: set[Path] = set()
     identities_found: set[staff.StaffId] = set()
     statuses = tuple(status for status in ('open', 'closed')
                      if (ReviewState.DONE in states if status == 'closed' else states != (ReviewState.DONE,)))
     for owner in selected:
-        if isinstance(owner.doc,(staff.LiveDoc,staff.WrappedDoc)) and owner.doc.machine != local_machine():
-            print(f'questions: {owner.name}: ownership evidence is unavailable',file=sys.stderr)
+        doc = record_store.local_document(owner)
+        if doc is None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and not include_unowned:
+            print(f'questions: {owner.name}: ownership evidence is unavailable', file=sys.stderr)
             continue
-        document = owner if owner.kind == 'producer' else cast(staff.LiveDoc, owner.doc).path
-        if sources is not None and isinstance(document, Path):
-            sources.append(document)
-        records = update_registration.question_records_for_document(document, identities, include_unrouted=True, sources=sources,
-            statuses=statuses, owner_ids=identities_found)
+        if owner.kind == 'producer' or doc is not None:
+            document = owner if owner.kind == 'producer' else cast(Path, doc)
+            if sources is not None and isinstance(document, Path):
+                sources.append(document)
+            records = update_registration.question_records_for_document(document, identities, include_unrouted=True, sources=sources,
+                statuses=statuses, owner_ids=identities_found)
+        else:
+            records = update_registration.question_records_for_owner(owner.id, statuses=statuses, owner_ids=identities_found)
         for record in records:
             if record.path not in seen:
                 seen.add(record.path)
                 if question_state(record) not in states:
                     continue
-                if assign_ids:
-                    record.item['review_id'] = update_registration.question_review_id(record)
-                found.append(question_item(record, members))
+                found.append(question_item(record, members, assign_ids=assign_ids))
     if include_unowned:
         for record in update_registration.unowned_question_records(identities, statuses=statuses, owner_ids=identities_found):
             if record.path in seen:
@@ -411,9 +422,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             seen.add(record.path)
             if question_state(record) not in states:
                 continue
-            if assign_ids:
-                record.item['review_id'] = update_registration.question_review_id(record)
-            found.append(question_item(record, members, unowned=True))
+            found.append(question_item(record, members, unowned=True, assign_ids=assign_ids))
     if owner_options is not None:
         for identity in identities_found:
             member = members.by_id(identity)
@@ -426,15 +435,14 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                         sources: list[Path] | None = None,
                         states: tuple[ReviewState, ...] = REVIEW_STATES,
                         owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
-    root = investigation.state_root()
-    selected = owners or tuple(staff.StaffId(path.name) for path in sorted(root.iterdir()) if path.is_dir() and not path.is_symlink()) if root.exists() else owners
+    selected = owners or tuple(sorted(record_store.store_owners(record_store.RecordKind.INVESTIGATION)))
     found: list[ReviewItem] = []
     investigation_states = tuple(state for state,review_state in (
         (investigation.InvestigationState.OPEN, ReviewState.WAITING),
         (investigation.InvestigationState.ANSWER_READY, ReviewState.OPEN),
         (investigation.InvestigationState.READ, ReviewState.DONE)) if review_state in states)
     for identity in selected:
-        if owner_options is not None and any(investigation.folder(identity).glob('I*.md')):
+        if owner_options is not None and any(investigation.review_record_paths(identity)):
             for owner in (identity, owner_for(identity, members)):
                 owner_options[owner] = name(owner, members)
         for record in investigation.records(identity, include_read=True, sources=sources, states=investigation_states):
@@ -487,57 +495,80 @@ def proposal_item(key: str, issue: Issue, owner: staff.StaffId, who: staff.Staff
 def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    sources: list[Path] | None = None, own: list[Issue] | None = None,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
-                   owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
+                   owner_options: dict[staff.StaffId, str] | None = None,
+                   include_registered: bool = False) -> list[ReviewItem]:
     found: dict[str, ReviewItem] = {}
-    owners: dict[Path, staff.StaffId] = {}
+    scopes: dict[Path | staff.StaffId, staff.StaffId] = {}
     for doc in documents:
         try:
-            owners[doc] = unit_lookup.doc_owner(doc, members).id
-        except staff.StaffUnreadable:
-            owners[doc] = staff.StaffId('')
-    proposers = {doc:{owner, *(member.id for member in members.find(kind='unit', parent=owner))}
-                 for doc, owner in owners.items()}
-    references: dict[Path, dict[str, str]] = {doc:{} for doc in documents}
-    selected_issues: dict[Path, list[Issue]] = {doc:[] for doc in documents}
+            member = members.by_doc(local_machine(), doc.resolve())
+        except (OSError, staff.StaffRefused):
+            member = None
+        scopes[doc] = member.id if member is not None and member.kind in ('showrunner', 'producer') else staff.StaffId('')
+    if include_registered:
+        kind = record_store.RecordKind.PROPOSAL
+        for owner, row in record_store.store_owners(kind, members).items():
+            if owner not in scopes.values() and (row is None or row.kind in ('showrunner', 'producer')):
+                scopes[owner] = owner
+    proposers = {owner:{owner, *(member.id for member in members.find(kind='unit', parent=owner))}
+                 for owner in set(scopes.values())}
+    references: dict[Path | staff.StaffId, dict[str, str]] = {scope:{} for scope in scopes}
+    selected_issues: dict[Path | staff.StaffId, list[Issue]] = {scope:[] for scope in scopes}
+
+    def matching(issue: Issue, scope: Path | staff.StaffId) -> bool:
+        owner = scopes[scope]
+        legacy = owner if issue.value('proposed_by') in proposers[owner] else issue.value('proposed_by')
+        return proposal_issue.proposal_owner(issue, legacy) == owner
+
     if own is None:
-        folders: dict[Path, list[Path]] = {}
-        for doc in documents:
-            folder = proposals_folder.issues_folder(doc)
-            if folder is not None:
-                folders.setdefault(folder, []).append(doc)
-        for folder, scoped_documents in folders.items():
-            documents_by_proposer: dict[str, list[Path]] = {}
-            for doc in scoped_documents:
-                for proposer in proposers[doc]:
-                    documents_by_proposer.setdefault(proposer, []).append(doc)
+        scopes_by_folder: dict[Path, list[Path | staff.StaffId]] = {}
+        for scope, owner in scopes.items():
+            row = members.by_id(owner)
+            doc = scope if isinstance(scope, Path) else record_store.local_document(row)
+            for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc,
+                                                     strict=sources is not None):
+                scopes_by_folder.setdefault(folder, []).append(scope)
+        scopes_by_path: dict[Path, set[Path | staff.StaffId]] = {}
+        for folder, folder_scopes in scopes_by_folder.items():
+            for path in record_store.stored_paths((folder,), sources=sources, strict=sources is not None):
+                scopes_by_path.setdefault(path, set()).update(folder_scopes)
 
-            def selected(issue: Issue) -> bool:
-                if issue.value('record_type') == 'question':
-                    return False
-                scoped = documents_by_proposer.get(issue.value('proposed_by'), [])
-                for doc in scoped:
-                    references[doc][issue.path.stem] = str(issue.path)
-                return bool(scoped) and proposal_state(issue) in states
+        def selected(issue: Issue) -> bool:
+            if (issue.value('status') != 'open' or PROPOSAL_TAG not in issue.fields.get('tags', [])
+                    or issue.value('record_type') == 'question'):
+                return False
+            matched = [scope for scope in scopes_by_path[issue.path] if matching(issue, scope)]
+            for scope in matched:
+                references[scope][issue.path.stem] = str(issue.path)
+            return bool(matched) and proposal_state(issue) in states
 
-            for issue in open_issues(folder, PROPOSAL_TAG, sources=sources, select=selected, keys=PROPOSAL_STATE_FIELDS):
-                for doc in documents_by_proposer[issue.value('proposed_by')]:
-                    selected_issues[doc].append(issue)
+        for path, path_scopes in sorted(scopes_by_path.items()):
+            fields = record_store.read_header(path, sources=sources, select=selected, keys=PROPOSAL_STATE_FIELDS | {'tags'})
+            if fields:
+                issue = Issue(path, fields)
+                for scope in path_scopes:
+                    if matching(issue, scope):
+                        selected_issues[scope].append(issue)
     else:
-        for doc in documents:
-            references[doc] = {issue.path.stem:str(issue.path) for issue in own
-                               if issue.value('proposed_by') in proposers[doc]}
-            selected_issues[doc] = [issue for issue in own if proposal_state(issue) in states]
-    for doc in documents:
-        owner = owners[doc]
-        issues = selected_issues[doc]
-        waiting, _ = proposals_table.waiting_entries(doc, sources=sources, issues=issues, record=members)
+        for scope in scopes:
+            references[scope] = {issue.path.stem:str(issue.path) for issue in own if matching(issue, scope)}
+            selected_issues[scope] = [issue for issue in own if matching(issue, scope) and proposal_state(issue) in states]
+    for scope, owner in scopes.items():
+        issues = selected_issues[scope]
+        waiting: list[urgency.Entry[proposals_table.Row]] = []
+        if isinstance(scope, Path):
+            try:
+                waiting, _ = proposals_table.waiting_entries(scope, sources=sources, issues=issues, record=members)
+            except (OSError, UnicodeError):
+                if sources is not None:
+                    raise
         by_key = {str(issue.path):issue for issue in issues}
         queue = 'proposal-'+owner
         for entry in waiting:
             issue = by_key.get(entry.key)
             if issue is not None:
                 dependency = next(iter(issue.fields.get('depends_on', [])), '')
-                entry = replace(entry, after=references[doc].get(dependency, ''))
+                entry = replace(entry, after=references[scope].get(dependency, ''))
             filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
             key = 'proposal/'+entry.key
             if issue is not None:
@@ -576,7 +607,7 @@ def efficiency_ledger(doc: Path) -> Path | NoEfficiencyLedger:
     """Read the ledger path or name its absence."""
     try:
         return Path(production_field(doc.read_text(encoding='utf-8').splitlines(), EFFICIENCY_LEDGER_FIELD)).expanduser()
-    except Refusal:
+    except (Refusal, OSError, UnicodeError):
         return NoEfficiencyLedger()
 
 
@@ -671,7 +702,7 @@ def ordered(items: list[ReviewItem]) -> list[ReviewItem]:
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None, assign_ids: bool = True) -> list[ReviewItem]:
-    """Read each record from its existing store without another stored copy."""
+    """Read each record from its existing store."""
     members = staff.snapshot() if members is None else members
     documents = tuple(dict.fromkeys(member.doc.path for member in members.rows
                       if member.kind == 'showrunner' and isinstance(member.doc, staff.LiveDoc)))
@@ -684,7 +715,10 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None,
     if ReviewType.INVESTIGATION in kinds:
         items.extend(investigation_items(members,states=states,owner_options=owner_options))
     if ReviewType.PROPOSAL in kinds:
-        items.extend(proposal_items(members,documents,states=states,owner_options=owner_options))
+        producer_docs = tuple(member.doc.path for member in members.find(kind='producer')
+                              if isinstance(member.doc, staff.LiveDoc) and member.doc.machine == local_machine())
+        items.extend(proposal_items(members, tuple(dict.fromkeys((*documents, *producer_docs))),
+                                    states=states, owner_options=owner_options, include_registered=True))
     if ReviewType.EFFICIENCY in kinds:
         items.extend(efficiency_items(members,documents,states=states,owner_options=owner_options))
     return ordered(with_later(items))
