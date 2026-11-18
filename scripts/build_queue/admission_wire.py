@@ -104,6 +104,7 @@ class Identity:
     step: str
     folder: str
     unit: str = ""
+    verify: records.VerifyStep = field(default_factory=lambda: records.NotVerifyCall(), kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -392,7 +393,7 @@ class PlacementRequest(CallerCode):
     since: float
     profile: records.StepProfile | records.ProgramProfile
     constraints: placement.PlacementConstraints
-    identity: Identity = Identity("", "", "", "")
+    identity: Identity = field(default_factory=lambda: Identity("", "", "", ""))
     run: RunIdentity | NoRun = NO_RUN
     local: LocalAdmissionContext | LocalAdmissionUnavailable = LocalAdmissionUnavailable("not supplied")
     prerequisite: placement.LocalExecutionPrerequisite = field(default_factory=lambda: placement.TokenNotRequired())

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import PurePath
 from types import MappingProxyType
 
+from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import conf
 from scripts.message.owner_role import OwnerRole
 
@@ -16,11 +17,18 @@ class StepNames:
     def shown(self, step: str) -> str:
         return self.settings.get(f"names.{step}", step)
 
+    def queue_name(self, step: str) -> str:
+        """Use the verb or its recognized display form."""
+        display = QUEUE_STEP_DISPLAY.get(step, step.replace("-", " "))
+        if step == "run":
+            return display
+        return display if " ".join(self.shown(step).split()) == display else step
+
     def prose(self, step: str) -> str:
         return self.settings.get(f"prose.{step}", self.shown(step))
 
     def for_owner(self, step: str, unit: str, role: OwnerRole, *,
-                  ci: bool = False, current_name: str = "") -> str:
+                  ci: bool = False, current_name: str = "", step_name: str = "") -> str:
         """Use the configured owner template when the owner is known."""
         fallback = current_name or self.shown(step)
         if ci:
@@ -32,7 +40,7 @@ class StepNames:
         else:
             return fallback
         template = self.settings.get(prefix + step, self.settings.get(prefix + "default"))
-        return template.format(unit=unit, step=self.shown(step)) if template is not None else fallback
+        return template.format(unit=unit, step=step_name or self.shown(step)) if template is not None else fallback
 
 
     def about(self, job: "StepJob", unit: str) -> str:
@@ -90,6 +98,41 @@ def command_program(argv: Sequence[str]) -> str:
     return "" if isinstance(program, OtherCommand) else program[0]
 
 
+
+SCRIPT_SUFFIXES = frozenset({".awk", ".bash", ".fish", ".js", ".lua", ".mjs", ".pl", ".ps1", ".py", ".rb",
+                             ".sh", ".ts", ".zsh"})
+VERIFY_VERBS = frozenset({"check", "test", "lint", "doc", "build", "example", "final", "example-test"})
+RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "taplo", "rust-analyzer",
+    "targeted-test", "merge-gate", "integrate", "test-all", "test-modules",
+    "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote"}
+QUEUE_STEP_DISPLAY = {"run": "cargo run", "test-modules": "test named"}
+SHORT_OWNER_STEPS = {"merge-gate": "merge", "targeted-test": "targeted"}
+RAW_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32})(?![0-9a-f])",
+                    re.IGNORECASE)
+IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
+def queue_identifier(text: str) -> bool:
+    """Accept a package or repository name."""
+    return bool(IDENTIFIER.fullmatch(text)) and not RAW_ID.search(text)
+
+
+def is_recorded_step(text: str) -> bool:
+    """Accept a build verb with or without a package name."""
+    verb, _, package = text.partition(" ")
+    return verb in RECORDED_VERBS and (not package or queue_identifier(package))
+
+
+def script_file(word: str) -> bool:
+    """Recognize a script path in a recorded command."""
+    return bool(re.fullmatch(r"[\w./~+-]+", word)) and PurePath(word).suffix in SCRIPT_SUFFIXES
+
+
+def command_script(argv: Sequence[str]) -> str:
+    """Return the script file argument, if the command runs one."""
+    program = _program(argv, keep_path=True)
+    return program[0] if not isinstance(program, OtherCommand) and script_file(program[0]) else ""
+
 def _option(arguments: Sequence[str], name: str) -> str:
     for index, argument in enumerate(arguments):
         if argument == name and index + 1 < len(arguments):
@@ -110,7 +153,7 @@ VALUE_OPTIONS = frozenset("XW")
 LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs", "--init-file", "--rcfile"})
 
 
-def _program(argv: Sequence[str]) -> tuple[str, Sequence[str]] | OtherCommand:
+def _program(argv: Sequence[str], *, keep_path: bool = False) -> tuple[str, Sequence[str]] | OtherCommand:
     """The script a command runs and its arguments, after a python or shell interpreter.
 
     Code from -c or standard input ("-") runs no named script, so it is OtherCommand.
@@ -119,7 +162,7 @@ def _program(argv: Sequence[str]) -> tuple[str, Sequence[str]] | OtherCommand:
     while index < len(argv):
         name = PurePath(argv[index]).name
         if not INTERPRETER.fullmatch(name):
-            return name, argv[index + 1:]
+            return (argv[index] if keep_path else name), argv[index + 1:]
         index += 1
         while index < len(argv) and argv[index].startswith("-"):
             option = argv[index]
@@ -135,7 +178,7 @@ def _program(argv: Sequence[str]) -> tuple[str, Sequence[str]] | OtherCommand:
                     return OTHER_COMMAND
                 if flag == "m":
                     module = rest or (argv[index] if index < len(argv) else "")
-                    if not module:
+                    if not module or keep_path:
                         return OTHER_COMMAND
                     return module.rsplit(".", 1)[-1] + ".py", argv[index + (0 if rest else 1):]
                 if flag in VALUE_OPTIONS:

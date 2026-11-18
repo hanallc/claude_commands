@@ -49,6 +49,7 @@ from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHol
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 from scripts.build_hold import override_guard
+from scripts.production import staff
 
 from scripts.buildlog import store
 from scripts.lib import test_phase
@@ -352,7 +353,22 @@ class ReservationRecord:
     charge_use: test_phase.TestPhaseChargeUse | test_phase.NoTestPhaseChargeUse = test_phase.NoTestPhaseChargeUse()
     run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
     place: wire.LocalPlace | wire.CloudPlace = wire.LocalPlace()
+    slot_staff: staff.StaffId | records.NoEndedStepStaff = records.NoEndedStepStaff()
     cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
+
+
+def step_staff(row: records.Waiter, host: str) -> staff.StaffId | records.NoEndedStepStaff:
+    """Resolve the fixed staff ID while the caller's step is live."""
+    try:
+        members = staff.local_snapshot()
+    except staff.StaffUnreadable:
+        return records.NoEndedStepStaff()
+    reference = row.get("session_id", "")
+    member = members.by_member_reference(reference) if reference else None
+    folder = Path(row.get("folder", ""))
+    if member is None and folder.is_absolute():
+        member = members.unit_by_worktree(host, folder) or members.by_worktree(host, folder)
+    return member.id if member is not None else records.NoEndedStepStaff()
 
 
 def reservation_row(record: ReservationRecord) -> records.Reservation:
@@ -369,6 +385,7 @@ def reservation_row(record: ReservationRecord) -> records.Reservation:
     if isinstance(record.run, wire.RunIdentity):
         row["build_run"] = _live_run(record.run)
         row["run_origin"] = records.CallerRun(row["build_run"])
+        row["slot_staff"] = record.slot_staff
     if record.repo_identity:
         row["repo_identity"] = record.repo_identity
     if record.shape:
@@ -1744,6 +1761,8 @@ class AdmissionServer:
             "repository_name": profile.repo,
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
+        if isinstance(identity.verify, records.VerifyCall):
+            row["verify"] = identity.verify
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -1962,6 +1981,9 @@ class AdmissionServer:
                 running.append(step)
                 continue
             row, step, use = next(attributed)
+            waiter = row.get("queue_waiter")
+            if waiter is not None and "verify" in waiter:
+                step = replace(step, verify=waiter["verify"])
             if row["step"] not in gate.PROGRESS_STEPS:
                 running.append(step)
                 continue
@@ -2268,7 +2290,8 @@ class AdmissionServer:
                 continue
             waiter = record.queue_waiter
             identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
-                record.step, record.worktree, waiter.get("unit", ""))
+                record.step, record.worktree, waiter.get("unit", ""),
+                verify=waiter.get("verify", records.NotVerifyCall()))
             sidecar = Path(record.sidecar)
             rows.append(wire.CloudRow(record.owner, identity, record.place, waiter["since"],
                 step_estimator.epoch(record.admitted_at), cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress(),
@@ -2373,7 +2396,9 @@ class AdmissionServer:
                 identity.folder or request.profile.worktree, 0, records.RemoteMemoryUnavailable("remote memory is unavailable"),
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
-                assignment_host=assignment.destination.host))
+                assignment_host=assignment.destination.host, verify=identity.verify,
+                mac_placement=f"{assignment.episode}/{assignment.attempt}"
+                    if assignment.destination.provider == "mac" else ""))
         if not remote:
             return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
@@ -2389,11 +2414,15 @@ class AdmissionServer:
             return
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        waiting = tuple(replace(step, verify=row["verify"]) if "verify" in row else step
+                        for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True))
+        reading = replace(reading, view=replace(reading.view, waiting=waiting))
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
-                row.get("unit", ""), route=records.waiter_route(row))
+                row.get("unit", ""), route=records.waiter_route(row),
+                verify=row.get("verify", records.NotVerifyCall()))
                 for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
@@ -2509,6 +2538,8 @@ class AdmissionServer:
                 shape, run=request.run, place=request.place, cargo_folder=cargo_folder)
             self.writes.register(record)
             if not cloud:
+                if isinstance(request.run, wire.RunIdentity):
+                    record = replace(record, slot_staff=step_staff(record.queue_waiter, self.host))
                 record = self._freeze_test_phase_need(record, config, share_percent)
             result = self.last_result
             candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
@@ -2562,6 +2593,8 @@ class AdmissionServer:
         if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
+            if isinstance(record.slot_staff, records.NoEndedStepStaff):
+                row["slot_staff"] = step_staff(record.queue_waiter, self.host)
             slot = gate.ended_step_slot(row, ended_at, self.last_usable_configuration.policy)
             if isinstance(slot, records.BetweenStepsSlot):
                 self.slots[slot.reservation] = slot
@@ -2788,7 +2821,7 @@ class AdmissionServer:
         scope = claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
             if (mac_test.scopes_overlap(claim.scope, scope)
-                    and mac_test.run_is_live(claim.record)):
+                    and mac_test.run_holds_work(claim.record)):
                 diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
                 session_id = claim.record.get("holder_session", "")
                 if session_id and session_id != claim_state.session_id(key.session):

@@ -172,6 +172,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
+| `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
+| `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
