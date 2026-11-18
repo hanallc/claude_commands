@@ -14,7 +14,7 @@ import re
 import subprocess
 from typing import Protocol, cast
 
-from scripts.aws_target import gate_box, hana_provider, hana_receiver, hana_source
+from scripts.aws_target import hana_provider, hana_receiver, hana_source, s3_presign
 from scripts.aws_target.aws_cli import AwsUnavailable
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
@@ -61,8 +61,8 @@ class AwsSourceObjects:
             if not isinstance(value, str):
                 raise hana_source.SourceRefused('SigningUnavailable: source signing credentials are invalid')
             return value
-        signing = gate_box.SigningKey(text('AccessKeyId'), text('SecretAccessKey'), text('SessionToken'))
-        return gate_box.presign('GET', self.provider.bucket + '.s3.' + self.provider.api.region + '.amazonaws.com',
+        signing = s3_presign.SigningKey(text('AccessKeyId'), text('SecretAccessKey'), text('SessionToken'))
+        return s3_presign.presign('GET', self.provider.bucket + '.s3.' + self.provider.api.region + '.amazonaws.com',
             self.key(sha256), self.provider.api.region, signing, datetime.fromtimestamp(self.clock(), UTC), self.url_seconds)
 
 

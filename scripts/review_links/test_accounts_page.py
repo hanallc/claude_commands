@@ -58,7 +58,7 @@ MENU_PROBE = '''<script>
   check(document.querySelectorAll('tr[data-move-group]').length===1 && groupRow().dataset.moveAccount==='claude1'
    && groupRow().dataset.moveGroup==='units','only the selected Claude group line takes the menu');
   check(getComputedStyle(groupRow()).cursor==='context-menu','the group line shows the menu cursor');
-  const plain=right(document.querySelector('[data-account-color="claude2"]').closest('tr').cells[1]);
+  const plain=right(document.querySelector('[data-color-key="account.claude2"]').closest('tr').cells[1]);
   check(!plain.defaultPrevented && menu.hidden,'another line keeps the browser menu');
   const opened=right(groupRow().cells[3]);
   check(opened.defaultPrevented && !menu.hidden,'a right click on the group line opens the page menu');
@@ -155,38 +155,49 @@ class AccountsPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
         _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", configuration)
-        _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\naccount.claude2=#b294bb\n", encoding="utf-8")
+        _ = (configuration / "statusline.conf").write_text("account.claude1=#af875f\naccount.claude2=#b294bb\nrole.unit-director=#d7af00\n",
+                                                            encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_board_draws_the_board_table_with_moves_and_problems(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
         _ = shutil.copyfile(Path(__file__).resolve().parents[2] / 'config/accounts.conf', config / 'accounts.conf')
-        _ = (config / 'statusline.conf').write_text('account.claude1=brown\n')
+        _ = (config / 'statusline.conf').write_text('account.claude1=brown\nrole.unit-director=yellow\nrole.worker=#c0c0c0\n')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {'CONF_DIR': str(config)})))
         reading = accounts.StatusReading((status_row("claude1"),), ("* <stale>",), (), timezone.utc, AT,
                                          upcoming_moves=("Upcoming moves:", "units → claude1"))
         markup = accounts_page.board(reading)
         table = accounts.status_board(reading)
-        heads = "".join(f'<th class="{column["align"]}">{column["heading"]}</th>' for column in table["columns"])
-        self.assertIn(f'<thead><tr>{heads}<th class="left">Color</th></tr></thead>', markup)
+        self.assertEqual([column["key"] for column in table["columns"]][1:4], ["label", "left", "roles"])
+        self.assertIn('<thead><tr><th class="left"></th><th class="left">account</th><th class="left"></th>'
+                      + '<th class="right">left</th><th class="left">role</th><th class="left"></th><th class="right">busy</th>', markup)
+        self.assertNotIn(">Color<", markup)
         self.assertEqual(markup.count('<tr class="account">'), 2)
         self.assertEqual(markup.count("<tr>"), 1)
-        self.assertIn('<td class="left">'
-                      + '<button type="button" class="color-swatch" data-account-color="claude1" '
-                      + 'data-saved-color="#af875f" style="background:#af875f" '
-                      + 'aria-label="Change claude1 color" aria-haspopup="dialog"></button></td></tr>', markup)
-        self.assertIn('<td class="left" data-account-name><span class="default bold" style="color:#af875f">claude1</span></td>', markup)
+        self.assertIn('<td class="left" data-account-name><span class="default bold" style="color:#af875f" '
+                      + 'data-color-text="account.claude1">claude1</span></td><td class="left"><button type="button" class="color-swatch" data-color-key="account.claude1" '
+                      + 'data-color-name="claude1" data-saved-color="#af875f" style="background:#af875f" '
+                      + 'aria-label="Change claude1 color" aria-haspopup="dialog"></button></td>'
+                      + '<td class="right"><span class="default">60%</span></td>', markup)
+        self.assertIn('<td class="left"><span class="default" style="color:#808000" data-color-text="role.unit-director">units</span></td>'
+                      + '<td class="left"><button type="button" class="color-swatch" data-color-key="role.unit-director" '
+                      + 'data-color-name="units" data-saved-color="#808000" style="background:#808000" '
+                      + 'aria-label="Change units color" aria-haspopup="dialog"></button></td>'
+                      + '<td class="right"><span class="default">1</span></td>', markup)
         self.assertIn('<td class="left" data-account-name><span class="default bold">total</span></td>', markup)
         self.assertIn('<td class="left"></td>', markup)
         self.assertIn('<td class="right"><span class="default">60%</span></td>', markup)
         self.assertIn('<li>units → claude1</li>', markup)
         self.assertIn('<h2>Problems</h2><ul class="problems"><li>&lt;stale&gt;</li></ul>', markup)
-        multiple_roles = replace(reading, rows=(replace(status_row("claude1"), roles=("units", "workers")),))
+        multiple_roles = replace(reading, rows=(replace(status_row("claude1"), roles=("units", "workers", "spare"),
+            role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),) * 2 + (accounts.NoRoleCount(),)),))
         markup = accounts_page.board(multiple_roles)
-        self.assertRegex(markup, r'<tr>(?:(?!</tr>).)*<td class="left"></td></tr>')
-        self.assertEqual(markup.count('class="color-swatch"'), 1)
+        self.assertEqual(markup.count('class="color-swatch"'), 3)
+        self.assertIn('data-color-key="role.worker" data-color-name="workers" data-saved-color="#c0c0c0"', markup)
+        self.assertIn('<td class="left"><span class="default">spare</span></td><td class="left"></td>', markup)
+        self.assertNotIn('data-color-name="total"', markup)
         table = accounts.status_board(multiple_roles)
-        self.assertEqual(markup.count("<td "), len(table["rows"]) * (len(table["columns"]) + 1))
+        self.assertEqual(markup.count("<td "), len(table["rows"]) * (len(table["columns"]) + 2))
 
     def test_account_labels_use_terminal_colors_and_hex_without_css_injection(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
@@ -200,11 +211,11 @@ class AccountsPageTests(unittest.TestCase):
                 with self.subTest(value=value), patch.dict(os.environ, {"CONF_DIR": temporary}):
                     _ = config.write_text(f"account.claude1={value}\n" if value else "# no account key\n")
                     markup = accounts_page.board(reading)
-                    style = f' style="color:{expected}"' if expected else ""
+                    style = f' style="color:{expected}" data-color-text="account.claude1"' if expected else ""
                     self.assertIn(f'<span class="default bold"{style}>claude1</span>', markup)
                     self.assertNotIn("position:fixed", markup)
                     self.assertNotIn("<script>", markup)
-                    self.assertEqual('aria-label="Change claude1 color"' in markup, bool(value))
+                    self.assertEqual('aria-label="Change claude1 color"' in markup, bool(expected))
                     if value == "#af875f":
                         self.assertEqual(conf.read("statusline").values()["account.claude1"], value)
                         self.assertEqual(accounts.account_color(value), accounts.AccountColor("\x1b[38;2;175;135;95m", value))
@@ -218,26 +229,31 @@ class AccountsPageTests(unittest.TestCase):
 
     def test_color_save_validates_the_request_and_uses_this_checkouts_tune(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"CONF_DIR": temporary}):
-            _ = (Path(temporary) / "statusline.conf").write_text("account.claude1=brown\nrole.units=teal\n")
-            for label, value in (("unknown", "#af875f"), ("units", "#af875f"), ("claude1", "brown"),
-                                 ("claude1", "#AF875F"), ("claude1", "#fff"), ("claude1", "#af875f\n")):
-                with self.subTest(label=label, value=value), patch.object(subprocess, "run") as run:
-                    self.assertIsInstance(accounts_page.save_color(label, value), accounts_page.Refused)
+            _ = (Path(temporary) / "statusline.conf").write_text(
+                "account.claude1=brown\nrole.units=teal\nrole.worker=white\nlevel.ok=green\n")
+            for key, value in (("account.unknown", "#af875f"), ("claude1", "#af875f"), ("role.units", "#af875f"),
+                               ("role.showrunner", "#af875f"), ("level.ok", "#af875f"), ("account.claude1", "brown"),
+                               ("account.claude1", "#AF875F"), ("account.claude1", "#fff"), ("account.claude1", "#af875f\n")):
+                with self.subTest(key=key, value=value), patch.object(subprocess, "run") as run:
+                    self.assertIsInstance(accounts_page.save_color(key, value), accounts_page.Refused)
                     run.assert_not_called()
             for status, errors, expected in ((0, "", accounts_page.Saved()),
                     (2, "first line\ntune: cannot publish\n", accounts_page.SaveFailed("tune: cannot publish")),
                     (1, "", accounts_page.SaveFailed("Tune exited 1."))):
                 with self.subTest(status=status), patch.object(subprocess, "run",
                         return_value=subprocess.CompletedProcess((), status, "", errors)) as run:
-                    self.assertEqual(accounts_page.save_color("claude1", "#af875f"), expected)
+                    self.assertEqual(accounts_page.save_color("account.claude1", "#af875f"), expected)
                     root = Path(accounts_page.__file__).resolve().parents[1]
                     run.assert_called_once_with((str(root / "lib/py"), str(root / "lib/tune.py"),
                         "statusline", "account.claude1", "#af875f", "--why",
                         "The user chose this color with the Accounts page color chooser.", "--user-words",
-                        "claude1 color set to #af875f with Save on the console Accounts page"),
+                        "account.claude1 set to #af875f with Save on the console Accounts page"),
                         capture_output=True, text=True, check=False)
+            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, "", "")) as run:
+                self.assertEqual(accounts_page.save_color("role.worker", "#123456"), accounts_page.Saved())
+                self.assertEqual(cast(tuple[str, ...], run.call_args.args[0])[2:5], ("statusline", "role.worker", "#123456"))
             with patch.object(subprocess, "run", side_effect=OSError("runner unavailable")):
-                self.assertEqual(accounts_page.save_color("claude1", "#af875f"),
+                self.assertEqual(accounts_page.save_color("account.claude1", "#af875f"),
                                  accounts_page.SaveFailed("runner unavailable"))
 
     def test_board_marks_the_selected_claude_group_lines_and_lists_the_claude_targets(self) -> None:
@@ -408,7 +424,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(state()==='Live' && line().textContent.includes('14 s ago') && line().textContent.includes('render 0.75 s'),'first timing');
   check(line().querySelector('[data-status-render]').title==='Median 0.50 s of the last 2 renders.','median hover text');
   check(timer(),'the Accounts interval');
-  const swatch=document.querySelector('[data-account-color="claude1"]');
+  const swatch=document.querySelector('[data-color-key="account.claude1"]');
   swatch.scrollIntoView({block:'nearest',inline:'nearest'});
   frameElement.style.height='560px';
   const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('#account-color-value');
@@ -421,12 +437,14 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const action=name=>popup.querySelector('[data-color-'+name+']');
   const original=label().style.color, originalSwatch=swatch.style.background;
   const row=swatch.closest('tr'), cell=swatch.closest('td');
-  check(cell===row.cells[row.cells.length-1] && row.cells[1].contains(label()),'the swatch occupies the last column');
-  check(document.querySelector('thead th:last-child').textContent==='Color','the last heading is Color');
+  const heads=[...document.querySelectorAll('thead th')].map(head=>head.textContent);
+  check(cell===row.cells[2] && row.cells[1].contains(label()) && heads[1]==='account' && heads[2]==='' && heads[3]==='left',
+   'the swatch column without a heading sits between account and left');
+  check(heads[4]==='role' && heads[5]==='' && heads[6]==='busy','the role swatch column sits between role and busy');
   check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&
    Math.abs(swatch.getBoundingClientRect().left-cell.getBoundingClientRect().left-parseFloat(getComputedStyle(cell).paddingLeft))<1,
    'the swatch aligns with the cell content on the left');
-  const other=document.querySelector('[data-account-color="claude2"]');
+  const other=document.querySelector('[data-color-key="account.claude2"]');
   const otherLabel=other.closest('tr').querySelector('[data-account-name] span'), otherColor=otherLabel.style.color;
   const normalFetch=window.fetch;let pendingRead;
   window.fetch=()=>new Promise(resolve=>pendingRead=resolve);
@@ -451,7 +469,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   swatch.scrollIntoView({block:'nearest',inline:'nearest'});dispatchEvent(new Event('scroll'));
   const aligned=popup.getBoundingClientRect();
   check(Math.abs(aligned.left-Math.max(8,Math.min(swatch.getBoundingClientRect().left,innerWidth-aligned.width-8)))<1,
-   'the popup stays beside the last-column swatch within the viewport');
+   'the popup stays beside the swatch within the viewport');
   frameElement.style.width='';dispatchEvent(new Event('resize'));
   document.documentElement.dataset.theme='light';const light=getComputedStyle(popup).backgroundColor;
   document.documentElement.dataset.theme='dark';const dark=getComputedStyle(popup).backgroundColor;
@@ -546,7 +564,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(swatch.dataset.savedColor==='#af875f','a pending POST retains the previous saved color');
   check(saves.length===1 && saves[0].path===location.pathname && saves[0].options.method==='POST','Save posts to this page');
   const form=new URLSearchParams(saves[0].options.body);
-  check(form.get('label')==='claude1' && form.get('value')==='#123456' &&
+  check(form.get('key')==='account.claude1' && form.get('value')==='#123456' && [...form.keys()].length===2 &&
    saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','Save sends the form fields');
   timer().load();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
   check(calls===0 && swatch.isConnected && state()==='Paused','a pending POST holds interval and visibility refreshes');
@@ -555,7 +573,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   picker.value='#fedcba';action('save').click();
   check(!popup.open && saves.length===2,'another account saves without waiting for the first POST');
   const otherForm=new URLSearchParams(saves[1].options.body);
-  check(otherForm.get('label')==='claude2' && otherForm.get('value')==='#fedcba','each pending POST retains its account and color');
+  check(otherForm.get('key')==='account.claude2' && otherForm.get('value')==='#fedcba','each pending POST retains its account and color');
   saves[1].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
   check(other.dataset.savedColor==='#fedcba' && otherLabel.style.color==='rgb(254, 220, 186)',
    'success stores the second account color');
@@ -597,6 +615,28 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   saves[6].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
   check(swatch.dataset.savedColor==='#abcdef','success stores the chosen color before refresh');
   check(!popup.open && calls===1,'a successful save closes the popup and refreshes');
+  const roles=[...document.querySelectorAll('[data-color-key="role.unit-director"]')];
+  const roleWords=[...document.querySelectorAll('[data-color-text="role.unit-director"]')];
+  check(roles.length===2 && roleWords.length===2 && roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)'),
+   'each units row shows the unit color swatch and word');
+  roles[1].click();
+  check(popup.open && picker.value==='#d7af00' && popup.querySelector('#color-title').textContent==='Change units color',
+   'a role swatch opens the picker with the role color');
+  pick('#102030');action('try').click();
+  check(roles.every(button=>button.style.background==='rgb(16, 32, 48)') &&
+   roleWords.every(word=>word.style.color==='rgb(16, 32, 48)') &&
+   document.querySelector('[data-color-key="account.claude1"]').style.background==='rgb(175, 135, 95)',
+   'Try paints every units swatch and word and keeps the account colors');
+  action('cancel').click();
+  check(roles.every(button=>button.style.background==='rgb(215, 175, 0)') &&
+   roleWords.every(word=>word.style.color==='rgb(215, 175, 0)'),'Cancel restores every units color');
+  roles[0].click();pick('#405060');action('save').click();
+  const roleForm=new URLSearchParams(saves[7].options.body);
+  check(roleForm.get('key')==='role.unit-director' && roleForm.get('value')==='#405060','Save posts the role key');
+  saves[7].resolve({ok:false,json:async()=>({reason:'role save failed'})});await flush();
+  check(roles.every(button=>button.dataset.savedColor==='#d7af00' && button.style.background==='rgb(215, 175, 0)') &&
+   roleWords.every(word=>word.style.color==='rgb(215, 175, 0)') && line().textContent.includes('units: role save failed'),
+   'a failed role save restores every units color and names the role');
   window.fetch=pageFetch;calls=0;
   timer().load();await flush();
   check(calls===1,'the interval loads once');

@@ -4355,6 +4355,8 @@ class BoardSpan(TypedDict):
     tone: BoardTone
     kind: Literal["fact", "bold"]
     color: NotRequired[str]
+    # The statusline.conf key of a valid color; the console Accounts page offers a swatch for it.
+    color_key: NotRequired[str]
 
 
 class BoardColumn(TypedDict):
@@ -4548,11 +4550,28 @@ def account_color(value: str) -> AccountColor | NoAccountColor:
     return NoAccountColor()
 
 
-def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
-    span = _span(label, kind="bold")
-    if (key := f"account.{label}") in colors:
+# The statusline.conf key that colors each account role group's labels.
+ROLE_COLOR_KEYS = {"units": "role.unit-director", "showrunners": "role.showrunner", "workers": "role.worker"}
+
+
+def _colored_span(text: str, key: str, colors: dict[str, str], kind: Literal["fact", "bold"] = "fact") -> BoardSpan:
+    span = _span(text, kind=kind)
+    if key in colors:
         span["color"] = colors[key]
+        if isinstance(account_color(colors[key]), AccountColor):
+            span["color_key"] = key
     return span
+
+
+def _account_label(label: str, colors: dict[str, str]) -> BoardSpan:
+    return _colored_span(label, f"account.{label}", colors, kind="bold")
+
+
+def _role_spans(role: str, selected: bool, colors: dict[str, str]) -> list[BoardSpan]:
+    if not role:
+        return [_span("")]
+    key = ROLE_COLOR_KEYS.get(role)
+    return [_colored_span(role, key, colors) if key else _span(role), *([_span(" ✓")] if selected else [])]
 
 
 def _read_ok(row: StatusRow, reading: StatusReading, *, account_config: conf.ConfigRead) -> bool:
@@ -4589,20 +4608,19 @@ def _account_board_rows(row: StatusRow, reading: StatusReading, *, account_confi
     balance = ("" if isinstance(row.credits, StatusUnavailable) else "unlimited" if row.credits == "unlimited"
                else f"{row.credits:,.0f}")
     dot: BoardTone = "success" if _read_ok(row, reading, account_config=account_config) else "error"
-    roles = [f"{role} ✓" if role in row.selected_roles else role for role in row.roles] or [""]
+    roles = list(row.roles) or [""]
     lines: list[BoardRow] = []
     for index, role in enumerate(roles):
         first = index == 0
         counts = _count_cells(row.role_counts[index] if index < len(row.role_counts) else None)
         cells = {"dot": [_span("●", dot)] if first else [], "label": [_account_label(row.label, colors)] if first else [],
-                 "left": [_span(left, tone)] if first else [], "roles": [_span(role)],
+                 "left": [_span(left, tone)] if first else [], "roles": _role_spans(role, role in row.selected_roles, colors),
                  **{key: [_span(value)] for key, value in counts.items()},
                  "resets": [_span(reset)] if first else [], "credits": [_span(balance)] if first else [],
                  "enabled": [_span("yes" if row.use_credits else "")] if first else []}
         line = BoardRow(cells=cells)
-        group = role.removesuffix(" ✓")
-        if row.tool == "claude" and group in row.selected_roles and (group == "units" or group == "showrunners"):
-            line["group"] = BoardGroup(account=row.label, group=group)
+        if row.tool == "claude" and role in row.selected_roles and (role == "units" or role == "showrunners"):
+            line["group"] = BoardGroup(account=row.label, group=role)
         lines.append(line)
     return lines
 

@@ -418,10 +418,12 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
 The `board` is `accounts.status_board()`: the table the console Accounts page draws.
 `config/statusline.conf` holds each account color under `account.<label>`.
+`ROLE_COLOR_KEYS` names the role color of each role group: units `role.unit-director`, showrunners `role.showrunner`, workers `role.worker`.
 The value accepts a color name or a six-digit hex color.
-Configured accounts have a color swatch on the console Accounts page.
+A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.
+Configured accounts and role groups have a color swatch on the console Accounts page.
 The swatch opens a color chooser with Try, Save, and Cancel.
-Try changes the label and swatch locally without a request.
+Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
 The page pauses refresh while the chooser is open.

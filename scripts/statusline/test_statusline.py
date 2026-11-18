@@ -45,8 +45,12 @@ ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 def shipped_account_label(label: str) -> str:
     """Derive the expected account escape from the shipped configuration."""
+    return shipped_label(f"account.{label}", label)
+
+
+def shipped_label(key: str, label: str) -> str:
+    """Derive the expected escape for one configured key from the shipped configuration."""
     colors = conf.read(SHIPPED_COLORS).values()
-    key = f"account.{label}"
     if key not in colors:
         return label
     color = colors[key]
@@ -181,11 +185,11 @@ class ColorTests(unittest.TestCase):
                                      staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id, unit_type=staff.UnitDetails("direct"))), STAFF_ID=UNIT.id)
             self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables | cables")
 
-    def test_shipped_role_colors_and_plain_worker_and_unassigned(self) -> None:
+    def test_shipped_role_colors_and_plain_unassigned(self) -> None:
         cases = (
             ("\x1b[38;5;141mshow showrunner\x1b[0m", OWNER.id),
             ("\x1b[33mtrunk unit for show\x1b[0m", UNIT.id),
-            ("worker", WORKER.id),
+            (shipped_label("role.worker", "worker"), WORKER.id),
             ("unassigned", ""),
         )
         for expected, identity in cases:
@@ -721,7 +725,7 @@ class RoleTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 line = self.command_lines({"session_id": WORKER.id}, shell=shell, STAFF_ID=OWNER.id,
                                           SHOWRUNNER_UNIT="wrong", UNIT_TEAM_ROLE="director")[0]
-                self.assertEqual(line, "worker | ~")
+                self.assertEqual(ANSI.sub("", line), "worker | ~")
                 self.assertEqual(self.command_lines({"session_id": OWNER.id}, shell=shell, STAFF_ID=WORKER.id,
                                                     SHOWRUNNER_UNIT="wrong")[0].split(" | ")[0],
                                  "\x1b[38;5;141mshow showrunner\x1b[0m")
