@@ -16,7 +16,7 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.buildlog import treekey
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap, wait_for_marker_exit
 from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
@@ -58,13 +58,32 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
                                check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
 
     @contextmanager
-    def occupy_doc_slot(self) -> Generator[None]:
+    def occupy_doc_slot(self, wait_policy: build_slots.SlotWaitPolicy = build_slots.SlotWaitPolicy.QUEUE) -> Generator[Path]:
         admission = caller_admission(self, self.root, self.environment)
         settings = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
         _ = write_config_fixture(settings, f"# whole: 1..\nslots.{admission.server.host}.workspace.max=1\n")
         with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
-                self.repo, "HEAD", showrunner="builds", unit="doc-test", work="competing copy", purpose="doc"):
-            yield
+                self.repo, "HEAD", showrunner="builds", unit="doc-test", work="competing copy", purpose="doc",
+                wait_policy=wait_policy) as slot:
+            yield slot.path
+
+    def use_real_scope(self) -> AdmissionFixture:
+        write_real_scope_launcher(self.root / "bin")
+        admission = caller_admission(self, self.root, self.environment)
+        use_fixture_scope_readings(self, self.root, admission)
+        return admission
+
+    def install_scope_interpreter(self, supervisor_code: str) -> None:
+        wrapper = self.root / "scope-interpreter"
+        self.executable(wrapper, '''import os
+import sys
+arguments = sys.argv[1:]
+script_arguments = arguments[1:] if arguments[0] == "-P" else arguments
+script = script_arguments[0]
+if not script.endswith("/verify_scoped_step.py"):
+    os.execv(sys.executable, [sys.executable, *arguments])
+''' + supervisor_code)
+        self.environment["CLAUDE_PYTHON"] = str(wrapper)
 
     def test_doc_finishes_while_another_caller_holds_the_cargo_token(self) -> None:
         with self.hold_cargo_token():
@@ -74,9 +93,7 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
             self.assertEqual(len(self.pass_records()), 1)
 
     def assert_doc_retains_checkout_until_scope_empties(self, *, interrupt: bool) -> None:
-        write_real_scope_launcher(self.root / "bin")
-        admission = caller_admission(self, self.root, self.environment)
-        use_fixture_scope_readings(self, self.root, admission)
+        admission = self.use_real_scope()
         scope_file = self.root / "doc-scope"
         child_pid = self.root / "doc-descendant"
         pending_pid = child_pid.with_suffix(".new")
@@ -118,18 +135,80 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
             _ = admission.run_pass()
             self.assertTrue(admission.caller_reservations())
             self.assertFalse(self.pass_records())
+            with self.assertRaises(build_slots.SlotsFull), self.occupy_doc_slot(build_slots.SlotWaitPolicy.REFUSE):
+                self.fail("another caller took the checkout while the scope was populated")
         finally:
             kill_file.chmod(0o200)
             _ = kill_file.write_text("1\n")
             self.assertEqual(wait_for_marker_exit(marker, TEST_HANG_GUARD_SECS), set())
             _ = admission.run_pass()
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        with self.occupy_doc_slot(build_slots.SlotWaitPolicy.REFUSE) as next_checkout:
+            self.assertEqual(next_checkout, checkout)
 
     def test_doc_scope_stop_failure_retains_checkout_after_cargo_exits(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(interrupt=False)
 
     def test_doc_scope_stop_failure_retains_checkout_after_interrupt(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(interrupt=True)
+
+    def assert_doc_refuses_without_holder(self, failure: str) -> None:
+        self.install_scope_interpreter(f'''
+import runpy
+import subprocess
+from unittest.mock import patch
+
+start = subprocess.Popen
+def start_process(arguments, *args, **kwargs):
+    if "--hold-doc-checkout" in arguments:
+        {failure}
+    return start(arguments, *args, **kwargs)
+
+with patch.object(subprocess, "Popen", start_process):
+    sys.argv = script_arguments
+    runpy.run_path(script, run_name="__main__")
+''')
+        result = self.verify()
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 125, output)
+        self.assertIn("cannot hold the doc checkout before launch", output)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.pass_records())
+        with self.occupy_doc_slot(build_slots.SlotWaitPolicy.REFUSE):
+            pass
+
+    def test_doc_refuses_when_lease_holder_cannot_start(self) -> None:
+        self.assert_doc_refuses_without_holder('raise OSError("fixture cannot start the lease holder")')
+
+    def test_doc_refuses_when_lease_holder_does_not_confirm(self) -> None:
+        self.assert_doc_refuses_without_holder('arguments = [sys.executable, "-c", "raise SystemExit(0)"]')
+
+    def test_doc_scope_command_does_not_inherit_checkout_pipe(self) -> None:
+        _ = self.use_real_scope()
+        lease_pipe = self.root / "lease-pipe"
+        cargo_pipes = self.root / "cargo-pipes"
+        self.install_scope_interpreter(f'''
+from pathlib import Path
+descriptor = os.environ["VERIFY_DOC_LEASE_FD"]
+Path({str(lease_pipe)!r}).write_text(os.readlink(f"/proc/self/fd/{{descriptor}}"))
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+''')
+        self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
+            '    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))', f'''
+    targets = []
+    for descriptor in Path("/proc/self/fd").iterdir():
+        try:
+            targets.append(os.readlink(descriptor))
+        except FileNotFoundError:
+            pass
+    Path({str(cargo_pipes)!r}).write_text("\\n".join(targets))
+    raise SystemExit(0)
+'''))
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        pipe = lease_pipe.read_text()
+        self.assertTrue(pipe.startswith("pipe:["))
+        self.assertNotIn(pipe, cargo_pipes.read_text().splitlines())
 
     def test_doc_refuses_a_tree_staged_during_the_copy_slot_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)

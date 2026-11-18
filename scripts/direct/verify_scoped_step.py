@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from dataclasses import dataclass
 from enum import Enum, auto
 import errno
 import fcntl
@@ -22,6 +23,21 @@ from scripts.build_queue.admission_records import process_start_time
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
+DOC_HOLDER_START_TIMEOUT_SECONDS = 10
+DOC_HOLDER_READY = b"1"
+
+
+@dataclass(frozen=True)
+class OwnedDocCheckoutLease:
+    pipe_writer: int
+
+
+class NoOwnedDocCheckoutLease(Enum):
+    NOT_REQUIRED = auto()
+
+
+class UnboundedScopeWait(Enum):
+    UNTIL_EMPTY = auto()
 
 
 # The scope shell publishes its path before this check. A dead owner permits no start.
@@ -32,8 +48,8 @@ live_owner() {
     [ "$2" != Z ] && [ "$2" != X ] && [ "$1" = "${21}" ]
 }
 read -r scope < "$1" && [ "${scope##*/}" = "$2" ] && [ -r "$scope/cgroup.events" ] || exit 125
-live_owner "$3" "$4" && live_owner "$5" "$6" || exit 125
-shift 6
+live_owner "$3" "$4" && live_owner "$5" "$6" && live_owner "$7" "$8" || exit 125
+shift 8
 exec "$@"
 '''
 
@@ -86,10 +102,10 @@ def open_scope_events(scope: Path) -> int | None:
         return None
 
 
-def wait_for_empty_scope(scope: Path, events: int, *, timeout: int | None) -> None:
+def wait_for_empty_scope(scope: Path, events: int, *, timeout: int | UnboundedScopeWait) -> None:
     ready = select.poll()
     ready.register(events, select.POLLPRI | select.POLLERR)
-    deadline = None if timeout is None else time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if isinstance(timeout, int) else None
     while scope_populated(events):
         milliseconds = None
         if deadline is not None:
@@ -119,15 +135,23 @@ def drain_scope(scope: Path) -> None:
         os.close(events)
 
 
-def hold_doc_checkout(scope: Path) -> None:
-    """Keep the inherited lease open until the scope is empty."""
+def hold_doc_checkout(lease: OwnedDocCheckoutLease, supervisor: int, sidecar: Path, unit: str) -> None:
+    """Keep the lease until the supervisor exits and the scope empties."""
+    _ = os.fstat(lease.pipe_writer)
+    with ExitStack() as cleanup:
+        supervisor_exit = open_pidfd(supervisor, cleanup)
+        _ = os.write(sys.stdout.fileno(), DOC_HOLDER_READY)
+        _ = select.select([supervisor_exit], [], [])
     while True:
         try:
+            scope = published_scope(sidecar, unit)
+            if isinstance(scope, ScopePublication):
+                return
             events = open_scope_events(scope)
             if events is None:
                 return
             try:
-                wait_for_empty_scope(scope, events, timeout=None)
+                wait_for_empty_scope(scope, events, timeout=UnboundedScopeWait.UNTIL_EMPTY)
             finally:
                 os.close(events)
             return
@@ -136,11 +160,30 @@ def hold_doc_checkout(scope: Path) -> None:
             time.sleep(1)
 
 
+def start_doc_checkout_holder(lease: OwnedDocCheckoutLease, sidecar: Path, unit: str) -> None:
+    holder = subprocess.Popen(
+        [sys.executable, __file__, "--hold-doc-checkout", str(lease.pipe_writer), str(os.getpid()),
+         str(sidecar), unit],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        pass_fds=(lease.pipe_writer,), start_new_session=True,
+    )
+    assert holder.stdout is not None
+    with holder.stdout as ready:
+        readable, _, _ = select.select([ready], [], [], DOC_HOLDER_START_TIMEOUT_SECONDS)
+        if readable and os.read(ready.fileno(), len(DOC_HOLDER_READY)) == DOC_HOLDER_READY:
+            return
+    holder.kill()
+    _ = holder.wait(timeout=DOC_HOLDER_START_TIMEOUT_SECONDS)
+    raise RuntimeError("the doc checkout lease holder did not confirm ownership")
+
+
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
-                    scope_shell: str, command: list[str], doc_lease: tuple[int, ...]) -> int:
+                    scope_shell: str, command: list[str],
+                    doc_lease: OwnedDocCheckoutLease | NoOwnedDocCheckoutLease) -> int:
     # The supervisor and the scope survive the exit of the step shell.
     os.setpgid(0, 0)
-    unit = f"verify-step-{os.getpid()}.scope"
+    supervisor = os.getpid()
+    unit = f"verify-step-{supervisor}.scope"
     sidecar = Path(peak + ".cgroup")
     with release_state.open("r+b", buffering=0) as release, ExitStack() as cleanup:
         fcntl.flock(release, fcntl.LOCK_EX)
@@ -148,16 +191,22 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             return 125
         caller_start = process_start_time(caller)
         leader_start = process_start_time(leader)
-        if caller_start is None or leader_start is None:
+        supervisor_start = process_start_time(supervisor)
+        if caller_start is None or leader_start is None or supervisor_start is None:
             return 125
         owners = select.poll()
         owners.register(open_pidfd(caller, cleanup), select.POLLIN)
         owners.register(open_pidfd(leader, cleanup), select.POLLIN)
         if owners.poll(0):
             return 125
+        if isinstance(doc_lease, OwnedDocCheckoutLease):
+            try:
+                start_doc_checkout_holder(doc_lease, sidecar, unit)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                print(f"verify.sh: cannot hold the doc checkout before launch: {error}", file=sys.stderr)
+                return 125
         # Keep this state if the scope cannot be proved empty.
         _ = release.write(b"scope may be populated\n")
-        scope: Path | ScopePublication = ScopePublication.UNPUBLISHED
         try:
             process = subprocess.Popen(
                 ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
@@ -165,8 +214,8 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                  "--",
                  "/bin/sh", "-c", 'exec 3>&1; ' + scope_shell, peak, "/bin/sh", "-c", CHECK_SCOPE_OWNER,
                  "verify-scope-owner", str(sidecar), unit, str(caller), caller_start, str(leader), leader_start,
-                 *command],
-                stderr=subprocess.DEVNULL, process_group=0, pass_fds=doc_lease,
+                 str(supervisor), supervisor_start, *command],
+                stderr=subprocess.DEVNULL, process_group=0,
             )
             try:
                 owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
@@ -191,11 +240,6 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                 _ = release.seek(0)
                 _ = release.write(f"cannot finish the local build scope: {error}\n".encode())
                 _ = release.truncate()
-                if doc_lease and isinstance(scope, Path):
-                    # A surviving process may have closed its copy of the lease.
-                    _ = subprocess.Popen([sys.executable, __file__, "--hold-doc-checkout", str(scope)],
-                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                         pass_fds=doc_lease, start_new_session=True)
             return 125
     if not sidecar.is_file():
         print("verify.sh: the local step did not enter its build scope", file=sys.stderr)
@@ -204,13 +248,14 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) == 2 and argv[0] == "--hold-doc-checkout":
-        hold_doc_checkout(Path(argv[1]))
+    if len(argv) == 5 and argv[0] == "--hold-doc-checkout":
+        _, lease_writer, supervisor, sidecar, unit = argv
+        hold_doc_checkout(OwnedDocCheckoutLease(int(lease_writer)), int(supervisor), Path(sidecar), unit)
         return 0
     caller, leader, release_state, peak, scope_shell, *command = argv
     try:
         lease = os.environ.pop("VERIFY_DOC_LEASE_FD", "")
-        doc_lease = (int(lease),) if lease else ()
+        doc_lease = OwnedDocCheckoutLease(int(lease)) if lease else NoOwnedDocCheckoutLease.NOT_REQUIRED
         return run_scoped_step(int(caller), int(leader), Path(release_state), peak, scope_shell, command, doc_lease)
     except (OSError, ValueError) as error:
         print(f"verify.sh: cannot finish the local build scope ({error})", file=sys.stderr)

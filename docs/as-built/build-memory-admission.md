@@ -257,7 +257,9 @@ Cargo writes to a file. A separate reader sends the file contents to the step lo
 The supervisor can return a shutdown error while a process still has the file open.
 Verify closes the launch before it releases or cancels the grant.
 If shutdown fails, verify reports the error and keeps the reservation for the service to reclaim.
-For a local doc step, a separate process holds the checkout lease until the scope empties.
+Before local Cargo starts, a separate process confirms that it holds the doc checkout lease.
+It keeps the lease until the supervisor exits and the scope empties.
+Verify gives the lease descriptor to the holder only.
 Verify returns status 125 for that error even if a Mac copy passes.
 After a local build, verify reports the binary from the pinned target folder.
 Remote candidates use their target slots.
