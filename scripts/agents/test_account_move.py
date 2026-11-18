@@ -276,17 +276,17 @@ class AccountMoveTests(ShutdownTestCase):
         members = [replace(self.current_listing()[0], session_id="first", kind="showrunner"),
                    replace(self.current_listing()[0], session_id="second", kind="showrunner", login="default@example.invalid", config_dir=self.root / ".claude2"),
                    replace(self.current_listing()[0], session_id="already", kind="showrunner", login="target@example.invalid", config_dir=self.root / ".claude3")]
-        producer = accounts.LiveGroupMember("producer", "producer", "showrunners", self.root / ".claude2")
+        producer = accounts.LiveGroupMember("producer", "producer", "producers", self.root / ".claude2")
         with (patch.object(inventory, "listing", return_value=members),
-              patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": [*members, producer]}),
+              patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": members, "producers": [producer]}),
               patch.object(inventory, "unregistered_showrunners", return_value=[])):
             result = accounts.move_group("showrunners", "claude3", why="manual group move")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
-        self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second", "producer")])
-        self.assertEqual(self.moves.batches, [["first", "second", "producer"]])
+        self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second")])
+        self.assertEqual(self.moves.batches, [["first", "second"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
-        self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 3)
+        self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)
 
         from scripts.production import staff
         from scripts.agents import remote
@@ -310,7 +310,7 @@ class AccountMoveTests(ShutdownTestCase):
                     self.moves.failures[identity] = "live process account is unreadable"
                 family = "codex:gpt-test:high" if state == "control codex" else "claude:opus:max"
                 registry = write_registry(self.root / "producer-models.conf", {"producers": {row.name: family}})
-                live = [accounts.LiveGroupMember(identity, row.name, "showrunners", self.root / ".claude1")] if state == "interrupted" else []
+                live = [accounts.LiveGroupMember(identity, row.name, "producers", self.root / ".claude1")] if state == "interrupted" else []
                 move = self.moves.move
                 def start(session: str, target: str, *, why: str) -> stop_resume.MoveResult:
                     nonlocal row
@@ -326,18 +326,18 @@ class AccountMoveTests(ShutdownTestCase):
                           pid=998071, sessionId=identity, name=row.name, messagingSocketPath="", updatedAt=1,
                           tmux="", formerNames=[])] if state == "unreadable account" else []),
                       patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}),
-                      patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": live})):
+                      patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": [], "producers": live})):
                     if state in ("interrupted", "early exit after home write"):
                         if state == "interrupted":
                             self.moves.failures[identity] = "resume pending"
-                        first = accounts.move_group("showrunners", "claude3", why="retry")
+                        first = accounts.move_group("producers", "claude3", why="retry")
                         self.assertIsInstance(first, accounts.GroupMoveStartFailed)
-                        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
+                        self.assertEqual(accounts.group_accounts().get("producers"), "claude3")
                         if state == "early exit after home write":
                             self.assertEqual(row.home, staff.SessionHome(self.root / ".claude3"))
                         self.moves.failures.clear()
                         live.clear()
-                    retry = accounts.move_group("showrunners", "claude3", why="retry")
+                    retry = accounts.move_group("producers", "claude3", why="retry")
                 if state == "unreadable account":
                     self.assertIsInstance(retry, accounts.GroupMoveStartFailed)
                     assert isinstance(retry, accounts.GroupMoveStartFailed)

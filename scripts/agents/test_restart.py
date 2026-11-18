@@ -1907,7 +1907,7 @@ class RestartTests(RestartTestCase):
                 self.assertEqual(resumed[resumed.index("--model") + 1], expected)
                 self.assertEqual(entry["model"], saved_model)
 
-    def test_start_row_without_a_role_uses_units_unless_the_target_is_explicit(self) -> None:
+    def test_start_row_uses_the_producer_account_unless_the_target_is_explicit(self) -> None:
         self.running.clear()
         row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
         source, target = self.root / ".claude3", self.root / ".claude2"
@@ -1936,7 +1936,7 @@ class RestartTests(RestartTestCase):
                 if requested:
                     role.assert_not_called()
                 else:
-                    role.assert_called_once_with("showrunner")
+                    role.assert_called_once_with("producer")
 
     def test_a_claude_producer_starts_and_resumes_with_remote_control(self) -> None:
         row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())

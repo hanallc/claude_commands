@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from collections.abc import Generator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -52,6 +52,32 @@ class NextMovesTests(unittest.TestCase):
         self.assertNotIn('"else"', document)
         self.assertEqual(next_moves.decode_next_moves(document), (legacy,))
         self.assertEqual(legacy.fallback_targets, ())
+
+    def test_producers_have_an_independent_next_move_list(self) -> None:
+        runner = next_moves.add_next_move("showrunners", 1, "claude2")
+        producer = next_moves.add_next_move("producers", 2, "claude3")
+        self.assertEqual(next_moves.read_next_moves(), (runner, producer))
+        self.assertIn("producers 1: at 2% → claude3", next_moves.list_next_moves())
+        next_moves.remove_next_move("producers", next_moves.FIRST_GROUP_POSITION)
+        self.assertEqual(next_moves.read_next_moves(), (runner,))
+
+    def test_unknown_groups_keep_known_moves_readable_and_survive_an_edit(self) -> None:
+        unit = next_moves.ClaudeGroupMove("unit", "units", 1, 0, "claude2", NOW)
+        runner = next_moves.ClaudeGroupMove("runner", "showrunners", 1, 0, "claude2", NOW)
+        future = {"id": "future", "group": "future-role", "hold_mode": "future-mode", "to": "future-account"}
+        path = next_moves.next_moves_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        known = cast(list[dict[str, object]], json.loads(next_moves.encode_next_moves((unit, runner))))
+        _ = path.write_text(json.dumps([known[0], future, known[1]]))
+
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(next_moves.read_next_moves(), (unit, runner))
+        self.assertEqual(errors.getvalue().splitlines(), ["next: anomaly: skipped entries for unknown groups 'future-role'"])
+
+        with redirect_stderr(io.StringIO()):
+            next_moves.remove_next_move("units", next_moves.FIRST_GROUP_POSITION)
+            self.assertEqual(next_moves.read_next_moves(), (runner,))
+        self.assertIn(future, cast(list[dict[str, object]], json.loads(path.read_text())))
 
     def test_workers_keep_their_existing_target_form(self) -> None:
         with self.assertRaisesRegex(next_moves.NextMoveError, "workers entries cannot use --else"):

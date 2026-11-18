@@ -364,6 +364,31 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(self.files(self.server_home), remote_before)
         self.assertFalse(role_map.role_map_cache_file().exists())
 
+    def test_producer_account_falls_back_until_the_group_has_a_selection(self) -> None:
+        from scripts.agents import member_account
+        from scripts.production import staff
+
+        self.seed(self.home, groups={"units": "claude3", "showrunners": "claude1"}, workers="codex3")
+        row = staff.StaffRow(staff.StaffId("fixture-producer"), "producer", "fixture-producer", staff.StaffRoot(),
+                             current_session=staff.StaffId("fixture-producer-session"))
+        runner = accounts.NamedAccount("claude1", accounts.account_dir("claude1"))
+        producer = accounts.NamedAccount("claude3", accounts.account_dir("claude3"))
+        with (patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(accounts, "_workers_home", return_value=self.home / ".codex3")):
+            self.assertNotIn("producers", role_map.read_role_map().groups)
+            self.assertEqual(member_account.producer_account("claude"), runner)
+            self.assertEqual(member_account.resume_account("claude", row), runner)
+            _ = accounts.set_group_account("producers", "claude3", why="fixture")
+            selected = role_map.read_role_map()
+            self.assertEqual(accounts.group_accounts(),
+                             {"units": "claude3", "showrunners": "claude1", "producers": "claude3"})
+            self.assertEqual(json.loads(accounts.groups_file().read_text()), selected.groups)
+            self.assertEqual(member_account.producer_account("claude"), producer)
+            self.assertEqual(member_account.resume_account("claude", row), producer)
+            workers = accounts.role_account("workers")
+            self.assertEqual(member_account.producer_account("codex"), workers)
+            self.assertEqual(member_account.resume_account("codex", row), workers)
+
     def test_unreadable_login_home_keeps_reads_and_writes_in_the_process_home(self) -> None:
         self.seed(self.home, groups={"units": "claude3"}, workers="codex3")
         change = role_map.RoleMapChange("units", "claude2", "isolated selection",
@@ -654,7 +679,7 @@ class RoleMapTests(unittest.TestCase):
         document = cast(dict[str, object], json.loads(output))
         rows = cast(list[dict[str, object]], document["accounts"])
         selected = next(row for row in rows if row["label"] == "claude2")
-        self.assertEqual(selected["roles"], ["units", "showrunners"])
+        self.assertEqual(selected["roles"], ["units", "showrunners", "producers"])
         self.assertIn("codex1: not set up; no folder holds this account; affected roles: workers; run accounts.py setup codex1",
                       cast(list[str], document["problems"]))
         self.assertEqual(self.files(self.home), before)
