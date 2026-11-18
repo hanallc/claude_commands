@@ -172,13 +172,35 @@ class ClientTests(unittest.TestCase):
             (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
             (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
             (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
+            (3, "first · nextest", "behind #2 · second · nextest · compiler", ""),
         ):
             with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
                 waiting = replace(WAIT, position=position, head=label,
                     snapshot=replace(WAIT.snapshot, head_need=int(12.3 * GIB), head_label=label))
+                if position == 3:
+                    fixture.hold_starts()
+                    first = fixture.request(need=GIB, since=fixture.clock.now() - 2)
+                    _ = fixture.server.handle_request(replace(first, identity=replace(first.identity, name="first")))
+                    nextest = fixture.request(need=18 * GIB, since=fixture.clock.now() - 1)
+                    _ = fixture.server.handle_request(replace(nextest,
+                        identity=replace(nextest.identity, name="second", unit="compiler")))
+                    follower = fixture.request(need=GIB)
+                    _ = fixture.server.handle_request(follower)
+                    fixture.free(15 * GIB)
+                    _ = fixture.run_pass()
+                    self.assertIn(first.episode, fixture.server.reservations)
+                    reply = fixture.server.waiters[follower.episode].last_reply
+                    assert isinstance(reply, wire.Wait)
+                    received = wire.parse_reply(wire.encode_reply(reply))
+                    assert isinstance(received, wire.Wait)
+                    waiting = received
+                    self.assertEqual(waiting.position, position)
                 with mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as output:
                     client.WaitOutput(local_reason=reason)(waiting)
                 self.assertIn(expected, output.getvalue())
+                if position == 3:
+                    self.assertNotIn("head first", output.getvalue())
+                    self.assertNotIn("queue head", output.getvalue())
                 if reason:
                     self.assertIn(f"runs on natedev: {reason}", output.getvalue())
                 else:
