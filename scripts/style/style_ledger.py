@@ -5530,8 +5530,18 @@ class Ledger:
         """Judging-ticket completion for merge checks; use finding_anchor to read source coordinates."""
         return self._judged_from(self._judging_ticket(finding.ticket))
 
+    def _finding_history(self, finding: HeldFinding) -> FindingSourceHistory:
+        """Reload a history when another finding's read clears the site rows."""
+        identity = finding.finding_id
+        if identity not in self._finding_histories:
+            self._load_site_rows((finding,))
+        try:
+            return self._finding_histories[identity]
+        except KeyError:
+            raise LedgerError(f"unknown held finding {identity}") from None
+
     def _anchor_candidates(self, finding: HeldFinding) -> tuple[str, ...]:
-        history = self._finding_histories[finding.finding_id]
+        history = self._finding_history(finding)
         candidates = ((finding.follow.commit,) if isinstance(finding.follow, FollowedDeclaration)
                       else (history.anchor_commit,) if history.anchor_commit else history.judging[0] if history.judging else ())
         return tuple(dict.fromkeys(resolved.commit for candidate in candidates if candidate
@@ -5545,7 +5555,7 @@ class Ledger:
         return self._finding_anchors[finding]
 
     def _prove_finding_anchor(self, finding: HeldFinding) -> FindingAnchor | NeedsJudgment:
-        history = self._finding_histories[finding.finding_id]
+        history = self._finding_history(finding)
         candidates = self._anchor_candidates(finding)
         if isinstance(finding.follow, FollowedDeclaration) or history.anchor_commit:
             if not candidates:
@@ -7308,7 +7318,7 @@ class Ledger:
             # Collect both legacy candidates before proving any anchor, so all source reads share one batch.
             candidates = self._anchor_candidates(finding)
             trees = (*(self._tip(commit) for commit in candidates), tip)
-            untracked = not candidates and not self._finding_histories[finding.finding_id].judging
+            untracked = not candidates and not self._finding_history(finding).judging
             for tree in trees:
                 blob = tree.blobs.get(finding.path, "")
                 if blob:
@@ -7452,7 +7462,7 @@ class Ledger:
         # this legacy finding has no matching cell row.
         site_row = Judgment(finding.rule_blob, "", read, "held", CellInputScope.FILE, DeclaredInputScope.FILE)
         eligible = self._rows_after_removals((site_row, *rows), tip.commit)
-        history = self._finding_histories[finding.finding_id]
+        history = self._finding_history(finding)
         # Following changes the coordinate, never the original judgment's ancestry or removal barrier.
         original_anchor = history.anchor_commit or (anchor.commit if isinstance(finding.follow, NotFollowed) else "")
         original = self._judged_from(((original_anchor, ""),)) if original_anchor else self._judged_from(history.judging)
@@ -7506,7 +7516,7 @@ class Ledger:
         self._load_site_rows((finding,))
         fields = (finding.rule, finding.rule_blob, finding.path, finding.line, finding.text,
                   finding.kind, finding.before, finding.after, finding.ticket,
-                  asdict(finding.follow), asdict(self._finding_histories[finding.finding_id]))
+                  asdict(finding.follow), asdict(self._finding_history(finding)))
         return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
     def rename_judgment_site(self, finding: HeldFinding, at: str) -> RenameJudgmentSite | NeedsJudgment:
@@ -7964,7 +7974,7 @@ class Ledger:
             read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else judged
             before_path = finding.follow.from_path if isinstance(finding.follow, FollowedDeclaration) else finding.path
             before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
-            history = self._finding_histories[finding.finding_id]
+            history = self._finding_history(finding)
             # The preceding coordinate belongs to the preceding follow, not the first judgment.
             previous = (history.previous_site_commit or judged.commit) if isinstance(finding.follow, FollowedDeclaration) else history.anchor_commit or judged.commit
             anchor = FindingAnchor(previous, before_path, before_line)
@@ -8157,7 +8167,7 @@ class Ledger:
                                             if isinstance(anchor, FindingAnchor) else anchor)
                             elif isinstance(outcome, DeclarationRemoved):
                                 evidence = NeedsJudgment("no source site after proved declaration removal")
-                            elif isinstance(outcome, DeclarationNotRead) and not self._finding_histories[finding.finding_id].judging:
+                            elif isinstance(outcome, DeclarationNotRead) and not self._finding_history(finding).judging:
                                 # Existing untracked findings remain eligible for filing without historical carry.
                                 evidence = FilingEligibleWithoutHistory(finding.path, finding.line)
                             elif isinstance(outcome, (DeclarationInPlace, DeclarationNotRead)):
