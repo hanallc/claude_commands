@@ -334,16 +334,20 @@ async function inspect(frame){
      await finish();return;
     }
     check(!target.hidden && !target.querySelector('[data-detail]').hidden,'the card opens from List before Later');
-    const status=doc.querySelector('[data-hidden-action-status]');
-    const saved=new Promise(resolve=>{
+    const form=target.querySelector('form');
+    const settled=new Promise(resolve=>{
      const observer=new doc.defaultView.MutationObserver(()=>{
-      if(status.textContent.includes('Saved: parked')){observer.disconnect();resolve();}
+      if(!form.hasAttribute('data-sending')){observer.disconnect();resolve();}
      });
-     observer.observe(status,{childList:true});
+     observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
     });
-    target.querySelector('[data-later-toggle]').click();
-    target.querySelector('[data-later-preset="morning"]').click();
-    await saved;
+    form.querySelector('[data-later-toggle]').click();
+    form.querySelector('[data-later-preset="morning"]').click();
+    if(!form.hasAttribute('data-sending')) throw new Error('Later did not start.');
+    await settled;
+    check(form.querySelector('[data-send-status]').textContent==='Saved: parked','Later confirms the save on the card');
+    const status=doc.querySelector('[data-hidden-action-status]');
+    check(status.hidden && !status.textContent,'Later shows no success notice above the table');
     const place=new URLSearchParams(doc.location.hash.slice(1));
     check(!place.has('item') && !place.has('linked'),'Later removes the linked target from the Review address');
     sessionStorage.setItem('later-reload','yes');
