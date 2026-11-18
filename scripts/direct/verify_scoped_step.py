@@ -10,7 +10,6 @@ from pathlib import Path
 import select
 import subprocess
 import sys
-import time
 
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -21,6 +20,7 @@ from scripts.build_queue.admission_records import process_start_time
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
+SCOPE_TERM_GRACE_SECONDS = 5
 
 
 # The scope shell publishes its path before this check. A dead owner permits no start.
@@ -66,42 +66,24 @@ def drain_scope(sidecar: Path) -> None:
     except FileNotFoundError:
         return
     try:
-        if scope_populated(events):
-            result = subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", "--kill-whom=all",
-                                     scope.name], stderr=subprocess.PIPE, text=True, check=False,
-                                    timeout=SCOPE_STOP_TIMEOUT_SECONDS)
-            if result.returncode:
-                detail = result.stderr.strip() or f"systemctl exited with status {result.returncode}"
-                raise OSError(f"cannot stop scope {scope.name}: {detail}")
-            ready = select.poll()
-            ready.register(events, select.POLLPRI | select.POLLERR)
-            deadline = time.monotonic() + SCOPE_STOP_TIMEOUT_SECONDS
-            while scope_populated(events):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"build scope {scope.name} is still populated")
-                _ = ready.poll(round(remaining * 1000))
+        if not scope_populated(events):
+            return
+        try:
+            result = subprocess.run(["systemctl", "--user", "stop", scope.name],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    text=True, check=False, timeout=SCOPE_STOP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            if scope_populated(events):
+                raise
+            return
+        if not scope_populated(events):
+            return
+        if result.returncode:
+            detail = result.stderr.strip() or f"systemctl exited with status {result.returncode}"
+            raise OSError(f"cannot stop scope {scope.name}: {detail}")
+        raise OSError(f"build scope {scope.name} is still populated after stop")
     finally:
         os.close(events)
-
-
-def copy_scope_output(descriptor: int) -> bool:
-    try:
-        data = os.read(descriptor, 65536)
-    except BlockingIOError:
-        return False
-    if not data:
-        return False
-    _ = sys.stdout.buffer.write(data)
-    _ = sys.stdout.buffer.flush()
-    return True
-
-
-def watch_scope(owners: select.poll, descriptor: int) -> None:
-    _ = owners.register(descriptor, select.POLLIN)
-    while (ready := owners.poll()) and all(fd == descriptor for fd, _ in ready):
-        if not copy_scope_output(descriptor):
-            owners.unregister(descriptor)
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
@@ -128,30 +110,24 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
         try:
             process = subprocess.Popen(
                 ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-                 "--slice=builds.slice", f"--unit={unit}", "--",
+                 "--slice=builds.slice", f"--unit={unit}",
+                 f"--property=TimeoutStopSec={SCOPE_TERM_GRACE_SECONDS}s", "--",
                  "/bin/sh", "-c", 'exec 3>&1; ' + scope_shell, peak, "/bin/sh", "-c", CHECK_SCOPE_OWNER,
                  "verify-scope-owner", str(sidecar), unit, str(caller), caller_start, str(leader), leader_start,
                  *command],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, process_group=leader,
+                stderr=subprocess.DEVNULL, process_group=leader,
             )
-            assert process.stdout is not None
-            # The scope cannot hold verify's output stream open after a failed kill.
-            with process.stdout as output:
-                descriptor = output.fileno()
-                os.set_blocking(descriptor, False)
-                try:
-                    owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
-                    watch_scope(owners, descriptor)
-                except (ProcessLookupError, BrokenPipeError):
-                    pass
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                    status = process.wait(timeout=SCOPE_STOP_TIMEOUT_SECONDS)
-                    drain_scope(sidecar)
-                    _ = release.truncate(0)
-                while copy_scope_output(descriptor):
-                    pass
+            try:
+                owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
+                _ = owners.poll()
+            except ProcessLookupError:
+                pass
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                status = process.wait(timeout=SCOPE_STOP_TIMEOUT_SECONDS)
+                drain_scope(sidecar)
+                _ = release.truncate(0)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             # The step's log readers can die before the scope stops.
             if release.seek(0, os.SEEK_END):

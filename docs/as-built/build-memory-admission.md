@@ -249,10 +249,14 @@ The queue checks that folder together with memory before a local grant.
 Verify sets `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the paths it resolved for the local grant.
 On Linux, a local placement grant names the build scope through its sidecar.
 The scope publishes that path before Cargo starts.
-The step supervisor stops the scope if the verify caller or step shell exits.
+The step supervisor asks systemd to stop the scope if the verify caller or step shell exits.
+Systemd sends a hard kill if the scope still has members after five seconds.
+Cargo writes directly to the step's output.
 Verify closes the launch before it releases or cancels the grant.
 The supervisor holds the launch lock until the scope is empty.
+Verify accepts an empty scope even if systemd reports a stop error.
 If shutdown fails, verify reports the error and keeps the reservation for the service to reclaim.
+Verify returns status 125 for that error even if a Mac copy passes.
 After a local build, verify reports the binary from the pinned target folder.
 Remote candidates use their target slots.
 An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.

@@ -3114,7 +3114,7 @@ run_local_test() {
     run_nextest "${NEXTEST_ARGS[@]}" || status=$?
     if [[ -n "${COPY_WATCH_PID:-}" ]]; then
         stop_copy_watch
-        if [[ "$COPY_WORD" == won && "$COPY_STOPPED" == 1 && "$status" != 0 \
+        if [[ "$COPY_WORD" == won && "$COPY_STOPPED" == 1 && "$status" != 0 && "$status" != 125 \
               && ( "$COPY_MAC" == failed || "$COPY_MAC" == passed ) ]]; then
             finish_copy_win
         fi
