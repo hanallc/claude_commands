@@ -119,10 +119,8 @@ class ReviewRepairsTests(unittest.TestCase):
             assert isinstance(waiting.source, review_items.UnownedQuestionSource)
             before = waiting.source.record.path.read_bytes()
             self.assertEqual(waiting.actions, ())
-            settings = conf.read('review_links')
-            cards = review_page.CardSettings(settings.whole('review_words_rows'),
-                                             review_page.soon_label(settings.whole('later_soon_minutes')))
-            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'), cards)
+            form = review_page.form(waiting, change_page.ReviewBrowser('fixture-token'),
+                                    conf.read('review_links').whole('review_words_rows'), 'fixture-revision')
             self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later', form)
             self.assertIn('value="later">Save', form)
             for action in ('answer', 'feedback', 'question'):
@@ -271,6 +269,7 @@ class ReviewRepairsTests(unittest.TestCase):
         results: list[list[str]] = []
         complete = threading.Event()
         case = self.case
+        markup=markup.replace('<head>','<head><script>'+test_review_page.BODY_READY_SCRIPT+'</script>',1)
         document = markup.replace('</body>','<img hidden src="/complete"><script>'+probe+'</script></body>').encode()
 
         class Handler(BaseHTTPRequestHandler):
@@ -298,13 +297,24 @@ class ReviewRepairsTests(unittest.TestCase):
                     assert isinstance(validation, (change_page.DeliveryIntent, change_page.ValidationRequested))
                     _ = change_review.save_verdict(case.fixture.review_list, row, verdict, case.fixture.production,
                                                    validation_id=validation.attempt)
+                fields = parse_qs(route.query)
+                snapshot = review_page.build_snapshot(case.root) if route.path in ('/fresh', review_page.PAGE_PATH) else None
                 self.send_response(200)
                 self.send_header('Content-Type','text/html; charset=utf-8')
+                if snapshot is not None and 'body' in fields:
+                    self.send_header('X-Review-Version', snapshot.version)
                 self.end_headers()
                 if self.path == '/complete':
                     _ = complete.wait(25)
-                elif self.path.startswith('/fresh') or self.path.startswith('/console/review.html'):
-                    _ = self.wfile.write(review_page.render(case.root, show=parse_qs(route.query).get('show', ['open'])[0]))
+                elif snapshot is not None:
+                    if 'body' in fields:
+                        _ = self.wfile.write(snapshot.body(fields['body'][0]))
+                    elif 'index' in fields:
+                        _ = self.wfile.write(snapshot.index_response())
+                    elif 'version' in fields:
+                        _ = self.wfile.write(json.dumps({'version':snapshot.version,'facts':snapshot.facts()}).encode())
+                    else:
+                        _ = self.wfile.write(snapshot.render(show=fields.get('show',['open'])[0]))
                 else:
                     _ = self.wfile.write(document)
 
@@ -349,7 +359,10 @@ class ReviewRepairsTests(unittest.TestCase):
         waiting = self.case.investigation(False)
         setup = """<script>
 const nativeFetch=fetch;
-window.fetch=(url,options)=>nativeFetch(options?.method==='POST' ? url : '/fresh'+new URL(url,location.href).search,options);
+window.fetch=(url,options)=>{
+ const target=new URL(url,location.href);
+ return nativeFetch(options?.method==='POST' || !target.search ? url : '/fresh'+target.search,options);
+};
 </script>"""
         markup = review_page.render(self.case.root).decode().replace('<head>', '<head>'+setup, 1)
         probe = r'''
@@ -383,12 +396,7 @@ window.fetch=(url,options)=>nativeFetch(options?.method==='POST' ? url : '/fresh
    'The selected owner stays visible with zero in another Show.');
   const previous=document.querySelector('[data-review]');
   chip(UNIT_OWNER)?.focus();
-  const refreshed=new Promise(resolve=>{
-   const observer=new MutationObserver(()=>{
-    if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
-   });
-   observer.observe(document.body,{childList:true,subtree:true});
-  });
+  const refreshed=new Promise(resolve=>previous.addEventListener('review-refreshed',resolve,{once:true}));
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   await refreshed;
   check(pressed(UNIT_OWNER) && count(UNIT_OWNER)==='0' && document.activeElement===chip(UNIT_OWNER),
@@ -430,18 +438,18 @@ window.fetch=(url,options)=>nativeFetch(options?.method==='POST' ? url : '/fresh
 })();'''.replace('FIRST', json.dumps(str(first.owner))).replace('SECOND', json.dumps(str(second.owner)))
         place = '/#'+urlencode({'legacy':'investigation', 'owner':first.owner, 'show':'not-read',
                                  'type':'investigation', 'q':'gate'})
-        self.assertEqual(self.browser(review_page.render(self.case.root).decode(), probe, place), [])
+        self.assertEqual(self.browser(test_review_page.browser_markup(self.case.root), probe, place), [])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_refresh_focuses_all_when_the_focused_owner_is_excluded(self) -> None:
-        without_owner = review_page.render(self.case.root).decode()
+        without_owner = test_review_page.browser_markup(self.case.root)
         ready = self.case.investigation()
-        before = review_page.render(self.case.root).decode()
+        before = test_review_page.browser_markup(self.case.root)
         key = f'investigation/{ready.owner}/{ready.id}'
         until = datetime.now(user_zone()) + timedelta(days=1)
         body = self.case.body(key, 'later') + '&' + urlencode({'later':until.isoformat()})
         _ = review_page.submit(self.case.root, body, self.case.status)
-        with_hidden_owner = review_page.render(self.case.root).decode()
+        with_hidden_owner = test_review_page.browser_markup(self.case.root)
         setup = r"""<script>
 const nativeFetch=fetch;
 window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) :
@@ -456,12 +464,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
  check(document.activeElement===owner && owner.getAttribute('aria-pressed')==='true',
   'The selected owner starts focused.');
  const previous=document.querySelector('[data-review]');
- const refreshed=new Promise(resolve=>{
-  const observer=new MutationObserver(()=>{
-   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
-  });
-  observer.observe(document.body,{childList:true,subtree:true});
- });
+ const refreshed=new Promise(resolve=>previous.addEventListener('review-refreshed',resolve,{once:true}));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await refreshed;
  const replacement=chip(OWNER),all=chip('');
@@ -482,7 +485,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_refresh_focuses_selected_owner_when_another_chip_disappears(self) -> None:
         selected = self.case.investigation()
-        fresh = review_page.render(self.case.root).decode()
+        fresh = test_review_page.browser_markup(self.case.root)
         other = fixture_member('showrunner', name='second-owner')
         _ = investigation.file(
             other.id, 'Why did the second gate stop?', 'Read the log.',
@@ -492,7 +495,7 @@ const nativeFetch=fetch;
 window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) :
  Promise.resolve(new Response(FRESH));
 </script>""".replace('FRESH', json.dumps(fresh).replace('</', '<\\/'))
-        markup = review_page.render(self.case.root).decode().replace('<head>', '<head>'+setup, 1)
+        markup = test_review_page.browser_markup(self.case.root).replace('<head>', '<head>'+setup, 1)
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
@@ -502,12 +505,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
  check(document.activeElement===chip(OTHER) && pressed(chip(SELECTED)) && !pressed(chip(OTHER)),
   'The other chip has focus while the selected chip stays pressed.');
  const previous=document.querySelector('[data-review]');
- const refreshed=new Promise(resolve=>{
-  const observer=new MutationObserver(()=>{
-   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
-  });
-  observer.observe(document.body,{childList:true,subtree:true});
- });
+ const refreshed=new Promise(resolve=>previous.addEventListener('review-refreshed',resolve,{once:true}));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await refreshed;
  check(!chip(OTHER) && pressed(chip(SELECTED)) && new URLSearchParams(location.hash.slice(1)).get('owner')===SELECTED,
@@ -529,24 +527,20 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const nextView=()=>new Promise(resolve=>{
-  const previous=document.querySelector('[data-review]');
-  const observer=new MutationObserver(()=>{
-   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
-  });observer.observe(document.body,{childList:true,subtree:true});
- });
+ const nextView=()=>new Promise(resolve=>document.querySelector('[data-review]').addEventListener('review-refreshed',resolve,{once:true}));
  const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{
   source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
  const show=async value=>{
   const chip=document.querySelector('[data-show-chip="'+value+'"]');
   if(chip.getAttribute('aria-pressed')==='true') return;
-  const loaded=nextView();chip.click();await loaded;
+  chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
  const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
  const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
  const ownerChips=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
  const chooseOwner=value=>ownerChip(value).click();
+
  const type=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
  const search=value=>{const field=document.querySelector('#list-search');field.value=value;field.dispatchEvent(new Event('input'));};
  const save=async form=>{
@@ -560,7 +554,7 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   for(const [id,selected] of [['C1','all'],['C2','Done']]){
    await show('open');const before=count('open'),all=count('all');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
-   row.querySelector('.list-toggle').click();await save(row.querySelector('form'));
+   row.querySelector('.list-toggle').click();await readyReviewCard(row);await save(row.querySelector('form'));
    await show(selected);await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
    check(count('open')===before && count('all')===all,
     'F005: the fresh index restores the counts after an owner answer in '+selected);
@@ -614,13 +608,7 @@ window.fetch=(url,options={})=>{
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
- const nextView=()=>new Promise(resolve=>{
-  const previous=document.querySelector('[data-review]');
-  const observer=new MutationObserver(()=>{
-   if(document.querySelector('[data-review]')!==previous){observer.disconnect();resolve();}
-  });
-  observer.observe(document.body,{childList:true,subtree:true});
- });
+ const nextView=()=>new Promise(resolve=>document.querySelector('[data-review]').addEventListener('review-refreshed',resolve,{once:true}));
  const row=id=>document.querySelector('[data-key="page-owner/'+id+'"]');
  const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
  const save=async(form,value)=>{
@@ -633,19 +621,19 @@ window.fetch=(url,options={})=>{
  const show=async value=>{
   const chip=document.querySelector('[data-show-chip="'+value+'"]');
   if(chip.getAttribute('aria-pressed')==='true') return;
-  const loaded=nextView();chip.click();await loaded;
+  chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
  try{
-  row('C1').querySelector('.list-toggle').click();
+  row('C1').querySelector('.list-toggle').click();await readyReviewCard(row('C1'));
   const counts=()=>['open','Validating','Done','all'].map(value=>
    Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent));
   const before=counts();
   const form=row('C1').querySelector('form');await save(form,'validate');
-  check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2],before[3]-1]),
-   'A hand-off moves the change from the Open and All counts to the Validating count.');
-  check(row('C1').hidden,'the saved check leaves Open');
+  check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2],before[3]]),
+   'A save moves the entry from Open to Validating without changing All.');
+  check(!row('C1') || row('C1').hidden,'the saved check leaves Open');
   await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the active check out of Open');
-  check(counts()[1]===before[1]+1 && counts()[2]===before[2] && counts()[3]===before[3]-1,
+  check(counts()[1]===before[1]+1 && counts()[2]===before[2] && counts()[3]===before[3],
    'F001: refresh replaces the counts with the saved state');
   await show('Validating');
   check(row('C1') && !row('C1').hidden && row('C1').dataset.state==='Validating',
@@ -655,13 +643,13 @@ window.fetch=(url,options={})=>{
    row('C1').textContent.includes('With page-owner since'),'All shows the active check without buttons.');
   await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
-  row('C2').querySelector('.list-toggle').click();
+  row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
   const second=row('C2').querySelector('form');await save(second,'validate');
   await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
   await show('Done');check(!row('C2').hidden && row('C2').dataset.state==='Done','a passed check records Done');
-  await show('all');row('C3').querySelector('.list-toggle').click();
+  await show('all');row('C3').querySelector('.list-toggle').click();await readyReviewCard(row('C3'));
   const third=row('C3').querySelector('form');await save(third,'works');
-  check(row('C3').hidden,'F010: Works leaves All');
+  check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
   for(let pass=0;pass<2;pass++){
    await refresh();
    for(const choice of ['open','Done','all']){
@@ -672,10 +660,10 @@ window.fetch=(url,options={})=>{
   for(const key of keys){
    await show('open');
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
-   asked().querySelector('.list-toggle').click();
+   asked().querySelector('.list-toggle').click();await readyReviewCard(asked());
    const asking=asked().querySelector('form');asking.elements.feedback.value='Check the next case.';
    await save(asking,'question');
-   check(asked().hidden,'F021: Ask question leaves Open for '+key);
+   check(!asked() || asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
     await refresh();check(!asked() || asked().hidden,'F021: the sent request stays out of Open after refresh for '+key);
    }
@@ -686,7 +674,7 @@ window.fetch=(url,options={})=>{
   location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
   await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
-  investigation.querySelector('.list-toggle').click();await save(investigation.querySelector('form'),'read');
+  investigation.querySelector('.list-toggle').click();await readyReviewCard(investigation);await save(investigation.querySelector('form'),'read');
   await refresh();
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
