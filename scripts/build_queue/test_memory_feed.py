@@ -362,6 +362,12 @@ class MemoryFeedTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
+        _ = write_config_fixture(self.root / "build_steps.conf",
+            "changes.default=no branch\nchanges.integrate={branch} branch\n"
+            + "names.integrate=integrate\nnames.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
+            + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
+            + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
+            + "owned.showrunner-default=showrunner {step}\nowned.showrunner-merge-gate=showrunner merge\n")
         self.configure()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
         proc = self.root / "proc"
@@ -440,10 +446,10 @@ class MemoryFeedTests(unittest.TestCase):
                         self.assertEqual(send.call_count, 3)
 
     def configure(self, *, seconds: float = 0.125) -> None:
-        source = Path(__file__).resolve().parents[2] / "config/memory_feed.conf"
-        text = source.read_text().replace("output_folder=~/.local/share/review-links/h7uj5c", f"output_folder={self.output}")
-        text = text.replace("interval_seconds=3", f"interval_seconds={seconds}").replace("# range: 1..60", "# range: 5e-324..")
-        _ = self.configuration.write_text(text)
+        _ = write_config_fixture(self.configuration,
+                                 f"output_folder={self.output}\n# range: 5e-324..\ninterval_seconds={seconds}\n"
+                                 + "history_days=7\nswap_rows=6\nreport_refresh_seconds=300\n"
+                                 + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n")
 
     def expected_page(self, seconds: float = 0.125) -> str:
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
@@ -850,6 +856,7 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(memory_feed.mac_build_units((replace(build, session="unclaimed"),), (claim,)), {})
 
     def test_old_native_mac_readings_hide_their_process_rows(self) -> None:
+        _ = write_config_fixture(self.configuration, "mac_activity_refresh_seconds=30\n")
         baseline = reservation_reading()
         now = baseline.explanation.now
         build = queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 120)
@@ -996,7 +1003,7 @@ process.stdout.write(JSON.stringify({
 
     def test_served_page_allows_same_origin_framing(self) -> None:
         for name in ("review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{name}.conf", self.root / f"{name}.conf")
+            _ = write_config_fixture(self.root / f'{name}.conf')
         server_fixture = test_serve.ReviewLinksServerTests()
         self.addCleanup(server_fixture.doCleanups)
         server_fixture.setUp()
@@ -1046,9 +1053,7 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
-                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
-                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
+                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
                     self.assertEqual(memory_feed.main(["--once"]), 0)
@@ -1069,9 +1074,7 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
-                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
-                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
+                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
                     _ = memory_feed.main(["--once"])
@@ -1218,8 +1221,7 @@ process.stdout.write(JSON.stringify({
         for interval, expected in ((30, [710001, 710001, 710002]), (60, [710001, 710001, 710001])):
             with self.subTest(interval=interval):
                 self.configure()
-                _ = self.configuration.write_text(self.configuration.read_text().replace(
-                    "mac_activity_refresh_seconds=30", f"mac_activity_refresh_seconds={interval}"))
+                _ = write_config_fixture(self.configuration, f"mac_activity_refresh_seconds={interval}\n")
                 builds = iter((710001, 710002))
                 published: list[int] = []
 
@@ -1595,7 +1597,7 @@ process.stdout.write(JSON.stringify({
                 _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
-                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/console.conf", installed / "config/console.conf")
+                _ = write_config_fixture(installed / 'config/console.conf')
                 probe = textwrap.dedent("""
                     import builtins
                     import json
@@ -1983,6 +1985,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(memory_feed.wait_why(reason), expected)
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
+        _ = write_config_fixture(self.root / "mac_test.conf", "stale_seconds=300\n")
         _ = write_idle_config(self.root)
         reading = captured_reading()
         now = reading.explanation.now
@@ -2495,6 +2498,7 @@ process.stdout.write(JSON.stringify({
         for registered, registered_use, unregistered_use, kept in (
                 ((), 0, 6, 0), ((700001,), 2, 4, 6), ((700001, 700002), 6, 0, 10)):
             with self.subTest(registered=registered), AdmissionFixture() as fixture:
+                fixture.configure(safety_gib=3)
                 owners: list[wire.Owner] = []
                 for pid, worker, used in ((700001, 700011, 2), (700002, 700012, 4)):
                     owner = fixture.fixture_owner(pid, str(pid))

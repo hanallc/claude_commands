@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.message.test_send_budget import write_configs
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.lib.checkout_test_support import python_tool_source
 
 import io
@@ -64,7 +67,7 @@ from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, r
 from scripts.message import roster
 from scripts.message import sessions, session_records
 from scripts.accounts import accounts
-from scripts.agents.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase, write_machine_config
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -114,10 +117,10 @@ REAL_OPEN_CASE = rca.open_case
 
 def write_send_config(path: Path, values: str) -> int:
     """Keep timing settings when a test writes its own send settings."""
-    defaults = Path(send.__file__).resolve().parents[2] / "config"
     for name in ("postmaster", "codex_daemon", "send_repeat_guard", "rca", "machines", "production"):
-        _ = (path.parent / f"{name}.conf").write_text((defaults / f"{name}.conf").read_text())
-    return path.write_text((defaults / "send.conf").read_text() + "\n" + values)
+        _ = write_config_fixture(path.parent / f"{name}.conf")
+    write_configs(path.parent)
+    return write_config_fixture(path, values)
 
 class RelayAccountTests(unittest.TestCase):
     def test_relay_imports_only_its_temporary_checkout(self) -> None:
@@ -4236,9 +4239,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                                     sent=send.now().isoformat(), expires=send.now().isoformat())
             budgets: list[tuple[float, float]] = []
             for allowance in (30, 90):
-                source = Path(__file__).resolve().parents[2] / "config/send.conf"
-                _ = config.write_text(source.read_text().replace("remote_transport_seconds=30",
-                                                               f"remote_transport_seconds={allowance}"))
+                _ = write_config_fixture(config, f"remote_transport_seconds={allowance}\n")
                 with mock.patch.object(send, "run", return_value=(0, "SENT: fixture\n", "")) as run:
                     self.assertEqual(send.remote(message, "fixture-peer", options).outcome, "sent")
                     delivery = cast(float, run.call_args.args[2])
@@ -5319,6 +5320,7 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(staff, "snapshot", side_effect=lambda: staff.StaffSnapshot(tuple(self.staff_rows.values()))))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (self.root / "config").mkdir()
+        write_machine_config(self.root / "config")
         _ = write_send_config(self.root / "config/send.conf", "")
         binaries = self.root / "bin"
         binaries.mkdir()

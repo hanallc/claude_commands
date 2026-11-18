@@ -10,6 +10,7 @@ from typing import cast
 import unittest
 from unittest import mock
 from scripts.mac_test import eligibility, offload
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
@@ -19,6 +20,8 @@ class OffloadCommandTests(SeededCleanupFixture):
     def command_with_changed_cleanup_timeout(self, value: str) -> subprocess.CompletedProcess[str]:
         self.config["leftover_timeout_s"] = "10"
         self.sync_config()
+        _ = write_config_fixture(self.root / "transport-mac.conf", self.config_path.read_text(), template="mac_test")
+        _ = write_config_fixture(self.root / "build_targets.conf", "settings.mac=transport-mac.conf\n")
         self.fixture["run_cleanup_line"] = ""
         self.sync_fixture()
         stream = offload.ProcessController.stream_mac_run

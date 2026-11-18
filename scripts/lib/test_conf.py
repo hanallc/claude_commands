@@ -10,12 +10,13 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
 
 from scripts.lib import conf, conf_reads
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -30,6 +31,15 @@ class ConfTests(unittest.TestCase):
         self.directory = self.root / "config"
         self.directory.mkdir()
         self.path = self.directory / "example.conf"
+        repository = self.root / "repository-config"
+        _ = write_config_fixture(repository / "accounts.conf",
+                                 "usage_stale_minutes=10\nnotes_directory=~/rust/hanadocs/agents\n")
+        original = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
+
+        def repository_path(stem: str) -> Path:
+            return repository / "accounts.conf" if stem == "accounts" else original(stem)
+
+        _ = self.enterContext(mock.patch.object(conf, "_repository_path", side_effect=repository_path))
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.directory), "HOME": str(self.root / "home"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",

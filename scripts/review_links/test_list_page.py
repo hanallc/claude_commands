@@ -1,5 +1,6 @@
 """Test The List page with private records and a real browser."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import html
 import io
@@ -586,8 +587,11 @@ frame.addEventListener('load',async()=>{
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="list-page-test-")))
         config = self.root / "config"
         config.mkdir()
-        for name in ("review_links", "console", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{name}.conf", config / f"{name}.conf")
+        _ = write_config_fixture(config / "change_review.conf")
+        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\n")
+        _ = write_config_fixture(config / "console.conf",
+            "page.list.url=python:scripts.review_links.list_page:page_url\n"
+            + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
             "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews")})))
