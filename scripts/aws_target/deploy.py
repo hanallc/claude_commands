@@ -1507,13 +1507,15 @@ class Deployment:
             for position, region in enumerate(additional, 1):
                 with timings.measure(GateRegionOperation.NETWORK, region, position, len(additional), self.settings_path):
                     networks.append(self.regional_network(api, settings, region))
+            gpu_types = sorted(gpu_size_trial.settings().spot_max_usd_per_hour.keys() |
+                               set(values.words('hana_gpu_instance_types')))
             parameters = {
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
                                       *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
                 'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
                 'GateInstanceTypes': ','.join(values.words('instance_types')),
-                'GateGpuInstanceTypes': ','.join(gpu_size_trial.settings().spot_max_usd_per_hour),
+                'GateGpuInstanceTypes': ','.join(gpu_types),
                 'GateRootGiB': str(values.whole('root_gib')),
                 'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
                 'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
@@ -1543,6 +1545,7 @@ class Deployment:
             manifest: dict[str, object] = {
                 'deployment_id': ledger.text(saved, 'deployment_id'), 'revision': revision,
                 'instance_types': values.words('instance_types'),
+                'gpu_instance_types': gpu_types,
                 'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
                 'regions': [{'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
                     'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],

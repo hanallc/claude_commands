@@ -1,7 +1,7 @@
 """Test offline GPU preparation with private files and fake build commands."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from io import BytesIO, StringIO
@@ -12,6 +12,7 @@ import tarfile
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +25,8 @@ from unittest import mock
 from scripts.aws_target import cloud_gate, gpu_size_trial as trial, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, largest_gate_vcpus
 from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.build_hold import build_hold
+from scripts.build_targets import build_targets
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import merge_gate
@@ -32,6 +35,13 @@ from scripts.production.gate_modules import GateRefused
 
 HARDWARE = 'deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\ndeviceName = Fixture GPU\n'
 SOFTWARE = 'deviceType = PHYSICAL_DEVICE_TYPE_CPU\ndeviceName = llvmpipe\n'
+NEXTEST_PASSED = (
+    '{"type":"suite","event":"started","test_count":1}\n'
+    '{"type":"test","event":"started","name":"fixture::shader_variants$draws"}\n'
+    '{"type":"test","event":"ok","name":"fixture::shader_variants$draws"}\n'
+    '{"type":"suite","event":"ok","passed":1}\n'
+)
+NEXTEST_PLAN = '    Starting 1 test across 1 binary\n'
 
 
 def fake_tool_path(name: str, *, path: str | None = None) -> str:
@@ -182,6 +192,190 @@ elif name == 'cargo':
             self.assertIn('machines/g6.xlarge/vulkan.txt', names)
             self.assertIn(f'machines/g6.xlarge/{number}/samples/test.json', names)
             self.assertIn(f'machines/g6.xlarge/{number}/junit.xml', names)
+
+    def test_generated_guest_runs_one_locked_hana_nextest_command(self) -> None:
+        folder = self.root / 'guest'
+        folder.mkdir()
+        workspace = self.root / 'Cargo.toml'
+        _ = workspace.write_text('[workspace]\n')
+        workflow = self.root / 'ci.yml'
+        _ = workflow.write_text('env:\n  HANA_NEXTEST_VERSION: "0.9.143"\n')
+        with tarfile.open(folder / 'source.tar', 'w') as archive:
+            archive.add(workspace, arcname='Cargo.toml')
+            archive.add(workflow, arcname='.github/workflows/ci.yml')
+        arguments = ['--profile', 'ci', '--test', 'shader_variants', '-E', 'package(hana_mimesis_tools)']
+        manifest = {'commit': 'a' * 40, 'tree': 'b' * 40, 'nextest': 'cargo-nextest 0.9.143',
+                    'hana_nextest': {'arguments': arguments, 'instance_types': ['g6.2xlarge']},
+                    'sha256': {'source.tar': trial.digest(folder / 'source.tar')}}
+        trial.write_json(folder / 'manifest.json', manifest)
+        trial.write_json(folder / 'setup.json', {'boot': 2, 'import_start': 3, 'import_end': 4, 'reboot': 5})
+        finished = self.root / 'finished.json'
+        trial.write_json(folder / 'links.json', {'started': '1', 'attempt': 'fixture-attempt', 'finished': str(finished)})
+        tools = self.root / 'guest-tools'
+        tools.mkdir()
+        fake = r"""import json, os, shutil, sys
+from pathlib import Path
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+if name == 'vulkaninfo':
+    print('deviceType = ' + os.environ['FIXTURE_VULKAN'])
+elif name == 'curl':
+    assert '-T' in args
+    shutil.copyfile(args[args.index('-T') + 1], args[-1])
+elif name == 'cargo':
+    if args == ['nextest', '--version']:
+        print(os.environ['FIXTURE_NEXTEST_VERSION'])
+    else:
+        target = Path(os.environ['CARGO_TARGET_DIR'])
+        with (target.parent / 'cargo-invocations').open('a') as log:
+            print(json.dumps(args), file=log)
+        assert Path('Cargo.toml').is_file()
+        assert target.is_dir() and not list(target.iterdir())
+        assert os.environ['CARGO_BUILD_JOBS'] == '8'
+        assert os.environ['CARGO_NET_OFFLINE'] == 'true'
+        print('fixture stdout')
+        print('fixture stderr', file=sys.stderr)
+        sys.exit(100)
+"""
+        for name in ('cargo', 'vulkaninfo', 'curl'):
+            executable = tools / name
+            _ = executable.write_text('#!' + sys.executable + '\n' + fake)
+            executable.chmod(0o700)
+        guest = folder / 'guest.py'
+        _ = guest.write_text(trial.guest_program().replace(
+            "root = Path('/var/lib/gpu-size-trial')", 'root = Path(' + repr(str(folder)) + ')', 1))
+        environment = {**os.environ, 'PATH': str(tools) + os.pathsep + os.environ.get('PATH', ''),
+                       'GPU_TRIAL_CARGO': str(tools / 'cargo')}
+        for version, device, failure in (
+                ('0.9.142', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', 'does not match the Hana CI pin'),
+                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_CPU', 'hardware Vulkan adapter'),
+                ('0.9.143', 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU', '')):
+            with self.subTest(version=version, device=device):
+                manifest['nextest'] = 'cargo-nextest ' + version
+                trial.write_json(folder / 'manifest.json', manifest)
+                result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=10,
+                                        env={**environment, 'FIXTURE_VULKAN': device,
+                                             'FIXTURE_NEXTEST_VERSION': manifest['nextest']})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                document = trial.read_json(finished)
+                if failure:
+                    self.assertEqual(document['status'], 'incomplete')
+                    self.assertIn(failure, str(document['reason']))
+                    self.assertFalse((folder / 'cargo-invocations').exists())
+                    shutil.rmtree(folder / 'source')
+                    continue
+                actual = trial.nextest_result(document, 'fixture-attempt', manifest)
+                self.assertEqual((actual.exit_code, actual.stdout, actual.stderr),
+                                 (100, 'fixture stdout\n', 'fixture stderr\n'))
+                call, = (folder / 'cargo-invocations').read_text().splitlines()
+                self.assertEqual(cast(object, json.loads(call)),
+                                 ['nextest', 'run', '--locked', '--offline', '--target-dir', str(folder / 'target'),
+                                  '--no-tests', 'fail', '--color', 'never', '--message-format', 'libtest-json',
+                                  '--message-format-version', '0.1', *arguments])
+
+    def test_hana_preparation_refuses_a_toolchain_that_differs_from_the_source_pin(self) -> None:
+        folder = trial.trial_root() / 'trial'
+        source = folder / 'source'
+        workflow = source / '.github/workflows/ci.yml'
+        workflow.parent.mkdir(parents=True)
+        _ = workflow.write_text('env:\n  HANA_NEXTEST_VERSION: "0.9.143"\n')
+        trial.write_json(folder / 'request.json', {'repo': str(self.root), 'commit': 'a' * 40,
+            'tools': {'nix': 'nix', 'nix-store': 'nix-store'}, 'limits': {},
+            'hana_nextest': {'arguments': ['--test', 'shader_variants'], 'instance_types': ['g6.2xlarge']}})
+        with (mock.patch.object(trial, 'nix_toolchain', return_value='/nix/store/fixture-toolchain'),
+              mock.patch.object(trial, 'checked', return_value='cargo-nextest 0.9.142'),
+              mock.patch.object(trial, 'cache_dependencies') as cache,
+              mock.patch.object(trial, 'build_system') as build):
+            with self.assertRaisesRegex(ValueError, 'does not match the Hana CI pin 0.9.143'):
+                trial.prepare_worker(folder)
+        cache.assert_not_called()
+        build.assert_not_called()
+
+    def test_hana_preparation_uses_the_pinned_release_in_the_guest_toolchain(self) -> None:
+        folder = trial.trial_root() / 'trial'
+        workflow = folder / 'source/.github/workflows/ci.yml'
+        workflow.parent.mkdir(parents=True)
+        _ = workflow.write_text('env:\n  HANA_NEXTEST_VERSION: "0.9.143"\n')
+        for name in ('Cargo.lock', 'flake.lock'):
+            _ = (folder / 'source' / name).write_text('fixture lock\n')
+        _ = (folder / 'source.tar').write_text('fixture source\n')
+        trial.write_json(folder / 'request.json', {'repo': str(self.root), 'commit': 'a' * 40,
+            'tools': {'nix': 'nix', 'nix-store': 'nix-store', 'git': 'git'}, 'limits': {},
+            'hana_nextest': {'arguments': ['--test', 'shader_variants'], 'instance_types': ['g6.2xlarge']}})
+        toolchain = '/nix/store/fixture-toolchain'
+
+        def checked(argv: Sequence[str], _cwd: Path, *, environment: Mapping[str, str]) -> str:
+            if argv[:2] == ['nix', 'build']:
+                expression = argv[argv.index('--expr') + 1]
+                self.assertIn('cargo-nextest-0.9.143-x86_64-unknown-linux-musl.tar.gz', expression)
+                self.assertRegex(expression, r'sha256 = "[a-f0-9]{64}"')
+                self.assertIn('paths = [ nextest chosen ]', expression)
+                self.assertNotIn('pkgs.cargo-nextest', expression)
+                return toolchain
+            if argv[0] == toolchain + '/bin/cargo-nextest':
+                self.assertEqual(argv[1:], ['nextest', '--version'])
+                self.assertTrue(environment['PATH'].startswith(toolchain + '/bin:'))
+                return 'cargo-nextest 0.9.143'
+            if argv[0] == 'git':
+                return 'b' * 40
+            return 'fixture rust tools'
+
+        def build(_folder: Path, _source: Path, _env: Mapping[str, str], guest_toolchain: str, *, hana_nextest: bool) -> str:
+            self.assertTrue(hana_nextest)
+            self.assertEqual(guest_toolchain, toolchain)
+            for name in ('closure.export', 'runtime.env', 'gpu-trial.nix'):
+                _ = (folder / name).write_text('fixture file\n')
+            return '/nix/store/fixture-system'
+
+        with (mock.patch.object(trial, 'checked', side_effect=checked),
+              mock.patch.object(trial, 'scan_toolchain_wrappers'),
+              mock.patch.object(trial, 'cache_dependencies'),
+              mock.patch.object(trial, 'build_system', side_effect=build)):
+            trial.prepare_worker(folder)
+        manifest = trial.read_json(folder / 'manifest.json')
+        self.assertEqual((manifest['toolchain'], manifest['nextest']), (toolchain, 'cargo-nextest 0.9.143'))
+
+    def test_nextest_cli_keeps_real_preparation_hold_progress_on_stderr(self) -> None:
+        _ = write_config_fixture(conf.path('cloud_gate'),
+            'hana_gpu_instance_types=g6.2xlarge\nhana_gpu_spot_max_usd_per_hour={"g6.2xlarge":0.8}')
+        holder = build_hold.Holder('fixture holder', datetime.now(UTC), 'fixture', build_hold.UnknownReleaseEta(), 'fixture')
+        holds = build_hold.NatedevHolds((holder,))
+        attempt = 'f' * 64
+
+        def service(folder: Path, _directory: Path, _settings: Path, _execute: Callable[[Sequence[str]], int]) -> int:
+            request = trial.read_json(folder / 'request.json')
+            box = folder / 'boxes/g6.2xlarge' / attempt
+            box.mkdir(parents=True)
+            trial.write_json(folder / 'manifest.json',
+                             {'trial': folder.name, 'commit': 'a' * 40, 'tree': 'b' * 40,
+                              'hana_nextest': request['hana_nextest']})
+            trial.write_json(folder / 'online-result.json',
+                             {'status': 'complete', 'attempt': attempt, 'instance_type': 'g6.2xlarge'})
+            trial.write_json(box / 'finished.json', {'status': 'complete', 'nextest': {'attempt': attempt,
+                'commit': 'a' * 40, 'tree': 'b' * 40, 'exit_code': 0, 'stdout': NEXTEST_PASSED, 'stderr': NEXTEST_PLAN}})
+            return 0
+
+        stdout, stderr = StringIO(), StringIO()
+        with (mock.patch.object(trial, 'checked', return_value='a' * 40),
+              mock.patch.object(trial, 'export_source', return_value=self.root),
+              mock.patch.object(trial, 'preflight', return_value={}),
+              mock.patch.object(build_hold, 'natedev_holds', return_value=holds),
+              mock.patch.object(build_targets, 'caller_waits_on_hold', side_effect=[True, False, False]),
+              mock.patch.object(merge_gate, 'local_release_waiter'),
+              mock.patch.object(merge_gate, 'gate_reservation') as admission,
+              mock.patch.object(trial, 'start_service', side_effect=service),
+              redirect_stdout(stdout), redirect_stderr(stderr)):
+            context = cast(mock.MagicMock, admission.return_value)
+            place = cast(mock.MagicMock, cast(mock.MagicMock, context.__enter__).return_value)
+            popen = cast(mock.MagicMock, place.popen)
+            wait = cast(mock.MagicMock, cast(mock.MagicMock, popen.return_value).wait)
+            wait.return_value = 0
+            code = trial.main(['nextest', '--repo', str(self.root), '--commit', 'HEAD',
+                               '--instance-types', 'g6.2xlarge', '--', '--test', 'shader_variants'])
+        self.assertEqual(code, 0, stderr.getvalue())
+        self.assertEqual(trial.mapping(cast(object, json.loads(stdout.getvalue())))['attempt'], attempt)
+        self.assertIn('held by fixture holder', stderr.getvalue())
+        self.assertIn('Gate hold: released', stderr.getvalue())
 
     def test_environment_removes_software_overrides(self) -> None:
         with mock.patch.dict(os.environ, {'VK_DRIVER_FILES': 'lavapipe.json', 'LIBGL_ALWAYS_SOFTWARE': '1',
@@ -854,11 +1048,26 @@ class FakeGpuAws:
         self.quotas: dict[str, int] = {region: largest_gate_vcpus(tuple(trial.settings().spot_max_usd_per_hour))}
         self.missing: set[str] = set()
         self.expensive: set[str] = set()
+        self.live_prices: dict[tuple[str, str], Decimal] = {}
+        self.used_types: dict[str, tuple[str, ...]] = {}
+        self.pending_types: dict[str, tuple[str, ...]] = {}
+        self.nextest_exit = 0
+        self.nextest_stdout = NEXTEST_PASSED
+        self.nextest_stderr = NEXTEST_PLAN
+        self.launch_timeout = False
+        self.launch_error = ''
+        self.launch_errors: dict[tuple[str, str], str] = {}
+        self.launch_attempt_limit = ''
+        self.lose_nextest_result = False
+        self.bad_nextest_identity = False
+        self.on_launch: Callable[[str], None] = lambda _attempt: None
         self.events: list[str] = []
         self.objects: dict[str, bytes] = {}
         self.instances: dict[str, str] = {}
         self.launches: list[dict[str, object]] = []
         self.fail_result = False
+        self.result_list_error = ''
+        self.result_missing_codes: list[str] = []
         self.unconfirmed = False
 
     def clock(self) -> float:
@@ -868,6 +1077,13 @@ class FakeGpuAws:
         self.now += max(1, seconds)
 
     def results(self, attempt: str, size: str) -> None:
+        if 'hana_nextest' in self.manifest:
+            if not self.lose_nextest_result:
+                self.objects[f'artifacts/gpu-size-trial/{attempt}/finished.json'] = json.dumps({
+                    'status': 'complete', 'nextest': {'attempt': attempt, 'exit_code': self.nextest_exit,
+                        'commit': 'wrong' if self.bad_nextest_identity else self.manifest['commit'],
+                        'tree': self.manifest['tree'], 'stdout': self.nextest_stdout, 'stderr': self.nextest_stderr}}).encode()
+            return
         for number in (1, 2):
             payloads = {'machine.json': {'commit': self.manifest['commit'],
                                         'archive_sha256': trial.mapping(self.manifest['sha256'])['hana-tests.tar.zst']},
@@ -887,7 +1103,7 @@ class FakeGpuAws:
 
     def execute(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                 timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        del capture_output, text, timeout, check, env
+        del capture_output, text, timeout, check
         if arguments[0] != 'aws':
             raise AssertionError('Unexpected external command: ' + str(arguments))
         offset = arguments.index('--region')
@@ -903,32 +1119,53 @@ class FakeGpuAws:
                 {'InstanceType': size, 'Location': region + 'a'}]}
         elif operation == 'describe-spot-price-history':
             size = arguments[arguments.index('--instance-types') + 1]
-            maximum = trial.settings().spot_max_usd_per_hour[size]
+            price = self.live_prices.get((region, size))
+            if price is None:
+                maximum = trial.settings().spot_max_usd_per_hour[size]
+                price = maximum * (2 if size in self.expensive else Decimal('0.5'))
             reply = {'SpotPriceHistory': [{'InstanceType': size, 'AvailabilityZone': region + 'a',
-                'SpotPrice': str(maximum * (2 if size in self.expensive else Decimal('0.5'))),
+                'SpotPrice': str(price),
                 'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat()}]}
         elif operation == 'put-object':
             key = arguments[arguments.index('--key') + 1]
             self.objects[key] = Path(arguments[arguments.index('--body') + 1]).read_bytes()
             reply = {}
+        elif operation == 'list-objects-v2':
+            prefix = arguments[arguments.index('--prefix') + 1]
+            self.events[-1] += ':' + prefix.rsplit('/', 1)[-1]
+            if self.result_list_error:
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    f'An error occurred ({self.result_list_error}) when calling ListObjectsV2')
+            reply = {'Contents': [{'Key': key} for key in sorted(self.objects) if key.startswith(prefix)][:1]}
         elif operation == 'get-object':
             if self.fail_result:
                 self.fail_result = False
                 return subprocess.CompletedProcess(arguments, 1, '', 'An error occurred (AccessDenied) when calling GetObject')
             key = arguments[arguments.index('--key') + 1]
             self.events[-1] += ':' + key.rsplit('/', 1)[-1]
+            if self.result_missing_codes:
+                code = self.result_missing_codes.pop(0)
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    f'aws: [ERROR]: An error occurred ({code}) when calling the GetObject operation: Not Found')
             if key not in self.objects:
-                return subprocess.CompletedProcess(arguments, 1, '', 'An error occurred (NoSuchKey) when calling GetObject')
+                return subprocess.CompletedProcess(arguments, 1, '', 'An error occurred (403) when calling GetObject')
             _ = Path(arguments[arguments.index('--key') + 2]).write_bytes(self.objects[key])
             reply = {}
         elif operation == 'export-credentials' and service == 'configure':
             reply = {'AccessKeyId': 'fixture-access', 'SecretAccessKey': 'fixture-secret'}
         elif operation == 'run-instances':
+            self.launch_attempt_limit = (env or {}).get('AWS_MAX_ATTEMPTS', '')
+            if self.launch_timeout:
+                raise subprocess.TimeoutExpired(arguments, 5)
+            launch = trial.mapping(cast(object, json.loads(arguments[arguments.index('--cli-input-json') + 1])))
+            size = str(launch['InstanceType'])
+            error = self.launch_errors.get((region, size), self.launch_error)
+            if error:
+                return subprocess.CompletedProcess(arguments, 1, '', error)
             if any(state != 'terminated' for state in self.instances.values()):
                 raise AssertionError('The next box started before confirmed termination')
-            launch = trial.mapping(cast(object, json.loads(arguments[arguments.index('--cli-input-json') + 1])))
+            self.on_launch(str(launch['ClientToken']))
             self.launches.append(launch)
-            size = str(launch['InstanceType'])
             self.events[-1] += ':' + size
             instance = 'i-fixture-' + str(len(self.launches))
             self.instances[instance] = 'running'
@@ -941,7 +1178,15 @@ class FakeGpuAws:
                     self.instances[instance] = 'terminated'
             reply = {}
         elif operation == 'describe-instances':
-            if '--filters' in arguments:
+            if 'Name=instance-lifecycle,Values=spot' in arguments:
+                reply = {'Reservations': [{'Instances': [
+                    {'InstanceId': f'fixture-{state}-{index}', 'InstanceType': size, 'State': {'Name': state}}
+                    for state, sizes in (('pending', self.pending_types.get(region, ())),
+                                         ('running', self.used_types.get(region, ())))
+                    if any(arg.startswith('Name=instance-state-name,Values=')
+                           and state in arg.partition('Values=')[2].split(',') for arg in arguments)
+                    for index, size in enumerate(sizes)]}]}
+            elif '--filters' in arguments:
                 reply = {'Reservations': []}
             else:
                 ids = arguments[arguments.index('--instance-ids') + 1:arguments.index('--output')]
@@ -963,14 +1208,31 @@ class GpuOnlineTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = write_config_fixture(conf.path('cloud_gate'), """spot_candidate_regions=us-east-1 us-east-2 us-west-2
+hana_gpu_instance_types=g4dn.2xlarge g6.2xlarge
+hana_gpu_spot_max_usd_per_hour={"g4dn.2xlarge":0.75,"g6.2xlarge":0.98}
+hana_gpu_lifetime_minutes=90
+gpu_size_trial_limit_usd=6
+gpu_size_trial_box_extra_usd=0.05
+# whole: 1..60
+gpu_size_trial_result_poll_s=10
+# range: 0..1
+gpu_size_trial_s3_list_usd_per_1000=0.005
+gpu_size_trial_gp3_usd_per_gib_month_by_region={}
+gpu_size_trial_root_gib=100
+expiry_schedule_minutes=1
+expiry_timeout_s=30
+gpu_size_trial_lifetime_minutes=60
+gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
+""")
+        _ = write_config_fixture(conf.path('hana_aws'), 'gp3_usd_per_gib_month=0.08\n')
+        self.costs({'ipv4_usd_per_month': '3.65'})
         candidates = conf.read('cloud_gate').words('spot_candidate_regions')
         region = candidates[0]
         self.folder = trial.trial_root() / 'gpu-trial'
         self.folder.mkdir(parents=True)
         limits = trial.settings()
-        prices = dict(list(limits.spot_max_usd_per_hour.items())[:2])
-        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_spot_max_usd_per_hour='
-                                  + json.dumps({key: str(value) for key, value in prices.items()}))
+        prices = limits.spot_max_usd_per_hour
         for name in ('source.tar', 'runtime.env', 'gpu-trial.nix', 'closure.json', 'request.json', 'gpu_trial_wrapper.py',
                      'hana-tests.tar.zst', 'closure.export'):
             _ = (self.folder / name).write_text('fixture ' + name)
@@ -983,7 +1245,7 @@ class GpuOnlineTests(CostFixture):
                        for name in (path.name,)}}
         trial.write_json(self.folder / 'manifest.json', manifest)
         self.fake = FakeGpuAws(manifest, tuple(prices), region)
-        api = AwsCli('fixture-scaler', 'us-east-1', 5, self.fake.execute)
+        api = AwsCli('fixture-scaler', 'us-east-1', 5, trial.gpu_aws_executor(self.fake.execute))
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(int(self.fake.now) - 1, (), 'fixture', builder_removed=True))
         gates = cloud_gate.GateWorker(api, self.book, self.settings, self.folder / 'sidecar',
@@ -993,11 +1255,480 @@ class GpuOnlineTests(CostFixture):
         self.deployment = {'bucket': 'fixture-bucket', 'deployment_id': 'fixture-deployment', 'regions': [
             {'region': candidate, 'template': 'lt-fixture', 'version': '1', 'image': 'ami-nixos',
              'security_group': 'sg-fixture', 'subnets': [{'id': 'subnet-fixture', 'zone': candidate + 'a'}]}
-            for candidate in candidates]}
+            for candidate in candidates], 'gpu_instance_types': ['g4dn.2xlarge', 'g6.2xlarge', 'g6.4xlarge']}
 
     def execute(self) -> None:
         with redirect_stdout(StringIO()):
             self.worker.execute(self.folder, self.deployment)
+
+    def nextest_cli(self, types: tuple[str, ...], arguments: tuple[str, ...]) -> tuple[int, str, str]:
+        self.fake.manifest['tree'] = 'b' * 40
+        self.fake.manifest['hana_nextest'] = {'arguments': arguments, 'instance_types': types}
+        self.fake.manifest['sha256'] = {name: checksum for name, checksum in
+            trial.mapping(self.fake.manifest['sha256']).items() if name not in
+            ('hana-tests.tar.zst', 'gpu_trial_wrapper.py', 'inventory.json')}
+        def prepared(repo: Path, commit: str, folder: Path, request: trial.HanaGpuNextestRequest) -> None:
+            self.fake.manifest['trial'] = folder.name
+            self.assertEqual(repo, self.root)
+            self.assertEqual(commit, 'a' * 40)
+            self.assertEqual(request.arguments, arguments)
+            self.assertEqual(request.instance_types, types)
+            for name in trial.mapping(self.fake.manifest['sha256']):
+                _ = shutil.copyfile(self.folder / name, folder / name)
+            (folder / 'cargo-home').mkdir()
+            trial.write_json(folder / 'manifest.json', self.fake.manifest)
+
+        def service(folder: Path, _directory: Path, _settings: Path, _execute: Callable[[Sequence[str]], int]) -> int:
+            try:
+                self.worker.execute(folder, self.deployment)
+            except (ValueError, OSError, AwsUnavailable):
+                return 1
+            finally:
+                self.assertFalse((folder / 'cargo-home').exists())
+                self.assertFalse((folder / 'closure.export').exists())
+            return 0
+
+        output, errors = StringIO(), StringIO()
+        with (mock.patch.object(trial, 'prepare_locked', side_effect=prepared),
+              mock.patch.object(trial, 'start_service', side_effect=service),
+              redirect_stdout(output), redirect_stderr(errors)):
+            code = trial.main(['nextest', '--repo', str(self.root), '--commit', 'a' * 40,
+                               '--instance-types', ','.join(types), '--', *arguments])
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_hana_nextest_uses_the_cheapest_offer_within_quota_and_settles(self) -> None:
+        types = ('g4dn.2xlarge', 'g6.2xlarge', 'g6.4xlarge')
+        _ = write_config_fixture(conf.path('cloud_gate'), 'hana_gpu_instance_types=' + ' '.join(types) + '\n'
+                                  + 'hana_gpu_spot_max_usd_per_hour={"g4dn.2xlarge":0.75,"g6.2xlarge":0.98,"g6.4xlarge":1.32}')
+        first, second, third = conf.read('cloud_gate').words('spot_candidate_regions')[:3]
+        self.fake.quotas = {first: 4, second: 8, third: 8}
+        self.fake.live_prices = {
+            (first, types[0]): Decimal('.01'), (first, types[1]): Decimal('.01'),
+            (second, types[0]): Decimal('.4'), (second, types[1]): Decimal('.2'), (second, types[2]): Decimal('.01'),
+            (third, types[0]): Decimal('.3'), (third, types[1]): Decimal('.25'), (third, types[2]): Decimal('.01'),
+        }
+        booked: list[ledger.GateReservation] = []
+        def before_launch(attempt: str) -> None:
+            booked.extend(row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt)
+
+        self.fake.on_launch = before_launch
+        code, output, errors = self.nextest_cli(types, ('--profile', 'ci', '--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        result = trial.mapping(cast(object, json.loads(output)))
+        launch, = self.fake.launches
+        booking, = booked
+        self.assertEqual(result, {'attempt': launch['ClientToken'], 'commit': 'a' * 40, 'tree': 'b' * 40,
+                                  'exit_code': 0, 'stdout': NEXTEST_PASSED, 'stderr': NEXTEST_PLAN})
+        self.assertEqual(launch['InstanceType'], 'g6.2xlarge')
+        self.assertEqual((booking.region, booking.usd_per_hour), (second, Decimal('.98')))
+        self.assertIsInstance(booking.state, ledger.GateLaunchPending)
+        settled, = self.book.read_snapshot().gate_reservations
+        self.assertIsInstance(settled.state, ledger.GateTerminated)
+        self.assertFalse(any(key.endswith('hana-tests.tar.zst') for key in self.fake.objects))
+
+    def test_hana_nextest_uses_only_types_from_the_saved_gate_deployment(self) -> None:
+        types = ('g4dn.2xlarge', 'g6.2xlarge')
+        self.fake.live_prices = {(self.fake.region, types[0]): Decimal('.2'),
+                                 (self.fake.region, types[1]): Decimal('.4')}
+        del self.deployment['gpu_instance_types']
+        code, _, errors = self.nextest_cli(types, ('--test', 'shader_variants'))
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
+        self.assertIn('Update the gate setup', errors)
+        self.assertEqual(self.fake.events, [])
+        self.deployment['gpu_instance_types'] = [types[1]]
+        code, _, errors = self.nextest_cli(types, ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        launch, = self.fake.launches
+        self.assertEqual(launch['InstanceType'], types[1])
+
+    def test_nextest_refuses_empty_selection_and_incomplete_pass_evidence(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        for arguments in (('--help',), ('--profile', 'ci'), ('--retries', '2'), ('--profile=ci', '--', '--skip', 'draws'),
+                          ('--test', 'shader_variants', '--no-tests=pass')):
+            with self.subTest(arguments=arguments):
+                code, output, errors = self.nextest_cli((size,), arguments)
+                self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
+                self.assertEqual(output, '')
+        self.assertEqual(self.fake.events, [])
+        for stdout, stderr, names in (('', '', ()),
+                (NEXTEST_PASSED, '    Starting 2 tests across 1 binary\n', ()),
+                (NEXTEST_PASSED, NEXTEST_PLAN, ('--', 'draws', 'missing', '--exact'))):
+            with self.subTest(stdout=stdout, stderr=stderr, names=names):
+                self.fake.nextest_stdout, self.fake.nextest_stderr = stdout, stderr
+                code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants', *names))
+                self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
+                self.assertEqual(output, '')
+                self.assertIn('has no passing test for the filter missing' if names
+                              else 'does not confirm that all selected tests passed', errors)
+
+    def test_launch_timeout_does_not_publish_arguments_or_signed_links(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.launch_timeout = True
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+        self.assertEqual(output, '')
+        self.assertEqual(errors.strip(), 'Hana GPU infrastructure failure: run-instances: TimeoutExpired')
+        folder = trial.trial_root() / str(self.fake.manifest['trial'])
+        self.assertEqual(trial.read_json(folder / 'run-error.json')['reason'], 'run-instances: TimeoutExpired')
+        launch = trial.read_json(folder / 'boxes' / size / 'launch.json')
+        self.assertEqual(set(launch), {'region', 'zone'})
+        self.assertNotIn('subnet-fixture', (folder / 'online.json').read_text())
+        booking, = self.book.read_snapshot().gate_reservations
+        self.assertIsInstance(booking.state, ledger.GateLaunchPending)
+
+    def test_nextest_retry_checks_bookings_from_previous_trial_ids(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.unconfirmed = True
+        first, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(first, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+        self.assertIn('termination remains unconfirmed', errors)
+        calls = self.fake.events.copy()
+        first_trial = self.fake.manifest['trial']
+        retry, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(retry, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+        self.assertNotEqual(self.fake.manifest['trial'], first_trial)
+        self.assertIn('Complete cleanup for that run, then retry.', errors)
+        self.assertEqual(self.fake.events, calls)
+
+    def test_hana_offer_checks_used_quota_and_rechecks_after_upload(self) -> None:
+        size = 'g6.2xlarge'
+        first, second, _third = conf.read('cloud_gate').words('spot_candidate_regions')
+        self.fake.quotas = {first: 8, second: 8}
+        self.fake.used_types[first] = ('g6.xlarge',)
+        self.fake.live_prices = {(first, size): Decimal('.2'), (second, size): Decimal('.4')}
+        upload = self.worker.artifacts
+        for changes, refusal in (('price', 'above the cap'), ('usage', 'available Spot quota'),
+                                 ('cost', 'LIST, root disk, and IPv4 cost $0.05414')):
+            with self.subTest(changes=changes):
+                def change_offer(folder: Path, online: dict[str, object]) -> None:
+                    self.assertEqual(online['region'], second)
+                    upload(folder, online)
+                    if changes == 'price':
+                        self.fake.live_prices[second, size] = Decimal('1.1')
+                    elif changes == 'usage':
+                        self.fake.used_types[second] = ('g6.xlarge',)
+                    else:
+                        _ = write_config_fixture(conf.path('cloud_gate'),
+                            'gpu_size_trial_gp3_usd_per_gib_month_by_region=' + json.dumps({second: 0.10}))
+
+                price_reads = self.fake.events.count('describe-spot-price-history')
+                with mock.patch.object(self.worker, 'artifacts', side_effect=change_offer):
+                    code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+                self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+                self.assertIn(refusal, errors)
+                if changes == 'cost':
+                    self.assertEqual(self.fake.events.count('describe-spot-price-history') - price_reads, 2)
+                self.fake.live_prices[second, size] = Decimal('.4')
+                _ = self.fake.used_types.pop(second, None)
+        self.assertEqual(self.fake.launches, [])
+        self.assertTrue(all(isinstance(row.state, ledger.GateAbsent)
+                            for row in self.book.read_snapshot().gate_reservations))
+
+    def test_hana_quota_counts_pending_and_running_instances_with_scaler_reads(self) -> None:
+        size = 'g6.2xlarge'
+        first, second, _third = conf.read('cloud_gate').words('spot_candidate_regions')
+        self.fake.quotas = {first: 20, second: 8}
+        self.fake.used_types[first] = ('g6.xlarge',)
+        self.fake.pending_types[first] = ('vt1.3xlarge',)
+        self.fake.live_prices = {(first, size): Decimal('.2'), (second, size): Decimal('.4')}
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        booking, = self.book.read_snapshot().gate_reservations
+        self.assertEqual(booking.region, second)
+        self.assertNotIn('describe-spot-instance-requests', self.fake.events)
+
+    def test_hana_expiry_reserves_each_async_attempt_and_retry_delay(self) -> None:
+        size = 'g6.2xlarge'
+        _ = write_config_fixture(conf.path('cloud_gate'), 'expiry_schedule_minutes=1\nexpiry_timeout_s=30')
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        started = int(self.fake.now)
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        launch, = self.fake.launches
+        booking, = self.book.read_snapshot().gate_reservations
+        tag_spec = ledger.rows(launch, 'TagSpecifications')[0]
+        tag_expiry = next(int(str(tag['Value'])) for tag in ledger.rows(tag_spec, 'Tags') if tag['Key'] == 'ExpiresAt')
+        self.assertEqual(tag_expiry, started + 90 * 60)
+        self.assertEqual(booking.expires, tag_expiry + 60 * 60 + 3 * 60 + 60 + 120 + 60)
+
+    def test_hana_refuses_when_list_disk_and_ipv4_exceed_the_extra_allowance(self) -> None:
+        size = 'g6.2xlarge'
+        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_box_extra_usd=0.045\n')
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
+        self.assertIn('LIST, root disk, and IPv4 cost', errors)
+        self.assertEqual(self.fake.launches, [])
+        self.assertFalse(self.book.read_snapshot().gate_reservations)
+
+    def test_hana_cost_check_uses_the_selected_regions_gp3_rate(self) -> None:
+        size = 'g6.2xlarge'
+        _first, second, _third = conf.read('cloud_gate').words('spot_candidate_regions')
+        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_gp3_usd_per_gib_month_by_region='
+                                 + json.dumps({second: 0.10}) + '\n')
+        self.fake.quotas = {second: 8}
+        self.fake.live_prices = {(second, size): Decimal('.20')}
+
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
+        self.assertIn('LIST, root disk, and IPv4 cost $0.05414 exceeds the $0.05 allowance', errors)
+        self.assertEqual(self.fake.launches, [])
+        self.assertFalse(self.book.read_snapshot().gate_reservations)
+
+    def test_hana_selects_ohio_when_frankfurt_costs_more_in_total(self) -> None:
+        size = 'g6.2xlarge'
+        ohio, frankfurt = 'us-east-2', 'eu-central-1'
+        self.deployment['regions'] = [
+            dict(row, region=region, subnets=[{'id': 'subnet-fixture', 'zone': region + 'a'}])
+            for row, region in zip(ledger.rows(self.deployment, 'regions'), (ohio, frankfurt))
+        ]
+        self.fake.quotas = {ohio: 8, frankfurt: 8}
+        for gp3_rate, frankfurt_spot in ((0.0952, '.20'), (0.088, '.439')):
+            with self.subTest(gp3_rate=gp3_rate, frankfurt_spot=frankfurt_spot):
+                _ = write_config_fixture(conf.path('cloud_gate'), 'spot_candidate_regions=eu-central-1 us-east-2\n'
+                                         + 'gpu_size_trial_gp3_usd_per_gib_month_by_region='
+                                         + json.dumps({frankfurt: gp3_rate}) + '\n')
+                self.fake.live_prices = {(ohio, size): Decimal('.44'), (frankfurt, size): Decimal(frankfurt_spot)}
+
+                code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+
+                self.assertEqual(code, 0, errors)
+                booking = self.book.read_snapshot().gate_reservations[-1]
+                self.assertEqual(booking.region, ohio)
+                self.assertIsInstance(booking.state, ledger.GateTerminated)
+
+    def test_hana_offer_selector_names_selection_and_no_eligible_offer(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        prices = {size: Decimal('.98')}
+
+        def select(offers: dict[str, Decimal], excluded_regions: Sequence[str] = ()
+                   ) -> trial.SelectedHanaGpuOffer | trial.NoEligibleHanaGpuOffer:
+            return self.worker.select_nextest_offer(self.deployment, offers, lifetime_minutes=90, root_gib=100,
+                extra_allowance=Decimal('.05'), excluded_regions=excluded_regions)
+
+        selected = select(prices)
+        self.assertIsInstance(selected, trial.SelectedHanaGpuOffer)
+        assert isinstance(selected, trial.SelectedHanaGpuOffer)
+        self.assertEqual(selected.region, self.fake.region)
+        self.assertEqual(selected.instance_type, size)
+        self.assertEqual(selected.zone, self.fake.region + 'a')
+        self.assertIsInstance(select(prices, [self.fake.region]), trial.NoEligibleHanaGpuOffer)
+        self.assertIsInstance(select({}), trial.NoEligibleHanaGpuOffer)
+
+    def test_hana_retries_in_another_region_after_a_spot_quota_refusal(self) -> None:
+        size = 'g6.2xlarge'
+        first, second, _third = conf.read('cloud_gate').words('spot_candidate_regions')
+        self.fake.quotas = {first: 8, second: 8}
+        self.fake.live_prices = {(first, size): Decimal('.2'), (second, size): Decimal('.4')}
+        self.fake.launch_errors[first, size] = (
+            'An error occurred (MaxSpotInstanceCountExceeded) when calling the RunInstances operation: fixture')
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        refused, launched = self.book.read_snapshot().gate_reservations
+        self.assertEqual((refused.region, launched.region), (first, second))
+        self.assertNotEqual(refused.attempt, launched.attempt)
+        self.assertIsInstance(refused.state, ledger.GateAbsent)
+        self.assertIsInstance(launched.state, ledger.GateTerminated)
+        self.assertEqual(self.fake.events.count('put-object'), 3)
+        self.assertNotIn('describe-spot-instance-requests', self.fake.events)
+
+    def test_hana_budget_includes_the_backstop_before_launch(self) -> None:
+        size = 'g6.2xlarge'
+        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_limit_usd=2.57')
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
+        self.assertIn('gpu_size_trial_limit_usd', errors)
+        self.assertEqual(self.fake.launches, [])
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
+
+    def test_launch_only_settles_documented_first_attempt_refusals(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        for error_code, retries, absent in (
+                ('UnauthorizedOperation', 0, True), ('MaxSpotInstanceCountExceeded', 0, True),
+                ('UnauthorizedOperation', 1, False), ('500', 0, False), ('503', 0, False),
+                ('InternalError', 0, False), ('ServiceUnavailable', 0, False),
+                ('InsufficientInstanceCapacity', 0, True), ('InsufficientInstanceCapacity', 1, False),
+                ('SpotMaxPriceTooLow', 0, False)):
+            with self.subTest(error_code=error_code, retries=retries):
+                self.fake.launch_error = (f'aws: [ERROR]: An error occurred ({error_code}) when calling the '
+                                          f'RunInstances operation (reached max retries: {retries}): fixture detail')
+                before = len(self.fake.events)
+                code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+                self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+                self.assertIn(f'run-instances: {error_code}', errors)
+                self.assertEqual(self.fake.launch_attempt_limit, '1')
+                booking = self.book.read_snapshot().gate_reservations[-1]
+                discovery = self.fake.events.index('run-instances', before)
+                self.assertEqual('describe-instances' in self.fake.events[discovery + 1:], not absent)
+                if absent:
+                    self.assertIsInstance(booking.state, ledger.GateAbsent)
+                else:
+                    self.assertIsInstance(booking.state, ledger.GateLaunchPending)
+                    self.book.resolve_gate(booking.attempt, ledger.GateAbsent(int(self.fake.now)))
+
+    def test_nextest_lists_the_exact_result_before_download(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.lose_nextest_result = True
+        attempt = ''
+
+        def launched(value: str) -> None:
+            nonlocal attempt
+            attempt = value
+            self.fake.objects[f'artifacts/gpu-size-trial/{attempt}/finished.json.extra'] = b'fixture'
+
+        def publish(seconds: float) -> None:
+            self.fake.pause(seconds)
+            self.fake.lose_nextest_result = False
+            self.fake.results(attempt, size)
+
+        self.fake.on_launch = launched
+        with mock.patch.object(self.worker.gates, 'pause', side_effect=publish):
+            code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(self.fake.events.count('list-objects-v2:finished.json'), 2)
+        self.assertEqual(self.fake.events.count('get-object:finished.json'), 1)
+
+    def test_nextest_preserves_result_list_and_download_errors(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        for list_fails in (True, False):
+            with self.subTest(list_fails=list_fails):
+                self.fake.result_list_error = '403' if list_fails else ''
+                self.fake.fail_result = not list_fails
+                code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+                self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
+                message = 'list-objects-v2: 403' if list_fails else 'get-object: AccessDenied'
+                self.assertIn(message, errors)
+
+    def test_nextest_reads_a_result_once_more_after_the_stop_time(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.lose_nextest_result = True
+        deadline = self.fake.now + 90 * 60
+        attempt = ''
+
+        def launched(value: str) -> None:
+            nonlocal attempt
+            attempt = value
+            self.fake.now = deadline - 61
+
+        def publish(seconds: float) -> None:
+            self.fake.now += .5
+            self.assertLess(self.fake.now, deadline)
+            self.fake.lose_nextest_result = False
+            self.fake.results(attempt, size)
+            self.fake.pause(seconds)
+
+        self.fake.on_launch = launched
+        with mock.patch.object(self.worker.gates, 'pause', side_effect=publish) as pause:
+            code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        pause.assert_called_once()
+        self.assertGreaterEqual(self.fake.now, deadline)
+        self.assertEqual(self.fake.events.count('list-objects-v2:finished.json'), 2)
+        self.assertEqual(self.fake.events.count('get-object:finished.json'), 1)
+
+    def test_nextest_uses_the_gpu_result_poll_interval(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.result_missing_codes = ['404', 'NoSuchKey']
+
+        with mock.patch.object(self.worker.gates, 'pause', wraps=self.fake.pause) as pause:
+            code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(pause.call_args_list, [mock.call(10), mock.call(10)])
+
+    def test_nextest_collects_results_after_s3_reports_missing_object(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.result_missing_codes = ['404', 'NoSuchKey']
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(trial.mapping(cast(object, json.loads(output)))['exit_code'], 0)
+        self.assertEqual(self.fake.events.count('get-object:finished.json'), 3)
+
+    def test_nextest_counts_a_successful_retry_as_the_original_test(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.nextest_stdout = NEXTEST_PASSED.replace(
+            '"event":"ok","name":"fixture::shader_variants$draws"',
+            '"event":"ok","name":"fixture::shader_variants$draws#2"')
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants', '--', 'draws', '--exact'))
+        self.assertEqual(code, 0, errors)
+        result = trial.mapping(cast(object, json.loads(output)))
+        self.assertEqual(result['stdout'], self.fake.nextest_stdout)
+
+    def test_expiry_backstop_fits_reservation_and_guest_arms_before_import(self) -> None:
+        size = 'g6.2xlarge'
+        schedule, timeout = 60, 30
+        _ = write_config_fixture(conf.path('cloud_gate'),
+                                 f'expiry_schedule_minutes={schedule}\nexpiry_timeout_s={timeout}')
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, 0, errors)
+        launch, = self.fake.launches
+        booking, = self.book.read_snapshot().gate_reservations
+        tag_spec = ledger.rows(launch, 'TagSpecifications')[0]
+        tag_expiry = next(int(str(tag['Value'])) for tag in ledger.rows(tag_spec, 'Tags') if tag['Key'] == 'ExpiresAt')
+        self.assertLessEqual(tag_expiry + schedule * 60 + timeout, booking.expires)
+        bootstrap = base64.b64decode(str(launch['UserData'])).decode()
+        root = self.root / 'guest-root'
+        tools = self.root / 'guest-commands'
+        tools.mkdir()
+        for name, script in (('date', f'echo {booking.at}'), ('systemd-run', 'printf "%s\\n" "$@"; exit 1')):
+            command = tools / name
+            _ = command.write_text('#!/bin/sh\n' + script + '\n')
+            command.chmod(0o700)
+        bootstrap = bootstrap.replace('export PATH=/run/current-system/sw/bin:$PATH', 'export PATH=' + str(tools) + ':$PATH')
+        bootstrap = bootstrap.replace('/var/lib/gpu-size-trial', str(root))
+        result = subprocess.run(['sh'], input=bootstrap, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(root.exists())
+        stop = next(int(line.removeprefix('--on-calendar=@')) for line in result.stdout.splitlines()
+                    if line.startswith('--on-calendar=@'))
+        self.assertEqual(stop, tag_expiry)
+
+    def test_hana_nextest_above_price_cap_refuses_before_launch(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('1')}
+        code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+        self.assertEqual(output, '')
+        self.assertIn('applied quota and price cap', errors)
+        self.assertEqual(self.fake.launches, [])
+        self.assertEqual(self.fake.objects, {})
+
+    def test_hana_nextest_failure_and_invalid_results_terminate_the_box(self) -> None:
+        size = 'g6.2xlarge'
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.nextest_exit = 100
+        for publish, valid, expected in ((True, True, 100), (False, True, trial.NEXTEST_INFRASTRUCTURE_EXIT),
+                                        (True, False, trial.NEXTEST_INFRASTRUCTURE_EXIT)):
+            with self.subTest(publish=publish, valid=valid):
+                self.fake.lose_nextest_result = not publish
+                self.fake.bad_nextest_identity = not valid
+                code, output, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+                self.assertEqual(code, expected, errors)
+                if publish and valid:
+                    result = trial.mapping(cast(object, json.loads(output)))
+                    self.assertEqual(result['exit_code'], 100)
+                else:
+                    self.assertEqual(output, '')
+                    self.assertIn('without a result' if not publish else 'wrong attempt or source identity', errors)
+                latest = self.fake.launches[-1]['ClientToken']
+                settled, = [row for row in self.book.read_snapshot().gate_reservations if row.attempt == latest]
+                self.assertIsInstance(settled.state, ledger.GateTerminated)
 
     def test_online_completion_keeps_results_and_removes_large_inputs(self) -> None:
         self.execute()
@@ -1181,6 +1912,31 @@ class GpuOnlineTests(CostFixture):
             self.assertEqual(trial.mapping(trial.mapping(cast(list[object], launch['BlockDeviceMappings'])[0])['Ebs'])['VolumeSize'],
                              conf.read('cloud_gate').whole('gpu_size_trial_root_gib'))
 
+    def test_comparison_reads_result_and_archives_once_more_at_the_deadline(self) -> None:
+        size = self.fake.types[0]
+        attempt = 'fixture-attempt'
+        box = self.folder / 'boxes' / size
+        box.mkdir(parents=True)
+        deadline = int(self.fake.now) + 7
+        request: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'stop_at': deadline}
+
+        def publish(seconds: float) -> None:
+            self.fake.now += 4
+            self.assertLess(self.fake.now, deadline)
+            self.fake.results(attempt, size)
+            self.fake.pause(seconds - 4)
+
+        with mock.patch.object(self.worker.gates, 'pause', side_effect=publish) as pause:
+            self.worker.collect(self.folder, box, request, {'bucket': 'fixture-bucket'}, 10)
+
+        self.assertEqual(trial.read_json(box / 'result.json')['status'], 'complete')
+        pause.assert_called_once_with(7)
+        self.assertEqual(self.fake.now, deadline)
+        for name in ('finished.json', 'result-1.tar.gz', 'result-2.tar.gz'):
+            self.assertEqual(self.fake.events.count('list-objects-v2:' + name), 2)
+            self.assertEqual(self.fake.events.count('get-object:' + name), 1)
+        self.assertTrue((self.folder / 'machines' / size / '2/samples/test.json').exists())
+
     def test_budget_counts_previous_open_reservation(self) -> None:
         artifacts = self.worker.artifacts
         def uploaded(folder: Path, online: dict[str, object]) -> None:
@@ -1203,6 +1959,61 @@ class GpuOnlineTests(CostFixture):
         self.assertEqual(len(self.book.read_snapshot().gate_reservations), 1)
         self.execute()
         self.assertEqual(self.fake.launches, [])
+
+    def test_comparison_launches_with_an_unrelated_open_booking_inside_budget(self) -> None:
+        now = int(self.fake.now)
+        reservation = ledger.GateReservation('unrelated', now, now + 600, Decimal('.2'), Decimal(0),
+                                              region=self.fake.region, instance_type='m7a.4xlarge')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, reservation), ledger.GateReserved)
+        self.execute()
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], list(self.fake.types))
+        earlier, *comparison = self.book.read_snapshot().gate_reservations
+        self.assertTrue(ledger.gate_is_open(earlier))
+        self.assertTrue(all(isinstance(row.state, ledger.GateTerminated) for row in comparison))
+
+    def test_comparison_tries_the_next_size_after_a_capacity_refusal(self) -> None:
+        first, second = self.fake.types
+        self.fake.launch_errors[self.fake.region, first] = (
+            'An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture')
+        self.execute()
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], [second])
+        refused, launched = self.book.read_snapshot().gate_reservations
+        self.assertIsInstance(refused.state, ledger.GateAbsent)
+        self.assertIsInstance(launched.state, ledger.GateTerminated)
+        self.assertEqual(trial.read_json(self.folder / 'boxes' / first / 'outcome.json')['status'], 'refused')
+
+    def test_comparison_resumes_a_capacity_refusal_before_or_after_settlement(self) -> None:
+        first, second = self.fake.types
+        self.fake.launch_errors[self.fake.region, first] = (
+            'An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture')
+        box = self.folder / 'boxes' / first
+        result_path, outcome_path = box / 'result.json', box / 'outcome.json'
+        with (mock.patch.object(self.book, 'resolve_gate', side_effect=OSError('settlement interrupted')),
+              mock.patch.object(self.worker, 'cleanup', return_value=True),
+              self.assertRaisesRegex(OSError, 'settlement interrupted')):
+            self.execute()
+
+        result = trial.read_json(result_path)
+        self.assertEqual(result['status'], 'refused')
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+        save = cloud_gate.save
+
+        def interrupt_outcome(path: Path, row: dict[str, object]) -> None:
+            if path == outcome_path:
+                raise OSError('outcome interrupted')
+            save(path, row)
+
+        with (mock.patch.object(cloud_gate, 'save', side_effect=interrupt_outcome),
+              self.assertRaisesRegex(OSError, 'outcome interrupted')):
+            self.execute()
+
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+        self.assertFalse(outcome_path.exists())
+        self.execute()
+        self.assertEqual(trial.read_json(outcome_path), result)
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], [second])
+        self.assertEqual([event for event in self.fake.events if event.startswith('run-instances')],
+                         ['run-instances', 'run-instances:' + second])
 
     def test_restart_reuses_trial_and_does_not_repeat_the_first_launch(self) -> None:
         self.fake.fail_result = True
