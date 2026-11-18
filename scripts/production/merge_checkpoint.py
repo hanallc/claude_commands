@@ -554,13 +554,19 @@ def record_publication_changes(production: ProductionDocument, *, report_unchang
             checkpoint_gate.report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
     try:
-        rows = change_review.list_ready(production.checkout, production.doc, production.merge_branch, record=record,
-                                        known_producer=known_producer)
+        rows = change_review.list_ready_rows(production.checkout, production.doc, production.merge_branch, record=record,
+                                             known_producer=known_producer)
     except (change_review.ChangeReviewError, OSError) as error:
         checkpoint_gate.report("change review", "failed", f"{doc} not written: {error}; retry after the repair")
         return
-    if rows or report_unchanged:
-        checkpoint_gate.report("change review", "ok", f"{len(rows)} row(s) added to {doc}" + "".join(f"; {row}" for row in rows))
+    rows_by_list: dict[Path, list[str]] = {}
+    for row in rows:
+        rows_by_list.setdefault(row.list_path, []).append(row.markdown)
+    if not rows and report_unchanged:
+        rows_by_list[doc] = []
+    for path, written in rows_by_list.items():
+        checkpoint_gate.report("change review", "ok",
+                               f"{len(written)} row(s) added to {path}" + "".join(f"; {row}" for row in written))
 
 
 def merge_paths(checkout: Path, base: str, tip: str) -> tuple[str, ...]:

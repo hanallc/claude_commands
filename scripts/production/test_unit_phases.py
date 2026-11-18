@@ -789,7 +789,7 @@ class UnitPhasesTests(unittest.TestCase):
             {"event_type": "activity_started", "phase_instance_id": "images", "activity": "write the card"},
             {"event_type": "checkpoint", "phase_instance_id": "images", "checkpoint_commit": "c" * 40},
             {"event_type": "eta_stated", "phase_instance_id": "images", "eta_phase_id": "images"}]
-        failed: land_runs.LandResult = {"commit": "c" * 40, "production": "show", "unit": "shells", "phase": "images",
+        failed: land_runs.LandResult = {"commit": "c" * 40, "production": "sdlc", "unit": "shells", "phase": "images",
             "landed": False, "step": "red", "state": "failed", "detail": "test_cards red\nmore",
             "time": "2026-11-15T17:50:00+00:00"}
         landed: land_runs.LandResult = {**failed, "landed": True, "step": "", "state": "", "detail": ""}
@@ -808,6 +808,8 @@ class UnitPhasesTests(unittest.TestCase):
             (land_queue.LandView({}, second, {"c" * 40: landed}, frozenset(), {}), "2nd in sdlc's merge line"),
             (land_queue.LandView({}, {}, {"c" * 12: failed}, frozenset(), {}),
              "sdlc cannot merge it: test_cards red"),
+            (land_queue.LandView({}, {}, {"c" * 12: {**failed, "production": "builds"}}, frozenset(), {}),
+             "builds cannot merge it: test_cards red"),
             (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), {}), ""),
             (land_queue.LandView({"c" * 40: "shells images"}, second, {"c" * 40: failed}, frozenset(), {}), "sdlc merges it now"),
             (land_queue.LandView({}, {}, {}, frozenset(), carrier), "3rd in sdlc's merge line"),
@@ -1030,6 +1032,11 @@ class UnitPhasesTests(unittest.TestCase):
         targets = [fixture_member("unit", name=name, parent=foreign_owner.id,
                                   worktree=staff.PresentWorktree("natedev", self.root / name))
                    for name in ("aws", "aws-other")]
+        cross_repo_tree = self.root / "cross-repo"
+        _ = subprocess.run(["git", "-C", str(foreign), "worktree", "add", "--detach", str(cross_repo_tree)],
+                           check=True, capture_output=True)
+        targets.append(fixture_member("unit", name="cross-repo", parent=owner.id,
+                                      worktree=staff.PresentWorktree(remote.local_machine(), cross_repo_tree)))
         for target in targets:
             _ = self.write_run(target, target.name, [("spendtool", "Spend tool")], [
                 self.phase_event("checkpoint", "spendtool", checkpoint_commit=foreign_commit)])
@@ -1042,7 +1049,8 @@ class UnitPhasesTests(unittest.TestCase):
             _ = self.queue(member, unit_queue.QueuedItem("follow: Review delivery", base),
                 unit_queue.QueuedItem("copy: Review copy", "handler/open-copied"),
                 unit_queue.QueuedItem("aws: Review AWS", "aws/spendtool"),
-                unit_queue.QueuedItem("other: Review other", "aws-other/spendtool"))
+                unit_queue.QueuedItem("other: Review other", "aws-other/spendtool"),
+                unit_queue.QueuedItem("cross: Review cross-repo delivery", "cross-repo/spendtool"))
         listing = live_units.UnitListing([unit(member.name, live(member.name)) for member in members], ())
         for running in (False, True):
             with self.subTest(running=running):
@@ -1074,7 +1082,8 @@ class UnitPhasesTests(unittest.TestCase):
                     expected = "cargo-liner merges it now" if running else "1st in cargo-liner's merge line"
                     self.assertTrue(any(row.work == "Pending work (pending)" and row.state == expected for row in rows), rows)
                     self.assertIn(("Next", "Review delivery (follow)", "Ready"), rows)
-                    for work in ("Review copy (copy)", "Review AWS (aws)", "Review other (other)"):
+                    for work in ("Review copy (copy)", "Review AWS (aws)", "Review other (other)",
+                                 "Review cross-repo delivery (cross)"):
                         self.assertTrue(any(row.work == work and row.state == "Ready" for row in rows), rows)
                     self.assertTrue(any(row.work == "Later delivery (later)" and row.state == "Not started"
                                         for row in rows), rows)
@@ -1082,13 +1091,13 @@ class UnitPhasesTests(unittest.TestCase):
                 for reads in (lands, merges, identities):
                     self.assertCountEqual([call.args[0] for call in reads.call_args_list], [repository, foreign])
                 self.assertEqual([call.args[0] for call in sources.call_args_list], [owner.name, foreign_owner])
-                self.assertEqual(len(run_reads.call_args_list), 4)
-                self.assertEqual(len({call.args[0] for call in run_reads.call_args_list}), 4)
+                self.assertEqual(len(run_reads.call_args_list), 5)
+                self.assertEqual(len({call.args[0] for call in run_reads.call_args_list}), 5)
                 self.assertEqual(sum(call.args[1] == checkpoint for call in copies.call_args_list), 1)
                 self.assertTrue(all(call.args[0] == repository for call in copies.call_args_list))
                 self.assertCountEqual([(call.args[0], call.kwargs["repo"]) for call in dependencies.call_args_list],
                     [(base, repository), ("handler/open-copied", repository), ("aws/spendtool", foreign),
-                     ("aws-other/spendtool", foreign)])
+                     ("aws-other/spendtool", foreign), ("cross-repo/spendtool", foreign)])
 
     def test_finished_phases_use_merge_subjects_and_results_with_other_hashes(self) -> None:
         member = self.member("finished")

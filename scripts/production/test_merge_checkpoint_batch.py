@@ -10,6 +10,8 @@ import subprocess
 import unittest
 from typing import final
 
+from scripts.production import staff
+from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment,
@@ -63,19 +65,35 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
         return merges
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
-        for wrapper_fails in (False, True):
-            with self.subTest(wrapper_fails=wrapper_fails):
+        for outcome in ("shared list", "push failure", "separate lists"):
+            with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
+                self.push = "git"
                 self.promotions = str(self.promote)
                 review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
                 self.production_doc(change_review=review)
+                beta_review = review
+                beta_log = self.log
+                if outcome == "separate lists":
+                    other_checkout = self.root / "other-production"
+                    _ = self.git("init", "-b", "main", str(other_checkout))
+                    other_doc = self.root / "other-production.md"
+                    beta_review = review.with_name("change-review - other.md")
+                    beta_log = other_checkout / "production.log"
+                    _ = other_doc.write_text(f"- **Repository:** `{other_checkout}`\n"
+                                           + f"- **Showrunner checkout:** `{other_checkout}`\n"
+                                           + "- **Merge branch:** main\n- **Log:** production.log\n"
+                                           + f"- **Change review:** `{beta_review}`\n")
+                    owner = recorded_showrunner("other", other_doc)
+                    beta = unit_membership("example", "beta")
+                    _ = staff.move(beta.id, staff.ReportsTo(owner.id))
                 start = self.git("rev-parse", "HEAD")
                 first = self.checkpoint(subject="checkpoint(alpha): batch change\n\n"
                                         + "Change-Review: Alpha changes | Open alpha | The alpha change appears | image 012345abcdef")
                 second = self.beta_checkpoint("src/beta.txt", "beta batch change\n", visible=True)
-                if wrapper_fails:
+                if outcome == "push failure":
                     self.push = "validate_and_push"
                     self.production_doc(change_review=review)
                     self.executable(self.bin / "validate_and_push.sh", STUB + """
@@ -87,7 +105,7 @@ subprocess.run(["git", "push", origin, "HEAD:refs/heads/production"],
 raise SystemExit(1)
 """)
                 result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second)])
-                if wrapper_fails:
+                if outcome == "push failure":
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     tip = self.git("rev-parse", "production", cwd=self.origin)
                     self.assertNotEqual(tip, start)
@@ -112,9 +130,15 @@ raise SystemExit(1)
                     self.assertEqual([call[call.index("--unit") + 1] for call in self.events("review_regime.py")],
                                      ["alpha", "beta"])
                     self.assertIn("Alpha changes", review.read_text())
-                    self.assertIn("Beta changes", review.read_text())
+                    self.assertIn("Beta changes", beta_review.read_text())
                     self.assertIn("alpha phase 2", self.log.read_text())
-                    self.assertIn("beta phase 2", self.log.read_text())
+                    self.assertIn("beta phase 2", beta_log.read_text())
+                    if outcome == "separate lists":
+                        lines = [line for line in result.stdout.splitlines() if "row(s) added to" in line]
+                        self.assertEqual(len(lines), 2, result.stdout)
+                        for path, change in ((review, "Alpha changes"), (beta_review, "Beta changes")):
+                            self.assertTrue(any(f"1 row(s) added to {path}; | C1 | {change} |" in line
+                                                for line in lines), lines)
 
     def test_rerun_resumes_promotion_of_merged_items_before_new_items_land(self) -> None:
         self.promotions = str(self.promote) + " — live checkout"

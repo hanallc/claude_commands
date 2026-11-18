@@ -40,6 +40,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.style import style_config
 from scripts.direct import phase_table, phase_waits
 from scripts.direct import plan_history
+from scripts.worktree import worktrees
 
 from scripts.production import display_cells, land_queue, land_runs
 from scripts.production import unit_queue, waits_on
@@ -448,6 +449,7 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
     if isinstance(state, land_queue.InLine):
         return f"{ordinal(state.place.number)} in {actor}'s merge line"
     if isinstance(state, land_queue.LandEnded) and not state.result["landed"]:
+        actor = state.result["production"] or actor
         detail = state.result["detail"].strip()
         conflicts = re.findall(r"Merge conflict in (\S+)", detail)
         cause = ("merge conflict in " + ", ".join(dict.fromkeys(conflicts)) if conflicts else
@@ -571,7 +573,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     for phase, result in newest_results.items():
         if (not result["landed"] and phase not in open_sent and phase not in queued and phase not in merging
                 and not on_main(result["commit"])):
-            parts.append(WorkItem(named(phase), merge_state_text(land_queue.LandEnded(result), production or result["production"])))
+            parts.append(WorkItem(named(phase), merge_state_text(land_queue.LandEnded(result), production)))
             pending = True
     return UnitMergeNotes(frozenset(grouped), tuple(parts), pending, frozenset(wait_targets))
 
@@ -1429,8 +1431,13 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
     plan_failures: dict[Path, OSError | UnicodeError] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
-    wait_states: dict[str, waits_on.WaitState] = {}
+    wait_states: dict[tuple[Path, str], waits_on.WaitState] = {}
     dependency_members = {row.name: row for row in staff.active(snapshot, "unit")}
+    unit_repositories: dict[staff.StaffId, Path] = {}
+    try:
+        evidence[worktrees.main_checkout(repository)] = current_evidence
+    except worktrees.Refused:
+        pass
 
     def read_run(path: Path) -> list[dict[str, object]]:
         if path not in events:
@@ -1451,29 +1458,41 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             queues[identity] = read_work_queue(identity)
         return queues[identity]
 
-    def dependency_evidence(after: str) -> RepositoryEvidence:
-        unit_name, slash, phase = after.partition("/")
-        member = dependency_members.get(unit_name) if slash and phase else None
-        if member is None:
-            return current_evidence
+    def unit_repository(member: staff.StaffRow) -> Path:
+        tree = member.worktree
+        if isinstance(tree, staff.PresentWorktree) and local_worktree_exists(tree):
+            try:
+                return worktrees.main_checkout(tree.path)
+            except worktrees.Refused:
+                pass
         owner = snapshot.parent_of(member)
         if owner is None:
-            return current_evidence
+            return repository
         if owner.id not in owner_repositories:
             try:
                 owner_repositories[owner.id] = read_production(owner).checkout
             except (OSError, ValueError, Refusal):
                 owner_repositories[owner.id] = repository
-        return repository_evidence(owner_repositories[owner.id])
+        return owner_repositories[owner.id]
 
-    def wait_state(after: str) -> waits_on.WaitState:
-        if after not in wait_states:
-            target = dependency_evidence(after)
+    def dependency_evidence(after: str, viewer: live_units.LiveUnit) -> RepositoryEvidence:
+        unit_name, slash, phase = after.partition("/")
+        target = dependency_members.get(unit_name) if slash and phase else None
+        member = target if target is not None else viewer.member
+        if not isinstance(member, staff.StaffRow):
+            return current_evidence
+        if member.id not in unit_repositories:
+            unit_repositories[member.id] = unit_repository(member)
+        return repository_evidence(unit_repositories[member.id])
+
+    def wait_state(after: str, target: RepositoryEvidence) -> waits_on.WaitState:
+        key = (target.repository, after)
+        if key not in wait_states:
             found = waits_on.state(after, repo=target.repository, snapshot=snapshot, read_run=read_run)
             if isinstance(found, waits_on.PhaseSent | waits_on.NotOnMain) and target.on_main(found.commit):
                 found = waits_on.OnMain(found.commit)
-            wait_states[after] = found
-        return wait_states[after]
+            wait_states[key] = found
+        return wait_states[key]
 
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
     newest = newest_unit_runs(unit_snapshot)
@@ -1572,8 +1591,9 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                            production=production_name, merged_ids=frozenset(merged_phases), dropped_ids=dropped)
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
-        next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan, wait_state=wait_state,
-                              dependency_land=lambda after: dependency_evidence(after).land, now=now, zone=zone,
+        next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan,
+                              wait_state=lambda after: wait_state(after, dependency_evidence(after, unit)),
+                              dependency_land=lambda after: dependency_evidence(after, unit).land, now=now, zone=zone,
                               unit_waits=tuple(wait for wait in waits if wait.target not in merge.wait_targets),
                               unit=unit.unit, events=run_events, facts=facts)
         tasks = tuple(task for phase in phases if isinstance(open_sent[phase.phase], NoSentWork)

@@ -2338,10 +2338,25 @@ def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
     return frozenset(foreign)
 
 
+@dataclass(frozen=True)
+class WrittenReviewRow:
+    list_path: Path
+    markdown: str
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
                known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
+    """Return the Markdown for the rows written to the review lists."""
+    return [row.markdown for row in list_ready_rows(repo, production, merge_branch, review_list=review_list,
+                                                   record=record, selection=selection, known_producer=known_producer)]
+
+
+def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
+                    review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
+                    selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+                    known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
     try:
@@ -2376,7 +2391,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside = _reviewed_merge_refs_by_doc(repo, lambda: outside_docs, record=record)
     outside_refs = set(outside.values())
     foreign = _foreign_merges(repo, outside, production, merge_branch, record)
-    rows: list[str] = []
+    rows: list[WrittenReviewRow] = []
     matched_step = False
     recorded = checkpoint_producers(record)
     for entry in merges:
@@ -2461,9 +2476,10 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
-            rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
-                                    on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem))
+            written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
+                                  on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                  merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+            rows.extend(WrittenReviewRow(path, row) for row in written)
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
