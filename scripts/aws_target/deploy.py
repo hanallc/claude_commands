@@ -195,9 +195,15 @@ class HanaSetupChange:
     """Allow the stack changes needed for setup."""
 
 
+class HanaBoxOwnership(StrEnum):
+    STACK = 'stack'
+    DIRECT = 'direct'
+
+
 @dataclass(frozen=True)
 class HanaPolicyUpdate:
     resource_outputs: dict[str, str]
+    ownership: HanaBoxOwnership = HanaBoxOwnership.DIRECT
 
 
 HANA_SETUP_CHANGE = HanaSetupChange()
@@ -386,6 +392,28 @@ def _save_hana_setup(path: Path, saved: dict[str, object]) -> None:
 def _hana_parameter_hash(parameters: dict[str, str]) -> str:
     return sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()
 
+
+def _hana_setup_ownership(saved: dict[str, object]) -> HanaBoxOwnership:
+    version = saved.get('version')
+    generation = saved.get('generation')
+    resource_fields = ('instance', 'spot_request', 'data_volume', 'bucket')
+    text_fields = (*resource_fields, 'deployment', 'region', 'stack', 'parameters_sha256', 'template_sha256')
+    if (type(version) is int and version == 1 and saved.keys() == {*text_fields, 'version', 'requested', 'generation'}
+            and saved['requested'] is True and type(generation) is int and generation >= 0
+            and all(isinstance(saved[key], str) and saved[key] for key in text_fields)):
+        return HanaBoxOwnership.STACK
+    if (type(version) is not int or version != HANA_SETUP_VERSION) and any(
+            key in saved for key in (*resource_fields, 'launch_template', 'security_group', 'pending_launch', 'pending_volume')):
+        raise DeploymentRefused('The saved Hana setup uses stack-owned resources. ' + HANA_DOWN_FIRST)
+    return HanaBoxOwnership.DIRECT
+
+
+def _print_hana_placement(workload: conf.ConfigRead) -> None:
+    enabled = workload.text('enabled')
+    if enabled not in ('on', 'off'):
+        raise ValueError('enabled must be on or off')
+    state = 'enabled' if enabled == 'on' else 'disabled'
+    print(f'Hana placement is {state}. This command does not change it.')
 
 
 def deployment_parameters(path: Path, settings: DeploymentSettings,
@@ -597,7 +625,7 @@ class Deployment:
         print(f'Hana plan: separate stack; {limits.instance_type}; persistent Spot; interruption stop')
         print(f'Hana plan: root {limits.root_gib} GiB; data {limits.data_gib} GiB; compute ceiling ${limits.spot_max_usd_per_hour}/hour')
         print('Hana resources: instance, retained data disk, launch template, security group, private control bucket, scaler policy')
-        print('Hana placement remains disabled')
+        _print_hana_placement(workload)
         if not approve_resources:
             return False
         stop_timeout = workload.whole('stop_wait_timeout_s')
@@ -609,9 +637,9 @@ class Deployment:
         with control_lock(self.directory):
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
-            if (saved.get('version') != HANA_SETUP_VERSION
-                    and any(saved.get(key) for key in ('instance', 'spot_request', 'data_volume'))):
-                raise DeploymentRefused('The saved Hana setup uses stack-owned resources. ' + HANA_DOWN_FIRST)
+            ownership = _hana_setup_ownership(saved)
+            if ownership is HanaBoxOwnership.STACK:
+                return self._update_stack_owned_hana(path, saved, workload, limits)
             settings, parameters, template = self._hana_inputs(workload)
             if not saved:
                 prepared = cast(object, json.loads((child.output / 'parameters.json').read_text()))
@@ -668,35 +696,8 @@ class Deployment:
                         or outputs['SecurityGroup'] != saved['security_group']):
                     raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
                 resources = {key: outputs[key] for key in output_names}
-                try:
-                    registration = remote.read_record(path.with_name('lifecycle.json'))
-                except FileNotFoundError:
-                    raise DeploymentRefused('The saved Hana setup has no lifecycle registration. Complete approved setup first.') from None
-                if registration.get('version') != 1 or registration.get('identity') != {
-                        key: ledger.text(saved, key) for key in ('deployment', 'instance', 'spot_request', 'region')}:
-                    raise DeploymentRefused('The Hana lifecycle registration differs from the saved setup.')
-                identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], ledger.text(saved, 'instance'),
-                                                       ledger.text(saved, 'spot_request'), settings.region)
-                retry = 'Run hana-setup again when the box is idle.'
-                operation = registration.get('operation', {})
-                observing = (isinstance(operation, dict)
-                             and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
-                if (registration.get('state') != hana_box.Lifecycle.IDLE_STOPPED or registration.get('claims') != []
-                        or registration.get('start', {}) is not None or (operation is not None and not observing)):
-                    raise DeploymentRefused('The Hana lifecycle is busy. ' + retry)
                 api = self._api(settings)
-                try:
-                    observed = api.observe(identity.instance, int(self.clock()))
-                except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
-                    raise DeploymentRefused('Setup could not confirm the Hana instance is stopped. ' + retry) from None
-                if observed.state != 'stopped':
-                    raise DeploymentRefused('The Hana instance must be stopped. ' + retry)
-                volume = ledger.text(saved, 'data_volume')
-                volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume), 'Volumes')
-                attachments = ledger.rows(volumes[0], 'Attachments') if len(volumes) == 1 and volumes[0].get('VolumeId') == volume else ()
-                if (len(attachments) != 1 or attachments[0].get('InstanceId') != identity.instance
-                        or attachments[0].get('Device') != HANA_DATA_DEVICE or attachments[0].get('State') != 'attached'):
-                    raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
+                identity = self._idle_hana_policy_identity(api, path, saved)
                 provider = self._hana_provider()
                 print('hana-setup probe: before the policy update')
                 _ = self._probe_hana_scaler(provider, identity)
@@ -818,8 +819,99 @@ class Deployment:
         identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region)
         hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
             clock=self.clock).register(identity)
-        print('Hana setup complete: the box is stopped; placement remains disabled')
+        print('Hana setup complete. The box is stopped.')
+        _print_hana_placement(workload)
         return self._probe_hana_scaler(provider, identity)
+
+    def _update_stack_owned_hana(self, path: Path, saved: dict[str, object], workload: conf.ConfigRead,
+                                 limits: hana_spend.PermitSettings) -> bool:
+        """Update the scaler policy for a stopped stack-owned box."""
+        account = read_deployment_settings(self.settings_path)
+        stack_name = workload.text('stack_name')
+        if stack_name == account.stack_name or saved.get('stack') != stack_name or saved.get('region') != limits.region:
+            raise DeploymentRefused('The saved Hana stack or region differs from the workload.')
+        settings = replace(account, stack_name=stack_name, region=limits.region, timeout_s=workload.whole('aws_timeout_s'))
+        api = self._api(settings)
+        stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack_name, service='cloudformation'), 'Stacks')
+        if len(stacks) != 1:
+            raise DeploymentRefused('Expected one Hana stack for the policy update.')
+        stack = stacks[0]
+        outputs = self._stack_outputs(stack, require_outputs=True)
+        resource_fields = {'Instance': 'instance', 'DataVolume': 'data_volume', 'ControlBucket': 'bucket'}
+        if any(outputs.get(output) != saved[key] for output, key in resource_fields.items()) or not outputs.get('LaunchTemplate'):
+            raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
+        resources = {key: outputs[key] for key in (*resource_fields, 'LaunchTemplate')}
+        parameter_rows = ledger.rows(stack, 'Parameters')
+        parameters = {ledger.text(row, 'ParameterKey'): ledger.text(row, 'ParameterValue') for row in parameter_rows}
+        if len(parameters) != len(parameter_rows) or parameters.get('DeploymentId') != saved.get('deployment'):
+            raise DeploymentRefused('The live Hana stack parameters differ from the saved deployment.')
+        if parameters.get('ScalerUser') != settings.scaler_user_name:
+            raise DeploymentRefused('The live Hana stack scaler user differs from the approved configuration.')
+        identity = self._idle_hana_policy_identity(api, path, saved)
+        stack_id = ledger.text(stack, 'StackId')
+        reply = api.call('get-template', '--stack-name', stack_id, '--template-stage', 'Original', service='cloudformation')
+        body = reply.get('TemplateBody')
+        template = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
+        live = ledger.mapping(template['Resources'])
+        resource_types = {'Instance': 'AWS::EC2::Instance', 'DataVolume': 'AWS::EC2::Volume',
+                          'DataAttachment': 'AWS::EC2::VolumeAttachment', 'ScalerPolicy': 'AWS::IAM::ManagedPolicy'}
+        if (ledger.mapping(template['Parameters']).keys() != parameters.keys()
+                or any(ledger.mapping(live.get(key, {})).get('Type') != kind for key, kind in resource_types.items())):
+            raise DeploymentRefused('The live template does not match the stack-owned Hana setup.')
+        current = ledger.mapping(cast(object, json.loads(HANA_TEMPLATE.read_bytes())))
+        policy = ledger.mapping(current['Resources'])['ScalerPolicy']
+        needs_update = live['ScalerPolicy'] != policy
+        live['ScalerPolicy'] = policy
+        content = json.dumps(template, sort_keys=True).encode()
+        provider = self._hana_provider()
+        if needs_update:
+            print('hana-setup probe: before the policy update')
+            _ = self._probe_hana_scaler(provider, identity)
+            with tempfile.TemporaryDirectory(prefix='hana-policy-') as folder:
+                change_template = Path(folder) / 'template.json'
+                _ = change_template.write_bytes(content)
+                with step('hana-setup', 'updating the Hana IAM policy', self.settings_path):
+                    self._hana_stack_change(api, replace(settings, stack_name=stack_id), change_template,
+                        parameters, keep='', scope=HanaPolicyUpdate(resources, HanaBoxOwnership.STACK))
+        else:
+            print('The Hana scaler policy is current.')
+        template_hash = sha256(content).hexdigest()
+        if saved.get('template_sha256') != template_hash:
+            saved['template_sha256'] = template_hash
+            _save_hana_setup(path, saved)
+        if needs_update:
+            print('hana-setup probe: after the policy update')
+        return self._probe_hana_scaler(provider, identity)
+
+    def _idle_hana_policy_identity(self, api: AwsCli, path: Path, saved: dict[str, object]) -> hana_box.DeploymentIdentity:
+        try:
+            registration = remote.read_record(path.with_name('lifecycle.json'))
+        except FileNotFoundError:
+            raise DeploymentRefused('The saved Hana setup has no lifecycle registration. Complete approved setup first.') from None
+        fields = {key: ledger.text(saved, key) for key in ('deployment', 'instance', 'spot_request', 'region')}
+        if registration.get('version') != 1 or registration.get('identity') != fields:
+            raise DeploymentRefused('The Hana lifecycle registration differs from the saved setup.')
+        identity = hana_box.DeploymentIdentity(fields['deployment'], fields['instance'], fields['spot_request'], fields['region'])
+        retry = 'Run hana-setup again when the box is idle.'
+        operation = registration.get('operation', {})
+        observing = (isinstance(operation, dict)
+                     and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
+        if (registration.get('state') != hana_box.Lifecycle.IDLE_STOPPED or registration.get('claims') != []
+                or registration.get('start', {}) is not None or (operation is not None and not observing)):
+            raise DeploymentRefused('The Hana lifecycle is busy. ' + retry)
+        try:
+            observed = api.observe(identity.instance, int(self.clock()))
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
+            raise DeploymentRefused('Setup could not confirm the Hana instance is stopped. ' + retry) from None
+        if observed.state != 'stopped':
+            raise DeploymentRefused('The Hana instance must be stopped. ' + retry)
+        volume = ledger.text(saved, 'data_volume')
+        volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume), 'Volumes')
+        attachments = ledger.rows(volumes[0], 'Attachments') if len(volumes) == 1 and volumes[0].get('VolumeId') == volume else ()
+        if (len(attachments) != 1 or attachments[0].get('InstanceId') != identity.instance
+                or attachments[0].get('Device') != HANA_DATA_DEVICE or attachments[0].get('State') != 'attached'):
+            raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
+        return identity
 
     def _hana_provider(self) -> AwsHanaProvider:
         return AwsHanaProvider.from_settings(conf.path('aws_target'), self.directory, conf.path('hana_aws'),
@@ -1076,7 +1168,7 @@ class Deployment:
         workload = conf.read_or_repository('hana_aws')
         print(f'Hana image plan: {built.name}; {built.logical_bytes / 2**30:.1f} GiB; boot {built.boot_mode}')
         print('Hana image resources: one EBS snapshot and one registered image; no instance')
-        print('Hana placement remains disabled')
+        _print_hana_placement(workload)
         if not approve_resources:
             return False
         self._authorize(True)
@@ -1161,7 +1253,7 @@ class Deployment:
             path = hana_image.save(self.directory, hana_image.RegisteredImage(
                 built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
                 settings.vpc_id, str(subnets[0]['id'])))
-        print(f'Hana image ready: saved in {path}; placement remains disabled')
+        print(f'Hana image ready. The record is in {path}.')
         return True
 
     @staticmethod
@@ -1172,11 +1264,17 @@ class Deployment:
             raise DeploymentRefused('The existing Hana stack owns the instance. ' + HANA_DOWN_FIRST)
 
     @staticmethod
-    def _hana_parameters_match(reply: dict[str, object], approved: dict[str, str]) -> bool:
+    def _hana_parameters_match(reply: dict[str, object], approved: dict[str, str], *, allow_previous: bool = False) -> bool:
         try:
             rows = ledger.rows(reply, 'Parameters')
-            return len(rows) == len(approved) and {
-                ledger.text(row, 'ParameterKey'): row.get('ParameterValue') for row in rows} == approved
+            values = {}
+            for row in rows:
+                key = ledger.text(row, 'ParameterKey')
+                value = row.get('ParameterValue')
+                if allow_previous and 'ParameterValue' not in row and row.get('UsePreviousValue') is True:
+                    value = approved.get(key)
+                values[key] = value
+            return len(rows) == len(approved) and values == approved
         except ValueError:
             return False
 
@@ -1195,6 +1293,7 @@ class Deployment:
         kind = 'UPDATE' if stacks else 'CREATE'
         stack_target = settings.stack_name
         policy_only = isinstance(scope, HanaPolicyUpdate)
+        stack_owned = isinstance(scope, HanaPolicyUpdate) and scope.ownership is HanaBoxOwnership.STACK
         if policy_only:
             if not stacks:
                 raise DeploymentRefused('The Hana stack is absent. The policy update requires an existing stack.')
@@ -1207,6 +1306,8 @@ class Deployment:
             if not self._hana_parameters_match(stack, parameters):
                 raise DeploymentRefused('The live Hana stack parameters differ from the approved parameters.')
             stack_target = ledger.text(stack, 'StackId')
+            if stack_owned and stack_target != settings.stack_name:
+                raise DeploymentRefused('The live Hana stack ID differs from the stack selected for the policy update.')
         else:
             for stack in stacks:
                 if 'Outputs' in stack and any(row.get('OutputKey') in ('Instance', 'DataVolume')
@@ -1234,9 +1335,16 @@ class Deployment:
             change = api.call('describe-change-set', '--stack-name', stack_target, '--change-set-name', name,
                               *(['--no-paginate'] if policy_only else []), service='cloudformation')
             reason = str(change.get('StatusReason', '')).lower()
+            no_changes = change.get('Status') == 'FAILED' and any(
+                text in reason for text in ("didn't contain changes", 'no changes'))
+            if (stack_owned and no_changes and not change.get('NextToken')
+                    and change.get('Changes', []) == []):
+                _ = self._discard_change_set(api, stack_target, name)
+                print('The Hana scaler policy is current.')
+                return
             if policy_only and change.get('Status') == 'FAILED':
                 raise DeploymentRefused('CloudFormation failed to create the Hana policy change set.')
-            if change.get('Status') == 'FAILED' and any(text in reason for text in ("didn't contain changes", 'no changes')):
+            if no_changes:
                 _ = self._discard_change_set(api, stack_target, name)
                 return
             if wait_error is not None:
@@ -1259,11 +1367,12 @@ class Deployment:
             if policy_only and any(
                     resource.get('Action') != 'Modify'
                     or resource.get('Replacement') != 'False'
+                    or (stack_owned and resource.get('LogicalResourceId') != 'ScalerPolicy')
                     or resource.get('ResourceType') not in ('AWS::IAM::ManagedPolicy', 'AWS::IAM::Policy',
                         'AWS::IAM::RolePolicy', 'AWS::IAM::UserPolicy', 'AWS::IAM::GroupPolicy')
                     for resource in resources):
                 raise DeploymentRefused('The Hana change set must contain only IAM policy modifications without replacement.')
-            if policy_only and not self._hana_parameters_match(change, parameters):
+            if policy_only and not self._hana_parameters_match(change, parameters, allow_previous=stack_owned):
                 raise DeploymentRefused('The Hana policy change set parameters differ from the approved parameters.')
             execute_api = self._api(settings, single_attempt=True) if policy_only else api
             execution_requested = True
@@ -1279,6 +1388,8 @@ class Deployment:
                 raise
             _ = api.call('wait', 'stack-create-complete' if kind == 'CREATE' else 'stack-update-complete',
                          '--stack-name', stack_target, service='cloudformation', timeout_s=timeout)
+            if stack_owned:
+                print('Hana policy update complete')
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             if policy_only or isinstance(error, DeploymentRefused):
                 leftover = self._discard_change_set(api, stack_target, name) if not execution_requested else ''
