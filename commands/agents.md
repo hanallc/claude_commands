@@ -24,6 +24,13 @@ Use the `agents` program.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
 
+## Create a producer
+
+Use `agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]` to create a producer.
+The command uses `producer_defaults.model` in `config/models.conf`.
+It creates the README if needed and prints the staff id, account and tab.
+Repeat the command with the same options after an interruption.
+
 First admission adopts one proved live Claude session or Codex thread with the producer name.
 It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
 Adoption writes the staff row with that native session. It launches nothing.
@@ -34,6 +41,14 @@ Recovery checks live sessions before it resumes a retained conversation.
 Recovery adopts a different proved live session and removes the pending admission record.
 Stop selects the producer row's `current_session` when several tabs have the same label.
 The Claude session registry proves a plain start without a session ID in its arguments.
+
+After you change a producer's family in `config/models.conf`, run `agents resume NAME`.
+The command stops the old conversation and closes its pane.
+It starts a fresh conversation in a new tab and binds it to the producer's row.
+Claude uses the producers account. Codex uses the workers account. `--to ACCOUNT` selects a different account.
+Repeat the command to continue from a saved admission record.
+If an interruption occurs before the admission write, a retry can leave an extra shell tab open.
+If transfer reports a pending admission, run `agents resume NAME` first.
 
 Remove a stray producer with these steps:
 
@@ -63,7 +78,7 @@ Other Claude sessions use the units account; `--to ACCOUNT` overrides the accoun
 The default reason is `resumed by name`.
 Retired units do not appear in active status or the board.
 Resume without `--retired` refuses a retired unit.
-A running session prints `unchanged` and returns status 0.
+When resume selects a running conversation, it prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
 Resume restores retained workers with their native conversations.
