@@ -298,6 +298,27 @@ The first conversation receives a prompt to read the README and run `/producer:p
 The producer admission record keeps the time for prompt recovery after a failed start.
 The command reports the staff id, account and tab.
 
+### Rename or retire a producer
+
+`agents rename OLD NEW` moves the registry key and retains the staff id.
+If the old name no longer belongs to the saved staff id, the retry keeps the old key.
+It updates the session label and tab title.
+The staff document path still names the original folder.
+Rename and retire refuse while the producer has a pending admission.
+
+`agents retire NAME [--to PRODUCER]` requires a handoff file and no open questions.
+Without `handoff.md`, it asks the producer for the file and returns.
+The command stops the conversation and closes its tab before it reads the open List items.
+It moves those items with log source `agents retire` and tells each item's showrunner.
+The retirement receipt keeps the profile, session id, and notices.
+The command records notice delivery after the send succeeds.
+A retry refuses if the producer has a different session id.
+The command removes the producer key after a final read confirms that no open List items remain assigned to the producer.
+The staff row keeps the profile in `retired_producer`.
+Active staff lookups omit retired producers.
+The fixed-id lookup supplies their names for closed List items.
+`agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+
 ### First start
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.

@@ -445,6 +445,7 @@ class PlanRun:
             for action in ('ec2:DescribeInstances', 'ec2:DescribeInstanceTypeOfferings', 'ec2:DescribeSpotPriceHistory',
                            'servicequotas:GetServiceQuota', 'ce:GetCostAndUsage'):
                 simulate(action)
+        simulate('ec2:GetSpotPlacementScores', context={'ec2:Region': api.region})
         instance = ec2('instance/i-00000000000000000')
         volume = ec2('volume/vol-00000000000000000')
         resource_tags = {'GateDeployment': launch.deployment, 'Workload': 'cloud-claude-gate'}

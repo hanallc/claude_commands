@@ -1300,7 +1300,7 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
     return ClaudeUp(identity, pane_id, label, start_state=ClaudeStartState.ALREADY_RUNNING, pid=live.pid)
 
 
-def _member_machine(member: StaffRow) -> str:
+def member_machine(member: StaffRow) -> str:
     """Return the member's recorded machine, or an empty string when unknown."""
     from scripts.production import staff
 
@@ -1316,7 +1316,7 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
     machine = remote.local_machine()
     return sorted({row.name for row in names.tab_record.rows
-                   if row.kind in {"unit", "showrunner"} and _member_machine(row) == machine
+                   if row.kind in {"unit", "showrunner"} and member_machine(row) == machine
                    and reference.casefold() in row.name.casefold()})[:5]
 
 
@@ -1379,6 +1379,9 @@ def _resume(session: str, *, why: str = "resumed by name", to: str | None = None
 def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | None, requester: str,
                        client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
     record = names.tab_record
+    retired = next((row for row in record.retired_producers if session in (row.name, row.id, row.current_session)), None)
+    if retired is not None:
+        return ResumeFailed(session, f"{retired.name}: retired; use agents resume {retired.name} --retired")
     member = record.by_member_reference(session)
     matches = [row for row in record.rows if row.name == session or row == member]
     candidates = ", ".join(f"{row.name} ({row.id})" for row in matches[:5])
@@ -1388,7 +1391,7 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         from scripts.agents import remote
 
         member = matches[0]
-        machine = _member_machine(member)
+        machine = member_machine(member)
         if machine and machine != remote.local_machine():
             return ResumeFailed(session, f"session is on {machine}")
         if member.kind == "producer":
