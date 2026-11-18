@@ -934,7 +934,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 1. The new check fails on main.
 2. basedpyright: 0 errors, 0 warnings. The update_registration suite passes.
 
-### Phase 65 — A same-tab link shows a just-closed Change  · status: todo
+### Phase 65 — A same-tab link shows a just-closed Change  · status: done
 **Depends on:** 60, 63
 
 #### Work Order
@@ -956,6 +956,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. The new check fails on main.
 2. The Review page suite passes. basedpyright: 0 errors, 0 warnings.
+
+**Result:** a Review link, fresh or in the same tab, shows the Change or Question it names, also just after it closes. The jump keeps the filters that match the card. A link that arrives during a verdict save opens its card after the save. On main 78de4e3ec (hash d53e3a4d2, row C1892).
 
 ### Phase 66 — An asked image leaves the page until its answer  · status: done
 **Depends on:** none
@@ -1098,7 +1100,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** the producer commands and the as-built docs say Claude producers use the producers account, with the showrunners account as the fallback, and show the live models from `config/models.conf`. On main 3515c9470 (hash 287f9256c).
 
-### Phase 72 — One common producer command  · status: todo
+### Phase 72 — One common producer command  · status: done
 **Depends on:** phases 65 and 70 (queue order).
 
 #### Work Order
@@ -1118,6 +1120,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. dwight and brain start from the common command. Two skills are gone. brain has a folder and a README.
 2. Full gate green.
+
+**Result:** `commands/producer/produce.md` is the one producer command; each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`. The brain and dwight skills are gone; brain has its README; dwight rewrites its own. On main 78de4e3ec (hash 3c7a8d4ad).
 
 ### Phase 73 — A change row can be withdrawn  · status: todo
 **Depends on:** phase 72 (queue order).
@@ -1146,10 +1150,12 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Goal:** the sdlc showrunner (2026-11-18). `merge_checkpoint.py --production <p>` merges into the production's own repo. The style unit (staff parent cargo-liner) has a `~/.claude` commit 9d636482f. Under cargo-liner it merges into `~/rust/cargo-liner` and fails at ancestry. Under sdlc it is refused: "staff parent is cargo-liner; use that production".
 
 **Spec:**
-1. The unit's worktree repo selects the merge repo. The staff parent selects only the authority.
-2. Add rows to the existing merge_checkpoint tests: a unit whose staff parent owns another repo merges into its worktree repo, under its parent's authority.
+1. `--production P` names the destination. The merge uses P's checkout, branch, tests, push, promotion and lock, as on main. No repo-owner lookup: several productions merge into one repo (showrunner agreed 2026-11-18).
+2. A unit whose staff parent is another production Q is accepted only when its worktree repo is P's repo. Q keeps the production log and the review ledger.
+3. Overlap notices compare only units in P's repo. `merge.md` and `produce.md` say that an order runs under the production whose repo holds the commit, one batch for each repo.
+4. Add rows to the existing merge_checkpoint tests: the style unit's `~/.claude` commit merges under sdlc and writes cargo-liner's log and ledger; its cargo-liner commit under sdlc is refused.
 
-**Files:** `scripts/production/merge_checkpoint.py`, its tests.
+**Files:** `scripts/production/merge_checkpoint.py`, `checkpoint_gate.py`, their tests, `commands/showrunner/produce.md`, `commands/unit/merge.md`.
 
 **Workers:** 1 writer.
 
