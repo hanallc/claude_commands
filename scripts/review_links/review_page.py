@@ -297,8 +297,11 @@ def render(root: Path, *, show: str = 'open') -> bytes:
         +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div>'
         +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
         +'<div class="list-filters">'
+        +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
+        +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
         +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
-        +'</div><p data-hidden-action-status role="status" hidden></p>'
+        +'</div><p data-missing-item role="status" hidden></p>'
+        +'<p data-hidden-action-status role="status" hidden></p>'
         +'<script type="application/json" data-review-index>'+index_json(entries)+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
@@ -363,9 +366,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus) -> tuple[c
 STYLE = '''<style>
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-types{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}
-.review-types button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
+:is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
-.review-types button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+:is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}
@@ -420,6 +423,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + review_legacy.SCRIPT + r'''(() => {
 let content=document.querySelector('[data-review]'),saving=0;
 let selectedShow=content.dataset.show,requestedShow=selectedShow;
+let entryJump=new URLSearchParams(location.hash.slice(1)).get('jump');
 const drafts=new Map(),departures=new Map(),bodies=new Map();
 let index=readIndex();
 function readIndex(){
@@ -430,7 +434,7 @@ function matchesOwner(entry,owner){
 }
 function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
  const linked=keys.has(entry.key);
- return (!keys.size || linked) && (linked || entry.hiddenUntil<=Date.now()) &&
+ return (!keys.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
   matchesOwner(entry,owner) &&
   (!type || entry.type===type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
@@ -448,6 +452,8 @@ function matching(filters,includePending=false){
 }
 const view=createRecordTable({content:()=>content,single:true,
  place:reviewPlace,
+ persistLinkedTarget:true,
+ missingItem:()=> 'This review is no longer on the Review page.',
  resolveOwner:owner=>{
   const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>
    button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
@@ -480,7 +486,10 @@ const view=createRecordTable({content:()=>content,single:true,
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
    button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
   });
-  if(show!==requestedShow){requestedShow=show;queueMicrotask(()=>pageRefresh.refresh(true));}
+  if(show!==requestedShow){
+   requestedShow=show;
+   if(!entryJump) queueMicrotask(()=>pageRefresh.refresh(true));
+  }
  }
 });
 function updateTitleFallback(panel){
@@ -545,7 +554,7 @@ function bind(){
     departures.set(key,{kind:'saved',outcome,updated:row.dataset.updated,previousState:row.dataset.state,
      state:waits ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done',
      hiddenUntil:outcome==='later' ? Date.parse(until) : 0});
-    view.opened.delete(key);
+    view.closeCard(key);
     view.showActionResult(row,form.elements.row.value,'Saved: '+result.answer);
    }catch(error){
     departures.delete(key);
@@ -769,7 +778,11 @@ async function refresh(_supersede=false,current=()=>true){
  }else restoreFocus();
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
-view.place();bind();view.apply();
+view.place();
+if(entryJump) view.jump(entryJump,{pushPlace:false});
+bind();
+if(entryJump) entryJump=null;
+else view.apply();
 addEventListener('hashchange',()=>{
  const item=new URLSearchParams(location.hash.slice(1)).get('item'),departure=departures.get(item);
  if(departure?.kind==='saved' && ['validate','later'].includes(departure.outcome)) departures.delete(item);

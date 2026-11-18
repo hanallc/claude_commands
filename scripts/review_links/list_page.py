@@ -184,11 +184,10 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
 
 
 def review_place(keys: tuple[str, ...]) -> str:
-    """Select linked cards through the console, including completed reviews."""
-    place = [("key", key) for key in keys]
+    """Open one linked card or select a group of linked reviews."""
     if len(keys) == 1:
-        place.append(("item", keys[0]))
-    return review_page.PAGE_PATH + '?show=all#' + urlencode(place)
+        return review_page.PAGE_PATH + '?show=all#' + urlencode({"show": "open", "jump": keys[0]})
+    return review_page.PAGE_PATH + '?show=all#' + urlencode([("key", key) for key in keys])
 
 
 def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.ReviewItem], today: datetime) -> str:
@@ -205,7 +204,8 @@ def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.R
         text = footer_counts.plural(len(waiting), "review") + " waiting on others"
     else:
         text = "Reviews done — decide: close, keep or park"
-    return count_link("review", review_place(item.reviews), text)
+    destinations = tuple(review.key for review in linked if review.type in review_page.TYPES)
+    return count_link("review", review_place(destinations), text) if destinations else text
 
 
 def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -> str:
@@ -437,7 +437,8 @@ def change_counts() -> dict[str, int]:
 def count_link(page: str, place: str, text: str) -> str:
     """Open the count's page through the console navigation."""
     path = f"/{change_page.CONSOLE_FOLDER}/" + console.place_query(page, place)
-    return f'<a href="{html.escape(path, quote=True)}" target="_top">{text}</a>'
+    review_link_attr = ' data-list-review-link=""' if page == "review" else ''
+    return f'<a href="{html.escape(path, quote=True)}" target="_top"{review_link_attr}>{text}</a>'
 
 
 def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) -> str:
@@ -698,7 +699,97 @@ async function refresh(_supersede=false,current=()=>true){
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
-place();bind();apply();
+const listReturnParam='list-return',listReturnsKey='console.list.review-returns';
+const maxListReturns=8,maxOpenRows=128,maxRowKeyLength=128,listReturnAge=60*60*1000;
+function reviewDestination(link){
+ const destination=new URL(link.href),target=new URL(destination.searchParams.get('at.review'),location.href);
+ const jump=new URLSearchParams(target.hash.slice(1)).get('jump');
+ if(!jump) return;
+ const previous=new URL(parent.location.href).searchParams.get('at.review');
+ const filters=new URLSearchParams({show:'open',jump});
+ if(previous){
+  const place=new URL(previous,location.href);
+  if(place.origin===location.origin && place.pathname===target.pathname){
+   const fragment=new URLSearchParams(place.hash.slice(1));
+   for(const name of ['show','owner','type','q','sort','dir','source-owner']){
+    const value=fragment.get(name) ?? place.searchParams.get(name);
+    if(value!==null) filters.set(name,value);
+   }
+  }
+ }
+ target.hash=filters;
+ destination.searchParams.set('at.review',target.pathname+target.search+target.hash);
+ link.href=destination;
+}
+function listReturns(){
+ const raw=sessionStorage.getItem(listReturnsKey);
+ if(!raw || raw.length>maxListReturns*(maxOpenRows*(maxRowKeyLength+3)+200)) return [];
+ let records;
+ try{records=JSON.parse(raw);}catch(_){return [];}
+ if(!Array.isArray(records)) return [];
+ const now=Date.now();
+ return records.filter(record=>record && typeof record.id==='string' &&
+  Number.isFinite(record.saved) && record.saved<=now && now-record.saved<listReturnAge &&
+  Number.isFinite(record.top) && record.top>=0 &&
+  Array.isArray(record.opened) && record.opened.length<=maxOpenRows &&
+  record.opened.every(key=>typeof key==='string' && key.length<=maxRowKeyLength)).slice(-maxListReturns);
+}
+function writeListReturns(records){
+ if(records.length) sessionStorage.setItem(listReturnsKey,JSON.stringify(records));
+ else sessionStorage.removeItem(listReturnsKey);
+}
+function saveListReturn(){
+ tableView.saveDeparturePlace();
+ const outer=new URL(parent.location.href),prior=outer.searchParams.get(listReturnParam);
+ const records=listReturns();
+ const id=records.some(record=>record.id===prior) ? prior : Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-');
+ const opened=[...tableView.opened].filter(key=>key.length<=maxRowKeyLength).slice(0,maxOpenRows);
+ const retained=records.filter(record=>record.id!==id);
+ writeListReturns([...retained,{id,saved:Date.now(),opened,top:scrollY}].slice(-maxListReturns));
+ outer.searchParams.set(listReturnParam,id);
+ if(parent!==window) outer.searchParams.set('at.list',location.pathname+location.search+location.hash);
+ parent.history.replaceState(parent.history.state,'',outer);
+}
+function prepareReviewLink(event){
+ const link=event.target.closest('a[data-list-review-link]');
+ if(!link || event.defaultPrevented) return;
+ try{
+  reviewDestination(link);
+  if(event.type==='click' && event.button===0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey)
+   saveListReturn();
+ }catch(_){}
+}
+for(const event of ['click','auxclick','contextmenu','focusin']) document.addEventListener(event,prepareReviewLink);
+function listReturnForEntry(){
+ const outer=new URL(parent.location.href),id=outer.searchParams.get(listReturnParam);
+ if(!id) return;
+ try{
+  const records=listReturns();
+  writeListReturns(records);
+  return records.find(record=>record.id===id);
+ }catch(_){}
+}
+function restoreListRows(record){
+ const surviving=new Set([...content.querySelectorAll('[data-list-item]')].map(row=>row.dataset.key));
+ tableView.opened.clear();
+ for(const key of record.opened) if(surviving.has(key)) tableView.opened.add(key);
+}
+function restoreListScroll(top){
+ requestAnimationFrame(()=>requestAnimationFrame(()=>scrollTo({top,behavior:'instant'})));
+}
+place();
+const listReturn=parent.performance.getEntriesByType('navigation')[0]?.type==='back_forward' ? listReturnForEntry() : undefined;
+if(listReturn) restoreListRows(listReturn);
+bind();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
+if(listReturn) restoreListScroll(listReturn.top);
+addEventListener('pageshow',event=>{
+ if(!event.persisted) return;
+ const record=listReturnForEntry();
+ if(!record) return;
+ place();restoreListRows(record);
+ tableView.apply(true,{top:record.top,dismissMissingItem:true});
+ restoreListScroll(record.top);
+});
 addEventListener('popstate',tableView.restorePlace);
 addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);

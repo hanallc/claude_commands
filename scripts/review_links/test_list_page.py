@@ -52,7 +52,7 @@ NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
 
-    def test_review_links_keep_the_console_and_select_exact_cards_in_every_state(self) -> None:
+    def test_review_links_keep_the_console_and_jump_to_cards_in_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
         ready = review_items.ReviewItem("proposal/sdlc/P10", "sdlc/P10", review_items.ReviewType.PROPOSAL,
             OWNER.id, OWNER.id, "Check this proposal", review_items.ReviewState.OPEN,
@@ -66,7 +66,7 @@ class ListPageTests(unittest.TestCase):
                 place = urlsplit(query["at.review"][0])
                 self.assertEqual(place.path, review_page.PAGE_PATH)
                 self.assertEqual(parse_qs(place.query), {"show": ["all"]})
-                self.assertEqual(parse_qs(place.fragment), {"key": [review.key], "item": [review.key]})
+                self.assertEqual(parse_qs(place.fragment), {"show": ["open"], "jump": [review.key]})
                 self.assertEqual(link.attrib["target"], "_top")
         item = replace(self.add("Linked work"), reviews=("proposal/sdlc/P10", "change/sdlc/C1830"))
         for state in review_items.ReviewState:
@@ -87,7 +87,7 @@ class ListPageTests(unittest.TestCase):
         self.assertIn('.list-toggle{white-space:nowrap}', body)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_browser_review_links_open_exact_cards_inside_the_console(self) -> None:
+    def test_browser_review_links_jump_inside_the_full_review_list(self) -> None:
         source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1830", "How to check": "Read the card."},
             change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
             delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
@@ -97,20 +97,45 @@ class ListPageTests(unittest.TestCase):
         reviews = [ready, replace(ready, key="change/hana/P10", id="hana/P10", state=review_items.ReviewState.DONE),
                    replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
-                           times=review_items.ReviewTimes(NOW, NOW, NOW + timedelta(days=1)))]
+                           times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))]
         item = self.add("Linked review cards", number=111)
-        _ = the_list.link(MORTY.id, item.id, tuple(review.key for review in reviews), source="morty")
+        linked_keys = tuple(review.key for review in reviews)
+        _ = the_list.link(MORTY.id, item.id, linked_keys, source="morty")
+        missing = replace(ready, key="change/sdlc/C1833", id="sdlc/C1833")
+        missing_item = self.add("Review removed after rendering", number=112)
+        _ = the_list.link(MORTY.id, missing_item.id, (missing.key,), source="morty")
+        for number in range(1, 16):
+            _ = self.add(f"List fixture {number}", number=number)
         reviews.append(replace(ready, key="change/other/C9", id="other/C9", title="Unlinked review"))
-        with patch.object(review_items, "read", return_value=reviews), patch.object(list_page, "counts_strip", return_value=""):
+        reviews.append(replace(ready, key="change/other/C10", id="other/C10", title="Check another change"))
+        reviews.append(replace(ready, key="change/builds/C17", id="builds/C17", title="Check a build",
+                               owner=OTHER.id, source_unit=OTHER.id))
+
+        def read_reviews(*_args: object, **kwargs: object) -> list[review_items.ReviewItem]:
+            owners = cast(dict[staff.StaffId, str] | None, kwargs.get("owner_options"))
+            if owners is not None:
+                owners.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
+            return reviews
+
+        with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
+            reviews.append(missing)
             listing = list_page.render(self.root / "reviews")
-            review = review_page.render(self.root / "reviews", show="all")
+            _ = reviews.pop()
+            review = {show: review_page.render(self.root / "reviews", show=show)
+                      for show in ("open", "Waiting", "Done", "all")}
+            reviews[0] = replace(ready, times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))
+            parked_review = {show: review_page.render(self.root / "reviews", show=show) for show in ("open", "all")}
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
         list_url = "/console/" + console.place_query("list", list_page.PAGE_PATH + '#' + urlencode({"item": f"{MORTY.id}/{item.id}"}))
         probe = r'''<script>
-const listUrl=LIST_URL,keys=KEYS,proof=new URLSearchParams(location.search).get('proof');
-let finished=false;
+const listUrl=LIST_URL,keys=KEYS,ownerId=OWNER_ID,otherId=OTHER_ID;
+const params=new URLSearchParams(location.search),proof=params.get('proof'),returnWords=params.get('pending') || '';
+let finished=false,inspected=false;
+const frames=win=>new Promise(done=>win.requestAnimationFrame(()=>win.requestAnimationFrame(done)));
+const nav=name=>document.querySelector('[data-page="'+name+'"]');
+const selected=(doc,name)=>doc.querySelector('[data-'+name+'-chip][aria-pressed="true"]').dataset[name+'Chip'];
 const failures=JSON.parse(sessionStorage.getItem('link-failures') || '[]');
 const check=(ok,text)=>{
  if(!ok){failures.push(text);sessionStorage.setItem('link-failures',JSON.stringify(failures));}
@@ -129,10 +154,44 @@ function ids(doc){
   check(range.getClientRects().length===1,'the ID text has one line');
  }
 }
+async function configureReview(show,words){
+ nav('review').click();
+ const frame=document.querySelector('iframe:not([hidden])');
+ const loaded=frame.contentDocument?.querySelector('[data-review]') ? frame.contentDocument :
+  await new Promise(resolve=>frame.addEventListener('load',()=>resolve(frame.contentDocument),{once:true}));
+
+ const doc=loaded,win=doc.defaultView;
+ if(doc.querySelector('[data-review]').dataset.show!==show){
+  await new Promise(resolve=>{
+   const observer=new win.MutationObserver(()=>{
+    if(doc.querySelector('[data-review]').dataset.show===show){observer.disconnect();resolve();}
+   });
+   observer.observe(doc.body,{childList:true,subtree:true});
+   doc.querySelector('[data-show-chip="'+show+'"]').click();
+  });
+ }
+ doc.querySelector('[data-type-chip="change"]').click();
+ doc.querySelector('[data-owner-chip="'+ownerId+'"]').click();
+ const sort=doc.querySelector('[data-sort="3"]');
+ if(sort.parentElement.getAttribute('aria-sort')==='none') sort.click();
+ const search=doc.querySelector('#list-search');
+ const recorded=new Promise(resolve=>{
+  const recordedPlace=event=>{
+   const at=new URL(location.href).searchParams.get('at.review');
+   if(event.source!==win || !at || new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('q')!==words) return;
+   removeEventListener('message',recordedPlace);resolve();
+  };
+  addEventListener('message',recordedPlace);
+ });
+ search.value=words;search.dispatchEvent(new win.Event('input',{bubbles:true}));
+ await recorded;
+ nav('list').click();
+}
 async function inspect(frame){
  try{
   const doc=frame.contentDocument;
-  if(!doc?.querySelector('[data-list-item]')) return;
+  if(inspected || !doc?.querySelector('[data-list-item]')) return;
+  inspected=true;
   check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator remains visible');
   const stage=proof==='review' ? keys.length : Number(sessionStorage.getItem('link-stage') || 0);
   if(doc.querySelector('[data-list]')){
@@ -140,50 +199,191 @@ async function inspect(frame){
    const row=doc.querySelector('[data-number="111"]');
    check(!row.hidden && !row.querySelector('[data-detail]').hidden,'List item 111 is open');
    if(proof==='list'){await finish();return;}
-   const links=[...row.querySelector('[data-detail]').querySelectorAll('a')];
-   const link=stage<keys.length ? links.find(link=>{
+   const win=doc.defaultView;
+   if(stage===0 && !proof){
+    await configureReview('all','Check');
+    const extra=doc.querySelector('[data-number="15"]');
+    extra.querySelector('.list-toggle').click();
+    check(!extra.querySelector('[data-detail]').hidden,'the extra List row is open before leaving');
+    const stale=new URL(win.location.href),filters=new URLSearchParams(stale.hash.slice(1));
+    filters.set('producer','unavailable');stale.hash=filters;
+    win.history.replaceState(win.history.state,'',stale);
+    const outer=new URL(location.href);outer.searchParams.set('at.list',stale.pathname+stale.hash);
+    history.replaceState(history.state,'',outer);
+    win.history.scrollRestoration='manual';
+    win.scrollTo({top:120,behavior:'instant'});
+    sessionStorage.setItem('list-top',String(win.scrollY));
+    check(win.scrollY>0,'the List has a scroll position to restore');
+   }
+   if(stage===1 && !proof){
+    await frames(win);
+    const restored=new URLSearchParams(win.location.hash.slice(1));
+    check(!restored.has('producer') && restored.get('item')===row.dataset.key,'Back normalizes the stale List filter and keeps the source');
+    check(!doc.querySelector('[data-number="15"] [data-detail]').hidden,'Back restores the extra open List row');
+    check(Math.abs(win.scrollY-Number(sessionStorage.getItem('list-top')))<=1,
+      'Back restores the List scroll from '+sessionStorage.getItem('list-top')+' to '+win.scrollY);
+    check(doc.querySelector('#list-search').value===returnWords,'Back restores words typed just before the link click');
+    const returns=Number(sessionStorage.getItem('list-returns') || 0)+1;
+    sessionStorage.setItem('list-returns',String(returns));
+    if(returns===1){
+     doc.body.dataset.firstReturn='';
+     history.forward();return;
+    }
+    check(!doc.body.hasAttribute('data-first-return'),'the second Back loads a new List document');
+    await configureReview('open','Unlinked review');
+   }
+   const source=stage===keys.length+1 ? doc.querySelector('[data-number="112"]') : row;
+   if(source!==row) source.querySelector('.list-toggle').click();
+   const links=[...source.querySelector('[data-detail]').querySelectorAll('a')];
+   const key=stage<keys.length ? keys[stage] : stage===keys.length+2 ? keys[0] : '';
+   const link=key ? links.find(link=>{
     const at=new URL(link.href).searchParams.get('at.review');
-    return at && new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('item')===keys[stage];
-   }) : row.querySelector('[data-label="State"] a');
+    return at && new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('jump')===key;
+   }) : source.querySelector('[data-label="State"] a');
    check(!!link,'the selected List link exists');
+   if(stage===0 && returnWords){
+    const search=doc.querySelector('#list-search');
+    search.value=returnWords;search.dispatchEvent(new win.Event('input',{bubbles:true}));
+   }
    if(link) link.click();else await finish();
   }else if(doc.querySelector('[data-review]')){
+   if(stage===1 && sessionStorage.getItem('list-returns')==='1'){history.back();return;}
    ids(doc);
-   const visible=[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+   const visibleRows=()=>[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
+   const visible=visibleRows();
    if(stage<keys.length){
-    check(visible.length===1 && visible[0].dataset.key===keys[stage],'the exact linked card is shown');
-    check(visible[0]?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the linked card is expanded');
-    check(!visible[0]?.querySelector('[data-detail]').hidden,'the linked card detail is open');
-    sessionStorage.setItem('link-stage',String(stage+1));location.href=listUrl;
-   }else{
+    const target=visible.find(row=>row.dataset.key===keys[stage]);
+    check(!!target && visible.some(row=>row.dataset.key==='change/other/C10'),'the linked card and an unlinked card are shown');
+    check(target?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the linked card is expanded');
+    check(!target?.querySelector('[data-detail]').hidden,'the linked card detail is open');
+    const place=new URLSearchParams(doc.location.hash.slice(1)),search=doc.querySelector('#list-search');
+    check(!place.has('key') && !place.has('jump') && place.get('item')===keys[stage],'the address keeps only an open item target');
+    check(selected(doc,'show')===(stage<3 ? 'all' : 'open'),'Review keeps the selected All view or widens Show for a card outside Open');
+    const reloaded=sessionStorage.getItem('review-reload')===String(stage);
+    if(!reloaded){
+     const row=target?.querySelector('.list-row'),box=row?.getBoundingClientRect();
+     check(box?.top>=0 && box?.bottom<=doc.defaultView.innerHeight,'the linked row is in view');
+     check(row?.hasAttribute('data-record-highlight'),'the linked row has the shared highlight');
+     const reduced=doc.defaultView.matchMedia('(prefers-reduced-motion: reduce)').matches;
+     check(row?.getAnimations().some(animation=>animation.playState==='running')===!reduced,
+       'the highlight respects reduced motion');
+    }
+    if(stage===0){
+     check(selected(doc,'owner')===ownerId && selected(doc,'type')==='change' && search.value==='Check',
+       'the generated link keeps the Review filters selected in the controls');
+     check(doc.querySelector('[data-sort="3"]').parentElement.getAttribute('aria-sort')==='ascending',
+       'the generated link keeps the Review sort selected in the controls');
+    }
+    if(stage===1){
+     check(selected(doc,'owner')==='','the jump resets Owner to All when words or Show hide the card');
+     check(search.value==='' && selected(doc,'type')==='change','the jump clears conflicting words and keeps the matching type');
+    }
+    if(stage===0 && !reloaded){
+     const input=value=>{
+      search.value=value;search.dispatchEvent(new doc.defaultView.Event('input',{bubbles:true}));
+     };
+     input('Unlinked review');
+     check(visibleRows().length===1 && visibleRows()[0].dataset.key==='change/other/C9','the words box still filters');
+     input('');
+     doc.querySelector('[data-type-chip="question"]').click();
+     check(visibleRows().length===0,'the type chips still filter');
+     doc.querySelector('[data-type-chip=""]').click();
+     doc.querySelector('[data-owner-chip="'+otherId+'"]').click();
+     check(visibleRows().length===1 && visibleRows()[0].dataset.owner===otherId,'the owner chips still filter');
+     doc.querySelector('[data-owner-chip=""]').click();
+     doc.querySelector('[data-show-chip="open"]').click();
+     check(visibleRows().every(row=>row.dataset.state==='Open'),'the Show chips still filter');
+     doc.querySelector('[data-show-chip="all"]').click();
+     doc.querySelector('[data-owner-chip="'+ownerId+'"]').click();
+     doc.querySelector('[data-type-chip="change"]').click();
+     input('Check');
+     await frames(doc.defaultView);
+    }
+    if((stage===0 || stage===3) && !reloaded){
+     sessionStorage.setItem('review-reload',String(stage));
+     location.reload();return;
+    }
+    sessionStorage.setItem('link-stage',String(stage+1));
+    if(stage===0) history.back();else location.href=listUrl;
+   }else if(stage===keys.length){
     check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
     const done=visible.find(row=>row.dataset.state==='Done');
     if(done?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') done?.querySelector('.list-toggle').click();
     check(done?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Done card can open in the linked view');
-    await finish();
+    if(proof){await finish();return;}
+    const group=doc.querySelector('[data-clear-linked-reviews]');
+    check(group && !group.hidden,'the linked group has one visible filter chip');
+    group?.click();
+    check(visibleRows().some(row=>row.dataset.key==='change/other/C9'),'one click restores the normal Review list');
+    check(group?.hidden && !new URLSearchParams(doc.location.hash.slice(1)).has('key'),'the group chip clears the selection');
+    sessionStorage.setItem('link-stage',String(stage+1));
+    location.href=listUrl;
+   }else if(stage===keys.length+1){
+    const notice=doc.querySelector('[data-missing-item]');
+    check(notice && !notice.hidden && notice.textContent==='This review is no longer on the Review page.',
+      'a removed linked review shows a missing-target notice');
+    check(visibleRows().some(row=>row.dataset.key==='change/other/C9'),'a missing link leaves the normal Review list visible');
+    sessionStorage.setItem('link-stage',String(stage+1));
+    location.href=listUrl;
+   }else{
+    const target=doc.querySelector('[data-key="'+keys[0]+'"]');
+    if(sessionStorage.getItem('later-reload')){
+     check(target.dataset.parked==='true' && target.hidden && target.querySelector('[data-detail]').hidden,
+       'a parked linked card stays hidden and closed after reload');
+     await finish();return;
+    }
+    check(!target.hidden && !target.querySelector('[data-detail]').hidden,'the card opens from List before Later');
+    const status=doc.querySelector('[data-hidden-action-status]');
+    const saved=new Promise(resolve=>{
+     const observer=new doc.defaultView.MutationObserver(()=>{
+      if(status.textContent.includes('Saved: parked')){observer.disconnect();resolve();}
+     });
+     observer.observe(status,{childList:true});
+    });
+    target.querySelector('[data-later-toggle]').click();
+    target.querySelector('[data-later-preset="morning"]').click();
+    await saved;
+    const place=new URLSearchParams(doc.location.hash.slice(1));
+    check(!place.has('item') && !place.has('linked'),'Later removes the linked target from the Review address');
+    sessionStorage.setItem('later-reload','yes');
+    await frames(doc.defaultView);
+    location.reload();
    }
   }
  }catch(error){failures.push(String(error));await finish();}
 }
 for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('load',()=>inspect(frame));
-</script><img hidden src="/complete">'''.replace('LIST_URL', json.dumps(list_url)).replace(
-            'KEYS', json.dumps([entry.key for entry in reviews[:-1]]))
+addEventListener('pageshow',event=>{
+ if(event.persisted){
+  inspected=false;
+  const active=document.querySelector('iframe:not([hidden])');
+  requestAnimationFrame(()=>requestAnimationFrame(()=>inspect(active)));
+ }
+});
+if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complete';document.body.append(keepOpen);}
+</script>'''.replace('LIST_URL', json.dumps(list_url)).replace('KEYS', json.dumps(linked_keys)).replace(
+            'OWNER_ID', json.dumps(OWNER.id)).replace('OTHER_ID', json.dumps(OTHER.id))
         shell = shell.replace('</body>', probe + '</body>')
         output = Path(os.environ.get("LISTLINKS_PROOF_DIR", str(self.root)))
         output.mkdir(parents=True, exist_ok=True)
-        for shot in ("clicks", "review", "list"):
+        for shot in ("clicks", "reduced", "review", "list"):
             with self.subTest(shot=shot):
                 results: list[list[str]] = []
                 complete = threading.Event()
+                later_saved = threading.Event()
 
                 class Probe(BaseHTTPRequestHandler):
                     def do_GET(self) -> None:
-                        path = urlsplit(self.path).path
+                        route = urlsplit(self.path)
+                        path = route.path
                         if path == '/complete':
                             _ = complete.wait(30)
-                        body = (listing if path == list_page.PAGE_PATH else review if path == review_page.PAGE_PATH
+                        show = parse_qs(route.query).get("show", ["open"])[0]
+                        review_pages = parked_review if later_saved.is_set() else review
+                        body = (listing if path == list_page.PAGE_PATH else review_pages[show] if path == review_page.PAGE_PATH
                                 else b'{}' if path.endswith('.json') else shell.encode())
                         self.send_response(200)
+                        self.send_header('Cache-Control', 'no-store')
                         self.send_header('Content-Type', 'application/json' if path.endswith('.json') else 'text/html; charset=utf-8')
                         self.end_headers()
                         try:
@@ -192,8 +392,16 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
                             pass
 
                     def do_POST(self) -> None:
+                        body = self.rfile.read(int(self.headers['Content-Length']))
+                        if self.path == review_page.PAGE_PATH and parse_qs(body.decode()).get('outcome') == ['later']:
+                            later_saved.set()
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/json')
+                            self.end_headers()
+                            _ = self.wfile.write(b'{"answer":"parked"}')
+                            return
                         if self.path == '/results':
-                            results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                            results.append(cast(list[str], json.loads(body)))
                             complete.set()
                         self.send_response(204)
                         self.end_headers()
@@ -208,14 +416,16 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
                     try:
                         profile = self.root / f'links-profile-{shot}'
                         profile.mkdir()
-                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        destination = list_url
+                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n'
+                            + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n'
+                            + f'user_pref("ui.prefersReducedMotion", {int(shot == "reduced")});\n')
+                        destination = list_url + ('&pending=i' if shot == 'reduced' else '')
                         if shot == 'review':
                             destination = '/console/' + console.place_query('review', review_page.PAGE_PATH + '?show=all#'
-                                + urlencode([('key', entry.key) for entry in reviews[:-1]] + [('item', reviews[1].key)]))
+                                + urlencode([('key', key) for key in linked_keys] + [('item', reviews[1].key)]))
                         url = f'http://127.0.0.1:{server.server_port}' + destination
                         command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
-                        if shot == 'clicks':
+                        if shot in ('clicks', 'reduced'):
                             with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as browser:
                                 try:
                                     self.assertTrue(complete.wait(35), "The browser must report its click results")
@@ -244,11 +454,12 @@ for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('
         _ = the_list.update(MORTY.id, other_producer.id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.update(MORTY.id, source.id, {"related_to": (29,),
             "blocked_by": (the_list.ItemDependency(30, "The blocker is complete."),)}, source="morty")
-        records = [
-            list_page.ListRecord(entry.keeper, replace(entry.item, related_to=(2, 29, 31, 99)))
-            if entry.item.id == source.id else entry
-            for entry in list_page.records()
-        ]
+        records = list_page.records()
+        for index, entry in enumerate(records):
+            if entry.item.id == source.id:
+                records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, related_to=(2, 29, 31, 99), unread_since=NOW))
+            elif entry.item.id == "L30":
+                records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, unread_since=NOW))
         with patch.object(list_page, "records", return_value=records), patch.object(list_page, "counts_strip", return_value=""):
             listing = list_page.render(self.root / "reviews")
         listing = listing.replace(b'data-page-facts ', b'data-page-facts data-read-error="Test read failed" ', 1)
@@ -290,7 +501,8 @@ frame.addEventListener('load',async()=>{
    const rect=element.getBoundingClientRect();
    return rect.top>=0 && rect.bottom<=win.innerHeight;
   };
-  check(!source.hidden && expanded(source) && selected('show')==='open','the source starts open in the Open view');
+  const originalShow=scenario==='unread-words' ? 'unread' : 'open';
+  check(!source.hidden && expanded(source) && selected('show')===originalShow,'the source starts open in the selected view');
   check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator is visible');
   link.scrollIntoView({block:'center'});
   if(scenario==='history') win.scrollTo(0,120);
@@ -335,7 +547,8 @@ frame.addEventListener('load',async()=>{
    check(!missing.hidden && missing.textContent==='Item #99 is not on the List' && inView(missing),'the missing message is in view');
   }else{
    const title=target.querySelector('.list-row');
-   check(selected('show')===(number==='29' ? 'all' : 'open'),'the view after the click is '+selected('show'));
+   const fallback=['closed','repeat','producer','open','pending-words','unread-words','proof'].includes(scenario);
+   check(selected('show')===(fallback ? 'all' : 'open'),'the view after the click is '+selected('show'));
    check(!target.hidden && expanded(target),'the target is visible and open');
    check(inView(title),'the target row is outside the viewport at '+title.getBoundingClientRect().top);
    check(title.getAnimations().some(animation=>animation.playState==='running'),'the target row has a short highlight');
@@ -346,9 +559,10 @@ frame.addEventListener('load',async()=>{
    }
   }
   const expected=originalFilters.slice();
-  if(scenario==='closed'){expected[0]='all';expected[3]='all';}
+  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='all';
+  if(scenario==='closed') expected[3]='all';
   if(scenario==='producer') expected[1]='all';
-  if(scenario==='open' || pendingWords) expected[2]='';
+  if(['open','unread-words'].includes(scenario) || pendingWords) expected[2]='';
   check(filters().every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters()));
   if(scenario==='repeat'){
    const jumpPlace=win.location.href,jumpHistoryLength=win.history.length;
@@ -372,7 +586,7 @@ frame.addEventListener('load',async()=>{
     check(win.location.href===originalPlace,'Back restores the frame address');
     check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
    }
-   check(selected('show')==='open' && !source.hidden && expanded(source),'Back restores the open source');
+   check(selected('show')===originalShow && !source.hidden && expanded(source),'Back restores the open source');
    check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the former chip selections');
    check(!target || !expanded(target),'Back collapses the target row');
    if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
@@ -441,7 +655,8 @@ frame.addEventListener('load',async()=>{
             try:
                 proof = os.environ.get("LIST_JUMP_PROOF")
                 cases = [(30, "open"), (29, "closed"), (31, "producer"), (99, "missing"), (29, "repeat"),
-                         (2, "history"), (2, "banner"), (30, "pending-words"), (30, "unavailable-producer")]
+                         (2, "history"), (2, "banner"), (30, "pending-words"), (30, "unavailable-producer"),
+                         (30, "unread-words")]
                 if proof:
                     cases.append((29, "proof"))
                 for number, case in cases:
@@ -454,6 +669,8 @@ frame.addEventListener('load',async()=>{
                         filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
                         if case in ("open", "closed", "producer", "missing"):
                             filters.update(owner=OWNER.id, producer=MORTY.id, state="Working", q="linked item")
+                        if case == "unread-words":
+                            filters.update(show="unread", q="item")
                         place = list_page.PAGE_PATH + "?show=open#" + urlencode(filters)
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
@@ -759,22 +976,28 @@ frame.addEventListener('load',async()=>{
                     continue
                 self.assertIn(expected, state)
                 self.assertEqual(row.count(expected), 2)
-                place = review_page.PAGE_PATH + '?show=all#' + urlencode(
-                    [('key', key) for key in identities] + ([('item', identities[0])] if len(identities) == 1 else []))
-                href = html.escape('/console/' + console.place_query('review', place), quote=True)
-                self.assertIn(f'href="{href}" target="_top">{expected}</a>', state)
+                found = [key for key in identities if any(review.key == key for review in reviews)]
+                if not found:
+                    self.assertNotIn('<a ', state)
+                else:
+                    target = ([('show', 'open'), ('jump', found[0])] if len(found) == 1
+                              else [('key', key) for key in found])
+                    place = review_page.PAGE_PATH + '?show=all#' + urlencode(target)
+                    href = html.escape('/console/' + console.place_query('review', place), quote=True)
+                    self.assertIn(f'href="{href}" target="_top" data-list-review-link="">{expected}</a>', state)
                 detail = row.split('<div class="list-panel"><div>', 1)[1]
                 self.assertLess(detail.index(expected), detail.index('<form'))
                 positions: list[int] = []
                 for identity in identities:
                     matching = [review for review in reviews if review.key == identity]
+                    place = review_page.PAGE_PATH + '?show=all#' + urlencode({'show': 'open', 'jump': identity})
+                    href = html.escape('/console/' + console.place_query('review', place), quote=True)
+                    anchor = f'<a href="{href}" target="_top" data-list-review-link="">'
                     if matching:
-                        place = review_page.PAGE_PATH + '?show=all#' + urlencode({'key': identity, 'item': identity})
-                        href = html.escape('/console/' + console.place_query('review', place), quote=True)
-                        card = f'<a href="{href}" target="_top">{html.escape(matching[0].id)}</a>'
+                        card = f'{anchor}{html.escape(matching[0].id)}</a>'
                     else:
                         card = html.escape(identity)
-                        self.assertNotIn('#' + urlencode({"item": identity}), detail)
+                        self.assertNotIn(f'{anchor}{card}</a>', detail)
                     self.assertIn(card, detail)
                     positions.append(detail.index(card))
                 self.assertEqual(positions, sorted(positions))
@@ -817,10 +1040,10 @@ frame.addEventListener('load',async()=>{
                 read.assert_called_once()
                 row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
                 self.assertIn(expected, row)
-                place = review_page.PAGE_PATH + '?show=all#' + urlencode({'key': review.key, 'item': review.key})
+                place = review_page.PAGE_PATH + '?show=all#' + urlencode({'show': 'open', 'jump': review.key})
                 card = '/console/' + console.place_query('review', place)
                 if review.type in review_page.TYPES:
-                    self.assertIn(f'<a href="{html.escape(card, quote=True)}" target="_top">{review.id}</a>', row)
+                    self.assertIn(f'<a href="{html.escape(card, quote=True)}" target="_top" data-list-review-link="">{review.id}</a>', row)
                 else:
                     self.assertNotIn(card, row)
                     self.assertIn('<p>' + review.id + '</p>', row)

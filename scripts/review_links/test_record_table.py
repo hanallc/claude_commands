@@ -58,12 +58,13 @@ assert.deepEqual(changes,['two']);
 
 
 class LinkedTableTests(unittest.TestCase):
-    def render(self, fragment: str, *, closed_item: str = '') -> dict[str, object]:
+    def render(self, fragment: str, *, closed_item: str = '', park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
         _, start, callbacks = review_page.SCRIPT.partition('function matchesOwner(')
         callbacks = start + callbacks.split('\nfunction loadBodies()', 1)[0]
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
-                  + 'const closedItem=' + json.dumps(closed_item) + ';\n') + r'''
+                  + 'const closedItem=' + json.dumps(closed_item) + ';\n'
+                  + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
  setAttribute(key,value){this[key]=value;},classList:{toggle(){}},
  addEventListener(type,listener){this[type]=listener;}});
@@ -107,6 +108,11 @@ let selectedShow='all',requestedShow='all';
 const reviewPlace=()=>{},loadBodies=()=>{},pageRefresh={refresh(){}};
 ''' + record_table.SCRIPT + '\n' + callbacks + r'''
 view.place();view.apply(false);
+if(parkOpenCard){
+ view.opened.add('sdlc/C1830');view.apply(false);
+ index.get('sdlc/C1830').hiddenUntil=Date.now()+60000;
+ view.apply(false);
+}
 if(closedItem){
  view.bind();
  view.opened.delete(closedItem);view.apply(false);
@@ -128,6 +134,11 @@ console.log(JSON.stringify({
         result = subprocess.run([node, '-e', source], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         return cast(dict[str, object], json.loads(result.stdout))
+
+    def test_an_open_card_leaves_the_view_when_parked_elsewhere(self) -> None:
+        result = self.render('#show=all', park_open_card=True)
+        self.assertEqual(result['expanded'], ['sdlc/C1830'])
+        self.assertEqual(result['shown'], ['other/C9'])
 
     def test_explicit_item_remains_visible_outside_the_linked_keys(self) -> None:
         result = self.render('#show=all&key=sdlc%2FC1830&item=hana%2FQ10')
