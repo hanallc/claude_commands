@@ -7,9 +7,10 @@ except FileNotFoundError:
     pass
 
 import argparse
+import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable, Sequence, Generator
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -32,24 +33,125 @@ from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
-from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
+from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
-from scripts.lib import conf, user_zone
+from scripts.lib import conf, file_lock, user_zone
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
 HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
 CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
+PROBE_DENIED_CODES = frozenset(('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation',
+                               'Client.UnauthorizedOperation', 'Forbidden', '401', '403'))
+HANA_SETUP_VERSION = 2
+HANA_DATA_DEVICE = '/dev/sdf'
+HANA_DOWN_FIRST = 'Run deploy.py down --workload hana --approve-destroy first.'
+HANA_BUSY = 'The Hana lifecycle is busy. Run hana-setup again when the box is idle.'
+HANA_SPOT_REFUSALS = frozenset(('InsufficientInstanceCapacity', 'SpotMaxPriceTooLow', 'Unsupported',
+                               'MaxSpotInstanceCountExceeded'))
+HANA_CREATE_REFUSALS = frozenset((
+    'AccessDenied', 'AccessDeniedException', 'AuthFailure', 'UnauthorizedOperation',
+    'ClientInvalidParameterValue', 'InvalidParameter', 'InvalidParameterCombination', 'InvalidParameterValue',
+    'MissingParameter', 'ValidationError',
+    'InvalidAMIID.NotFound', 'InvalidSubnetID.NotFound', 'InvalidGroup.NotFound',
+    'InsufficientFreeAddressesInSubnet',
+    'VolumeLimitExceeded', 'VolumeTypeNotAvailableInZone', 'UnknownVolumeType',
+    'UnsupportedOperation', 'TagPolicyViolation',
+))
 
 
-def _hana_operation_failure(operation: str, error: Exception) -> str:
+def _operation_failure(operation: str, error: Exception) -> str:
     code = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
     return f'{operation}: fail' + (f' ({code})' if code else '')
+
+
+@dataclass(frozen=True)
+class ScalerProbe:
+    operation: str
+    call: Callable[[AwsCli], object]
+    success_code: str = 'OK'
+
+
+@dataclass(frozen=True)
+class ScalerProbeUnverified:
+    reason: str = ''
+
+
+@dataclass(frozen=True)
+class ScalerProbePassed:
+    pass
+
+
+@dataclass(frozen=True)
+class ScalerProbeFailure:
+    operation: str
+    code: str
+
+    def next_step(self) -> str:
+        if self.code in PROBE_DENIED_CODES or self.code in ('AuthFailure', 'TerminationGrantDenied'):
+            return 'Check the gate scaler permissions and repeat approved setup.'
+        if ((self.operation, self.code) == ('get-cost-and-usage', 'LimitExceededException')
+                or self.code.startswith(('Throttl', 'TooManyRequests', 'RequestTimeout'))
+                or self.code in ('TimeoutExpired', 'TimeoutError', 'RequestLimitExceeded', 'SlowDown', '429',
+                                 'InternalError', 'InternalFailure', 'ServiceUnavailable')
+                or re.fullmatch(r'5[0-9]{2}', self.code)):
+            return 'Run approved setup again.'
+        return 'Check the failed operation and repeat approved setup.'
+
+
+class TerminationGrantDenied(ValueError):
+    pass
+
+
+class ScalerIdentityMismatch(ValueError):
+    pass
+
+
+def run_scaler_probes(label: str, api: AwsCli, probes: Iterable[ScalerProbe], *,
+                      show_codes: bool = False) -> tuple[ScalerProbeFailure, ...]:
+    failed: list[ScalerProbeFailure] = []
+    for probe in probes:
+        try:
+            result = probe.call(api)
+        except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            code = aws_error_code(error, allow_status=show_codes) if isinstance(error, AwsUnavailable) else ''
+            code = code or (type(error).__name__ if show_codes else '')
+            failed.append(ScalerProbeFailure(probe.operation, code))
+            if isinstance(error, ScalerIdentityMismatch):
+                report = f'{probe.operation}: fail. The scaler profile does not match the stack user.'
+            else:
+                report = f'{probe.operation}: fail' + (f' ({code})' if code else '')
+        else:
+            if isinstance(result, ScalerProbeUnverified):
+                report = f'{probe.operation} unverified.'
+                if result.reason:
+                    report += f' {result.reason}'
+            else:
+                report = f'{probe.operation}: pass'
+                if show_codes:
+                    report += f' ({probe.success_code})'
+        print(f'{label}: {report}', flush=True)
+    return tuple(failed)
+
+
+def put_probe_object(api: AwsCli, bucket: str, key: str, content: bytes) -> None:
+    with tempfile.TemporaryDirectory(prefix='scaler-probe-') as folder:
+        body = Path(folder) / 'probe.json'
+        _ = body.write_bytes(content)
+        _ = api.call('put-object', '--bucket', bucket, '--key', key, '--body', str(body), service='s3api')
+
+
+def get_probe_object(api: AwsCli, bucket: str, key: str, content: bytes) -> None:
+    with tempfile.TemporaryDirectory(prefix='scaler-probe-') as folder:
+        body = Path(folder) / 'probe.json'
+        _ = api.call('get-object', '--bucket', bucket, '--key', key, str(body), service='s3api')
+        if body.read_bytes() != content:
+            raise ValueError('The probe object differs from the value sent')
 
 
 @contextmanager
@@ -94,9 +196,15 @@ class HanaSetupChange:
     """Allow the stack changes needed for setup."""
 
 
+class HanaBoxOwnership(StrEnum):
+    STACK = 'stack'
+    DIRECT = 'direct'
+
+
 @dataclass(frozen=True)
 class HanaPolicyUpdate:
     resource_outputs: dict[str, str]
+    ownership: HanaBoxOwnership = HanaBoxOwnership.DIRECT
 
 
 HANA_SETUP_CHANGE = HanaSetupChange()
@@ -246,6 +354,69 @@ class PreparedDeployment:
     parameters: dict[str, str]
 
 
+@dataclass(frozen=True)
+class HanaSpotCandidate:
+    instance_type: str
+    zone: str
+    subnet: str
+    usd_per_hour: Decimal
+
+    @property
+    def description(self) -> str:
+        return f'{self.instance_type} in {self.zone}'
+
+
+@dataclass(frozen=True)
+class PendingHanaLaunch:
+    instance_type: str
+    zone: str
+    subnet: str
+    token: str
+
+    def matches(self, candidate: HanaSpotCandidate) -> bool:
+        return (self.instance_type, self.zone, self.subnet) == (candidate.instance_type, candidate.zone, candidate.subnet)
+
+    @classmethod
+    def decode(cls, value: object) -> PendingHanaLaunch:
+        row = ledger.mapping(value)
+        return cls(ledger.text(row, 'instance_type'), ledger.text(row, 'zone'),
+                   ledger.text(row, 'subnet'), ledger.text(row, 'token'))
+
+    def encode(self) -> dict[str, str]:
+        return {'instance_type': self.instance_type, 'zone': self.zone, 'subnet': self.subnet, 'token': self.token}
+
+
+def _save_hana_setup(path: Path, saved: dict[str, object]) -> None:
+    write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+
+
+def _hana_parameter_hash(parameters: dict[str, str]) -> str:
+    return sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()
+
+
+def _hana_setup_ownership(saved: dict[str, object]) -> HanaBoxOwnership:
+    version = saved.get('version')
+    generation = saved.get('generation')
+    resource_fields = ('instance', 'spot_request', 'data_volume', 'bucket')
+    text_fields = (*resource_fields, 'deployment', 'region', 'stack', 'parameters_sha256', 'template_sha256')
+    if (type(version) is int and version == 1 and saved.keys() == {*text_fields, 'version', 'requested', 'generation'}
+            and saved['requested'] is True and type(generation) is int and generation >= 0
+            and all(isinstance(saved[key], str) and saved[key] for key in text_fields)):
+        return HanaBoxOwnership.STACK
+    if (type(version) is not int or version != HANA_SETUP_VERSION) and any(
+            key in saved for key in (*resource_fields, 'launch_template', 'security_group', 'pending_launch', 'pending_volume')):
+        raise DeploymentRefused('The saved Hana setup uses stack-owned resources. ' + HANA_DOWN_FIRST)
+    return HanaBoxOwnership.DIRECT
+
+
+def _print_hana_placement(workload: conf.ConfigRead) -> None:
+    enabled = workload.text('enabled')
+    if enabled not in ('on', 'off'):
+        raise ValueError('enabled must be on or off')
+    state = 'enabled' if enabled == 'on' else 'disabled'
+    print(f'Hana placement is {state}. This command does not change it.')
+
+
 def deployment_parameters(path: Path, settings: DeploymentSettings,
                           notification: BudgetNotificationAddress, deployment_id: str) -> dict[str, str]:
     spending = read_settings(path)
@@ -271,7 +442,8 @@ class Deployment:
     def __init__(self, settings_path: Path, directory: Path, output: Path, *,
                  execute: AwsExecutor = execute_command, clock: Callable[[], float] = time.time,
                  pause: Callable[[float], None] = time.sleep,
-                 notify: Callable[[ledger.LimitEvent], bool] = ledger.send_limit_event) -> None:
+                 notify: Callable[[ledger.LimitEvent], bool] = ledger.send_limit_event,
+                 mode: plan_run.ApprovedSetup | plan_run.PlanRun = plan_run.APPROVED_SETUP) -> None:
         self.settings_path = settings_path
         self.directory = directory
         self.output = output
@@ -279,6 +451,7 @@ class Deployment:
         self.clock = clock
         self.pause = pause
         self.notify = notify
+        self.mode = mode
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
     def _deployment_id(self) -> str:
@@ -394,9 +567,21 @@ class Deployment:
         return decision
 
     def _api(self, settings: DeploymentSettings, *, single_attempt: bool = False) -> AwsCli:
-        execute = (self.admin.executor(self.execute, single_attempt=True) if single_attempt
-                   else self.admin.executor(self.execute))
-        return AwsCli(settings.profile, settings.region, settings.timeout_s, execute)
+        if isinstance(self.mode, plan_run.PlanRun):
+            return self.mode.api(settings.region, settings.timeout_s)
+        if single_attempt:
+            return AwsCli(settings.profile, settings.region, settings.timeout_s,
+                          self.admin.executor(self.execute, single_attempt=True))
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool,
+                    timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            offset = arguments.index('--region') + 2
+            if tuple(arguments[offset:offset + 2]) in (('ec2', 'run-instances'), ('ec2', 'create-volume')):
+                # Give each saved intent one EC2 attempt per call.
+                env = dict(env or {}, AWS_MAX_ATTEMPTS='1')
+            return self.execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+
+        return AwsCli(settings.profile, settings.region, settings.timeout_s, self.admin.executor(execute))
 
     def _print_spot_quota(self, api: AwsCli, largest: int) -> None:
         """Show the regional gate quota without stopping deployment on a failed read."""
@@ -434,8 +619,8 @@ class Deployment:
             prepared = self._hana_output()._write_preparation(settings, parameters, template, decision)
             path = self.directory / 'hana' / 'setup.json'
             if not path.exists():
-                write_text_atomic(path, json.dumps({'version': 1, 'deployment': parameters['DeploymentId'],
-                    'stack': settings.stack_name, 'region': settings.region}, sort_keys=True) + '\n')
+                _save_hana_setup(path, {'version': HANA_SETUP_VERSION, 'deployment': parameters['DeploymentId'],
+                                       'stack': settings.stack_name, 'region': settings.region})
             return prepared
 
     def hana_setup(self, *, approve_resources: bool = False) -> bool:
@@ -445,18 +630,23 @@ class Deployment:
         print(f'Hana plan: separate stack; {limits.instance_type}; persistent Spot; interruption stop')
         print(f'Hana plan: root {limits.root_gib} GiB; data {limits.data_gib} GiB; compute ceiling ${limits.spot_max_usd_per_hour}/hour')
         print('Hana resources: instance, retained data disk, launch template, security group, private control bucket, scaler policy')
-        print('Hana placement remains disabled')
-        if not approve_resources:
+        _print_hana_placement(workload)
+        if not approve_resources and isinstance(self.mode, plan_run.ApprovedSetup):
             return False
         stop_timeout = workload.whole('stop_wait_timeout_s')
         stop_interval = workload.whole('stop_poll_seconds')
         if min(stop_timeout, stop_interval) <= 0:
             raise DeploymentRefused('Hana setup requires positive values for stop_wait_timeout_s and stop_poll_seconds.')
+        if isinstance(self.mode, plan_run.PlanRun):
+            return self._plan_hana_update(workload, limits, self.mode)
         self._authorize(True)
         child = self._hana_output()
-        with control_lock(self.directory):
+        with self._hana_setup_lock():
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
+            ownership = _hana_setup_ownership(saved)
+            if ownership is HanaBoxOwnership.STACK:
+                return self._update_stack_owned_hana(path, saved, workload, limits)
             settings, parameters, template = self._hana_inputs(workload)
             if not saved:
                 prepared = cast(object, json.loads((child.output / 'parameters.json').read_text()))
@@ -471,9 +661,13 @@ class Deployment:
             if saved.get('requested'):
                 saved_settings = replace(settings, region=ledger.text(saved, 'region'))
                 outputs = child._stack(saved_settings, require_outputs=True)
+                if 'Instance' in outputs or 'DataVolume' in outputs:
+                    raise DeploymentRefused('The existing Hana stack owns the instance or data disk. ' + HANA_DOWN_FIRST)
+                if outputs:
+                    self._refuse_hana_stack_instance(self._api(saved_settings), saved_settings.stack_name)
                 if not outputs:
-                    if any(saved.get(key) for key in ('instance', 'data_volume', 'bucket')):
-                        raise DeploymentRefused('The Hana stack is missing and the setup record names resources. '
+                    if any(key in saved for key in ('instance', 'data_volume', 'bucket', 'pending_launch', 'pending_volume')):
+                        raise DeploymentRefused('The Hana stack is missing and the setup record names resources or pending requests. '
                                                 + 'Run down --workload hana --approve-destroy before setup.')
                     try:
                         saved_api = self._api(saved_settings)
@@ -490,83 +684,78 @@ class Deployment:
                     print('hana-setup: cleared the saved setup for the missing stack')
                     saved = {}
             template_hash = sha256(template).hexdigest()
-            parameters_hash = sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()
-            if 'generation' in saved:
-                if saved.get('region') != settings.region or saved.get('parameters_sha256') != parameters_hash:
+            parameter_hash = _hana_parameter_hash(parameters)
+            stack_parameters = {key: value for key, value in parameters.items()
+                                if key not in ('InstanceType', 'AvailabilityZone', 'SubnetId', 'DataGiB',
+                                               'FallbackInstanceTypes')}
+            if 'generation' in saved and saved.get('template_sha256') != template_hash:
+                if saved.get('region') != settings.region or saved.get('parameters_sha256') != parameter_hash:
                     raise DeploymentRefused('The approved Hana parameters or region changed. Review the saved deployment.')
-                if saved.get('template_sha256') != template_hash:
-                    if not outputs:
-                        raise DeploymentRefused('The approved Hana template changed; review the saved deployment')
-                    resources: dict[str, str] = {}
-                    for key, output in (('instance', 'Instance'), ('data_volume', 'DataVolume'), ('bucket', 'ControlBucket')):
-                        identity = saved.get(key)
-                        if not isinstance(identity, str) or not identity:
-                            raise DeploymentRefused(f'The saved Hana setup lacks {key}. Complete approved setup first.')
-                        if outputs.get(output) != identity:
-                            raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
-                        resources[output] = identity
-                    try:
-                        registration = remote.read_record(path.with_name('lifecycle.json'))
-                    except FileNotFoundError:
-                        raise DeploymentRefused('The saved Hana setup has no lifecycle registration. Complete approved setup first.') from None
-                    if registration.get('version') != 1 or registration.get('identity') != {
-                            key: ledger.text(saved, key) for key in ('deployment', 'instance', 'spot_request', 'region')}:
-                        raise DeploymentRefused('The Hana lifecycle registration differs from the saved setup.')
-                    identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], resources['Instance'],
-                                                           ledger.text(saved, 'spot_request'), settings.region)
-                    retry = 'Run hana-setup again when the box is idle.'
-                    operation = registration.get('operation', {})
-                    observing = (isinstance(operation, dict)
-                                 and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
-                    if (registration.get('state') != hana_box.Lifecycle.IDLE_STOPPED or registration.get('claims') != []
-                            or registration.get('start', {}) is not None or (operation is not None and not observing)):
-                        raise DeploymentRefused('The Hana lifecycle is busy. ' + retry)
-                    api = self._api(settings)
-                    try:
-                        observed = api.observe(identity.instance, int(self.clock()))
-                    except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
-                        raise DeploymentRefused('Setup could not confirm the Hana instance is stopped. ' + retry) from None
-                    if observed.state != 'stopped':
-                        raise DeploymentRefused('The Hana instance must be stopped. ' + retry)
-                    provider = self._hana_provider()
-                    print('hana-setup probe: before the policy update')
-                    _ = self._probe_hana_scaler(provider, identity)
-                    with step('hana-setup', 'updating the Hana IAM policy', self.settings_path):
-                        self._hana_stack_change(api, settings, child.output / 'template.json',
-                                                parameters, keep='', scope=HanaPolicyUpdate(resources))
-                    saved['template_sha256'] = template_hash
-                    write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
-                    print('Hana policy update complete')
-                    print('hana-setup probe: after the policy update')
-                    return self._probe_hana_scaler(provider, identity)
+                if not outputs:
+                    raise DeploymentRefused('The approved Hana template changed; review the saved deployment')
+                for key in ('instance', 'data_volume', 'bucket', 'launch_template', 'security_group'):
+                    if not saved.get(key):
+                        raise DeploymentRefused(f'The saved Hana setup lacks {key}. Complete approved setup first.')
+                output_names = ('ControlBucket', 'LaunchTemplate', 'LaunchTemplateVersion', 'SecurityGroup')
+                launch = f"LaunchTemplateId={outputs.get('LaunchTemplate')},Version={outputs.get('LaunchTemplateVersion')}"
+                if (not all(outputs.get(key) for key in output_names)
+                        or outputs['ControlBucket'] != saved['bucket'] or launch != saved['launch_template']
+                        or outputs['SecurityGroup'] != saved['security_group']):
+                    raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
+                resources = {key: outputs[key] for key in output_names}
+                api = self._api(settings)
+                identity = self._idle_hana_policy_identity(api, path, saved)
+                provider = self._hana_provider()
+                print('hana-setup probe: before the policy update')
+                _ = self._probe_hana_scaler(provider, identity)
+                with step('hana-setup', 'updating the Hana IAM policy', self.settings_path):
+                    self._hana_stack_change(api, settings, child.output / 'template.json',
+                                            stack_parameters, keep='', scope=HanaPolicyUpdate(resources))
+                saved['template_sha256'] = template_hash
+                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+                print('Hana policy update complete')
+                print('hana-setup probe: after the policy update')
+                return self._probe_hana_scaler(provider, identity)
             _ = self._guard()
             api = self._api(settings)
+            generation = ledger.instant(saved, 'generation') if 'generation' in saved else 0
+            update_ceiling = False
+            if 'generation' in saved:
+                if saved.get('region') != settings.region:
+                    raise DeploymentRefused('The approved Hana region changed. Review the saved deployment.')
+                if saved.get('parameters_sha256') != parameter_hash:
+                    if (not outputs or saved.get('version') != HANA_SETUP_VERSION
+                            or any(key in saved for key in ('instance', 'pending_launch', 'data_volume', 'pending_volume'))):
+                        raise DeploymentRefused('The approved Hana parameters changed. Review the saved deployment.')
+                    previous_ceiling = str(saved.get('spot_max_price', '')) or next(
+                        (str(row.usd_per_hour) for row in book.read_snapshot().hana_compute if row.generation == generation), '')
+                    if (not previous_ceiling or saved.get('parameters_sha256')
+                            != _hana_parameter_hash(parameters | {'SpotMaxPrice': previous_ceiling})):
+                        raise DeploymentRefused('Only the Spot ceiling can change on the saved Hana stack.')
+                    saved['spot_max_price'] = previous_ceiling
+                    update_ceiling = True
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
                 self._validate_inputs(settings)
-                if not outputs:
-                    self._check_hana_spot_price(api, settings.availability_zone, limits, workload)
-            if 'generation' not in saved:
-                # Explicit setup approval reserves resources without enabling command admission.
-                now = int(self.clock())
-                reservation = spending.reserve_setup(now, now + limits.permit_max_seconds)
-                if isinstance(reservation, hana_spend.PermitRefused):
-                    raise DeploymentRefused(reservation.reason)
-                saved.update(version=1, deployment=parameters['DeploymentId'], stack=settings.stack_name,
-                             region=settings.region, generation=reservation.exposure.generation)
-                saved['template_sha256'] = template_hash
-                saved['parameters_sha256'] = parameters_hash
-                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
-            if not outputs:
-                active = [row for row in book.read_snapshot().hana_compute
-                    if row.generation == saved['generation'] and isinstance(row.state, ledger.HanaExposureOpen)]
-                if not active or int(self.clock()) >= active[0].expires:
-                    raise DeploymentRefused('The Hana setup reservation expired; reconcile the separate stack before retry')
+                candidates = (() if saved.get('instance') else self._hana_spot_candidates(api, settings, limits, workload))
+            launch_deadline = 0
+            if not saved.get('instance'):
+                if update_ceiling:
+                    spending.close_unlaunched_setup(int(self.clock()), generation)
+                exposure = self._reserve_hana_setup(spending, saved, generation)
+                generation, launch_deadline = exposure.generation, exposure.expires
+                saved.update(version=HANA_SETUP_VERSION, deployment=parameters['DeploymentId'], stack=settings.stack_name,
+                             region=settings.region, generation=generation, template_sha256=template_hash)
+                if not update_ceiling:
+                    saved.update(parameters_sha256=parameter_hash, spot_max_price=parameters['SpotMaxPrice'])
+                _save_hana_setup(path, saved)
+            if not outputs or update_ceiling:
+                if saved.get('instance'):
+                    raise DeploymentRefused('The saved Hana instance has no stack outputs. ' + HANA_DOWN_FIRST)
                 saved['requested'] = True
-                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+                _save_hana_setup(path, saved)
                 with step('hana-setup', 'updating the separate Hana stack', self.settings_path):
                     try:
-                        self._hana_stack_change(api, settings, child.output / 'template.json', parameters,
-                                                keep=str(saved.get('instance', '')))
+                        self._hana_stack_change(api, settings, child.output / 'template.json', stack_parameters, keep='')
                     except HanaCreateRolledBack as error:
                         try:
                             self._clear_hana_setup(spending, path, saved)
@@ -574,54 +763,215 @@ class Deployment:
                             raise AwsUnavailable(f'{error}\nThe saved Hana setup remains: {cleanup_error}') from None
                         raise
                 outputs = child._stack(settings)
-            instance, bucket = outputs['Instance'], outputs['ControlBucket']
-            if saved.get('instance', instance) != instance or saved.get('data_volume', outputs['DataVolume']) != outputs['DataVolume']:
-                raise DeploymentRefused('Hana resource identities changed; review replacement before setup')
-            observed = api.observe(instance, int(self.clock()))
+            if not all(outputs.get(key) for key in ('ControlBucket', 'LaunchTemplate', 'LaunchTemplateVersion', 'SecurityGroup')):
+                raise DeploymentRefused('The Hana stack did not report its launch resources.')
+            bucket = outputs['ControlBucket']
+            launch = 'LaunchTemplateId=' + outputs['LaunchTemplate'] + ',Version=' + outputs['LaunchTemplateVersion']
+            group = outputs['SecurityGroup']
+            identities = {'bucket': bucket, 'launch_template': launch, 'security_group': group}
+            expected = {key: str(saved.get(key, value)) for key, value in identities.items()}
+            if update_ceiling and expected['launch_template'].split(',Version=', 1)[0] == launch.split(',Version=', 1)[0]:
+                expected['launch_template'] = launch
+            if identities != expected:
+                raise DeploymentRefused('Hana stack outputs changed. Review replacement before setup.')
+            saved.update(identities, parameters_sha256=parameter_hash, spot_max_price=parameters['SpotMaxPrice'])
+            _save_hana_setup(path, saved)
+            if not saved.get('instance'):
+                self._launch_hana_instance(api, path, saved, candidates, spending, launch_deadline)
+            instance = ledger.text(saved, 'instance')
+            spending.record_setup_instance_type(generation, ledger.text(saved, 'instance_type'))
+            stack_timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+            _ = api.call('wait', 'instance-exists', '--instance-ids', instance, timeout_s=stack_timeout)
             reply = api.call('describe-instances', '--instance-ids', instance)
             instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
             if len(instances) != 1 or instances[0].get('InstanceId') != instance:
                 raise DeploymentRefused('Hana instance confirmation differs')
             request = ledger.text(instances[0], 'SpotInstanceRequestId')
+            if saved.get('spot_request', request) != request:
+                raise DeploymentRefused('The Hana Spot request differs from the saved request.')
+            saved['spot_request'] = request
             try:
                 requests = ledger.rows(api.call('describe-spot-instance-requests', '--spot-instance-request-ids', request),
                                        'SpotInstanceRequests')
             except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                raise AwsUnavailable(_hana_operation_failure('describe-spot-instance-requests', error)) from None
+                raise AwsUnavailable(_operation_failure('describe-spot-instance-requests', error)) from None
             if (len(requests) != 1 or requests[0].get('InstanceId') != instance
                     or requests[0].get('Type') != 'persistent'
                     or requests[0].get('InstanceInterruptionBehavior') != 'stop'):
                 raise DeploymentRefused('Hana requires a persistent Spot request with stop behavior')
-            saved.update(instance=instance, spot_request=request, bucket=bucket, data_volume=outputs['DataVolume'],
-                         stop_pending=True)
-            write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+            if 'pending_launch' in saved:
+                del saved['pending_launch']
+            _save_hana_setup(path, saved)
+            self._attach_hana_data(api, path, saved, limits.data_gib, stack_timeout, stop_interval)
+            saved['stop_pending'] = True
+            _save_hana_setup(path, saved)
             with step('hana-setup', 'confirming the idle stop', self.settings_path):
+                observed = api.observe(instance, int(self.clock()))
                 if observed.state not in ('stopped', 'stopping'):
                     _ = api.call('stop-instances', '--instance-ids', instance)
-                started = time.monotonic()
-                deadline = started + stop_timeout
-                while time.monotonic() < deadline:
+                for started in self._hana_check_times(stop_timeout, stop_interval):
                     confirmed = api.observe(instance, int(self.clock()))
-                    now = time.monotonic()
-                    print(f'waiting for the Hana box to stop: {confirmed.state}, {int(now - started)} s of {stop_timeout} s',
+                    elapsed = int(time.monotonic() - started)
+                    print(f'waiting for the Hana box to stop: {confirmed.state}, {elapsed} s of {stop_timeout} s',
                           flush=True)
                     if confirmed.state == 'stopped':
                         break
-                    remaining = deadline - now
-                    if remaining > 0:
-                        self.pause(min(stop_interval, remaining))
                 else:
                     raise DeploymentRefused('The Hana box is not yet stopped. '
                                             + 'Run deploy.py hana-setup --approve-resources again to resume setup.')
                 spending.reconcile(int(self.clock()), 'stopped', generation=ledger.instant(saved, 'generation'))
                 del saved['stop_pending']
-                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+                _save_hana_setup(path, saved)
         provider = self._hana_provider()
         identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region)
         hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
             clock=self.clock).register(identity)
-        print('Hana setup complete: the box is stopped; placement remains disabled')
+        print('Hana setup complete. The box is stopped.')
+        _print_hana_placement(workload)
         return self._probe_hana_scaler(provider, identity)
+
+    @contextmanager
+    def _hana_setup_lock(self, *, wait: bool = True) -> Generator[None]:
+        path = self.directory / 'controller.lock'
+        if wait:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        elif not path.is_file():
+            raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
+        with file_lock.exclusive(path, wait=wait) as result:
+            if result is file_lock.LockResult.BUSY:
+                raise DeploymentRefused(HANA_BUSY)
+            yield
+
+    def _plan_hana_update(self, workload: conf.ConfigRead, limits: hana_spend.PermitSettings,
+                          plan: plan_run.PlanRun) -> bool:
+        path = self.directory / 'hana' / 'setup.json'
+        try:
+            saved = remote.read_record(path)
+        except FileNotFoundError:
+            raise plan_run.unsupported('first-time Hana setup') from None
+        if any(key in saved for key in ('pending_launch', 'pending_volume', 'stop_pending')):
+            raise plan_run.unsupported('Hana setup has pending instance or volume work')
+        try:
+            ownership = _hana_setup_ownership(saved)
+        except DeploymentRefused:
+            raise plan_run.unsupported('the saved Hana setup has an unsupported format') from None
+        if ownership != HanaBoxOwnership.STACK:
+            raise plan_run.unsupported('Hana uses direct-owned resources')
+        self._check_credentials()
+        with self._hana_setup_lock(wait=False):
+            if remote.read_record(path) != saved:
+                raise DeploymentRefused('The saved Hana setup changed. Run hana-setup again.')
+            plan.confirm_account(limits.region, workload.whole('aws_timeout_s'))
+            return self._update_stack_owned_hana(path, saved, workload, limits)
+
+    def _update_stack_owned_hana(self, path: Path, saved: dict[str, object], workload: conf.ConfigRead,
+                                 limits: hana_spend.PermitSettings) -> bool:
+        """Update the scaler policy for a stopped stack-owned box."""
+        account = read_deployment_settings(self.settings_path)
+        stack_name = workload.text('stack_name')
+        if stack_name == account.stack_name or saved.get('stack') != stack_name or saved.get('region') != limits.region:
+            raise DeploymentRefused('The saved Hana stack or region differs from the workload.')
+        settings = replace(account, stack_name=stack_name, region=limits.region, timeout_s=workload.whole('aws_timeout_s'))
+        api = self._api(settings)
+        stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack_name, service='cloudformation'), 'Stacks')
+        if len(stacks) != 1:
+            raise DeploymentRefused('Expected one Hana stack for the policy update.')
+        stack = stacks[0]
+        outputs = self._stack_outputs(stack, require_outputs=True)
+        resource_fields = {'Instance': 'instance', 'DataVolume': 'data_volume', 'ControlBucket': 'bucket'}
+        if any(outputs.get(output) != saved[key] for output, key in resource_fields.items()) or not outputs.get('LaunchTemplate'):
+            raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
+        resources = {key: outputs[key] for key in (*resource_fields, 'LaunchTemplate')}
+        parameter_rows = ledger.rows(stack, 'Parameters')
+        parameters = {ledger.text(row, 'ParameterKey'): ledger.text(row, 'ParameterValue') for row in parameter_rows}
+        if len(parameters) != len(parameter_rows) or parameters.get('DeploymentId') != saved.get('deployment'):
+            raise DeploymentRefused('The live Hana stack parameters differ from the saved deployment.')
+        if parameters.get('ScalerUser') != settings.scaler_user_name:
+            raise DeploymentRefused('The live Hana stack scaler user differs from the approved configuration.')
+        identity = self._idle_hana_policy_identity(api, path, saved)
+        stack_id = ledger.text(stack, 'StackId')
+        reply = api.call('get-template', '--stack-name', stack_id, '--template-stage', 'Original', service='cloudformation')
+        body = reply.get('TemplateBody')
+        template = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
+        live = ledger.mapping(template['Resources'])
+        resource_types = {'Instance': 'AWS::EC2::Instance', 'DataVolume': 'AWS::EC2::Volume',
+                          'DataAttachment': 'AWS::EC2::VolumeAttachment', 'ScalerPolicy': 'AWS::IAM::ManagedPolicy'}
+        if (ledger.mapping(template['Parameters']).keys() != parameters.keys()
+                or any(ledger.mapping(live.get(key, {})).get('Type') != kind for key, kind in resource_types.items())):
+            raise DeploymentRefused('The live template does not match the stack-owned Hana setup.')
+        current = ledger.mapping(cast(object, json.loads(HANA_TEMPLATE.read_bytes())))
+        policy = ledger.mapping(current['Resources'])['ScalerPolicy']
+        needs_update = live['ScalerPolicy'] != policy
+        live['ScalerPolicy'] = policy
+        content = json.dumps(template, sort_keys=True).encode()
+        provider = self._hana_provider()
+        if isinstance(self.mode, plan_run.PlanRun):
+            if not needs_update:
+                raise plan_run.unsupported('the Hana scaler policy is current')
+            plan = self.mode
+            _ = provider.signing_key()
+            scaler = plan.scaler(provider.api.in_region(identity.region), settings.scaler_user_name)
+            print('plan guard: Hana scaler credentials passed', flush=True)
+            replacement = plan.scaler_policy(api, stack_id, policy, parameters, outputs['ControlBucket'])
+            with tempfile.TemporaryDirectory(prefix='hana-policy-') as folder:
+                change_template = Path(folder) / 'template.json'
+                _ = change_template.write_bytes(content)
+                self._hana_stack_change(api, replace(settings, stack_name=stack_id), change_template,
+                    parameters, keep='', scope=HanaPolicyUpdate(resources, HanaBoxOwnership.STACK))
+            bucket = outputs['ControlBucket']
+            bucket_policy = plan.bucket_policy(api.region, template, parameters, bucket)
+            plan.probe_scaler(api, scaler, replacement, identity.instance, identity.deployment, bucket, bucket_policy)
+            return True
+        if needs_update:
+            print('hana-setup probe: before the policy update')
+            _ = self._probe_hana_scaler(provider, identity)
+            with tempfile.TemporaryDirectory(prefix='hana-policy-') as folder:
+                change_template = Path(folder) / 'template.json'
+                _ = change_template.write_bytes(content)
+                with step('hana-setup', 'updating the Hana IAM policy', self.settings_path):
+                    self._hana_stack_change(api, replace(settings, stack_name=stack_id), change_template,
+                        parameters, keep='', scope=HanaPolicyUpdate(resources, HanaBoxOwnership.STACK))
+        else:
+            print('The Hana scaler policy is current.')
+        template_hash = sha256(content).hexdigest()
+        if saved.get('template_sha256') != template_hash:
+            saved['template_sha256'] = template_hash
+            _save_hana_setup(path, saved)
+        if needs_update:
+            print('hana-setup probe: after the policy update')
+        return self._probe_hana_scaler(provider, identity)
+
+    def _idle_hana_policy_identity(self, api: AwsCli, path: Path, saved: dict[str, object]) -> hana_box.DeploymentIdentity:
+        try:
+            registration = remote.read_record(path.with_name('lifecycle.json'))
+        except FileNotFoundError:
+            raise DeploymentRefused('The saved Hana setup has no lifecycle registration. Complete approved setup first.') from None
+        fields = {key: ledger.text(saved, key) for key in ('deployment', 'instance', 'spot_request', 'region')}
+        if registration.get('version') != 1 or registration.get('identity') != fields:
+            raise DeploymentRefused('The Hana lifecycle registration differs from the saved setup.')
+        identity = hana_box.DeploymentIdentity(fields['deployment'], fields['instance'], fields['spot_request'], fields['region'])
+        retry = 'Run hana-setup again when the box is idle.'
+        operation = registration.get('operation', {})
+        observing = (isinstance(operation, dict)
+                     and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
+        if (registration.get('state') != hana_box.Lifecycle.IDLE_STOPPED or registration.get('claims') != []
+                or registration.get('start', {}) is not None or (operation is not None and not observing)):
+            raise DeploymentRefused(HANA_BUSY)
+        try:
+            observed = api.observe(identity.instance, int(self.clock()))
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
+            raise DeploymentRefused('Setup could not confirm the Hana instance is stopped. ' + retry) from None
+        if observed.state != 'stopped':
+            raise DeploymentRefused('The Hana instance must be stopped. ' + retry)
+        volume = ledger.text(saved, 'data_volume')
+        volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume), 'Volumes')
+        attachments = ledger.rows(volumes[0], 'Attachments') if len(volumes) == 1 and volumes[0].get('VolumeId') == volume else ()
+        if (len(attachments) != 1 or attachments[0].get('InstanceId') != identity.instance
+                or attachments[0].get('Device') != HANA_DATA_DEVICE or attachments[0].get('State') != 'attached'):
+            raise DeploymentRefused('Hana resource identities changed. Review the saved deployment.')
+        if isinstance(self.mode, plan_run.PlanRun):
+            print('plan guard: Hana instance stopped and data disk attached', flush=True)
+        return identity
 
     def _hana_provider(self) -> AwsHanaProvider:
         return AwsHanaProvider.from_settings(conf.path('aws_target'), self.directory, conf.path('hana_aws'),
@@ -629,86 +979,87 @@ class Deployment:
 
     @staticmethod
     def _probe_hana_scaler(provider: AwsHanaProvider, identity: hana_box.DeploymentIdentity) -> bool:
-        api = provider.api.in_region(identity.region)
-        passed = True
-
-        @contextmanager
-        def report(operation: str) -> Generator[None]:
-            nonlocal passed
-            try:
-                yield
-            except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                passed = False
-                print('hana-setup probe: ' + _hana_operation_failure(operation, error))
-            else:
-                print(f'hana-setup probe: {operation}: pass')
-
-        with report('export-credentials'):
-            _ = provider.signing_key()
-        with report('describe-instances'):
-            _ = api.call('describe-instances', '--instance-ids', identity.instance)
-        with report('describe-spot-instance-requests'):
-            _ = api.call('describe-spot-instance-requests', '--spot-instance-request-ids', identity.spot_request)
         attribute = ('--instance-id', identity.instance, '--attribute', 'userData')
         user_data = ''
-        with report('describe-instance-attribute'):
+
+        def read_user_data(api: AwsCli) -> None:
+            nonlocal user_data
             reply = api.call('describe-instance-attribute', *attribute)
             value = ledger.mapping(reply.get('UserData', {})).get('Value', '')
             if not isinstance(value, str):
                 raise ValueError('Invalid user data value')
             user_data = value
-        with report('modify-instance-attribute'), tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
-            # Use an empty value for the dry run if the read failed.
-            data = Path(folder) / 'user-data'
-            _ = data.write_text(user_data)
-            api.ec2_dry_run('modify-instance-attribute', *attribute, '--value', f'file://{data}')
-        for operation in ('start-instances', 'stop-instances'):
-            with report(operation):
-                api.ec2_dry_run(operation, '--instance-ids', identity.instance)
+
+        def check_user_data_write(api: AwsCli) -> None:
+            with tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
+                # Use an empty value for the dry run if the read failed.
+                data = Path(folder) / 'user-data'
+                _ = data.write_text(user_data)
+                api.ec2_dry_run('modify-instance-attribute', *attribute, '--value', f'file://{data}')
 
         key = f'control/{identity.deployment}/setup-probe.json'
-        query = ('--bucket', provider.bucket, '--key', key)
         content = b'{"probe": "hana-setup"}'
-        with report('put-object'), tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
-            body = Path(folder) / 'probe.json'
-            _ = body.write_bytes(content)
-            _ = api.call('put-object', *query, '--body', str(body), service='s3api')
-        with report('get-object'), tempfile.TemporaryDirectory(prefix='hana-probe-') as folder:
-            body = Path(folder) / 'probe.json'
-            _ = api.call('get-object', *query, str(body), service='s3api')
-            if body.read_bytes() != content:
-                raise ValueError('The probe object differs from the value sent')
-        return passed
+        return not run_scaler_probes('hana-setup probe', provider.api.in_region(identity.region), [
+            ScalerProbe('export-credentials', lambda _api: provider.signing_key()),
+            ScalerProbe('describe-instances', lambda api: api.call('describe-instances', '--instance-ids', identity.instance)),
+            ScalerProbe('describe-spot-instance-requests', lambda api: api.call('describe-spot-instance-requests',
+                '--spot-instance-request-ids', identity.spot_request)),
+            ScalerProbe('describe-instance-attribute', read_user_data),
+            ScalerProbe('modify-instance-attribute', check_user_data_write),
+            ScalerProbe('start-instances', lambda api: api.ec2_dry_run('start-instances', '--instance-ids', identity.instance)),
+            ScalerProbe('stop-instances', lambda api: api.ec2_dry_run('stop-instances', '--instance-ids', identity.instance)),
+            ScalerProbe('put-object', lambda api: put_probe_object(api, provider.bucket, key, content)),
+            ScalerProbe('get-object', lambda api: get_probe_object(api, provider.bucket, key, content)),
+        ])
 
-    def _check_hana_spot_price(self, api: AwsCli, zone: str, limits: hana_spend.PermitSettings,
-                               workload: conf.ConfigRead) -> None:
+    def _hana_spot_candidates(self, api: AwsCli, settings: DeploymentSettings,
+                              limits: hana_spend.PermitSettings, workload: conf.ConfigRead) -> tuple[HanaSpotCandidate, ...]:
         try:
             margin = conf.decimal(workload.text('spot_ceiling_margin', recover_invalid=False))
         except ValueError as error:
             raise DeploymentRefused(f'Hana setup requires a positive spot_ceiling_margin. {error}') from error
         if margin <= 0:
             raise DeploymentRefused('Hana setup requires a positive spot_ceiling_margin.')
-        size = limits.instance_type
+        sizes = (limits.instance_type, *limits.fallback_instance_types)
+        primary = settings.availability_zone
+        subnets = {primary: settings.subnet_id}
+        reply = api.call('describe-subnets', '--filters', 'Name=vpc-id,Values=' + settings.vpc_id)
+        for row in sorted(ledger.rows(reply, 'Subnets'), key=lambda subnet: ledger.text(subnet, 'SubnetId')):
+            zone = ledger.text(row, 'AvailabilityZone')
+            if (zone != primary and zone.startswith(api.region) and row.get('VpcId') == settings.vpc_id
+                    and row.get('State') == 'available' and row.get('DefaultForAz') is True):
+                _ = subnets.setdefault(zone, ledger.text(row, 'SubnetId'))
         try:
-            rows = fetch_spot_prices(api, (size,), int(self.clock()))
+            rows = fetch_spot_prices(api, sizes, int(self.clock()))
         except (AwsUnavailable, OSError, ValueError, subprocess.SubprocessError) as error:
-            raise DeploymentRefused(f'Could not read Spot prices for {size} in {api.region}.') from error
-
-        prices = {row.zone: row.usd_per_hour for row in rows}
-        if zone not in prices:
-            priced_zones = ', '.join(sorted(prices)) or 'none'
-            raise DeploymentRefused(f'AWS lists no Spot price for {size} in {zone}. '
-                                    + f'Zones with a price in {api.region}: {priced_zones}.')
-        price = prices[zone]
+            raise DeploymentRefused(f'Could not read Spot prices for Hana instance types in {api.region}.') from error
+        prices = {(row.instance_type, row.zone): row.usd_per_hour for row in rows}
         ceiling = limits.spot_max_usd_per_hour
-        summary = f'The current Spot price for {size} in {zone} is {price:f} USD/hour. The ceiling is {ceiling:f} USD/hour.'
-        if price > ceiling:
-            cheapest = min(prices, key=prices.__getitem__)
-            suggested = format((price * (1 + margin)).quantize(Decimal('0.01'), rounding=ROUND_CEILING), 'f')
+        available: list[HanaSpotCandidate] = []
+        above_ceiling: list[HanaSpotCandidate] = []
+        for size in sizes:
+            for zone, subnet in subnets.items():
+                if (size, zone) not in prices:
+                    print(f'hana-setup: skip {size} in {zone}. AWS lists no Spot price.')
+                    continue
+                candidate = HanaSpotCandidate(size, zone, subnet, prices[size, zone])
+                if candidate.usd_per_hour > ceiling:
+                    print(f'hana-setup: skip {candidate.description}. '
+                          + f'{candidate.usd_per_hour:f} USD/h exceeds the {ceiling:f} USD/h ceiling.')
+                    above_ceiling.append(candidate)
+                else:
+                    available.append(candidate)
+        if available:
+            return tuple(sorted(available, key=lambda candidate: (
+                (candidate.instance_type, candidate.zone) != (limits.instance_type, primary),
+                candidate.usd_per_hour)))
+        if above_ceiling:
+            cheapest = min(above_ceiling, key=lambda candidate: candidate.usd_per_hour)
+            suggested = format((cheapest.usd_per_hour * (1 + margin)).quantize(
+                Decimal('0.01'), rounding=ROUND_CEILING), 'f')
             ceiling_key = workload.effective_key('spot_max_usd_per_hour')
-            details = (f'{summary}\n'
-                + f'The cheapest zone is {cheapest} at {prices[cheapest]:f} USD/hour. '
-                + 'To change zones, use a subnet in the new zone.\n')
+            details = (f'No Hana Spot candidate meets the {ceiling:f} USD/h ceiling.\n'
+                + f'The cheapest candidate is {cheapest.description} at {cheapest.usd_per_hour:f} USD/h.\n')
             try:
                 _ = conf.editable_line('hana_aws', ceiling_key)
                 conf.check('hana_aws', ceiling_key, suggested)
@@ -718,7 +1069,140 @@ class Deployment:
                 + f'1. Run /tune hana_aws {ceiling_key} {suggested}\n'
                 + '2. Run deploy.py prepare --workload hana\n'
                 + '3. Run deploy.py hana-setup --approve-resources')
-        print(f'hana-setup: {summary}')
+        raise DeploymentRefused(f'AWS lists no Spot prices for Hana instance types in the eligible subnets of {api.region}.')
+
+    def _reserve_hana_setup(self, spending: hana_spend.HanaSpending, saved: dict[str, object],
+                            generation: int) -> ledger.HanaComputeExposure:
+        now = int(self.clock())
+        for row in spending.book.read_snapshot().hana_compute:
+            if row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen):
+                if now < row.expires:
+                    return row
+                if not saved.get('pending_launch'):
+                    spending.close_unlaunched_setup(now, generation)
+                break
+        if saved.get('pending_launch'):
+            raise DeploymentRefused('The pending Hana launch has no active reservation. ' + HANA_DOWN_FIRST)
+        reservation = spending.reserve_setup(now, now + spending.settings.permit_max_seconds)
+        if isinstance(reservation, hana_spend.PermitRefused):
+            raise DeploymentRefused(reservation.reason)
+        return reservation.exposure
+
+    def _launch_hana_instance(self, api: AwsCli, path: Path, saved: dict[str, object],
+                              candidates: tuple[HanaSpotCandidate, ...], spending: hana_spend.HanaSpending,
+                              deadline: int) -> None:
+        if 'pending_launch' in saved:
+            pending = PendingHanaLaunch.decode(saved['pending_launch'])
+            first = next((candidate for candidate in candidates if pending.matches(candidate)), None)
+            if first is None:
+                raise DeploymentRefused('The pending Hana launch is no longer an eligible candidate. ' + HANA_DOWN_FIRST)
+            candidates = (first, *(candidate for candidate in candidates if candidate != first))
+        failures: list[str] = []
+        ceiling = spending.settings.spot_max_usd_per_hour
+        for number, candidate in enumerate(candidates, 1):
+            if int(self.clock()) >= deadline:
+                raise DeploymentRefused('The Hana setup reservation expired before the next launch.')
+            retrying = 'pending_launch' in saved
+            token = PendingHanaLaunch.decode(saved['pending_launch']).token if retrying else uuid4().hex
+            saved['pending_launch'] = PendingHanaLaunch(
+                candidate.instance_type, candidate.zone, candidate.subnet, token).encode()
+            _save_hana_setup(path, saved)
+            print(f'attempt {number} of {len(candidates)}: {candidate.description} at '
+                  + f'{candidate.usd_per_hour:f} USD/h (ceiling {ceiling:f})', flush=True)
+            try:
+                reply = api.call('run-instances', '--launch-template', ledger.text(saved, 'launch_template'),
+                    '--instance-type', candidate.instance_type, '--subnet-id', candidate.subnet,
+                    '--security-group-ids', ledger.text(saved, 'security_group'), '--associate-public-ip-address',
+                    '--count', '1', '--client-token', token)
+            except AwsUnavailable as error:
+                reason = ' '.join(str(error).split())
+                code = aws_error_code(error, first_attempt_of='RunInstances')
+                spot_refusal = code in HANA_SPOT_REFUSALS or (not code and (
+                    'no spot capacity' in reason.lower()
+                    or 'lower than the minimum required spot request fulfillment price' in reason.lower()))
+                message = f'attempt {number} failed: {reason}'
+                if not retrying and (spot_refusal or code in HANA_CREATE_REFUSALS):
+                    del saved['pending_launch']
+                    _save_hana_setup(path, saved)
+                if retrying or not spot_refusal:
+                    raise DeploymentRefused(message) from error
+                print(message, flush=True)
+                failures.append(f'{candidate.description}: {message}')
+                continue
+            instances = ledger.rows(reply, 'Instances')
+            if len(instances) != 1:
+                raise DeploymentRefused('AWS did not identify one instance for the Hana launch.')
+            launched = instances[0]
+            saved.update(instance=ledger.text(launched, 'InstanceId'), instance_type=candidate.instance_type,
+                         zone=candidate.zone, subnet=candidate.subnet)
+            if launched.get('SpotInstanceRequestId'):
+                saved['spot_request'] = ledger.text(launched, 'SpotInstanceRequestId')
+            _save_hana_setup(path, saved)
+            return
+        spending.close_unlaunched_setup(int(self.clock()), ledger.instant(saved, 'generation'))
+        raise DeploymentRefused('No Hana Spot candidate launched. The stack is ready for another setup run.\n'
+                                + '\n'.join(failures))
+
+    def _hana_check_times(self, timeout: int, interval: int) -> Generator[float]:
+        started = time.monotonic()
+        deadline = started + timeout
+        while time.monotonic() < deadline:
+            yield started
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self.pause(min(interval, remaining))
+
+    def _attach_hana_data(self, api: AwsCli, path: Path, saved: dict[str, object],
+                          size: int, timeout: int, interval: int) -> None:
+        instance, zone = ledger.text(saved, 'instance'), ledger.text(saved, 'zone')
+        if saved.get('data_volume'):
+            volume = ledger.text(saved, 'data_volume')
+            if 'pending_volume' not in saved:
+                volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume), 'Volumes')
+                if len(volumes) != 1 or volumes[0].get('VolumeId') != volume or volumes[0].get('AvailabilityZone') != zone:
+                    raise DeploymentRefused('The Hana data volume differs from the saved volume.')
+                attachments = ledger.rows(volumes[0], 'Attachments')
+                if attachments:
+                    if (len(attachments) != 1 or attachments[0].get('InstanceId') != instance
+                            or attachments[0].get('Device') != HANA_DATA_DEVICE
+                            or attachments[0].get('State') not in ('attaching', 'attached')):
+                        raise DeploymentRefused('The Hana data volume attachment differs from the saved instance.')
+                    _ = api.call('wait', 'volume-in-use', '--volume-ids', volume, timeout_s=timeout)
+                    return
+        else:
+            identity = ledger.text(saved, 'deployment')
+            retrying = 'pending_volume' in saved
+            token = (ledger.text(saved, 'pending_volume') if retrying
+                     else sha256(f'hana-data:{identity}:{instance}'.encode()).hexdigest())
+            saved['pending_volume'] = token
+            _save_hana_setup(path, saved)
+            tags = {'HanaDeployment': identity, 'Workload': 'hana', 'HanaData': 'true', 'HanaVolumeToken': token}
+            try:
+                reply = api.call('create-volume', '--availability-zone', zone, '--size', str(size), '--volume-type', 'gp3',
+                    '--encrypted', '--client-token', token, '--tag-specifications', json.dumps(
+                        [{'ResourceType': 'volume', 'Tags': [{'Key': key, 'Value': value} for key, value in tags.items()]}]))
+            except AwsUnavailable as error:
+                if not retrying and aws_error_code(error, first_attempt_of='CreateVolume') in HANA_CREATE_REFUSALS:
+                    del saved['pending_volume']
+                    _save_hana_setup(path, saved)
+                raise
+            volume = ledger.text(reply, 'VolumeId')
+            saved['data_volume'] = volume
+            _save_hana_setup(path, saved)
+        _ = api.call('wait', 'volume-available', '--volume-ids', volume, timeout_s=timeout)
+        if 'pending_volume' in saved:
+            del saved['pending_volume']
+            _save_hana_setup(path, saved)
+        for _started in self._hana_check_times(timeout, interval):
+            state = api.observe(instance, int(self.clock())).state
+            if state in ('running', 'stopped'):
+                break
+            if state not in ('pending', 'stopping'):
+                raise DeploymentRefused(f'Cannot attach the Hana data disk while the instance is {state}.')
+        else:
+            raise DeploymentRefused('The Hana instance is not ready for its data disk. Run approved setup again.')
+        _ = api.call('attach-volume', '--volume-id', volume, '--instance-id', instance, '--device', HANA_DATA_DEVICE)
+        _ = api.call('wait', 'volume-in-use', '--volume-ids', volume, timeout_s=timeout)
 
     @staticmethod
     def _hana_setup_started(book: ledger.CostLedger, saved: dict[str, object]) -> int:
@@ -744,7 +1228,7 @@ class Deployment:
         workload = conf.read_or_repository('hana_aws')
         print(f'Hana image plan: {built.name}; {built.logical_bytes / 2**30:.1f} GiB; boot {built.boot_mode}')
         print('Hana image resources: one EBS snapshot and one registered image; no instance')
-        print('Hana placement remains disabled')
+        _print_hana_placement(workload)
         if not approve_resources:
             return False
         self._authorize(True)
@@ -829,15 +1313,28 @@ class Deployment:
             path = hana_image.save(self.directory, hana_image.RegisteredImage(
                 built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
                 settings.vpc_id, str(subnets[0]['id'])))
-        print(f'Hana image ready: saved in {path}; placement remains disabled')
+        print(f'Hana image ready. The record is in {path}.')
         return True
 
     @staticmethod
-    def _hana_parameters_match(reply: dict[str, object], approved: dict[str, str]) -> bool:
+    def _refuse_hana_stack_instance(api: AwsCli, stack: str) -> None:
+        reply = api.call('describe-stack-resources', '--stack-name', stack, service='cloudformation')
+        if any(row.get('LogicalResourceId') == 'Instance' and row.get('ResourceType') == 'AWS::EC2::Instance'
+               for row in ledger.rows(reply, 'StackResources')):
+            raise DeploymentRefused('The existing Hana stack owns the instance. ' + HANA_DOWN_FIRST)
+
+    @staticmethod
+    def _hana_parameters_match(reply: dict[str, object], approved: dict[str, str], *, allow_previous: bool = False) -> bool:
         try:
             rows = ledger.rows(reply, 'Parameters')
-            return len(rows) == len(approved) and {
-                ledger.text(row, 'ParameterKey'): row.get('ParameterValue') for row in rows} == approved
+            values = {}
+            for row in rows:
+                key = ledger.text(row, 'ParameterKey')
+                value = row.get('ParameterValue')
+                if allow_previous and 'ParameterValue' not in row and row.get('UsePreviousValue') is True:
+                    value = approved.get(key)
+                values[key] = value
+            return len(rows) == len(approved) and values == approved
         except ValueError:
             return False
 
@@ -856,6 +1353,7 @@ class Deployment:
         kind = 'UPDATE' if stacks else 'CREATE'
         stack_target = settings.stack_name
         policy_only = isinstance(scope, HanaPolicyUpdate)
+        stack_owned = isinstance(scope, HanaPolicyUpdate) and scope.ownership is HanaBoxOwnership.STACK
         if policy_only:
             if not stacks:
                 raise DeploymentRefused('The Hana stack is absent. The policy update requires an existing stack.')
@@ -868,31 +1366,31 @@ class Deployment:
             if not self._hana_parameters_match(stack, parameters):
                 raise DeploymentRefused('The live Hana stack parameters differ from the approved parameters.')
             stack_target = ledger.text(stack, 'StackId')
+            if stack_owned and stack_target != settings.stack_name:
+                raise DeploymentRefused('The live Hana stack ID differs from the stack selected for the policy update.')
+        else:
+            for stack in stacks:
+                if 'Outputs' in stack and any(row.get('OutputKey') in ('Instance', 'DataVolume')
+                                             for row in ledger.rows(stack, 'Outputs')):
+                    raise DeploymentRefused('The existing Hana stack owns the instance or data disk. ' + HANA_DOWN_FIRST)
+            if stacks:
+                self._refuse_hana_stack_instance(api, settings.stack_name)
         values: list[dict[str, object]] = [
             {'ParameterKey': key, 'UsePreviousValue': True} if policy_only
             else {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
         ]
-        name = 'hana-' + uuid4().hex
-        execution_requested = False
-        try:
-            _ = api.call('create-change-set', '--stack-name', stack_target, '--change-set-name', name,
-                         '--change-set-type', kind, '--template-body', 'file://' + str(template),
-                         '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(values),
-                         service='cloudformation')
-            wait_error: Exception | None = None
-            try:
-                _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_target,
-                             '--change-set-name', name, service='cloudformation', timeout_s=timeout)
-            except (AwsUnavailable, subprocess.SubprocessError) as error:
-                wait_error = error
-            change = api.call('describe-change-set', '--stack-name', stack_target, '--change-set-name', name,
-                              *(['--no-paginate'] if policy_only else []), service='cloudformation')
+        def validate(change: dict[str, object], wait_error: Exception | None = None) -> bool:
             reason = str(change.get('StatusReason', '')).lower()
+            no_changes = change.get('Status') == 'FAILED' and any(
+                text in reason for text in ("didn't contain changes", 'no changes'))
+            if (stack_owned and no_changes and not change.get('NextToken')
+                    and change.get('Changes', []) == []):
+                print('The Hana scaler policy is current.')
+                return False
             if policy_only and change.get('Status') == 'FAILED':
                 raise DeploymentRefused('CloudFormation failed to create the Hana policy change set.')
-            if change.get('Status') == 'FAILED' and any(text in reason for text in ("didn't contain changes", 'no changes')):
-                _ = self._discard_change_set(api, stack_target, name)
-                return
+            if no_changes:
+                return False
             if wait_error is not None:
                 raise wait_error
             if change.get('Status') != 'CREATE_COMPLETE':
@@ -908,17 +1406,52 @@ class Deployment:
                 raise DeploymentRefused(refusal)
             if policy_only and change.get('NextToken'):
                 raise DeploymentRefused('The Hana policy change set has more than one page.')
-            if policy_only and not resources:
-                raise DeploymentRefused('The Hana policy change set has no changes.')
+            if policy_only and (not resources or stack_owned and len(resources) != 1):
+                raise DeploymentRefused('The Hana policy change set must contain exactly one stack-owned policy change.'
+                                         if resources else 'The Hana policy change set has no changes.')
             if policy_only and any(
                     resource.get('Action') != 'Modify'
                     or resource.get('Replacement') != 'False'
+                    or (stack_owned and resource.get('LogicalResourceId') != 'ScalerPolicy')
                     or resource.get('ResourceType') not in ('AWS::IAM::ManagedPolicy', 'AWS::IAM::Policy',
                         'AWS::IAM::RolePolicy', 'AWS::IAM::UserPolicy', 'AWS::IAM::GroupPolicy')
                     for resource in resources):
                 raise DeploymentRefused('The Hana change set must contain only IAM policy modifications without replacement.')
-            if policy_only and not self._hana_parameters_match(change, parameters):
+            if policy_only and not self._hana_parameters_match(change, parameters, allow_previous=stack_owned):
                 raise DeploymentRefused('The Hana policy change set parameters differ from the approved parameters.')
+            return True
+
+        if isinstance(self.mode, plan_run.PlanRun):
+            if kind != 'UPDATE' or not stack_owned:
+                raise plan_run.unsupported('Hana needs an existing stack-owned box')
+            with self.mode.change(api, stack_target, template.read_bytes(), values, timeout) as change:
+                if not validate(change):
+                    raise plan_run.unsupported('the Hana scaler policy is current')
+                resource = ledger.mapping(ledger.rows(change, 'Changes')[0].get('ResourceChange'))
+                if resource.get('ResourceType') != 'AWS::IAM::ManagedPolicy':
+                    raise DeploymentRefused('The Hana change must modify the managed ScalerPolicy.')
+                print('plan IAM: Modify ScalerPolicy AWS::IAM::ManagedPolicy replacement=False', flush=True)
+                print('plan guard: Hana change set passed', flush=True)
+            return
+
+        name = 'hana-' + uuid4().hex
+        execution_requested = False
+        try:
+            _ = api.call('create-change-set', '--stack-name', stack_target, '--change-set-name', name,
+                         '--change-set-type', kind, '--template-body', 'file://' + str(template),
+                         '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(values),
+                         service='cloudformation')
+            wait_error: Exception | None = None
+            try:
+                _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_target,
+                             '--change-set-name', name, service='cloudformation', timeout_s=timeout)
+            except (AwsUnavailable, subprocess.SubprocessError) as error:
+                wait_error = error
+            change = api.call('describe-change-set', '--stack-name', stack_target, '--change-set-name', name,
+                              *(['--no-paginate'] if policy_only else []), service='cloudformation')
+            if not validate(change, wait_error):
+                _ = self._discard_change_set(api, stack_target, name)
+                return
             execute_api = self._api(settings, single_attempt=True) if policy_only else api
             execution_requested = True
             try:
@@ -933,6 +1466,8 @@ class Deployment:
                 raise
             _ = api.call('wait', 'stack-create-complete' if kind == 'CREATE' else 'stack-update-complete',
                          '--stack-name', stack_target, service='cloudformation', timeout_s=timeout)
+            if stack_owned:
+                print('Hana policy update complete')
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             if policy_only or isinstance(error, DeploymentRefused):
                 leftover = self._discard_change_set(api, stack_target, name) if not execution_requested else ''
@@ -971,8 +1506,8 @@ class Deployment:
 
     def hana_down(self, *, approve_destroy: bool = False) -> bool:
         """Delete Hana resources and close their charges."""
-        print('down --workload hana cancels each Hana Spot request, then terminates its boxes and deletes the Hana stack.')
-        print('down --workload hana then deletes the Hana data disk and control bucket; their data is lost.')
+        print('down --workload hana cancels the Spot request and terminates the Hana instance.')
+        print('It deletes the data disk, stack, and control bucket. This deletes their data.')
         if not approve_destroy:
             print('Run deploy.py down --workload hana --approve-destroy to remove the Hana box.')
             return True
@@ -983,26 +1518,41 @@ class Deployment:
                 print('down --workload hana: no Hana deployment is saved')
                 return True
             saved = remote.read_record(path)
-            settings, _, _ = self._hana_inputs()
+            workload = conf.read_or_repository('hana_aws')
+            settings, _, _ = self._hana_inputs(workload)
             if 'region' in saved:
                 settings = replace(settings, region=ledger.text(saved, 'region'))
             api = self._api(settings)
             timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
             tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
-            # Read the stack's disk and bucket before the stack delete removes the record of them.
+            direct = saved.get('version') == HANA_SETUP_VERSION
+            if direct and any(key in saved for key in ('pending_launch', 'pending_volume')):
+                lookup_timeout = workload.whole('intent_lookup_timeout_s')
+                interval = workload.whole('stop_poll_seconds')
+                if min(lookup_timeout, interval) <= 0:
+                    raise DeploymentRefused('Hana teardown requires positive values for intent_lookup_timeout_s and stop_poll_seconds.')
+                self._resolve_hana_intents(api, path, saved, lookup_timeout, interval)
+            volumes: frozenset[str] = self._hana_data_volumes(api, saved) if direct else frozenset()
             kept = retained.in_stack(api, settings.stack_name) | retained.Retained(
-                frozenset([str(saved['data_volume'])] if saved.get('data_volume') else []),
-                frozenset([str(saved['bucket'])] if saved.get('bucket') else []))
+                frozenset((ledger.text(saved, 'data_volume'),)) if not direct and saved.get('data_volume') else frozenset(),
+                frozenset((ledger.text(saved, 'bucket'),)) if saved.get('bucket') else frozenset())
             book = ledger.CostLedger(self.directory)
             started = self._hana_setup_started(book, saved) if saved.get('requested') and not saved.get('instance') else None
             with step('hana-down', 'ending the Hana Spot boxes', self.settings_path):
-                ended = spot_end.end_boxes(api, tag)
+                ended = (self._end_saved_hana_boxes(api, tag, saved, timeout) if direct
+                         else spot_end.end_boxes(api, tag, wait_s=timeout))
+                if not ended:
+                    print('hana-down: no live Hana instance remains.')
+            if direct:
+                with step('hana-down', 'deleting the Hana data disk', self.settings_path):
+                    retained.delete(api, retained.Retained(volumes), wait_s=timeout)
             with step('hana-down', 'deleting the Hana stack', self.settings_path, hint='can take several minutes'):
                 _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
                 _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
                              service='cloudformation', timeout_s=timeout)
-            with step('hana-down', 'checking for Spot boxes that the stack kept', self.settings_path):
-                ended += spot_end.end_boxes(api, tag)
+            if not direct:
+                with step('hana-down', 'checking for Spot boxes that the stack kept', self.settings_path):
+                    ended += spot_end.end_boxes(api, tag, wait_s=timeout)
             with step('hana-down', 'deleting the Hana data disk and control bucket', self.settings_path):
                 if started is not None:
                     deleted = retained.deleted_since(api, settings.stack_name, started)
@@ -1011,8 +1561,7 @@ class Deployment:
                     else:
                         kept |= deleted
                 retained.delete(api, kept, wait_s=timeout)
-            spending = hana_spend.HanaSpending(book, self.settings_path,
-                hana_spend.read_settings(conf.read_or_repository('hana_aws')))
+            spending = hana_spend.HanaSpending(book, self.settings_path, hana_spend.read_settings(workload))
             now = int(self.clock())
             compute = book.read_snapshot().hana_compute if book.path.exists() else []
             if compute:
@@ -1021,8 +1570,126 @@ class Deployment:
             for name in ('lifecycle.json', 'setup.json'):
                 (self.directory / 'hana' / name).unlink(missing_ok=True)
         print(f'down --workload hana: done; {ended} Spot boxes ended; '
-              + f'{len(kept.volumes)} disks and {len(kept.buckets)} buckets deleted')
+              + f'{len(volumes | kept.volumes)} disks and {len(kept.buckets)} buckets deleted')
         return True
+
+    def _resolve_hana_intents(self, api: AwsCli, path: Path, saved: dict[str, object], timeout: int, interval: int) -> None:
+        if 'pending_launch' in saved:
+            pending = PendingHanaLaunch.decode(saved['pending_launch'])
+            for _started in self._hana_check_times(timeout, interval):
+                reply = api.call('describe-instances', '--filters', f'Name=client-token,Values={pending.token}')
+                instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
+                if len(instances) > 1:
+                    raise DeploymentRefused('AWS returned multiple instances for the pending Hana launch. Teardown stopped.')
+                if not instances or not instances[0].get('SpotInstanceRequestId'):
+                    continue
+                request = ledger.text(instances[0], 'SpotInstanceRequestId')
+                try:
+                    requests = ledger.rows(api.call('describe-spot-instance-requests', '--spot-instance-request-ids', request),
+                                           'SpotInstanceRequests')
+                except AwsUnavailable as error:
+                    if 'InvalidSpotInstanceRequestID.NotFound' not in str(error):
+                        raise
+                    continue
+                if not any(row.get('SpotInstanceRequestId') == request for row in requests):
+                    continue
+                saved.update(instance=ledger.text(instances[0], 'InstanceId'), spot_request=request,
+                             instance_type=pending.instance_type, zone=pending.zone, subnet=pending.subnet)
+                del saved['pending_launch']
+                _save_hana_setup(path, saved)
+                break
+            else:
+                raise DeploymentRefused('AWS did not confirm the pending Hana launch. Run approved teardown again.')
+        if 'pending_volume' in saved:
+            token = ledger.text(saved, 'pending_volume')
+            deployment = ledger.text(saved, 'deployment')
+            for _started in self._hana_check_times(timeout, interval):
+                reply = api.call('describe-volumes', '--filters', f'Name=tag:HanaVolumeToken,Values={token}',
+                                 f'Name=tag:HanaDeployment,Values={deployment}')
+                volumes = ledger.rows(reply, 'Volumes')
+                if len(volumes) > 1:
+                    raise DeploymentRefused('AWS returned multiple disks for the pending Hana disk creation. Teardown stopped.')
+                if not volumes or volumes[0].get('State') == 'creating':
+                    continue
+                volume = ledger.text(volumes[0], 'VolumeId')
+                if saved.get('data_volume', volume) != volume:
+                    raise DeploymentRefused('The pending Hana disk differs from the saved disk. Teardown stopped.')
+                saved['data_volume'] = volume
+                del saved['pending_volume']
+                _save_hana_setup(path, saved)
+                break
+            else:
+                raise DeploymentRefused('AWS did not confirm the pending Hana disk creation. Run approved teardown again.')
+
+    @staticmethod
+    def _end_saved_hana_boxes(api: AwsCli, tag: tuple[str, str], saved: dict[str, object], timeout: int) -> int:
+        request = ledger.text(saved, 'spot_request') if saved.get('spot_request') else ''
+        if not saved.get('instance'):
+            print('hana-down: no saved instance ID. Checking the deployment tags.')
+        if not request:
+            print('hana-down: no saved Spot request ID. Checking the instance and deployment tags.')
+            if saved.get('instance'):
+                instance = ledger.text(saved, 'instance')
+                reply = api.call('describe-instances', '--filters', f'Name=instance-id,Values={instance}')
+                for reservation in ledger.rows(reply, 'Reservations'):
+                    for row in ledger.rows(reservation, 'Instances'):
+                        if row.get('InstanceId') == instance and row.get('SpotInstanceRequestId'):
+                            request = ledger.text(row, 'SpotInstanceRequestId')
+        if request:
+            try:
+                rows = ledger.rows(api.call('describe-spot-instance-requests', '--spot-instance-request-ids', request),
+                                   'SpotInstanceRequests')
+                if any(row.get('SpotInstanceRequestId') == request and row.get('State') in spot_end.LIVE_REQUEST_STATES
+                       for row in rows):
+                    _ = api.call('cancel-spot-instance-requests', '--spot-instance-request-ids', request)
+                else:
+                    print('hana-down: the saved Spot request is already closed or gone.')
+            except AwsUnavailable as error:
+                if 'InvalidSpotInstanceRequestID.NotFound' not in str(error):
+                    raise
+                print('hana-down: the saved Spot request is already gone.')
+        ended = spot_end.end_boxes(api, tag, wait_s=timeout)
+        if not request:
+            return ended
+        # Check the exact request too. Its replacement instances can lack deployment tags.
+        reply = api.call('describe-instances', '--filters', f'Name=spot-instance-request-id,Values={request}',
+                         'Name=instance-state-name,Values=' + spot_end.LIVE_BOX_STATES)
+        remaining = {ledger.text(row, 'InstanceId') for group in ledger.rows(reply, 'Reservations')
+                     for row in ledger.rows(group, 'Instances') if row.get('SpotInstanceRequestId') == request}
+        if saved.get('instance'):
+            instance = ledger.text(saved, 'instance')
+            reply = api.call('describe-instances', '--filters', f'Name=instance-id,Values={instance}',
+                             'Name=instance-state-name,Values=' + spot_end.LIVE_BOX_STATES)
+            if any(row.get('InstanceId') == instance for group in ledger.rows(reply, 'Reservations')
+                   for row in ledger.rows(group, 'Instances')):
+                remaining.add(instance)
+        if remaining:
+            instances = sorted(remaining)
+            _ = api.call('terminate-instances', '--instance-ids', *instances)
+            _ = api.call('wait', 'instance-terminated', '--instance-ids', *instances, timeout_s=timeout)
+        try:
+            rows = ledger.rows(api.call('describe-spot-instance-requests', '--spot-instance-request-ids', request),
+                               'SpotInstanceRequests')
+        except AwsUnavailable as error:
+            if 'InvalidSpotInstanceRequestID.NotFound' not in str(error):
+                raise
+            rows = ()
+        if any(row.get('SpotInstanceRequestId') == request and row.get('State') in spot_end.LIVE_REQUEST_STATES
+               for row in rows):
+            raise spot_end.SpotEndIncomplete('The saved Hana Spot request remains open.')
+        return ended + len(remaining)
+
+    @staticmethod
+    def _hana_data_volumes(api: AwsCli, saved: dict[str, object]) -> frozenset[str]:
+        if saved.get('data_volume'):
+            return frozenset((ledger.text(saved, 'data_volume'),))
+        print('hana-down: no saved data disk ID.')
+        if not saved.get('instance'):
+            return frozenset()
+        # Recover a disk when AWS created it before setup saved the ID.
+        reply = api.call('describe-volumes', '--filters', 'Name=tag:HanaData,Values=true',
+                         'Name=tag:HanaDeployment,Values=' + ledger.text(saved, 'deployment'))
+        return frozenset(ledger.text(row, 'VolumeId') for row in ledger.rows(reply, 'Volumes'))
 
     def _hana_inputs(self, workload: conf.ConfigRead | None = None) -> tuple[DeploymentSettings, dict[str, str], bytes]:
         """Share the existing deployment validation and use only Hana sizes and prices."""
@@ -1054,6 +1721,7 @@ class Deployment:
             raise DeploymentRefused('The saved Hana stack differs; review replacement before setup')
         parameters = {
             'DeploymentId': identity, 'Image': settings.ami_id, 'InstanceType': limits.instance_type,
+            'FallbackInstanceTypes': ','.join(limits.fallback_instance_types),
             'AvailabilityZone': settings.availability_zone, 'VpcId': settings.vpc_id, 'SubnetId': settings.subnet_id,
             'RootDevice': settings.root_device_name, 'RootGiB': str(limits.root_gib), 'DataGiB': str(limits.data_gib),
             'SpotMaxPrice': str(limits.spot_max_usd_per_hour), 'ScalerUser': settings.scaler_user_name,
@@ -1313,6 +1981,8 @@ class Deployment:
             write_text_atomic(self.output / 'preflight.json', json.dumps(preflight, sort_keys=True) + '\n')
 
     def _authorize(self, approve_resources: bool) -> None:
+        if isinstance(self.mode, plan_run.PlanRun):
+            raise plan_run.unsupported('this command requires approved setup')
         if not approve_resources:
             raise DeploymentRefused('the user must pass --approve-resources at their terminal')
         self._check_credentials()
@@ -1540,10 +2210,16 @@ class Deployment:
             if not executed:
                 _ = self._discard_change_set(api, stack_id, name)
 
-    def regional_image(self, api: AwsCli, settings: DeploymentSettings, region: str) -> str:
+    def regional_image(self, api: AwsCli, settings: DeploymentSettings, region: str,
+                       *, home_image: dict[str, object] | None = None) -> str:
         """Find the matching release or retain a copied image for recovery."""
         target = api.in_region(region)
-        source = ledger.rows(api.call('describe-images', '--image-ids', settings.ami_id), 'Images')[0]
+        source = home_image
+        if source is None:
+            sources = ledger.rows(api.call('describe-images', '--image-ids', settings.ami_id), 'Images')
+            if isinstance(self.mode, plan_run.PlanRun) and not sources:
+                raise DeploymentRefused('EC2 did not return the configured home gate image.')
+            source = sources[0]
         images = ledger.rows(target.call('describe-images', '--owners', ledger.text(source, 'OwnerId'),
             '--filters', 'Name=name,Values=' + ledger.text(source, 'Name'), 'Name=state,Values=available'), 'Images')
         if images:
@@ -1551,6 +2227,14 @@ class Deployment:
         path = self.directory / 'regional-images.json'
         saved = remote.read_record(path) if path.exists() else {}
         identity = region + ':' + settings.ami_id
+        if isinstance(self.mode, plan_run.PlanRun):
+            if identity not in saved:
+                raise plan_run.unsupported('the regional gate image needs an EC2 copy')
+            image = ledger.text(ledger.mapping(saved[identity]), 'image')
+            matches = ledger.rows(target.call('describe-images', '--image-ids', image), 'Images')
+            if len(matches) != 1 or matches[0].get('ImageId') != image or matches[0].get('State') != 'available':
+                raise plan_run.unsupported('the saved regional gate image is unavailable')
+            return image
         if identity not in saved:
             copied = target.call('copy-image', '--source-region', settings.region, '--source-image-id', settings.ami_id,
                 '--name', ledger.text(source, 'Name'), '--client-token', sha256(identity.encode()).hexdigest())
@@ -1561,7 +2245,8 @@ class Deployment:
                        timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
         return image
 
-    def regional_network(self, api: AwsCli, settings: DeploymentSettings, region: str) -> RegionalNetwork:
+    def regional_network(self, api: AwsCli, settings: DeploymentSettings, region: str,
+                         *, home_image: dict[str, object] | None = None) -> RegionalNetwork:
         """Read the default VPC and public subnets of a gate region, and find or copy its gate image."""
         target = api.in_region(region)
         vpcs = ledger.rows(target.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
@@ -1572,7 +2257,14 @@ class Deployment:
             subnets = gate_subnets(target, vpc)
         except DeploymentRefused as error:
             raise DeploymentRefused(region + ': ' + str(error)) from error
-        return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region))
+        return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region, home_image=home_image))
+
+    def _regional_gate_values(self, settings: DeploymentSettings, parameters: dict[str, str],
+                              network: RegionalNetwork, deployment: str, profile: str) -> dict[str, str]:
+        return {**parameters, 'GateImage': network.image, 'VpcId': network.vpc,
+            'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
+            'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
+            'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': profile}
 
     def regional_gate_stack(self, api: AwsCli, settings: DeploymentSettings, home: dict[str, str],
                             parameters: dict[str, str], network: RegionalNetwork) -> dict[str, object]:
@@ -1580,10 +2272,7 @@ class Deployment:
         region = network.region
         target = api.in_region(region)
         deployment = ledger.text(deployment_record(self.directory), 'deployment_id')
-        values = {**parameters, 'GateImage': network.image, 'VpcId': network.vpc,
-            'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
-            'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
-            'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': home['GateProfileArn']}
+        values = self._regional_gate_values(settings, parameters, network, deployment, home['GateProfileArn'])
         template = self.output / ('region-gates-' + region + '.json')
         write_text_atomic(template, json.dumps(region_gate_template(), sort_keys=True) + '\n')
         definitions = ledger.mapping(region_gate_template()['Parameters'])
@@ -1736,6 +2425,190 @@ class Deployment:
         return gpu_size_trial.start_service(folder, self.directory.resolve(),
                                             self.settings_path.resolve(), execute) == 0
 
+    def gate_plan(self) -> None:
+        """Preview the approved gate update in configured region order."""
+        if not isinstance(self.mode, plan_run.PlanRun):
+            raise DeploymentRefused('The gate plan requires the plan identity.')
+        directory = self.directory / 'gate-up'
+        directory.mkdir(parents=True, exist_ok=True)
+        with file_lock.exclusive(directory / 'controller.lock', wait=False) as lock:
+            if lock is file_lock.LockResult.BUSY:
+                raise DeploymentRefused('The gate controller lock gate-up/controller.lock is busy.')
+            self._gate_plan_locked(self.mode)
+
+    def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
+        from scripts.aws_target import cloud_gate, gpu_size_trial
+
+        settings = read_deployment_settings(self.settings_path)
+        values = cloud_gate.settings()
+        regions = gate_regions(settings.region, values)
+        api = plan.api(settings.region, settings.timeout_s)
+        failures: dict[str, str] = {}
+        results: dict[str, str] = {}
+        networks: dict[str, RegionalNetwork] = {}
+        try:
+            self._check_credentials()
+            plan.confirm_account(api.region, api.timeout_s)
+            owner = plan.credential.owner
+            saved = deployment_record(self.directory)
+            stack = plan.gate_stack(api, settings.stack_name)
+            status = ledger.text(stack, 'StackStatus')
+            if status == 'REVIEW_IN_PROGRESS':
+                raise plan_run.unsupported('the home gate stack is in REVIEW_IN_PROGRESS')
+            stack_id = ledger.text(stack, 'StackId')
+            if (saved.get('stack') != settings.stack_name or saved.get('region') != settings.region
+                    or saved.get('account_id') != owner.account or saved.get('stack_id') != stack_id):
+                raise DeploymentRefused('The home gate stack differs from the saved deployment identity.')
+            outputs = self._stack_outputs(stack, require_outputs=False)
+            deployment = ledger.text(saved, 'deployment_id')
+            live_parameters = {ledger.text(row, 'ParameterKey'): str(row.get('ParameterValue', ''))
+                               for row in ledger.rows(stack, 'Parameters')}
+            if (not re.fullmatch(r'[a-f0-9]{32}', deployment)
+                    or live_parameters.get('DeploymentId') != deployment
+                    or live_parameters.get('VpcId') != settings.vpc_id
+                    or live_parameters.get('ScalerUserName') != settings.scaler_user_name
+                    or outputs.get('ScalerUserName') != settings.scaler_user_name):
+                raise DeploymentRefused('The home gate deployment parameters differ from the saved identity.')
+            scaler_api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
+            _ = gpu_size_trial.gpu_signing_key(scaler_api)
+            scaler = scaler_api.call('get-caller-identity', service='sts')
+            principal = owner.iam('user/' + settings.scaler_user_name)
+            local_scaler = ledger.mapping(saved.get('scaler_user', {}))
+            if (scaler.get('Account') != owner.account or scaler.get('Arn') != principal
+                    or local_scaler.get('name') != settings.scaler_user_name or local_scaler.get('arn') != principal
+                    or local_scaler.get('user_id') != ledger.text(scaler, 'UserId')):
+                raise DeploymentRefused('STS did not confirm the saved gate scaler user.')
+            reply = api.call('get-template', '--stack-name', stack_id, '--template-stage', 'Original',
+                             service='cloudformation')
+            body = reply['TemplateBody']
+            live = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
+            live_resources = ledger.mapping(live['Resources'])
+            source = TEMPLATE.read_bytes()
+            template = ledger.mapping(cast(object, json.loads(source)))
+            definitions = ledger.mapping(template['Parameters'])
+            spending = read_settings(self.settings_path)
+            gpu_types = sorted(gpu_size_trial.settings().spot_max_usd_per_hour.keys()
+                               | set(values.words('hana_gpu_instance_types')))
+            wait_s = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+            print('plan guard: home gate stack and scaler credentials passed', flush=True)
+            images = ledger.rows(api.call('describe-images', '--image-ids', settings.ami_id), 'Images')
+            if len(images) != 1 or images[0].get('ImageId') != settings.ami_id:
+                raise DeploymentRefused('EC2 did not return the configured home gate image.')
+            home_image = images[0]
+        except plan_run.PLAN_ERRORS as error:
+            for region in regions:
+                print(f'plan gate: {region}: refused: {plan_run.safe_reason(error)}', flush=True)
+            raise DeploymentRefused('one or more gate regions failed') from None
+
+        for region in regions:
+            try:
+                if region == settings.region:
+                    networks[region] = RegionalNetwork(region, settings.vpc_id, gate_subnets(api, settings.vpc_id),
+                                                       settings.ami_id)
+                else:
+                    networks[region] = self.regional_network(api, settings, region, home_image=home_image)
+            except plan_run.PLAN_ERRORS as error:
+                failures[region] = plan_run.safe_reason(error)
+
+        try:
+            parameters = gate_parameters(settings, values, owner.partition, owner.account,
+                                         [networks[region] for region in regions[1:] if region in networks], gpu_types)
+            proposed = live_parameters | parameters
+            regional_template = region_gate_template()
+            regional_source = json.dumps(regional_template, sort_keys=True).encode()
+            regional_definitions = ledger.mapping(regional_template['Parameters'])
+            if failures and settings.region not in failures:
+                failures[settings.region] = 'the home gate policy needs the image and VPC of every gate region'
+            documents, shared = plan.gate_policy_documents(api.region, settings.scaler_user_name, template, proposed)
+            for key, value in (('GateBucket', shared.bucket), ('GateProfileArn', shared.profile), ('GateRoleArn', shared.role)):
+                if key in outputs and outputs[key] != value:
+                    raise DeploymentRefused('The home gate outputs differ from the proposed resource identities.')
+
+        except plan_run.PLAN_ERRORS as error:
+            for region in regions:
+                reason = failures.get(region, plan_run.safe_reason(error))
+                print(f'plan gate: {region}: refused: {reason}', flush=True)
+            raise DeploymentRefused('one or more gate regions failed') from None
+
+        home_policy_ids = tuple(logical_id for logical_id in plan_run.GATE_SCALER_POLICY_IDS
+                                if live_parameters.get('EnableGates') == 'true' and logical_id in live_resources)
+        displaced = {settings.region: plan_run.GateDisplacedPolicies(stack_id, home_policy_ids)}
+        covered_regions: set[str] = set()
+        pending_probes: dict[str, plan_run.GateLaunchProbe] = {}
+        interrupted = False
+        for region in regions:
+            if region in failures:
+                continue
+            try:
+                target = api.in_region(region)
+                network = networks[region]
+                if region == settings.region:
+                    changes = gate_update_values(stack, parameters, definitions)
+                    with plan.gate_update(target, stack_id, source, changes, wait_s) as preview:
+                        displaced[region] = plan_run.GateDisplacedPolicies(
+                            stack_id, home_policy_ids + preview.displaced_policy_ids)
+                        change_kind = preview.summary
+                    regional_outputs = outputs
+                else:
+                    name = settings.stack_name + '-gates-' + region
+                    regional = plan.gate_stack(target, name)
+                    if regional.get('StackStatus') == 'ROLLBACK_COMPLETE':
+                        change_kind = 'permissions passed; approved setup must recreate the rolled-back stack'
+                        regional_outputs = {}
+                    else:
+                        regional_outputs = self._stack_outputs(regional, require_outputs=False)
+                        if regional.get('StackStatus') == 'REVIEW_IN_PROGRESS':
+                            raise plan_run.unsupported('the regional gate stack is in REVIEW_IN_PROGRESS')
+                        regional_parameters = self._regional_gate_values(settings, parameters, network, deployment,
+                                                                         shared.profile)
+                        changes = gate_update_values(regional, {key: value for key, value in regional_parameters.items()
+                                                                if key in regional_definitions}, regional_definitions)
+                        regional_id = ledger.text(regional, 'StackId')
+                        with plan.gate_update(target, regional_id, regional_source, changes, wait_s) as preview:
+                            displaced[region] = plan_run.GateDisplacedPolicies(regional_id, preview.displaced_policy_ids)
+                            change_kind = preview.summary
+
+                pending_probes[region] = plan_run.GateLaunchProbe(deployment, network.image, network.vpc,
+                    ledger.text(network.subnets[0], 'id'), regional_outputs.get('GateLaunchTemplate', 'lt-00000000000000000'),
+                    regional_outputs.get('GateSecurityGroup', 'sg-00000000000000000'), tuple(gpu_types),
+                    {'GateAttempt': 'setup-probe', 'GpuSizeTrial': 'setup-probe', 'ExpiresAt': '0',
+                     spending.cost_explorer_tag_key: spending.cost_explorer_tag_value},
+                    gpu_size_trial.GPU_TRIAL_ARTIFACT_PREFIX + 'setup-probe.json',
+                    gpu_size_trial.GPU_TRIAL_REQUEST_PREFIX + 'setup-probe.json')
+                results[region] = change_kind
+                covered_regions.add(region)
+            except plan_run.GateStackAbsent as error:
+                covered_regions.add(region)
+                failures[region] = plan_run.safe_reason(error)
+            except KeyboardInterrupt:
+                covered_regions.discard(region)
+                failures[region] = 'The gate preview was interrupted.'
+                interrupted = True
+                break
+            except plan_run.PLAN_ERRORS as error:
+                failures[region] = plan_run.safe_reason(error)
+
+        try:
+            exclusions = plan.gate_policy_exclusions(api, regions, covered_regions, displaced)
+        except plan_run.PlanRefused as error:
+            for region in regions:
+                _ = failures.setdefault(region, plan_run.safe_reason(error))
+        else:
+            for region, launch in pending_probes.items():
+                try:
+                    plan.probe_gate_scaler(api.in_region(region), principal, exclusions, documents, shared, launch,
+                                           home=region == settings.region)
+                except plan_run.PLAN_ERRORS as error:
+                    failures[region] = plan_run.safe_reason(error)
+
+        for region in regions:
+            result = f'refused: {failures[region]}' if region in failures else f'pass ({results[region]})'
+            print(f'plan gate: {region}: {result}', flush=True)
+        if interrupted:
+            raise KeyboardInterrupt
+        if failures:
+            raise DeploymentRefused('one or more gate regions failed')
+
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
@@ -1753,7 +2626,6 @@ class Deployment:
             revision = aws_trial.host_nixpkgs_revision()
             account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
             partition = stack_id.split(':')[1]
-            prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
             values = cloud_gate.settings()
             # The home scaler policies cover every gate region, so the scaler user's policy count stays fixed.
             timings = GateRegionTimings.read(self.directory)
@@ -1763,49 +2635,34 @@ class Deployment:
             for position, region in enumerate(additional, 1):
                 with timings.measure(GateRegionOperation.NETWORK, region, position, len(additional), self.settings_path):
                     networks.append(self.regional_network(api, settings, region))
-            gpu_types = sorted(gpu_size_trial.settings().spot_max_usd_per_hour.keys() |
-                               set(values.words('hana_gpu_instance_types')))
-            parameters = {
-                'EnableGates': 'true', 'GateImage': settings.ami_id,
-                'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
-                                      *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
-                'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
-                'GateInstanceTypes': ','.join(values.words('instance_types')),
-                'GateGpuInstanceTypes': ','.join(gpu_types),
-                'GateRootGiB': str(values.whole('root_gib')),
-                'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
-                'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
-                'GateExpiryMinutes': str(values.whole('expiry_schedule_minutes')),
-                'GateExpiryTimeout': str(values.whole('expiry_timeout_s')),
-                'GateExpiryMemory': str(values.whole('expiry_memory_mib')),
-            }
+            comparison_caps = gpu_size_trial.settings().spot_max_usd_per_hour
+            gpu_types = sorted(comparison_caps.keys() | set(values.words('hana_gpu_instance_types')))
+            gpu_caps = comparison_caps | gpu_size_trial.price_caps(values.text('hana_gpu_spot_max_usd_per_hour'))
+            parameters = gate_parameters(settings, values, partition, account, networks, gpu_types)
             book = ledger.CostLedger(self.directory)
             inventory = book.read_snapshot().inventories
             resources = tuple(resource for resource in inventory[-1].resources if resource.name != 'gate-shared') if inventory else ()
             book.record_inventory(ledger.ResourceInventory(int(self.clock()), resources + (
                 ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment',
                 builder_removed=bool(inventory and inventory[-1].builder_removed)))
-            # A parameter that the template no longer has must not be passed again.
             known = ledger.mapping(ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))['Parameters'])
-            changes: list[dict[str, object]] = [
-                {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
-                for row in ledger.rows(stack, 'Parameters')
-                if ledger.text(row, 'ParameterKey') not in parameters and ledger.text(row, 'ParameterKey') in known]
-            changes.extend({'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items())
+            changes = gate_update_values(stack, parameters, known)
             self.output.mkdir(parents=True, exist_ok=True)
             template = self.output / 'gate-template.json'
             write_bytes_atomic(template, TEMPLATE.read_bytes())
             with step('up', 'updating the stack', self.settings_path, hint='can take several minutes'):
                 self._gate_change(api, stack_id, template, changes)
             outputs = self._stack(settings)
+            deployment_id = ledger.text(saved, 'deployment_id')
+            home: dict[str, object] = {'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
+                'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
+                'security_group': outputs['GateSecurityGroup']}
             manifest: dict[str, object] = {
-                'deployment_id': ledger.text(saved, 'deployment_id'), 'revision': revision,
+                'deployment_id': deployment_id, 'revision': revision,
                 'instance_types': values.words('instance_types'),
                 'gpu_instance_types': gpu_types,
                 'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
-                'regions': [{'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
-                    'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
-                    'security_group': outputs['GateSecurityGroup']}],
+                'regions': [home],
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
@@ -1816,8 +2673,189 @@ class Deployment:
                     manifest['regions'] = regional
                     cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
-        self._fill_prices()
-        return True
+            self._fill_prices()
+            scaler_arn = f"arn:{partition}:iam::{account}:user/{outputs['ScalerUserName']}"
+            return self._probe_gate_gpu(settings, values, manifest, gpu_caps, admin_api=api,
+                                        scaler_arn=scaler_arn, partition=partition, account_id=account)
+
+    def _gate_scaler_api(self, settings: DeploymentSettings, timeout: float) -> AwsCli:
+        # Use the GPU worker's profile and credential file without inherited admin credentials.
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('AWS_')}
+        environment.update(AWS_SHARED_CREDENTIALS_FILE=str(admin_secrets.credentials_file()),
+                           AWS_EC2_METADATA_DISABLED='true')
+
+        def scaler(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                   check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            _ = env
+            return self.execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check,
+                                env=environment)
+
+        account = conf.read(self.settings_path)
+        return AwsCli(account.text('credentials_profile'), settings.region, timeout, scaler)
+
+    def _probe_gate_gpu(self, settings: DeploymentSettings, values: conf.ConfigRead, manifest: dict[str, object],
+                        caps: dict[str, Decimal], *, admin_api: AwsCli, scaler_arn: str,
+                        partition: str, account_id: str) -> bool:
+        from scripts.aws_target import gpu_size_trial
+
+        api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
+        regions = ledger.rows(manifest, 'regions')
+        home = regions[0]
+        candidates = set(values.words('spot_candidate_regions'))
+        subnets = ledger.rows(home, 'subnets')
+        types = gpu_size_trial.string_list(manifest['gpu_instance_types'])
+        bucket = ledger.text(manifest, 'bucket')
+        deployment_id = ledger.text(manifest, 'deployment_id')
+        now = int(self.clock())
+        started = datetime.fromtimestamp(now, UTC).isoformat()
+        utc_day = now - now % 86400
+        nonce = uuid4().hex
+        key = gpu_size_trial.GPU_TRIAL_ARTIFACT_PREFIX + 'setup-probe.json'
+        input_key = gpu_size_trial.GPU_TRIAL_REQUEST_PREFIX + 'setup-probe.json'
+        content = json.dumps({'probe': nonce}).encode()
+        spending = read_settings(self.settings_path)
+        termination_targets: list[str] = []
+        offered_zones: dict[str, set[str]] = {}
+        label = 'gate-setup probe'
+        retry_interval = values.whole('gpu_setup_dry_run_retry_interval_s')
+        simulation_access_denied = False
+
+        def verify_scaler_identity(api: AwsCli) -> None:
+            reply = api.call('get-caller-identity', service='sts')
+            if reply.get('Arn') != scaler_arn:
+                raise ScalerIdentityMismatch
+
+        def describe_instances(api: AwsCli) -> None:
+            reply = api.call('describe-instances', '--filters', *gpu_size_trial.GPU_SPOT_FILTERS)
+            if reply.get('NextToken'):
+                raise ValueError('The GPU Spot instance list is incomplete')
+            for reservation in ledger.rows(reply, 'Reservations'):
+                for instance in ledger.rows(reservation, 'Instances'):
+                    tags = {row['Key']: row['Value'] for row in
+                            ledger.rows({'Tags': instance.get('Tags', [])}, 'Tags')}
+                    if (tags.get('GateDeployment') == deployment_id and tags.get('Workload') == 'cloud-claude-gate'
+                            and tags.get('GpuSizeTrial')):
+                        termination_targets.append(ledger.text(instance, 'InstanceId'))
+
+        def describe_offerings(api: AwsCli) -> None:
+            reply = api.call('describe-instance-type-offerings', '--location-type', 'availability-zone',
+                             '--filters', 'Name=instance-type,Values=' + ','.join(types))
+            for row in ledger.rows(reply, 'InstanceTypeOfferings'):
+                offered_zones.setdefault(ledger.text(row, 'InstanceType'), set()).add(ledger.text(row, 'Location'))
+
+        def launch_probe(api: AwsCli, size: str, deadline: float) -> ScalerProbePassed | ScalerProbeUnverified:
+            zones = offered_zones.get(size, set())
+            subnet = next((row for row in subnets if ledger.text(row, 'zone') in zones), None)
+            if subnet is None:
+                return ScalerProbeUnverified('No saved subnet offers this type.')
+            launch = gpu_size_trial.GpuSpotLaunch(deployment_id, nonce, f'{nonce}-{size}', size, caps[size],
+                now + 60 * values.whole('hana_gpu_lifetime_minutes'), values.whole('gpu_size_trial_root_gib'),
+                base64.b64encode(b'#!/bin/sh\nexit 0\n').decode())
+            arguments = json.dumps(launch.arguments(home, subnet, settings.root_device_name, spending))
+            remaining = deadline - time.monotonic()
+            timeout = min(api.timeout_s, remaining) if remaining > 0 else api.timeout_s
+            while True:
+                try:
+                    api.ec2_dry_run('run-instances', '--cli-input-json', arguments, timeout_s=timeout)
+                    return ScalerProbePassed()
+                except AwsUnavailable as error:
+                    code = aws_error_code(error, operation='RunInstances', allow_status=True)
+                    if code not in PROBE_DENIED_CODES or deadline - time.monotonic() <= retry_interval:
+                        raise
+                    print(f'{label}: run-instances {size}: {code}. Retry in {retry_interval} s.', flush=True)
+                    self.pause(retry_interval)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    timeout = min(api.timeout_s, remaining)
+
+        def simulate_termination(region: str) -> ScalerProbePassed | ScalerProbeUnverified:
+            nonlocal simulation_access_denied
+            action = 'ec2:TerminateInstances'
+            instance_arn = f'arn:{partition}:ec2:{region}:{account_id}:instance/i-00000000000000000'
+            context = [{'ContextKeyName': key, 'ContextKeyType': 'string', 'ContextKeyValues': [value]}
+                       for key, value in (('ec2:ResourceTag/GateDeployment', deployment_id),
+                                          ('ec2:ResourceTag/Workload', 'cloud-claude-gate'),
+                                          ('aws:RequestedRegion', region))]
+            try:
+                reply = admin_api.call('simulate-principal-policy', '--policy-source-arn', scaler_arn,
+                    '--action-names', action, '--resource-arns', instance_arn,
+                    '--context-entries', json.dumps(context), '--no-paginate', service='iam')
+            except AwsUnavailable as error:
+                if aws_error_code(error, operation='SimulatePrincipalPolicy', allow_status=True) not in PROBE_DENIED_CODES:
+                    raise
+                simulation_access_denied = True
+                return ScalerProbeUnverified()
+            incomplete = 'The termination simulation result is incomplete'
+            results = ledger.rows(reply, 'EvaluationResults')
+            if reply.get('IsTruncated') or len(results) != 1 or results[0].get('EvalActionName') != action:
+                raise ValueError(incomplete)
+            result = results[0]
+            decision_key = 'EvalDecision'
+            if 'ResourceSpecificResults' in result:
+                matches = [row for row in ledger.rows(result, 'ResourceSpecificResults')
+                           if row.get('EvalResourceName') == instance_arn]
+                if len(matches) != 1:
+                    raise ValueError(incomplete)
+                result = matches[0]
+                decision_key = 'EvalResourceDecision'
+            elif result.get('EvalResourceName') != instance_arn:
+                raise ValueError(incomplete)
+            decision = result.get(decision_key)
+            if decision in ('implicitDeny', 'explicitDeny'):
+                raise TerminationGrantDenied('The simulator denied termination for the scaler')
+            if decision != 'allowed' or result.get('MissingContextValues'):
+                raise ValueError(incomplete)
+            return ScalerProbePassed()
+
+        def list_result_probe(api: AwsCli) -> None:
+            if not gpu_size_trial.gpu_object_exists(api, bucket, key):
+                raise ValueError('The probe object does not appear in the list')
+
+        def probe_multipart(api: AwsCli) -> None:
+            location = ('--bucket', bucket, '--key', input_key)
+            reply = api.call('create-multipart-upload', *location, service='s3api')
+            _ = api.call('abort-multipart-upload', *location, '--upload-id', ledger.text(reply, 'UploadId'), service='s3api')
+
+        def probes() -> Iterable[ScalerProbe]:
+            yield ScalerProbe('describe-instances', describe_instances)
+            yield ScalerProbe('describe-instance-type-offerings', describe_offerings)
+            yield ScalerProbe('describe-spot-price-history', lambda api: api.call('describe-spot-price-history',
+                '--instance-types', *types, '--product-descriptions', 'Linux/UNIX', '--start-time', started))
+            yield ScalerProbe('get-service-quota', lambda api: spot_quota(api, 'L-3819A6DF'))
+            yield ScalerProbe('get-cost-and-usage', lambda api: fetch_account_charges(
+                api, utc_day - 86400, utc_day, now, spending.cost_explorer_read_usd))
+            deadline = time.monotonic() + values.whole('gpu_setup_dry_run_retry_timeout_s')
+            for size in types:
+                yield ScalerProbe(f'run-instances {size}',
+                                  lambda api, size=size: launch_probe(api, size, deadline), 'DryRunOperation')
+            if termination_targets:
+                yield ScalerProbe('terminate-instances', lambda api: api.ec2_dry_run(
+                    'terminate-instances', '--instance-ids', termination_targets[0]), 'DryRunOperation')
+            for row in regions:
+                region = ledger.text(row, 'region')
+                if region in candidates and row.get('subnets'):
+                    yield ScalerProbe(f'termination {region}', lambda _api, region=region: simulate_termination(region),
+                                      'IAM simulation')
+            yield ScalerProbe('export-credentials', gpu_size_trial.gpu_signing_key)
+            yield ScalerProbe('put-object', lambda api: put_probe_object(api, bucket, key, content))
+            yield ScalerProbe('list-objects-v2', list_result_probe)
+            yield ScalerProbe('get-object', lambda api: get_probe_object(api, bucket, key, content))
+            yield ScalerProbe('put-object inputs', lambda api: put_probe_object(api, bucket, input_key, content))
+            yield ScalerProbe('get-object inputs', lambda api: get_probe_object(api, bucket, input_key, content))
+            yield ScalerProbe('create/abort-multipart-upload', probe_multipart)
+
+        failed = run_scaler_probes(label, api, (ScalerProbe('get-caller-identity', verify_scaler_identity),),
+                                   show_codes=True)
+        if failed and failed[0].code == ScalerIdentityMismatch.__name__:
+            return False
+        if not failed:
+            failed = run_scaler_probes(label, api, probes(), show_codes=True)
+        if simulation_access_denied:
+            print('gate-setup: The administrator cannot call iam:SimulatePrincipalPolicy.', flush=True)
+        for next_step in dict.fromkeys(failure.next_step() for failure in failed):
+            print(f'gate-setup: {next_step}', flush=True)
+        return not failed
 
     def _fill_prices(self) -> None:
         """Read Spot prices and quotas once the stack allows it; the hourly refresh continues."""
@@ -1849,6 +2887,36 @@ class Deployment:
         with step('down', 'removing local and cloud resources', self.settings_path):
             return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
+
+
+def gate_parameters(settings: DeploymentSettings, values: conf.ConfigRead, partition: str, account: str,
+                    networks: list[RegionalNetwork], gpu_types: list[str]) -> dict[str, str]:
+    return {
+        'EnableGates': 'true', 'GateImage': settings.ami_id,
+        'GateVpcs': ','.join([f'arn:{partition}:ec2:{settings.region}:{account}:vpc/{settings.vpc_id}',
+                              *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
+        'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
+        'GateInstanceTypes': ','.join(values.words('instance_types')),
+        'GateGpuInstanceTypes': ','.join(gpu_types),
+        'GateRootGiB': str(values.whole('root_gib')),
+        'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
+        'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
+        'GateExpiryMinutes': str(values.whole('expiry_schedule_minutes')),
+        'GateExpiryTimeout': str(values.whole('expiry_timeout_s')),
+        'GateExpiryMemory': str(values.whole('expiry_memory_mib')),
+    }
+
+
+def gate_update_values(stack: dict[str, object], parameters: dict[str, str],
+                       definitions: dict[str, object]) -> list[dict[str, object]]:
+    # Preserve the values of parameters that the template still uses.
+    changes: list[dict[str, object]] = [
+        {'ParameterKey': key, 'UsePreviousValue': True}
+        for row in ledger.rows(stack, 'Parameters')
+        if (key := ledger.text(row, 'ParameterKey')) not in parameters and key in definitions
+    ]
+    changes.extend({'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items())
+    return changes
 
 
 def region_gate_template() -> dict[str, object]:
@@ -1963,32 +3031,69 @@ class DeploymentArguments(argparse.Namespace):
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
+        self.plan: bool = False
         self.trial_action: str | None = None
         self.trial_folder: Path = Path()
         self.image: Path | None = None
 
 
+def run_setup_plan(args: DeploymentArguments) -> int:
+    try:
+        workloads = ('rust', 'merge-gates', 'hana') if args.command == 'hana-setup' else ('rust', 'merge-gates')
+        if (args.command not in ('up', 'hana-setup')
+                or args.workload not in workloads
+                or args.command == 'up' and args.workload != 'merge-gates'
+                or args.trial_action or args.approve_resources or args.approve_destroy):
+            raise DeploymentRefused('Use --plan with hana-setup or up --workload merge-gates without approval flags.')
+        plan = plan_run.PlanRun(plan_identity.plan_credentials, execute_command, time.sleep)
+        subject = Deployment(args.settings, args.directory, args.output, execute=execute_command, mode=plan)
+        if args.command == 'up':
+            subject.gate_plan()
+        elif not subject.hana_setup():
+            raise DeploymentRefused('Setup did not pass every check.')
+    except KeyboardInterrupt:
+        print('plan run: refused: interrupted', flush=True)
+        return 1
+    except (KeyError, OSError, TypeError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+        print('plan run: refused: ' + plan_run.safe_reason(error), flush=True)
+        return 1
+    print('plan run: pass', flush=True)
+    return 0
+
+
 def main() -> int:
-    os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
     if sys.argv[1:2] == ['aws-trial']:
         from scripts.aws_target import aws_trial
+        os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         settings_path = conf.path('aws_target')
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--image', type=Path)
-    _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
+    _ = parser.add_argument('--workload', choices=('merge-gates', 'hana', 'plan-identity'), default='merge-gates')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
     _ = parser.add_argument('--approve-resources', action='store_true')
     _ = parser.add_argument('--approve-destroy', action='store_true')
+    _ = parser.add_argument('--plan', action='store_true', help='Check setup with the AWS plan identity.')
     args = parser.parse_args(namespace=DeploymentArguments())
+    if args.plan:
+        return run_setup_plan(args)
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
+        if args.workload == 'plan-identity' and args.command != 'down':
+            raise DeploymentRefused('Use --workload plan-identity only with down.')
+        if args.command == 'plan-identity' or args.workload == 'plan-identity':
+            if args.command == 'plan-identity':
+                plan_identity.command_create(args.settings, approve_resources=args.approve_resources)
+            else:
+                plan_identity.command_down(args.settings, approve_destroy=args.approve_destroy)
+            return 0
+        os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         if args.command == 'gpu-size-trial':
             if args.trial_action != 'run' or args.trial_folder == Path():
                 raise DeploymentRefused('Use gpu-size-trial run --trial-folder DIR --approve-resources')

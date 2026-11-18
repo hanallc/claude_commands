@@ -216,9 +216,25 @@ class HanaSourceTests(unittest.TestCase):
 
     def test_credentials_and_disallowed_environment_refuse_before_upload(self) -> None:
         _ = (self.checkout / '.env').write_text('fixture secret')
-        with self.assertRaisesRegex(source.SourceRefused, 'CredentialOrBuildInput'):
+        with self.assertRaisesRegex(source.SourceRefused, 'CredentialOrBuildInput: .* forbidden path .env'):
             _ = self.prepare()
         (self.checkout / '.env').unlink()
+        unreadable = Path(os.fsdecode(os.fsencode(self.checkout) + b'/\xff.key'))
+        _ = unreadable.write_text('fixture secret')
+        with self.assertRaises(source.SourceRefused) as refused:
+            _ = self.prepare()
+        self.assertIn(b'\\xff.key', str(refused.exception).encode())
+        unreadable.unlink()
+        (self.checkout / 'build/target').mkdir(parents=True)
+        _ = (self.checkout / 'build/target/output').write_text('untracked build output')
+        _ = (self.checkout / '.gitignore').write_text('.direnv/\n__pycache__/\n.claude/settings.local.json\nprivate.bin\n')
+        with self.assertRaisesRegex(source.SourceRefused, 'forbidden path build/target/output'):
+            _ = self.prepare()
+        _ = self.git('add', 'build/target/output')
+        self.assertIn('build/target/output', self.git('ls-tree', '-r', '--name-only', self.prepare().commit))
+        _ = self.git('rm', '-r', '-f', '--quiet', 'build')
+        _ = self.git('checkout', '--quiet', '.gitignore')
+        self.objects.uploads.clear()
         for name in ('HOME', 'AWS_ACCESS_KEY_ID', 'CARGO_TARGET_DIR'):
             with self.subTest(name=name), self.assertRaisesRegex(source.SourceRefused, 'EnvironmentRefused'):
                 _ = self.sender.prepare(self.checkout, ('cargo', 'check'), environment={name: 'fixture'})

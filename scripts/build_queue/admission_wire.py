@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
@@ -104,6 +105,7 @@ class Identity:
     step: str
     folder: str
     unit: str = ""
+    job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
 @dataclass(frozen=True, kw_only=True)

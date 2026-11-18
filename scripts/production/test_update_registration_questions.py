@@ -7,6 +7,7 @@ from scripts.agents import remote
 import hashlib
 import json
 import os
+import subprocess
 import unittest
 from collections.abc import Callable
 from dataclasses import replace
@@ -472,6 +473,42 @@ class RegistrationTests(RegistrationFixture):
         listed_after_answer = self.run_command("questions-table")
         self.assertEqual(listed_after_answer.returncode, 0, listed_after_answer.stdout + listed_after_answer.stderr)
         self.assertEqual(listed_after_answer.stdout.strip(), "no open questions")
+
+    def test_producer_closes_its_own_questions_without_a_production(self) -> None:
+        producer = fixture_member("producer", name="dwight")
+        environment = {**self.env, "CLAUDE_CODE_SESSION_ID": producer.current_session, "CODEX_THREAD_ID": ""}
+        showrunner = staff.snapshot().by_id(self.owner_id)
+        assert showrunner is not None
+        showrunner_environment = {**environment, "CLAUDE_CODE_SESSION_ID": showrunner.current_session}
+        folder = self.state / "showrunner" / producer.id / "questions"
+
+        def run(*arguments: str, env: dict[str, str] = environment) -> subprocess.CompletedProcess[str]:
+            return invoke_cli(registration, registration.main, list(arguments), env, self.checkout, production_state=True)
+
+        for action, title in (("answer", "Choose the layout"), ("withdraw", "Choose the colors")):
+            with self.subTest(action=action):
+                question = title + "?"
+                with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
+                    filed = run("ask", "--ask", question, "--text", title)
+                self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+                listed = run("questions-table")
+                self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+                self.assertIn(title, listed.stdout)
+
+                refused = run(action, "--item", title, env=showrunner_environment)
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertIn("the following arguments are required: --production", refused.stderr)
+
+                closed = run(action, "--item", title)
+                self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+                self.assertIn(f"{action}: ok — dwight: {title}", closed.stdout)
+                listed_after_close = run("questions-table")
+                self.assertEqual(listed_after_close.returncode, 0, listed_after_close.stdout + listed_after_close.stderr)
+                self.assertNotIn(title, listed_after_close.stdout)
+                records = registration.question_records_for_document(producer, registration.QuestionStaff.read())
+                record, = (record for record in records if record.item["text"] == title)
+                self.assertEqual(record.path.parent, folder)
+                self.assertEqual(record.status, "closed")
 
     def test_ask_refuses_to_replace_an_open_legacy_question_from_the_same_asker(self) -> None:
         title = "Choose the layout"

@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.direct import workers
+from scripts.herdr import herdr
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import sessions
@@ -59,9 +60,17 @@ class DirectorResolutionTests(StaffTestCase):
         super().setUp()
         _ = showrunner_relationship("demo")
         _ = self.enterContext(isolated_source_readers())
+        _ = self.enterContext(patch.object(herdr, "live_sessions", return_value=[]))
+        _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
+        _ = self.enterContext(patch.object(herdr, "process_environment", return_value={}))
         _ = self.enterContext(cast(AbstractContextManager[object], patch.dict(
             os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")},
         )))
+
+    @override
+    def session_record(self, session_id: str, name: str) -> Path:
+        path = super().session_record(session_id, name)
+        return path.replace(path.with_name(f"{os.getpid()}.json"))
 
     def test_explicit_role_renders_the_title_without_reading_dispatch_history(self) -> None:
         from scripts.direct import progress_history
@@ -80,11 +89,14 @@ class DirectorResolutionTests(StaffTestCase):
         self.write_json(run / workers.STATE, {**json_object(run / workers.STATE), "owner_staff_id": parent.id})
         self.assertEqual(json_object(registry)["messagingSocketPath"], "")
 
-        self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(parent.current_session, os.getpid()))
+        with patch.object(herdr, "process_placement", wraps=herdr.process_placement) as placement:
+            self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(parent.current_session, os.getpid()))
+        placement.assert_called_once_with(os.getpid())
 
     def test_live_unit_director_prefers_the_newest_running_name_match(self) -> None:
         parent = unit_membership("demo", "builders")
-        older = self.session_record(parent.current_session, "builders")
+        _ = self.session_record(parent.current_session, "builders")
+        older, = sessions.read_registry().entries
         current = staff.update_current_session(parent.current_session, staff.native_id(fixture_runtime_id("newer-director")))
         newer = self.session_record(current.current_session, "builders")
         record = json_object(newer)
@@ -97,10 +109,10 @@ class DirectorResolutionTests(StaffTestCase):
             "host": {"kind": "unit", "unit": "builders", "session_name": "builders"},
         }})
         registry = sessions.read_registry()
-        entries = {item.record["sessionId"]: item for item in registry.entries}
-        # Present readable records in the older-first order that caused the defect.
+        latest, = registry.entries
+        # Present the older registry record first.
         with patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(
-            (entries[older.stem], entries[newer.stem]), registry.unreadable,
+            (older, latest), registry.unreadable,
         )):
             self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(current.current_session, os.getpid()))
 
@@ -114,6 +126,26 @@ class DirectorResolutionTests(StaffTestCase):
         _ = self.session_record(renamed.current_session, renamed.name)
         self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(renamed.current_session, os.getpid()))
 
+    def test_unproved_director_placement_stays_unknown_despite_a_live_registry_record(self) -> None:
+        parent = unit_membership("demo", "builders")
+        _ = self.session_record(parent.current_session, parent.name)
+        run = self.worker_run("demo", "builders", parent.current_session)
+        with patch.object(herdr, "process_placement", return_value=herdr.UnprovedHerdrPlacement("placement denied")):
+            result = workers.live_unit_director(run)
+            self.assertEqual(result, workers.UnknownUnitDirector("placement denied"))
+            self.assertEqual(workers.run_has_live_director(run), result)
+            with self.assertRaisesRegex(workers.WorkerUnavailable, "placement denied"):
+                _ = bool(result)
+
+    def test_an_unreadable_registry_cannot_prove_the_director_is_absent(self) -> None:
+        parent = unit_membership("demo", "builders")
+        run = self.worker_run("demo", "builders", parent.current_session)
+        unreadable = sessions.RegistryRead((), (sessions.sessions_dir(),))
+        with patch.object(sessions, "read_registry", return_value=unreadable):
+            self.assertEqual(workers.live_unit_director(run), workers.UnknownUnitDirector("cannot list session records"))
+            self.assertEqual(workers.run_has_live_director(run), workers.UnknownUnitDirector("cannot list session records"))
+        self.assertEqual(workers.live_unit_director(run), workers.NoLiveUnitDirector())
+        self.assertIs(workers.run_has_live_director(run), False)
 
 
 

@@ -39,6 +39,15 @@ class LedgerTests(CostFixture):
         self.book.record_inventory(ledger.ResourceInventory(
             at, (ledger.PricedResource("retained-storage", Decimal(monthly)),), "priced fixture inventory"))
 
+    def test_quota_refusal_without_saved_time_is_expired(self) -> None:
+        pool = ledger.SpotQuotaPool('us-west-2', ledger.SpotQuotaClass.STANDARD)
+        self.book.record_gate_quota_refusal(pool, self.start)
+        document = ledger.mapping(cast(object, json.loads(self.book.path.read_text())))
+        row, = ledger.rows(document, 'gate_quota_refusals')
+        del row['at']
+        _ = self.book.path.write_text(json.dumps(document))
+        self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
+
     def observe(self, at: int, state: ledger.InstanceState) -> None:
         self.book.observe(ledger.InstanceObservation(at, state, "fake DescribeInstances"))
 
@@ -58,6 +67,27 @@ class LedgerTests(CostFixture):
     def running(self, at: int) -> None:
         self.inventory(at)
         self.observe(at, "running")
+
+    def test_spot_quota_classes_use_the_instance_families(self) -> None:
+        for instance_type, quota_class in (
+                ('g6.8xlarge', ledger.SpotQuotaClass.G_AND_VT),
+                ('vt1.3xlarge', ledger.SpotQuotaClass.G_AND_VT),
+                ('p4d.24xlarge', ledger.SpotQuotaClass.P),
+                ('m7a.8xlarge', ledger.SpotQuotaClass.STANDARD)):
+            with self.subTest(instance_type=instance_type):
+                self.assertEqual(ledger.spot_quota_class(instance_type), quota_class)
+
+    def test_spot_quota_snapshot_can_omit_the_p_limit(self) -> None:
+        path = self.state / 'spot-prices.json'
+        region = {'region': 'us-east-2', 'read_at': self.start, 'standard_vcpus': '128', 'gpu_vcpus': '32'}
+        p_limits: tuple[dict[str, str], ...] = ({}, {'p_vcpus': '96'})
+        for p_limit in p_limits:
+            with self.subTest(p_limit=p_limit):
+                _ = path.write_text(json.dumps({'regions': [{**region, **p_limit}]}))
+                quota, = ledger.read_spot_quotas(self.state)
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.STANDARD), Decimal(128))
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.G_AND_VT), Decimal(32))
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.P), Decimal(96) if p_limit else ledger.NoSpotQuota())
 
     def test_gpu_trial_budget_counts_booked_cost_and_open_maximum(self) -> None:
         self.inventory(self.start)
@@ -1255,6 +1285,39 @@ class LedgerTests(CostFixture):
         self.assertTrue(published)
         self.assertTrue(all(cast(int, row["start"]) >= current for row in published))
         self.assertEqual(len(cast(list[object], json.loads(self.book.path.read_text())["observations"])), 2)
+
+
+class SpotPlacementEvidenceTests(CostFixture):
+    def test_request_type_order_is_canonical_in_storage_and_in_older_readings(self) -> None:
+        now = 1768478400
+        types = ('c7a.8xlarge', 'm7a.8xlarge')
+        request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
+            ledger.SpotPlacementTypeSet.GATE_32_VCPU, 8, types[::-1], ('us-east-2',))
+        path = self.state / ledger.SPOT_PLACEMENT_FILE
+        reading = ledger.SpotPlacementSample(request, now, ())
+        ledger.write_spot_placement_scores(self.state, (reading,), now)
+        saved = path.read_text()
+        self.assertIn(json.dumps(types), saved)
+        _ = path.write_text(saved.replace(json.dumps(types), json.dumps(types[::-1])))
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (reading,))
+
+    def test_scores_and_failures_round_trip_with_only_the_last_72_hours(self) -> None:
+        now = 1768478400
+        first = now - 72 * 3600
+        region = 'us-east-2'
+        request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
+            ledger.SpotPlacementTypeSet.GATE_32_VCPU, 8, ('c7a.8xlarge', 'm7a.8xlarge'), (region,))
+        sample = ledger.SpotPlacementSample(request, first,
+            (ledger.SpotPlacementScore(ledger.SpotPlacementRegion(region), 5),))
+        zone_sample = ledger.SpotPlacementSample(replace(request, scope=ledger.SpotPlacementScope.ZONE), now,
+            (ledger.SpotPlacementScore(ledger.SpotPlacementZone(region, 'use2-az1'), 7),))
+        failed = ledger.SpotPlacementFailure(request, now, 'UnauthorizedOperation')
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), ())
+        ledger.write_spot_placement_scores(self.state, (replace(sample, at=first - 1), sample, zone_sample, failed), now)
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (sample, zone_sample, failed))
+        ledger.write_spot_placement_scores(self.state, (sample, zone_sample, failed), now + 1)
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (zone_sample, failed))
+        self.assertFalse((self.state / 'spot-prices.json').exists())
 
 
 class SpotPriceEvidenceTests(CostFixture):

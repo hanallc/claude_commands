@@ -1216,10 +1216,11 @@ UNSCHEDULED_USAGE_READS = UnscheduledUsageReads()
 
 @dataclass(frozen=True)
 class ScheduledUsageReads:
-    """Independent account attempt times and the configured eligibility interval."""
+    """Track account attempt times and the interval for each tool."""
 
     history: IntervalHistory
     interval_seconds: float
+    codex_interval_seconds: float
 
 
 async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome, *,
@@ -1238,7 +1239,7 @@ async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWo
         directories = [directory for directory in directories
                        if schedule.history.is_due(str(directory), schedule.interval_seconds, checked_at)]
         homes = [home for home in homes
-                 if schedule.history.is_due(str(home), schedule.interval_seconds, checked_at)]
+                 if schedule.history.is_due(str(home), schedule.codex_interval_seconds, checked_at)]
 
     async def read_account(directory: Path, reading: Awaitable[Report]) -> Report:
         started_at = time.time() if isinstance(schedule, ScheduledUsageReads) else 0

@@ -81,10 +81,6 @@ function fakeCalls() {
   };
 }
 
-function firstLine(message: SessionSendArgs): string {
-  return message.text.split("\n")[0] ?? "";
-}
-
 function onlyForwarded(forwards: ForwardLog[]): string[] {
   expect(forwards.length).toBe(1);
   const forward = forwards[0];
@@ -110,8 +106,9 @@ describe("reply routes", () => {
     const forward = fake.sent[0];
     if (forward === undefined) throw new Error("Expected a forward");
     expect(forward.to).toEqual({ sessionId: "original-session" });
-    expect(firstLine(forward)).toEqual(expect.stringMatching(/^Message from Recipient \(their answer to Original sender, passed on by postmaster\) \[1000-\d+\]:$/));
-    expect(forward.text.slice(forward.text.indexOf("\n") + 1)).toBe("\n" + body);
+    expect(forward.text).toEqual(expect.stringMatching(
+      /^Recipient \(answer to Original sender\): My answer\n\nincluding a second paragraph\n\nTag: 1000-\d+$/,
+    ));
     expect(onlyLog(fake.logs())).toEqual({ at_ms: 1000, socket, name: "Recipient", session_id: "recipient",
       senders: ["Original sender"], body, targets: ["original-session"] });
     expect(onlyForwarded(fake.forwards())).toEqual(["original-session"]);
@@ -181,7 +178,7 @@ describe("reply routes", () => {
     expect(fake.logs().map(log => log.body)).toEqual(["first", "second"]);
   });
 
-  test("non-peer origins plain text and unknown sockets pass without writes or forwards", async () => {
+  test("events outside reply routing pass without writes or forwards", async () => {
     const fake = fakeCalls();
     const replies = await startReplies(fake.calls);
     await replies.sending(entry(), fake.calls.now());
@@ -191,6 +188,8 @@ describe("reply routes", () => {
       { ...reply(), origin: { kind: "coordinator" } },
       { origin: { kind: "peer" }, text: "ordinary message" },
       reply("unrelated message", "uds:/test-sockets/unknown.sock"),
+      reply("postmaster: Check the queue."),
+      reply("\n \tPostMaster: Check the queue."),
     ];
     const before = fake.writes.length;
     for (const event of events) {
@@ -246,14 +245,17 @@ describe("reply routes", () => {
     expect(onlyForwarded(fake.forwards())).toEqual([]);
   });
 
-  test("equal answers at the same time have distinct first lines and log files", async () => {
+  test("equal answers at the same time have distinct tags and log files", async () => {
     const fake = fakeCalls();
     const replies = await startReplies(fake.calls);
     await replies.sending(entry(), fake.calls.now());
     expect(await replies.receive(reply())).toEqual(consumed);
     expect(await replies.receive(reply())).toEqual(consumed);
     expect(fake.sent.length).toBe(2);
-    expect(new Set(fake.sent.map(firstLine)).size).toBe(2);
+    expect(fake.sent.map(message => message.text)).toEqual([
+      "Recipient (answer to Original sender): My answer\n\nTag: 1000-1",
+      "Recipient (answer to Original sender): My answer\n\nTag: 1000-2",
+    ]);
     expect(fake.logs().map(log => log.body)).toEqual(["My answer", "My answer"]);
   });
 
@@ -265,7 +267,9 @@ describe("reply routes", () => {
     expect(await replies.receive(reply())).toEqual(consumed);
     expect(fake.sent.map(message => message.to)).toEqual([{ sessionId: "alice-session" }, { sessionId: "bob-session" }]);
     for (const message of fake.sent) {
-      expect(firstLine(message)).toEqual(expect.stringMatching(/^Message from Recipient \(their answer to one of Alice, Bob, passed on by postmaster\) \[1000-\d+\]:$/));
+      expect(message.text).toEqual(expect.stringMatching(
+        /^Recipient \(answer to one of Alice, Bob\): My answer\n\nTag: 1000-\d+$/,
+      ));
     }
     expect(onlyForwarded(fake.forwards())).toEqual(["alice-session", "bob-session"]);
     expect(onlyLog(fake.logs()).senders).toEqual(["Alice", "Bob"]);

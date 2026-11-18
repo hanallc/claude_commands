@@ -20,6 +20,7 @@ import time
 import traceback
 import unittest
 from collections.abc import Generator
+from contextvars import ContextVar
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
@@ -42,6 +43,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
+_PRIVATE_STAFF_FILE: ContextVar[Path | None] = ContextVar("private_staff_file", default=None)
 
 
 @contextmanager
@@ -250,11 +252,12 @@ with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.curr
 
 def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
     """Seed an old unit name in the private staff file."""
-    configured = os.environ.get("STAFF_TEST_OWNER_FILE") or os.environ.get("STAFF_FILE")
+    configured = os.environ.get("STAFF_FILE") or os.environ.get("STAFF_TEST_OWNER_FILE")
     if row.kind != "unit" or not configured:
         raise AssertionError("A saved unit name requires a private staff fixture.")
     path = Path(configured).resolve()
-    if not any(path.is_relative_to(root.resolve()) for root in (Path(tempfile.gettempdir()), Path("/tmp"))):
+    temporary_roots = (Path(tempfile.gettempdir()), Path("/tmp"))
+    if path != _PRIVATE_STAFF_FILE.get() and not any(path.is_relative_to(root.resolve()) for root in temporary_roots):
         raise AssertionError("The staff fixture must be in a temporary directory.")
     with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -403,13 +406,14 @@ class ClaudeBackendFixture:
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
     """Use private staff and registry paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
+    if "XDG_CONFIG_HOME" not in environment or environment["XDG_CONFIG_HOME"] == os.environ.get("XDG_CONFIG_HOME"):
+        environment["XDG_CONFIG_HOME"] = str(path.parent / "config")
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
     _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
     for key, folder in (
         ("SHOWRUNNER_STATE_DIR", "showrunners"),
         ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("HERDR_PANE_RECORD_DIR", "panes"),
-        ("XDG_CONFIG_HOME", "config"),
         # Session folders belong to staff members; a fixture member never makes one in the live root.
         ("SESSION_TEMP_ROOT", "session"),
     ):
@@ -446,6 +450,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
                 _ = contexts.enter_context(mock.patch.object(
                     module, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
                 ))
+        _ = contexts.callback(_PRIVATE_STAFF_FILE.reset, _PRIVATE_STAFF_FILE.set(path.resolve()))
         yield
 
 
