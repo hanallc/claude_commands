@@ -24,6 +24,13 @@ Use the `agents` program.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
 
+## Create a producer
+
+Use `agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]` to create a producer.
+The command uses `producer_defaults.model` in `config/models.conf`.
+It creates the README if needed and prints the staff id, account and tab.
+Repeat the command with the same options after an interruption.
+
 First admission adopts one proved live Claude session or Codex thread with the producer name.
 It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
 Adoption writes the staff row with that native session. It launches nothing.

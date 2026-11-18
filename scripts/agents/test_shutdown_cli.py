@@ -82,6 +82,7 @@ class AgentsUsageTests(unittest.TestCase):
             row = staff.initial_snapshot().rows[0]
             self.assertEqual((row.name, row.kind, row.current_session), ("dwight", "producer", world.identity))
             self.assertEqual(len(world.arguments), 1)
+            self.assertEqual(world.openings, [herdr.NoOpeningPrompt()])
 
     def test_status_excludes_a_retired_unit_whose_process_still_runs(self) -> None:
         from scripts.agents.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
@@ -128,9 +129,11 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray", "transfer"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move",
+                          "restart", "stop", "remove-stray", "transfer", "add-producer"])
         self.assertIn("resume NAME", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
+        self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)

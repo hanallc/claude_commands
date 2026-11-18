@@ -285,6 +285,15 @@ A Claude compaction summary is one block. A Codex compaction summary is encrypte
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
 
+### Create a producer
+
+`agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
+The create command validates the name and records its profile and README text before it writes them.
+It creates the README from `templates/producer/README.md` when the README is absent.
+The first conversation receives a prompt to read the README and run `/producer:produce`.
+The producer admission record keeps the time for prompt recovery after a failed start.
+The command reports the staff id, account and tab.
+
 ### First start
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.

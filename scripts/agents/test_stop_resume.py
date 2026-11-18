@@ -72,6 +72,7 @@ class ProducerAdmissionWorld:
         self.home: Path = case.root / (".claude3" if kind == "claude" else ".codex3")
         self.arguments: list[list[str]] = []
         self.started_panes: list[str] = []
+        self.openings: list[herdr.OpeningPrompt | herdr.NoOpeningPrompt] = []
         self.environment: dict[str, str] = {}
         self.active: bool = False
         self.pane: str = "w1:p3"
@@ -88,7 +89,8 @@ class ProducerAdmissionWorld:
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
-        del name, opening, timeout_ms
+        del name, timeout_ms
+        self.openings.append(opening)
         if kind != self.kind or pane != self.pane:
             raise AssertionError("unexpected producer launch")
         if staff.initial_snapshot().rows:

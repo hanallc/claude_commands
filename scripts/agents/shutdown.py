@@ -47,6 +47,7 @@ from scripts.production.production_doc import Production, Refusal, read_producti
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.agents import (
+    producer_lifecycle,
     producer_transfer,
     restart,
     restart_support,
@@ -103,6 +104,7 @@ class CommandLine(argparse.Namespace):
     producer: str = ""
     model: str = ""
     effort: str = ""
+    job: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -249,6 +251,7 @@ USAGE = """usage: agents COMMAND
   agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
+  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
 """
 
 
@@ -669,6 +672,11 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
+    command = commands.add_parser("add-producer")
+    _ = command.add_argument("producer", metavar="NAME")
+    _ = command.add_argument("--model", default="")
+    _ = command.add_argument("--effort", default="")
+    _ = command.add_argument("--job", default="")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -723,6 +731,8 @@ def main(argv: list[str] | None = None) -> int:
             return remove_stray_producer(options.producer, options.session)
         if options.command == "transfer":
             return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
+        if options.command == "add-producer":
+            return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run,
                                     only=tuple(item for item in options.only.split(",") if item),
