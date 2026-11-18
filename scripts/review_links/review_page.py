@@ -898,7 +898,7 @@ const view=createRecordTable({content:()=>content,single:true,
  visible:(data,filters)=>{
   const key=data.key,entry=index.get(key),departure=saved.get(key);
   if(!entry || pendingSaves.get(key)?.departing) return false;
-  const reopened=departure?.closes && entry.type==='change' && view.opened.has(key);
+  const reopened=departure?.closes && view.linkedItem===key && view.opened.has(key);
   return (!departure || entry.handoff || reopened) && matches(entry,filters);
  },
  sortValues:data=>{
@@ -974,7 +974,7 @@ function loadBodies(){
    if(!current || current.dataset.bodyLoaded) return;
    current.dataset.bodyLoaded='true';current.querySelector('[data-detail]>td').innerHTML=text;
    const departure=saved.get(key);
-   if(departure?.closes && departure.awaitingSnapshot && current.dataset.type==='change')
+   if(departure?.closes && departure.awaitingSnapshot)
     current.querySelector('[data-review-form]')?.remove();
    const panel=current.querySelector('.review-panel');if(panel) updateTitleFallback(panel);
    bindForm(current);restoreFocus(key);view.drawWindow();
@@ -1075,6 +1075,7 @@ function bindForm(row){
    }
    finally{
     pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
+    followItemLink({inheritFilters:true,unappliedOnly:true});
     if(!pendingSaves.size) void pageRefresh.refresh(true);
    }
   };
@@ -1200,14 +1201,16 @@ async function refresh(_supersede=false,current=()=>true){
 }
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
-function followItemLink(inheritFilters){
- return view.followItemLink({inheritFilters,beforeJump:key=>{
+function followItemLink(options){
+ return view.followItemLink({...options,beforeJump:key=>{
+  if(pendingSaves.has(key)) return false;
   if(!saved.get(key)?.closes && !saved.get(key)?.question) saved.delete(key);
+  return true;
  }});
 }
-if(!followItemLink(false)){view.place();view.apply();}
+if(!followItemLink()){view.place();view.apply();}
 function restorePlace(event){
- if(event.type==='hashchange' && !history.state?.recordTable && followItemLink(true)) return;
+ if(event.type==='hashchange' && !history.state?.recordTable && followItemLink({inheritFilters:true})) return;
  view.restorePlace(event);
 }
 addEventListener('popstate',restorePlace);

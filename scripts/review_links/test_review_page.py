@@ -3229,16 +3229,22 @@ window.fetch=async(url)=>{
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
+        _ = self.question()
         setup = r"""<script>
 const nativeFetch=fetch;
+let finishVerdict;
 history.replaceState(null,'','#show=all');
 window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
  if(options.method!=='POST') return nativeFetch(url,options);
  const fields=new URLSearchParams(options.body);
+ if(fields.get('row').startsWith('question/') && fields.get('outcome')==='answer')
+  return Promise.resolve(Response.json({answer:'answered',state:'Done'}));
  if(!['page-owner/C1','page-owner/C2'].includes(fields.get('row')) || fields.get('outcome')!=='works')
   throw new Error('The form did not submit a verdict for the expected Change.');
- return Promise.resolve(new Response(JSON.stringify({answer:'works',state:'Done'})));
+ const result=()=>Response.json({answer:'works',state:'Done'});
+ if(fields.get('row')==='page-owner/C1') return new Promise(resolve=>{finishVerdict=()=>resolve(result());});
+ return Promise.resolve(result());
 };
 </script>"""
         probe = r"""<script>
@@ -3253,17 +3259,24 @@ window.fetch=(url,options={})=>{
  const review=document.querySelector('[data-review]');
  const selectShow=value=>document.querySelector('[data-show-chip="'+value+'"]').click();
  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip;
- const follow=async params=>{
+ const follow=async(params,key='page-owner/C1')=>{
   const link=document.createElement('a');
-  link.href='#'+new URLSearchParams({item:'page-owner/C1',...params});
-  link.textContent='Open Change C1';
+  link.href='#'+new URLSearchParams({item:key,...params});
+  link.textContent='Open review item';
   document.body.append(link);
   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   link.click();
   await navigated;
   link.remove();
-  return change('page-owner/C1');
+  return change(key);
  };
+ const savedForm=form=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(form.dataset.sending) return;
+   observer.disconnect();resolve();
+  });
+  observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+ });
  const expanded=(row,state)=>row?.dataset.state===state && !row.hidden && !row.querySelector('[data-detail]').hidden;
  try{
   const owner=change('page-owner/C1').dataset.owner;
@@ -3282,19 +3295,19 @@ window.fetch=(url,options={})=>{
    check(row && !row.hidden,key+' is visible before the save.');
    row.querySelector('.list-toggle').click();
    const form=await readyReviewCard(row);
-   const saved=new Promise(resolve=>{
-    const observer=new MutationObserver(()=>{
-     if(form.dataset.sending) return;
-     observer.disconnect();resolve();
-    });
-    observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
-   });
+   const saved=savedForm(form);
    form.requestSubmit(form.querySelector('button[value="works"]'));
    if(!form.dataset.sending) throw new Error('The save did not start for '+key+'.');
+   if(key==='page-owner/C1'){
+    await follow({show:'Done',owner});
+    finishVerdict();
+   }
    await saved;
    check(form.querySelector('[data-send-status]').textContent==='Saved: works',key+' saved.');
    check(row.hidden,'The save hides '+key+'.');
   }
+  check(expanded(change('page-owner/C1'),'Done') && review.dataset.show==='Done' && selectedOwner()===owner,
+   'F006: A link during the save opens the Done Change and keeps the matching filters.');
 
   const linked=await follow({show:'all'});
   check(expanded(linked,'Done'),'The same-tab link shows the closed Change C1.');
@@ -3305,6 +3318,19 @@ window.fetch=(url,options={})=>{
   check(expanded(await follow({show:'open'}),'Done') && review.dataset.show==='all',
    'A link from Open selects All and shows the closed Change C1.');
   check(!change('page-owner/C2'),'The unlinked Change C2 stays hidden.');
+
+  const question=document.querySelector('[data-type="question"][data-list-item]');
+  question.querySelector('.list-toggle').click();
+  const answerForm=await readyReviewCard(question),answered=savedForm(answerForm);
+  answerForm.elements.feedback.value='Use the wide layout.';
+  answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));
+  if(!answerForm.dataset.sending) throw new Error('The Question save did not start.');
+  await answered;
+  selectShow('Done');
+  const answeredQuestion=await follow({},question.dataset.key);
+  check(expanded(answeredQuestion,'Done') && review.dataset.show==='Done' &&
+    answeredQuestion.querySelector('[data-review-body]') && !answeredQuestion.querySelector('[value="answer"]'),
+   'F007: A link opens the Done Question without the old Answer action.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""

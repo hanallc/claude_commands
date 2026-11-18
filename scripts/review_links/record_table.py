@@ -385,16 +385,17 @@ function readPlace(params,followingItemLink=false){
  if(sharedWords()) words().value=query;
  return saved?.top;
 }
-function followItemLink({inheritFilters=false,beforeJump}={}){
+function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
+ if(unappliedOnly && (location.hash===placeHash || history.state?.recordTable)) return false;
  const params=placeParams();
  const jumpKey=params.get('jump'),key=jumpKey || params.get('item');
  if(!key) return false;
+ if(beforeJump?.(key)===false) return true;
  if(inheritFilters){
   for(const [name,value] of Object.entries({owner,show,q:query,sort,dir:direction,type,'source-owner':sourceOwner,...filters}))
    if(!params.has(name)) params.set(name,value);
   if(!params.has('key')) keys.forEach(key=>params.append('key',key));
  }
- beforeJump?.(key);
  readPlace(params,true);
  jump(key,{pushPlace:false,focusTarget:Boolean(jumpKey),keepMatchingFilters:true});
  return true;
@@ -584,7 +585,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
  if(!options.mount) showHiddenActionResults(items);
  options.applied?.(selection,{owner,show,query:search,type,sourceOwner,keys});
- if(write || owner!==previousOwner || show!==previousShow || filterNames.some(name=>filters[name]!==previousFilters[name]))
+ if(write || location.hash===placeHash &&
+  (owner!==previousOwner || show!==previousShow || filterNames.some(name=>filters[name]!==previousFilters[name])))
   writePlace(pushPlace,top);
 }
 function writePlace(push=false,top){
@@ -715,7 +717,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
   const wasOpen=opened.delete(key);
   if(linkedItem===key) linkedItem='';
   else if(!wasOpen) return;
-  writePlace();
+  if(location.hash===placeHash) writePlace();
  },
  startAction(item){
   const submission=++latestSubmission;
