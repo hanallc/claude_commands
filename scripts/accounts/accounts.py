@@ -2437,28 +2437,37 @@ def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
     return tuple(row for row in members if not isinstance(row.exited, staff.Exited))
 
 
-@settings_report_scope()
-def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple[staff.StaffRow, ...]]:
-    """Keep verified accounts and retain eligible members without account proof."""
-    from scripts.production import staff
-    from scripts.message import sessions
+@dataclass(frozen=True)
+class GroupMoveMembers:
+    live: tuple[LiveGroupMember, ...]
+    without_live_account: tuple[staff.StaffRow, ...]
+    claude_registry_unreadable: bool
+    running_sessions: frozenset[str]
 
-    live = live_group_members()[group]
+
+@settings_report_scope()
+def group_move_members(group: ClaudeGroup) -> GroupMoveMembers:
+    """Keep verified members and report an incomplete registry read."""
+    from scripts.production import staff
+
+    observed = _read_local_role_sessions(GroupAccounts(), include_workers=False)
+    live = tuple(observed.members[group])
+    running = observed.running_claude_sessions.union(member.session_id for member in live)
     try:
         membership = staff.local_snapshot()
     except staff.StaffUnreadable:
-        return live, ()
-    running = {session["sessionId"] for session in sessions.running_sessions()}
-    running.update(member.session_id for member in live)
+        return GroupMoveMembers(live, (), observed.claude_registry_unreadable, running)
     if group == "producers":
         candidates = {row.id: row for row in eligible_producers(membership, "claude")}
     else:
         kind = "unit" if group == "units" else "showrunner"
         candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
-    live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
-            or owner.kind != "producer" or owner.id in candidates]
+    live = tuple(member for member in live if (owner := membership.by_current_session(member.session_id)) is None
+                 or owner.kind != "producer" or owner.id in candidates)
     verified = {member.session_id for member in live}
-    return live, tuple(row for row in candidates.values() if row.current_session not in verified)
+    unresolved = tuple(row for row in candidates.values() if row.current_session not in verified
+                       and (not observed.claude_registry_unreadable or row.current_session in running))
+    return GroupMoveMembers(live, unresolved, observed.claude_registry_unreadable, running)
 
 
 def session_account_label(session: ListedSession | LiveGroupMember) -> str:
@@ -3315,23 +3324,26 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
         return checked
-    members, stopped = group_move_members(group)
-    selected = [session for session in members if not session_on_account(session, target)]
+    members = group_move_members(group)
+    stopped = members.without_live_account
+    selected = [session for session in members.live if not session_on_account(session, target)]
     ids = (*tuple(session.session_id for session in selected), *(row.current_session for row in stopped))
     reason = why or f"{group} moved by hand"
-    notices = (f"{group}: no live session moves",) if not ids else ()
+    if members.claude_registry_unreadable:
+        notices = (f"{group}: member list is incomplete because the Claude session registry is unreadable",)
+    else:
+        notices = (f"{group}: no live session moves",) if not ids else ()
     notices += tuple(f"{row.name}: saved account is unknown; resume on {target}"
                      for row in stopped if not isinstance(row.home, staff.SessionHome))
-    if group == "showrunners":
+    if group == "showrunners" and not members.claude_registry_unreadable:
         if TYPE_CHECKING:
             from scripts.agents import inventory
         else:
             inventory = import_module("scripts.agents.inventory")
-        live_ids = {member.session_id for member in members}
         notices += tuple(
             f"{runner.name}: no session runs under the id its update timer names; "
             + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
-            for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
+            for runner in inventory.showrunner_registrations().entries if runner.session_id not in members.running_sessions)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
             *(move_preview_line(item, target) for item in selected),
@@ -5825,6 +5837,7 @@ class LocalRoleSessions:
     session_lines: tuple[str, ...]
     continuation_lines: tuple[str, ...]
     claude_registry_unreadable: bool
+    running_claude_sessions: frozenset[str]
     models: dict[tuple[Path, str], ObservedSessionModel] = field(default_factory=dict)
 
 
@@ -6323,7 +6336,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
                 member, activity, detached=detached)
             record_codex_model(directory, member.current_session, process.pid if process else 0)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
-                             tuple(session_lines), (), bool(registry.unreadable), models)
+                             tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models)
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:

@@ -135,9 +135,11 @@ class MeasurementTests(MeasurementFixture):
         local = self.local_step("local-day", 300, 100, started_at="2026-01-16T01:00:00+00:00")
         self.write_records(local, self.call("local-day"), self.call("fallback-call"), self.remote_step(),
             self.attempt(queued_at=departure - 100, departed_at=departure))
-        _ = index.update()
+        with mock.patch.object(time, "time", return_value=departure + 1):
+            _ = index.update()
         try:
-            with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+            # Use the fixed UTC-05:00 offset for New York in January.
+            with mock.patch.dict(os.environ, {"TZ": "EST5"}):
                 time.tzset()
                 with closing(index.read_only()) as connection:
                     result = aws_report.estimate_wait_saved(connection, DAY, bounds=report.day_range(DAY))
