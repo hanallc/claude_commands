@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
+import json
 from pathlib import Path
 import re
 import sys
@@ -38,6 +39,7 @@ class ReviewType(StrEnum):
 
 class ReviewState(StrEnum):
     OPEN = 'Open'
+    VALIDATING = 'Validating'
     WAITING = 'Waiting'
     DONE = 'Done'
 
@@ -69,6 +71,42 @@ class ReviewTimes:
     filed: datetime
     updated: datetime
     later: datetime | NoLaterTime = NoLaterTime()
+
+
+@dataclass(frozen=True)
+class OpenFeedback(delivery_state.OpenQuestion):
+    """The showrunner must act before this change returns to the user."""
+
+
+@dataclass(frozen=True)
+class CompletedFeedback(delivery_state.AnsweredQuestion):
+    """The showrunner's note returns this change to the user."""
+
+
+def decode_change_delivery(value: object) -> delivery_state.DeliverySlots:
+    slots = delivery_state.decode_value(value)
+    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    saved = fields.get("question")
+    question = slots.question
+    if isinstance(saved, dict) and cast(dict[str, object], saved).get("kind") == "feedback":
+        if isinstance(question, delivery_state.OpenQuestion):
+            return replace(slots, question=OpenFeedback(question.question_id, question.text, question.delivery))
+        if isinstance(question, delivery_state.AnsweredQuestion):
+            return replace(slots, question=CompletedFeedback(question.question_id, question.text, question.answer))
+    return slots
+
+
+def read_change_delivery(path: Path) -> delivery_state.DeliverySlots:
+    """Read change exchanges with their request type."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    try:
+        value = cast(object, json.loads(content))
+    except ValueError:
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    return decode_change_delivery(value)
 
 
 @dataclass(frozen=True)
@@ -173,7 +211,7 @@ def name(identity: staff.StaffId, members: staff.StaffSnapshot) -> str:
 def change_state(row: dict[str, str], slots: delivery_state.DeliverySlots) -> ReviewState:
     if row.get('Verdict'):
         return ReviewState.DONE
-    return ReviewState.OPEN if slots.waits_for_user(False) else ReviewState.WAITING
+    return ReviewState.OPEN if slots.waits_for_user(False) else ReviewState.VALIDATING
 
 
 def question_state(record: update_registration.QuestionRecord) -> ReviewState:
@@ -188,6 +226,13 @@ def investigation_state(item: investigation.Investigation) -> ReviewState:
             investigation.InvestigationState.READ: ReviewState.DONE}[item.state]
 
 
+def change_delivery(root: Path, path: Path, row: str) -> delivery_state.DeliverySlots:
+    try:
+        return read_change_delivery(change_routing.delivery_path(root, path, row))
+    except OSError:
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+
+
 def change_item(path: Path, row: dict[str, str], assignment: change_routing.ChangeAssignment,
                 members: staff.StaffSnapshot, root: Path, queue: str, current: Path,
                 slots: delivery_state.DeliverySlots | None = None) -> ReviewItem:
@@ -197,7 +242,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     owner = next((member for member in members.rows if member.name == routed.tab), None)
     identity = owner.id if owner is not None else staff.StaffId(routed.tab)
     source = staff.StaffId(row.get('Producer', '') or identity)
-    slots = (change_routing.delivery_slots(change_routing.delivery_path(root, path, row['#']))
+    slots = (change_delivery(root, path, row['#'])
              if slots is None else slots)
     state = change_state(row, slots)
     entry = change_review.row_entries([row])[0]
@@ -205,14 +250,16 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     logs = [ReviewLog(filed, name(source, members), 'Filed for your check')]
     saved_log = review_events.decode(row.get('Review log', ''))
     words = {entry.words.casefold() for entry in saved_log}
-    if isinstance(slots.question, delivery_state.OpenQuestion):
-        if ('question: '+slots.question.text).casefold() not in words:
-            logs.append(ReviewLog(filed, 'nate', 'Question: ' + slots.question.text))
-    elif isinstance(slots.question, delivery_state.AnsweredQuestion):
-        if ('question: '+slots.question.text).casefold() not in words:
-            logs.append(ReviewLog(filed, 'nate', 'Question: ' + slots.question.text))
-        if ('answer: '+slots.question.answer).casefold() not in words:
-            logs.append(ReviewLog(filed, name(identity, members), 'Answer: ' + slots.question.answer))
+    request = slots.question
+    if isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)) and not isinstance(
+            request, (OpenFeedback, CompletedFeedback)):
+        event = 'Question: ' + request.text
+        if event.casefold() not in words:
+            logs.append(ReviewLog(filed, 'nate', event))
+    if isinstance(request, delivery_state.AnsweredQuestion):
+        answer = 'Answer: ' + request.answer
+        if answer.casefold() not in words:
+            logs.append(ReviewLog(filed, name(identity, members), answer))
     if slots.validation_requested and not any(entry.words.startswith('validate') for entry in saved_log):
         logs.append(ReviewLog(filed, 'nate', 'Asked the showrunner to check'))
     if row.get('Verdict') and row['Verdict'].casefold() not in words and not any(
@@ -224,7 +271,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     local = path.absolute() == current.absolute()
     return ReviewItem(prefix+'/'+row['#'], shown, ReviewType.CHANGE, identity, source,
         row['Change'], state, ReviewTimes(filed, logs[-1].time), tuple(logs),
-        ('works', 'not works', 'validate', 'feedback', 'question') if state != ReviewState.DONE else (),
+        ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN else (),
         ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
@@ -243,6 +290,8 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                  below: bool = False, sources: list[Path] | None = None,
                  states: tuple[ReviewState, ...] = REVIEW_STATES,
                  owner_options: dict[staff.StaffId, str] | None = None) -> list[ReviewItem]:
+    if owner_options is None and states == (ReviewState.WAITING,):
+        return []
     if document is not None:
         current = change_review.scope_list(document, record=members, sources=sources)
         queue = change_queue_name(document, members, current, below)
@@ -278,7 +327,7 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                 continue
             if not row.get('Verdict') and states == (ReviewState.DONE,):
                 continue
-            slots = change_routing.delivery_slots(change_routing.delivery_path(root, path, row['#']))
+            slots = change_delivery(root, path, row['#'])
             if change_state(row, slots) not in states:
                 continue
             assignment = routing.owner_and_production(path, row)
@@ -682,7 +731,8 @@ def read_open(root: Path) -> list[ReviewItem]:
 
 def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> list[ReviewItem]:
     times = review_later.times(sources)
-    return [replace(item,times=replace(item.times,later=times.get(item.key,item.times.later))) for item in items]
+    return [replace(item, times=replace(item.times, later=times[item.key]))
+            if item.state != ReviewState.VALIDATING and item.key in times else item for item in items]
 
 
 def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,

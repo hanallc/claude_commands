@@ -256,6 +256,29 @@ class RemoveRunScratchTests(unittest.TestCase):
         self.assertFalse(gate.exists())
         self.assertEqual(self.worktrees(source), [str(source)])
 
+    def test_a_worktree_with_linked_commondir_keeps_its_staged_deletion(self) -> None:
+        source, run, gate = self.worktree_run()
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(gate), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
+                                  check=True, capture_output=True, text=True).stdout
+
+        _ = (gate / "tracked").write_text("The last tracked file\n")
+        _ = git("add", "tracked")
+        _ = git("commit", "-qm", "Add the tracked file")
+        _ = git("rm", "-q", "tracked")
+        common = source / ".git" / "worktrees" / gate.name / "commondir"
+        target = common.rename(common.with_name("shared-folder"))
+        common.symlink_to(target.name)
+        self.assertEqual(git("status", "--porcelain"), "D  tracked\n")
+
+        result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"{gate}: it has uncommitted changes", result.stderr)
+        self.assertTrue(gate.is_dir())
+        self.assertEqual(git("status", "--porcelain"), "D  tracked\n")
+
     def test_a_worktree_whose_source_is_gone_is_still_deleted(self) -> None:
         source, run, gate = self.worktree_run()
         _ = subprocess.run(["rm", "-rf", str(source)], check=True)
