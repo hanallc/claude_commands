@@ -78,6 +78,7 @@ COMMAND_GATE = ('read -r ready || exit 125; watcher_python=$1 watcher_script=$2;
                 + '(read -r end; [ "$end" = done ] || exec "$watcher_python" "$watcher_script" supervisor-gone '
                 + '"$UNIT_DETACHED_RECORD") <&0 & exec 0</dev/null; exec "$@"')
 SUPERVISOR_GONE_REASON = "the supervisor ended before the command, so its watcher stopped the command"
+CONFIRMED_STOP_SUFFIX = ".stop-confirmed"
 
 
 class RunRecord(TypedDict):
@@ -226,6 +227,13 @@ def _read_record(path: Path) -> RunRecord:
         raise SystemExit(f"detached_runs: {path} is not a run record")
     if path.name != f"{raw['run_id']}.json":
         raise SystemExit(f"detached_runs: {path} does not match run ID {raw['run_id']}")
+    confirmed_path = path.with_suffix(CONFIRMED_STOP_SUFFIX)
+    confirmed = worker_lifecycle.read_json_object(confirmed_path)
+    if confirmed:
+        reason = confirmed.get("stop_reason")
+        if confirmed.get("run_id") != raw["run_id"] or not isinstance(reason, str):
+            raise worker_lifecycle.WorkerStateUnreadable(confirmed_path, "invalid confirmed stop reason")
+        raw["stop_reason"] = reason
     return raw
 
 
@@ -242,6 +250,7 @@ def stop_with_reason(
         if isinstance(verify_group(), CommandGroupUnverified):
             return False
         pending = path.with_suffix(".stop-pending")
+        confirmed = path.with_suffix(CONFIRMED_STOP_SUFFIX)
         stopping = {**record, "stop_reason": reason}
         signaled = False
         try:
@@ -253,14 +262,22 @@ def stop_with_reason(
                     return False
                 signal_group(command.group, signal.SIGTERM)
                 signaled = True
-                _ = pending.replace(path)
+                try:
+                    _ = pending.replace(path)
+                except OSError:
+                    # Publish the staged content only after the signal succeeds.
+                    with contextlib.suppress(FileExistsError):
+                        os.link(pending, confirmed)
+                    atomic_file.sync_folder(path.parent)
+                    raise
+                confirmed.unlink(missing_ok=True)
                 atomic_file.sync_folder(path.parent)
             finally:
                 pending.unlink(missing_ok=True)
         except OSError as error:
             if not signaled:
                 raise
-            print(f"detached_runs: {path}: sent SIGTERM but could not publish the stop reason: {error}",
+            print(f"detached_runs: {path}: sent SIGTERM but could not finalize the stop record: {error}",
                   file=sys.stderr)
         return True
 
@@ -425,11 +442,10 @@ class OrphanReapResult:
                     continue
                 try:
                     current = _read_record(path)
+                    if current.get("completion_pending") is True:
+                        _finish_record(path, current)
                 except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
                     print(" ".join(str(error).splitlines()), file=sys.stderr)
-                    continue
-                if current.get("completion_pending") is True:
-                    _finish_record(path, current)
 
 
 def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
@@ -526,6 +542,7 @@ def _complete_worker_dispatch(record: RunRecord) -> None:
 
 # Keep the record lock at its path until the record is gone.
 _RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.completion.lock", ".{}.delivery.lock", "{}.stop-pending",
+              "{}" + CONFIRMED_STOP_SUFFIX,
               "{}.json", "{}.record.lock")
 
 

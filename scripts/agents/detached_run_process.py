@@ -3,7 +3,6 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-import re
 import subprocess
 
 from scripts.lib import conf
@@ -38,7 +37,7 @@ def process_args(pid: int) -> list[str] | ProcessCommandText | ProcessArgumentsU
     command = shown.stdout.strip()
     if shown.returncode == 1 and not command and not shown.stderr.strip():
         return ProcessAbsent()
-    if shown.returncode or not command or re.fullmatch(r"\([^()]+\)", command):
+    if shown.returncode or not command or (command.startswith("(") and command.endswith(")")):
         return ProcessArgumentsUnavailable()
     return ProcessCommandText(command)
 
