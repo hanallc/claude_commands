@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -1888,7 +1889,10 @@ class BuildToolRam:
 
 def python_test_command(command: tuple[str, ...]) -> bool:
     """Identify a Python test runner from its command line."""
-    if not command or not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", Path(command[0]).name):
+    if not command:
+        return False
+    program = Path(command[0])
+    if program.parts[-2:] != ("lib", "py") and not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", program.name):
         return False
     for index, arg in enumerate(command[1:], 1):
         if arg == "-m":
@@ -1994,11 +1998,7 @@ def waiting_tool_processes(waiters: Sequence[admission_records.RankedWaiter],
         shell = chain[-1]
         wrappers.add(shell)
         wrappers.update(parent for parent in chain[1:-1] if reader.verify_helper(parent))
-        run = row.get("build_run")
-        if isinstance(run, LiveBuildRun) and run.pid == shell:
-            identity = reader.identity(run.pid)
-            if identity is not None and identity.start == run.start_time:
-                roots[run.pid] = True
+        roots[shell] = True
 
     queued: set[int] = set()
     pending = list(roots.items())
@@ -2036,17 +2036,38 @@ def tool_group_children(path: Path) -> list[Path]:
 class ToolGroup:
     members: set[int]
     children: list[Path]
+    python_test_scope: bool = False
+
+
+def scope_starts_python_tests(unit: Path) -> bool:
+    """Read the launch command from the transient scope file."""
+    prefix = "Description=[systemd-run] "
+    try:
+        description = next((line[len(prefix):] for line in unit.read_text().splitlines()
+                            if line.startswith(prefix)), "")
+        command = tuple(shlex.split(description))
+    except (OSError, ValueError):
+        return False
+    if command[:2] == ("/bin/sh", "-c") and len(command) > 4:
+        # The detached launcher gives its shell a marker, then the command.
+        marker = Path(command[3])
+        if marker.suffix == ".scope" and marker.parent.name == "detached_runs":
+            command = command[4:]
+    return python_test_command(command)
 
 
 def detached_tool_groups(detached: Path, excluded: set[Path]) -> dict[Path, ToolGroup]:
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    transient = runtime / "systemd" / "transient"
     groups: dict[Path, ToolGroup] = {}
-    pending = [detached]
+    pending = [(detached, False)]
     while pending:
-        path = pending.pop()
+        path, python_scope = pending.pop()
         if path not in excluded:
+            python_scope = python_scope or (path.suffix == ".scope" and scope_starts_python_tests(transient / path.name))
             children = tool_group_children(path)
-            groups[path] = ToolGroup(tool_group_members(path), children)
-            pending.extend(children)
+            groups[path] = ToolGroup(tool_group_members(path), children, python_scope)
+            pending.extend((child, python_scope) for child in children)
     return groups
 
 
@@ -2100,23 +2121,33 @@ def proportional_tool_bytes(pid: int) -> int:
     return 0
 
 
-def shares_within_budget(budget: int, tests: int, wrappers: int, measured: int) -> tuple[int, int]:
+@dataclass(frozen=True)
+class ToolGroupRam:
+    python_tests_bytes: int = 0
+    waiting_runs_bytes: int = 0
+
+
+def shares_within_budget(budget: int, shares: ToolGroupRam, measured: int) -> ToolGroupRam:
     # Process shares and cgroup charges can differ across scopes or when processes move.
     # Divide the charge by all measured shares if they exceed the charge.
     if measured > budget:
-        return tests * budget // measured, wrappers * budget // measured
-    return tests, wrappers
+        return ToolGroupRam(
+            python_tests_bytes=shares.python_tests_bytes * budget // measured,
+            waiting_runs_bytes=shares.waiting_runs_bytes * budget // measured)
+    return shares
 
 
 def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], charged: set[int],
-                      waiters: Sequence[admission_records.RankedWaiter]) -> dict[Path, tuple[int, int]]:
+                      waiters: Sequence[admission_records.RankedWaiter]) -> dict[Path, ToolGroupRam]:
     """Read detached scopes and the specific cgroups of waiting wrappers."""
     reader = ToolProcessReader()
     waiting = waiting_tool_processes(waiters, reader)
     detached = builds / "builds-detached.slice"
     groups = detached_tool_groups(detached, excluded)
     members = {pid for group in groups.values() for pid in group.members}
-    tests = detached_test_processes(members - waiting.queued - waiting.wrappers - charged, reader)
+    mixed_members = {pid for group in groups.values() if not group.python_test_scope for pid in group.members}
+    non_tests = waiting.queued | waiting.wrappers | charged
+    tests = detached_test_processes(mixed_members - non_tests, reader)
     for pid in waiting.wrappers - charged - members:
         path = waiting_tool_group(pid, builds, outside, excluded)
         if path is not None and path not in groups:
@@ -2129,12 +2160,13 @@ def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], cha
             charges[path] = swap_backed_bytes(path)
         return charges[path]
 
-    result: dict[Path, tuple[int, int]] = {}
+    result: dict[Path, ToolGroupRam] = {}
     for path, group in groups.items():
         members = group.members
-        group_tests = members & tests
+        group_tests = members - non_tests if group.python_test_scope else members & tests
         group_wrappers = (members & waiting.wrappers) - charged
-        if not (group_tests or group_wrappers):
+        whole_test_scope = group.python_test_scope and group_tests == members
+        if not (whole_test_scope or group_tests or group_wrappers):
             continue
         try:
             direct = charge(path) - sum(charge(child) for child in group.children)
@@ -2142,14 +2174,15 @@ def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], cha
             continue
         if direct <= 0:
             continue
-        if group_tests == members:
-            result[path] = (direct, 0)
+        if whole_test_scope:
+            result[path] = ToolGroupRam(python_tests_bytes=direct)
         elif group_wrappers == members:
-            result[path] = (0, direct)
+            result[path] = ToolGroupRam(waiting_runs_bytes=direct)
         else:
             use = {pid: proportional_tool_bytes(pid) for pid in members}
-            result[path] = shares_within_budget(direct, sum(use[pid] for pid in group_tests),
-                                                sum(use[pid] for pid in group_wrappers), sum(use.values()))
+            shares = ToolGroupRam(python_tests_bytes=sum(use[pid] for pid in group_tests),
+                                  waiting_runs_bytes=sum(use[pid] for pid in group_wrappers))
+            result[path] = shares_within_budget(direct, shares, sum(use.values()))
     return result
 
 
@@ -2210,13 +2243,15 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
         return BuildToolRam(rust_analyzer, sccache, other)
     outward_roots = gate.owned_scope_roots(outside, Path("/"))
     groups = split_tool_groups(builds, outward_roots, excluded, charged, waiters)
-    tests = sum(amount[0] for path, amount in groups.items() if path.is_relative_to(builds))
-    wrappers = sum(amount[1] for path, amount in groups.items() if path.is_relative_to(builds))
-    python_tests, waiting_runs = shares_within_budget(inside_tools, tests, wrappers, tests + wrappers)
+    inside = [amount for path, amount in groups.items() if path.is_relative_to(builds)]
+    tests = sum(amount.python_tests_bytes for amount in inside)
+    wrappers = sum(amount.waiting_runs_bytes for amount in inside)
+    shares = shares_within_budget(inside_tools, ToolGroupRam(tests, wrappers), tests + wrappers)
+    python_tests, waiting_runs = shares.python_tests_bytes, shares.waiting_runs_bytes
     for root in outward_roots:
-        wrappers = sum(amount[1] for path, amount in groups.items() if path.is_relative_to(root))
-        _, share = shares_within_budget(outside[root], 0, wrappers, wrappers)
-        waiting_runs += share
+        wrappers = sum(amount.waiting_runs_bytes for path, amount in groups.items() if path.is_relative_to(root))
+        shares = shares_within_budget(outside[root], ToolGroupRam(waiting_runs_bytes=wrappers), wrappers)
+        waiting_runs += shares.waiting_runs_bytes
     return BuildToolRam(rust_analyzer, sccache, other - python_tests - waiting_runs, python_tests, waiting_runs)
 
 
