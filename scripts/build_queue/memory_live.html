@@ -336,7 +336,7 @@ body.queue-unavailable .card { display: none; }
 .track .b.row-progress { top: calc(50% - 1px); bottom: auto; height: 2px; border-radius: 0; z-index: 2; pointer-events: none; }
 .row-progress, .sw.progress { box-shadow: 0 -1px 0 var(--card), 0 1px 0 var(--card); }
 .row-progress.building { background: var(--building); }
-.row-progress.testing { background: var(--testing); }
+.row-progress.testing, .cloud-work .row-progress { background: var(--testing); }
 .sw.progress { height: 2px; border-radius: 0; }
 .sw.building { background: var(--building); }
 .sw.testing { background: var(--testing); }
@@ -782,6 +782,7 @@ function ownerText(text) {
   return /not recorded/.test(shown) || shown === '—' ? '' : shown;
 }
 function stageText(row) {
+  if (row.kind === "cloud") return row.stage || "—";
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
   return row.progress?.kind === "RowProgress" ? row.progress.phase
     : row.progress?.kind === "TokenWaitProgress" ? "waiting" : "—";
@@ -825,8 +826,10 @@ function progressRows(row) {
   const progress = row.progress;
   // The Stage column shows only "waiting"; the tooltip gives the full reason.
   if (progress?.kind === 'TokenWaitProgress') return [field('Stage', sentence(progress.stage))];
-  if (!progress || progress.kind !== 'RowProgress') return [];
-  return groupRows([field(sentence(progress.phase), `${progress.done} of ${progress.total} ${progress.unit}`),
+  if (!progress || progress.kind !== 'RowProgress')
+    return row.kind === 'cloud' && row.stage ? [field('Stage', sentence(row.stage))] : [];
+  const stage = row.kind === 'cloud' ? stageText(row) : progress.phase;
+  return groupRows([field(sentence(stage), `${progress.done} of ${progress.total} ${progress.unit}`),
     field('Done', formatPercent(progress.percent ?? 100 * progress.done / progress.total, progress.done === progress.total)),
     ...(progress.unit === 'modules' ? [field('Order', 'slowest first')] : [])]);
 }
@@ -889,7 +892,7 @@ function stepTooltip(key, data) {
     const machine = macRow(row) ? 'Mac' : row.kind === 'cloud' ? 'AWS' : row.machine || 'natedev';
     rows.push(field('Runs on', machine));
     if (row.kind === 'cloud') {
-      if (row.activity) rows.push(field('Status', row.activity));
+      if (row.location) rows.push(field('Where', row.location));
       if (row.failed_modules) rows.push(field('Failed modules', row.failed_modules));
     } else if (macRow(row)) {
       rows.push(...groupRows([field('Uses', ramAmount(row.used * GIB)),
@@ -1745,7 +1748,7 @@ function placeMemoryBars(d) {
     if (hasCap(d) && progress?.kind === "RowProgress") {
       bars += `<div class="progress-track" style="width:${progressEnd}px"></div>`;
       if (progress.percent > 0) {
-        bars += `<div class="b row-progress ${progress.phase}" style="left:0;width:${Math.min(progressEnd, progressEnd * progress.percent / 100)}px"></div>`;
+        bars += `<div class="b row-progress ${progress.phase ?? ''}" style="left:0;width:${Math.min(progressEnd, progressEnd * progress.percent / 100)}px"></div>`;
       }
     }
     row.querySelector(".track").innerHTML = bars;

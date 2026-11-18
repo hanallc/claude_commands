@@ -775,13 +775,16 @@ def cloud_update_age(seconds: float) -> str:
     return f"{int(seconds)} s"
 
 
+def cloud_location(progress: cloud_progress.CloudProgress) -> str:
+    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
+    return ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
+
+
 def cloud_detail(row: wire.CloudRow) -> str:
     progress = row.progress
     if not isinstance(progress, cloud_progress.CloudProgress):
         return ""
-    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
-    location = ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
-    return " · ".join(filter(None, (progress.stage, location)))
+    return " · ".join(filter(None, (progress.stage, cloud_location(progress))))
 
 
 def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
@@ -801,11 +804,7 @@ def cloud_failed_modules(work: CloudWork) -> str:
 def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
     if isinstance(row.wait, wire.CloudSlotWait):
         return cloud_status(row, work)
-    parts = (work.state if work.state != "running" else "",
-             cloud_detail(row),
-             work.modules if isinstance(row.counter, progress_profile.ProgressCounter) else "",
-             cloud_failed_modules(work))
-    return (Span(" · ".join(filter(None, parts))),)
+    return (Span(cloud_failed_modules(work)),)
 
 
 def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:

@@ -567,18 +567,43 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(hover[1], "Showrunner  fixture-production\nRuns on  natedev\n" +
                     ("" if queued else "Started by  not the queue\n") + "Uses  1.0 GiB")
 
-    def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
-        for status, counter in (("7 of 12 modules", progress.ProgressCounter("modules", 7, 12)),
-                                 ("setup", progress.NoCounter("no cloud counter")), ("", progress.NoCounter("no cloud counter"))):
-            with self.subTest(status=status):
-                hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"walk": [{
-                    "kind": "cloud", "machine": "aws", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
-                    "status": status, "activity": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
-                self.assertIn("Showrunner  fixture\nRuns on  AWS", hover[1])
-                self.assertEqual("Status  " in hover[1], bool(status))
-                self.assertNotIn("Uses", hover[1])
+    def test_cloud_hover_uses_the_table_stage_and_shows_location_and_progress(self) -> None:
+        for stage, counter, expected in (
+            ("testing", progress.ProgressCounter("modules", 852, 852), "Testing  852 of 852 modules"),
+            ("uploading", progress.ProgressCounter("modules", 852, 852), "Uploading  852 of 852 modules"),
+            ("launch", progress.NoCounter("no cloud counter"), "Stage  Launch"),
+            ("", progress.NoCounter("no cloud counter"), ""),
+        ):
+            with self.subTest(stage=stage):
+                data = {"walk": [{"kind": "cloud", "machine": "aws", "name": "merge-gate",
+                    "unit": "cloud-unit", "showrunner": "fixture", "stage": stage, "location": "eu-south-2, zone b",
+                    "progress": memory_feed.cloud_row_progress(counter)}]}
+                shown = cast(list[str], self.page_expression(
+                    "[stageText(data.walk[0]), ...tipText('row:fixture-run-0', data)]", data))
+                place, _, tip = shown
+                self.assertEqual(place, stage or "—")
+                self.assertIn("Showrunner  fixture\nRuns on  AWS\nWhere  eu-south-2, zone b", tip)
+                self.assertNotIn("Status  ", tip)
+                self.assertNotIn("Uses", tip)
+                if expected:
+                    self.assertIn(expected, tip)
+                else:
+                    self.assertNotIn("Stage  ", tip)
                 if isinstance(counter, progress.ProgressCounter):
-                    self.assertIn("Testing  7 of 12 modules\nDone  58.3%\nOrder  slowest first", hover[1])
+                    self.assertIn("Done  100.0%\nOrder  slowest first", tip)
+
+    def test_cloud_chart_shows_only_failures_and_the_late_update(self) -> None:
+        for status, late_age, expected in (
+            ("1 failed module", "3 min", "1 failed module · no update for 3 min"),
+            ("", "3 min", "no update for 3 min"),
+            ("", "", ""),
+        ):
+            with self.subTest(status=status, late_age=late_age):
+                row = {"status": status, "stale": bool(late_age), "late_age": late_age}
+                html = str(self.page_expression("cloudStatus(data.row, 'row:fixture-run-0')", {"row": row}, walk=True))
+                chart = ElementTree.fromstring(html).find("./div[@class='amounts']")
+                assert chart is not None
+                self.assertEqual("".join(chart.itertext()), expected)
 
     def test_progress_percent_rounds_to_one_decimal_without_early_completion(self) -> None:
         for done, total, percent, expected in (
@@ -625,12 +650,12 @@ class MemoryHoverTests(unittest.TestCase):
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
                     {"name": "Mac builds", "kind": "cloud", "machine": "mac", "slot": 3,
                      "progress": {"kind": "NoProgress"}},
-                    {"name": "cloud test", "kind": "cloud", "machine": "aws",
-                     "progress": {"kind": "RowProgress", "phase": "testing"}},
+                    {"name": "cloud test", "kind": "cloud", "machine": "aws", "stage": "testing",
+                     "progress": {"kind": "RowProgress"}},
                     {"name": "cloud setup", "kind": "cloud", "machine": "aws",
                      "progress": {"kind": "NoProgress"}},
-                    {"name": "Mac test", "kind": "cloud", "machine": "mac",
-                     "progress": {"kind": "RowProgress", "phase": "testing"}},
+                    {"name": "Mac test", "kind": "cloud", "machine": "mac", "stage": "testing",
+                     "progress": {"kind": "RowProgress"}},
                     {"name": "hana CI", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],
                      "progress": {"kind": "NoProgress"}},
                     {"name": "CI counter", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],

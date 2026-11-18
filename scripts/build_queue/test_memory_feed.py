@@ -548,7 +548,7 @@ process.stdout.write(JSON.stringify({
                     text = "\n".join(tips[collection][index])
                     cell = cells[f"{kind}:{row['key']}"]
                     progress = cast(dict[str, object], row.get("progress", {}))
-                    place = (str(progress.get("phase", "—")) if kind == "row" else
+                    place = (str(row.get("stage") or progress.get("phase", "—")) if kind == "row" else
                              "cloud" if row.get("kind") == "cloud" else str(local_position))
                     self.assertIn(f'<td class="place">{place}</td>', cell)
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
@@ -580,9 +580,11 @@ process.stdout.write(JSON.stringify({
                                                      + rf'style="color:[^"]+">{unit}</span>{separator}{re.escape(step)}$')
                         self.assertIn(f"{unit} · {step}", text)
                         self.assertNotIn("Uses  ", text)
-                        self.assertIn(str(row.get("activity")), text) if kind == "row" else self.assertIn("Waits for  AWS slot", text)
                         if kind == "row":
                             self.assertIn("Runs on  AWS", text)
+                            self.assertIn("Testing  7 of 12 modules", text)
+                        else:
+                            self.assertIn("Waits for  AWS slot", text)
                     else:
                         self.assertEqual(row["unit"], unit_labels.OWNER_NOT_RECORDED)
                         self.assertEqual(shown_name, name)
@@ -2139,24 +2141,28 @@ process.stdout.write(JSON.stringify({
         reading = cloud_reading(reservation_reading())
         first = reading.cloud[0]
         assert isinstance(first.progress, cloud_progress.CloudProgress)
-        for stage, region, zone, detail in (
-            ("tools ready", "", "", "tools ready"),
-            ("tests start", "eu-south-2", "eu-south-2a", "tests start · eu-south-2, zone a"),
-            ("", "eu-south-2", "us-east-1b", "eu-south-2, zone us-east-1b"),
+        for stage, region, zone, location in (
+            ("launch", "", "", ""),
+            ("uploading", "eu-south-2", "eu-south-2b", "eu-south-2, zone b"),
+            ("recording", "eu-south-2", "us-east-1b", "eu-south-2, zone us-east-1b"),
             ("", "", "eu-south-2a", "zone eu-south-2a"),
             ("", "eu-south-2", "", "eu-south-2"),
             ("", "", "", ""),
         ):
             with self.subTest(stage=stage, region=region, zone=zone):
-                current = replace(first, progress=replace(first.progress, stage=stage, region=region, zone=zone))
-                with mock.patch.object(admission_client, "view", return_value=replace(
-                        reading, cloud=(current, *reading.cloud[1:]))):
+                state = "uploading" if stage == "uploading" else "setup" if stage == "launch" else "running"
+                current = replace(first, progress=replace(first.progress, state=state, stage=stage,
+                                                          region=region, zone=zone, failed_modules=0))
+                with (mock.patch.object(admission_client, "view", return_value=replace(
+                        reading, cloud=(current, *reading.cloud[1:]))),
+                      mock.patch.object(queue_view, "cloud_push_interval", return_value=queue_view.CloudPushInterval(5))):
                     page = memory_feed.reading()
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 rows = cast(list[dict[str, object]], payload["walk"])
                 remote, = [row for row in rows if row.get("kind") == "cloud"]
-                expected = " · ".join(filter(None, (detail, "7 of 12 modules", "1 failed module")))
-                self.assertEqual(remote["status"], expected)
+                self.assertEqual(remote["stage"], stage or "testing")
+                self.assertEqual(remote["location"], location)
+                self.assertEqual(remote["status"], "")
 
     def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels) -> memory_feed.MemoryPage:
         """Read the owner from the session when the cloud step has no recorded unit."""
@@ -2284,8 +2290,6 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(names.prose("merge-gate"), "merge gate")
 
     def test_cloud_rows_share_the_feed_without_memory_reservations(self) -> None:
-        _ = (self.root / "cloud_gate.conf").write_text(
-            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
         reading = cloud_reading(reservation_reading())
         first = reading.cloud[0]
         assert isinstance(first.progress, cloud_progress.CloudProgress)
@@ -2312,6 +2316,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(state=state, progress=cloud.progress, counter=cloud.counter):
                 current = replace(reading, cloud=(cloud, *reading.cloud[1:]))
                 with (mock.patch.object(admission_client, "view", return_value=current),
+                      mock.patch.object(queue_view, "cloud_push_interval", return_value=queue_view.CloudPushInterval(5)),
                       mock.patch.object(os, "cpu_count", return_value=17)):
                     page = memory_feed.reading()
                 text = memory_feed.page_json(page)
@@ -2332,22 +2337,17 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(remote["vcpus"], 32 if isinstance(cloud.progress, cloud_progress.CloudProgress)
                                  else {"kind": "UnknownCpuCount"})
                 self.assertEqual(remote["state"], state)
+                self.assertEqual(remote["stage"], "testing" if isinstance(cloud.progress, cloud_progress.NoCloudProgress)
+                                 or state == "running" else state)
                 self.assertEqual(remote["pid"], 700001)
                 self.assertEqual(remote["started_at"], first.started_at)
                 if isinstance(cloud.counter, progress_profile.ProgressCounter):
-                    self.assertEqual(remote["progress"], {"kind": "RowProgress", "phase": "testing",
+                    self.assertEqual(remote["progress"], {"kind": "RowProgress",
                         "unit": "modules", "done": 7, "total": 12, "percent": 100 * 7 / 12})
-                    self.assertIn("7 of 12 modules", str(remote["status"]))
                 else:
                     self.assertEqual(remote["progress"], {"kind": "NoProgress", "reason": cloud.counter.reason})
-                    self.assertNotIn("modules unknown", str(remote["status"]))
-                if state == "running":
-                    self.assertNotIn("running", str(remote["status"]))
-                else:
-                    self.assertTrue(str(remote["status"]).startswith(state), remote["status"])
-                if isinstance(cloud.progress, cloud_progress.CloudProgress):
-                    self.assertIn("1 failed module", str(remote["status"]))
-                self.assertNotIn("no update for", str(remote["status"]))
+                self.assertEqual(remote["status"], "1 failed module" if isinstance(
+                    cloud.progress, cloud_progress.CloudProgress) else "")
                 self.assertEqual(remote["late_age"], late_age)
                 self.assertEqual(remote["stale"], bool(late_age))
                 self.assertEqual(local["machine"], "fixture")

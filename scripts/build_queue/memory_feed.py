@@ -321,13 +321,16 @@ class TokenWaitProgress(TypedDict):
     tokens: int
 
 
-class RowProgress(TypedDict):
+class StepProgressCount(TypedDict):
     kind: Literal["RowProgress"]
-    phase: Literal["building", "testing"]
     done: int
     total: int
     percent: float
     unit: Literal["modules", "units", "tests"]
+
+
+class RowProgress(StepProgressCount):
+    phase: Literal["building", "testing"]
 
 
 class RoomRow(TypedDict):
@@ -731,7 +734,8 @@ class MacReadingUnavailableRow(RowQueueNotes):
 
 
 class CloudWorkRow(RowQueueNotes):
-    activity: str
+    stage: str
+    location: str
     failed_modules: int
     kind: Literal["cloud"]
     name: str
@@ -743,7 +747,7 @@ class CloudWorkRow(RowQueueNotes):
     vcpus: int | queue_view.UnknownCpuCount
     state: str
     status: str
-    progress: RowProgress | NoProgress
+    progress: StepProgressCount | NoProgress
     stale: bool
     late_age: str
 
@@ -1153,10 +1157,17 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                          {"kind": "NoProgress", "reason": build.counter.reason})}
 
 
-def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> RowProgress | NoProgress:
+def cloud_stage(row: wire.CloudRow) -> str:
+    """Use the reported stage, or the state when the stage is absent."""
+    if isinstance(row.progress, cloud_progress.CloudProgress):
+        return row.progress.stage or ("testing" if row.progress.state == "running" else row.progress.state)
+    return "testing" if isinstance(row.counter, progress.ProgressCounter) else ""
+
+
+def cloud_row_progress(counter: progress.ProgressCounter | progress.NoCounter) -> StepProgressCount | NoProgress:
     if isinstance(counter, progress.NoCounter):
         return {"kind": "NoProgress", "reason": counter.reason}
-    return {"kind": "RowProgress", "phase": "testing", "done": counter.done,
+    return {"kind": "RowProgress", "done": counter.done,
             "total": counter.total, "percent": counter.percent, "unit": "modules"}
 
 
@@ -2271,9 +2282,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
                 "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
-                "activity": (cloud.progress.stage if isinstance(cloud.progress, cloud_progress.CloudProgress) and cloud.progress.stage
-                             else "testing" if isinstance(cloud.counter, progress.ProgressCounter)
-                             else information.state), "failed_modules": information.failed_modules,
+                "stage": cloud_stage(cloud),
+                "location": queue_view.cloud_location(cloud.progress)
+                    if isinstance(cloud.progress, cloud_progress.CloudProgress) else "",
+                "failed_modules": information.failed_modules,
                 "progress": cloud_row_progress(cloud.counter),
                 "stale": isinstance(information.update, queue_view.CloudUpdateLate)
                          and not isinstance(cloud.wait, wire.CloudSlotWait),

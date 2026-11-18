@@ -717,22 +717,24 @@ try {
             assert.match(await evaluate("document.querySelector('#top-costs').textContent"), /Updated cost action/);
             await show(base);
 
-            // A disagree reading hides the memory bar; the Running chart keeps the layout of the agree reading.
+            // The Running chart keeps its layout when the RAM readings disagree.
             const disagreeReading=structuredClone(readings.cloud_region);
             disagreeReading.ram.agreement='disagree';
             const detailLayouts={};
-            for(const [name,detail,reading] of [
-              ['cloud_stage','tools ready',readings.cloud_stage],
-              ['cloud_region','tests start · eu-south-2, zone a',readings.cloud_region],
-              ['cloud_region_disagree','tests start · eu-south-2, zone a',disagreeReading],
-              ['cloud_zone','eu-south-2, zone us-east-1b',readings.cloud_zone],
-              ['cloud_empty','',readings.cloud_empty]]) {
+            for(const [name,stage,location,reading] of [
+              ['cloud_stage','tools ready','',readings.cloud_stage],
+              ['cloud_region','tests start','eu-south-2, zone a',readings.cloud_region],
+              ['cloud_region_disagree','tests start','eu-south-2, zone a',disagreeReading],
+              ['cloud_zone','testing','eu-south-2, zone us-east-1b',readings.cloud_zone],
+              ['cloud_empty','testing','',readings.cloud_empty]]) {
               await show(reading);
               const detailProof=await evaluate(`(() => {
                 const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
                 const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
                 const amounts=chart.querySelector('.amounts');
-                return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
+                const fields=Object.fromEntries(tooltipRows(row.dataset.tip,latest).map(({label,value})=>[label,value]));
+                return {stage:row.querySelector('.place').textContent,fields,
+                  text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
                   ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
                   rootFont:getComputedStyle(document.documentElement).fontSize,
                   beside:document.querySelector('#walk').classList.contains('beside'),
@@ -745,8 +747,11 @@ try {
                   chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
-              const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
-              assert.equal(detailProof.text,expected,'The AWS detail text differs.');
+              assert.equal(detailProof.stage,stage,'The AWS Stage differs.');
+              assert.equal(detailProof.text,'1 failed module · no update for 2 min','The AWS detail text differs.');
+              assert.equal(detailProof.fields.Where,location || undefined,'The AWS tooltip location differs.');
+              const stageLabel=stage[0].toUpperCase()+stage.slice(1);
+              assert.equal(detailProof.fields[stageLabel],'7 of 12 modules','The AWS tooltip module count differs.');
               assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
               assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
               if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
@@ -790,6 +795,8 @@ try {
                 element.childElementCount===0 && element.textContent.includes('no update for'));
               return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
                 running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
+                stage:running?.querySelector('.place')?.textContent,
+                moduleCount:tooltipRows(running.dataset.tip,latest).find(row=>row.label==='Testing')?.value,
                 machine:running?.querySelector('.machine')?.textContent,
                 place:waiting?.querySelector('.place')?.textContent,
                 waitingMachine:waiting?.querySelector('.machine')?.textContent,
@@ -826,12 +833,12 @@ try {
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
             assert.ok(!/\brunning\b/.test(cloudProof.running),'The cloud row repeats the running state.');
-            for(const value of [modules,failed,'no update for '+cloudRow.late_age])
-              assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
+            assert.equal(cloudProof.stage,'testing');
+            assert.equal(cloudProof.amounts,`${failed} · no update for ${lateAge}`,'The AWS detail text differs.');
+            assert.equal(cloudProof.moduleCount,modules,'The AWS tooltip module count differs.');
             assert.ok(cloudProof.progressInTrack,'The cloud progress line is absent from the track.');
             assert.ok(Math.abs(cloudProof.progressWidth-cloudProof.progressTrackWidth*cloudRow.progress.percent/100)<1,
               'The cloud progress width differs from its percent.');
-            assert.ok(cloudProof.amounts.includes(modules),'The cloud module count is absent from the amounts.');
             assert.equal(cloudProof.trackText,'','The cloud track contains text.');
             assert.ok(!cloudProof.waitingBar,'The waiting cloud row has a progress line.');
             assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
