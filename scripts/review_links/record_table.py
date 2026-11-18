@@ -544,10 +544,13 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
    const linked=expanded && item.dataset.key===linkedItem && isLinkedOnly(item);
-   const matched=matches(item,active,counts),showRow=matched || linked,wasShown=!item.hidden;
+   const matched=matches(item,active,counts);
+   const keepExpanded=expanded && !matched && options.keepExpanded?.(item.dataset,active) &&
+    matches(item,{...active,show:'all'});
+   const showRow=matched || linked || keepExpanded,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(table,item,false);
    item.hidden=!showRow;if(matched) count++;
-   if(linked) linkedVisible=true;
+   if(linked || keepExpanded) linkedVisible=true;
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
    if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(table,item,true);
@@ -652,6 +655,7 @@ function jump(key,{pushPlace=true}={}){
  row.dataset.recordHighlight='';
  highlightedRow=row;
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
+ options.itemOpened?.(mountedTarget);
 }
 function setRowsExpanded(items,expanded){
  for(const item of items){
@@ -695,7 +699,9 @@ function bind(){
   const row=event.target.closest('.list-row');if(!row) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
   const item=row.parentElement;
-  setRowsExpanded([item],!opened.has(item.dataset.key));
+  const expanded=!opened.has(item.dataset.key);
+  setRowsExpanded([item],expanded);
+  if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
   type=button.dataset.typeChip;changePlace();

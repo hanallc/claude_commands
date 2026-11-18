@@ -914,14 +914,25 @@ Focus stays on the user's selection if they move it during the request, includin
 On refresh, the List restores focus to an available action button with the same item key and action.
 Column sort buttons keep focus through refresh.
 A direct or related-item link opens a waiting row with “The producer will answer” and no action buttons.
+The panel shows each open question with its asked time. The waiting row keeps its log after Ask saves.
 A related-item link keeps the current filters.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one log entry. It marks the item unread if the item is not Closed.
+The answer marks the item unread unless the item is Closed.
 After the last answer, the next refresh returns the row to the applicable views.
 A waiting item stays out of Parked. After the last answer, Parked shows the item if its parking time is still active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
 That request leaves the item hidden and shows its confirmation next to Show.
-The log shows each answered question with its answer.
+An unread answer appears in the panel with the question, both times, and an Unread mark.
+Mark read clears the signed update shown by the form.
+Opening an individual row with an unread answer uses the same signed read operation.
+The List waits until the tab and console frame are visible before it sends this request.
+The row must still be open and visible when the request starts.
+A newer update stays unread if it arrives before the read saves.
+In Unread, an item stays visible after this read until the user closes its row or changes the Show filter.
+After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
+The panel clears the question when the log shows it.
+The List uses its local date and time format for questions and answers.
+A newer unread update leaves previously read answers in the log.
 The command refuses an unknown ID, a second answer, and empty text.
 
 List and Images questions share one delivery record for each question and recipient.

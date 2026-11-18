@@ -11,10 +11,10 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, tzinfo
+from datetime import UTC, datetime, tzinfo
 from enum import Enum
 from pathlib import Path
-from typing import Literal, NamedTuple, TypedDict, cast
+from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
@@ -132,10 +132,18 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
     return html.escape(cast(str, value)) or "Not recorded"
 
 
-def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
-                   questions: Mapping[str, question_record.Question]) -> str:
+def log_source_html(source: str, names: staff_names.StaffNames) -> str:
+    return " <small>— " + names.html(source, owner_name(names.members, staff.StaffId(source))) + "</small>"
+
+
+def log_row(index: str, moment: datetime, body: str, today: datetime) -> str:
+    return (f'<li data-log-index="{index}"><time datetime="{moment.isoformat()}">'
+            + html.escape(local_time(moment, today)) + '</time><div>' + body + '</div></li>')
+
+
+def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames) -> str:
     content = change.what
-    by = " <small>— " + names.html(change.source, owner_name(names.members, staff.StaffId(change.source))) + "</small>"
+    by = log_source_html(change.source, names)
     if isinstance(content, the_list.FieldChange):
         heading = content.action + by
         fields = ''.join(f'<dt>{FIELD_LABELS[field]}</dt><dd>{field_html(field, value, today, names)}</dd>'
@@ -147,9 +155,6 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = label + by + change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
         body = "Answered question " + html.escape(content.question_id) + by
-        question = questions.get(content.question_id)
-        if question is not None and question.answer is not None:
-            body += page_question.answered_question_html(question)
     elif isinstance(content, the_list.MarkedRead):
         body = "Marked read" + by
     elif isinstance(content, the_list.Reopened):
@@ -164,8 +169,37 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = html.escape(content) + by
     else:
         return ""
-    return (f'<li data-log-index="{index}"><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
-            + '</time><div>' + body + '</div></li>')
+    return log_row(str(index), change.time, body, today)
+
+
+def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames,
+                  unread_answers: frozenset[str]) -> str:
+    answers = {question.question_id for question in item.questions if question.answer is not None}
+    sources: dict[str, str] = {}
+    rows: list[tuple[datetime, str]] = []
+    for index, change in enumerate(item.log):
+        content = change.what
+        if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
+            sources[content.question_id] = change.source
+        elif not the_list.is_page_request_receipt(change):
+            rows.append((change.time, log_entry_html(change, index, today, names)))
+    for question in item.questions:
+        answer = question.answer
+        identity = question.question_id
+        if answer is None or identity in unread_answers:
+            continue
+        asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
+        answered = datetime.fromisoformat(answer.answered_at).astimezone(UTC)
+        question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
+        answer_body = "Answer" + log_source_html(sources.get(identity, item.producer), names)
+        rows.append((asked, log_row(f"{identity}-asked", asked,
+                                   question_body + change_browser.question_paragraphs(question.words), today)))
+        rows.append((answered, log_row(f"{identity}-answered", answered,
+                                       answer_body + change_browser.question_paragraphs(answer.text), today)))
+    if not answers.difference(unread_answers):
+        return ''.join(markup for _, markup in reversed(rows))
+    # Use reverse record order for events with the same time.
+    return ''.join(markup for _, markup in sorted(reversed(rows), key=lambda row: row[0], reverse=True))
 
 
 def item_link(keeper: staff.StaffId, number: int) -> str:
@@ -202,10 +236,14 @@ def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
     return signed_token(secret, keeper, identity, prefix)
 
 
-def feedback_form(entry: ListRecord, secret: str, resends: tuple[the_list.QuestionResend, ...] = (),
-                  *, parking_label: str = "") -> str:
+def signed_item_request(entry: ListRecord, secret: str) -> tuple[str, str]:
     request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item)).format()
-    token = signed_token(secret, entry.keeper, entry.item.id, request)
+    return request, signed_token(secret, entry.keeper, entry.item.id, request)
+
+
+def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tuple[the_list.QuestionResend, ...],
+                  *, parking_label: str = "") -> str:
+    request, token = signed_item_request(entry, secret)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
     hidden = ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                      for name, value in fields.items())
@@ -214,7 +252,7 @@ def feedback_form(entry: ListRecord, secret: str, resends: tuple[the_list.Questi
     parked = '' if parking_label else ' hidden'
     unpark = ' hidden' if entry.item.state == the_list.ItemState.CLOSED else parked
     note = 'Parked until ' + parking_label if parking_label else ''
-    retry = "".join(question_resend(resend) for resend in resends)
+    retry = "".join(question_resend(resend, today) for resend in resends)
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
             + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button>'
@@ -229,14 +267,16 @@ def feedback_form(entry: ListRecord, secret: str, resends: tuple[the_list.Questi
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
 
-def question_resend(resend: the_list.QuestionResend) -> str:
+def question_resend(resend: the_list.QuestionResend, today: datetime) -> str:
     question = resend.question
     notice = {"failed": "did not reach morty", "ready": "is ready to send",
               "prepared": "is ready to send"}.get(resend.delivery.state, "may not have reached morty")
     block = resend.delivery
     action = (f'<p>{html.escape(block.reason)}</p>' if isinstance(block, change_page.ResendBlocked)
               else f'<button name="action" value="resend-{question.question_id}">Resend question {question.question_id}</button>')
-    return (f'<section class="page-question"><h3>Question {question.question_id} {notice}</h3>'
+    return (f'<section class="page-question" data-question="{question.question_id}">'
+            + f'<h3>Question {question.question_id} {notice}</h3>'
+            + question_time_html(question.asked_at, today)
             + f'<p>{html.escape(question.words)}</p>' + action + '</section>')
 
 
@@ -279,12 +319,56 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
 WAITING_NOTE = "The producer will answer."
 
 
+def question_time_html(stamp: str, today: datetime) -> str:
+    moment = datetime.fromisoformat(stamp)
+    return f'<time datetime="{moment.isoformat()}">{html.escape(local_time(moment, today))}</time>'
+
+
+def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[str],
+                    resends: tuple[the_list.QuestionResend, ...] = ()) -> str:
+    retry = {resend.question.question_id for resend in resends}
+    sections: list[str] = []
+    for question in item.questions:
+        answer = question.answer
+        if answer is None and question.question_id not in retry:
+            sections.append(page_question.open_question_html(
+                question, asked_time_html=question_time_html(question.asked_at, today)))
+        elif answer is not None and question.question_id in unread_answers:
+            sections.append(page_question.answered_question_html(question, answer,
+                asked_time_html=question_time_html(question.asked_at, today),
+                answer_time_html=question_time_html(answer.answered_at, today),
+                answer_mark_html=' <span class="question-unread">Unread</span>'))
+    return ''.join(sections)
+
+
+def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
+                 unread_answers: frozenset[str], secret: str) -> str:
+    log = item_log_html(entry.item, today, names, unread_answers)
+    log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
+    read = ''
+    keeper = names.members.by_id(entry.keeper)
+    if unread_answers and keeper is not None and keeper.kind == "producer" and keeper.name == "morty":
+        request, token = signed_item_request(entry, secret)
+        read = f' data-open-read-request="{request}" data-open-read-token="{token}"'
+    return (f'<div class="list-panel"{read}><div>' + sections
+            + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
+            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
+            + '<ol class="list-log">' + log + '</ol></div></section></div>')
+
+
+def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
+                    unread_answers: frozenset[str], secret: str) -> str:
+    sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
+                + panel_questions(entry.item, today, unread_answers) + '</div>')
+    return detail_panel(entry, sections, today, names, unread_answers, secret)
+
+
 def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionResends,
-            *, parking_label: str) -> str:
+            unread_answers: frozenset[str], *, parking_label: str) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
-        return f'<p data-waiting-note>{WAITING_NOTE}</p>'
+        return waiting_details(entry, today, names, unread_answers, secret)
     sections = ''.join(f'<section><h3>{FIELD_LABELS[field]}</h3>{field_html(field, value, today, names)}</section>'
                        for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
@@ -299,16 +383,10 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     if item.reviews:
         cards = (review_card(identity, reviews) for identity in item.reviews)
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
-    questions = {question.question_id: question for question in item.questions}
-    # The log appends entries in storage order. Each index stays stable when new entries arrive.
-    log = ''.join(reversed([log_entry_html(change, index, today, names, questions) for index, change in enumerate(item.log)
-                            if not the_list.is_page_request_receipt(change)]))
-    log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
-    return (f'<p data-waiting-note hidden>{WAITING_NOTE}</p><div class="list-panel"><div>' + sections
-            + feedback_form(entry, secret, visibility.questions, parking_label=parking_label)
-            + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
-            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
-            + '<ol class="list-log">' + log + '</ol></div></section></div>')
+    questions = panel_questions(item, today, unread_answers, visibility.questions)
+    form = feedback_form(entry, secret, today, visibility.questions, parking_label=parking_label)
+    return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
+        entry, sections + questions + form, today, names, unread_answers, secret)
 
 
 def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str,
@@ -319,6 +397,7 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
     owner = owner_name(members, item.owner)
     producer = owner_name(members, item.producer)
     unread = isinstance(item.unread_since, datetime)
+    unread_answers = the_list.unread_answer_ids(item)
     parked = isinstance(item.parked_until, datetime) and item.parked_until > today
     visibility = the_list.question_visibility(entry.keeper, item, status)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
@@ -372,7 +451,7 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
     hidden = ' hidden' if waiting or parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
-            + details(entry, today, secret, reviews, names, visibility, parking_label=parking_label)
+            + details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label)
             + '</td></tr></tbody>')
 
 
@@ -419,6 +498,7 @@ class SavedActionState(TypedDict):
     parked: str
     parked_until: str
     waiting_for_answer: str
+    waiting_details_html: NotRequired[str]
 
 
 def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None) -> SavedActionState:
@@ -431,11 +511,17 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     unread = item.unread_since
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     waiting = isinstance(the_list.question_visibility(owner, item, reading), the_list.WaitingForAnswer)
-    return {"unread": str(isinstance(unread, datetime)).lower(),
-            "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
-            "item_state": item.state.value,
-            "parked": str(bool(parked_until)).lower(), "parked_until": parked_until,
-            "waiting_for_answer": str(waiting).lower()}
+    saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
+                               "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
+                               "item_state": item.state.value,
+                               "parked": str(bool(parked_until)).lower(), "parked_until": parked_until,
+                               "waiting_for_answer": str(waiting).lower()}
+    if waiting:
+        names = staff_names.StaffNames(staff.snapshot())
+        secret = change_browser.browser_manifest(change_page.console_folder(reading.root))[0]
+        saved["waiting_details_html"] = waiting_details(
+            ListRecord(owner, item), today.astimezone(zone), names, the_list.unread_answer_ids(item), secret)
+    return saved
 
 
 def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
@@ -464,7 +550,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         raise question_record.AnswerRefused("the item has no morty producer")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
     if action == "read":
-        _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE,
+        _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                page_request=the_list.PageRequest(request, "read", words))
         return change_page.NoMessageDelivery()
     item = the_list.load(morty.id, identity)
@@ -700,6 +786,10 @@ STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
 .list-log dd>:last-child{margin-bottom:0}
 .list-log dl li{display:list-item;padding:0;border:0}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
+.page-question time{color:var(--ink-3);font-size:13px}
+.page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
+.list-panel:has([data-waiting-note]){min-height:12rem}
+.list-panel [data-waiting-note]{margin-top:16px}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 @media(max-width:960px){
@@ -775,11 +865,58 @@ function syncUnread(item,form,unread,unreadSort){
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
  }
 }
+const pendingOpenReads=new Set(),deferredOpenReads=new Set(),keepOpenAfterRead=new Set();
+function listIsHidden(){
+ return document.visibilityState!=='visible' || window.frameElement?.hidden===true;
+}
+function resumeOpenedAnswerReads(){
+ if(listIsHidden() || !deferredOpenReads.size) return;
+ for(const item of content.querySelectorAll('[data-list-item]:not([hidden])')){
+  if(deferredOpenReads.delete(item.dataset.key)) void markOpenedAnswerRead(item);
+ }
+ deferredOpenReads.clear();
+}
+async function markOpenedAnswerRead(item){
+ const key=item.dataset.key;
+ if(item.hidden || !tableView.opened.has(key)) return;
+ const panel=item.querySelector('[data-detail]:not([hidden]) .list-panel');
+ const request=panel?.dataset.openReadRequest;
+ if(!request || pendingOpenReads.has(key)) return;
+ if(listIsHidden()){deferredOpenReads.add(key);return;}
+ const token=panel.dataset.openReadToken;
+ const [keeper,id]=key.split('/');
+ const body=new URLSearchParams({keeper,id,request,token,action:'read',words:'',until:''});
+ const submission=tableView.startAction(item);
+ pendingOpenReads.add(key);saving++;pageRefresh.abandon();
+ let saved=false;
+ try{
+  const response=await fetch(location.pathname,{method:'POST',body});
+  const result=await response.json();
+  if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+  saved=true;
+  if(result.unread==='false'){
+   delete panel.dataset.openReadRequest;
+   if(tableView.opened.has(key)) keepOpenAfterRead.add(key);
+  }
+ }catch(error){
+  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
+   {kind:'failure',message:'Read not confirmed: '+error.message});
+ }finally{
+  pendingOpenReads.delete(key);saving--;
+  if(saved) void pageRefresh.refresh(true);
+ }
+}
 const tableView=createRecordTable({content:()=>content,
  shows:['open','needs-me','unread','done','parked','closed','all'],
  filters:['state','producer'],
  beforeApply:rememberLogPositions,
- applied:restoreLogPositions,
+ applied:(_items,selection)=>{
+  for(const key of deferredOpenReads) if(!tableView.opened.has(key)) deferredOpenReads.delete(key);
+  for(const key of keepOpenAfterRead) if(selection.show!=='unread' || !tableView.opened.has(key)) keepOpenAfterRead.delete(key);
+  restoreLogPositions();
+ },
+ itemOpened:markOpenedAnswerRead,
+ keepExpanded:(data,selection)=>selection.show==='unread' && keepOpenAfterRead.has(data.key),
  linkedOnly:data=>data.waitingForAnswer==='true',
  missingItem:key=>{
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
@@ -907,7 +1044,8 @@ function bindListControls(){
     const closed=confirmed.state==='Closed',unread=!closed && result.unread==='true';
     const unparked=action==='unpark' && result.unpark_outcome==='cleared';
     const message=action==='remove' ? 'Removed' : action==='park' ? 'Parked' :
-     action==='unpark' ? (unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable') : action==='read' ? 'Marked read' :
+     action==='unpark' ? (unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable') :
+     action==='read' ? (unread ? 'Update remains unread' : 'Marked read') :
      asksQuestion ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     if(usesWords && words.value===data.get('words')) words.value='';
@@ -944,8 +1082,13 @@ function bindListControls(){
      tableView.applyAction();
     }
     if(waiting){
-     item.querySelector('.list-panel')?.remove();
-     item.querySelector('[data-waiting-note]').hidden=false;
+     const detail=item.querySelector('[data-detail] td');
+     if(typeof result.waiting_details_html==='string') detail.innerHTML=result.waiting_details_html;
+     else{
+      const note=detail.querySelector('[data-waiting-note]');
+      note.hidden=false;
+      detail.querySelector('.list-panel > div').replaceChildren(note);
+     }
     }
    }catch(error){
     const wasHidden=item.hidden;
@@ -1122,4 +1265,12 @@ addEventListener('pageshow',event=>{
 addEventListener('popstate',tableView.restorePlace);
 addEventListener('hashchange',tableView.restorePlace);
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+document.addEventListener('visibilitychange',resumeOpenedAnswerReads);
+window.addEventListener('message',event=>{
+ if(event.source===parent && event.origin===location.origin && event.data==='console-shown') resumeOpenedAnswerReads();
+});
+if(tableView.linkedItem && !listReturn){
+ const row=[...content.querySelectorAll('[data-list-item]:not([hidden])')].find(item=>item.dataset.key===tableView.linkedItem);
+ if(row) void markOpenedAnswerRead(row);
+}
 })();'''

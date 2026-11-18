@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from xml.etree import ElementTree
@@ -34,7 +34,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, serve, staff_names
-from scripts.review_links import change_browser, change_page, question_record
+from scripts.review_links import change_browser, change_page, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
@@ -1350,7 +1350,7 @@ document.body.append(result);
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", NOW, ())
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -1539,7 +1539,7 @@ document.body.append(result);
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
         folder = change_page.console_folder(self.root / "reviews")
         secret = change_browser.browser_manifest(folder)[0]
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret, NOW, ())
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
 
@@ -1630,8 +1630,9 @@ document.body.append(result);
             _ = list_page.submit(root, urlencode({**park, "action": "read"}))
         self.assertEqual(the_list.load(MORTY.id, item.id), parked)
 
-        read = {**park, "action": "read", "request": park["request"] + "." + uuid4().hex}
+        read = self.fields(parked, "read")
         _ = list_page.submit(root, urlencode(read))
+        self.assertIs(the_list.load(MORTY.id, item.id).unread_since, the_list.NoTimestamp.UNSET)
         newer = the_list.update(MORTY.id, item.id, {"latest_status": "Keep this newer update unread."}, source="morty")
         _ = list_page.submit(root, urlencode(read))
         self.assertEqual(the_list.load(MORTY.id, item.id), newer)
@@ -2429,28 +2430,94 @@ observer.observe(original.parentNode,{childList:true});
         status = change_page.DeliveryStatus(root)
         item = self.add("Inspect the List", number=106)
         fields = self.fields(item, "question", words="What changed in <List>?")
-        delivery = list_page.submit(root, urlencode(fields), status)
-        opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
-        self.assertIn('data-waiting-for-answer="true"', opened)
-        self.assertIn('<p data-waiting-note>The producer will answer.</p>', opened)
-        self.assertNotIn('value="question"', opened)
-        self.assertNotIn('aria-label="Unread update"', opened)
-        with patch.object(change_page, "send_question", return_value=question_outcome()):
-            list_page.deliver(delivery)
-        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
+        asked_at = NOW - timedelta(days=1)
+        answered_at = NOW - timedelta(minutes=25)
+        asked_time = f'<time datetime="{asked_at.isoformat()}">2026-11-15 13:00 EST</time>'
+        answer_time = f'<time datetime="{answered_at.isoformat()}">12:35 EST</time>'
+        question_clock = Mock(wraps=datetime)
+        question_clock.configure_mock(**{"now.side_effect": (asked_at, answered_at)})
+        with patch.object(page_question, "datetime", question_clock):
+            delivery = list_page.submit(root, urlencode(fields), status)
+            opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
+            self.assertIn('data-waiting-for-answer="true"', opened)
+            self.assertIn('<p data-waiting-note>The producer will answer.</p>', opened)
+            self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
+            self.assertIn("What changed in &lt;List&gt;?", opened)
+            self.assertNotIn('value="question"', opened)
+            self.assertNotIn('aria-label="Unread update"', opened)
+            with patch.object(change_page, "send_question", return_value=question_outcome()):
+                list_page.deliver(delivery)
+            with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
+                  patch.object(the_list, "now", return_value=answered_at), redirect_stdout(io.StringIO())):
+                self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
         _ = list_page.submit(root, urlencode(fields))
         answered = list_page.render(root).decode().split('<script>', 1)[0]
         self.assertIn('data-waiting-for-answer="false"', answered)
         self.assertIn('value="question"', answered)
         self.assertIn('aria-label="Unread update"', answered)
         self.assertIn('value="read">Mark read</button>', answered)
-        log = answered.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
-        self.assertIn("Answered question Q1 <small>", log)
+        panel, log = answered.split('<ol class="list-log">', 1)
         self.assertIn("Marked read <small>", log)
-        self.assertIn("What changed in &lt;List&gt;?", log)
-        self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", log)
+        self.assertNotIn("Answered question Q1 <small>", log)
+        self.assertNotIn('What changed in &lt;List&gt;?', log)
+        self.assertNotIn('The &lt;filter&gt; changed.', log)
+        self.assertIn('Question Q1</h3>' + asked_time + '<p>What changed in &lt;List&gt;?</p>', panel)
+        self.assertIn('<h3>Answer <span class="question-unread">Unread</span></h3>'
+                      + answer_time + '<p>The &lt;filter&gt; changed.</p>', panel)
+
+        current = the_list.load(MORTY.id, item.id)
+        _ = list_page.submit(root, urlencode(self.fields(current, "read")))
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer update arrived."}, source="morty")
+        read = list_page.render(root).decode().split('<script>', 1)[0]
+        self.assertIn('aria-label="Unread update"', read)
+        panel, log = read.split('<ol class="list-log">', 1)
+        self.assertNotIn('data-question="Q1"', panel)
+        self.assertNotIn('class="question-unread"', panel)
+        log = re.sub(r'<span class="staff-name"[^>]*>(.*?)</span>', r'\1', log)
+        question_row = '<li data-log-index="Q1-asked">' + asked_time + '<div>Question Q1 <small>— nate</small>'
+        answer_row = '<li data-log-index="Q1-answered">' + answer_time + '<div>Answer <small>— morty</small>'
+        self.assertIn(question_row + '<p>What changed in &lt;List&gt;?</p></div></li>', log)
+        self.assertIn(answer_row + '<p>The &lt;filter&gt; changed.</p></div></li>', log)
+        self.assertLess(log.index(answer_row), log.index(question_row))
+
+    def test_stale_mark_read_keeps_the_newer_answer_in_the_panel(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Read the answer shown by the form")
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        already_read = self.fields(the_list.load(MORTY.id, item.id), "read")
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
+            first = self.fields(the_list.load(MORTY.id, item.id), "question", words="Which check passed?")
+            list_page.deliver(list_page.submit(root, urlencode(first), status))
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The first check passed."]), 0)
+            current = the_list.load(MORTY.id, item.id)
+            stale = self.fields(current, "read")
+            second = self.fields(item, "question", words="Did the next check pass?")
+            list_page.deliver(list_page.submit(root, urlencode(second), status))
+            waiting = list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", "")
+            self.assertIn('data-question="Q1"', waiting)
+            credential = re.search(r'data-open-read-request="([^"]+)" data-open-read-token="([^"]+)"', waiting)
+            assert credential is not None
+            request, token = credential.groups()
+            _ = list_page.submit(root, urlencode({**stale, "request": request, "token": token}), status)
+            self.assertIn('data-log-index="Q1-answered"',
+                          list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", ""))
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q2", "--text", "The next check passed."]), 0)
+
+        current = the_list.load(MORTY.id, item.id)
+        for fields in (stale, already_read):
+            with self.subTest(request=fields["request"]):
+                _ = list_page.submit(root, urlencode(fields), status)
+                saved = the_list.load(MORTY.id, item.id)
+                self.assertEqual(the_list.unread_update(saved), the_list.unread_update(current))
+                markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
+                panel, log = markup.split('<ol class="list-log">', 1)
+                self.assertIn('data-question="Q2"', panel)
+                self.assertIn('class="question-unread">Unread</span>', panel)
+                self.assertIn('The next check passed.', panel)
+                self.assertIn('data-log-index="Q1-answered"', log)
+                self.assertNotIn('data-log-index="Q2-answered"', log)
 
     def test_answer_returns_a_parked_item_with_its_current_parking(self) -> None:
         root = self.root / "reviews"
@@ -3400,13 +3467,74 @@ observer.observe(original.parentNode,{childList:true});
  check(parent.document.activeElement===nav,'The response preserves the console focus');
 """, add_item=False, reduced_motion=True, in_frame=True)
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_direct_answer_link_waits_for_visibility(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Read the answer after opening the tab")
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
+            fields = self.fields(item, "question", words="Which check passed?")
+            list_page.deliver(list_page.submit(root, urlencode(fields)))
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."]), 0)
+        markup = list_page.render(root, include_counts=False).decode()
+        markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
+        fragment = urlencode({"show": "unread", "item": f"{MORTY.id}/{item.id}"})
+        setup = """<script>
+let visibility='hidden';
+Object.defineProperty(document,'visibilityState',{get:()=>visibility});
+window.frameElement.hidden=true;
+history.replaceState(null,'','#FRAGMENT');
+const reads=[];
+window.fetch=async(_url,options)=>{
+ if(options?.method!=='POST') return new Response('',{status:503});
+ reads.push(new URLSearchParams(options.body));
+ return new Response(JSON.stringify({unread:'true'}));
+};
+</script>""".replace('FRAGMENT', fragment)
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
+ const panel=detail.querySelector('.list-panel');
+ const unread=()=>row.dataset.unread==='true' && panel.querySelector('.question-unread');
+ const showTab=()=>{visibility='visible';document.dispatchEvent(new Event('visibilitychange'));};
+ const showFrame=()=>{
+  window.frameElement.hidden=false;
+  window.dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ };
+ try{
+  check(!row.hidden && !detail.hidden,'The direct link opens the unread row');
+  check(!reads.length && unread(),'A hidden tab keeps the answer unread');
+  if(CLOSE_ROW){
+   row.querySelector('.list-toggle').click();
+   document.getElementById('list-expand-all').click();
+  }
+  REVEAL_FIRST();
+  check(!reads.length && unread(),'The answer stays unread while the tab or frame is hidden');
+  REVEAL_SECOND();
+  if(CLOSE_ROW) check(!reads.length && unread(),'Closing the row cancels its deferred read');
+  else check(reads.length===1 && reads[0].get('action')==='read' &&
+   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
+   'The visible row sends its signed read once');
+ }catch(error){failures.push(String(error));}
+ const result=parent.document.createElement('p');result.id='probe-results';
+ result.textContent=JSON.stringify(failures);parent.document.body.append(result);
+})();
+</script>"""
+        for first, second, close_row in (('showTab', 'showFrame', False), ('showFrame', 'showTab', False),
+                                         ('showTab', 'showFrame', True)):
+            with self.subTest(first=first, close_row=close_row):
+                case = (probe.replace('REVEAL_FIRST', first).replace('REVEAL_SECOND', second)
+                        .replace('CLOSE_ROW', str(close_row).lower()))
+                self.browser_actions(markup, setup, case, in_frame=True)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
         item = self.add("Check the current result")
         root = self.root / "reviews"
         results: list[list[str]] = []
         complete = threading.Event()
-        probe = b"""<!doctype html><iframe></iframe><img hidden src="/complete"><script>
+        probe = """<!doctype html><meta charset="utf-8"><iframe></iframe><img hidden src="/complete"><script>
 const frame=document.querySelector('iframe'), errors=[];
 const check=(ok,message)=>{if(!ok) errors.push(message);};
 const open=(show,key='')=>new Promise(resolve=>{
@@ -3415,7 +3543,7 @@ const open=(show,key='')=>new Promise(resolve=>{
 });
 const row=()=>frame.contentDocument.querySelector('[data-list-item]');
 const hasDot=()=>Boolean(row().querySelector('.list-dot'));
-const ask=async words=>{
+const act=async (action,words='')=>{
  const win=frame.contentWindow, current=row();
  const form=current.querySelector('form'), input=form.elements.words;
  const fetch=win.fetch.bind(win);
@@ -3428,10 +3556,13 @@ const ask=async words=>{
   ? (post=fetch(url,options))
   : Promise.resolve(new win.Response('',{status:503}));
  try{
-  current.querySelector('.list-toggle').click();
+  if(current.querySelector('[data-detail]').hidden){
+   if(action==='read') frame.contentDocument.getElementById('list-expand-all').click();
+   else current.querySelector('.list-toggle').click();
+  }
   input.value=words;input.dispatchEvent(new win.Event('input'));
-  form.querySelector('[value="question"]').click();
-  if(!post || !(await post).ok) throw new Error('The question POST must succeed.');
+  form.querySelector('[value="'+action+'"]').click();
+  if(!post || !(await post).ok) throw new Error('The List POST must succeed.');
   await settled;
   return form.querySelector('[data-send-status]').textContent;
  }finally{observer.disconnect();win.fetch=fetch;}
@@ -3443,8 +3574,10 @@ const change=async path=>{
  try{
   await open('unread');
   check(!row().hidden && hasDot(),'the item starts in Unread');
-  check(await ask('Which check passed?')==='Question saved','the first question saves');
+  check(await act('question','Which check passed?')==='Question saved','the first question saves');
   check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
+  check(row().querySelector('[data-waiting-questions] time[datetime]'),
+   'the save response supplies the asked time for the waiting row');
   const key=row().dataset.key;
   await open('open');
   check(row().hidden,'a saved question stays out of Open after a page load');
@@ -3452,19 +3585,66 @@ const change=async path=>{
   check(!row().hidden && !row().querySelector('[data-detail]').hidden &&
    row().querySelector('[data-waiting-note]')?.textContent==='The producer will answer.' &&
    !row().querySelector('[value="question"]'),'a direct link shows the waiting line without Ask');
+  const waitingQuestion=row().querySelector('[data-waiting-questions] [data-question="Q1"]');
+  check(/(?:EST|EDT)$/.test(waitingQuestion?.querySelector('time[datetime]')?.textContent),
+   'the waiting question shows the asked time in the user zone');
   await change('/answer');
   await open('unread');
-  check(!row().hidden && hasDot() && row().querySelector('.list-log').textContent.includes('Which check passed?') &&
-   row().querySelector('.list-log').textContent.includes('The gate passed.'),
-   'the answer returns the item to Unread with the question and answer in the log');
+  const unreadQuestion=row().querySelector('.list-panel [data-question="Q1"]');
+  check(!row().hidden && hasDot() && unreadQuestion?.textContent.includes('Which check passed?') &&
+   unreadQuestion.textContent.includes('The gate passed.'),
+   'the answer returns the item to Unread with the question and answer in the panel');
+  check(unreadQuestion?.querySelectorAll('time[datetime]').length===2 &&
+   unreadQuestion.querySelector('.question-unread')?.textContent==='Unread',
+   'the unread answer shows both times and the Unread mark');
+  check(!row().querySelector('.list-log').textContent.includes('The gate passed.'),
+   'the log has no unread answer');
+  check(await act('read')==='Marked read','Mark read saves the existing read action');
+  await open('open',key);
+  const log=row().querySelector('.list-log');
+  check(!hasDot() && !row().querySelector('[data-question="Q1"]'),
+   'the read question leaves the panel');
+  check(log.querySelector('[data-log-index="Q1-answered"]').textContent.includes('Answer — morty') &&
+   log.querySelector('[data-log-index="Q1-asked"]').textContent.includes('Question Q1 — nate'),
+   'the log shows both parts of the read question with their authors');
+  await change('/update');
+  await open('unread');
   await change('/newer');
-  check(await ask('Which check is next?')==='Question saved; update remains unread',
+  check(await act('question','Which check is next?')==='Question saved; update remains unread',
    'the notice says the newer update remains unread');
   check(hasDot() && row().hidden,'the newer update stays unread while the question hides the row');
+  const nextQuestion=(current)=>current.querySelector('[data-waiting-questions] [data-question="Q2"]');
+  const firstAnswer=(current)=>current.querySelector('[data-log-index="Q1-answered"]');
+  check(nextQuestion(row()) && firstAnswer(row())?.textContent.includes('The gate passed.'),
+   'the Ask response keeps the first answer in the log beside the new waiting question');
+  await open('all',key);
+  check(!row().querySelector('[data-detail]').hidden && nextQuestion(row()) && firstAnswer(row()),
+   'a direct link shows both the waiting question and the first answer in the log');
+  await change('/second-answer');
+  await open('unread');
+  const original=row(), doc=frame.contentDocument;
+  check(hasDot() && original.querySelector('[data-question="Q2"] .question-unread'),
+   'the second answer stays unread before the row opens');
+  const refreshed=new Promise(resolve=>{
+   const observer=new frame.contentWindow.MutationObserver(()=>{
+    if(row()!==original && row().querySelector('[data-log-index="Q2-answered"]')){
+     observer.disconnect();resolve();
+    }
+   });
+   observer.observe(doc.body,{childList:true,subtree:true});
+  });
+  original.querySelector('.list-toggle').click();
+  await refreshed;
+  check(!hasDot() && !row().hidden && !row().querySelector('[data-detail]').hidden,
+   'opening the row marks the answer read and keeps the row open in Unread');
+  check(row().querySelector('[data-log-index="Q2-answered"]').textContent.includes('The next check passed.'),
+   'opening the row moves the answer to the log');
+  row().querySelector('.list-toggle').click();
+  check(row().hidden,'closing the read row removes it from Unread');
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
-</script>""".replace(b'LIST_PATH', list_page.PAGE_PATH.encode())
+</script>""".replace('LIST_PATH', list_page.PAGE_PATH).encode()
 
         class Probe(serve.ReviewLinksHandler):
             @override
@@ -3480,11 +3660,13 @@ const change=async path=>{
 
             @override
             def do_POST(self) -> None:
-                if self.path == '/newer':
-                    _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                if self.path in ('/update', '/newer'):
+                    _ = the_list.update(MORTY.id, item.id, {"latest_status": f"New result from {self.path}."}, source="morty")
                     self.json_response(200, {})
-                elif self.path == '/answer':
-                    result = the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."])
+                elif self.path in ('/answer', '/second-answer'):
+                    question_id, words = (("Q1", "The gate passed.") if self.path == '/answer'
+                                          else ("Q2", "The next check passed."))
+                    result = the_list.main(["answer", item.id, "--question", question_id, "--text", words])
                     self.json_response(200 if result == 0 else 500, {})
                 elif self.path == '/results':
                     results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
@@ -3494,6 +3676,7 @@ const change=async path=>{
                     super().do_POST()
 
         with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session),
@@ -3798,7 +3981,8 @@ window.fetch=async(_path,options={})=>{
  result.textContent=before && after && notice==='NOTICE' ? 'PASS' : 'FAIL';document.body.append(result);
 })();
 </script>'''
-        for action, unread, notice in (("read", "false", "Marked read"), ("tell", "false", "sent to morty"),
+        for action, unread, notice in (("read", "false", "Marked read"), ("read", "true", "Update remains unread"),
+                                      ("tell", "false", "sent to morty"),
                                       ("tell", "true", "sent to morty; update remains unread")):
             with self.subTest(action=action, unread=unread):
                 page = self.root / f"{action}-{unread}.html"

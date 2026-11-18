@@ -1189,11 +1189,26 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
 
 
+def unread_answer_ids(item: ListItem) -> frozenset[str]:
+    """Find answers since the last action that cleared the item's unread state."""
+    if not isinstance(item.unread_since, datetime):
+        return frozenset()
+    unread: set[str] = set()
+    for change in reversed(item.log):
+        content = change.what
+        if (isinstance(content, (MarkedRead, Reopened)) or content in ("Marked read", "Reopened")
+                or isinstance(content, FieldChange) and content.action == "Closed"):
+            break
+        if isinstance(content, QuestionAnswered):
+            unread.add(content.question_id)
+    return frozenset(unread)
+
+
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
-              update: UnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
+              update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
               page_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
     def edit(item: ListItem, _: datetime) -> ListItem:
-        if isinstance(update, UnreadUpdate) and unread_update(item) != update:
+        if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
         return replace(item, unread_since=NoTimestamp.UNSET)
     return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
