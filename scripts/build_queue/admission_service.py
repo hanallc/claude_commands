@@ -1049,7 +1049,7 @@ class WaitingRepositorySlot:
     """The loop owns this connection until capacity or the deadline ends its wait."""
     request: wire.RepositorySlotRequest
     connection: Connection | NoConnection
-    reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired | NoWaitReply = NoWaitReply()
+    reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired | wire.Refused | NoWaitReply = NoWaitReply()
     last_sent: float = float("-inf")
 
 
@@ -2161,12 +2161,19 @@ class AdmissionServer:
         locks = Path("/proc/locks").read_text()
         now = self.clock.now()
         for (repository, machine, root), waiting_pool in pools.items():
-            pool = slot_wait.read_pool(repository, machine, Path(root), locks)
-            available = len(pool.held) < pool.maximum
+            pool: wire.RepositorySlotWaiting | wire.Refused
+            with conf.report_key_changes():
+                try:
+                    pool = slot_wait.read_pool(repository, machine, Path(root), locks)
+                except conf.Unusable as error:
+                    pool = wire.Refused(str(error))
+            available = isinstance(pool, wire.RepositorySlotWaiting) and len(pool.held) < pool.maximum
             for waiting in sorted(waiting_pool, key=lambda item: (item.request.since, item.request.owner.pid)):
                 request = waiting.request
-                reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired
-                if now >= request.deadline:
+                reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired | wire.Refused
+                if isinstance(pool, wire.Refused):
+                    reply = pool
+                elif now >= request.deadline:
                     reply = wire.RepositorySlotExpired(pool.expired_text)
                 elif available:
                     reply = wire.RepositorySlotReady()

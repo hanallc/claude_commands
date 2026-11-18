@@ -1511,6 +1511,30 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         self.assertEqual(cycle["entries"], [])
         self.assertFalse((self.root / "registration").exists())
 
+    def test_missing_ssh_settings_do_not_block_local_hold_or_exact_release(self) -> None:
+        config = self.write_config(
+            "targets=missing,natedev,mac\nkind.missing=ssh\nplatform.missing=linux\n"
+            + "settings.missing=missing.conf\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+            self.begin_hold()
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10, errors.getvalue())
+            with mock.patch.object(build_targets, "wait_sleep", side_effect=self.release_hold):
+                code, output, errors = self.wait()
+            self.assertEqual(code, 0, output + errors)
+            self.assertEqual(self.sleeps, 1)
+            self.assertFalse((self.holders / "hana").exists())
+
+            self.write_claim("claims/hana.json")
+            self.write_claim("claims/other.json")
+            paths = claim_state.state_paths("mac")
+            exact = claim_state.ClaimIdentity("claim-claims/hana.json", "episode-claims/hana.json", "attempt-1")
+            with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")):
+                self.assertEqual(build_targets.command_release_wait(12345, identity=exact, session=NoOwningSession()), 0)
+            retained, = claim_state.read_claims(paths)
+            self.assertEqual(retained.path, paths.claims / "other.json")
+
     def test_register_local_free_and_unreadable_states_do_not_create_registration(self) -> None:
         self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
         self.assertFalse((self.root / "registration").exists())

@@ -26,11 +26,25 @@ def slot_root(values: Mapping[str, str], machine: str) -> str:
     return values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
 
 
-def configured_slot_root() -> Path:
+def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
+    """Read the repository limit or the machine's default limit."""
+    key = f"slots.{machine}.{repository}.max"
+    return settings.whole(key if settings.has_key(key) else f"slots.{machine}.default_max")
+
+
+def configured_slot_root(
+    settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+) -> Path:
     """Read the machine's slot root without creating a folder."""
-    settings = conf.read_or_repository("build_folders")
+    if isinstance(settings, conf.UseConfiguredValue):
+        settings = conf.read_or_repository("build_folders")
     machine = host_name()
-    root = slot_root(settings.values(), machine)
+    key = f"roots.slots.{machine}"
+    if not settings.has_key(key):
+        key = "roots.slots"
+        if not settings.has_key(key):
+            raise SlotsNotConfigured(machine)
+    root = settings.value(key, str, allow_blank=True)
     if not root:
         raise SlotsNotConfigured(machine)
     return Path(os.path.expandvars(root)).expanduser().resolve()

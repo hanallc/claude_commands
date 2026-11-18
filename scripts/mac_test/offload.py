@@ -431,8 +431,9 @@ def pending_start_key(identity: claim_state.ClaimIdentity) -> str:
     return hashlib.sha256(json.dumps([identity.claim_id, identity.episode, identity.attempt]).encode()).hexdigest()
 
 
-def pending_start_path(target: str, identity: claim_state.ClaimIdentity) -> Path:
-    return claim_state.state_paths(target).directory / "pending-starts" / pending_start_key(identity)
+def pending_start_path(target: str | claim_state.StatePaths, identity: claim_state.ClaimIdentity) -> Path:
+    paths = claim_state.state_paths(target) if isinstance(target, str) else target
+    return paths.directory / "pending-starts" / pending_start_key(identity)
 
 
 def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> Path:
@@ -1322,12 +1323,7 @@ def linux_mirror_root() -> Path:
 
 def mac_mirror_root() -> MacMirrorRoot:
     """Read the remote mirror root without expanding the local home folder."""
-    def mirror_root(value: str) -> MacMirrorRoot:
-        if not value.startswith("~/"):
-            raise ValueError("mirror_root must start with ~/")
-        return MacMirrorRoot(value[2:])
-
-    return conf.read("mac_test").value("mirror_root", mirror_root)
+    return MacMirrorRoot.read(conf.read("mac_test"))
 
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:

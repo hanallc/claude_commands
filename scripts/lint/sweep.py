@@ -195,6 +195,7 @@ from scripts.lib.cargo_target_config import (
     cargo_home_folder,
 )
 from scripts.lib.process_failure import failure_detail
+from scripts.lib.slot_root import SlotsNotConfigured, configured_slot_root
 from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
@@ -1270,12 +1271,10 @@ class SlotBuildOutput:
 def output_slot_leases(path: str) -> tuple[SlotBuildOutput, ...]:
     """Locate slot leases for direct output and recorded external output."""
     settings = conf.read_or_repository("build_folders")
-    values = settings.values()
-    machine = store.host_name()
-    slot_value = values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
-    if not slot_value:
+    try:
+        slots = configured_slot_root(settings)
+    except SlotsNotConfigured:
         return ()
-    slots = Path(os.path.expandvars(slot_value)).expanduser().resolve()
     cargo = Path(os.path.expandvars(settings.text("roots.slot_cargo"))).expanduser().resolve()
     resolved = Path(path).resolve()
     sources = (resolved, *(mapping.workspace_root.resolve() for mapping in OUTPUT_ROOTS.get().mappings_for(resolved)))
@@ -4104,19 +4103,35 @@ class FloorOutcome:
 def mac_floor_settings(
     settings: conf.ConfigRead, *, mirror_root: MacMirrorRoot | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> tuple[int, tuple[str, ...]]:
-    """Refuse a missing live floor or a floor below the admission minimum."""
+    """Read a floor that meets the current admission minimum."""
     if isinstance(mirror_root, UseConfiguredValue):
         mirror_root = MacMirrorRoot.read(settings)
-    if "sweep_floor_gib" not in settings.values():
+    if not settings.has_key("sweep_floor_gib"):
         raise conf.Unusable("mac_test.conf: sweep_floor_gib is missing")
-    floor = settings.number("sweep_floor_gib")
-    if floor < settings.number("free_floor_gib"):
-        raise conf.Unusable("mac_test.conf: sweep_floor_gib must be at least free_floor_gib")
-    roots = settings.words("sweep_floor_roots")
-    approved = (Path("/tmp").resolve(), Path.home() / "rust", mirror_root.local_path())
-    if len(roots) != 3 or {Path(root).expanduser().resolve() for root in roots} != {root.resolve() for root in approved}:
-        raise conf.Unusable(f"mac_test.conf: sweep_floor_roots must name /tmp, ~/rust and ~/{mirror_root.relative}")
-    return int(floor * GIB), roots
+    minimum = settings.number("free_floor_gib")
+
+    def sweep_floor_bytes(floor: float) -> int:
+        if floor < minimum:
+            raise ValueError("sweep_floor_gib must be at least free_floor_gib")
+        size = floor * GIB
+        if not math.isfinite(size):
+            raise ValueError("sweep_floor_gib is too large to convert to bytes")
+        return int(size)
+
+    floor = settings.value("sweep_floor_gib", conf.RangeNumberDecoder(sweep_floor_bytes))
+    approved = {root.resolve() for root in (Path("/tmp"), Path.home() / "rust", mirror_root.local_path())}
+    expected_roots = f"sweep_floor_roots must name /tmp, ~/rust and ~/{mirror_root.relative}"
+
+    def floor_roots(value: str) -> tuple[str, ...]:
+        roots = tuple(value.split())
+        try:
+            if len(roots) == 3 and {Path(root).expanduser().resolve() for root in roots} == approved:
+                return roots
+        except RuntimeError as error:
+            raise ValueError(f"{expected_roots}: {error}") from error
+        raise ValueError(expected_roots)
+
+    return floor, settings.value("sweep_floor_roots", floor_roots)
 
 
 def hold_floor(floor: int, dry_run: bool, roots: Sequence[str] = (), lock: str = "", *,
@@ -5152,12 +5167,14 @@ def main(argv: list[str]) -> int:
             print("lint sweep: --host mac requires --floor-only", file=sys.stderr)
             return 2
         try:
-            with conf.diagnostics(report=False):
+            with conf.diagnostics(report=False) as warnings, conf.report_key_changes():
                 mac_settings = conf.read("mac_test")
                 mirror_root = MacMirrorRoot.read(mac_settings)
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
+            for warning in warnings:
+                print(warning, file=sys.stderr)
             with copies.mirror_sweep_leases(mirror_root.local_path()) as leases:
                 claims = floor_claims.read_claims(timeout)
                 return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,

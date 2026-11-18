@@ -22,10 +22,12 @@ class MacMirrorRoot:
     @classmethod
     def read(cls, settings: conf.ConfigRead) -> MacMirrorRoot:
         """Read and validate the configured remote path once."""
-        value = settings.text("mirror_root")
-        if not value.startswith("~/"):
-            raise conf.Unusable("mac_test.conf: mirror_root must start with ~/")
-        return cls(value[2:])
+        def mirror_root(value: str) -> MacMirrorRoot:
+            if not value.startswith("~/"):
+                raise ValueError("mirror_root must start with ~/")
+            return cls(value[2:])
+
+        return settings.value("mirror_root", mirror_root)
 
     def local_path(self) -> Path:
         """Expand the validated root on the Mac."""

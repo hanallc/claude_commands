@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
 import json
+import math
 import os
 import errno
 import re
@@ -45,11 +46,11 @@ class FolderPrefixes(Mapping[str, str]):
 
     @override
     def __iter__(self) -> Iterator[str]:
-        return iter(key.removeprefix("prefixes.") for key in _settings().values() if key.startswith("prefixes."))
+        return (key.removeprefix("prefixes.") for key in _settings().keys() if key.startswith("prefixes."))
 
     @override
     def __len__(self) -> int:
-        return len([key for key in _settings().values() if key.startswith("prefixes.")])
+        return sum(1 for _ in self)
 
 
 FOLDER_PREFIXES: Mapping[str, str] = FolderPrefixes()
@@ -204,7 +205,14 @@ def repository_git_timeout() -> float:
     from scripts.lib import conf
 
     path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
-    return float(conf.read(path.expanduser()).values()["git_timeout_seconds"])
+
+    def positive_seconds(value: str) -> float:
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("expected a positive finite timeout")
+        return seconds
+
+    return conf.read(path.expanduser()).value("git_timeout_seconds", positive_seconds)
 
 
 def repository_key_for(name: str, identity: str) -> str:
@@ -246,19 +254,25 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     if not suffix and ((named and not spec.work) or
                        (not named and spec.kind in ("temporary", "gate", "scratch", "legacy-unique"))):
         suffix = _new_suffix(spec.suffix_length, settings)
-    pattern = settings.text("patterns.named" if named else f"patterns.{spec.kind}")
-    for field, value in (("repository", spec.repository), ("owner", spec.owner), ("purpose", spec.purpose)):
-        if "{" + field + "}" in pattern and not value and spec.kind != "legacy-unique":
-            raise ValueError(f"{spec.kind} needs {field}")
-    relative = pattern.format(
-        repository=spec.repository, owner=spec.owner, purpose=spec.purpose, suffix=suffix, slot=spec.slot,
-        showrunner=spec.showrunner, unit=spec.unit, work=spec.work or suffix)
-    if not relative or Path(relative).is_absolute() or any(part in (".", "..") for part in relative.split("/")):
-        raise ValueError("a build folder pattern must stay below its parent")
-    path = spec.parent / relative
-    if not path.is_relative_to(spec.parent) or path == spec.parent:
-        raise ValueError("a build folder must stay below its parent")
-    return path
+
+    def folder_path(pattern: str) -> Path:
+        for field, value in (("repository", spec.repository), ("owner", spec.owner), ("purpose", spec.purpose)):
+            if "{" + field + "}" in pattern and not value and spec.kind != "legacy-unique":
+                raise ValueError(f"{spec.kind} needs {field}")
+        try:
+            relative = pattern.format(
+                repository=spec.repository, owner=spec.owner, purpose=spec.purpose, suffix=suffix, slot=spec.slot,
+                showrunner=spec.showrunner, unit=spec.unit, work=spec.work or suffix)
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid build folder pattern: {error}") from error
+        if not relative or Path(relative).is_absolute() or any(part in (".", "..") for part in relative.split("/")):
+            raise ValueError("a build folder pattern must stay below its parent")
+        path = spec.parent / relative
+        if not path.is_relative_to(spec.parent) or path == spec.parent:
+            raise ValueError("a build folder must stay below its parent")
+        return path
+
+    return settings.value("patterns.named" if named else f"patterns.{spec.kind}", folder_path)
 
 
 @contextmanager

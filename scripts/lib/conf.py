@@ -116,6 +116,16 @@ Result = TypeVar("Result")
 
 
 @dataclass(frozen=True)
+class RangeNumberDecoder[Value]:
+    """Decode a finite number with a required range limit."""
+
+    decode: Callable[[float], Value]
+
+    def __call__(self, value: str) -> Value:
+        return self.decode(_number(value))
+
+
+@dataclass(frozen=True)
 class UsableLiveValue[Value]:
     """The live configuration supplies this usable value."""
     value: Value
@@ -230,12 +240,27 @@ class ConfigRead:
     def words(self, key: str) -> tuple[str, ...]:
         return self.value(key, lambda value: tuple(value.split()))
 
+    def _read_settings(self) -> dict[str, Setting]:
+        if isinstance(self.settings, _UnreadableFile):
+            return self._recover_file(self.settings)
+        return self.settings
+
+    def has_key(self, key: str) -> bool:
+        """Check for an effective key without validating its value."""
+        settings = self._read_settings()
+        try:
+            _ = _setting(settings, key)
+        except _MissingKey:
+            return False
+        return True
+
+    def keys(self) -> tuple[str, ...]:
+        """Return the stored keys without validating their values."""
+        return tuple(self._read_settings())
+
     def values(self) -> dict[str, str]:
         """Return the map, including empty entries that have no limits."""
-        keys = self.settings
-        if isinstance(keys, _UnreadableFile):
-            fault = keys
-            keys = self._recover_file(fault)
+        keys = self._read_settings()
         result: dict[str, str] = {}
         for key in keys:
             setting = _setting(keys, key)
@@ -422,7 +447,8 @@ def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
     whole = convert is _whole or convert is positive_whole or convert is positive_whole_seconds
     if whole and not setting.limit.startswith("# whole:"):
         raise ValueError("expected a # whole: limit")
-    if convert is _number and not setting.limit.startswith("# range:"):
+    range_number = convert is _number or issubclass(type(convert), RangeNumberDecoder)
+    if range_number and not setting.limit.startswith("# range:"):
         raise ValueError("expected a # range: limit")
     result = convert(setting.value)
     _limits(setting)

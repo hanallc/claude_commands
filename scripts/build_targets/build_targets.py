@@ -1073,14 +1073,17 @@ def command_release_wait(pid: int, *,
     start = process_identity.process_start(pid)
     if not isinstance(start, process_identity.Started):
         return 0
-    for target in read_targets():
+    with conf.report_key_changes():
+        configured = read_targets(purpose=RegistryRead.PLACEMENT)
+    for target in configured:
         if not isinstance(target, SshTarget):
             continue
         from scripts.build_targets import target_config
 
-        if not target_config.ssh_target_state_directory(target.name).exists():
+        directory = target_config.ssh_target_state_directory(target.name)
+        if not directory.exists():
             continue
-        paths = claim_state.state_paths(target.name)
+        paths = claim_state.StatePaths(directory, target.name, registry_selected=True, platform=target.platform)
         fenced: list[claim_state.HeldClaim] = []
         with claim_state.locked(paths.lock):
             for claim in claim_state.read_claims(paths):
@@ -1091,7 +1094,7 @@ def command_release_wait(pid: int, *,
                     from scripts.mac_test import offload
 
                     exact = claim_state.ClaimIdentity(claim.record["claim_id"], claim.record["episode"], claim.record["attempt"])
-                    if offload.pending_start_path(target.name, exact).exists():
+                    if offload.pending_start_path(paths, exact).exists():
                         fenced.append(claim)
                     else:
                         claim.path.unlink(missing_ok=True)
@@ -1166,9 +1169,10 @@ def wait_sleep(seconds: float) -> None:
 
 
 def local_target() -> LocalTarget:
-    for target in read_targets():
-        if target.name == "natedev" and isinstance(target, LocalTarget):
-            return target
+    with conf.report_key_changes():
+        for target in read_targets(selected="natedev", purpose=RegistryRead.PLACEMENT):
+            if isinstance(target, LocalTarget):
+                return target
     raise ConfigError("targets: natedev local target is required")
 
 

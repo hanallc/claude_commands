@@ -28,7 +28,7 @@ from uuid import uuid4
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
 from scripts.lib.slot_root import SlotsNotConfigured as SlotsNotConfigured, configured_slot_root as configured_slot_root
-from scripts.lib.slot_root import slot_root as slot_root
+from scripts.lib.slot_root import configured_maximum as configured_maximum, slot_root as slot_root
 
 
 SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
@@ -148,12 +148,6 @@ def unused(last_use: datetime, settings: conf.ConfigRead, now: datetime) -> bool
     return last_use < now - timedelta(days=settings.whole("slots.unused_days"))
 
 
-def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
-    """Read the repository limit or the machine's default limit."""
-    key = f"slots.{machine}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
-
-
 def _pool(source: Path) -> RepositoryPool:
     settings = conf.read_or_repository("build_folders")
     machine = host_name()
@@ -170,8 +164,9 @@ def _pool(source: Path) -> RepositoryPool:
 
 
 def _maximum(pool: RepositoryPool) -> int:
-    settings = conf.read_or_repository("build_folders")
-    return configured_maximum(settings, pool.machine, pool.repository)
+    with conf.report_key_changes():
+        settings = conf.read_or_repository("build_folders")
+        return configured_maximum(settings, pool.machine, pool.repository)
 
 
 def _slot_repository(pool: RepositoryPool) -> Path:
@@ -308,7 +303,7 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 cargo = pool.cargo_root / path.name
                 settings = conf.read_or_repository("build_folders")
                 key = f"slots.{pool.machine}.{pool.repository}.max_bytes"
-                if key in settings.values():
+                if settings.has_key(key):
                     limit = settings.whole(key)
                     size = _size(path) + _size(cargo)
                     if size > limit:
@@ -443,7 +438,7 @@ def sweep_slots() -> None:
                 record_path.unlink()
                 continue
             key = f"slots.{machine}.{repository}.max_bytes"
-            if key in settings.values():
+            if settings.has_key(key):
                 limit = settings.whole(key)
                 size = _size(path) + _size(cargo)
                 if size > limit and cargo.exists():

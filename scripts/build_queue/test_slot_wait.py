@@ -14,7 +14,9 @@ from typing import cast
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, reply_bytes
+from scripts.lib import build_folders, build_slots, conf
 from scripts.lib.build_slots_test_support import SlotTestConfiguration, private_slot_config
+from scripts.lint.memory_test_support import commit_config_fixture
 
 
 class RepositorySlotWaitTests(unittest.TestCase):
@@ -55,6 +57,31 @@ class RepositorySlotWaitTests(unittest.TestCase):
                 self.assertFalse(fixture.server.waiters)
                 self.assertFalse(fixture.server.repository_slot_waiters)
                 self.doCleanups()
+
+    def test_slot_wait_recovers_the_pool_limit_and_ignores_an_unused_key(self) -> None:
+        fixture, settings = self.pool()
+        descriptor = self.hold(settings)
+        original = settings.settings.read_text()
+        contents = original.replace("# whole: 1..64\nnames.repository_key_length=8\n", "")
+        self.assertNotEqual(contents, original)
+        _ = settings.settings.write_text(contents)
+        commit_config_fixture(settings.settings)
+        key = f"slots.{settings.machine}.widget.max"
+        _ = settings.settings.write_text(contents.replace(f"{key}=1", f"{key}=broken")
+                                         + "# whole: 1..64\nnames.repository_key_length=broken\n")
+
+        with redirect_stderr(io.StringIO()) as warnings:
+            with conf.report_key_changes():
+                self.assertEqual(build_slots.configured_maximum(conf.read(settings.settings), settings.machine, "widget"), 1)
+                self.assertEqual(build_slots.configured_slot_root(), settings.slots)
+                self.assertIn("verify-hold", tuple(build_folders.FOLDER_PREFIXES))
+            peer = fixture.connect(self.request(fixture, settings))
+            self.assertEqual(peer.replies()[-1], wire.RepositorySlotWaiting("widget", (1,), 1, key))
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _ = fixture.server.run_pass()
+            self.assertEqual(peer.replies()[-1], wire.RepositorySlotReady())
+        self.assertEqual(warnings.getvalue().count(f"{key}='broken'"), 1)
+        self.assertNotIn("names.repository_key_length", warnings.getvalue())
 
     def test_lost_race_retains_the_original_place_ahead_of_a_later_waiter(self) -> None:
         fixture, settings = self.pool()

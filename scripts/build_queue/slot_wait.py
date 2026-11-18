@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from scripts.lib import conf
+from scripts.lib.slot_root import configured_maximum
 from scripts.build_queue import admission_wire as wire
 
 
@@ -16,7 +17,7 @@ def read_pool(repository: str, machine: str, root: Path, locks: str) -> wire.Rep
     """Read lock holders without taking a slot lock or changing a slot."""
     settings = conf.read_or_repository("build_folders")
     key = f"slots.{machine}.{repository}.max"
-    maximum = settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
+    maximum = configured_maximum(settings, machine, repository)
     holders: set[tuple[int, int, int]] = set()
     for line in locks.splitlines():
         fields = line.split()

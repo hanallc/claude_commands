@@ -1171,6 +1171,47 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             self.assertEqual(evidence.eligibility, ALLOWED_HOST)
             self.assertEqual(warnings.getvalue().count("max_steps='2'"), 1)
 
+    def test_ssh_execution_evidence_recovers_the_committed_mirror_pattern(self) -> None:
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
+            _, request, destination = self.target_settings_fixture(fixture)
+            settings = fixture.root / "build_folders.conf"
+            pattern = "committed-mirrors/{repository}/{owner}-s{slot}"
+            _ = write_config_fixture(settings, f"patterns.mirror={pattern}\n")
+            self.commit_settings(settings)
+            _ = settings.write_text(settings.read_text().replace(pattern, "{unknown_field}/{repository}"))
+            paths = claim_state.state_paths(destination.target)
+            paths.directory.mkdir(parents=True, exist_ok=True)
+            record: mac_test.RemoteJobClaim = {
+                "claim_id": "provider-claim", "episode": request.episode, "attempt": "attempt-1",
+                "submitting_session": "submitting-session", "pid": request.owner.pid,
+                "proc_start": request.owner.start_time, "remote_host": "claimed-host",
+                "instance_generation": "host-generation-a", "what": "hana check",
+                "worktree": request.constraints.repository, "since": "2026-11-10T12:00:00+00:00",
+                "repo_name": "hana", "repo_key": "fixture/hana", "slot": 1,
+            }
+            mac_test.write_json(paths.run, record)
+            reply = subprocess.CompletedProcess(["ssh"], 0, "321\tprocess-start\n", "")
+            expected = placement.ObservedExecution(placement.ProcessExecution(
+                "claimed-host", "host-generation-a", 321, "process-start"))
+            ssh = mock.Mock(return_value=reply)
+            with (mock.patch.object(mac_test, "free_now", return_value="free"),
+                  mock.patch.object(offload.ProcessController, "capture",
+                                    return_value=offload.CommandOutput(0, "", "")),
+                  mock.patch.object(service, "subprocess", wraps=subprocess, run=ssh)):
+                for _index in range(2):
+                    evidence = self.read_target(fixture, request)
+                    assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                    claim, = evidence.claims
+                    self.assertEqual(evidence.executions, ((claim.reference, expected),))
+                self.assertEqual(ssh.call_count, 2)
+                for call in ssh.call_args_list:
+                    command = cast(list[str], call.args[0])
+                    self.assertEqual(command[0], "ssh")
+                    self.assertEqual(command[-2], "claimed-host")
+                    self.assertIn("committed-mirrors/", command[-1])
+                    self.assertIn("fixture-s1", command[-1])
+            self.assertEqual(warnings.getvalue().count("patterns.mirror='{unknown_field}/{repository}'"), 1)
+
     def test_mac_probe_recovers_the_committed_mirror_root(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
             settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")

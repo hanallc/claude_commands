@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext, redirect_stderr
 import fcntl
+import io
 import os
 from pathlib import Path
 import shlex
@@ -14,11 +16,12 @@ import unittest
 from typing import TextIO, cast, override
 from unittest import mock
 
-from scripts.mac_test import eligibility, offload
+from scripts.copies import copies
+from scripts.mac_test import eligibility, floor_claims, offload
 from scripts.lib import conf
 from scripts.lint import sweep
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import commit_config_fixture, config_environment, write_config_fixture
 
 
 class FloorSweepTests(unittest.TestCase):
@@ -135,6 +138,45 @@ class FloorSweepTests(unittest.TestCase):
                     f"mirror_root={root}\nsweep_floor_roots=/tmp ~/rust {root}\n")
                 with self.assertRaisesRegex(ValueError, "mirror_root"):
                     _ = sweep.mac_floor_settings(conf.read(self.settings))
+
+    def test_mac_floor_ignores_an_unusable_cleanup_timeout(self) -> None:
+        roots = ("/tmp", "~/rust", "~/fixture-mirrors")
+        _ = write_config_fixture(self.settings, "leftover_timeout_s=broken\nsweep_floor_gib=140\n"
+                                 + f"mirror_root={roots[-1]}\nsweep_floor_roots={' '.join(roots)}\n")
+        claims = floor_claims.ClaimSnapshot(frozenset())
+        leases = copies.MirrorSweepLeases(frozenset(), frozenset())
+        with (redirect_stderr(io.StringIO()) as errors,
+              mock.patch.object(copies, "mirror_sweep_leases", return_value=nullcontext(leases)),
+              mock.patch.object(floor_claims, "read_claims", return_value=claims),
+              mock.patch.object(sweep, "hold_floor", return_value=0) as take):
+            self.assertEqual(sweep.main(["--floor-only", "--host", "mac"]), 0, errors.getvalue())
+        self.assertEqual(take.call_args.args, (140 * sweep.GIB, False))
+        policy = cast(object, take.call_args.kwargs["policy"])
+        assert isinstance(policy, sweep.MacFloor)
+        self.assertEqual(policy.roots, roots)
+        self.assertNotIn("leftover_timeout_s", errors.getvalue())
+
+    def test_mac_floor_recovers_when_the_live_floor_is_too_low_or_too_large(self) -> None:
+        _ = write_config_fixture(self.settings, "sweep_floor_gib=150\n")
+        commit_config_fixture(self.settings)
+        for live in ("99", "1e308"):
+            with self.subTest(live=live), redirect_stderr(io.StringIO()) as warnings:
+                _ = write_config_fixture(self.settings, f"sweep_floor_gib={live}\n")
+                floor, _roots = sweep.mac_floor_settings(conf.read(self.settings))
+                self.assertEqual(floor, 150 * sweep.GIB)
+                self.assertIn(f"sweep_floor_gib={live!r}", warnings.getvalue())
+
+    def test_mac_floor_recovers_roots_with_an_unknown_home(self) -> None:
+        roots = ("/tmp", "~/rust", "~/fixture-mirrors")
+        _ = write_config_fixture(self.settings, f"mirror_root={roots[-1]}\nsweep_floor_roots={' '.join(roots)}\n")
+        commit_config_fixture(self.settings)
+        _ = write_config_fixture(self.settings, "sweep_floor_roots=/tmp ~missing-user/rust ~/fixture-mirrors\n")
+
+        with mock.patch("pwd.getpwnam", side_effect=KeyError("missing-user")), redirect_stderr(io.StringIO()) as warnings:
+            _floor, recovered = sweep.mac_floor_settings(conf.read(self.settings))
+        self.assertEqual(recovered, roots)
+        self.assertIn("sweep_floor_roots=", warnings.getvalue())
+        self.assertIn("Could not determine home directory", warnings.getvalue())
 
     def test_selector_rejects_its_assignment_text_and_near_miss_paths(self) -> None:
         configured = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root")
