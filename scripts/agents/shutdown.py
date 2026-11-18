@@ -2153,7 +2153,8 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                 except staff.StaffRefused as error:
                     print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
     if unchanged:
-        print(f"{unchanged} worker names unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
+        worker_names = "worker name" if unchanged == 1 else "worker names"
+        print(f"{unchanged} {worker_names} unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
     return changed
 
 
@@ -2243,6 +2244,12 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
         return request
 
 
+def _unit_rename_target(value: str, old_name: str, new_name: str) -> str | None:
+    """Replace a matching old suffix or keep a matching new suffix."""
+    return (unit_names.swap_stem(value, old_name, new_name)
+            or unit_names.swap_stem(value, new_name, new_name))
+
+
 def rename_apply_unit(request: RenamePlan) -> RenamePlan:
     with staff.row_operation(str(request.member.id)):
         record = staff.snapshot()
@@ -2267,13 +2274,13 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
                 if row.worktree.machine != remote.local_machine():
                     raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
                 folder = row.worktree.path.expanduser().resolve()
-                target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
+                target = _unit_rename_target(folder.name, row.name, request.name) if changed else folder.name
                 destination = folder.with_name(target) if target is not None else folder
                 unit_move.require_move_destination(record, row, destination)
                 checkout = unit_move.move_checkout(record, row)
                 branch = unit_move.checked_out_branch(checkout) if checkout.exists() else ""
                 renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
-                                  unit_names.swap_stem(branch, row.name, request.name))
+                                  _unit_rename_target(branch, row.name, request.name))
                 if changed and target is None:
                     print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
                 if changed and renamed_branch is None:
