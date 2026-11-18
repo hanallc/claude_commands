@@ -2723,14 +2723,18 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** none.
 
-### Phase 144 — A new worktree's Cargo folder starts from a warm sibling  · status: todo
+### Phase 144 — A new worktree's Cargo folder starts from a warm sibling  · status: done
 
-The user approved the pilot from Phase 143: "yes copy from a warm sibling is fine". A new worktree's first build is cold (Hana nextest 634 s against 113 s warm). The first build of a new folder in `/build/cargo` starts from a copy of a warm sibling folder of the same repository.
+#### As-built
 
-- Sibling rule: the sibling whose last built revision is nearest to the new worktree's HEAD.
-- Safety: the copy never runs while a build writes the sibling. It holds the sibling's build lock, or it skips that sibling.
-- Cost: `/build` is ext4, so the copy shares no blocks. Copy time and disk per seeded folder are measured and reported.
-- Settings live in `config/build_folders.conf` (new keys). Seeded folders are the worktree's own Cargo folder, so the owner of worktree removal removes them.
-- Proof: Hana first run before and after.
+- `scripts/lib/cargo_seed.py`: before the first Cargo build of a worktree's own managed folder on natedev, copy `deps`, `build` and `.fingerprint` of the profile from the warm sibling of the same repository with the nearest revision (`git rev-list --count`).
+- The copy holds the donor's Cargo locks without a wait, skips a donor with an admission reservation, runs one at a time, stages in a unique folder inside the seeder-private `.cargo-seed` folder and publishes by rename. Recovery clears `.cargo-seed` under the disk lock.
+- Only registry crates are copied. Workspace and Git units, build-script run records and `OUT_DIR` stay out, because they can hold donor paths.
+- An override build folder (`build.build-dir` or a target) gets no seed. A seed failure never fails the build. `scripts/lint/invoke.sh` skips the helper for a known warm folder of the same workspace.
+- Worktree removal (`scripts/worktree/worktrees.py`) takes the seed's checkout guard and removes the managed folder through the guarded Cargo cleanup.
+- Settings: new `seed.*` keys in `config/build_folders.conf`; the Mac is off.
+- Hana first nextest: cold Cargo 1188.65 s (639 crates); seeded copy 6.43 GiB in 18.31 s, Cargo 956.68 s (409 crates); gain 213.66 s. The 409: 25 workspace, 76 registry crates with a build script, 305 registry crates above one, 3 path crates.
+- Known limit: `~/rust/X` and `~/worktrees/X` share `/build/cargo/X` in the live mirror; reported to builds.
+- Checkpoint `73bb35737`.
 
-**Files:** to be named by the work order.
+**Files:** `scripts/lib/cargo_seed.py`, `scripts/lib/test_cargo_seed.py`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `scripts/worktree/worktrees.py`, `scripts/worktree/test_worktrees.py`, `config/build_folders.conf`.
