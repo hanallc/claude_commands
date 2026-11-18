@@ -23,10 +23,9 @@ import time
 from types import CodeType, SimpleNamespace
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
-from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
 from scripts.aws_target.measurement_test_support import DAY, narrow
@@ -37,6 +36,10 @@ from scripts.lib import conf
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+QUOTA_PLAN_KEY = plan_identity.PlanCredentials('AKIAFIXTUREEXAMPLE00', 'Fixture000' * 4,
+                                               plan_identity.PlanAccount('aws', '123456789012'))
 
 
 FAKE_AWS = r'''import datetime, json, os, pathlib, sys
@@ -3076,21 +3079,16 @@ sys.exit(7)
                 self.assertNotIn('arn:', output.getvalue())
                 self.assertNotIn('123456789012', output.getvalue())
 
-    def test_quota_status_prints_aligned_regional_blocks_without_writes(self) -> None:
+    def test_quota_status_reads_with_plan_key_and_prints_newest_request_without_ids(self) -> None:
         gates = self.root / 'cloud_gate.conf'
         home = conf.read(self.settings).text('region')
         other, candidate = 'us-west-2', 'eu-north-1'
         text_setting(gates, 'regions', home + ' ' + other)
         text_setting(gates, 'spot_candidate_regions', other + ' ' + candidate)
-        text_setting(gates, 'credential_file', str(self.credentials))
-        values = conf.read(gates)
-        desired = {'L-34B43A08': values.whole('spot_quota_request_vcpus'),
-                   'L-3819A6DF': values.whole('gpu_spot_quota_request_vcpus')}
-        zone = 'Pacific/Honolulu'
-        updated = datetime.fromtimestamp(self.now, UTC)
-        created = datetime.fromtimestamp(self.now - 86400, UTC)
-        date = updated.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M:%S %Z')
-        created_date = created.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.8xlarge": "1"}')
+        applied = {'L-34B43A08': 120, 'L-3819A6DF': 32}
+        day_ago = datetime.fromtimestamp(self.now - 86400, UTC)
+        hours_ago = datetime.fromtimestamp(self.now - 10800, UTC).isoformat()
         history = 'list-requested-service-quota-change-history-by-quota'
         calls: list[tuple[str, str, str]] = []
         subject = self.deployment()
@@ -3102,37 +3100,46 @@ sys.exit(7)
             self.assertGreater(timeout, 0)
             self.assertNotIn('--profile', arguments)
             assert env is not None
-            self.assertEqual(env['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
-            self.assertEqual(env['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
-            self.assertEqual(env['AWS_SHARED_CREDENTIALS_FILE'], str(self.credentials))
+            self.assertEqual(env['AWS_ACCESS_KEY_ID'], QUOTA_PLAN_KEY.access_key_id)
+            self.assertEqual(env['AWS_SECRET_ACCESS_KEY'], QUOTA_PLAN_KEY.secret_access_key)
+            self.assertEqual(env['AWS_SHARED_CREDENTIALS_FILE'], '/dev/null')
+            self.assertEqual(env['AWS_CONFIG_FILE'], '/dev/null')
+            self.assertNotIn('AWS_PROFILE', env)
+            self.assertNotIn('AWS_SESSION_TOKEN', env)
             region = arguments[arguments.index('--region') + 1]
             operation = arguments[arguments.index('service-quotas') + 1]
             code = arguments[arguments.index('--quota-code') + 1]
             self.assertIn(operation, ('get-service-quota', history))
-            self.assertNotIn('--no-paginate', arguments)
-            self.assertNotIn('--max-items', arguments)
+            self.assertEqual(list(arguments), ['aws', '--region', region, 'service-quotas', operation,
+                '--service-code', 'ec2', '--quota-code', code, '--output', 'json'])
             calls.append((region, code, operation))
             reply: dict[str, object]
             if operation == 'get-service-quota':
-                reply = {'Quota': {'Value': desired[code], 'QuotaName': 'private-name', 'QuotaArn': 'arn:private-quota'}}
+                reply = {'Quota': {'Value': applied[code], 'QuotaName': 'private-name', 'QuotaArn': 'arn:private-quota'}}
             else:
                 rows: list[dict[str, object]] = []
                 if (region, code) == (home, 'L-34B43A08'):
-                    rows = [{'DesiredValue': desired[code], 'Status': 'APPROVED', 'Created': created.timestamp(),
-                             'LastUpdated': created.timestamp()},
-                            {'DesiredValue': desired[code] + 1, 'Status': 'CASE_OPENED', 'CaseId': 'case-fixture',
-                             'Created': created.isoformat(), 'LastUpdated': updated.isoformat(),
-                             'Id': 'private-request', 'Requester': 'private-account', 'QuotaArn': 'arn:private-quota'}]
+                    rows = [{'DesiredValue': 128, 'Status': 'APPROVED', 'Created': day_ago.timestamp(),
+                             'LastUpdated': self.now},
+                            {'DesiredValue': 129, 'Status': 'CASE_OPENED', 'CaseId': 'case-fixture',
+                             'Created': hours_ago, 'LastUpdated': hours_ago,
+                             'Id': 'private-request', 'Requester': '123456789012', 'QuotaArn': 'arn:private-quota'}]
+                elif (region, code) == (other, 'L-34B43A08'):
+                    rows = [{'DesiredValue': 130, 'Status': 'FUTURE_STATUS', 'Created': hours_ago},
+                            {'DesiredValue': 128, 'Status': 'PENDING', 'Created': day_ago.timestamp()}]
                 elif (region, code) == (other, 'L-3819A6DF'):
-                    rows = [{'DesiredValue': desired[code], 'Status': 'PENDING',
-                             'Created': created.isoformat().replace('+00:00', 'Z')}]
+                    rows = [{'DesiredValue': 4, 'Status': 'PENDING',
+                             'LastUpdated': day_ago.isoformat().replace('+00:00', 'Z')}]
                 reply = {'RequestedQuotas': rows}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
         subject.execute = execute
         before = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
                   for path in self.root.rglob('*')}
-        with (mock.patch.dict(os.environ, {'USER_ZONE': zone}),
+        with (mock.patch.dict(os.environ, {'AWS_SESSION_TOKEN': 'ambient-token', 'AWS_PROFILE': 'ambient-profile'}),
+              mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY) as plan_key,
+              mock.patch.object(subject.admin, 'get', side_effect=AssertionError('The report must not read the admin key')),
+              mock.patch.object(admin_secrets, 'credentials_file', side_effect=AssertionError('The report must not load the admin path')),
               mock.patch.object(deploy, 'Deployment', return_value=subject),
               mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
               mock.patch.object(deploy, 'write_text_atomic', side_effect=AssertionError('The report must not write')),
@@ -3140,6 +3147,7 @@ sys.exit(7)
               mock.patch.object(subject, '_guard', side_effect=AssertionError('The report must not change the ledger')),
               redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
             self.assertEqual(deploy.main(), 0, errors.getvalue())
+        plan_key.assert_called_once_with()
         after = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
                  for path in self.root.rglob('*')}
         self.assertEqual(before, after)
@@ -3147,31 +3155,22 @@ sys.exit(7)
         self.assertEqual(calls, [(region, code, operation) for region, code in (
             (home, 'L-34B43A08'), (home, 'L-3819A6DF'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'))
             for operation in ('get-service-quota', history)])
-        lines = output.getvalue().splitlines()
-        self.assertEqual([line for line in lines if line and not line.startswith((' ', 'Summary:'))],
-                         [home, other])
-        self.assertEqual([line.strip() for line in lines if line.startswith('  ') and not line.startswith('    ')], [
-            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
-            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied',
-            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
-            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied'])
-        headers = [line for line in lines if 'Asked vCPUs' in line]
-        requests = [line for line in lines if line.startswith('    ') and any(
-            status in line for status in ('CASE_OPENED', 'APPROVED', 'PENDING'))]
-        self.assertEqual([re.split(r' {2,}', line.strip()) for line in requests], [
-            [str(desired['L-34B43A08'] + 1), 'CASE_OPENED', 'case-fixture', date],
-            [str(desired['L-34B43A08']), 'APPROVED', '-', created_date],
-            [str(desired['L-3819A6DF']), 'PENDING', '-', created_date]])
-        for line, status in zip(requests[:2], ('CASE_OPENED', 'APPROVED')):
-            self.assertEqual(line.index(status), headers[0].index('Status'))
-            self.assertEqual(line.index(date if status == 'CASE_OPENED' else created_date), headers[0].index('Updated'))
-        self.assertEqual(lines.count('    No requests.'), 2)
-        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
-        fits = f'{home}, {other}' if desired['L-3819A6DF'] >= needed else 'no region has enough applied quota'
-        self.assertEqual(lines[-1], f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
-            + f'open requests: {home} Standard Spot {desired["L-34B43A08"] + 1} vCPUs (CASE_OPENED), '
-            + f'{other} G and VT Spot {desired["L-3819A6DF"]} vCPUs (PENDING)')
-        for private in ('private-name', 'private-request', 'private-account', 'arn:', 'fixture-admin-id', 'fixture-admin-secret'):
+        self.assertEqual(output.getvalue().splitlines(), [
+            home, '  Standard Spot: 120 vCPUs applied, 128 vCPUs needed',
+            '    Newest request: CASE_OPENED for 129 vCPUs (3h old).',
+            '  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed', '    No requests.', '',
+            other, '  Standard Spot: 120 vCPUs applied, 128 vCPUs needed',
+            '    Newest request: FUTURE_STATUS for 130 vCPUs (3h old).',
+            '  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed',
+            '    Newest request: PENDING for 4 vCPUs (1d old).', '',
+            f'Summary: GPU trial needs 32 vCPUs; quota fits: {home}, {other}; '
+            + f'open requests: {home} Standard Spot 129 vCPUs (CASE_OPENED), '
+            + f'{other} Standard Spot 130 vCPUs (FUTURE_STATUS), '
+            + f'{other} Standard Spot 128 vCPUs (PENDING), '
+            + f'{other} G and VT Spot 4 vCPUs (PENDING)'])
+        for private in ('private-name', 'private-request', 'case-fixture', '123456789012', 'arn:',
+                        'fixture-admin-id', 'fixture-admin-secret', QUOTA_PLAN_KEY.access_key_id,
+                        QUOTA_PLAN_KEY.secret_access_key):
             self.assertNotIn(private, output.getvalue() + errors.getvalue())
 
     def test_quota_status_continues_after_regional_failures_and_exits_one(self) -> None:
@@ -3179,10 +3178,17 @@ sys.exit(7)
         home = conf.read(self.settings).text('region')
         other = 'us-west-2'
         text_setting(gates, 'regions', home + ' ' + other)
-        text_setting(gates, 'spot_candidate_regions', home + ' ' + other)
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.8xlarge": "1"}')
         history = 'list-requested-service-quota-change-history-by-quota'
-        for failure in ('get-service-quota', history, 'timeout', 'uncoded'):
-            with self.subTest(failure=failure):
+        cases = (
+            ('get-service-quota', 'AccessDeniedException'), (history, 'AccessDeniedException'),
+            ('timeout', ''), ('uncoded', ''),
+            ('get-service-quota', 'InvalidClientTokenId'), ('get-service-quota', 'UnrecognizedClientException'),
+            ('get-service-quota', 'AuthFailure'), ('get-service-quota', 'SignatureDoesNotMatch'),
+            (history, 'AuthFailure'),
+        )
+        for failure, error_code in cases:
+            with self.subTest(failure=failure, error_code=error_code):
                 subject = self.deployment()
                 calls: list[tuple[str, str, str]] = []
 
@@ -3198,20 +3204,32 @@ sys.exit(7)
                         if failure == 'timeout':
                             raise subprocess.TimeoutExpired('private-timeout', timeout)
                         if failure == 'uncoded' or operation == failure:
+                            action = 'GetServiceQuota' if operation == 'get-service-quota' else 'ListRequestedServiceQuotaChangeHistoryByQuota'
                             reason = 'private-error' if failure == 'uncoded' else (
-                                'An error occurred (AccessDeniedException) when calling quota operation: private-error arn:private')
+                                f'An error occurred ({error_code}) when calling the {action} operation: private-error arn:private')
                             return subprocess.CompletedProcess(arguments, 1, '', reason)
-                    reply: dict[str, object] = {'Quota': {'Value': conf.read(gates).whole('spot_quota_request_vcpus')}}
+                    reply: dict[str, object] = {'Quota': {'Value': 128}}
                     if operation == history:
                         reply = {'RequestedQuotas': []}
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
                 subject.execute = execute
-                with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+                      mock.patch.object(deploy, 'Deployment', return_value=subject),
                       mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
                       redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
                     self.assertEqual(deploy.main(), 1)
-                expected = 'TimeoutExpired' if failure == 'timeout' else 'AwsUnavailable' if failure == 'uncoded' else 'AccessDeniedException'
+                if error_code and error_code != 'AccessDeniedException':
+                    expected_calls = [(home, 'L-34B43A08', 'get-service-quota')]
+                    if failure == history:
+                        expected_calls.append((home, 'L-34B43A08', history))
+                    self.assertEqual(calls, expected_calls)
+                    self.assertEqual(output.getvalue(), '')
+                    self.assertEqual(errors.getvalue(), 'quota-status: AWS rejected the plan key. '
+                                                       + 'Run deploy.py plan-identity --check.\n')
+                    continue
+                self.assertEqual(errors.getvalue(), '')
+                expected = error_code or ('PlanRefused' if failure == 'timeout' else 'AwsUnavailable')
                 self.assertIn(f'    Quota status failed: {expected}', output.getvalue())
                 self.assertIn((other, 'L-34B43A08', history), calls)
                 self.assertIn((other, 'L-3819A6DF', history), calls)
@@ -3227,15 +3245,10 @@ sys.exit(7)
         gates = self.root / 'cloud_gate.conf'
         home = conf.read(self.settings).text('region')
         text_setting(gates, 'regions', home)
-        text_setting(gates, 'spot_candidate_regions', home)
-        prices = gpu_size_trial.settings().spot_max_usd_per_hour
-        sizes = sorted(prices, key=lambda name: aws_target.largest_gate_vcpus((name,)))
-        applied = aws_target.largest_gate_vcpus((sizes[0],))
-        asked = conf.read(gates).whole('gpu_spot_quota_request_vcpus')
-        for size in (sizes[0], sizes[-1]):
+        applied = 4
+        for size, needed in (('g4dn.xlarge', 4), ('g6.8xlarge', 32)):
             with self.subTest(size=size):
-                text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', json.dumps({size: str(prices[size])}))
-                needed = aws_target.largest_gate_vcpus(tuple(gpu_size_trial.settings().spot_max_usd_per_hour))
+                text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', json.dumps({size: '1'}))
                 subject = self.deployment()
                 def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
                     operation = arguments[arguments.index('service-quotas') + 1]
@@ -3243,12 +3256,14 @@ sys.exit(7)
                         reply: dict[str, object] = {'Quota': {'Value': applied}}
                     else:
                         self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
-                        reply = {'RequestedQuotas': [{'DesiredValue': asked, 'Status': status}
+                        reply = {'RequestedQuotas': [{'DesiredValue': 4, 'Status': status}
                             for status in ('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST')]}
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
                 subject.execute = execute
-                with redirect_stdout(StringIO()) as output:
+                with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+                      redirect_stdout(StringIO()) as output):
                     self.assertTrue(subject.quota_status())
+                self.assertIn('Newest request: APPROVED for 4 vCPUs (age unknown).', output.getvalue())
                 fits = home if applied >= needed else 'no region has enough applied quota'
                 self.assertEqual(output.getvalue().splitlines()[-1],
                     f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; open requests: none')
@@ -3258,8 +3273,8 @@ sys.exit(7)
         home = conf.read(self.settings).text('region')
         other = 'us-west-2'
         text_setting(gates, 'regions', home + ' ' + other)
-        text_setting(gates, 'spot_candidate_regions', home + ' ' + other)
-        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.8xlarge": "1"}')
+        needed = 32
         history = 'list-requested-service-quota-change-history-by-quota'
         for failure in ('get-service-quota', history):
             with self.subTest(failure=failure):
@@ -3270,14 +3285,14 @@ sys.exit(7)
                     code = arguments[arguments.index('--quota-code') + 1]
                     self.assertIn(operation, ('get-service-quota', history))
                     if region == home and code == 'L-3819A6DF' and operation == failure:
-                        return subprocess.CompletedProcess(arguments, 1, '',
-                            'An error occurred (AccessDeniedException) when calling quota operation: fixture refusal')
+                        return subprocess.CompletedProcess(arguments, 1, '', 'fixture refusal')
                     reply: dict[str, object] = {'Quota': {'Value': needed}}
                     if operation == history:
                         reply = {'RequestedQuotas': [{'DesiredValue': needed, 'Status': 'PENDING'}]}
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
                 subject.execute = execute
-                with redirect_stdout(StringIO()) as output:
+                with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+                      redirect_stdout(StringIO()) as output):
                     self.assertFalse(subject.quota_status())
                 fits = f'{other}, unknown for {home}' if failure == 'get-service-quota' else f'{home}, {other}'
                 self.assertEqual(output.getvalue().splitlines()[-1],
@@ -3285,17 +3300,54 @@ sys.exit(7)
                     + f'request history unavailable: {home} G and VT Spot')
                 self.assertIn('PENDING', output.getvalue())
 
-    def test_quota_status_credential_refusal_stops_before_aws(self) -> None:
+    def test_quota_status_omits_identifiers_from_a_closed_request(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.xlarge": "1"}')
         subject = self.deployment()
-        message = 'Run deploy.py secrets in a terminal'
-        with (mock.patch.object(subject.admin, 'get', side_effect=admin_secrets.SecretsRefused(message)),
-              mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')),
-              mock.patch.object(deploy, 'Deployment', return_value=subject),
-              mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
-              redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
-            self.assertEqual(deploy.main(), 1)
-        self.assertEqual(output.getvalue(), '')
-        self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            operation = arguments[arguments.index('service-quotas') + 1]
+            reply: dict[str, object]
+            if operation == 'get-service-quota':
+                reply = {'Quota': {'Value': 4}}
+            else:
+                self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
+                reply = {'RequestedQuotas': [{'DesiredValue': 4, 'Status': 'CASE_CLOSED', 'CaseId': 'case-private',
+                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120}]}
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        subject.execute = execute
+        with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+              redirect_stdout(StringIO()) as output):
+            self.assertTrue(subject.quota_status())
+        for identity in ('case-private', 'request-private', '123456789012'):
+            self.assertNotIn(identity, output.getvalue())
+        self.assertIn('    Newest request: CASE_CLOSED for 4 vCPUs (2m old).', output.getvalue())
+
+    def test_quota_status_credential_refusal_stops_before_aws(self) -> None:
+        plan_key = self.root / 'plan.gpg'
+        for locked, message in (
+            (False, 'The AWS plan key is missing. On natedev, run deploy.py plan-identity --approve-resources.'),
+            (True, 'The AWS plan key is locked. Run github-warmup in a terminal on natedev.'),
+        ):
+            with self.subTest(locked=locked):
+                if locked:
+                    _ = plan_key.write_bytes(b'fixture-plan-key')
+                    plan_key.chmod(0o600)
+                subject = self.deployment()
+                refusal = subprocess.CompletedProcess(['gpg'], 2, b'', b'[GNUPG:] ERROR pkdecrypt_failed 85\n')
+                with (mock.patch.object(plan_identity, 'credential_path', return_value=plan_key),
+                      mock.patch('scripts.aws_target.plan_identity._gpg', return_value=refusal),
+                      mock.patch.object(subject.admin, 'get',
+                                        side_effect=admin_secrets.SecretsRefused('Run deploy.py secrets in a terminal')) as admin_key,
+                      mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')),
+                      mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(deploy.main(), 1)
+                self.assertEqual(output.getvalue(), '')
+                self.assertEqual(errors.getvalue(), 'quota-status: ' + message + '\n')
+                admin_key.assert_not_called()
 
     def test_quota_request_without_an_environment_override_reaches_aws_with_the_configured_file(self) -> None:
         gates = self.root / 'cloud_gate.conf'

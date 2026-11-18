@@ -135,11 +135,19 @@ A requested quota does not prove an applied quota.
 On the AWS page, expand **How to open the quota cases in AWS** under **Quotas** for the sign-in steps.
 
 `quota-status` reports the applied quotas and their request history without creating a request or writing local state.
-It uses the same regions, quota codes, and encrypted administrator credentials as `quota-request`.
+It reads the same regions and quota codes as `quota-request`.
+It uses the saved read-only plan key.
+If the plan key is missing, run `deploy.py plan-identity --approve-resources` on natedev.
+If the plan key is locked, run `github-warmup` in a terminal on natedev.
+If AWS rejects the plan key during any call, the command stops and prints one line on stderr.
+Run `deploy.py plan-identity --check` to check a rejected plan key.
 Each region starts one block with its name as the heading.
-Each quota prints its applied vCPUs once, followed by aligned request columns.
-Requests appear newest first by update time, or creation time when no update time exists.
-Dates use the zone from `config/user_zone.conf`, with `USER_ZONE` as an override.
+Each quota shows its applied and needed vCPUs.
+The newest request shows its status, requested vCPUs, and age.
+The command selects the newest request and calculates its age from its creation time.
+If a request has no creation time, the command uses its last update time.
+If a request has neither date, the command shows `age unknown`.
+The command keeps unknown status text and counts the request as open.
 A quota with no history prints `No requests.`
 The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
 The trial and report share the vCPU calculation over the types in `gpu_size_trial_spot_max_usd_per_hour`.
@@ -152,26 +160,17 @@ Example from the test fake:
 
 ```text
 us-east-1
-  Standard Spot: 128 vCPUs applied
-    Asked vCPUs  Status       Case ID       Updated
-            129  CASE_OPENED  case-fixture  2026-01-15 13:59:00 HST
-            128  APPROVED     -             2026-01-14 13:59:00 HST
-
-us-west-2
-  Standard Spot: 128 vCPUs applied
-    No requests.
-  G and VT Spot: 4 vCPUs applied
-    Asked vCPUs  Status   Case ID  Updated
-              4  PENDING  -        2026-01-14 13:59:00 HST
-
-eu-north-1
-  G and VT Spot: 4 vCPUs applied
+  Standard Spot: 120 vCPUs applied, 128 vCPUs needed
+    Newest request: CASE_OPENED for 129 vCPUs (3h old).
+  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed
     No requests.
 
-Summary: GPU trial needs 32 vCPUs; quota fits: no region has enough applied quota; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED), us-west-2 G and VT Spot 4 vCPUs (PENDING)
+Summary: GPU trial needs 32 vCPUs; quota fits: us-east-1; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED)
 ```
-A regional failure prints only its error code and makes the command exit with status 1 after the remaining regions.
-The report includes case IDs and omits account IDs, ARNs, and request IDs.
+
+Other regional failures print the error code or class and permit the remaining quota reads.
+Any quota failure makes the command exit with status 1.
+The report omits account IDs, case IDs, request IDs, and ARNs.
 It calls only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota` through the AWS CLI.
 The AWS CLI reads every page of request history.
 [AWS provides Service Quotas at no additional charge](https://aws.amazon.com/about-aws/whats-new/2023/03/service-quotas-additional-regions/).
@@ -182,7 +181,7 @@ The administrator IAM policy needs these actions:
 2. `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`.
 3. `servicequotas:RequestServiceQuotaIncrease`.
 
-`quota-status` needs only the first two actions, which this list already includes.
+The plan identity policy grants `quota-status` the first two actions in `ReadSetupInputs`.
 
 ## Deploy gate resources
 

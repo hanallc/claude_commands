@@ -38,14 +38,14 @@ from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
-from scripts.aws_target.terminal_table import aligned_table
-from scripts.lib import conf, file_lock, user_zone
+from scripts.lib import conf, file_lock
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
 HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
-CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
+QUOTA_PLAN_AUTH_FAILURES = frozenset(('InvalidClientTokenId', 'UnrecognizedClientException',
+                                      'AuthFailure', 'SignatureDoesNotMatch'))
 PROBE_DENIED_CODES = frozenset(('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation',
                                'Client.UnauthorizedOperation', 'Forbidden', '401', '403'))
 HANA_SETUP_VERSION = 2
@@ -367,11 +367,51 @@ def quota_timestamp(value: object) -> float:
     return moment.timestamp()
 
 
-def quota_date(value: object) -> str:
-    """Format AWS timestamps in the user's zone."""
-    if value is None:
-        return '-'
-    return datetime.fromtimestamp(quota_timestamp(value), UTC).astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
+def _quota_request_age(created: float, now: float) -> str:
+    """Show the age in the largest whole unit."""
+    if not math.isfinite(created):
+        return 'age unknown'
+    elapsed = max(0, int(now - created))
+    for unit, seconds in (('d', 86400), ('h', 3600), ('m', 60)):
+        if elapsed >= seconds:
+            return f'{elapsed // seconds}{unit} old'
+    return f'{elapsed}s old'
+
+
+class _KnownQuotaRequestStatus(StrEnum):
+    PENDING = 'PENDING'
+    CASE_OPENED = 'CASE_OPENED'
+    IN_PROGRESS = 'IN_PROGRESS'
+    APPROVED = 'APPROVED'
+    DENIED = 'DENIED'
+    CASE_CLOSED = 'CASE_CLOSED'
+    NOT_APPROVED = 'NOT_APPROVED'
+    INVALID_REQUEST = 'INVALID_REQUEST'
+
+
+CLOSED_QUOTA_REQUEST_STATUSES: frozenset[str] = frozenset((
+    _KnownQuotaRequestStatus.APPROVED, _KnownQuotaRequestStatus.DENIED, _KnownQuotaRequestStatus.CASE_CLOSED,
+    _KnownQuotaRequestStatus.NOT_APPROVED, _KnownQuotaRequestStatus.INVALID_REQUEST,
+))
+
+
+@dataclass(frozen=True)
+class _UnknownQuotaRequestStatus:
+    value: str
+
+
+def _quota_request_status(value: str) -> _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus:
+    try:
+        return _KnownQuotaRequestStatus(value)
+    except ValueError:
+        return _UnknownQuotaRequestStatus(value)
+
+
+@dataclass(frozen=True)
+class _QuotaRequest:
+    created_at: float
+    requested_vcpus: Decimal
+    status: _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus
 
 
 def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
@@ -2571,63 +2611,67 @@ class Deployment:
         return success
 
     def quota_status(self) -> bool:
-        """Report applied quotas and request history without changing AWS or local state."""
+        """Read regional Spot quotas with the plan identity."""
         from scripts.aws_target import gpu_size_trial
+        plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
+        _ = plan.credential
         settings = read_deployment_settings(self.settings_path)
-        api = self._api(settings)
+        api = plan.api(settings.region, settings.timeout_s)
         needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
-        regional: dict[str, list[tuple[str, str]]] = {}
-        for regions, code, _desired, label in quota_targets(settings.region):
+        now = self.clock()
+        regional: dict[str, list[tuple[str, str, int]]] = {}
+        for regions, code, desired, label in quota_targets(settings.region):
             for region in dict.fromkeys(regions):
-                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label))
-        _ = self.admin.get()
+                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label, desired))
         success = True
         ready: list[str] = []
         opened: list[str] = []
         unknown: list[str] = []
         unknown_quota: list[str] = []
+        lines: list[str] = []
         for region, quotas in regional.items():
-            print(region, flush=True)
             target = api.in_region(region)
-            for code, name in quotas:
+            lines.append(region)
+            for code, name, desired in quotas:
                 applied: Decimal | None = None
                 try:
                     applied = spot_quota(target, code)
-                    print(f'  {name}: {applied.normalize():f} vCPUs applied', flush=True)
+                    lines.append(f'  {name}: {applied.normalize():f} vCPUs applied, {desired} vCPUs needed')
                     if code == 'L-3819A6DF' and applied >= needed:
                         ready.append(region)
                     history = target.call('list-requested-service-quota-change-history-by-quota',
                         '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-                    requests = sorted(ledger.rows(history, 'RequestedQuotas'),
-                        key=lambda row: quota_timestamp(row.get('LastUpdated') or row.get('Created')), reverse=True)
-                    rows: list[list[str]] = []
-                    for request in requests:
-                        asked = f'{conf.decimal(str(request["DesiredValue"])).normalize():f}'
-                        status = ledger.text(request, 'Status')
-                        case = str(request.get('CaseId') or '-')
-                        date = quota_date(request.get('LastUpdated') or request.get('Created'))
-                        rows.append([asked, status, case, date])
-                        if status not in CLOSED_QUOTA_REQUEST_STATUSES:
-                            opened.append(f'{region} {name} {asked} vCPUs ({status})')
-                    if rows:
-                        for line in aligned_table(('Asked vCPUs', 'Status', 'Case ID', 'Updated'), rows,
-                                                  right=frozenset((0,))):
-                            print('    ' + line)
+                    requests: list[_QuotaRequest] = []
+                    for request in ledger.rows(history, 'RequestedQuotas'):
+                        created_value = request.get('Created')
+                        created = quota_timestamp(request.get('LastUpdated') if created_value is None else created_value)
+                        asked = conf.decimal(str(request['DesiredValue'])).normalize()
+                        status = _quota_request_status(ledger.text(request, 'Status'))
+                        requests.append(_QuotaRequest(created, asked, status))
+                    requests.sort(key=lambda request: request.created_at, reverse=True)
+                    if requests:
+                        newest = requests[0]
+                        age = _quota_request_age(newest.created_at, now)
+                        lines.append(f'    Newest request: {newest.status.value} for {newest.requested_vcpus:f} vCPUs ({age}).')
                     else:
-                        print('    No requests.')
-                except (admin_secrets.SecretsRefused, DeploymentRefused):
-                    raise
-                except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                    match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
-                    reason = match[1] if match else type(error).__name__
+                        lines.append('    No requests.')
+                    for item in requests:
+                        if item.status.value not in CLOSED_QUOTA_REQUEST_STATUSES:
+                            opened.append(f'{region} {name} {item.requested_vcpus:f} vCPUs ({item.status.value})')
+                except (KeyError, OSError, OverflowError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                    code_text = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
+                    if code_text in QUOTA_PLAN_AUTH_FAILURES:
+                        raise plan_identity.PlanIdentityRefused(
+                            'AWS rejected the plan key. Run deploy.py plan-identity --check.') from None
+                    reason = code_text or type(error).__name__
                     if applied is None:
-                        print(f'  {name}: applied quota unknown')
+                        lines.append(f'  {name}: applied quota unknown, {desired} vCPUs needed')
                         if code == 'L-3819A6DF':
                             unknown_quota.append(region)
-                    print('    Quota status failed: ' + reason)
+                    lines.append('    Quota status failed: ' + reason)
                     unknown.append(region + ' ' + name)
                     success = False
-            print()
+            lines.append('')
         fits = ', '.join(ready)
         if unknown_quota:
             fits += (', ' if fits else '') + 'unknown for ' + ', '.join(unknown_quota)
@@ -2635,8 +2679,9 @@ class Deployment:
             fits = 'no region has enough applied quota'
         requests_text = 'unknown' if unknown else ', '.join(opened) or 'none'
         incomplete = '; request history unavailable: ' + ', '.join(unknown) if unknown else ''
-        print(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
-              + 'open requests: ' + requests_text + incomplete, flush=True)
+        lines.append(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
+                     + 'open requests: ' + requests_text + incomplete)
+        print('\n'.join(lines), flush=True)
         return success
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
@@ -3298,7 +3343,8 @@ def main() -> int:
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__, epilog=aws_test_identity.CONSOLE_SETUP)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity', 'test-identity'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity', 'test-identity'),
+                            help='Use quota-status to read Spot quotas with the plan key. Use quota-request to request increases with the admin key.')
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--image', type=Path)
@@ -3331,6 +3377,12 @@ def main() -> int:
             else:
                 plan_identity.command_down(args.settings, approve_destroy=args.approve_destroy)
             return 0
+        if args.command == 'quota-status':
+            try:
+                return 0 if deploy.quota_status() else 1
+            except plan_identity.PlanIdentityRefused as error:
+                print('quota-status: ' + plan_run.safe_reason(error), file=sys.stderr)
+                return 1
         os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         if args.command == 'gpu-size-trial':
             if args.trial_action != 'run' or args.trial_folder == Path():
@@ -3351,8 +3403,6 @@ def main() -> int:
             deploy.prices()
         elif args.command == 'quota-request':
             return 0 if deploy.quota_request() else 1
-        elif args.command == 'quota-status':
-            return 0 if deploy.quota_status() else 1
         elif args.command == 'hana-image':
             if args.image is None:
                 raise DeploymentRefused('Use hana-image --image RESULT [--approve-resources]')
