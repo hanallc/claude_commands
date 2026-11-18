@@ -335,6 +335,7 @@ class OpeningPrompt:
     transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
+    resend_once: bool = False
 
     def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
         """Keep a supplied cursor or position a new cursor before the agent starts."""
@@ -463,6 +464,10 @@ class TranscriptCursor:
             if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+    def allows_resend(self) -> bool:
+        """Allow a caller to authorize one send when the transcript has a known gap."""
+        return False
 
     def command_rejections(self, text: str) -> int:
         """How many times Claude answered this prompt's slash command with `Unknown command` since launch."""
@@ -2752,7 +2757,7 @@ class Herdr:
                               timeout_ms: int) -> PromptSubmitOutcome:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
-        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt, opening.cursor)
+        opening = replace(opening, text=script_prompt(opening.text))
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         cursor = opening.cursor
         if not isinstance(cursor, TranscriptCursor) and isinstance(opening.transcript, SessionTranscript):
@@ -2808,7 +2813,9 @@ class Herdr:
                 existing = cursor.submitted_prompt(opening.text)
                 if isinstance(existing, PromptSubmitted):
                     return bound_outcome(existing)
-                while isinstance(cursor.readability, TranscriptUnreadable):
+                if opening.resend_once and (not ready.idle or not self.prompt_input_empty(pane)):
+                    return failure("check that the destination pane is idle and its input is empty")
+                while isinstance(cursor.readability, TranscriptUnreadable) and not opening.resend_once:
                     result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
                     if isinstance(result, PromptSubmitted):
                         return bound_outcome(result)
@@ -2838,7 +2845,10 @@ class Herdr:
                     proof = cursor.submitted_prompt(current)
                     if isinstance(proof, PromptSubmitted):
                         return bound_outcome(proof)
-                    if isinstance(cursor.readability, TranscriptUnreadable):
+                    if opening.resend_once:
+                        if not cursor.allows_resend():
+                            return PromptNotSubmitted("the transcript does not permit a resend", never_typed=True)
+                    elif isinstance(cursor.readability, TranscriptUnreadable):
                         result = self._wait_for_submit(cursor, current, deadline)
                         return bound_outcome(result) if isinstance(result, PromptSubmitted) else deadline_failure()
                     self._prompt(pane, current)
@@ -2852,6 +2862,9 @@ class Herdr:
                 last_input = time.monotonic()
                 if not isinstance(cursor, TranscriptCursor):
                     return failure("caller did not identify the transcript; submit is unproven")
+                if opening.resend_once:
+                    result = self._wait_for_submit(cursor, current, deadline)
+                    return bound_outcome(result) if isinstance(result, PromptSubmitted) else deadline_failure()
                 while True:
                     result = self._wait_for_submit(cursor, current, min(deadline, time.monotonic() + 5))
                     if isinstance(result, PromptSubmitted):

@@ -456,15 +456,23 @@ class StopResumeTests(unittest.TestCase):
                             _ = stop_resume.producer_adoption_launch(world.identity, world.pane, client)
 
     def test_producer_admission_refuses_an_incomplete_registry_before_reserving_a_pane(self) -> None:
-        with producer_first_fixture("claude") as world:
-            path = runtime_sessions.sessions_dir() / "unfinished.json"
-            _ = path.write_text("{")
-            result = stop_resume.resume("dwight")
-            self.assertIsInstance(result, stop_resume.ResumeFailed)
-            assert isinstance(result, stop_resume.ResumeFailed)
-            self.assertIn(f"session registry unreadable: {path}", result.reason)
-            self.assertEqual(world.case.client.opened, [])
-            self.assertEqual(world.arguments, [])
+        for missing in ("session registry", "creation record"):
+            with self.subTest(missing=missing), producer_first_fixture("claude") as world:
+                if missing == "session registry":
+                    path = runtime_sessions.sessions_dir() / "unfinished.json"
+                    _ = path.write_text("{")
+                    reason = f"session registry unreadable: {path}"
+                else:
+                    machine = remote.this_machine()
+                    registry = world.case.root / "configuration/models.conf"
+                    _ = write_registry(registry, {"producer_creations": {"dwight": f"{machine}:{'1' * 32}"}}, update=True)
+                    reason = f"the creation record is on {machine}"
+                result = stop_resume.resume("dwight")
+                self.assertIsInstance(result, stop_resume.ResumeFailed)
+                assert isinstance(result, stop_resume.ResumeFailed)
+                self.assertIn(reason, result.reason)
+                self.assertEqual(world.case.client.opened, [])
+                self.assertEqual(world.arguments, [])
 
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
         for shown in (None, "old-producer-title"):

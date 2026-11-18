@@ -28,7 +28,6 @@ from threading import Event, Lock
 from time import monotonic
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Never, Protocol, cast, final, override
-from urllib.parse import quote
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -43,7 +42,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_records, session_send
-from scripts.agents import member_account, pane_record, shutdown_record
+from scripts.agents import member_account, pane_record, producer_creation, shutdown_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -64,6 +63,7 @@ from scripts.agents.stop_results import (
     ResumeResult as ResumeResult, StopResult, SourceRelease, SourceReleased, SourceUnresolved, SourceReleaseUnknown,
 )
 from scripts.message import sessions
+
 from scripts.agents.stop_results import shutdown_state_root
 
 if TYPE_CHECKING:
@@ -105,7 +105,7 @@ class PendingProducerOpening:
     creation: dict[str, object]
 
     def confirm(self, identity: str) -> None:
-        write_text_atomic(self.path, json.dumps({**self.creation, "opening_confirmed": identity}, sort_keys=True) + "\n")
+        producer_creation.write_record(self.path, {**self.creation, "opening_confirmed": identity})
 
 
 @dataclass(frozen=True)
@@ -150,17 +150,9 @@ def producer_admission_record(name: str) -> Path:
     return _producer_admission_path(name)
 
 
-def producer_creation_path(name: str) -> Path:
-    return pane_record.record_directory() / f".producer-add-{quote(name, safe='')}"
-
-
-def _pending_producer_opening(name: str) -> PendingProducerOpening | herdr.NoOpeningPrompt:
-    path = producer_creation_path(name)
-    try:
-        saved = herdr.json_object(cast(object, json.loads(path.read_text(encoding="utf-8"))), "producer creation")
-    except FileNotFoundError:
-        return herdr.NoOpeningPrompt()
-    if isinstance(saved.get("opening_confirmed"), str):
+def _pending_producer_opening(name: str, saved: dict[str, object]) -> PendingProducerOpening | herdr.NoOpeningPrompt:
+    path = producer_creation.record_path(name)
+    if not saved or isinstance(saved.get("opening_confirmed"), str):
         return herdr.NoOpeningPrompt()
     folder = Path(herdr.json_text(saved.get("folder"), "producer folder"))
     stamp = saved.get("opening_since")
@@ -371,42 +363,67 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
 
 
 def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str, why: str = "resumed by name", requester: str = "",
+                                  resend_opening: bool = False,
                                   client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     """Serialize producer admission and replacement."""
     path = _producer_admission_path(request.name)
     with staff.slot_operation("producer-first-" + request.name, request.name):
-        opening = (_pending_producer_opening(request.name) if not isinstance(request, ProducerFamilyChange)
-                   else herdr.NoOpeningPrompt())
+        try:
+            saved = producer_creation.read_record(producer_creation.record_path(request.name))
+            marker = producer_creation.require_record(request.name, saved)
+            opening = _pending_producer_opening(request.name, saved)
+        except (OSError, ValueError, staff.StaffRefused) as error:
+            return ResumeFailed(request.name, str(error))
         if isinstance(opening, PendingProducerOpening):
+            if marker is None:
+                return ResumeFailed(request.name, f"creation has no shared marker. Run {producer_creation.retry(request.name)}.")
+            if isinstance(request, ProducerFamilyChange):
+                return ResumeFailed(request.name, "complete producer creation before changing its family")
             request = replace(request, folder=opening.folder)
+        if resend_opening and (not isinstance(opening, PendingProducerOpening) or not path.is_file()):
+            return ResumeFailed(request.name, "there is no reserved pane with a pending opening prompt")
         record = staff.initial_snapshot()
         row = next((row for row in record.rows if row.kind == "producer" and row.name == request.name), None)
         if row is None:
-            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client, opening=opening)
+            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client,
+                                          opening=opening, marker=marker, resend_opening=resend_opening)
         with staff.row_operation(str(row.id)):
             if not path.exists() and isinstance(opening, herdr.NoOpeningPrompt) and (not isinstance(request, ProducerFamilyChange)
                                       or row.current_session != request.session):
                 return _resume(str(row.id), to=to, why=why, requester=requester, client=client)
-            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client, member=row, opening=opening)
+            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client, member=row,
+                                          opening=opening, marker=marker, resend_opening=resend_opening)
 
 
 @final
 @dataclass(frozen=True)
-class PartialCodexRolloutLine(herdr.TranscriptUnreadable):
-    """The last rollout line has no newline."""
-
-    reason: str = "the first turn is still being written"
+class UnprovedCodexRollout(herdr.TranscriptUnreadable):
+    reason: str
+    malformed: bool = False
 
 
 @final
+@dataclass
 class CodexProducerPromptCursor(herdr.TranscriptCursor):
     """Read Codex user turns for the opening prompt check."""
+
+    _malformed: UnprovedCodexRollout | None = field(default=None, init=False)
+
+    @override
+    def bind_transcript(self, transcript: herdr.SessionTranscript) -> None:
+        if self.transcript != transcript:
+            self._malformed = None
+        super().bind_transcript(transcript)
+
+    @override
+    def allows_resend(self) -> bool:
+        return isinstance(self.readability, UnprovedCodexRollout) and self.readability.malformed
 
     @override
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         from scripts.production import worker_admission
 
-        self.readability = herdr.TranscriptReadable()
+        self.readability = self._malformed or herdr.TranscriptReadable()
         try:
             source = worker_admission.codex_transcript_source(self.transcript.session_id, self.transcript.config_dir)
         except ValueError:
@@ -427,7 +444,7 @@ class CodexProducerPromptCursor(herdr.TranscriptCursor):
                 _ = stream.seek(offset)
                 while line := stream.readline():
                     if not line.endswith(b"\n"):
-                        self.readability = PartialCodexRolloutLine()
+                        self.readability = UnprovedCodexRollout("the first turn is still being written")
                         break
                     self.offsets[source] = stream.tell()
                     try:
@@ -435,17 +452,22 @@ class CodexProducerPromptCursor(herdr.TranscriptCursor):
                         if not isinstance(value, dict):
                             continue
                         row = cast(dict[str, object], value)
-                        stamp = row.get("timestamp")
-                        if not isinstance(stamp, str):
-                            continue
-                        at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
                     except ValueError:
+                        self._malformed = UnprovedCodexRollout(
+                            "a malformed Codex rollout line may contain the opening prompt", malformed=True)
+                        self.readability = self._malformed
                         continue
-                    if at.tzinfo is None or at <= self.since:
+                    stamp = row.get("timestamp")
+                    try:
+                        at = datetime.fromisoformat(stamp.replace("Z", "+00:00")) if isinstance(stamp, str) else None
+                    except ValueError:
+                        at = None
+                    if at is not None and at.tzinfo is not None and at <= self.since:
                         continue
                     role, _, text = worker_admission.transcript_entry(row, set()).partition("\n")
                     if role == "user:":
-                        turns.append((at, {"type": "user", "content": text}))
+                        turns.append((at if at is not None and at.tzinfo is not None else self.since,
+                                      {"type": "user", "content": text, "isMeta": row.get("isMeta", False)}))
                 return turns
         except (OSError, ValueError, subprocess.SubprocessError):
             self.readability = herdr.TranscriptUnreadable()
@@ -453,21 +475,32 @@ class CodexProducerPromptCursor(herdr.TranscriptCursor):
 
 
 def _confirm_producer_opening(request: ProducerFirstStart, opening: PendingProducerOpening,
-                              pending: PendingProducerAdmission, identity: str, client: herdr.Herdr) -> None:
+                              pending: PendingProducerAdmission, identity: str, client: herdr.Herdr, *,
+                              resend: bool) -> None:
     if isinstance(pending.opening, ProducerOpeningUnconfirmed):
         transcript = herdr.SessionTranscript(pending.home, identity)
         cursor_type = CodexProducerPromptCursor if pending.kind == "codex" else herdr.TranscriptCursor
         cursor = cursor_type(transcript, opening.since)
         text = f"Read ~/rust/hanadocs/{request.name}/README.md, then run /producer:produce."
+        recovery = shlex.join(["agents", "resume", request.name, "--resend-opening-prompt"])
+
+        def reason(state: UnprovedCodexRollout) -> str:
+            if state.malformed:
+                return f"{state.reason}. Check the pane, then run {recovery} if the prompt is absent."
+            return state.reason
+
         proof = cursor.submitted_prompt(script_prompt(text))
         if not isinstance(proof, herdr.PromptSubmitted):
-            if isinstance(cursor.readability, PartialCodexRolloutLine):
-                raise OSError(cursor.readability.reason)
-            proof = client.submit_opening_prompt(pending.pane, herdr.OpeningPrompt(text, transcript, cursor=cursor),
+            if resend and not cursor.allows_resend():
+                raise ValueError("a resend requires a malformed Codex rollout line")
+            if not resend and isinstance(cursor.readability, UnprovedCodexRollout):
+                raise OSError(reason(cursor.readability))
+            proof = client.submit_opening_prompt(pending.pane, herdr.OpeningPrompt(
+                text, transcript, cursor=cursor, resend_once=resend),
                 opening.since, int(conf.read("shutdown").number("START_SECONDS") * 1000))
             if isinstance(proof, herdr.PromptNotSubmitted):
                 state = cursor.readability
-                raise OSError(state.reason if isinstance(state, PartialCodexRolloutLine) else proof.reason)
+                raise OSError(reason(state) if isinstance(state, UnprovedCodexRollout) and not resend else proof.reason)
         _write_producer_reservation(request, replace(pending, opening=ConfirmedProducerOpening(identity)))
     opening.confirm(identity)
 
@@ -481,6 +514,7 @@ def _check_producer_admission_account(pending: PendingProducerAdmission, to: str
 
 
 def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProducerOpening | herdr.NoOpeningPrompt, to: str, why: str, requester: str,
+                           marker: producer_creation.Marker | None, resend_opening: bool,
                            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW,
                            member: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW) -> ResumeResult:
     """Retain the pane before launch and admit only its proved native identity."""
@@ -489,6 +523,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
     began = monotonic()
     try:
         if not (request.folder / "README.md").is_file():
+            if marker is not None:
+                raise ValueError(f"producer README is unavailable. Run {producer_creation.retry(request.name)}.")
             raise ValueError(f"producer README is unavailable: {request.folder / 'README.md'}")
         starter = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
         kind, arguments = starter.producer_first_arguments(request.name)
@@ -545,6 +581,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             _save_producer_reservation(request, pending, client)
         pane_row = client.pane_row(pending.pane)
         if isinstance(pane_row, herdr.NoPane) or pane_row.get("terminal_id") != pending.terminal:
+            if resend_opening:
+                raise ValueError("the reserved pane changed. Run agents resume without the resend option.")
             lost = pending
             retained = pane_record.read_strict(client.session).get(lost.pane)
             if retained is not None and not isinstance(herdr.read_conversation(pane_record.resume_launch(retained)["session_id"], kind), herdr.StoppedConversation):
@@ -568,6 +606,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
             if retained is not None:
                 pane_launch.retire_launch(pane_record.record_path(client.session), lost.pane, retained)
         starting = isinstance(client.pane_activity(pending.pane), herdr.PaneAtShell)
+        if resend_opening and starting:
+            raise ValueError("the reserved pane is at a shell. Run agents resume without the resend option.")
         if starting:
             retained = pane_record.read_strict(client.session).get(pending.pane)
             if retained is not None:
@@ -617,7 +657,7 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
         entry["name"] = request.name
         pane_record.write(client.session, entry)
         if isinstance(opening, PendingProducerOpening):
-            _confirm_producer_opening(request, opening, pending, identity, client)
+            _confirm_producer_opening(request, opening, pending, identity, client, resend=resend_opening)
         folder = staff.PresentWorktree(remote.local_machine(), request.folder)
         document: staff.LiveDoc | staff.WrappedDoc = staff.LiveDoc(folder.machine, request.folder)
         if isinstance(member, staff.StaffRow):
@@ -633,6 +673,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
         if publication is None or not publication.get("producer_binding", False):
             raise ValueError("producer admission needs pane publication; retain its native conversation")
         client.remember_row_tab(str(row.id), pending.pane)
+        if marker is not None:
+            producer_creation.finish(request.name, marker)
         path.unlink(missing_ok=True)
         label = (accounts.claude_config_label(pending.home) if kind == "claude"
                  else agent_accounts.codex_home_role_label(pending.home))
@@ -1334,6 +1376,11 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
         return _resume(session, why=why, to=to, requester=requester, client=client)
 
 
+def resend_producer_opening(name: str, *, to: str = "") -> ResumeResult:
+    """Try one explicit resend to the producer's existing reserved pane."""
+    return _locked_first_producer_resume(ProducerFirstStart(name, producer_folder(name)), to=to, resend_opening=True)
+
+
 def _codex_name_ids(name: str) -> list[str]:
     """Accept an explicit native ID without reading Codex display names."""
     from scripts.production import staff
@@ -1396,8 +1443,9 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
             return ResumeFailed(session, f"session is on {machine}")
         if member.kind == "producer":
             try:
+                saved = producer_creation.read_record(producer_creation.record_path(member.name))
                 if (_producer_admission_path(member.name).exists()
-                        or isinstance(_pending_producer_opening(member.name), PendingProducerOpening)):
+                        or isinstance(_pending_producer_opening(member.name, saved), PendingProducerOpening)):
                     return _locked_first_producer_resume(_producer_start_request(member), to=to or "", client=client)
             except (OSError, ValueError) as error:
                 return ResumeFailed(session, str(error))
@@ -1405,7 +1453,8 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
     else:
         if session and Path(session).name == session and session not in {".", ".."}:
             try:
-                opening = _pending_producer_opening(session)
+                saved = producer_creation.read_record(producer_creation.record_path(session))
+                opening = _pending_producer_opening(session, saved)
                 if isinstance(opening, PendingProducerOpening) or _producer_admission_path(session).exists():
                     folder = opening.folder if isinstance(opening, PendingProducerOpening) else producer_folder(session)
                     return _locked_first_producer_resume(ProducerFirstStart(session, folder), to=to or "", client=client)
@@ -1414,13 +1463,13 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         try:
             configuration = (models_registry.launch_configuration(os.environ).text
                 if models_registry.OPERATION_ENVIRONMENT[0] in os.environ else models_registry.registry_text())
-            producers = models_registry.parse_registry(configuration).get("producers", {})
+            registry = models_registry.parse_registry(configuration)
         except (OSError, ValueError):
-            producers = {}
-        if session in producers:
+            registry = {}
+        if session in registry.get("producers", {}):
             try:
                 folder = producer_folder(session)
-                if ((folder / "README.md").is_file()
+                if (session in registry.get(producer_creation.SECTION, {}) or (folder / "README.md").is_file()
                         or isinstance(_tab_of(session, names=names), SessionNotFound)):
                     return _locked_first_producer_resume(ProducerFirstStart(session, folder), to=to or "", client=client)
             except (OSError, ValueError) as error:
