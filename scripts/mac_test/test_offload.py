@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import fields
 import io
 from pathlib import Path
@@ -37,7 +37,7 @@ else:
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
 from scripts.lib import conf, session_folder
-from scripts.production.cli_fixture import invoke_cli
+from scripts.production.cli_fixture import invoke_cli, locked_environment
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
@@ -752,6 +752,10 @@ class BusyHolderTests(unittest.TestCase):
 
 
 class OffloadCommandTests(OffloadCommandFixture):
+    def command_environment(self) -> AbstractContextManager[None]:
+        admission = caller_admission(self, self.root, self.environment)
+        return locked_environment(self.environment, admission.loop_access)
+
     def test_remote_build_target_directory_reaches_the_result_file(self) -> None:
         self.write_portable_workspace()
         stub = self.bin_directory / "command-stub"
@@ -958,7 +962,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assert_wire("passed", "")
                 config, request = observed[0]
-                with mock.patch.dict(os.environ, self.environment, clear=True):
+                with self.command_environment():
                     prefix = offload.ssh_prefix(config)
                     remote = offload.remote_test_command(config, request, HANA)
                     mirror = offload.request_mirror(config, request, HANA)
@@ -1119,7 +1123,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         request = offload.OffloadRequest(self.repository, "hana", "busy", offload.NO_RESULT_FILE, (),
                                         owner="verify", target="mac", holder_session="fixture")
         mirror = offload.request_mirror(config, request, HANA)
-        with mock.patch.dict(os.environ, self.environment), copies.remote_lease(mirror):
+        with self.command_environment(), copies.remote_lease(mirror):
             result = self.command(runner_options=("--target", "mac"))
             self.assertEqual(result.returncode, 75, result.stdout)
             self.assertEqual(result.stdout, "mac_test: not running on the mac (busy)\n")
@@ -1228,7 +1232,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     self.assertTrue(held["claimed"])
                     self.assertEqual(held.get("what"), f"{verb} hana")
                 else:
-                    with mock.patch.dict(os.environ, self.environment, clear=True):
+                    with self.command_environment():
                         config = eligibility.read_config(self.config_path)
                         request = offload.OffloadRequest(self.repository, "hana", "call-17",
                             offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture", verb=verb)
@@ -1262,7 +1266,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                         offload.ResultFile(self.result_path), ("--workspace",),
                         owner="verify", holder_session="fixture", verb=verb)
                     with (
-                        mock.patch.dict(os.environ, self.environment, clear=True),
+                        self.command_environment(),
                         mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(120, "Mac")),
                         mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.UNAVAILABLE_TREE_KEY)),
                         mock.patch.object(copies, "register_remote"),
@@ -1296,7 +1300,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     remote = self.events_for("ssh")[-1]["args"][-1]
                     self.assertFalse(self.events_for("rsync")[-1].get("copy_claim"))
                 else:
-                    with mock.patch.dict(os.environ, self.environment, clear=True):
+                    with self.command_environment():
                         config = eligibility.read_config(self.config_path)
                         request = offload.OffloadRequest(self.repository, "hana", "call-17",
                             offload.NO_RESULT_FILE, ("-E", "leave-this-argument"),
@@ -1447,7 +1451,7 @@ class OffloadCommandTests(OffloadCommandFixture):
             self.repository, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify",
             holder_session="fixture-session", fetch=offload.FetchFolder("output"),
             environment=(("CLICOLOR", "call-value"),))
-        with mock.patch.dict(os.environ, self.environment, clear=True):
+        with self.command_environment():
             config = eligibility.read_config(self.config_path)
             remote = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
             mirror = self.root / offload.remote_mirror(eligibility.KnownRepository("hana"))
@@ -1588,7 +1592,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 request = offload.OffloadRequest(self.repository, "hana", "byte-record",
                     offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture", target="mac")
                 with (
-                    mock.patch.dict(os.environ, self.environment, clear=True),
+                    self.command_environment(),
                     mock.patch.object(subprocess, "Popen", side_effect=[copy_process, run_process]),
                     redirect_stdout(io.StringIO()) as captured,
                 ):
@@ -1599,7 +1603,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     if not isinstance(outcome, offload.ReportedMacStatus):
                         self.fail("The runner did not send a completion status")
                     self.assertEqual(outcome.status, 0, captured.getvalue())
-                with mock.patch.dict(os.environ, self.environment, clear=True):
+                with self.command_environment():
                     offload.persist_attempt(request, offload.PassedOnMac(0), controller.attempt_evidence, time.monotonic())
                 rows = [cast(dict[str, object], json.loads(line))
                         for path in (self.root / "buildlog").glob("*/*.jsonl")
