@@ -1522,10 +1522,11 @@ class ReadyListTests(ProducerFixture):
         merged = self.merge_change("Change-Review: Ready change | Read | Ready\n"
                                    + "Change-Review: Held change | Read | Live | after restart")
         self.promote()
+        image = fixture_image()
 
         with self.subTest(command="add"):
             result = run("add", "--production", "top", "--repo", str(self.repo),
-                         "--change", "Manual change", "--check", "Read", "--see", "Manual")
+                         "--change", "Manual change", "--check", "Read", "--see", "Manual", "--image", image)
             self.assertEqual(result, (0, "C2\n", ""))
         with self.subTest(command="list-ready"):
             code, output, error = self.ready()
@@ -1536,13 +1537,15 @@ class ReadyListTests(ProducerFixture):
             self.assertEqual((code, error), (0, ""))
             self.assertIn("Held change", output)
 
+        rows = change_review.pending(self.listing)
         self.assertEqual([(row["Change"], row["Review log"], row["Notes"], row[change_review.CHECK])
-                          for row in change_review.pending(self.listing)], [
+                          for row in rows], [
             ("Earlier change", "Earlier review", "Earlier note", "Read"),
             ("Manual change", "", "", "Read. You see: Manual"),
             ("Ready change", "", "", "Read. You see: Ready"),
             ("Held change", "", "", "Read. You see: Live"),
         ])
+        self.assertEqual(rows[1][change_review.IMAGE], image)
 
     def test_list_ready_and_live_keep_images_and_report_a_missing_image(self) -> None:
         shot = self.root / "shot.png"
@@ -2645,17 +2648,26 @@ class ActionTest(unittest.TestCase):
         _ = self.path.write_text(LIST, encoding="utf-8")
         self.fresh = Path(directory.name) / "change-review" / "change-review - natedev.md"
 
-    def test_add_accepts_a_row_without_an_image_on_a_list_without_an_image_column(self) -> None:
-        _ = self.path.write_text("""## To review
+    def test_add_requires_an_image_and_adds_the_image_column_to_a_list(self) -> None:
+        original = """## To review
 
 | # | Change | Merged |
 | --- | --- | --- |
-""", encoding="utf-8")
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path),
-                             "--change", "Manual change", "--check", "Read", "--see", "Result"), (0, "C1\n", ""))
+"""
+        _ = self.path.write_text(original, encoding="utf-8")
+        arguments = ("add", "--production", DOC, "--repo", str(self.path.parent), "--list", str(self.path),
+                     "--change", "Manual change", "--check", "Read", "--see", "Result")
+        code, output, error = run(*arguments)
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("a visible row requires an image", error)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+
+        image = fixture_image()
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run(*arguments, "--image", image), (0, "C1\n", ""))
         row, = change_review.pending(self.path)
-        self.assertEqual(row["Change"], "Manual change")
-        self.assertNotIn(change_review.IMAGE, row)
+        self.assertEqual(row, {"#": "C1", "Change": "Manual change", "Merged": "2026-11-13 16:20",
+                               change_review.PRODUCTION: DEMO_ID, change_review.PRODUCER: "", change_review.IMAGE: image})
 
     def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
         rows = change_review.append_rows(self.fresh, pictured_changes([Visible("A", "B", "C")]), date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())
