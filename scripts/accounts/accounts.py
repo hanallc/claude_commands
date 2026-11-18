@@ -6333,7 +6333,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
                                      follow_role=options.follow_role, account_config=account_config)
             elif options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:
-                    raise AccountsError("move units|showrunners|producers requires <claudeN>")
+                    raise AccountsError(f"move {'|'.join(CLAUDE_GROUPS)} requires <claudeN>")
                 moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why, alerts=options.alerts, account_config=account_config)
             else:
                 if not options.label or options.source or options.target:
