@@ -643,7 +643,7 @@ class TurnEndTests(unittest.TestCase):
                         self.case.agent.complete(pane)
                     if receipt == "launcher error":
                         self.assertEqual(self.case.finish(name, turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.DONE)
-                        self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
+                        self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "error")
                         self.assertIn("The earlier pass ended with state error.", self.case.agent.notices[-1])
                     else:
                         self.assertEqual(self.case.finish(name, turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.DONE)
@@ -800,7 +800,7 @@ class TurnEndTests(unittest.TestCase):
         delivered = cast(send.Options, notice.call_args.args[0])
         self.assertEqual(delivered.to, "session:" + current)
 
-    def test_done_corrects_launcher_error_and_finishes_saved_actions(self) -> None:
+    def test_done_preserves_launcher_error_and_finishes_saved_actions(self) -> None:
         status = self.case.run_dir / "launcher.status"
         report = self.case.run_dir / "launcher-report.md"
         name = staff.WorkerName.parse("impl")
@@ -815,10 +815,17 @@ class TurnEndTests(unittest.TestCase):
         error_reply = self.case.run_dir / "launcher-error.txt"
         worker.save_reply(error_reply, "Dispatch ended at the compaction bound.")
         progress_history.complete_dispatch(self.case.run_dir, name.value, instance, status="error")
+        ended = worker_panes.worker_pass(row, self.case.run_dir)
+        history = self.case.run_dir / "history.jsonl"
+        recorded = history.read_bytes()
         progress_history.save_hook_completion(self.case.run_dir, instance,
             progress_history.HookCompletion("error", str(error_reply), ("Dispatch ended at the compaction bound.",)))
         self.assertEqual(self.case.finish(name.value), turn_end.TurnOutcome.DONE)
         self.assertTrue(progress_history.reply_completed(self.case.run_dir, self.case.reply))
+        state = self.case.run_dir / "progress_history_state.json"
+        saved = cast(dict[str, dict[str, dict[str, object]]], json.loads(state.read_text()))["pass"][name.value]
+        self.assertEqual((saved["status"], saved["finished_at"]), ("error", ended["finished_at"]))
+        self.assertEqual(history.read_bytes(), recorded)
         self.assertEqual(status.read_text(), "done\n")
         self.assertEqual(report.read_text(), self.case.reply.read_text())
         self.assertIn("The earlier pass ended with state error.", self.case.agent.notices[-1])
@@ -848,6 +855,39 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(len(self.case.agent.notices), 1)
         self.assertIn("The earlier pass ended with state error.", self.case.agent.notices[0])
         self.assertNotIn(pane, self.case.fixture.world.locations)
+
+    def test_late_done_delivers_a_notice_after_the_hook_records_error(self) -> None:
+        run = self.case.run_dir
+        name = staff.WorkerName.parse("impl")
+        self.case.agent.without_done = True
+        self.assertIs(worker.dispatch(self.case.fixture.parent.id, name, "impl", self.case.prompt,
+            session_dir=run, slot=name.value, phase="8", kind="impl", launcher_command=["assign.sh"],
+            reply=self.case.reply, completion_actions=progress_history.CompletionActions(end_worker=True)),
+            worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        self.case.agent.notice_failures = 1
+        with self.assertRaisesRegex(ValueError, "director message failed"):
+            _ = self.case.finish()
+        failed = worker_panes.worker_pass(row, run)
+        instance = failed["instance_id"]
+        self.assertEqual(failed["status"], "error")
+        self.assertNotIn("hook_notice", failed)
+        self.assertIn(pane, self.case.fixture.world.locations)
+
+        self.case.agent.without_done = False
+        self.case.agent.complete(pane)
+        self.assertIs(self.case.finish(), turn_end.TurnOutcome.DONE)
+        notice, = self.case.agent.notices
+        self.assertIn(f"done; reply {self.case.reply}; pass {instance}", notice)
+        self.assertIn("The earlier pass ended with state error.", notice)
+        stored = cast(dict[str, dict[str, dict[str, object]]],
+                      json.loads((run / "progress_history_state.json").read_text()))["pass"][name.value]
+        self.assertTrue(turn_end.completion_notice_delivered(stored))
+        self.assertTrue(stored["hook_notice"])
+        self.assertEqual((stored["instance_id"], stored["status"], stored["finished_at"]),
+                         (instance, "error", failed["finished_at"]))
+        self.assertEqual(len(self.case.agent.submitted), 1)
 
     def test_restore_and_assign_recover_late_done_before_close_or_reuse(self) -> None:
         for action in ("restore", "assign"):

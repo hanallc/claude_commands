@@ -298,7 +298,7 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
             completion = replace(completion, outcome=TurnOutcome.ERROR, details=(*completion.details, result.reason))
         progress_history.save_hook_completion(run, instance, completion)
     outcome = TurnOutcome(completion.outcome)
-    if outcome != TurnOutcome.LATE_DONE:
+    if outcome != TurnOutcome.LATE_DONE and passed.get("status") in ("active", "refused"):
         progress_history.complete_dispatch(run, str(passed.get("team_slot", row.name)), instance,
                                            status="completed" if outcome == TurnOutcome.DONE else "error")
     diagnostics: list[str] = []
@@ -533,6 +533,7 @@ def _save_late_done(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: 
                     completion: progress_history.HookCompletion | progress_history.NoHookCompletion,
                     delivery: progress_history.DispatchDelivery, *, require_transcript: bool,
                     ) -> progress_history.HookCompletion | worker.DispatchEvidenceUnknown | TurnOutcome | NoLateDone:
+    """Save the late reply and notice outcome for a pass the recorder already ended."""
     earlier = passed.get("status")
     instance = passed.get("instance_id")
     if earlier not in ("completed", "error", "canceled", "interrupted") or not isinstance(instance, str) or not instance:

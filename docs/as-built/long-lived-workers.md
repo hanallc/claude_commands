@@ -81,7 +81,9 @@ The hook reads the worker's run inside the worker lock.
 A new assign finishes the unfinished completion before it replaces the link.
 That notice names its own pass and says it is a late result. The pane stays for the new assign.
 The late step does not retire the worker, and it keeps a hold that the new assign also owns.
-If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
+If notice delivery fails, the assign returns uncertain and reports the pending notice.
+A replacement for a failed pass starts after the hook delivers the pending notice.
+The recorder gives the replacement a new pass id even when the assignment inputs match.
 
 A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
 The pass records the digest before submission.
@@ -169,9 +171,16 @@ A failed cleanup adds a diagnostic to the director notice and permits pane closu
 `progress_history.complete_dispatch` records both completed passes and failed managed Astra review passes.
 It matches the slot and dispatch instance id before it records an outcome.
 A refused launcher retry retains the existing pass and its run, including a run with one worker.
-When DONE arrives during launcher error recovery, the hook records `completed` and finishes the saved actions.
+When DONE arrives during launcher error recovery, the hook finishes the saved actions.
 The director's notice names the earlier state.
-A DONE that arrives after recovery has finished sends a late notice and preserves the recorded outcome.
+The recorder preserves the status of each ended pass.
+A DONE that arrives after recovery has finished sends a late notice.
+`astra_review.py --read` reads a reply when the saved completion names its file and the final DONE matches the dispatch.
+It reads the reply file once and prints the text from that read after validation.
+The check includes second-stage IDs and late reply files.
+The hook saves the completion before it sends the notice.
+The reply is ready before the hook stamps notice delivery, including when completion actions report an error.
+The check reads passes in the current recorder state.
 The review trial uses the latest completion duration for each pass.
 Named adversary and contract reviews use the same completion hook.
 Their DONE reply records `done` and sends one notice.

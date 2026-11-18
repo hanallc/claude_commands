@@ -1491,6 +1491,50 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual((self.reply.read_bytes(), self.reply.stat().st_mtime_ns, self.fixture.staff_state()), before)
         self.assertEqual(len(self.agent.submitted), 1)
 
+    def assert_reassignment_after_launcher_error(self, *, fail_notice: bool) -> None:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        row = self.agent.row(pane)
+        previous = worker_panes.worker_pass(row, self.run_dir)
+        instance = str(previous["instance_id"])
+        self.assertTrue(self.agent.replies[-1].endswith(f"DONE {instance}"))
+        progress_history.complete_dispatch(self.run_dir, "impl", instance, status="error")
+        if fail_notice:
+            self.agent.notice_failures = 1
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertIs(self.dispatch(), worker.ExitCode.UNCERTAIN)
+            self.assertIn("director message failed", errors.getvalue())
+            self.assertEqual(len(self.agent.submitted), 1)
+            self.assertEqual(self.agent.notices, [])
+            pending = worker_panes.worker_pass(row, self.run_dir)
+            self.assertEqual((pending["instance_id"], pending["status"]), (instance, "error"))
+            self.assertNotIn("hook_notice", pending)
+
+        def check_notice() -> None:
+            notice, = self.agent.notices
+            self.assertIn(f"; pass {instance}", notice)
+            self.assertIn("The earlier pass ended with state error.", notice)
+            self.assertEqual(self.reply.read_text().rstrip(), self.agent.replies[0])
+
+        self.agent.during_prompt = check_notice
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(len(self.agent.submitted), 2)
+        next_pane, line = self.agent.submitted[-1]
+        self.assertEqual(self.agent.row(next_pane).id, row.id)
+        current = worker_panes.worker_pass(row, self.run_dir)
+        self.assertNotEqual(current["instance_id"], instance)
+        self.assertIn(f"DONE {current['instance_id']}", line)
+        self.assertEqual(current["status"], "active")
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(len(self.agent.submitted), 2)
+        self.assertEqual(len(self.agent.notices), 1)
+
+    def test_reassignment_after_launcher_error_starts_a_new_turn_after_the_old_notice(self) -> None:
+        self.assert_reassignment_after_launcher_error(fail_notice=False)
+
+    def test_reassignment_after_a_failed_notice_starts_one_new_turn(self) -> None:
+        self.assert_reassignment_after_launcher_error(fail_notice=True)
+
     def test_completed_dispatch_rerun_repeats_its_notice_without_typing(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
         pane = self.agent.submitted[-1][0]
