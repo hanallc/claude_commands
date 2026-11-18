@@ -69,6 +69,25 @@ class SessionFolderTests(unittest.TestCase):
         self.assertEqual(session_folder.launch_folder(Member("m4", "verify"), "d"), self.root / "verify")
         self.assertEqual(session_folder.read_record(self.root / "verify"), {"owner": "m4", "session_id": "d"})
 
+    def test_selector_and_launcher_choose_the_same_available_folder(self) -> None:
+        self.root.mkdir()
+        first = self.root / "verify"
+        first.mkdir()
+        record = session_folder.FolderRecord(owner="m1", session_id="live")
+        session_folder.write_record(first, record)
+        (self.root / "verify-2").symlink_to(first, target_is_directory=True)
+        self.live = frozenset({"live"})
+        before = sorted(self.root.iterdir())
+
+        selected = session_folder.select_folder(self.root, "verify", "next")
+
+        self.assertEqual(selected, self.root / "verify-3")
+        self.assertEqual(sorted(self.root.iterdir()), before)
+        self.assertEqual(session_folder.read_record(first), record)
+        with patch.object(session_folder, "select_folder", wraps=session_folder.select_folder) as select:
+            self.assertEqual(session_folder.launch_folder(Member("m2", "verify"), "next"), selected)
+        select.assert_called_once_with(self.root, "verify", "next")
+
     def test_unknown_liveness_counts_as_live(self) -> None:
         self.root.mkdir()
         _ = session_folder.launch_folder(Member("m1", "verify"), "a")

@@ -15,7 +15,7 @@ from typing import TypedDict, cast
 import unittest
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 
@@ -121,6 +121,9 @@ fi
             run = self.identity(fixture, outer)
             first = fixture.request(run=run)
             _ = fixture.finish_step(first)
+            fixture.allow_next_start()
+            # A live reservation keeps the oversized continuation in the queue.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.free(0)
             fixture.clock.advance(1)
             peer = fixture.request()
@@ -190,7 +193,7 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             launcher = script.with_name("detach.py")
             started = fixture.root / "detach-started"
             _ = launcher.write_text(f"from pathlib import Path\n_ = Path({str(started)!r}).write_text('started')\n")
-            process = self.start(script, "build", "style_reader", "--release", "--attached",
+            process = self.start(script, "build", "sample", "--release", "--attached",
                                  CODEX_THREAD_ID="fixture", VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
             probe = self.probe(process)
             self.assertEqual(probe["pid"], process.pid)

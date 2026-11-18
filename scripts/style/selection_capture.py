@@ -19,11 +19,15 @@ from typing import Literal, TypedDict, cast
 
 from scripts.lib import conf
 from scripts.production import production_doc, staff
-from scripts.style import refill_inputs, refill_measure, style_config, style_ledger, style_rules
+from scripts.style import refill_inputs, refill_measure, style_config, style_ledger, style_reader, style_rules
 from scripts.style.unit_files import unit_worktrees
 from scripts.style.unit_plans import unit_plan_path
 
 OBSERVATION_VARIABLES = ("LC_ALL", "LC_CTYPE", "LANG", "XDG_CONFIG_HOME", "RIPGREP_CONFIG_PATH", "STAFF_CONFIG")
+
+
+class UnsupportedCaptureFormat(ValueError):
+    """The capture uses a format that this reader cannot read."""
 
 
 class CapturedFile(TypedDict):
@@ -47,7 +51,7 @@ class SourceProjection(TypedDict):
 
 
 class CaptureManifest(TypedDict):
-    format: int
+    format: Literal[2]
     repo: str
     unit: str
     files: list[CapturedFile]
@@ -245,13 +249,11 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
     _ = (folder / "board.json").write_text(board)
     files.append({"source": "cargo-berth board --json", "copy": "board.json", "sha256": fingerprint(folder / "board.json"),
                   "kind": "board", "replay": "compare"})
-    stamp = style_config.reader_install_folder() / "current/stamp"
-    save(stamp, "reader_stamp")
     save(xdg / "cargo-mend/config.toml", "lint_configuration", "XDG_CONFIG_HOME", "xdg/cargo-mend/config.toml")
     rg = subprocess.run(["rg", "--version"], capture_output=True, text=True, check=True).stdout
     # Ledger migration can change the private backup, so hash it after admission.
     files[0]["sha256"] = fingerprint(database)
-    manifest: CaptureManifest = {"format": 1, "repo": str(repo), "unit": unit, "files": files, "schema": schema,
+    manifest: CaptureManifest = {"format": 2, "repo": str(repo), "unit": unit, "files": files, "schema": schema,
         "schema_version": schema_version, "versions": versions, "source_projection": projections,
         "revisions": revisions, "objects": availability,
         "environment": {key: os.environ[key] for key in OBSERVATION_VARIABLES if key in os.environ},
@@ -260,7 +262,7 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
                   "implementation_diff": hashlib.sha256(git(checkout, "diff", "--", "scripts/style").encode()).hexdigest(),
                   "selection_sources": hashlib.sha256("\n".join(
                       path.name + ":" + fingerprint(path) for path in sorted((checkout / "scripts/style").glob("*.py"))).encode()).hexdigest(),
-                  "reader_source": git(checkout, "rev-parse", "HEAD:rust/style_reader").strip()},
+                  "cargo_style": style_reader.reader_version_line()},
         "board": "board.json", "directories": directories, "absent_inputs": absent_inputs, "references": references,
         "worktree_status": worktree_status, "git_configuration": git(repo, "config", "--list", "-z")}
     _ = (folder / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
@@ -269,12 +271,23 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
 
 def read_manifest(folder: Path) -> CaptureManifest:
     """Read the versioned capture manifest."""
-    return cast(CaptureManifest, json.loads((folder / "manifest.json").read_text()))
+    manifest = cast(object, json.loads((folder / "manifest.json").read_text()))
+    version = cast(dict[str, object], manifest)["format"]
+    if version != 2:
+        raise UnsupportedCaptureFormat(f"capture format {version} is not supported; capture again")
+    return cast(CaptureManifest, manifest)
 
 
 def external_changes(folder: Path, manifest: CaptureManifest) -> list[ExternalChange]:
     """Report changed unconfigured inputs without refusing a replay."""
     changes: list[ExternalChange] = []
+    try:
+        version = style_reader.observe_reader_version_line()
+    except style_reader.ReaderError as error:
+        version = str(error)
+    expected_version = manifest["tools"]["cargo_style"]
+    if version != expected_version:
+        changes.append({"source": "cargo-style --version", "expected": expected_version, "actual": version})
     for entry in manifest["files"]:
         if entry["replay"] != "backup" and entry["sha256"] != fingerprint(folder / entry["copy"]):
             changes.append({"source": str(folder / entry["copy"]), "expected": entry["sha256"], "actual": fingerprint(folder / entry["copy"])})
@@ -401,14 +414,17 @@ def main() -> int:
         _ = child.add_argument("--reader", type=style_config.ReaderSource, choices=list(style_config.ReaderSource), required=True)
         _ = child.add_argument("--stages", action="store_true")
     args = parser.parse_args(namespace=CaptureArguments())
-    if args.command == "capture":
-        manifest = capture(args.repo, args.ledger, args.unit, args.folder)
-        result: object = {"folder": str(args.folder), "files": len(manifest["files"]),
-                          "schema_version": manifest["schema_version"], "objects": len(manifest["objects"])}
-    elif args.command == "replay":
-        result = replay(args.folder, args.reader, args.workspace, stages=args.stages)
-    else:
-        result = measure_capture(args.folder, args.reader, args.workspace, stages=args.stages)
+    try:
+        if args.command == "capture":
+            manifest = capture(args.repo, args.ledger, args.unit, args.folder)
+            result: object = {"folder": str(args.folder), "files": len(manifest["files"]),
+                              "schema_version": manifest["schema_version"], "objects": len(manifest["objects"])}
+        elif args.command == "replay":
+            result = replay(args.folder, args.reader, args.workspace, stages=args.stages)
+        else:
+            result = measure_capture(args.folder, args.reader, args.workspace, stages=args.stages)
+    except UnsupportedCaptureFormat as error:
+        parser.exit(2, f"{parser.prog}: {error}\n")
     print(json.dumps(result, sort_keys=True))
     return 0
 

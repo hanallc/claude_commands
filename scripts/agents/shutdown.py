@@ -384,7 +384,8 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
     transcripts = tuple(sorted(set(cleanup.transcripts) | set(sessions.transcript_locations(cleanup.session))))
     cleanup = replace(cleanup, step=ProducerCleanupStep.ADMISSION, transcripts=transcripts)
     save_producer_cleanup(path, cleanup)
-    if cleanup.admission_matches and admission.exists():
+    admission_identity = cleanup.admission.get("session_id", "")
+    if cleanup.admission_matches and admission_identity in ("", cleanup.session) and admission.exists():
         saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         if saved == cleanup.admission:
             admission.unlink()
@@ -397,7 +398,7 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
             continue
         if current.get("tab_id") != pane.tab:
             raise ValueError(f"{pane.pane}: stray tab identity changed")
-        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal)
+        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal, target=cleanup.session)
         if not isinstance(client.pane_row(pane.pane), herdr.NoPane):
             raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
     cleanup = replace(cleanup, step=ProducerCleanupStep.TRANSCRIPTS)
@@ -435,26 +436,17 @@ def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProduc
             continue
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
                                  "stray pane process info")
-        proved = False
-        for value in herdr.json_items(info.get("foreground_processes"), "stray pane foreground processes"):
-            process = herdr.json_object(value, "stray pane process")
-            pid = process.get("pid")
-            if not isinstance(observed, herdr.LiveConversation) or pid not in observed.pids:
-                continue
-            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-                raise ValueError("stray pane process has no valid pid")
-            arguments = process.get("argv")
-            if not isinstance(arguments, list):
-                raise ValueError("stray pane process has no arguments")
-            argv = [herdr.json_text(argument, "stray process argument") for argument in cast(list[object], arguments)]
-            matches = herdr.is_claude_process(argv) if observed.kind == "claude" else herdr.is_codex_process(argv)
-            if not matches:
-                raise ValueError(f"{pid}: selected process no longer runs {observed.kind}")
-            native = herdr.native_process(pid, observed.kind)
-            proved = proved or native.current_identity == identity
-        idle_retained = (retained_identity == identity
-                         and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
-        if proved or idle_retained:
+        foreground = herdr.foreground_pane_owner(info)
+        if isinstance(foreground, herdr.UnprovedForegroundOwner):
+            continue
+        if isinstance(foreground, herdr.NoForegroundAgent):
+            matches = (retained_identity == identity
+                       and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
+        else:
+            matches = (isinstance(observed, herdr.LiveConversation)
+                       and foreground.pid in observed.pids and foreground.kind == observed.kind
+                       and herdr.read_foreground_pane_owner(foreground, pane).current_identity == identity)
+        if matches:
             selected.append(StrayProducerPane(pane["pane_id"], herdr.json_text(pane.get("terminal_id"), "stray terminal")))
     return selected
 
@@ -479,15 +471,22 @@ def remove_stray_producer(name: str, session: str) -> int:
         if admission.exists():
             saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         retained = pane_record.read_strict(client.session)
-        admission_matches = saved.get("session_id") == identity
-        for pane in panes:
-            if saved.get("pane") == pane.pane and saved.get("terminal") == pane.terminal:
-                admission_matches = True
-            entry = retained.get(pane.pane)
-            if entry is not None and saved.get("pane") == pane.pane:
-                owner = record.by_member_reference(pane_launch.reference_id(entry))
-                retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
-                admission_matches = admission_matches or retained_identity == identity
+        admission_identity = saved.get("session_id", "")
+        admission_matches = admission_identity == identity
+        if admission_identity == "":
+            for pane in panes:
+                if saved.get("pane") != pane.pane:
+                    continue
+                if saved.get("terminal") == pane.terminal:
+                    admission_matches = True
+                    break
+                entry = retained.get(pane.pane)
+                if entry is not None:
+                    owner = record.by_member_reference(pane_launch.reference_id(entry))
+                    retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
+                    if retained_identity == identity:
+                        admission_matches = True
+                        break
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
             raise ValueError(observed.reason)
@@ -1788,6 +1787,7 @@ def recovery_resumed_session_proven(production_name: str, name: str, session_id:
             and entry.get("staff_id") == row.id and session_id == row.current_session)
 
 def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
+    staff.validate_unit_name_for_write(unit.name)
     refused = recovery_refusals(unit)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
@@ -1969,6 +1969,8 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
         if to_doc:
             raise RenameRefused("--to-doc is only for showrunners; the staff row is a unit, not a showrunner")
         name = row.name if new == row.name + "-unit" else unit_names.name(new)
+        if name != row.name:
+            staff.validate_unit_name_for_write(name)
         staff.validate_name(row.kind, name)
         if any(other.id != row.id and other.name == name and other.parent == row.parent
                for other in record.find(kind="unit")):
@@ -2256,6 +2258,8 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
         if (row := record.by_id(request.member.id)) is None:
             raise ValueError(f"{request.member.id}: no unit staff row")
         changed = row.name != request.name
+        if changed:
+            staff.validate_unit_name_for_write(request.name)
         replaced_pending = False
         pending = unit_move.pending_rename(row.id)
         if pending is not None and (pending.name != request.name or isinstance(request.move, UnitBranchMove)

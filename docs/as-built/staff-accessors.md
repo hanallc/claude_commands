@@ -172,6 +172,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
+| `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
+| `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
@@ -212,6 +214,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
+| `scripts/lib/session_move.py` | read | local_snapshot, by_current_session, by_member_reference, StaffSnapshot, StaffAbsent; finds the staff member that owns a moved session |
 | `scripts/lib/session_folder.py` | read | local_snapshot, by_current_session, by_id, StaffRow and StaffSnapshot (types), ReportsTo; member_of names the folder of a staff session |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/memory_admit.py` | read | snapshot; queue priority takes waiter units from recorded staff rows |
@@ -309,10 +312,12 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
 | `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
+| `scripts/review_links/new_item_dialog.py` | read | StaffId (type) identifies the selected recipient and the recipient in the scoped reply key. |
 | `scripts/review_links/page_question.py` | read | StaffId (type) identifies the question recipient. |
 | `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
 | `scripts/review_links/review_page.py` | read | snapshot resolves the Review owner and source unit for the table and actions |
+| `scripts/review_links/review_submissions.py` | read | snapshot and by_id find the active recipient and locate the saved record for retries and replies. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |

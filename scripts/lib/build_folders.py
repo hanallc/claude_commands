@@ -7,7 +7,7 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import fcntl
@@ -25,6 +25,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
+from scripts.lib import git_files
 from scripts.lib.boot_identity import boot_identity
 
 if TYPE_CHECKING:
@@ -34,6 +35,65 @@ if TYPE_CHECKING:
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
+BUSY = ".claude-busy"
+REMOVAL_RECORD_PREFIX = ".scratch-removing-"
+REMOVAL_RECORD_SUFFIX = ".json"
+
+
+def removal_mark(path: Path) -> Path:
+    """Locate the deletion intent beside the source."""
+    return path.parent / f"{REMOVAL_RECORD_PREFIX}{path.name}{REMOVAL_RECORD_SUFFIX}"
+
+
+def open_busy_mark(mark: Path, *, create: bool, exclusive: bool = False) -> int:
+    """Return a descriptor for a regular busy mark. The caller closes it."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if create:
+        flags |= os.O_CREAT | (os.O_EXCL if exclusive else 0)
+    descriptor = os.open(mark, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EINVAL, "busy mark must be a regular file", str(mark))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def require_no_removal_mark(path: Path) -> None:
+    """Refuse to use a source with a deletion intent on it or an ancestor."""
+    for folder in (path, *path.parents):
+        try:
+            _ = removal_mark(folder).lstat()
+        except FileNotFoundError:
+            continue
+        raise BlockingIOError(errno.EWOULDBLOCK, "source removal has already started", str(folder))
+
+
+@contextmanager
+def _linked_source_locks(source: Path) -> Generator[tuple[int, ...]]:
+    """Hold the checkout and its shared Git folder while Git creates a link."""
+    source = source.expanduser().resolve()
+    require_no_removal_mark(source)
+    try:
+        checkout = git_files.locate(source)
+    except git_files.NotACheckout:
+        yield ()
+        return
+    with ExitStack() as stack:
+        descriptors: list[int] = []
+        for folder in dict.fromkeys((checkout.common_dir, checkout.git_dir)):
+            mark = folder / BUSY
+            descriptor = open_busy_mark(mark, create=True)
+            _ = stack.callback(os.close, descriptor)
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            descriptors.append(descriptor)
+            require_no_removal_mark(folder)
+            locked, present = os.fstat(descriptor), mark.lstat()
+            if (locked.st_dev, locked.st_ino) != (present.st_dev, present.st_ino):
+                raise BlockingIOError(errno.EWOULDBLOCK, "source busy mark changed", str(mark))
+        require_no_removal_mark(source)
+        yield tuple(descriptors)
 
 
 class FolderPrefixes(Mapping[str, str]):
@@ -166,6 +226,10 @@ class SlotCheckout:
     """The checkout holds the source repository and required commit for a slot."""
     source: Path
     commit: str
+
+
+class SlotSourceBusy(BlockingIOError):
+    """The source lock prevents creation of a slot checkout."""
 
 
 @dataclass(frozen=True)
@@ -446,16 +510,26 @@ def _stable_folder(spec: BuildFolderSpec) -> bool:
 def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> Path:
     """Allocate a unique folder or retain an owner's folder."""
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
+    spec = _request_spec(original)
+    with ExitStack() as source_locks:
+        descriptors: tuple[int, ...] = ()
+        if isinstance(original, LinkedEditableRepository):
+            descriptors = source_locks.enter_context(_linked_source_locks(original.source))
+        return _create_build_folder(request, spec, descriptors)
+
+
+def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest,
+                         spec: BuildFolderSpec, source_descriptors: tuple[int, ...]) -> Path:
+    original = request.request if isinstance(request, _TemporaryFolderRequest) else request
     if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, ExistingWorktreeBranch):
         import subprocess
 
         branch = subprocess.run(["git", "-C", str(original.source), "show-ref", "--verify", "--quiet",
                                  f"refs/heads/{original.branch.name}"], capture_output=True,
-                                timeout=repository_git_timeout())
+                                 timeout=repository_git_timeout(), pass_fds=source_descriptors)
         if branch.returncode:
             raise ValueError(f"existing worktree branch {original.branch.name!r} does not exist in {original.source}")
     editable_repository = isinstance(original, (LinkedEditableRepository, RemoteEditableRepository))
-    spec = _request_spec(original)
     stable = _stable_folder(spec)
     # Only a name with a random part gets a new name on a clash; a tool name is fixed per request.
     renamed = not stable and not (spec.suffix or spec.work) and spec.kind != "tool"
@@ -508,23 +582,31 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                                 path.with_name(path.name + ".lease.json").read_text()))
                         except FileNotFoundError:
                             lease = {}
+                        if existing is None or lease.get("ready") is not True:
+                            try:
+                                source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
+                            except BlockingIOError as error:
+                                raise SlotSourceBusy(errno.EWOULDBLOCK, f"slot source is busy: {error}",
+                                                     str(spec.slot_checkout.source)) from error
                         if existing is not None and lease.get("ready") is not True:
                             if (path / ".git").exists():
-                                from scripts.lib import git_files, git_rescue
+                                from scripts.lib import git_rescue
 
                                 checkout = git_files.at(path)
                                 if checkout.common_dir != git_files.at(spec.slot_checkout.source).common_dir:
                                     raise ValueError(f"{path}: incomplete slot owns a different Git repository; retained")
                                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                                 _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"],
-                                                     pass_fds=(descriptor, *held_build_folder_descriptors()))
+                                                     pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors))
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
-                                               pass_fds=(descriptor, *held_build_folder_descriptors()), timeout=repository_git_timeout())
+                                               pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
+                                               timeout=repository_git_timeout())
                             _remove_folder(path, directory, existing)
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
-                                               pass_fds=(descriptor, *held_build_folder_descriptors()), timeout=repository_git_timeout())
+                                               pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
+                                               timeout=repository_git_timeout())
                             existing = None
                     new_folder = existing is None
                     if isinstance(spec.slot_checkout, SlotCheckout):
@@ -554,13 +636,15 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                             if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, NewWorktreeBranch):
                                 _ = subprocess.run(["git", "-C", str(original.source), "branch", "--",
                                                     original.branch.name, original.branch.start_point], check=True,
-                                                   capture_output=True, text=True, timeout=repository_git_timeout())
+                                                    capture_output=True, text=True, timeout=repository_git_timeout(),
+                                                    pass_fds=source_descriptors)
                                 start = subprocess.run(["git", "-C", str(original.source), "rev-parse", "--verify",
                                                         f"refs/heads/{original.branch.name}"], check=True,
-                                                       capture_output=True, text=True, timeout=repository_git_timeout())
+                                                       capture_output=True, text=True, timeout=repository_git_timeout(),
+                                                       pass_fds=source_descriptors)
                                 new_branch_start = start.stdout.strip()
                             _ = subprocess.run(command, check=True, capture_output=True, text=True,
-                                               timeout=repository_git_timeout())
+                                               timeout=repository_git_timeout(), pass_fds=source_descriptors)
                         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                             detail: str | bytes = (str(error) if isinstance(error, OSError)
                                                    else cast(str | bytes, error.stderr or str(error)))
@@ -574,7 +658,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                         _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
                                             str(path), spec.slot_checkout.commit], check=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                           pass_fds=(descriptor, *held_build_folder_descriptors()),
+                                            pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
                                            timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
                     os.set_inheritable(descriptor, True)
@@ -598,7 +682,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                             for cleanup_command in cleanup_commands:
                                 try:
                                     _ = subprocess.run(cleanup_command, capture_output=True,
-                                                       timeout=repository_git_timeout())
+                                                       timeout=repository_git_timeout(), pass_fds=source_descriptors)
                                 except (OSError, subprocess.TimeoutExpired):
                                     # Keep the creation error when a cleanup command fails.
                                     pass
@@ -664,18 +748,88 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
-def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> bool:
-    """Hold path's lease lock when it is free. A missing lock file means no lease."""
+@dataclass(frozen=True)
+class RefusedRemovalLease:
+    """A busy or unreadable lock prevents removal."""
+
+
+@dataclass(frozen=True)
+class UnreservedRemovalFolder:
+    """The folder has no lock file to hold."""
+
+
+SidecarIdentity = tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class HeldFolderRemovalLease:
+    """The descriptor reserves the folder name until lock removal."""
+
+    folder: Path
+    directory: int
+    descriptor: int
+
+    def _sidecar_identity(self, name: str) -> SidecarIdentity | None:
+        try:
+            inode = os.stat(name, dir_fd=self.directory, follow_symlinks=False)
+        except OSError:
+            return None
+        if stat.S_ISREG(inode.st_mode) and inode.st_nlink == 1:
+            return inode.st_dev, inode.st_ino, inode.st_ctime_ns
+        return None
+
+    def sidecar_identities(self) -> dict[str, SidecarIdentity]:
+        """Read the identities for this removal while the lock is held."""
+        try:
+            lock = os.fstat(self.descriptor)
+        except OSError:
+            return {}
+        lock_name = self.folder.name + ".lock"
+        lock_identity = (lock.st_dev, lock.st_ino, lock.st_ctime_ns)
+        if self._sidecar_identity(lock_name) != lock_identity:
+            return {}
+        lease_name = self.folder.name + ".lease.json"
+        lease_identity = self._sidecar_identity(lease_name)
+        identities = {lease_name: lease_identity} if lease_identity is not None else {}
+        identities[lock_name] = lock_identity
+        return identities
+
+    def _source_removed(self) -> bool:
+        try:
+            return (os.path.samestat(os.fstat(self.directory), self.folder.parent.stat())
+                    and not _folder_exists(self.folder, self.directory))
+        except OSError:
+            return False
+
+    def unlink_sidecars(self, expected: dict[str, SidecarIdentity]) -> None:
+        """Remove the original sidecars after the source and marks are gone."""
+        lock_name = self.folder.name + ".lock"
+        lock_identity = expected.get(lock_name)
+        if lock_identity is None:
+            return
+        for name in (self.folder.name + ".lease.json", lock_name):
+            identity = expected.get(name)
+            if (identity is not None and self._source_removed() and self._sidecar_identity(name) == identity
+                    and (name == lock_name or self._sidecar_identity(lock_name) == lock_identity)):
+                with suppress(OSError):
+                    os.unlink(name, dir_fd=self.directory)
+
+
+FolderRemovalLease = RefusedRemovalLease | UnreservedRemovalFolder | HeldFolderRemovalLease
+
+
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> FolderRemovalLease:
+    """Hold the lock if it is free. The stack owns the descriptor."""
     try:
         descriptor = _open_lock(path, directory, create=False)
     except FileNotFoundError:
-        return True
+        return UnreservedRemovalFolder()
     _ = stack.callback(os.close, descriptor)
-    held = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) and _lock_current(path, directory, descriptor)
-    if held:
-        _ = stack.callback(_locks.pop, descriptor, None)
-        _locks[descriptor] = path
-    return held
+    if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) or not _lock_current(path, directory, descriptor):
+        return RefusedRemovalLease()
+    _ = stack.callback(_locks.pop, descriptor, None)
+    _locks[descriptor] = path
+    return HeldFolderRemovalLease(path, directory, descriptor)
 
 
 def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
@@ -688,9 +842,32 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bo
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if not _hold_free_lease(Path(top) / stem, directory, stack, wait=wait):
+                if isinstance(_hold_free_lease(Path(top) / stem, directory, stack, wait=wait), RefusedRemovalLease):
                     return False
     return True
+
+
+@contextmanager
+def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = True) -> Generator[FolderRemovalLease]:
+    """Hold the collector's locks and return the reservation for a folder."""
+    metadata = _METADATA.fullmatch(path.name)
+    folder = path.with_name(metadata[1]) if metadata else path
+    with ExitStack() as stack:
+        try:
+            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
+            lease = _hold_free_lease(folder, directory, stack, wait=wait)
+            if not isinstance(lease, RefusedRemovalLease):
+                if metadata is not None:
+                    lease = UnreservedRemovalFolder()
+                elif children:
+                    with suppress(FileNotFoundError):
+                        if not _hold_child_leases(folder, stack):
+                            lease = RefusedRemovalLease()
+        except FileNotFoundError:
+            lease = UnreservedRemovalFolder()
+        except (OSError, ValueError):
+            lease = RefusedRemovalLease()
+        yield lease
 
 
 @contextmanager
@@ -702,18 +879,8 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
     A lock file or lease record is judged by its folder's lease. With children, also hold every lease below the folder; a held one, or an unreadable
     folder, is busy.
     """
-    metadata = _METADATA.fullmatch(path.name)
-    folder = path.with_name(metadata[1]) if metadata else path
-    with ExitStack() as stack:
-        try:
-            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
-            free = (_hold_free_lease(folder, directory, stack, wait=wait)
-                    and (metadata is not None or not children or _hold_child_leases(folder, stack)))
-        except FileNotFoundError:
-            free = True
-        except (OSError, ValueError):
-            free = False
-        yield free
+    with folder_removal_lease(path, children=children, wait=wait) as lease:
+        yield not isinstance(lease, RefusedRemovalLease)
 
 
 @contextmanager

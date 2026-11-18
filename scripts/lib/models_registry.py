@@ -189,6 +189,7 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
 
 class SharedRegistry(NamedTuple):
     repository: Path
+    git_directory: Path
 
 
 class UnpublishedRegistry(NamedTuple):
@@ -242,10 +243,12 @@ def _git(repo: Path, *arguments: str, input_text: str | None = None,
 
 def _publish_repository(path: Path) -> SharedRegistry | UnpublishedRegistry:
     if path.match(REGISTRY_PATH):
-        found = main_publish.git(path.parent, "rev-parse", "--show-toplevel")
-        repo = Path(found.stdout.strip())
-        if not found.returncode and path == repo.resolve() / REGISTRY_PATH:
-            return SharedRegistry(repo)
+        found = main_publish.git(path.parent, "rev-parse", "--show-toplevel", "--absolute-git-dir")
+        if not found.returncode:
+            top_level, git_directory = found.stdout.splitlines()
+            repo = Path(top_level)
+            if path == repo.resolve() / REGISTRY_PATH:
+                return SharedRegistry(repo, Path(git_directory))
     return UnpublishedRegistry()
 
 
@@ -312,13 +315,17 @@ def _catalog_replay(before: str, written: str, catalog: list[registry_rows.RowCh
 
 
 def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_rows.RegistryReplay) -> bool:
-    branch = _git(repo, "symbolic-ref", "--short", "HEAD")
+    head_and_branch = _git(repo, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").splitlines()
+    if len(head_and_branch) != 2 or not head_and_branch[1].startswith("refs/heads/"):
+        raise OSError("registry publication refused: HEAD is not on a branch")
+    base, reference = head_and_branch
+    branch = reference.removeprefix("refs/heads/")
     try:
         remote = _fetch(repo, branch)
     except OSError as error:
         raise OSError(f"registry publication refused: fetch failed: {error}") from error
     try:
-        _fast_forward(repo, path, remote, replay_registry=replay_registry)
+        _fast_forward(repo, path, remote, expected_head=base, replay_registry=replay_registry)
     except FastForwardCheckFailed as error:
         raise OSError(f"registry publication refused: fast-forward check failed: {error}") from error
     if foreign := _git(repo, "rev-list", "--abbrev-commit", f"{remote}..HEAD").split():
@@ -364,7 +371,7 @@ def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_
 
 def _publish_lock_path(target: SharedRegistry | UnpublishedRegistry, path: Path) -> Path:
     if isinstance(target, SharedRegistry):
-        return Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
+        return target.git_directory / "models-config.publish.lock"
     return path.with_name(path.name + ".lock")
 
 

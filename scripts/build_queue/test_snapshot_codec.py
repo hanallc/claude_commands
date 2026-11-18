@@ -15,9 +15,11 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, snapshot_with_head_cause, wait_reply
+from scripts.build_queue.queue_fixture import head_reading
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
-from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+from scripts.production.staff import StaffId
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,40 @@ def pinned_snapshot_reader(revision: str = "7fdfd9a6a") -> Generator[tuple[Calla
 
 
 class SnapshotCodecTests(unittest.TestCase):
+    def test_snapshot_replies_preserve_the_ended_step_identity(self) -> None:
+        reading = head_reading()
+        now = reading.explanation.now
+        run = LiveBuildRun(42, "start", now - 1)
+        identity = records.EndedStepFacts("test", "hana", "hana", "/fixture/hana", StaffId("fixed-director"))
+        held = records.BetweenStepsSlot(run, "finished", GIB, now + 10, identity)
+        for slot in (held, records.ContinuationSlot(held, "next")):
+            inputs = replace(reading.explanation.decided_from, slots=(slot,))
+            explanation = replace(reading.explanation, decided_from=inputs)
+            current = replace(reading, explanation=explanation)
+            for reply in (wire.ViewReply(current), wire.ExplainReply(explanation), wire.MineReply(current)):
+                with self.subTest(slot=type(slot).__name__, reply=type(reply).__name__):
+                    self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+
+            raw = cast(dict[str, object], codec.snapshot_value(inputs))
+            older, = cast(list[dict[str, object]], raw["slots"])
+            if isinstance(slot, records.ContinuationSlot):
+                older = cast(dict[str, object], older["slot"])
+            del older["identity"]
+            parsed = cast(records.QueueInputs, codec.parse_snapshot_value(raw, records.QueueInputs))
+            retained = replace(held, identity=records.HoldPredatesStepFacts())
+            expected = replace(slot, slot=retained) if isinstance(slot, records.ContinuationSlot) else retained
+            self.assertEqual(parsed, replace(inputs, slots=(expected,)))
+
+            older["identity"] = {"kind": "EndedStepIdentity", "source": "step", "name": "test hana",
+                                 "staff_id": "fixed-director"}
+            parsed = cast(records.QueueInputs, codec.parse_snapshot_value(raw, records.QueueInputs))
+            absent = records.EndedStepFactNotRecorded()
+            recovered = records.EndedStepFacts("test hana", records.PackageNotRecorded(), absent, absent,
+                                              StaffId("fixed-director"))
+            retained = replace(held, identity=recovered)
+            expected = replace(slot, slot=retained) if isinstance(slot, records.ContinuationSlot) else retained
+            self.assertEqual(parsed, replace(inputs, slots=(expected,)))
+
     def test_older_services_read_direct_requests_with_a_local_reason(self) -> None:
         reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
         for revision in (CI_CLIENT, "1be2f8932"):
@@ -258,6 +294,7 @@ class SnapshotCodecTests(unittest.TestCase):
             records.EstimateExpired: records.EstimateExpired(1000.0),
             records.BehindHead: records.BehindHead("organon", 900.0, "session"),
             records.GpuSlotWait: records.GpuSlotWait(1, 1),
+            placement.CargoFolderWait: placement.CargoFolderWait(),
             records.ReadyForAdmission: records.ReadyForAdmission(),
         }
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
@@ -279,7 +316,7 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
                         self.assertEqual(type(older_cause).__name__,
-                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld))
+                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld, placement.CargoFolderWait))
                                          else type(cause).__name__)
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
