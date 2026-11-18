@@ -64,7 +64,7 @@ from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
 from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
-from scripts.mac_test import eligibility
+from scripts.mac_test import eligibility, nextest_log
 from scripts.mac_test.eligibility import (
     MacVerb,
     NonBusyMacDeclineReason,
@@ -80,6 +80,7 @@ from scripts.lib import build_folders
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+MAC_NEXTTEST_SETUP_FAILURE = "mac_nextest_setup=failed"
 # The Mac cargo gate's links (scripts/mac_test/cargo_gate/bin) in the installed copy.
 MAC_CARGO_GATE_BIN = "$HOME/.claude/scripts/mac_test/cargo_gate/bin"
 
@@ -783,6 +784,13 @@ class ReportedMacStatus:
 
 
 @dataclass(frozen=True)
+class MacNextestSetupFailed:
+    """The remote command reported a nextest setup failure."""
+
+    cleanup: CleanupOutcome = CleanupUnconfirmed()
+
+
+@dataclass(frozen=True)
 class ToolVersionMismatch:
     """The reason describes incompatible local and remote tool versions."""
     reason: str
@@ -805,7 +813,8 @@ class UnresolvedSlotStartup:
     """The Linux slot refused startup because earlier ownership remains unresolved."""
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy
+RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -1078,7 +1087,7 @@ class ProcessController:
             for raw_line in output:
                 if isinstance(raw_line, bytes):
                     received_bytes += len(raw_line)
-                    line = raw_line.decode()
+                    line = raw_line.decode("utf-8", errors="replace")
                 else:
                     received_bytes += len(raw_line.encode("utf-8"))
                     line = raw_line
@@ -1111,13 +1120,16 @@ class ProcessController:
                     cleanup = CleanupUnconfirmed()
                     continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
-                if status_match is not None:
+                if status_match is not None or marker == MAC_NEXTTEST_SETUP_FAILURE:
                     if held_status_line:
                         print(held_status_line, end="", flush=True)
-                    status_digits = status_match.group(1).lstrip("0") or "0"
-                    mac_status = int(status_digits) if len(status_digits) <= 3 else 256
-                    status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
-                    if isinstance(status, ReportedMacStatus):
+                    if status_match is None:
+                        status = MacNextestSetupFailed()
+                    else:
+                        status_digits = status_match.group(1).lstrip("0") or "0"
+                        mac_status = int(status_digits) if len(status_digits) <= 3 else 256
+                        status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
+                    if isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
                         self.pending = AcknowledgedStartOperation()
                         held_status_line = line
                     else:
@@ -1153,10 +1165,12 @@ class ProcessController:
                 self.attempt_evidence.traffic.transfers.append({"operation": "ssh_run",
                     "sent_bytes": len(arguments[-1].encode("utf-8")),
                     "received_bytes": received_bytes, "complete": finished_output})
-        if mismatch and not isinstance(status, (ReportedMacStatus)):
+        if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
+        if isinstance(status, MacNextestSetupFailed):
+            return MacNextestSetupFailed(cleanup)
         if mirror_refused:
             return MirrorUseBusy()
         if isinstance(status, UnresolvedSlotStartup):
@@ -1343,7 +1357,7 @@ def write_backoff(until: float, target: str = "mac") -> None:
         return
 
 
-def ssh_options(config: SshConnectionSettings) -> list[str]:
+def ssh_options(config: SshConnectionSettings | eligibility.SshProbeSettings | OffloadConfig) -> list[str]:
     return [
         "-o",
         "BatchMode=yes",
@@ -1356,8 +1370,8 @@ def ssh_options(config: SshConnectionSettings) -> list[str]:
     ]
 
 
-def ssh_prefix(config: OffloadConfig) -> list[str]:
-    return ["ssh", *ssh_options(config.connection), config.host]
+def ssh_prefix(config: OffloadConfig | eligibility.SshProbeSettings) -> list[str]:
+    return ["ssh", *ssh_options(config), config.host]
 
 
 def linux_mirror_root() -> Path:
@@ -1366,7 +1380,7 @@ def linux_mirror_root() -> Path:
 
 def mac_mirror_root() -> MacMirrorRoot:
     """Read the remote mirror root without expanding the local home folder."""
-    return MacMirrorRoot.read(conf.read("mac_test"))
+    return conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
 
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1530,7 +1544,7 @@ def read_claim_answer(result: CapturedCommandResult, *,
 
 def probe_reachability(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | eligibility.SshProbeSettings,
 ) -> HostReachability:
     """Check SSH reachability without creating or inspecting a repository."""
     result = controller.capture(
@@ -1686,7 +1700,7 @@ def record_reachable(target: str = "mac") -> None:
 
 def probe_mac(
     controller: ProcessController,
-    config: OffloadConfig,
+    config: OffloadConfig | eligibility.SshProbeSettings,
     repository: KnownRepository,
     target: str = "mac",
     slot: int = 1,
@@ -1709,6 +1723,8 @@ def probe_mac(
 
     linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
     if linux:
+        if not isinstance(config, OffloadConfig):
+            raise ValueError("The Linux shell probe requires execution settings")
         from scripts.mac_test import linux_runner
         script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
                                                    repository.policy_name)
@@ -1744,7 +1760,7 @@ def probe_mac(
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
-            if not linux:
+            if not linux or not isinstance(config, OffloadConfig):
                 return succeeded(probe)
             expected = expected_linux_parity(controller, config)
             values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
@@ -1787,11 +1803,13 @@ class SweepFailed:
 
 
 def ensure_mac_disk_floor(
-    controller: ProcessController, config: OffloadConfig, repository: KnownRepository,
+    controller: ProcessController, config: OffloadConfig | eligibility.SshProbeSettings, repository: KnownRepository,
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
 ) -> MacDiskReady | SweepShort | SweepFailed:
     """Run one shared floor sweep, then read the Mac disk space again."""
-    if probe.free_gib >= config.free_floor_gib:
+    floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
+             else config.configuration.number("free_floor_gib"))
+    if probe.free_gib >= floor:
         return MacDiskReady(probe.free_gib)
     try:
         directory = eligibility.state_directory()
@@ -1808,8 +1826,11 @@ def ensure_mac_disk_floor(
                 _ = lock.truncate()
                 _ = lock.write("floor sweep was interrupted")
                 lock.flush()
-                settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
-                timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                if isinstance(config, OffloadConfig):
+                    settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
+                    timeout = conf.read(settings).number("floor_sweep_timeout_s")
+                else:
+                    timeout = config.configuration.number("floor_sweep_timeout_s")
                 result = controller.capture(
                     [*ssh_prefix(config),
                      "~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac"],
@@ -1835,10 +1856,12 @@ def ensure_mac_disk_floor(
                 return SweepFailed(cause or "floor sweep result missing")
             if not isinstance(after, ProbeSnapshot):
                 return SweepFailed("Mac disk reading failed after the floor sweep")
-            if after.free_gib < config.free_floor_gib:
+            if after.free_gib < floor:
                 return SweepShort(after.free_gib)
             return MacDiskReady(after.free_gib)
     except (OSError, ValueError) as error:
+        if isinstance(error, conf.Unusable) and isinstance(config, eligibility.SshProbeSettings):
+            raise
         return SweepFailed(f"floor sweep unavailable: {error}")
 
 
@@ -2033,9 +2056,17 @@ def remote_test_command(
         "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
         if isinstance(request.placement, AssignedOffloadRequest) else ""
     )
+    capture = ""
+    report_status = "; echo mac_exit=$?"
+    if request.verb == "nextest":
+        limits = nextest_log.output_limits(config.settings)
+        capture = nextest_log.capture_function(limits) + " && "
+        # The writer reports the child status. A failed launch takes the setup path.
+        report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
+    runner = "run_nextest_logged " if capture else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
-        f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
+        f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
@@ -2048,7 +2079,7 @@ def remote_test_command(
         f"{forced_config}"
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
+        f"{runner}~/.claude/scripts/lint/lint {invocation}{report_status}; {cleanup_command}"
     )
 
 
@@ -2549,6 +2580,11 @@ def claimed_run(
             if isinstance(copied, TreeCopyFailed):
                 return DeclinedMacRun("copy", elapsed_seconds(started), copied.detail)
             copy_seconds = elapsed_seconds(copy_started)
+        try:
+            step_command = remote_test_command(config, request, repository, copied.tree_key)
+        except ValueError as error:
+            evidence.execution = placement.ExecutionNotStarted()
+            return DeclinedMacRun("state", elapsed_seconds(started), str(error))
         eligibility.mirror_busy_path(repository.name, request.target).unlink(missing_ok=True)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
@@ -2594,8 +2630,7 @@ def claimed_run(
             evidence.launch_authorized = True
         release_allowed = False
         identity = controller.claim_identity
-        command = copies.remote_use_command(request_mirror(config, request, repository),
-                                           remote_test_command(config, request, repository, copied.tree_key))
+        command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         remote_status = controller.stream_mac_run(
@@ -2608,7 +2643,7 @@ def claimed_run(
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        if not isinstance(remote_status, ReportedMacStatus):
+        if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
                 if isinstance(settlement, StartUnsettled):
@@ -2633,8 +2668,11 @@ def claimed_run(
             return LostMacRun(elapsed_seconds(started), detail)
         if not linux:
             eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
-        fetched = fetch_folder(controller, config, request, repository) if isinstance(request.fetch, FetchFolder) else FetchNotRun()
-        if not linux and isinstance(request.fetch, FetchFolder):
+        setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
+                        or (linux and remote_status.status == os.EX_TEMPFAIL))
+        fetched = (fetch_folder(controller, config, request, repository)
+                   if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
+        if not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder):
             cleanup = controller.stream_mac_run([
                 *ssh_prefix(config),
                 copies.remote_use_command(request_mirror(config, request, repository),
@@ -2655,7 +2693,9 @@ def claimed_run(
             release_allowed = True
         sync_after_release = linux
         seconds = elapsed_seconds(started)
-        if linux and remote_status.status == 75:
+        if isinstance(remote_status, MacNextestSetupFailed) or setup_failed:
+            if not linux:
+                evidence.execution = placement.ExecutionNotStarted()
             return declined("state", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)
@@ -2767,8 +2807,9 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
             # A settings edit between reads permits one retry if the new settings stay current.
             refusal_settings = admission_records.RefusalSettings(admission_wire.placement_configuration_digest(
                 request.placement.assignment.destination.target, placement.ExplicitProviderSettings(transport.settings),
-                targets=target_config.read_targets(), transport_for=target_config.read_execution_transport,
-                read_bytes=Path.read_bytes))
+                targets=target_config.read_targets(selected=request.placement.assignment.destination.target,
+                                                   purpose=target_config.RegistryRead.PLACEMENT),
+                transport_for=target_config.read_execution_transport, read_bytes=Path.read_bytes))
         except (OSError, ValueError):
             pass
     policy = hana.fixed_policy(transport, str(request.repo_root), kind)
@@ -2786,7 +2827,7 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                      request: OffloadRequest, repository: KnownRepository, started: float) -> MacOffloadResult:
     """Keep the checked remote waiter until exact command and lifecycle settlement."""
     from scripts.aws_target import hana_box as box, hana_execution as execution, hana_placement as hana
-    from scripts.aws_target import hana_result, hana_source, hana_transport
+    from scripts.aws_target import hana_replacement_record, hana_result, hana_source, hana_transport
     from scripts.build_queue import admission_client
     from scripts.copies import copies
     from scripts.buildlog import record
@@ -2811,7 +2852,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     controller.pending = PendingHanaOperation()
 
     def settle_prelaunch(reference: placement.ProviderClaimReference, reason: str) -> None:
-        refusal = placement.HanaCommandAdmissionRefused(reason) if reason == placement.HANA_IMAGE_STALE else reason
+        refusal = (placement.HanaCommandAdmissionRefused(reason)
+                   if reason in (placement.HANA_IMAGE_STALE, hana_replacement_record.HELD) else reason)
         closed = execution.settle_unpublished_claim(lifecycle.directory, reference,
             release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=refusal)
         if isinstance(closed, execution.HanaAdmissionRefusalSettled):
@@ -2890,12 +2932,16 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     def permission() -> box.CommandPermission | box.ClaimRefused:
         nonlocal admission_refusal
         snapshot = lifecycle.inspect()
-        if isinstance(snapshot, (box.HanaUnprovisioned, box.HanaLifecycleUnavailable, box.HanaResourcesHeld)):
+        if isinstance(snapshot, box.HanaResourcesHeld):
+            admission_refusal = placement.HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY)
+            return box.ClaimRefused(admission_refusal.reason)
+        if isinstance(snapshot, (box.HanaUnprovisioned, box.HanaLifecycleUnavailable)):
             return box.ClaimRefused('The Hana acknowledged permit is unavailable')
         if not isinstance(snapshot.permit, box.DeliveredPermit):
             return box.ClaimRefused('The Hana acknowledged permit is unavailable')
         result = lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
-        if isinstance(result, box.ClaimRefused) and result.reason == placement.HANA_IMAGE_STALE:
+        if isinstance(result, box.ClaimRefused) and result.reason in (
+                placement.HANA_IMAGE_STALE, box.HANA_CLAIM_BUSY, hana_replacement_record.HELD):
             admission_refusal = placement.HanaCommandAdmissionRefused(result.reason)
         return result
 

@@ -138,7 +138,8 @@ class _PlacementAdapter(Protocol):
     def fixed_policy(self, transport: HanaControlTransport, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
         ...
 
-    def read_evidence(self, key: placement.HostEvidenceKey, request: HanaEvidenceRequest) -> placement.HostEvidence:
+    def read_evidence(self, key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                      transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
         ...
 
 
@@ -200,9 +201,10 @@ def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) ->
     return _adapter().fixed_policy(transport, repository, kind)
 
 
-def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) -> placement.HostEvidence:
-    """Project existing lifecycle and execution records without provider mutations."""
-    return _adapter().read_evidence(key, request)
+def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                  transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
+    """Use the workload that selected the Hana transport to read evidence."""
+    return _adapter().read_evidence(key, request, transport=transport, workload=workload)
 
 
 def __getattr__(name: str) -> object:

@@ -29,7 +29,9 @@ IAM_PATH = '/aws-build/'
 OWNER_TAG = {'Key': 'ManagedBy', 'Value': 'aws-build-plan-identity'}
 CHANGE_SET_PREFIX = 'aws-build-plan-'
 CREATE_COMMAND = 'deploy.py plan-identity --approve-resources'
+CHECK_COMMAND = 'deploy.py plan-identity --check'
 DOWN_COMMAND = 'deploy.py down --workload plan-identity --approve-destroy'
+REPLACE_KEY_COMMANDS = f'{DOWN_COMMAND}, then {CREATE_COMMAND}'
 
 READ_ACTIONS = (
     'budgets:ViewBudget',
@@ -77,11 +79,30 @@ class PlanAgentCold(PlanIdentityRefused):
     """The GPG agent cannot decrypt without a passphrase."""
 
 
-@final
+class PlanKeyRejected(PlanIdentityRefused):
+    """STS rejected the plan key as unknown or invalid."""
+
+
+class MalformedPlanKey(PlanIdentityRefused):
+    """The saved plan key has invalid fields."""
+
+
+class InvalidIdentityKey(PlanIdentityRefused):
+    """The access key ID or secret cannot identify a long-term AWS key."""
+
+
+class EncryptionRecipientUnavailable(PlanIdentityRefused):
+    """GPG could not identify one recipient for encryption."""
+
+
 class PlanAwsRefused(PlanIdentityRefused):
     def __init__(self, message: str, code: str = '') -> None:
         super().__init__(message)
-        self.code = code
+        self.code: str = code
+
+
+class AwsDidNotAnswer(PlanAwsRefused):
+    """The AWS CLI timed out or could not connect."""
 
 
 @dataclass(frozen=True, repr=False)
@@ -167,7 +188,7 @@ class PlanCredentials:
     owner: PlanAccount
 
     def environment(self) -> dict[str, str]:
-        return _aws_environment(os.environ, self.access_key_id, self.secret_access_key)
+        return credential_environment(os.environ, self.access_key_id, self.secret_access_key)
 
     def encode(self) -> bytes:
         return json.dumps({'version': 1, 'AccessKeyId': self.access_key_id, 'SecretAccessKey': self.secret_access_key,
@@ -182,10 +203,12 @@ class PlanCredentials:
                 raise ValueError
             return cls(ledger.text(row, 'AccessKeyId'), ledger.text(row, 'SecretAccessKey'), owner)
         except ValueError:
-            raise PlanIdentityRefused('The encrypted AWS plan credential has invalid fields.') from None
+            raise MalformedPlanKey('The encrypted AWS plan credential has invalid fields.') from None
 
 
-def _aws_environment(environment: Mapping[str, str], key: str, secret: str) -> dict[str, str]:
+def credential_environment(environment: Mapping[str, str], key: str, secret: str) -> dict[str, str]:
+    if re.fullmatch(r'AKIA[A-Z0-9]{16}', key) is None or re.fullmatch(r'[A-Za-z0-9/+=]{40}', secret) is None:
+        raise InvalidIdentityKey('The AWS access key ID or secret has an invalid format.')
     clean = {name: value for name, value in environment.items() if not name.startswith('AWS_')}
     clean.update(AWS_ACCESS_KEY_ID=key, AWS_SECRET_ACCESS_KEY=secret, AWS_EC2_METADATA_DISABLED='true',
                  AWS_CONFIG_FILE='/dev/null', AWS_SHARED_CREDENTIALS_FILE='/dev/null', AWS_MAX_ATTEMPTS='1',
@@ -211,7 +234,7 @@ def _gpg(*arguments: str, content: bytes = b'', interactive: bool = False) -> su
         raise PlanIdentityRefused('GPG could not complete the AWS plan credential operation.') from None
 
 
-def _decrypt(content: bytes, *, interactive: bool = False) -> bytes:
+def decrypt_credential(content: bytes, *, interactive: bool = False) -> bytes:
     result = _gpg('--status-fd', '2', '--decrypt', content=content, interactive=interactive)
     if result.returncode:
         errors = (match[1] for match in re.finditer(
@@ -222,16 +245,16 @@ def _decrypt(content: bytes, *, interactive: bool = False) -> bytes:
     return result.stdout
 
 
-def _encryption_recipient() -> str:
+def encryption_recipient() -> str:
     token = Path.home() / '.config/gh/token.gpg'
     result = _gpg('--list-only', '--status-fd', '1', '--decrypt', str(token))
     keys = [match[1] for match in re.finditer(rb'^\[GNUPG:\] ENC_TO ([0-9A-F]{16}) ', result.stdout, re.M)]
     if result.returncode or len(keys) != 1 or keys[0] == b'0000000000000000':
-        raise PlanIdentityRefused('GPG could not identify the one recipient of the encrypted GitHub token.')
+        raise EncryptionRecipientUnavailable('GPG could not identify the one recipient of the encrypted GitHub token.')
     return keys[0].decode('ascii') + '!'
 
 
-def _encrypt(recipient: str, content: bytes) -> bytes:
+def encrypt_credential(recipient: str, content: bytes) -> bytes:
     result = _gpg('--trust-model', 'always', '--no-encrypt-to', '--recipient', recipient,
                   '--output', '-', '--encrypt', content=content)
     if result.returncode or not result.stdout:
@@ -239,17 +262,21 @@ def _encrypt(recipient: str, content: bytes) -> bytes:
     return result.stdout
 
 
+def read_private_ciphertext(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as stream:
+        mode = os.fstat(stream.fileno()).st_mode
+        if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+            raise OSError
+        content = stream.read(65537)
+        if not content or len(content) > 65536:
+            raise OSError
+        return content
+
+
 def _read_encrypted(path: Path) -> bytes:
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(descriptor, 'rb') as stream:
-            mode = os.fstat(stream.fileno()).st_mode
-            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
-                raise OSError
-            content = stream.read(65537)
-            if not content or len(content) > 65536:
-                raise OSError
-            return content
+        return read_private_ciphertext(path)
     except FileNotFoundError:
         raise PlanIdentityRefused(f'The AWS plan key is missing. On natedev, run {CREATE_COMMAND}.') from None
     except OSError:
@@ -257,7 +284,7 @@ def _read_encrypted(path: Path) -> bytes:
 
 
 def _stored_credentials(path: Path) -> PlanCredentials:
-    return PlanCredentials.decode(_decrypt(_read_encrypted(path)))
+    return PlanCredentials.decode(decrypt_credential(_read_encrypted(path)))
 
 
 def plan_credentials() -> PlanCredentials:
@@ -282,12 +309,12 @@ def _key_for_setup(path: Path) -> PlanCredentials | PlanKeyToCreate:
         raise PlanIdentityRefused(
             'Cannot read the AWS plan key at ~/.config/aws-build/plan.gpg. '
             + 'Run github-warmup in a terminal on natedev. '
-            + 'If the file is damaged, delete it and run the command again.') from None
+            + f'If the file is damaged, run {REPLACE_KEY_COMMANDS}.') from None
 
     with _step('check encryption to the GitHub token key'):
-        recipient = _encryption_recipient()
+        recipient = encryption_recipient()
         sample = b'AWS plan encryption check'
-        if _decrypt(_encrypt(recipient, sample)) != sample:
+        if decrypt_credential(encrypt_credential(recipient, sample)) != sample:
             raise PlanIdentityRefused('GPG did not confirm the AWS plan encryption key.')
     return PlanKeyToCreate(recipient)
 
@@ -303,6 +330,7 @@ class IdentityApi:
 
     def call(self, service: str, operation: str, **parameters: object) -> dict[str, object]:
         try:
+            # Only the same user and root can read the key in the CLI process environment.
             result = subprocess.run(
                 ['aws', '--region', self.region, service, operation, '--output', 'json', '--cli-error-format', 'legacy',
                  '--cli-input-json', json.dumps(parameters)],
@@ -310,17 +338,74 @@ class IdentityApi:
         except OSError:
             raise PlanAwsRefused(f'The aws command did not start for {operation}.') from None
         except subprocess.TimeoutExpired:
-            raise PlanAwsRefused(f'The aws command timed out for {operation}.') from None
+            raise AwsDidNotAnswer(f'The aws command timed out for {operation}.') from None
         if result.returncode == 252:
             raise PlanAwsRefused(f'The aws command refused its arguments for {operation}.')
         if result.returncode:
-            code = aws_error_code(AwsUnavailable(result.stderr.decode(errors='replace')))
+            diagnostic = result.stderr.decode(errors='replace')
+            if diagnostic.lstrip().removeprefix('aws: [ERROR]: ').startswith((
+                'Could not connect to the endpoint URL:', 'Failed to connect to proxy URL:',
+                'Connect timeout on endpoint URL:', 'Read timeout on endpoint URL:',
+                'Connection was closed before we received a valid response', 'SSL validation failed for ',
+            )):
+                raise AwsDidNotAnswer(f'AWS did not answer {operation}.')
+            code = aws_error_code(AwsUnavailable(diagnostic))
             detail = f' ({code})' if code else ''
             raise PlanAwsRefused(f'AWS did not confirm {operation}.{detail}', code)
         try:
             return ledger.mapping(cast(object, json.loads(result.stdout))) if result.stdout.strip() else {}
         except ValueError:
             raise PlanIdentityRefused(f'AWS returned an invalid reply for {operation}.') from None
+
+
+def _confirmed_plan_account(reply: dict[str, object], owner: PlanAccount) -> PlanAccount:
+    if reply.get('Arn') != owner.user_arn or reply.get('Account') != owner.account:
+        raise PlanIdentityRefused('STS did not confirm the AWS plan user.')
+    return PlanAccount.from_identity(reply)
+
+
+def _verify_plan_key(api: IdentityApi, owner: PlanAccount, *, retry: bool = False) -> PlanAccount:
+    def read() -> dict[str, object]:
+        return api.call('sts', 'get-caller-identity')
+
+    try:
+        reply = _retry_proof(read) if retry else read()
+    except PlanAwsRefused as error:
+        if error.code in ('InvalidClientTokenId', 'UnrecognizedClientException'):
+            raise PlanKeyRejected(f'AWS rejected the saved plan key. Run {REPLACE_KEY_COMMANDS}.') from None
+        raise
+    return _confirmed_plan_account(reply, owner)
+
+
+def verified_plan_account(settings: Path) -> PlanAccount:
+    """Read the build account from STS with the saved plan key."""
+    region = conf.read(settings).text('region')
+    key = plan_credentials()
+    api = IdentityApi(region, 15, key.environment())
+    return _verify_plan_key(api, key.owner)
+
+
+def command_check(settings: Path) -> int:
+    try:
+        _ = verified_plan_account(settings)
+    except PlanAgentCold:
+        print('plan-identity: refused: The plan key is locked. Run github-warmup.', file=sys.stderr)
+        return 1
+    except PlanKeyRejected as error:
+        print(f'plan-identity: refused: {error}', file=sys.stderr)
+        return 1
+    except AwsDidNotAnswer:
+        print(f'plan-identity: refused: AWS did not answer. Run {CHECK_COMMAND} again.', file=sys.stderr)
+        return 1
+    except (MalformedPlanKey, InvalidIdentityKey):
+        print(f'plan-identity: refused: The saved plan key has invalid fields. Run {REPLACE_KEY_COMMANDS}.',
+              file=sys.stderr)
+        return 1
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(f'plan-identity: refused: Cannot verify the plan key. Run {CREATE_COMMAND}.', file=sys.stderr)
+        return 1
+    print('plan-identity: ready')
+    return 0
 
 
 @contextmanager
@@ -405,9 +490,7 @@ def _revoke_failed_creation(api: IdentityApi, path: Path, known_key: str) -> boo
 
 def _prove(api: IdentityApi, owner: PlanAccount) -> None:
     with _step('check the stored key with STS'):
-        reply = _retry_proof(lambda: api.call('sts', 'get-caller-identity'))
-        if reply.get('Arn') != owner.user_arn or reply.get('Account') != owner.account:
-            raise PlanIdentityRefused('STS did not confirm the AWS plan user.')
+        _ = _verify_plan_key(api, owner, retry=True)
 
     with _step('read availability zones with the stored key'):
         reply = _retry_proof(lambda: api.call('ec2', 'describe-availability-zones'))
@@ -429,7 +512,7 @@ def _prove(api: IdentityApi, owner: PlanAccount) -> None:
 
 def _admin_api(settings: Path, region: str, timeout: float) -> IdentityApi:
     environment = admin_secrets.AdminSecretSession(settings).environment()
-    return IdentityApi(region, timeout, _aws_environment(
+    return IdentityApi(region, timeout, credential_environment(
         environment, environment['AWS_ACCESS_KEY_ID'], environment['AWS_SECRET_ACCESS_KEY']))
 
 
@@ -442,7 +525,7 @@ def _create_key(api: IdentityApi, owner: PlanAccount, recipient: str, path: Path
             key = ledger.text(row, 'AccessKeyId')
         with _step('encrypt the new access key'):
             credential = PlanCredentials(key, ledger.text(row, 'SecretAccessKey'), owner)
-            ciphertext = _encrypt(recipient, credential.encode())
+            ciphertext = encrypt_credential(recipient, credential.encode())
         with prepared_replacement(path, ciphertext, mode=0o600) as temporary:
             with _step('decrypt the stored key through GPG'):
                 stored = _stored_credentials(temporary)
@@ -451,8 +534,7 @@ def _create_key(api: IdentityApi, owner: PlanAccount, recipient: str, path: Path
                 _require_missing_plan_key(path)
                 prepared_file = temporary.stat()
                 try:
-                    # This rename commits setup. Setup calls DeleteAccessKey only while plan.gpg is absent.
-                    # The approved down --workload plan-identity --approve-destroy command is the exception.
+                    # Setup publishes the key with this rename.
                     os.replace(temporary, path)
                     published = True
                 except (OSError, KeyboardInterrupt):
@@ -462,7 +544,7 @@ def _create_key(api: IdentityApi, owner: PlanAccount, recipient: str, path: Path
                         pass
                     raise
         sync_folder(path.parent)
-    except (Exception, KeyboardInterrupt):
+    except (Exception, KeyboardInterrupt) as error:
         if published:
             print('plan-identity: warning: the key is published. Setup could not confirm local cleanup or directory sync.',
                   file=sys.stderr, flush=True)
@@ -476,6 +558,9 @@ def _create_key(api: IdentityApi, owner: PlanAccount, recipient: str, path: Path
             if not found_key:
                 raise PlanIdentityRefused(
                     f'An IAM key can still appear. Run {CREATE_COMMAND} again on natedev to remove it.') from None
+        if isinstance(error, PlanKeyRejected):
+            raise PlanIdentityRefused(
+                f'AWS has not accepted the plan key yet. Run {CREATE_COMMAND} again after one minute.') from None
         raise
 
 
@@ -608,19 +693,15 @@ def command_down(settings: Path, *, approve_destroy: bool) -> None:
         with _step('confirm the administrator account'):
             api = _admin_api(settings, region, timeout)
             owner = PlanAccount.from_identity(api.call('sts', 'get-caller-identity'))
-        remove_local = True
         if os.path.lexists(path):
             try:
-                credential = PlanCredentials.decode(_decrypt(_read_encrypted(path), interactive=True))
+                credential = PlanCredentials.decode(decrypt_credential(_read_encrypted(path), interactive=True))
             except PlanIdentityRefused:
-                remove_local = False
+                pass
             else:
                 if credential.owner != owner:
                     raise PlanIdentityRefused('The local plan key belongs to a different AWS account.')
         _remove(api, owner)
-        if not remove_local:
-            print('plan-identity: kept the local encrypted file because its account could not be confirmed.', flush=True)
-            return
         with _step('remove the local encrypted plan key'):
             path.unlink(missing_ok=True)
             sync_folder(path.parent)
