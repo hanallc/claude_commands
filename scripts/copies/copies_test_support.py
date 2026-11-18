@@ -5,10 +5,29 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
+import unittest
 
+from scripts.build_queue import admission_client, admission_protocol as wire
 from scripts.copies import copies
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import memory_test_support
+
+
+class AdmissionWaitReached(RuntimeError):
+    """Stop a private caller after its first admission wait."""
+
+
+@contextmanager
+def stop_before_slot(test: unittest.TestCase, slot_root: Path) -> Generator[None]:
+    """Check the real slot state when the private service makes the caller wait."""
+    def observe(reply: wire.Wait) -> None:
+        test.assertGreater(reply.snapshot.peak.bytes, 0)
+        test.assertFalse(slot_root.exists(), f"the waiting caller created a slot: {slot_root}")
+        test.assertEqual(list(slot_root.glob("*.lease.json")), [])
+        raise AdmissionWaitReached("the private admission wait has no slot")
+
+    with mock.patch.object(admission_client.WaitOutput, "__call__", new=staticmethod(observe)):
+        yield
 
 
 def copies_environment(root: Path, *, repository: str = "fixture") -> dict[str, str]:

@@ -1,6 +1,7 @@
 """Keep exclusive locks across concurrent operations and exceptions."""
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import unittest
@@ -11,6 +12,22 @@ from scripts.lib import file_lock
 
 
 class FileLockTests(unittest.TestCase):
+    def test_closing_a_parent_handle_keeps_the_inherited_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "operation.lock"
+            parent = file_lock.take_exclusive(path)
+            assert isinstance(parent, file_lock.ExclusiveLock)
+            inherited = file_lock.ExclusiveLock(os.dup(parent.descriptor))
+            parent.close()
+            try:
+                self.assertIs(file_lock.take_exclusive(path), file_lock.LockResult.BUSY)
+                with file_lock.exclusive(path, wait=False) as held:
+                    self.assertIs(held, file_lock.LockResult.BUSY)
+            finally:
+                inherited.release()
+            with file_lock.exclusive(path, wait=False) as released:
+                self.assertIs(released, file_lock.LockResult.ACQUIRED)
+
     def test_blocking_acquire_continues_after_the_holder_releases(self) -> None:
         with tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(max_workers=1) as executor:
             path = Path(directory) / "operation.lock"

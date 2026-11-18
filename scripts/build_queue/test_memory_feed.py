@@ -41,6 +41,8 @@ from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.lib.build_steps import OTHER_COMMAND, StepJob, command_job, read_step_names
 from scripts.message import unit_labels
+from scripts.production import staff
+from scripts.review_links import staff_names
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
 
@@ -116,6 +118,15 @@ class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
     configuration: Path = Path()
+
+    def test_each_reading_shares_current_staff_role_names_with_the_page(self) -> None:
+        runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("fixture-runner"))
+        owner = unit_labels.make_labels("fixture-runner", unit_labels.RunsProduction("fixture-runner"), unit_labels.NoDirector())
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner,))):
+            page = self.owner_machine_page(owner)
+        self.assertIn('data-color-text="role.showrunner"', page.get("staff_names", {}).get(runner.name, ""))
+        self.assertNotIn("nate", page.get("staff_names", {}))
 
     def test_the_token_pool_names_its_memory_pause(self) -> None:
         gib = admission_records.GIB
@@ -277,6 +288,7 @@ class MemoryFeedTests(unittest.TestCase):
                     page = memory_feed.reading()
                 rows = [row for row in page["walk"] if row.get("machine") == machine]
                 self.assertEqual(len(rows), 1)
+                self.assertEqual(staff_names.parts_text(rows[0].get("name_parts", [])), rows[0]["name"])
                 self.assertEqual(rows[0].get("slot"), expected)
                 # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
                 self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
@@ -285,6 +297,8 @@ class MemoryFeedTests(unittest.TestCase):
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
                 self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
                 self.assertTrue(all("slot" not in row for row in page["waiters"]))
+                for waiting in page["waiters"]:
+                    self.assertEqual(staff_names.parts_text(waiting.get("name_parts", [])), waiting["name"])
                 # A natedev step that waits in a slot names it too; the waiting table shows no slot number.
                 in_slot = expected != "—" if machine == "natedev" else label == "other machine root"
                 self.assertEqual([(row.get("slot_folder"), row.get("slot_machine")) for row in page["waiters"]],
@@ -319,6 +333,12 @@ class MemoryFeedTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
+        _ = write_config_fixture(self.root / "build_steps.conf",
+            "changes.default=no branch\nchanges.integrate={branch} branch\n"
+            + "names.integrate=integrate\nnames.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
+            + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
+            + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
+            + "owned.showrunner-default=showrunner {step}\nowned.showrunner-merge-gate=showrunner merge\n")
         self.configure()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
         proc = self.root / "proc"
@@ -396,15 +416,16 @@ class MemoryFeedTests(unittest.TestCase):
                         self.assertEqual(send.call_count, 3)
 
     def configure(self, *, seconds: float = 0.125) -> None:
-        source = Path(__file__).resolve().parents[2] / "config/memory_feed.conf"
-        text = source.read_text().replace("output_folder=~/.local/share/review-links/h7uj5c", f"output_folder={self.output}")
-        text = text.replace("interval_seconds=3", f"interval_seconds={seconds}").replace("# range: 1..60", "# range: 5e-324..")
-        _ = self.configuration.write_text(text)
+        _ = write_config_fixture(self.configuration,
+                                 f"output_folder={self.output}\n# range: 5e-324..\ninterval_seconds={seconds}\n"
+                                 + "history_days=7\nswap_rows=6\nreport_refresh_seconds=300\n"
+                                 + "other_rows=6\ntoken_dump_seconds=10\nstevie_program=/run/current-system/sw/bin/stevie\n")
 
     def expected_page(self, seconds: float = 0.125) -> str:
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
         self.assertIn(console_theme.TOKENS, page)
-        return page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+        return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+                .replace('</head>', staff_names.script({}) + '</head>', 1))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()
@@ -805,6 +826,7 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(memory_feed.mac_build_units((replace(build, session="unclaimed"),), (claim,)), {})
 
     def test_old_native_mac_readings_hide_their_process_rows(self) -> None:
+        _ = write_config_fixture(self.configuration, "mac_activity_refresh_seconds=30\n")
         baseline = reservation_reading()
         now = baseline.explanation.now
         build = queue_view.MacBuild(710001, "/Users/nate/mac-clone", now - 120)
@@ -951,7 +973,7 @@ process.stdout.write(JSON.stringify({
 
     def test_served_page_allows_same_origin_framing(self) -> None:
         for name in ("review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{name}.conf", self.root / f"{name}.conf")
+            _ = write_config_fixture(self.root / f'{name}.conf')
         server_fixture = test_serve.ReviewLinksServerTests()
         self.addCleanup(server_fixture.doCleanups)
         server_fixture.setUp()
@@ -1001,9 +1023,7 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
-                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
-                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
+                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
                     self.assertEqual(memory_feed.main(["--once"]), 0)
@@ -1024,9 +1044,7 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
-                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
-                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
-                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
+                _ = write_config_fixture(self.root / "console.conf", f"status.builds.age_limit_seconds={stale}\n")
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
                     _ = memory_feed.main(["--once"])
@@ -1173,8 +1191,7 @@ process.stdout.write(JSON.stringify({
         for interval, expected in ((30, [710001, 710001, 710002]), (60, [710001, 710001, 710001])):
             with self.subTest(interval=interval):
                 self.configure()
-                _ = self.configuration.write_text(self.configuration.read_text().replace(
-                    "mac_activity_refresh_seconds=30", f"mac_activity_refresh_seconds={interval}"))
+                _ = write_config_fixture(self.configuration, f"mac_activity_refresh_seconds={interval}\n")
                 builds = iter((710001, 710002))
                 published: list[int] = []
 
@@ -1317,8 +1334,47 @@ process.stdout.write(JSON.stringify({
         reading = self.owner_swap_reading(owner)
         row, = [row for row in reading.rows if row.get("unit") == "research"]
         self.assertEqual(row.get("showrunner"), "hana")
+        self.assertEqual(row.get("title_kind"), "program")
         self.assertEqual(row["bytes"], admission_records.GIB)
         self.assertEqual(sum(row["bytes"] for row in reading.rows if row["kind"] != "total"), reading.used)
+
+    def test_swap_details_keep_staff_references_separate_from_paths(self) -> None:
+        owner = unit_labels.make_labels("builder", unit_labels.UnderShowrunner("hana", "hana", ""),
+                                       unit_labels.UnderDirector("research", "research", ""))
+        reading = self.owner_swap_reading(owner)
+        row, = [row for row in reading.rows if row.get("unit") == "research"]
+        self.assertEqual(row["detail"], "builder · builds.slice/owner.scope")
+        self.assertEqual(row.get("detail_parts"), [{"kind": "staff", "text": "builder"},
+            {"kind": "text", "text": " · builds.slice/owner.scope"}])
+        self.assertEqual(staff_names.parts_text(row.get("detail_parts", [])), row["detail"])
+
+    def test_grouped_process_labels_keep_staff_references_separate_from_programs(self) -> None:
+        reading = captured_reading(running=(leftover_step(45, small=True),))
+        owner = unit_labels.UnitLabels("helper", "hana", "builder")
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value={"fixture": owner})):
+            page = memory_feed.reading()
+        grouped, = [cast(memory_feed.RunRow, row) for row in page["walk"] if row.get("group")]
+        part, = grouped["parts"]
+        self.assertEqual(part.get("who_parts"), [{"kind": "staff", "text": "builder"},
+            {"kind": "text", "text": " · python3"}])
+        self.assertEqual(staff_names.parts_text(part.get("who_parts", [])), part["who"])
+
+    def test_gate_descriptions_and_mac_hold_reasons_keep_staff_parts(self) -> None:
+        from scripts.build_queue.test_target_availability import MAC_BLOCK
+
+        names = read_step_names()
+        notes = memory_feed.job_notes(StepJob("test-all"), "builder", names)
+        self.assertEqual(notes.get("about_parts"), [{"kind": "text", "text": "Tests every module of "},
+            {"kind": "staff", "text": "builder"}, {"kind": "text", "text": "."}])
+        self.assertEqual(staff_names.parts_text(notes.get("about_parts", [])), notes.get("about"))
+        routes = target_availability.MacRoutes((snapshot(MAC, MAC_BLOCK),),
+            {"mac-session": unit_labels.UnitLabels("helper", "hana", "builder")}, UTC)
+        hold = memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/fixture", "")
+        parts = hold.get("because_parts")
+        self.assertIsNotNone(parts)
+        self.assertEqual([part["text"] for part in parts or [] if part["kind"] == "staff"], ["builder", "hana"])
+        self.assertEqual("".join(part["text"] for part in parts or []), hold.get("because"))
 
     def test_swap_keeps_the_unattributed_bytes_without_rounding_them_away(self) -> None:
         self.host_swap(2 ** 20, 2 ** 20)
@@ -1366,6 +1422,7 @@ process.stdout.write(JSON.stringify({
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual({row["name"] for row in swap.rows if row["kind"] == "owner"}, set(labels))
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
+        self.assertTrue(all(row.get("title_kind") == "staff" for row in swap.rows if row["kind"] == "owner"))
 
     def test_swap_small_groups_and_total_use_the_same_current_host_reading(self) -> None:
         self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
@@ -1387,6 +1444,18 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["swap_by"][1]["bytes"], admission_records.GIB)
                 self.assertEqual(page["ram"]["swap_target_bytes"], returned)
                 self.assertEqual(page["ram"]["swap_covered_bytes"], returned)
+
+    def test_swap_smaller_members_keep_the_staff_title_marker(self) -> None:
+        rows = [memory_feed.swap_row(name, "", 1024, "outside", "owner")
+                for name in ("staff owner", "program", "old reading")]
+        rows[0]["title_kind"] = "staff"
+        rows[1]["title_kind"] = "program"
+        grouped, = memory_feed.pool_rows(rows, (), "outside", 3072, 0)
+        self.assertEqual(grouped["kind"], "smaller")
+        self.assertEqual(grouped["members"], [
+            {"name": "staff owner", "bytes": 1024, "title_kind": "staff"},
+            {"name": "program", "bytes": 1024, "title_kind": "program"},
+            {"name": "old reading", "bytes": 1024, "title_kind": "program"}])
 
     def test_between_steps_holds_name_their_distinct_owners(self) -> None:
         reading = captured_reading()
@@ -1498,7 +1567,7 @@ process.stdout.write(JSON.stringify({
                 _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
-                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/console.conf", installed / "config/console.conf")
+                _ = write_config_fixture(installed / 'config/console.conf')
                 probe = textwrap.dedent("""
                     import builtins
                     import json
@@ -1884,6 +1953,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(memory_feed.wait_why(reason), expected)
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
+        _ = write_config_fixture(self.root / "mac_test.conf", "stale_seconds=300\n")
         _ = write_idle_config(self.root)
         reading = captured_reading()
         now = reading.explanation.now
@@ -2008,6 +2078,10 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual({row.get("machine") for row in page["walk"]}, {"fixture", "mac", "aws"})
                 for row in (*page["walk"], *page["waiters"]):
                     self.assertEqual(row["name"], name)
+                    parts = row.get("name_parts", [])
+                    self.assertEqual(staff_names.parts_text(parts), name)
+                    self.assertEqual([part["text"] for part in parts if part["kind"] == "staff"],
+                                     ["research"] if owner.role is unit_labels.OwnerRole.UNIT else [])
                     self.assertEqual(row.get("showrunner"), "hana")
                     self.assertEqual(row["unit"], owner.unit)
 
@@ -2036,6 +2110,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["nextest"])
         local, = [row for row in page["walk"] if not row.get("kind")]
         self.assertEqual(local["name"], "fixture-project nextest")
+        for row in (*page["walk"], *page["waiters"]):
+            self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
 
     def test_cloud_page_names_use_the_owner_in_running_and_waiting_tables(self) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
@@ -2390,6 +2466,7 @@ process.stdout.write(JSON.stringify({
         for registered, registered_use, unregistered_use, kept in (
                 ((), 0, 6, 0), ((700001,), 2, 4, 6), ((700001, 700002), 6, 0, 10)):
             with self.subTest(registered=registered), AdmissionFixture() as fixture:
+                fixture.configure(safety_gib=3)
                 owners: list[wire.Owner] = []
                 for pid, worker, used in ((700001, 700011, 2), (700002, 700012, 4)):
                     owner = fixture.fixture_owner(pid, str(pid))

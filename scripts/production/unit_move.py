@@ -449,6 +449,18 @@ def prepare_rename(row: staff.StaffRow, destination: Path, branch: str | KeepBra
     return pending
 
 
+def rename_unstarted(record: staff.StaffSnapshot, row: staff.StaffRow, pending: PendingRename) -> bool:
+    """Confirm that the recorded folder and branch move has not started."""
+    if (isinstance(row.worktree, staff.WorktreeUnfilled)
+            or row.worktree.path.expanduser().resolve() != pending.source
+            or exists(pending.destination)):
+        return False
+    checkout = move_checkout(record, row)
+    return (checkout == pending.source and checkout.exists()
+            and checked_out_branch(checkout) == pending.source_branch
+            and not _worktree_lock(checkout).exists())
+
+
 def rename_observation(record: staff.StaffSnapshot, row: staff.StaffRow,
                        pending: PendingRename) -> tuple[Path, str]:
     """Accept only the recorded folder paths and branch names."""

@@ -867,6 +867,7 @@ class CrateRun:
 
     @contextmanager
     def frozen_checkout(self, manifest: Manifest) -> Generator[Path]:
+        # This checkout supplies pinned rule files without a queue step.
         with copies.standing(self.owner, self.repo, copies.CommittedSource(manifest["base"]), step="style") as checkout:
             yield checkout
 
@@ -1122,8 +1123,9 @@ class CrateRun:
                         raise bulk.BulkRenameError("worker checkout moved after commit")
                     if run.git(checkout, "status", "--porcelain", "--untracked-files=no"):
                         raise bulk.BulkRenameError("worker files changed after commit")
-                    tested_checkout = validation_checkouts.enter_context(copies.standing(
-                        self.owner, checkout, copies.CommittedSource(commit), step="test"))
+                    command = ("bash", str(Path.home() / ".claude/scripts/direct/verify.sh"), "final")
+                    tested_checkout = validation_checkouts.enter_context(copies.command_tree(
+                        self.owner, checkout, copies.CommittedSource(commit), command, step="test"))
                     result = run.test_tree(tested_checkout, commit, result_evidence["tree"], runner, {}, owner=self.owner)
                     if result.code:
                         self.abandon(manifest, record, "tests failed: " + run.first_failing_test(result),
@@ -1391,6 +1393,7 @@ class CrateRun:
                 if isinstance(validation, HeldCrateValidation):
                     validation.release()
                 source_commit = candidate
+                # Raw Cargo validation precedes the queue steps in this checkout.
                 checkout_scope = copies.standing(self.owner, self.repo, copies.CommittedSource(candidate), step="test")
             with checkout_scope as checkout:
                 tree = run.git(checkout, "rev-parse", "HEAD^{tree}")
