@@ -28,7 +28,9 @@ class HanaSetupTests(CostFixture):
         self.workload = self.root / 'hana_aws.conf'
         _ = self.workload.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
         for key, value in {'ami_id': 'fixture-image', 'ami_owner_id': '000000000000',
-                           'vpc_id': 'fixture-vpc', 'subnet_id': 'fixture-subnet'}.items():
+                           'vpc_id': 'fixture-vpc', 'subnet_id': 'fixture-subnet',
+                           # The fixture fixes the zone; /tune can change the live value.
+                           'availability_zone': 'us-east-2b'}.items():
             text_setting(self.workload, key, value)
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private setup inventory', True))
