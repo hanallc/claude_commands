@@ -207,6 +207,10 @@ class ListItem:
     reviews: tuple[str, ...] = ()
     questions: tuple[question_record.Question, ...] = ()
 
+    def __post_init__(self) -> None:
+        if self.state == ItemState.CLOSED:
+            object.__setattr__(self, "unread_since", NoTimestamp.UNSET)
+
     @property
     def id(self) -> str:
         return f"L{self.number}"
@@ -1396,7 +1400,7 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    answer = commands.add_parser("answer", help="answer a List question and mark the item unread")
+    answer = commands.add_parser("answer", help="save an answer to a List question")
     _ = answer.add_argument("id", help="the List item ID, such as L1")
     _ = answer.add_argument("--question", required=True, help="the question ID, such as Q1")
     _ = answer.add_argument("--text", required=True, help="the answer to show on The List")

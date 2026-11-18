@@ -336,6 +336,7 @@ class ListQuestionDelivery:
 
 class SavedActionState(TypedDict):
     unread: str
+    unread_sort: float
     item_state: str
     parked: str
     parked_until: str
@@ -347,7 +348,10 @@ def saved_action_state(keeper: str, identity: str) -> SavedActionState:
     today = the_list.now()
     parked_until = (the_list.parking_date(item.parked_until, zone)
                     if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
-    return {"unread": str(isinstance(item.unread_since, datetime)).lower(), "item_state": item.state.value,
+    unread = item.unread_since
+    return {"unread": str(isinstance(unread, datetime)).lower(),
+            "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
+            "item_state": item.state.value,
             "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
 
 
@@ -587,8 +591,11 @@ function matchesWords(data,search){
  return [data.number,data.ownerName,data.title,data.state,data.parked==='true' ? 'Parked' : '']
   .some(value=>(value || '').toLowerCase().includes(value===data.number ? number : search));
 }
-function syncUnread(item,form,unread){
+function syncUnread(item,form,unread,unreadSort){
  item.dataset.unread=String(unread);
+ const sortValues=JSON.parse(item.dataset.sortValues);
+ sortValues[7]=unread ? unreadSort : 0;
+ item.dataset.sortValues=JSON.stringify(sortValues);
  const update=item.querySelector('[data-label="Update"]'),dot=update.querySelector('.list-dot');
  const read=form.querySelector('[value="read"]');
  if(unread){
@@ -632,7 +639,13 @@ function bind(){
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
   notice.textContent=tableView.actionNotice(item);
-  const confirmed={state:item.dataset.state,parked:item.dataset.parked};
+  const confirmed={state:item.dataset.state,parked:item.dataset.parked,
+   unread:item.dataset.unread==='true',unreadSort:JSON.parse(item.dataset.sortValues)[7]};
+  const syncConfirmed=()=>{
+   item.dataset.state=confirmed.state;
+   item.dataset.parked=confirmed.parked;
+   syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
+  };
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
   const syncTell=()=>{ask.disabled=tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
@@ -668,7 +681,10 @@ function bind(){
    let buttons=[...item.querySelectorAll('button')],saved=false,refused=false;
    buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
-   if(action==='remove') item.dataset.state='Closed';
+   if(action==='remove'){
+    item.dataset.state='Closed';
+    syncUnread(item,form,false,0);
+   }
    if(action==='park') item.dataset.parked='true';
    if(clearsUnread) item.dataset.unread='false';
    const submission=tableView.startAction(item);
@@ -679,19 +695,21 @@ function bind(){
     const result=await response.json();
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
-    const unread=result.unread==='true';
+    if(typeof result.item_state==='string') confirmed.state=result.item_state;
+    const closed=confirmed.state==='Closed',unread=!closed && result.unread==='true';
     notice.textContent=action==='remove' ? 'Removed' : action==='park' ? 'Parked' : action==='read' ? 'Marked read' :
      action==='question' ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     if(usesWords && words.value===data.get('words')) words.value='';
-    if(typeof result.item_state==='string') confirmed.state=result.item_state;
     if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
-    Object.assign(item.dataset,confirmed);
+    if(closed || ['true','false'].includes(result.unread)){
+     confirmed.unread=unread;
+     confirmed.unreadSort=unread ? (result.unread_sort ?? confirmed.unreadSort) : 0;
+    }
+    syncConfirmed();
     const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
     state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
     const sortValues=JSON.parse(item.dataset.sortValues);sortValues[3]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
-    if(['true','false'].includes(result.unread)) syncUnread(item,form,unread);
-    else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(typeof result.parked_until==='string'){
      let note=item.querySelector('[data-parked-note]');
      if(result.parked_until){
@@ -701,11 +719,14 @@ function bind(){
     }
     tableView.applyAction();
    }catch(error){
-    if(clearsUnread) item.dataset.unread=unreadBefore;
-    if(refused) Object.assign(item.dataset,confirmed);
+    const wasHidden=item.hidden;
+    if(refused) syncConfirmed();
+    else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(refused || hidUnread) tableView.opened.add(key);
     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
     tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
+    // The return animation now has the confirmed sort keys.
+    if(refused && wasHidden && !item.hidden) tableView.applyAction();
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
