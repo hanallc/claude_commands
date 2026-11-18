@@ -171,7 +171,7 @@ class _Chrome(_Browser):
                     raise RuntimeError(f"{method}: {reply['error']}")
                 return cast(dict[str, object], reply["result"])
 
-    def dom(self, page: Path, marker: str, *, reduced_motion: bool, timeout_ms: int,
+    def dom(self, page: Path, marker: str, *, reduced_motion: bool,
             window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
         with self.stop_on_error():
             context = cast(str, self.command("Target.createBrowserContext", {})["browserContextId"])
@@ -195,7 +195,6 @@ class _Chrome(_Browser):
                 "const finish = () => { observer.disconnect(); resolve(document.documentElement.outerHTML); };"
                 f"const observer = new MutationObserver(() => {{ if (document.getElementById({marker_literal})) finish(); }});"
                 "observer.observe(document, {childList: true, subtree: true});"
-                f"addEventListener('DOMContentLoaded', () => setTimeout(finish, {timeout_ms}), {{once: true}});"
                 "});"
             )
             _ = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
@@ -206,8 +205,11 @@ class _Chrome(_Browser):
             deadline = time.monotonic() + 20
             while load not in self.loaded:
                 _ = self.read(deadline)
-            response = self.command("Runtime.evaluate",
-                {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
+            try:
+                response = self.command("Runtime.evaluate",
+                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
+            except TimeoutError as error:
+                raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
             result = cast(dict[str, object], response["result"])
             _ = self.command("Target.disposeBrowserContext", {"browserContextId": context})
             self.loaded.clear()
@@ -276,7 +278,9 @@ class _Firefox(_Browser):
 Services.prefs.setIntPref("ui.systemUsesDarkTheme", arguments[0]);
 Services.prefs.setIntPref("ui.prefersReducedMotion", arguments[1]);
 const flags = Ci.nsIClearDataService;
-Services.clearData.deleteData(flags.CLEAR_COOKIES | flags.CLEAR_DOM_STORAGES | flags.CLEAR_ALL_CACHES, arguments[2]);
+Services.clearData.deleteData(
+    flags.CLEAR_COOKIES | flags.CLEAR_DOM_STORAGES | flags.CLEAR_ALL_CACHES | flags.CLEAR_HISTORY,
+    arguments[2]);
 """, "args": [int(dark), int(reduced_motion)],
             }))
             if cleared["value"] != 0:
@@ -296,13 +300,17 @@ Services.clearData.deleteData(flags.CLEAR_COOKIES | flags.CLEAR_DOM_STORAGES | f
         result = cast(dict[str, str], self.command("WebDriver:TakeScreenshot", {"full": False}))
         _ = path.write_bytes(base64.b64decode(result["value"]))
 
-    def wait_for_load(self) -> None:
-        _ = self.command("WebDriver:SetTimeouts", {"script": 45000})
-        _ = self.command("WebDriver:ExecuteAsyncScript", {"args": [], "script": """
-const done = arguments[arguments.length - 1];
-if (document.readyState === 'complete') done();
-else addEventListener('load', () => done(), {once: true});
-"""})
+    def wait_for_load(self, destination: str) -> None:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if self.script("""
+// The console can change the query with history.replaceState.
+const navigation = performance.getEntriesByType('navigation')[0];
+return navigation?.name.split('#', 1)[0] === arguments[0] && document.readyState === 'complete';
+""", [destination.partition("#")[0]]) is True:
+                return
+            time.sleep(0.02)
+        raise TimeoutError(f"Firefox did not load {destination}")
 
 
 class ListPageTests(unittest.TestCase):
@@ -373,7 +381,7 @@ class ListPageTests(unittest.TestCase):
             browser = self.firefox()
             with browser.page(destination, width, height, dark=dark):
                 if complete is None:
-                    browser.wait_for_load()
+                    browser.wait_for_load(destination)
                 elif not complete.wait(45):
                     raise TimeoutError("Firefox did not report the page result")
                 browser.screenshot(path)
@@ -2090,7 +2098,7 @@ window.fetch=async(_path,options={})=>{
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe, virtual_time_ms=3000)
+        self.browser_actions(markup, setup, probe)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
@@ -3522,7 +3530,7 @@ window.fetch=async(_path,options={})=>{
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion, in_frame=in_frame)
 
     def browser_actions(self, markup: str, setup: str, probe: str, *,
-                        reduced_motion: bool = False, virtual_time_ms: int = 1500,
+                        reduced_motion: bool = False,
                         window_size: tuple[int, int] | None = None, in_frame: bool = False) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
@@ -3530,8 +3538,7 @@ window.fetch=async(_path,options={})=>{
             page = self.root / 'actions-console.html'
             _ = page.write_text('<!doctype html><button id="console-nav">Console navigation</button>'
                                 + '<iframe title="The List" src="actions.html"></iframe>')
-        result = self.chrome().dom(page, "probe-results", reduced_motion=reduced_motion,
-                                   timeout_ms=virtual_time_ms, window_size=window_size)
+        result = self.chrome().dom(page, "probe-results", reduced_motion=reduced_motion, window_size=window_size)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = '<p id="probe-results">'
         self.assertIn(marker, result.stdout[-3000:], 'The browser must complete the item action checks.')
@@ -3761,7 +3768,7 @@ window.fetch=async(_path,options={})=>{
                 page = self.root / f"{action}-{unread}.html"
                 _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
                     probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
-                result = self.chrome().dom(page, "probe-result", reduced_motion=False, timeout_ms=1000, window_size=None)
+                result = self.chrome().dom(page, "probe-result", reduced_motion=False, window_size=None)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
