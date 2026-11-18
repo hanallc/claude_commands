@@ -1560,10 +1560,12 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         retired = staff.StaffRow(staff.StaffId("producer-fixed"), "producer", "planner", staff.StaffRoot(),
                                  current_session=staff.StaffId("producer-current"),
                                  retirement=staff.RetiredProducer("claude:sonnet:high"))
+        self.session(retired.current_session, retired.name)
         self.staff_rows = {row.id: row for row in (*rows, retired)}
         cases = (
             (("resources", "builds/resources"), "ambiguous staff row for {target!r}"),
-            ((retired.id, f"session:{retired.id}"), "{target}: planner is a retired producer"),
+            ((retired.id, f"staff:{retired.id}", retired.name, f"session:{retired.current_session}"),
+             "{target}: planner is a retired producer"),
         )
         for targets, reason in cases:
             for target in targets:
@@ -1573,6 +1575,15 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                         _ = send.send(local_options(["--to", target, "--text", "hello"]))
                     self.assertEqual(stopped.exception.code, 2)
                     self.assertIn(reason.format(target=target), errors.getvalue())
+        errors = io.StringIO()
+        with (mock.patch.dict(os.environ, {"SSH_CONNECTION": "fixture"}), redirect_stderr(errors),
+              self.assertRaises(SystemExit) as stopped):
+            options = send.parse(["--here", "--to", f"session:{retired.current_session}", "--from", "fixture",
+                                  "--forwarded-sender-stamp", "unavailable", "--forwarded-conversation",
+                                  "--forwarded-shown-sender", "Fixture", "--no-accounting", "--text", "hello"])
+            _ = send.send(options)
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn(f"session:{retired.current_session}: planner is a retired producer", errors.getvalue())
         self.assertEqual(self.relayed, [])
         self.assertFalse((self.root / "queue").exists())
 
@@ -2211,6 +2222,26 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                              ["Native peer", "Native explicit"])
             self.assertEqual([row["text"] for row in send.read_queue(send.queue_path("staff:original"))],
                              ["Staff peer", "Staff explicit"])
+
+        self.staff_rows = {"original": replace(member, kind="producer", name="Planner",
+                                              retirement=staff.RetiredProducer("claude:sonnet:high"))}
+        self.outcome = send.Result("sent", "ok")
+        forwarded.clear()
+        self.relayed.clear()
+        self.assertEqual(self.send("--to", "session:original", "--text", "Local native").outcome, "sent")
+        with (mock.patch.object(send, "run", side_effect=ssh),
+              mock.patch.object(sessions, "read_registry", return_value=empty_registry),
+              mock.patch.object(roster, "roster", return_value=roster.Roster([], [])),
+              mock.patch.object(roster, "peer_roster", return_value=roster.Roster([entry], []))):
+            for flags in ([], ["--machine", "mac"]):
+                with self.subTest(flags=flags):
+                    result = send.send(send.parse([*flags, "--to", "session:original", "--text", "SSH native"]))
+                    self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual(len(forwarded), 2)
+        for args in forwarded:
+            self.assertIn("--forwarded-conversation", args)
+            self.assertEqual(args[args.index("--to") + 1], "session:original")
+        self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'original.sock'}"] * 3)
 
     def test_staff_and_native_queues_keep_separate_copies_after_staff_moves(self) -> None:
         self.session("original", "Original")
@@ -4437,6 +4468,44 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("ECONNREFUSED", errors.getvalue())
         self.assertFalse((self.root / "queue").exists())
         self.assertEqual(len(self.relayed), 1)
+
+        retired = staff.StaffRow(staff.StaffId("producer-fixed"), "producer", "planner", staff.StaffRoot(),
+                                 current_session=staff.StaffId("producer-current"),
+                                 retirement=staff.RetiredProducer("claude:sonnet:high"))
+        self.staff_rows[retired.id] = retired
+        self.staff_member("verify-one", "verify")
+        self.staff_member("verify-two", "verify")
+        pid = os.getpid()
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(self.root / "cc-socks" / f"{pid}.sock"))
+            listener.listen()
+            listener.setblocking(False)
+            for sender in (retired.id, retired.current_session):
+                with (self.subTest(retired_reference=sender), mock.patch.object(send, "relay", REAL_RELAY),
+                      mock.patch.object(send, "run") as launch, redirect_stderr(io.StringIO())):
+                    address = self.relay_record(pid, sender)
+                    result = self.send("--to", address, "--from", "survey", "--text", "reply to retired relay")
+                    self.assertEqual(result.outcome, "failed")
+                    self.assertIn("planner is a retired producer", result.detail)
+                    launch.assert_not_called()
+                    with self.assertRaises(BlockingIOError):
+                        _ = listener.accept()
+                self.assertFalse((self.root / "queue").exists())
+
+            self.outcome = send.Result("sent", "ok")
+            for sender in (retired.name, "verify"):
+                with self.subTest(display_name=sender):
+                    address = self.relay_record(pid, sender)
+                    before = len(self.relayed)
+                    result = self.send("--to", address, "--from", "survey", "--text", f"reply to {sender}")
+                    self.assertEqual(result.outcome, "sent", result.detail)
+                    relayed, = self.relayed[before:]
+                    self.assertEqual(relayed.to, address)
+                    attempt = relayed.claude_attempt
+                    assert isinstance(attempt, send.ClaudeDeliveryAttempt)
+                    assert isinstance(attempt.recipient, send.RelayProcessRecipient)
+                    self.assertEqual(attempt.recipient.reply_to, send.NO_RELAY_REPLY_MAILBOX)
+                    self.assertFalse((self.root / "queue").exists())
 
     def test_a_recipient_that_exits_after_the_queue_decision_keeps_its_session_key(self) -> None:
         self.session("recipient", "Recipient")

@@ -2152,19 +2152,32 @@ def dead_socket_reason(address: str, name: str = "") -> str:
     return (f"dead socket {address}; relay sender {name or '(unknown)'} has no live session; message not queued")
 
 
-def socket_recipient(address: str, records: list[sessions.SessionRecord]) -> ClaudeRecipient | RecipientLookupFailed:
+def socket_recipient(address: str, records: list[sessions.SessionRecord],
+                     membership: staff.StaffSnapshot) -> ClaudeRecipient | RecipientLookupFailed:
     """Keep the requested socket when its registry owner is unique."""
     owners = {record["sessionId"] for record in records if record["messagingSocketPath"] == address[4:]}
     if len(owners) > 1:
         return RecipientLookupFailed("the messaging socket has conflicting Claude registry owners")
-    if not owners and isinstance(_relay_socket_pid(address), NoRelaySocketPid):
+    if owners:
+        owner = _conversation_staff_owner(owners.pop(), membership)
+        checked = _checked_staff_recipient(address, owner)
+        if isinstance(checked, RecipientLookupFailed):
+            usage_error(checked.reason)
+    elif isinstance(_relay_socket_pid(address), NoRelaySocketPid):
         return RecipientLookupFailed(dead_socket_reason(address))
     return ClaudeRecipient(address)
 
 
-def _relay_reply_conversation(address: str, membership: staff.StaffSnapshot) -> ConversationRecipient | NoRelayReplyMailbox:
-    sender = relay_sender(address)
-    member = resolve_staff_recipient(sender, membership) if sender else NoStaffRecipient()
+def _relay_reply_conversation(address: str, sender: str, membership: staff.StaffSnapshot
+                              ) -> ConversationRecipient | NoRelayReplyMailbox | RecipientLookupFailed:
+    if not sender:
+        return NO_RELAY_REPLY_MAILBOX
+    owner = membership.by_id(staff.StaffId(sender)) or _conversation_staff_owner(sender, membership)
+    member = _checked_staff_recipient(address, owner)
+    if isinstance(member, RecipientLookupFailed):
+        return member
+    if isinstance(member, NoStaffRecipient):
+        member = resolve_staff_recipient(sender, membership)
     if isinstance(member, staff.StaffRow):
         return ConversationRecipient(machine(), str(member.current_session))
     return NO_RELAY_REPLY_MAILBOX
@@ -2192,11 +2205,13 @@ def _socket_delivery_plan(message: Message, registry: sessions.RegistryRead,
     pid = _relay_socket_pid(message.to)
     if isinstance(pid, NoRelaySocketPid):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(dead_socket_reason(message.to)))
-    fallback = _relay_reply_conversation(message.to, membership)
     try:
         _ = Path(path).lstat()
         os.kill(pid, 0)
     except (FileNotFoundError, ProcessLookupError) as error:
+        fallback = _relay_reply_conversation(message.to, relay_sender(message.to), membership)
+        if isinstance(fallback, RecipientLookupFailed):
+            return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(fallback.reason))
         if isinstance(fallback, ConversationRecipient):
             plan = _claude_delivery_plan(message, fallback, registry, records, membership)
             if not isinstance(plan, SessionIdWithoutLiveRecipient):
@@ -2205,7 +2220,11 @@ def _socket_delivery_plan(message: Message, registry: sessions.RegistryRead,
     except (OSError, ValueError) as error:
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(f"cannot verify the relay socket: {error}"))
     started = sessions.process_start(pid)
-    if started and isinstance(live_relay_identity(pid, STATE / "relay_senders"), RelayIdentity):
+    identity = live_relay_identity(pid, STATE / "relay_senders")
+    if started and isinstance(identity, RelayIdentity):
+        fallback = _relay_reply_conversation(message.to, identity.sender, membership)
+        if isinstance(fallback, RecipientLookupFailed):
+            return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(fallback.reason))
         attempt = ClaudeDeliveryAttempt(RelayProcessRecipient(machine(), pid, started, fallback), pid, started, path)
         return RelayAttempt(replace(message, claude_attempt=attempt))
     return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(
@@ -2820,24 +2839,36 @@ def resolve_staff_recipient(
 
 def staff_named(name: str, membership: staff.StaffSnapshot) -> staff.StaffRow | sessions.StaffNameMissing:
     """Expose the shared staff lookup to native session lookup."""
-    member = resolve_staff_recipient(name, membership)
+    member = _staff_recipient_match(name, membership, allow_unit_form=True, include_retired_names=False)
     if isinstance(member, RecipientLookupFailed):
         raise ValueError(member.reason)
     return member if isinstance(member, staff.StaffRow) else sessions.StaffNameMissing(name)
 
 
+def _conversation_staff_owner(conversation: str, membership: staff.StaffSnapshot) -> staff.StaffRow | None:
+    return membership.by_current_session(conversation) or next(
+        (row for row in membership.retired_producers if row.current_session == conversation), None)
+
+
+def _checked_staff_recipient(target: str, member: staff.StaffRow | None
+                             ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
+    if member is not None and isinstance(member.retirement, staff.RetiredProducer):
+        return RecipientLookupFailed(f"{target}: {member.name} is a retired producer")
+    return member or NoStaffRecipient()
+
+
 def _staff_recipient_match(
     target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
     observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (), allow_unit_form: bool = False,
+    include_retired_names: bool = True,
 ) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
-    """Match exact staff names unless the caller permits the unit form."""
+    """Match staff references and resolve unit aliases when requested."""
     from scripts.message import roster
 
     if target.startswith("staff:"):
-        member = membership.by_id(staff.StaffId(target[6:]))
-        if member is not None and isinstance(member.retirement, staff.RetiredProducer):
-            return RecipientLookupFailed(f"{target}: {member.name} is a retired producer")
-        return member or NoStaffRecipient()
+        return _checked_staff_recipient(target, membership.by_id(staff.StaffId(target[6:])))
+    if target.startswith("session:"):
+        return _checked_staff_recipient(target, _conversation_staff_owner(target[8:], membership))
     reference = target
     if target.startswith("worker:"):
         for entry in observed:
@@ -2861,16 +2892,18 @@ def _staff_recipient_match(
     if target.startswith("uds:"):
         record = next((record for record in records
                        if f"uds:{record['messagingSocketPath']}" == target), None)
-        reference = record["sessionId"] if record is not None else socket_sender(target, {})
-    elif target.startswith(("session:", "codex:")):
-        reference = target.split(":", 1)[1]
-    member = membership.by_id(staff.StaffId(reference)) or membership.by_current_session(reference)
+        if record is not None:
+            return _checked_staff_recipient(target, _conversation_staff_owner(record["sessionId"], membership))
+        reference = socket_sender(target, {})
+    elif target.startswith("codex:"):
+        reference = target[6:]
+    identity = staff.StaffId(reference)
+    member = membership.rows_by_id.get(identity) or membership.by_current_session(reference)
     if member is not None:
-        if isinstance(member.retirement, staff.RetiredProducer):
-            return RecipientLookupFailed(f"{target}: {member.name} is a retired producer")
         return member
-    if target.startswith(("session:", "codex:", "worker:")) or not reference:
-        return NoStaffRecipient()
+    if target.startswith(("codex:", "worker:")) or not reference:
+        return _checked_staff_recipient(target, membership.by_id(identity)) if reference else NoStaffRecipient()
+
     def normalized_name(value: str) -> str:
         try:
             return unit_names.name(value).casefold()
@@ -2893,18 +2926,18 @@ def _staff_recipient_match(
     normalized = "/".join(normalized_name(part) for part in reference.split("/"))
     matches: dict[staff.StaffId, staff.StaffRow] = {}
     paths: dict[staff.StaffId, str] = {}
-    for candidate in membership.find():
-        chain = name_chain(candidate)
-        path = "/".join(chain)
-        canonical = "/".join(normalized_name(part) for part in chain)
-        short = normalized_name(candidate.name)
-        if normalized == canonical or ("/" not in normalized and normalized == short):
-            # Preserve each identity when staff has duplicate paths.
-            found = membership.by_path(path)
-            row = found if found is not None and found.id == candidate.id else membership.by_id(candidate.id)
-            if row is not None:
-                matches[row.id] = row
-                paths[row.id] = path
+
+    def match_names(candidates: tuple[staff.StaffRow, ...]) -> None:
+        for candidate in candidates:
+            chain = name_chain(candidate)
+            path = "/".join(chain)
+            canonical = "/".join(normalized_name(part) for part in chain)
+            short = normalized_name(candidate.name)
+            if normalized == canonical or ("/" not in normalized and normalized == short):
+                matches[candidate.id] = candidate
+                paths[candidate.id] = path
+
+    match_names(membership.rows)
     if allow_unit_form and not matches:
         from scripts.copies import copies
 
@@ -2919,6 +2952,12 @@ def _staff_recipient_match(
             if normalized == canonical or ("/" not in normalized and normalized == short):
                 matches[candidate.id] = candidate
                 paths[candidate.id] = path
+    if not matches:
+        retired_id = membership.by_id(identity)
+        if retired_id is not None:
+            return _checked_staff_recipient(target, retired_id)
+        if include_retired_names:
+            match_names(membership.retired_producers)
     foreign_workers_only = False
     if "/" not in normalized and matches and all(row.kind == "worker" for row in matches.values()):
         sender = _sender_staff_row(membership)
@@ -2932,10 +2971,7 @@ def _staff_recipient_match(
             else:
                 foreign_workers_only = True
     if len(matches) == 1 and not foreign_workers_only:
-        row = next(iter(matches.values()))
-        if isinstance(row.retirement, staff.RetiredProducer):
-            return RecipientLookupFailed(f"{target}: {row.name} is a retired producer")
-        return row
+        return _checked_staff_recipient(target, next(iter(matches.values())))
     if matches:
         details: list[str] = []
         for row in matches.values():
@@ -3065,24 +3101,19 @@ def resolve_recipient(
     if isinstance(fixed_member, RecipientLookupFailed):
         usage_error(fixed_member.reason)
     problems = observed.diagnostics
+    native = not isinstance(target, FixedStaffLookup) and to.startswith("session:")
 
     def lookup() -> DeliveryRoute:
         nonlocal problems
-        native = not isinstance(target, FixedStaffLookup) and to.startswith("session:")
-        raw_socket = not isinstance(target, FixedStaffLookup) and to.startswith("uds:")
-        socket_records = (sessions.live_sessions() if records is None else records) if raw_socket else []
-        if raw_socket and sessions.addressed(to, socket_records) is None:
-            return socket_recipient(to, socket_records)
-        member = (fixed_member if isinstance(fixed_member, staff.StaffRow)
-                  else _staff_recipient_match(to, membership, observed=observed.entries, records=socket_records))
+        if native and isinstance(scope, NamedMachine):
+            return RemoteDelivery(scope.host, to, selected_conversation=True)
+        if not isinstance(target, FixedStaffLookup) and to.startswith("uds:"):
+            socket_records = sessions.live_sessions() if records is None else records
+            return socket_recipient(to, socket_records, membership)
+        member = (fixed_member if native or isinstance(fixed_member, staff.StaffRow)
+                  else _staff_recipient_match(to, membership, observed=observed.entries))
         if isinstance(member, RecipientLookupFailed):
             usage_error(member.reason)
-        if raw_socket:
-            return socket_recipient(to, socket_records)
-        if native:
-            if isinstance(scope, NamedMachine):
-                return RemoteDelivery(scope.host, to, selected_conversation=True)
-            member = NoStaffRecipient()
         if (not isinstance(scope, NamedMachine)
                 and isinstance(member, staff.StaffRow) and member.kind == "worker"):
             holder = membership.parent_of(member)
@@ -3148,6 +3179,11 @@ def resolve_recipient(
     failed = True
     try:
         route = lookup()
+        if native and not isinstance(route, RemoteDelivery):
+            owner = _conversation_staff_owner(to[8:], membership)
+            checked = _checked_staff_recipient(to, owner)
+            if isinstance(checked, RecipientLookupFailed):
+                usage_error(checked.reason)
         failed = isinstance(route, RecipientLookupFailed)
         return route
     finally:
