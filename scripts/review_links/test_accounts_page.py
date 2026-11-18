@@ -26,6 +26,7 @@ from scripts.accounts.home_test_support import scratch_account_home
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import accounts_page, console_theme, page_frame, serve
+from scripts.statusline.statusline_test_support import status_lines
 from scripts.whoami import agent_accounts
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
@@ -782,7 +783,6 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                             "hex-reader", str(Path(__file__).resolve().parents[1] / "lib/conf.sh")],
                             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                         self.assertEqual((shell.returncode, shell.stdout), (0, value + "\n"), shell.stderr)
-                        from scripts.statusline.test_statusline import status_lines
                         self.assertEqual(status_lines({}, colors=config)[1].split(" | ")[0],
                                          "\x1b[38;2;175;135;95mclaude1\x1b[0m")
 

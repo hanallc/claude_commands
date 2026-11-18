@@ -21,7 +21,6 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import ClassVar, NotRequired, TextIO, TypedDict, cast, final, override
 from unittest.mock import Mock, patch
-from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts, new_account
 from scripts.agents import pane_record, remote
@@ -34,30 +33,22 @@ from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
 from scripts.review_links import for_you, review_later
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
+from scripts.statusline.statusline_test_support import (
+    PROGRAM, SHELL_ENVIRONMENT, USER_ZONE, status_lines, statusline_environment,
+)
 
-PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.resolve().parents[2] / "config/statusline.conf"
 CONSOLE_HOST_SHELL = "uname() { echo Linux; }; "
-USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# Preserve the fixture PATH when NixOS starts a child shell.
-SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="statusline-")))
-    panes = root / "panes"
-    panes.mkdir()
-    zone_config = root / "user_zone.conf"
-    _ = zone_config.write_text(f"zone={USER_ZONE.key}\n", encoding="utf-8")
-    zone_files = next(folder for folder in ("/etc/zoneinfo", "/usr/share/zoneinfo", "/var/db/timezone/zoneinfo")
-                      if (Path(folder) / USER_ZONE.key).is_file())
-    environment = {"PATH": os.environ["PATH"], "HOME": str(root), "TZDIR": zone_files,
-                   "HERDR_PANE_RECORD_DIR": str(panes), "USER_ZONE_CONF": str(zone_config)}
+    environment = statusline_environment(root)
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, environment, clear=True)))
-    _ = unittest.enterModuleContext(patch.object(pane_record, "RECORD_DIR", panes))
-    _ = unittest.enterModuleContext(patch.object(user_zone, "CONF", str(zone_config)))
+    _ = unittest.enterModuleContext(patch.object(pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"])))
+    _ = unittest.enterModuleContext(patch.object(user_zone, "CONF", environment["USER_ZONE_CONF"]))
 
 
 def shell_environment(home: Path | str, **marks: str) -> dict[str, str]:
@@ -140,37 +131,6 @@ def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunn
         if source.name != "statusline" and not target.exists():
             target.symlink_to(source, target_is_directory=source.is_dir())
     return f'statusline="{folder}"; . "$statusline/statusline.sh"'
-
-
-def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
-                 colors: Path | str = "",
-                 counts: str = "", rebuild: str = "", adhoc: str = "", staff_text: str = "", **marks: str) -> list[str]:
-    """Run statusline.jq once over every input and return its output lines.
-
-    `colors` is a file path or temporary config text; empty text omits the argument.
-    """
-    record = assignment.staff_record(staff_text)
-    label, role = assignment.assignment(record, str(cast(dict[str, object], inputs[0]).get("session_id", "")) if isinstance(inputs[0], dict) else "")
-    branch = assignment.current_branch(cast(dict[str, object], inputs[0]), "/tmp") if role == "unit-director" else ""
-    stdin = "\n".join(json.dumps(each) for each in inputs)
-    stored = [] if labels is None else ["--slurpfile", "labels", str(labels)]
-    parent = ["--arg", "assignment", label, "--arg", "role", role, "--arg", "counts", counts,
-              "--arg", "rebuild", rebuild, "--arg", "adhoc", adhoc, "--arg", "branch", branch,
-              "--arg", "for_you", marks.pop("for_you", "")]
-    with tempfile.TemporaryDirectory() as directory:
-        configured: list[str] = []
-        if colors:
-            path = colors if isinstance(colors, Path) else Path(directory) / "statusline.conf"
-            if isinstance(colors, str):
-                _ = path.write_text(colors, encoding="utf-8")
-            configured = ["--rawfile", "colors", str(path)]
-        result = subprocess.run(
-            ["jq", "-r", "--arg", "pwd", "/tmp", "--arg", "account", account,
-             *stored, *parent, *configured, "-f", str(PROGRAM)],
-            input=stdin, capture_output=True, text=True, check=True,
-            env=shell_environment(os.environ["HOME"], **({"TZ": USER_ZONE.key} | marks)),
-        )
-    return result.stdout.splitlines()
 
 
 def seed_rebuild_cache(home: Path, configuration: Path, row: str = "", *, cache: Path | None = None) -> None:
@@ -274,16 +234,17 @@ class ColorTests(unittest.TestCase):
             with self.subTest(cwd=cwd):
                 self.assertEqual(status_lines({**payload, "workspace": {"current_dir": cwd}},
                                              staff_text=staff_text(staff.StaffRow(OWNER.id, "showrunner", "natedev", staff.StaffRoot(), current_session=OWNER.id)),
-                                             STAFF_ID=OWNER.id), [
+                                             STAFF_ID=OWNER.id, HOME=home), [
                     f"natedev showrunner | {path}", "claude1 | Opus 5.5 high | 103,438 | weekly 91% left"])
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
+        with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory) / "rust/hana_catalyst_cables"
             (folder / ".git").mkdir(parents=True)
             _ = (folder / ".git/HEAD").write_text("ref: refs/heads/cables\n", encoding="utf-8")
             lines = status_lines({**payload, "session_id": UNIT.id, "workspace": {"current_dir": str(folder)}},
                                  staff_text=staff_text(
                                      staff.StaffRow(OWNER.id, "showrunner", "hana", staff.StaffRoot(), current_session=OWNER.id),
-                                     staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id, unit_type=staff.UnitDetails("direct"))), STAFF_ID=UNIT.id)
+                                     staff.StaffRow(UNIT.id, "unit", "cables", staff.ReportsTo(OWNER.id), current_session=UNIT.id, unit_type=staff.UnitDetails("direct"))),
+                                 STAFF_ID=UNIT.id, HOME=directory)
             self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables | cables")
 
     def test_fixture_role_colors_and_plain_unassigned(self) -> None:
