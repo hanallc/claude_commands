@@ -1972,13 +1972,15 @@ else:
 PYDOC
 }
 
+readonly VERIFY_PREPARED_CHECKOUT_FD=69
+
 # The copy owner holds the lease until the last writer closes the pipe.
 doc_checkout() {
     local checkout="$DOC_REPO_TOP"
     if [[ "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
-        local copy_script writer checkout_tree current_tree status lease_fd=74
+        local copy_script writer reply_fd checkout_tree current_tree status lease_fd=74
         copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
-        coproc DOC_COPY { exec "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP"; }
+        coproc DOC_COPY { exec "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP" --bind-scope; }
         DOC_COPY_OWNER_PID=$DOC_COPY_PID
         writer=${DOC_COPY[1]}
         # Start above verify's fixed descriptors.
@@ -1988,8 +1990,11 @@ doc_checkout() {
         eval "exec $lease_fd>&$writer" || return $?
         DOC_COPY_LEASE_FD=$lease_fd
         eval "exec $writer>&-"
-        if ! IFS= read -r checkout_tree <&"${DOC_COPY[0]}" ||
-           ! IFS= read -r checkout <&"${DOC_COPY[0]}"; then
+        exec {reply_fd}<&"${DOC_COPY[0]}" || return $?
+        DOC_COPY_REPLY_FD=$reply_fd
+        eval "exec ${DOC_COPY[0]}<&-"
+        if ! IFS= read -r checkout_tree <&"$reply_fd" ||
+           ! IFS= read -r checkout <&"$reply_fd"; then
             doc_close_checkout
             return 1
         fi
@@ -1998,6 +2003,14 @@ doc_checkout() {
             doc_close_checkout
             echo 'verify.sh: the staged tree changed before doc ran; no doc pass record was written.' >&2
             return "$TREE_CHANGED_STATUS"
+        fi
+    else
+        local inherited=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
+        if [[ "$inherited" =~ ^[0-9]+$ && -e "/dev/fd/$inherited" ]] &&
+                eval "exec $VERIFY_PREPARED_CHECKOUT_FD>&$inherited"; then
+            BUILDLOG_PREPARED_COPY_LOCK_FD=$VERIFY_PREPARED_CHECKOUT_FD
+        else
+            BUILDLOG_PREPARED_COPY_LOCK_FD=""
         fi
     fi
     cd "$checkout" || { doc_close_checkout; return 1; }
@@ -2010,6 +2023,10 @@ doc_close_checkout() {
         if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
             eval "exec $DOC_COPY_LEASE_FD>&-"
             DOC_COPY_LEASE_FD=""
+        fi
+        if [[ -n "${DOC_COPY_REPLY_FD:-}" ]]; then
+            eval "exec $DOC_COPY_REPLY_FD<&-"
+            DOC_COPY_REPLY_FD=""
         fi
         if [[ "${1:-}" == stop ]]; then
             collect_child "$owner" TERM
@@ -2775,7 +2792,7 @@ run_placed_scope() {
     fi
     (
         if [[ -n "$checkout_pipe" ]]; then
-            exec 9>"$checkout_pipe" || exit 125
+            exec 9>"$checkout_pipe" 8<"/dev/fd/$DOC_COPY_REPLY_FD" || exit 125
         else
             exec 9>&"$checkout_fd" || exit 125
         fi
@@ -4086,6 +4103,7 @@ case "$CMD" in
         export CARGO_TARGET_DIR
         DOC_CALLER_DIR=$PWD
         DOC_COPY_LEASE_FD=""
+        DOC_COPY_REPLY_FD=""
         DOC_SOURCE_KEY=""
         if [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
             if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then

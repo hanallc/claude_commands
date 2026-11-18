@@ -459,13 +459,6 @@ class BuildFolderLockChanged(BlockingIOError):
     """The lock file changed before acquisition."""
 
 
-@dataclass(frozen=True)
-class MalformedLeaseRecord:
-    """A free lock has metadata that cannot supply lease attribution."""
-
-    error: ValueError
-
-
 def _read_lease(path: Path, directory: int) -> dict[str, object]:
     descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(descriptor) as source:
@@ -504,7 +497,7 @@ def _require_empty_checkout_scope(path: Path, lease: dict[str, object]) -> None:
 
 
 def claim_free_build_folder(path: Path, directory: int, descriptor: int | MissingFolderLock, *,
-                            mode: int = fcntl.LOCK_EX, wait: bool = True) -> dict[str, object] | MalformedLeaseRecord:
+                            mode: int = fcntl.LOCK_EX, wait: bool = True) -> dict[str, object]:
     """Take the current lock and require an empty scope. The caller closes the lock."""
     if isinstance(descriptor, int):
         acquired = _take_lock(descriptor, mode, wait=wait)
@@ -516,8 +509,9 @@ def claim_free_build_folder(path: Path, directory: int, descriptor: int | Missin
         lease = _read_lease(path, directory)
     except FileNotFoundError:
         return {}
-    except ValueError as error:
-        return MalformedLeaseRecord(error)
+    except (OSError, ValueError) as error:
+        print(f"{path}: cannot read the build folder lease: {error}", file=sys.stderr)
+        raise BlockingIOError(errno.EWOULDBLOCK, "cannot read the build folder lease", str(path)) from error
     _require_empty_checkout_scope(path, lease)
     return lease
 
@@ -568,11 +562,10 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec | CheckoutSco
 
 
 def write_checkout_lease(path: Path, binding: CheckoutScopeBinding, descriptor: int) -> None:
-    """Bind the scope under the copy owner's pipe or the inherited slot lock."""
+    """Bind the scope while this process holds the checkout lock."""
     with _folder_parent(path, path.parent, create=False) as directory:
-        if not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
-            if not _lock_current(path, directory, descriptor) or not _take_lock(descriptor, fcntl.LOCK_EX, wait=False):
-                raise ValueError(f"{path}: the prepared checkout lock is missing")
+        if not _lock_current(path, directory, descriptor) or not _take_lock(descriptor, fcntl.LOCK_EX, wait=False):
+            raise ValueError(f"{path}: the checkout lock is missing")
         _write_lease(path, directory, binding)
 
 
@@ -680,8 +673,6 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     if isinstance(spec.slot_checkout, SlotCheckout):
                         import subprocess
 
-                        if isinstance(lease, MalformedLeaseRecord):
-                            raise lease.error
                         if existing is None or lease.get("ready") is not True:
                             try:
                                 source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
@@ -927,10 +918,8 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     if isinstance(descriptor, int):
         _ = stack.callback(os.close, descriptor)
     try:
-        lease = claim_free_build_folder(path, directory, descriptor, wait=wait)
+        _ = claim_free_build_folder(path, directory, descriptor, wait=wait)
     except BlockingIOError:
-        return RefusedRemovalLease()
-    if isinstance(lease, MalformedLeaseRecord):
         return RefusedRemovalLease()
     if isinstance(descriptor, MissingFolderLock):
         return UnreservedRemovalFolder()
@@ -939,19 +928,35 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     return HeldFolderRemovalLease(path, directory, descriptor)
 
 
-def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
+def _allow_child_lease_scan(name: str, directory: int) -> None:
+    with suppress(FileNotFoundError):
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode) and not os.access(name, os.R_OK | os.X_OK, dir_fd=directory, follow_symlinks=False):
+            os.chmod(name, 0o700, dir_fd=directory, follow_symlinks=False)
+
+
+def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
+                       parent: int | None = None, repair_permissions: bool = False) -> bool:
     """Hold every lease lock below path without following links. False when an owner holds one."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
             raise error
 
-    for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
-        filenames = set(files)
-        names = {match[1] for name in files if (match := _METADATA.fullmatch(name)) is not None
-                 and (match[1] in folders or (match[1] + ".lock" in filenames and match[1] + ".lease.json" in filenames))}
-        for name in sorted(names):
-            if isinstance(_hold_free_lease(Path(top) / name, directory, stack, wait=wait), RefusedRemovalLease):
-                return False
+    if repair_permissions and parent is not None:
+        _allow_child_lease_scan(path.name, parent)
+    start = path.name if parent is not None else os.fspath(path)
+    prefix = path.parent if parent is not None else Path()
+    with suppress(FileNotFoundError):
+        for top, folders, files, directory in os.fwalk(start, follow_symlinks=False, onerror=unreadable, dir_fd=parent):
+            filenames = set(files)
+            names = {match[1] for name in files if (match := _METADATA.fullmatch(name)) is not None
+                     and (match[1] in folders or (match[1] + ".lock" in filenames and match[1] + ".lease.json" in filenames))}
+            for name in sorted(names):
+                if isinstance(_hold_free_lease(prefix / top / name, directory, stack, wait=wait), RefusedRemovalLease):
+                    return False
+            if repair_permissions:
+                for name in folders:
+                    _allow_child_lease_scan(name, directory)
     return True
 
 
@@ -968,9 +973,8 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
                 if metadata is not None:
                     lease = UnreservedRemovalFolder()
                 elif children:
-                    with suppress(FileNotFoundError):
-                        if not _hold_child_leases(folder, stack):
-                            lease = RefusedRemovalLease()
+                    if not _hold_child_leases(folder, stack):
+                        lease = RefusedRemovalLease()
         except FileNotFoundError:
             lease = UnreservedRemovalFolder()
         except (OSError, ValueError):
@@ -1016,8 +1020,8 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
 
 
 def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
-                        dir_fd: int | None = None, wait: bool = True) -> bool:
-    """Run cleanup under the free folder's lock, then remove temporary metadata."""
+                        dir_fd: int | None = None, wait: bool = True, repair_permissions: bool = False) -> bool:
+    """Run cleanup while holding the folder lock and the child leases."""
     with ExitStack() as parents:
         try:
             directory = dir_fd if dir_fd is not None else parents.enter_context(
@@ -1029,7 +1033,10 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
         try:
             try:
                 _ = claim_free_build_folder(path, directory, descriptor, wait=wait)
-            except BlockingIOError:
+                if not _hold_child_leases(path, parents, wait=wait, parent=directory,
+                                          repair_permissions=repair_permissions):
+                    return False
+            except (OSError, ValueError):
                 return False
             if cleanup() is False:
                 return False
@@ -1048,7 +1055,7 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
         return
     _release_build_folder(path, descriptor=descriptor)
     _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
-                            temporary=temporary, dir_fd=directory)
+                            temporary=temporary, dir_fd=directory, repair_permissions=True)
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
@@ -1058,14 +1065,7 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
             allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:
             return True
-        with ExitStack() as children:
-            # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
-            try:
-                if not _hold_child_leases(path, children, wait=wait):
-                    return False
-            except OSError:
-                return False
-            _remove_folder(path, directory, allocated)
+        _remove_folder(path, directory, allocated)
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)

@@ -77,14 +77,15 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         use_fixture_scope_readings(self, self.root, admission)
         return admission
 
-    def install_scope_interpreter(self, supervisor_code: str) -> None:
+    def install_scope_interpreter(self, supervisor_code: str, *,
+                                  scripts: tuple[str, ...] = ("/verify_scoped_step.py",)) -> None:
         wrapper = self.root / "scope-interpreter"
-        self.executable(wrapper, '''import os
+        self.executable(wrapper, f'''import os
 import sys
 arguments = sys.argv[1:]
 script_arguments = arguments[1:] if arguments[0] == "-P" else arguments
 script = script_arguments[0]
-if not script.endswith("/verify_scoped_step.py"):
+if not script.endswith({scripts!r}):
     os.execv(sys.executable, [sys.executable, *arguments])
 ''' + supervisor_code)
         self.environment["CLAUDE_PYTHON"] = str(wrapper)
@@ -249,6 +250,47 @@ with patch.object(os, "setpgid", side_effect=OSError("cannot set the supervisor 
         self.assertFalse(self.pass_records())
         with self.occupy_doc_slot(build_slots.SlotWaitPolicy.REFUSE):
             pass
+
+    def test_copy_owner_exit_during_publication_cannot_change_the_lease(self) -> None:
+        lease_path = self.root / "interrupted-lease"
+        self.install_scope_interpreter(f'''
+import json
+from pathlib import Path
+import runpy
+import select
+import signal
+from unittest.mock import patch
+
+replace = os.replace
+
+def owner_exits_before_replace(source, target, *, src_dir_fd=None, dst_dir_fd=None):
+    if str(target).endswith(".lease.json"):
+        with os.fdopen(os.open(source, os.O_RDONLY, dir_fd=src_dir_fd)) as pending:
+            record = json.load(pending)
+        if "scope" in record:
+            directory = Path(os.readlink(f"/proc/self/fd/{{dst_dir_fd}}"))
+            Path({str(lease_path)!r}).write_text(str(directory / target))
+            owner = record["pid"]
+            owner_fd = os.pidfd_open(owner)
+            try:
+                os.kill(owner, signal.SIGKILL)
+                ready, _, _ = select.select([owner_fd], [], [], {TEST_HANG_GUARD_SECS!r})
+                assert ready, "the copy owner did not exit"
+            finally:
+                os.close(owner_fd)
+    replace(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+with patch.object(os, "replace", owner_exits_before_replace):
+    sys.argv = script_arguments
+    runpy.run_path(script, run_name="__main__")
+''', scripts=("/verify_scoped_step.py", "/copies.py"))
+        result = self.verify()
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 125, output)
+        self.assertIn("keeping the reservation", output)
+        record = cast(dict[str, object], json.loads(Path(lease_path.read_text()).read_text()))
+        self.assertNotIn("scope", record)
+        self.assertFalse(self.events.exists())
 
     def test_doc_scope_command_does_not_inherit_checkout_pipe(self) -> None:
         _ = self.use_real_scope()
@@ -478,7 +520,7 @@ else:
         self.assertEqual(self.pass_records(), [])
         self.assertFalse(admission.caller_reservations())
 
-    def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
+    def assert_doc_uses_the_prepared_copy(self, command: tuple[str, ...]) -> None:
         original = self.repo
         with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
                 original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
@@ -488,12 +530,23 @@ else:
             self.environment["BUILDLOG_PREPARED_COPY_LOCK_FD"] = str(descriptor)
             self.environment["BUILDLOG_RUN"] = f"{os.getpid()}:{admission_records.process_start_time(os.getpid())}"
             self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(slot.path))
-            process, log, _ = self.start_doc(pass_fds=(descriptor,))
+            process, log, _ = self.start_doc(command=command, pass_fds=(descriptor,))
             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
             self.assertEqual(self.cargo_calls()[0]["cwd"], str(slot.path))
             self.assertEqual(build_folders.build_folder_state(slot.path), "held")
             self.assertEqual(list((self.root / "slots").glob("*-slot*.lease.json")),
                              [build_slots.lease_path(slot.path)])
+
+    def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
+        self.assert_doc_uses_the_prepared_copy(DOC_COMMAND)
+
+    def test_prepared_doc_keeps_the_slot_lock_inherited_on_descriptor_nine(self) -> None:
+        handoff = '''exec 9>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"
+export BUILDLOG_PREPARED_COPY_LOCK_FD=9
+exec "$@"'''
+        self.assert_doc_uses_the_prepared_copy((
+            "bash", "-c", handoff, "prepared-doc", *DOC_COMMAND,
+        ))
 
     def test_doc_takes_its_own_slot_when_the_prepared_copy_names_another_tree(self) -> None:
         self.environment["BUILDLOG_PREPARED_COPY"] = str(self.root / "another-copy")

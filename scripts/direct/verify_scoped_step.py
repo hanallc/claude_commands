@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import select
+import stat
 import subprocess
 import sys
 import time
@@ -133,9 +134,8 @@ def drain_scope(scope: Path) -> None:
         os.close(events)
 
 
-def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit: str) -> Path:
+def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit: str, deadline: float) -> Path:
     """Read the published scope while Cargo waits for its checkout lease."""
-    deadline = time.monotonic() + conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
     owners.register(watch, select.POLLIN)
     try:
         scope = published_scope(sidecar, unit)
@@ -156,11 +156,27 @@ def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit
         owners.unregister(watch)
 
 
-def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path) -> None:
+def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path, owners: select.poll, deadline: float) -> None:
     owner_start = process_start_time(checkout.lease_owner)
     if owner_start is None:
         raise ValueError("the checkout lease owner exited before scope publication")
-    build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner), 9)
+    if stat.S_ISFIFO(os.fstat(9).st_mode):
+        # The copy owner publishes while it holds the checkout lock.
+        owners.register(8, select.POLLIN)
+        try:
+            _ = os.write(9, os.fsencode(scope) + b"\n")
+            remaining = deadline - time.monotonic()
+            ready = owners.poll(max(0, math.ceil(remaining * 1000)))
+            if not ready:
+                raise TimeoutError("the copy owner did not confirm the checkout scope")
+            if any(descriptor != 8 for descriptor, _ in ready):
+                raise ValueError("a scope owner exited before launch")
+            if os.read(8, 6) != b"bound\n":
+                raise ValueError("the copy owner did not bind the checkout scope")
+        finally:
+            owners.unregister(8)
+    else:
+        build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner), 9)
     if process_start_time(checkout.lease_owner) != owner_start:
         raise ValueError("the checkout lease owner exited during scope publication")
 
@@ -193,8 +209,11 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             owner_pid = os.environ.pop("VERIFY_DOC_CHECKOUT_OWNER", "")
             checkout = OwnedDocCheckout(Path.cwd(), int(owner_pid)) if owner_pid else NoOwnedDocCheckout.NOT_REQUIRED
             watch = None
+            deadline = 0.0
             if isinstance(checkout, OwnedDocCheckout):
                 _ = os.fstat(9)
+                seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
+                deadline = time.monotonic() + seconds
                 watch = inotify.open_watch()
                 _ = cleanup.callback(os.close, watch)
                 _ = inotify.add_watch(watch, sidecar.parent, inotify.IN_CLOSE_WRITE | inotify.IN_MOVED_TO
@@ -214,8 +233,8 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             try:
                 owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
                 if isinstance(checkout, OwnedDocCheckout) and watch is not None:
-                    scope = wait_for_checkout_scope(owners, watch, sidecar, unit)
-                    bind_checkout_scope(checkout, scope)
+                    scope = wait_for_checkout_scope(owners, watch, sidecar, unit, deadline)
+                    bind_checkout_scope(checkout, scope, owners, deadline)
                     if owners.poll(0):
                         raise ValueError("a scope owner exited before launch")
                     assert process.stdin is not None

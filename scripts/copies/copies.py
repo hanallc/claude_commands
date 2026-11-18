@@ -2018,6 +2018,7 @@ class CopyParser(argparse.ArgumentParser):
 class CopyArguments(argparse.Namespace):
     host: str = ""
     shell_lease: bool = False
+    bind_scope: bool = False
     path: str = ""
     repository: str = ""
     session: str = ""
@@ -2072,6 +2073,7 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="prepare a standing tree and run a command in it")
     hold = commands.add_parser("hold", help="hold a staged checkout until standard input closes")
     _ = hold.add_argument("--repo", required=True)
+    _ = hold.add_argument("--bind-scope", action="store_true")
     remove = commands.add_parser("remove", help="remove the caller's idle standing trees")
     _ = run.add_argument("--repo", required=True)
     _ = remove.add_argument("--repo")
@@ -2101,6 +2103,13 @@ def main(argv: list[str] | None = None) -> int:
             with standing(source_owner(source), source, staged, step="hold") as checkout:
                 print(staged.tree)
                 print(checkout, flush=True)
+                if args.bind_scope and (request := sys.stdin.readline()):
+                    scope = Path(request.removesuffix("\n"))
+                    if not scope.is_absolute():
+                        raise CopyError("the checkout scope path must be absolute")
+                    build_folders.write_checkout_lease(checkout, build_folders.CheckoutScopeBinding(scope, os.getpid()),
+                                                       build_folders.build_folder_lock_fd(checkout))
+                    print("bound", flush=True)
                 _ = sys.stdin.read()
             return 0
         if args.action == "mirror-remove":

@@ -882,7 +882,7 @@ print('signals')
                 path.with_name(path.name + ".lock").touch()
                 if operation == "cleanup":
                     path.mkdir()
-                    _ = path.with_name(path.name + ".lease.json").write_text("record")
+                    _ = path.with_name(path.name + ".lease.json").write_text("{}")
                 reached, release = threading.Event(), threading.Event()
                 flock = fcntl.flock
 
@@ -921,13 +921,14 @@ print('signals')
                 parent = self.root / suffix.removeprefix(".")
                 parent.mkdir()
                 outside = parent / "unrelated"
-                _ = outside.write_text("keep this file")
+                contents = '{"keep": "this file"}'
+                _ = outside.write_text(contents)
                 os.link(outside, parent / ("owner" + suffix))
                 with self.assertRaises(ValueError):
                     try:
                         _ = folders.create_build_folder(folders.StableOwnerFolder("owner", folders.ExplicitBuildParent(parent)))
                     finally:
-                        self.assertEqual(outside.read_text(), "keep this file")
+                        self.assertEqual(outside.read_text(), contents)
 
     def test_lease_failure_removes_only_a_new_allocation_and_releases_its_lock(self) -> None:
         for existing in (False, True):
@@ -1028,9 +1029,9 @@ print('signals')
         with folders.folder_removal_lease(path, children=True) as lease:
             self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
 
-    def slot_with_recorded_scope(self) -> tuple[folders.BuildFolderSpec, Path, Path]:
+    def slot_with_recorded_scope(self, slot_parent: str = "slots") -> tuple[folders.BuildFolderSpec, Path, Path]:
         source, tip, _ = self.editable_source()
-        spec = folders.BuildFolderSpec(kind="slot", parent=self.root / "slots", suffix_length=0, slot=1, repository=source.name,
+        spec = folders.BuildFolderSpec(kind="slot", parent=self.root / slot_parent, suffix_length=0, slot=1, repository=source.name,
                                        slot_checkout=folders.SlotCheckout(source, tip))
         with folders.slot_build_folder(spec) as checkout:
             scope = self.root / "checkout.scope"
@@ -1088,6 +1089,29 @@ print('signals')
         self.assertEqual(folders.build_folder_state(checkout), "free")
         self.assertTrue(folders.remove_build_folder(checkout, cleanup))
         cleanup.assert_called_once_with()
+
+    def test_remove_refuses_a_parent_with_a_populated_child_scope(self) -> None:
+        _, checkout, scope = self.slot_with_recorded_scope("slots/nested")
+        parent = self.root / "slots"
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\n")
+        self.assertEqual(folders.main(["remove", str(parent)]), 1)
+        self.assertTrue(checkout.is_dir())
+        _ = events.write_text("populated 0\n")
+        self.assertEqual(folders.main(["remove", str(parent)]), 0)
+        self.assertFalse(parent.exists())
+
+    def test_all_readers_refuse_a_malformed_lease(self) -> None:
+        spec, checkout, _ = self.slot_with_recorded_scope()
+        _ = checkout.with_name(checkout.name + ".lease.json").write_text("{invalid")
+        cleanup = mock.Mock()
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertEqual(folders.build_folder_state(checkout), "held")
+            self.assertFalse(folders.remove_build_folder(checkout, cleanup))
+            self.assert_scope_blocks_slot_and_collector(spec, checkout)
+        cleanup.assert_not_called()
+        self.assertEqual(diagnostics.getvalue().count("cannot read the build folder lease"), 4)
 
     def test_checkout_scope_read_error_reports_and_blocks_reuse_and_collection(self) -> None:
         spec, checkout, scope = self.slot_with_recorded_scope()
@@ -1169,7 +1193,7 @@ print('shared')
                 child.kill()
             _ = child.communicate(timeout=10)
 
-    def test_process_death_frees_the_lock_without_reading_the_lease(self) -> None:
+    def test_process_death_frees_the_lock_with_an_unscoped_lease(self) -> None:
         probe = """import signal
 from scripts.lib import build_folders as f
 path = f.create_build_folder(f.UniqueBuildFolder('death-'))
@@ -1181,7 +1205,6 @@ signal.pause()
             assert process.stdout is not None
             path = Path(cast(str, process.stdout.readline()).strip())
             self.assertEqual(folders.build_folder_state(path), "held")
-            _ = path.with_name(path.name + ".lease.json").write_text("invalid attribution")
             process.kill()
             _ = process.communicate(timeout=10)
             self.assertEqual(folders.build_folder_state(path), "free")
