@@ -909,8 +909,10 @@ The test server joins its request handlers before fixture cleanup and gives each
 1. One dark desktop shot of a question card with a command block and its copy button.
 2. The new check fails without the fix. The Review page, change page and page frame suites pass. basedpyright: 0 errors, 0 warnings.
 
-### Phase 64 — An Ask never replaces a different open question  · status: todo
+### Phase 64 — An Ask never replaces a different open question  · status: done
 **Depends on:** 60, 63
+
+**Result:** under the write lock, Ask refuses when an open legacy JSON Question has the same title and asker. It prints `<title>: a legacy question from this asker is already open` and exits 2. The legacy question stays open. Built on the reviewask part A tip.
 
 #### Work Order
 
