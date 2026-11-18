@@ -479,7 +479,7 @@ class HanaController:
         return HanaLifecycleEvidence(row.identity, row.state, row.boot, row.operation,
             row.delivered, tuple(row.claims), row.observed_at)
 
-    def _spending(self) -> hana_spend.HanaSpending:
+    def _spending(self) -> hana_spend.HanaSpending[hana_spend.PermitSettings]:
         return hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
             hana_spend.read_settings(conf.read(self.workload_path)))
 
