@@ -12,7 +12,7 @@ Use lowercase `morty` and `nate`.
 ## Management
 
 Start morty with `resume morty`.
-Use the workers account for Codex and the showrunners account for Claude.
+Use the workers account for Codex. Claude uses the producers account, with the showrunners account as the fallback.
 Read the family, model, and effort from `[producers].morty` in `~/.claude/config/models.conf`.
 Use the `morty` tab in the `producers` herdr workspace.
 Resume the same conversation.

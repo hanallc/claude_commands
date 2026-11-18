@@ -349,7 +349,7 @@ herdr removes a tab when its last pane closes.
 Retirement cannot find an idle shell whose launch record was lost before this fix.
 
 Producers use their current `[producers]` model and effort through the shared launch code.
-Codex producers select the workers account; Claude producers select the showrunners account.
+Codex producers select the workers account; Claude producers select the producers account, with the showrunners account as the fallback.
 An explicit target account overrides that selection.
 The [producer admission contract](shutdown-and-restart.md#producer-launch-and-admission) defines first start and interrupted admission recovery.
 The [upkeep service](herdr-restore.md#restore-services) restores admitted producers after server loss and reboot.

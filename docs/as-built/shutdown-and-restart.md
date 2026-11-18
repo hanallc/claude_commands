@@ -95,7 +95,7 @@ The shared resume path reads the saved environment, arguments, and folder.
 The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Claude producers use the configured showrunners account.
+Claude producers use the configured producers account, with the showrunners account as the fallback.
 Other Claude sessions use the configured units account.
 A configured producer without a staff row uses the producer first-start account rule.
 When the account does not change, the resume message names no move.
@@ -227,8 +227,8 @@ The configured lines are:
 
 ```ini
 [producers]
-morty=codex:astra:high
-brain=codex:astra:medium
+morty=claude:fable:high
+brain=claude:fable:high
 dwight=claude:fable:high
 ```
 
