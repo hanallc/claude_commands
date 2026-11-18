@@ -190,7 +190,10 @@ class UpkeepTests(unittest.TestCase):
                     else accounts.NamedAccount("claude3", case.root / ".claude3"))
 
         def live(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            return sessions.LiveSessionProcess(456) if identity in launches else sessions.SessionNotLive()
+            launch = launches.get(identity)
+            if launch is not None and launch[0] == "claude":
+                return sessions.LiveSessionProcess(456)
+            return sessions.SessionNotLive()
 
         with (patch.object(job, "time", clock),
               patch.object(operation_deadline, "time", clock),
@@ -200,6 +203,7 @@ class UpkeepTests(unittest.TestCase):
               patch.object(herdr, "prepare_session_environment", side_effect=prepare),
               patch.object(herdr, "launch_prepared_agent", side_effect=launch),
               patch.object(herdr, "read_conversation", side_effect=conversation),
+              patch.object(pane_record, "save", test_stop_resume.SAVE_PANE_RECORD),
               patch.object(accounts, "role_account", side_effect=select),
               patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(case.root / ".codex1")),
               patch.object(accounts, "codex_home_label", return_value="codex1"),

@@ -600,10 +600,20 @@ Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrun
   On failure, report the error and leave the ticket assigned.
   Record the committed-awaiting-release state with that HEAD and `--ticket <id>`.
   Run `ticket checkpoint --commit HEAD --session-dir <run> --phase <id>`, then `ticket merge` to confirm reservation release.
-  Report `From <unit>: ticket <id> closed with no code change; <n> held.`, then refill.
-- Sync waits: refill writes a `sync_waits` row before its last check; `ticket merge` runs `style_sync.py wake-waiters`, which sends `From the showrunner of <showrunner name>: ticket <id> merged; refill.` to each waiting unit director found through `message/roster.py --json` and clears only a delivered wait (`acknowledge_sync_wait` keys on the wait token). A queued wake keeps its wait: the next merge wakes the director at its current roster address.
+  Report `ticket <id> closed with no code change; <n> held.`
+  Refill the unit.
+- Refill writes a `sync_waits` row before its last check.
+  `ticket merge` runs `style_sync.py wake-waiters`.
+  This command finds each waiting unit director through `message/roster.py --json` and sends `ticket <id> merged; refill.`.
+  After delivery, `acknowledge_sync_wait` clears the wait by its token.
+  If the message goes to the queue, the next merge sends a notice to the director's current roster address.
 
-**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` (two copies; 30 s subprocess timeout; one-line failure) call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges. It is silent with no style production on `b`; else `send.py --timeout 10` of `From <caller>: branch point <b> moved to <sha7>; sync.` keyed `style-sync:<showrunner name>`, bounded at 35 s. A failure prints one line and exits 0.
+**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges.
+Both callers use a 30 s subprocess timeout and print one line on failure.
+When branch `b` has a style production, `send.py --timeout 10` sends `branch point <b> moved to <sha7>; sync.`
+The send uses the key `style-sync:<showrunner name>` and has a 35 s limit.
+`notify` stays silent when branch `b` has no style production.
+On failure, `notify` prints one line and exits with status 0.
 
 **Direct sync.** `notify` reads the configured units and sends each direct director a sync notice.
 `resume` reconciles the parent's receiving branch without replaying hand-offs.
@@ -661,7 +671,7 @@ See `gate-checkouts.md` for removal, configured paths, pool limits and lock rule
 2. Run `ticket merge`.
 3. Run `style_sync.py send-handoff --repo R --production <style showrunner name> --checkpoint <style branch tip>`.
 
-`send-handoff` records `handoff add` and sends `From the showrunner of <showrunner name>: hand-off <hash>` to the parent.
+`send-handoff` records `handoff add` and sends `hand-off <checkpoint>` to the parent.
 It then records `handoff send`.
 `handoff_notice` returns `HandoffDelivery` with `sent` or `queued`.
 A send.py exit 1 with stdout `QUEUED:` means queued delivery.
@@ -693,7 +703,7 @@ The phase is `style hand-off`, without a review trial.
 4. Run `notify_style`.
 5. Promote with label `<child> style hand-off`.
 6. Record `style_ledger.py handoff merged --repo <child checkout> --checkpoint <hash> --merge-commit <merge>`.
-7. Send `From the showrunner of <parent showrunner name>: hand-off <hash7> merged as <merge7>.`.
+7. Send `hand-off <c7> merged as <m7>.`.
 
 The ledger command has a 30-second timeout.
 A ledger failure prints `hand-off ledger: <detail>`.

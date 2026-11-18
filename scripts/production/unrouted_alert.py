@@ -15,9 +15,7 @@ from scripts.message import send_result, session_send
 
 def send_message(recipient: str, sender: str, message: str) -> None:
     """Accept delivered messages and messages kept in the sender's queue."""
-    result = subprocess.run(session_send.send_argv("--to", recipient, "--from", sender, "--text", message),
-                            capture_output=True, text=True, check=False)
-    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    outcome, error = message_outcome(recipient, sender, message)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         match outcome.header.outcome:
             case "sent" | "queued" | "kept":
@@ -26,7 +24,16 @@ def send_message(recipient: str, sender: str, message: str) -> None:
                 raise RuntimeError(f"RETRY: {outcome.header.detail}")
             case "skipped" | "replaced" | "failed" | "refused" | "held" | "pending":
                 pass
-    raise RuntimeError((result.stderr or result.stdout).strip() or "message delivery failed")
+    raise RuntimeError(error)
+
+
+def message_outcome(recipient: str, sender: str, message: str, *options: str
+                    ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
+    """Return the confirmed transport result and its diagnostic."""
+    result = subprocess.run(session_send.send_argv("--to", recipient, "--from", sender, "--text", message, *options),
+                            capture_output=True, text=True, check=False)
+    return (send_result.send_outcome(result.returncode, result.stdout),
+            (result.stderr or result.stdout).strip() or "message delivery failed")
 
 
 def notify(root: Path, listing: str, row: dict[str, str], reason: str, candidates: tuple[str, ...]) -> None:

@@ -11,6 +11,7 @@ import importlib.util
 import json
 import gzip
 import os
+import re
 import select
 import shlex
 import shutil
@@ -24,7 +25,7 @@ from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection, RemoteDisconnected
 from io import StringIO
 from pathlib import Path
@@ -40,6 +41,8 @@ from scripts.aws_target import aws_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
+from scripts.message import send_result
+from scripts.review_links.test_page_question import question_outcome
 from scripts.production import change_review, change_routing, investigation, next_item, proposal_issue, record_store, staff, the_list, update_registration
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
@@ -1019,8 +1022,18 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertFalse(review_submissions.image_folder(origin).parent.parent.exists())
             attach.assert_not_called()
 
+    def test_new_item_offers_a_producer_with_a_directory_document(self) -> None:
+        _ = self.review_fixture()
+        directory = self.root.parent / 'brain'
+        directory.mkdir()
+        producer = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
+        response = self.new_item_http()
+        self.assertEqual(response.status, 200)
+        fields = cast(dict[str, object], json.loads(response.body))
+        self.assertEqual(fields['recipients'], [{'id': producer.id, 'name': producer.name, 'proposal': False}])
+
     def test_new_item_publishes_native_records_before_success(self) -> None:
-        from scripts.review_links.test_review_submissions import EVIDENCE, PNG
+        from scripts.review_links.test_review_submissions import EVIDENCE, PNG, identify_fixture_image
 
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
@@ -1049,6 +1062,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(self.server, 'delivery_status', case.status),
               patch.object(handler, 'json_response', see_published),
               patch.object(review_items, 'read', side_effect=AssertionError('Send scanned Review.')),
+              patch.object(review_submissions, '_identify_image', autospec=True, side_effect=identify_fixture_image),
               patch.object(change_page, 'send_to_staff', side_effect=message_sent) as send):
             for kind in new_item_dialog.SubmissionKind:
                 with self.subTest(kind=kind):
@@ -2340,6 +2354,22 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(failed.status, 503)
             self.assertIn(b"The List page is not available.", failed.body)
 
+    def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
+        case = self.review_fixture(changes=2)
+        directory = self.root.parent / "brain"
+        directory.mkdir()
+        producer = fixture_member("producer", name="brain", doc=staff.LiveDoc(local_machine(), directory))
+        item = the_list.add(producer.id, "Read the linked changes", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(producer.id, item.id, ("page-owner/C1", "page-owner/C2"), source="nate")
+        with patch.object(self.server, "root", case.root):
+            self.assertEqual(self.request(list_page.PAGE_PATH).status, 200)
+            change_routing.delivery_path(case.root, case.fixture.review_list, "C1").mkdir()
+            response = self.request(list_page.PAGE_PATH)
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"Read the linked changes", response.body)
+        self.assertIn(b">page-owner/C2</a>", response.body)
+
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
             ("/abc123/console.html?page=questions", "/console/?page=questions"),
@@ -2376,7 +2406,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "deliver", side_effect=complete_delivery),
               patch.object(change_page, "send_to_staff", side_effect=send) as delivery):
-            request = uuid4().hex
+            request = list_page.ListFormRequestPrefix(uuid4().hex, the_list.unread_update(item)).format()
             fields = {"keeper": morty.id, "id": item.id, "request": request,
                     "token": list_page.request_token(self.root, morty.id, item.id, request),
                     "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
@@ -2398,6 +2428,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     fields["request"] = f"{request}.{uuid4().hex}"
                     if action == "read":
                         delivery.assert_not_called()
+                        self.assertEqual(response["unread"], "false")
                     else:
                         self.assertTrue(sent.wait(TEST_HANG_GUARD_SECS))
                         expected = ("nate's words for item 1" if action == "tell" else
@@ -2424,6 +2455,82 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertTrue(sent.is_set())
                 finally:
                     restarted.server_close()
+
+    def test_list_unpark_retry_after_expiry_preserves_new_parking(self) -> None:
+        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        expiry = start + timedelta(hours=1)
+        new_time = expiry + timedelta(hours=1)
+        with patch.object(the_list, "now", return_value=start) as clock:
+            item = the_list.add(morty.id, "Unpark this item", owner=the_list.UnassignedOwner.NATE,
+                                source="nate", changes={})
+            parked = the_list.park(morty.id, item.id, expiry, source="morty")
+            request = uuid4().hex
+            def unpark_body(request_id: str) -> str:
+                return urlencode({"keeper": morty.id, "id": item.id, "request": request_id,
+                                  "token": list_page.request_token(self.root, morty.id, item.id, request_id),
+                                  "action": "unpark", "words": "", "until": ""})
+
+            body = unpark_body(request)
+            clock.return_value = expiry
+            delivered = threading.Event()
+
+            def finish_delivery(_submission: list_page.ListActionSubmission) -> None:
+                delivered.set()
+
+            with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+                  patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+                  patch.object(list_page, "deliver", side_effect=finish_delivery) as deliver):
+                code, response = self.post(list_page.PAGE_PATH, body)
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(response)["parked"], "false")
+                self.assertEqual(json.loads(response)["unpark_outcome"], "expired")
+                self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+                saved = the_list.load(morty.id, item.id)
+                self.assertEqual(saved.parked_until, expiry)
+                self.assertEqual(saved.log[:-1], parked.log)
+                self.assertEqual(saved.log[-1].what,
+                                 the_list.UnparkNoChangeReceipt(
+                                     the_list.PageRequest(request, "unpark", "List page: nate unparked item 1."),
+                                     the_list.UnparkNoChangeReason.EXPIRED))
+                reparked = the_list.park(morty.id, item.id, new_time, source="morty")
+                delivered.clear()
+                code, response = self.post(list_page.PAGE_PATH, body)
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(response)["parked"], "true")
+                self.assertEqual(json.loads(response)["unpark_outcome"], "expired")
+                self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+                self.assertEqual(the_list.load(morty.id, item.id), reparked)
+                expired = list_page.ListUnparkSubmission(list_page.UnparkOutcome.EXPIRED,
+                                                         change_page.NoMessageDelivery())
+                self.assertEqual([call.args for call in deliver.call_args_list],
+                                 [(expired,), (expired,)])
+                fresh = uuid4().hex
+                delivered.clear()
+                code, response = self.post(list_page.PAGE_PATH, unpark_body(fresh))
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(response)["parked"], "false")
+                self.assertEqual(json.loads(response)["unpark_outcome"], "cleared")
+                self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+                deliver.assert_called_with(list_page.ListUnparkSubmission(list_page.UnparkOutcome.CLEARED,
+                    list_page.ListFeedbackDelivery(morty.id, item.id, fresh)))
+                delivered.clear()
+                code, response = self.post(list_page.PAGE_PATH, unpark_body(uuid4().hex))
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(response)["parked"], "false")
+                self.assertEqual(json.loads(response)["unpark_outcome"], "no_active_parking")
+                self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+                deliver.assert_called_with(list_page.ListUnparkSubmission(list_page.UnparkOutcome.NO_ACTIVE_PARKING,
+                    change_page.NoMessageDelivery()))
+                newer = the_list.park(morty.id, item.id, new_time + timedelta(hours=1), source="morty")
+                delivered.clear()
+                code, response = self.post(list_page.PAGE_PATH, unpark_body(fresh))
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(response)["parked"], "true")
+                self.assertEqual(json.loads(response)["unpark_outcome"], "cleared_newer_parking_active")
+                self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+                self.assertEqual(the_list.load(morty.id, item.id), newer)
 
     def test_list_remove_reports_saved_when_directory_sync_fails_after_replace(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
@@ -2530,10 +2637,12 @@ class ReviewLinksServerTests(unittest.TestCase):
         started, release, finished = threading.Event(), threading.Event(), threading.Event()
         deliveries: list[tuple[staff.StaffId, str]] = []
 
-        def send(recipient: staff.StaffId, _sender: str, message: str) -> None:
+        def send(recipient: staff.StaffId, message: str, _message_id: str
+                 ) -> tuple[send_result.ConfirmedSendOutcome, str]:
             deliveries.append((recipient, message))
             started.set()
             self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+            return question_outcome()
 
         real_deliver = change_page.deliver
 
@@ -2549,12 +2658,14 @@ class ReviewLinksServerTests(unittest.TestCase):
                   "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
-              patch.object(change_page, "send_to_staff", side_effect=send),
+              patch.object(change_page, "send_question", side_effect=send),
               patch.object(change_page, "deliver", side_effect=deliver)):
             try:
                 code, body = self.post(list_page.PAGE_PATH, urlencode(fields))
                 self.assertEqual(code, 200)
                 self.assertEqual(json.loads(body)["state"], "saved")
+                self.assertEqual(json.loads(body)["waiting_for_answer"], "true")
+                self.assertEqual(json.loads(body)["open_question"], "true")
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(finished.is_set())
                 opened = the_list.load(morty.id, item.id)
@@ -2616,7 +2727,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(change_page, "deliver", side_effect=deliver),
-              patch.object(change_page, "send_to_staff") as send):
+              patch.object(change_page, "send_question", return_value=question_outcome()) as send):
             for _ in range(2):
                 finished.clear()
                 self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(fields))[0], 200)
@@ -2624,6 +2735,63 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_called_once()
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
+
+    def test_exhausted_list_question_returns_to_open_and_resends_the_same_id(self) -> None:
+        morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        request, words = uuid4().hex, "Which check passed?"
+        fields = {"keeper": morty.id, "id": item.id, "request": request, "words": words, "until": "",
+                  "token": list_page.request_token(self.root, morty.id, item.id, request), "action": "question"}
+        finished = threading.Event()
+        real_deliver = change_page.deliver
+        messages: list[str] = []
+        tries = conf.read("review_links").whole("delivery_tries")
+
+        def deliver(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
+                    status: change_page.DeliveryStatus) -> None:
+            try:
+                if isinstance(message, change_page.MessageDelivery):
+                    messages.append(message.message)
+                real_deliver(message, status)
+            finally:
+                finished.set()
+
+        with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(change_page, "deliver", side_effect=deliver),
+              patch.object(change_page, "alert_delivery_failures"),
+              patch.object(change_page, "send_question", side_effect=[
+                  *([question_outcome("refused", "Producer offline")] * tries), question_outcome()]) as send):
+            code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
+            self.assertEqual(json.loads(response)["open_question"], "true")
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            saved = the_list.load(morty.id, item.id)
+            self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
+            opened = self.request(list_page.PAGE_PATH)
+            self.assertEqual(opened.status, 200)
+            markup = opened.body.decode().split('<script>', 1)[0]
+            self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+            self.assertIn('data-open-question="true"', markup)
+            self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
+            signed = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', markup))
+            finished.clear()
+            code, response = self.post(list_page.PAGE_PATH, urlencode({
+                **signed, "action": "resend-Q1", "words": "Ignore these new words.", "until": ""}))
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
+            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(send.call_count, tries + 1)
+            self.assertEqual(messages, [messages[0], messages[0]])
+            self.assertIn(f"\n{words}\n", messages[0])
+            self.assertIn("answer L1 --question Q1", messages[0])
+            self.assertEqual(the_list.load(morty.id, item.id), saved)
+            waiting = self.request(list_page.PAGE_PATH).body.decode().split('<script>', 1)[0]
+            self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]*">')
+            self.assertNotIn('value="resend-Q1"', waiting)
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
@@ -3490,8 +3658,9 @@ class ServerStartupTests(unittest.TestCase):
         store.mkdir()
         keeper = staff.StaffId(str(uuid4()))
         producer = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
-        _ = (store / "staff.json").write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
-        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records")}):
+        staff_file = store / "staff.json"
+        _ = staff_file.write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
+        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records"), "STAFF_FILE": str(staff_file)}):
             item = the_list.add(keeper, "Private List item", owner=the_list.UnassignedOwner.NATE,
                                 source="morty", changes={})
 

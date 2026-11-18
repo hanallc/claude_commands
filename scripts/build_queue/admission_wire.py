@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
+from scripts.build_targets.execution_transport import HanaControlTransport
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -104,6 +106,7 @@ class Identity:
     step: str
     folder: str
     unit: str = ""
+    job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -459,10 +462,8 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
         paths.add(settings.path)
     for target in targets:
         if isinstance(target, target_config.SshTarget) and target.name == target_name:
-            from scripts.aws_target import hana_placement
-
             paths.add(target.settings)
-            if isinstance(transport_for(target), hana_placement.HanaControlTransport):
+            if isinstance(transport_for(target), HanaControlTransport):
                 paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
     for path in sorted(paths):
@@ -540,6 +541,7 @@ class Assignment:
     assignment: placement.PlacementAssignment
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -549,6 +551,7 @@ class LocalPlacementGranted:
     grant: Admitted
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)

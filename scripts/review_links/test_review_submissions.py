@@ -178,6 +178,13 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(proposal.id, "P1")
         self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P1")), Issue)
 
+    def test_proposal_folder_is_absent_for_a_producer_directory(self) -> None:
+        directory = self.root / "brain"
+        directory.mkdir()
+        producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
+        self.assertEqual(submissions.proposal_folder(producer),
+                         submissions.NoNativeFolder(submissions.SubmissionKind.PROPOSAL))
+
     def test_concurrent_retries_reuse_the_id_for_the_same_request(self) -> None:
         with ThreadPoolExecutor(max_workers=4) as executor:
             saved = list(executor.map(submissions.submit, [request()] * 4))

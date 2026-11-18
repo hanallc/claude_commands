@@ -150,9 +150,11 @@ class MemoryHoverTests(unittest.TestCase):
                                 (["a<&", "b"], "Queued, a<& followed by b and then in submission order")):
             with self.subTest(units=units):
                 data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "queued_priority_units": units,
-                    "walk": [{"name": "running", "queued": True}],
+                    "walk": [{"name": "running", "queued": True}, {"name": "second running", "queued": True}],
                     "waiters": [{"name": "first", "since": 100, "detail": "research", "pid": 200}]}
-                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                running_title, rendered = cast(list[str], self.page_expression(
+                    "(renderWalk(data), [$('walk-title').textContent, $('walk').innerHTML])", data, walk=True))
+                self.assertEqual(running_title, "Running, in start order (2)")
                 root = ElementTree.fromstring(f"<root>{rendered}</root>")
                 chart = root.find("./div[@class='walk-chart']")
                 assert chart is not None
@@ -160,7 +162,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert header is not None
                 title = header.find("./span[@class='queue-title section-head']")
                 assert title is not None
-                self.assertEqual(title.text, expected)
+                self.assertEqual("".join(title.itertext()), f"{expected} (1)")
                 self.assertEqual(title.get("title"), expected)
                 room = chart.find("./div[@class='wrow room']")
                 assert room is not None
@@ -169,7 +171,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(children[children.index(header) + 1].get("data-tip"), "wait:fixture-wait-0")
                 table_rows = root.findall(".//tbody/tr")
                 self.assertEqual([row.get("class") for row in table_rows],
-                                 ["tools", "", "room", "queue-head", "wait wait-first"])
+                                 ["tools", "", "", "room", "queue-head", "wait wait-first"])
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "first")
 
@@ -469,7 +471,7 @@ class MemoryHoverTests(unittest.TestCase):
                 queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
                 self.assertEqual(len(queue_headers), int(waiting))
-                self.assertEqual(len(spacers), int(waiting))
+                self.assertEqual(len(spacers), 1)
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
                                      ["#", "Done", "Step", "Waiting", "Unit", "Pid", "Target", "vCPU"])

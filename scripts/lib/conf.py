@@ -172,7 +172,9 @@ class ConfigRead:
 
     def effective_key(self, key: str) -> str:
         """Return the host override key when the live file has one."""
-        return _effective_key(self.settings, key) if isinstance(self.settings, dict) else key
+        if isinstance(self.settings, dict):
+            return effective_key(self.settings, key, host_name=_local_host_name())
+        return key
 
     def number(self, key: str) -> float:
         return self._value(key, _number)
@@ -283,14 +285,15 @@ def _local_host_name() -> str:
     return socket.gethostname().partition(".")[0]
 
 
-def _effective_key(settings: dict[str, Setting], key: str) -> str:
-    candidate = f"{key}.{_local_host_name()}"
+def effective_key(settings: dict[str, Setting], key: str, *, host_name: str) -> str:
+    """Select the override for the specified short host name when it exists."""
+    candidate = f"{key}.{host_name}"
     return candidate if candidate in settings else key
 
 
 def _setting(settings: dict[str, Setting], key: str) -> Setting:
     try:
-        return settings[_effective_key(settings, key)]
+        return settings[effective_key(settings, key, host_name=_local_host_name())]
     except KeyError:
         raise _MissingKey("key is missing") from None
 

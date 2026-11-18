@@ -2112,9 +2112,9 @@ print('two homes isolated; recorder lock retained; caller restored')
             "session_id": "supplier-session", "senders": ["another-director", "director"],
             "body": body, "targets": ["another-director", "director"],
         }))
+        forward = f"renamed-supplier (answer to one of another-director, director): {body}\n\nTag: 1030000-9"
         prompt = ('<cross-session-message from="uds:/fixture/postmaster/socket" from-name="postmaster">'
-                  + "Message from renamed-supplier (their answer to one of another-director, director, "
-                  + "passed on by postmaster) [1030000-9]:\n\n" + body + "</cross-session-message>")
+                  + forward + "</cross-session-message>")
         os.environ["UNIT_NOW_EPOCH"] = "1030"
         return session, record, prompt
 
@@ -2152,7 +2152,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def test_pending_forward_preserves_body_whitespace_and_ignores_the_record_counter(self) -> None:
         name = "pending-exact-body"
-        session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\n")
+        session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\nTag: 1029000-1\n\n")
         self.assertFalse((self.root / "state/message/postmaster/forwards").exists())
         progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
         progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
@@ -4272,6 +4272,11 @@ with patch.object(fcntl, "flock", admission):
                     _ = prompt.write_text(original_prompt)
             stage_two = self.root / "stage-two-prompt.txt"
             _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
+            stage_id = f"{first}-2"
+            stage_line = f"Stage 2: Read the unchanged prompt file {json.dumps(str(stage_two))}. DONE {stage_id}"
+            progress_history.save_dispatch_delivery(session, first, progress_history.DispatchDelivery(
+                stage_line, stage_id, str(self.root / "review.md"), str(self.root / "review.ready")))
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
             second_stage = progress_history.begin_dispatch(
                 session, slot="impl2", phase="3", role="review", worker_name="impl2",
                 worker_id=member.id,
