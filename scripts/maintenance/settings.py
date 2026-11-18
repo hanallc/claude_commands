@@ -28,6 +28,12 @@ class Schedule:
 
 
 @dataclass(frozen=True)
+class UsageIntervals:
+    claude_seconds: float
+    codex_seconds: float
+
+
+@dataclass(frozen=True)
 class Settings:
     job: Schedule
     parts: dict[Part, Schedule]
@@ -65,12 +71,16 @@ def configuration() -> dict[str, object]:
     return table(tomllib.loads(configuration_path().read_text(encoding="utf-8")))
 
 
-def usage_only_interval() -> float:
-    """Read the Mac usage cadence at use; absent or invalid config refuses a read."""
+def usage_only_intervals() -> UsageIntervals:
+    """Read both Mac usage intervals from one configuration."""
+    key = "interval_seconds"
     try:
-        return positive(table(configuration().get("mac_usage")), "interval_seconds")
+        values = table(configuration().get("mac_usage"))
+        claude_seconds = positive(values, key)
+        key = "codex_interval_seconds"
+        return UsageIntervals(claude_seconds, positive(values, key))
     except (OSError, ValueError, OverflowError) as error:
-        raise ValueError(f"{configuration_path()}: mac_usage.interval_seconds must be a finite positive number") from error
+        raise ValueError(f"{configuration_path()}: mac_usage.{key} must be a finite positive number") from error
 
 
 def settings() -> Settings:

@@ -172,6 +172,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
+| `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
+| `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
@@ -212,6 +214,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
+| `scripts/lib/session_move.py` | read | local_snapshot, by_current_session, by_member_reference, StaffSnapshot, StaffAbsent; finds the staff member that owns a moved session |
 | `scripts/lib/session_folder.py` | read | local_snapshot, by_current_session, by_id, StaffRow and StaffSnapshot (types), ReportsTo; member_of names the folder of a staff session |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/memory_admit.py` | read | snapshot; queue priority takes waiter units from recorded staff rows |

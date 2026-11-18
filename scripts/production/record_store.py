@@ -15,7 +15,7 @@ from itertools import chain
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
@@ -352,6 +352,10 @@ class OccupiedRecordPath(OSError):
     """Another writer published at the destination first."""
 
 
+class NumberedRecordUpdateNotSaved(OSError):
+    """The previous numbered record is still visible after an unconfirmed write."""
+
+
 @dataclass
 class LockedRecordNumbers:
     """The machine-wide sequence for one kind under its publication lock."""
@@ -387,30 +391,33 @@ class LockedRecordNumbers:
     def write(self, path: Path, identity: str, owner: staff.StaffId, *,
               folder: Path | None = None, new_record: bool = False) -> Generator[None]:
         """Reserve the ID before the native write. Restore its bytes if the write fails."""
-        root = path.parent if folder is None else folder
-        ceiling = self.number(identity)
-        if ceiling > self.high_water:
-            sequence = _sequence_path(self.kind)
-            write_text_atomic(sequence, f"{ceiling}\n")
-            sync_folder(sequence.parent.parent)
-            self.high_water = ceiling
-        registry = _folder_registry(owner, self.kind)
-        folders = _registered_folders(registry)
-        root = root.resolve()
-        with keep_file_on_error(registry):
-            if root not in folders:
-                write_text_atomic(registry, json.dumps(list(map(str, (*folders, root)))) + "\n")
-                sync_folder(registry.parent.parent)
-                sync_folder(registry.parent.parent.parent)
+        try:
+            root = (path.parent if folder is None else folder).resolve()
+            ceiling = self.number(identity)
+            if ceiling > self.high_water:
+                sequence = _sequence_path(self.kind)
+                write_text_atomic(sequence, f"{ceiling}\n")
+                sync_folder(sequence.parent.parent)
+                self.high_water = ceiling
+            registry = _folder_registry(owner, self.kind)
+            folders = _registered_folders(registry)
+            with keep_file_on_error(registry):
+                if root not in folders:
+                    write_text_atomic(registry, json.dumps(list(map(str, (*folders, root)))) + "\n")
+                    sync_folder(registry.parent.parent)
+                    sync_folder(registry.parent.parent.parent)
+                if new_record:
+                    yield
+                    return
+                with keep_file_on_error(path):
+                    yield
+        except AtomicDurabilityUnconfirmed as error:
             if new_record:
-                yield
-                return
-            before = _file_bytes(path)
-            try:
-                yield
-            except Exception:
-                _restore_bytes(path, before)
                 raise
+            # A reservation can fail before the record write. A record write
+            # that fails restores the previous contents before reaching here.
+            raise NumberedRecordUpdateNotSaved(
+                error.errno, "numbered record update did not stay saved", str(path)) from error
 
 
 @contextmanager
