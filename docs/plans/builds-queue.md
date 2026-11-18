@@ -2839,6 +2839,9 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 2. The line names the recorded hold of the row ahead. For a memory hold it shows the need and the room. For another hold it shows the resource, the holder or the deadline that applies.
 3. The Builds page and the wait line give the same reason for the same row.
 4. Acceptance: a test with room below the need of the head and host free memory above it. The line shows the room and the memory reason, and no host free memory figure. One test for each other hold kind of the row ahead.
+5. From the review of phase 44bu (2026-11-18): Verify does not print the reason of a Mac probe that got no answer (`admission_client.py:1380`). The wait line prints it.
+6. From the same review: under memory pressure, the client hides the hold reason of a held CI step (`admission_client.py:1048`). The line shows the hold reason.
+7. This phase carries the change review row and the image for the wait reasons of 44br and 44bq.
 
 ### Phase 44bw — A running step has all that it needs: no admitted step waits for a unit token  · status: todo
 **Ruling (builds, 2026-11-18 03:35 EST), from the user's rule of 2026-11-17:** "it shouldn't be locked down to a unit - if you get into the running that shoudl mean you have a cargo token to use". Measured in 7 days: 764 local calls waited for the unit Cargo token after their memory grant; median 707.5 s, longest 12,452 s. Built after 44bq, 44br and 44bt are on main. Facts with file and line: the token research of 2026-11-18 03:30 EST.
