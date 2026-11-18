@@ -1760,10 +1760,10 @@ window.fetch=async(url)=>{
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:
         fixture = self.fixture
-        _ = change_review.append_rows(fixture.review_list, [
+        _ = change_review.append_rows(fixture.review_list, pictured_changes([
             change_review.Visible(f'Change {number}', 'Read the diff', 'Check the result')
             for number in range(4, 9)
-        ], datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
+        ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
         self.assertEqual(save_notice_failures(review_page.render(self.root), 'works'), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
