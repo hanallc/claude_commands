@@ -1536,6 +1536,22 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(failed.status, 503)
             self.assertIn(b"The List page is not available.", failed.body)
 
+    def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
+        case = self.review_fixture(changes=2)
+        directory = self.root.parent / "brain"
+        directory.mkdir()
+        producer = fixture_member("producer", name="brain", doc=staff.LiveDoc(local_machine(), directory))
+        item = the_list.add(producer.id, "Read the linked changes", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(producer.id, item.id, ("page-owner/C1", "page-owner/C2"), source="nate")
+        with patch.object(self.server, "root", case.root):
+            self.assertEqual(self.request(list_page.PAGE_PATH).status, 200)
+            change_routing.delivery_path(case.root, case.fixture.review_list, "C1").mkdir()
+            response = self.request(list_page.PAGE_PATH)
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"Read the linked changes", response.body)
+        self.assertIn(b">page-owner/C2</a>", response.body)
+
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
             ("/abc123/console.html?page=questions", "/console/?page=questions"),
