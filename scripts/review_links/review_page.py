@@ -603,13 +603,14 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
     """Build the controls and compact index without any card body."""
     show = 'open'
     entries = snapshot.entries
-    owners = {entry['owner']:entry['ownerName'] for entry in entries}
-    owners.update({entry['sourceOwner']:entry['sourceName'] for entry in entries if entry['type']==ReviewType.INVESTIGATION})
+    owners = {entry['owner']:(entry['ownerName'], entry['ownerHtml']) for entry in entries}
+    owners.update({entry['sourceOwner']:(entry['sourceName'], entry['sourceHtml'])
+                   for entry in entries if entry['type']==ReviewType.INVESTIGATION})
     owner_chips = '<button id="review-owner-all" type="button" data-owner-chip="" aria-pressed="true">All <b></b></button>'
-    for owner, name in sorted(owners.items(), key=lambda pair: pair[1].casefold()):
+    for owner, (name, markup) in sorted(owners.items(), key=lambda pair: pair[1][0].casefold()):
         identity, label = html.escape(owner, quote=True), html.escape(name, quote=True)
         owner_chips += (f'<button id="review-owner-{identity}" type="button" data-owner-chip="{identity}" '
-                        +f'data-owner-name="{label}" aria-pressed="false">{label} <b></b></button>')
+                        +f'data-owner-name="{label}" aria-pressed="false">{markup or label} <b></b></button>')
     chips = '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
     chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
                      +' <b></b></button>' for kind in TYPES)
@@ -622,9 +623,9 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
-        +'<div class="review-types" role="group" aria-label="Type">'+chips+'</div>'
-        +'<div class="review-types review-shows" id="list-show" role="group" aria-label="Show">'+shows+'</div>'
-        +'<div class="review-types" id="list-owner" role="group" aria-label="Owner">'+owner_chips+'</div>'
+        +record_table.labelled_chip_row('Type', chips, chip_classes='review-types')
+        +record_table.labelled_chip_row('State', shows, chip_classes='review-types review-shows', chip_id='list-show')
+        +record_table.labelled_chip_row('Owner', owner_chips, chip_classes='review-types', chip_id='list-owner')
         +'<div class="list-filters">'
         +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
         +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
@@ -767,7 +768,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 STYLE = '''<style>
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.review-types{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}
+[data-review] .record-filter-row{margin-bottom:12px}
+.record-filter-row>.review-types{gap:8px}
+.review-types button{max-width:100%;overflow-wrap:anywhere}
 :is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -802,6 +805,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 @media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
+@media(max-width:480px){[data-review] .record-filter-row{grid-template-columns:minmax(0,1fr)}}
 </style>'''
 
 CARD_REQUEST_SCRIPT = r'''
@@ -839,13 +843,13 @@ function readIndex(payload){
 }
 function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
+const colored=(name,markup)=>markup || escapeText(name);
 function summary(entry){
  const node=document.createElement('tbody'),panel='review-detail-'+encodeURIComponent(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
   order:entry.order,updated:entry.updated,parked:'false'});
  const limit=Number(content.dataset.titleLimit),first=entry.title.split(/\r?\n/)[0],short=first.slice(0,limit);
- const colored=(name,markup)=>markup || escapeText(name);
  const age=Math.max(0,Math.floor(Date.now()/1000-entry.filed));
  const stamp=age>=86400 ? Math.floor(age/86400)+' d' : age>=3600 ? Math.floor(age/3600)+' h' : Math.floor(age/60)+' min';
  const icon=content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML;
@@ -1168,18 +1172,24 @@ async function refresh(_supersede=false,current=()=>true){
  const menu=content.querySelector('#list-owner'),pairs=new Map();
  const focusedOwner=document.activeElement?.dataset.ownerChip;
  for(const entry of index.values()){
-  pairs.set(entry.owner,entry.ownerName);
-  if(entry.type==='investigation') pairs.set(entry.sourceOwner,entry.sourceName);
+  pairs.set(entry.owner,{name:entry.ownerName,markup:entry.ownerHtml});
+ }
+ for(const entry of index.values()){
+  if(entry.type==='investigation') pairs.set(entry.sourceOwner,{name:entry.sourceName,markup:entry.sourceHtml});
  }
  for(const button of menu.querySelectorAll('[data-owner-chip]')){
   const id=button.dataset.ownerChip;
   if(id && !pairs.has(id)) button.remove();
  }
- for(const [id,name] of [...pairs].sort((a,b)=>a[1].localeCompare(b[1]))){
-  if(menu.querySelector('[data-owner-chip="'+CSS.escape(id)+'"]')) continue;
-  const button=document.createElement('button');button.type='button';
-  button.id='review-owner-'+id;button.dataset.ownerChip=id;button.dataset.ownerName=name;
-  button.append(name+' ',document.createElement('b'));menu.append(button);
+ for(const [id,{name,markup}] of [...pairs].sort((a,b)=>a[1].name.localeCompare(b[1].name))){
+  let button=menu.querySelector('[data-owner-chip="'+CSS.escape(id)+'"]');
+  if(!button){
+   button=document.createElement('button');button.type='button';
+   button.id='review-owner-'+id;button.dataset.ownerChip=id;menu.append(button);
+  }
+  const count=button.querySelector('b') || document.createElement('b');
+  button.dataset.ownerName=name;
+  button.innerHTML=colored(name,markup)+' ';button.append(count);
  }
  for(const [key,result] of saved){
   const entry=index.get(key);
