@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from scripts.direct.verify_scope_test_support import write_test_scope_launcher
+from scripts.direct.verify_scope_test_support import (
+    use_fixture_scope_readings, write_real_scope_launcher, write_test_scope_launcher,
+)
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
@@ -358,6 +360,8 @@ if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == 
 
     signal.signal(signal.SIGTERM, stop)
     print("   Compiling sample v0.1.0", flush=True)
+    if scope := os.environ.get("BUILDLOG_STEP_SCOPE"):
+        (root / "cargo-scope").write_text(scope, encoding="utf-8")
     (root / "cargo-compiling").write_text(f"{os.getpid()}\n", encoding="utf-8")
     with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
     from scripts.direct.wait_for_test_state import wait_for_file
@@ -1823,7 +1827,9 @@ trap 'finish_tree_watch; finish_hold_wait' EXIT
     def start_copy_call(self, *words: str, copy: dict[str, str]) -> tuple[subprocess.Popen[str], int]:
         """Start a call the busy Mac sends to natedev, where its step compiles
         until cargo-release; return it with the pid of the Mac copy it starts."""
+        write_real_scope_launcher(self.bin_directory)
         admission = caller_admission(self, self.root, self.environment)
+        use_fixture_scope_readings(self, self.root, admission)
         identity = ["--claim-id", "fixture-busy-claim", "--episode", "fixture-busy-episode",
                     "--attempt", "fixture-busy-attempt"]
         with admission.loop_turn():
@@ -1863,10 +1869,17 @@ trap 'finish_tree_watch; finish_hold_wait' EXIT
             "TEST_CARGO_HOLD": "1", **copy})
         self.addCleanup(self.stop_verify, process)
         started = self.runner_state / "copy-started"
-        self.wait_for_path(self.runner_state / "cargo-compiling", (process,))
-        release_busy()
-        _ = (self.runner_state / "mac-free").write_text("free\n")
-        self.wait_for_path(started, (process,))
+        try:
+            self.wait_for_path(self.runner_state / "cargo-compiling", (process,))
+            release_busy()
+            _ = (self.runner_state / "mac-free").write_text("free\n")
+            self.wait_for_path(started, (process,))
+        except AssertionError as error:
+            self.capture_queue_state()
+            self.stop_verify(process)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            state = (self.runner_state / "failed-queue-state.txt").read_text()
+            self.fail(f"{error}\n{output}{errors}\n{state}")
         self.assertTrue((self.runner_state / "cargo-compiling").exists())
         self.assertEqual(len(self.runner_events()), 0)
         return process, int(started.read_text(encoding="utf-8"))

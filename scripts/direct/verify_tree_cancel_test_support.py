@@ -22,6 +22,7 @@ from typing import cast, override
 
 from scripts.agents.detached_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
+from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -149,6 +150,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.control.mkdir()
         self.board = self.root / "board"
         stubs = self.root / "stubs"
+        write_real_scope_launcher(stubs)
         # All compilation tools stay private; only git is the real executable.
         git = shutil.which("git")
         assert git is not None
@@ -184,6 +186,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.control = self.root / "control"
         self.board = self.root / "board"
         self.admission = caller_admission(self, self.root, self.environment)
+        use_fixture_scope_readings(self, self.root, self.admission)
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             if key.destination.provider == "local":

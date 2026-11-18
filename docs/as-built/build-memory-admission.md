@@ -249,12 +249,12 @@ The queue checks that folder together with memory before a local grant.
 Verify sets `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the paths it resolved for the local grant.
 On Linux, a local placement grant names the build scope through its sidecar.
 The scope publishes that path before Cargo starts.
-The step supervisor asks systemd to stop the scope if the verify caller or step shell exits.
-Systemd sends a hard kill if the scope still has members after five seconds.
-Cargo writes directly to the step's output.
+The supervisor stops a published scope through the kernel's `cgroup.kill` file.
+The same path handles caller exit, cancellation, and a winning Mac copy.
+The supervisor holds the launch lock until `cgroup.events` confirms the scope is empty.
+Cargo writes to a file. A separate reader sends the file contents to the step log.
+The supervisor can return a shutdown error while a process still has the file open.
 Verify closes the launch before it releases or cancels the grant.
-The supervisor holds the launch lock until the scope is empty.
-Verify accepts an empty scope even if systemd reports a stop error.
 If shutdown fails, verify reports the error and keeps the reservation for the service to reclaim.
 Verify returns status 125 for that error even if a Mac copy passes.
 After a local build, verify reports the binary from the pinned target folder.

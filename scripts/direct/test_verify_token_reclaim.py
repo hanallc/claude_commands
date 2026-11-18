@@ -2,82 +2,65 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import fcntl
 import os
 from pathlib import Path
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
 from typing import override
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service
+from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
+from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint import memory_admit as gate
 
 
 class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        if sys.platform != "linux":
-            self.skipTest("build scopes require Linux")
-        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
-        if not runtime or not (Path(runtime) / "systemd/private").is_socket():
-            self.skipTest("build scopes require a systemd user manager")
+        write_real_scope_launcher(self.root / "stubs")
         self.environment["BUILDLOG_SCOPE"] = "1"
-        for name in ("systemd-run", "systemctl"):
-            executable = shutil.which(name)
-            if executable is None:
-                self.skipTest(f"build scopes require {name}")
-            tool = self.root / "stubs" / name
-            _ = tool.write_text(f"#!/bin/sh\nexport XDG_RUNTIME_DIR={shlex.quote(runtime)}\n"
-                                + f'exec {shlex.quote(executable)} "$@"\n')
-            tool.chmod(0o755)
+        supervisor = self.scope_fixture_script().with_name("verify_scoped_step.py")
+        source = supervisor.read_text()
+        marker = 'if __name__ == "__main__":'
+        self.assertEqual(source.count(marker), 1)
+        hook = r"""
+    from scripts.direct.wait_for_test_state import wait_for_file
+
+    root = Path(os.environ["TEST_SCOPE_FIXTURE"])
+    _ = (root / "scope-step-leader").write_text(sys.argv[2])
+    if os.environ.get("TEST_PAUSE_SCOPE_KILL"):
+        drain = drain_scope
+
+        def pause(scope: Path) -> None:
+            (root / "scope-stop").touch()
+            wait_for_file(root / "allow-scope-stop")
+            drain(scope)
+
+        drain_scope = pause
+"""
+        _ = supervisor.write_text(source.replace(marker, marker + "\n" + hook))
+        self.environment["TEST_SCOPE_FIXTURE"] = str(self.root)
 
         admission = caller_admission(self, self.root, self.environment)
-        guard = gate.check_memory_reading
-        reservation = admission.readings.reservation
-
-        scope_membership: set[Path] = set()
-
-        def membership_only(path: Path) -> None:
-            if path in scope_membership:
-                return
-            if path.name == "cgroup.procs":
-                for sidecar in (self.root / "tmp").glob("buildlog.*.peak.cgroup"):
-                    try:
-                        if sidecar.read_text().strip() == str(path.parent):
-                            scope_membership.add(path)
-                            return
-                    except FileNotFoundError:
-                        pass
-            guard(path)
-
-        def scoped_memory(path: Path, row: records.Reservation, now: datetime,
-                          processes: dict[int, gate.ProcessIdentity], proc: Path,
-                          policy: records.AdmissionPolicy) -> records.StepMemory:
-            if row["sidecar"]:
-                return records.MeasuredMemory(records.GIB)
-            return reservation(path, row, now, processes, proc, policy)
-
-        # Read process membership from the test's scope. Supply memory separately.
-        _ = self.enterContext(mock.patch.object(gate, "check_memory_reading", side_effect=membership_only))
-        _ = self.enterContext(mock.patch.object(admission.readings, "reservation", side_effect=scoped_memory))
+        use_fixture_scope_readings(self, self.root, admission)
         self.addCleanup(admission.run_pass)
+
+    def scope_fixture_script(self) -> Path:
+        return self.root / "home/.claude/scripts/direct/verify.sh"
 
     def start_cargo(self) -> tuple[subprocess.Popen[bytes], int]:
         log = self.root / "first-output"
         with log.open("wb") as output:
             first = subprocess.Popen(
-                ["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                ["bash", str(self.scope_fixture_script()), "check", "sample"], cwd=self.root,
                 env={**self.environment, "TEST_BLOCK": "1"}, stdout=output,
                 stderr=subprocess.STDOUT, start_new_session=True,
             )
@@ -92,6 +75,15 @@ class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):
         self.started_groups.add(step_group)
         self.assertNotEqual(step_group, first.pid)
         return first, step_group
+
+    def stop_step_leader(self) -> None:
+        leader = int((self.root / "scope-step-leader").read_text())
+        os.kill(leader, signal.SIGKILL)
+
+    def refuse_manager_stop(self) -> None:
+        systemctl = self.root / "stubs/systemctl"
+        _ = systemctl.write_text("#!/bin/sh\necho 'test manager refused the scope stop' >&2\nexit 7\n")
+        systemctl.chmod(0o755)
 
     def assert_next_build_starts_after_cargo_stops(self, step_group: int) -> None:
         admission = caller_admission(self, self.root, self.environment)
@@ -108,36 +100,30 @@ class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):
 
     def test_step_leader_death_stops_the_other_scope_members(self) -> None:
         first, step_group = self.start_cargo()
-        os.kill(step_group, signal.SIGKILL)
+        self.stop_step_leader()
         self.assertNotEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0)
         self.assert_next_build_starts_after_cargo_stops(step_group)
 
-    def test_caller_death_uses_systemd_stop_to_drain_the_scope(self) -> None:
-        systemctl = self.root / "stubs/systemctl"
-        _ = systemctl.write_text(systemctl.read_text().replace("#!/bin/sh\n", r'''#!/bin/sh
-case "$2" in
-    kill) printf 'kill' > "$PACKAGE_ROOT/manager-command"; exit 7 ;;
-    stop) printf 'stop' > "$PACKAGE_ROOT/manager-command" ;;
-esac
-''', 1))
+    def test_caller_death_drains_the_scope_when_the_manager_refuses(self) -> None:
+        self.refuse_manager_stop()
         first, step_group = self.start_cargo()
+        state, = (path for path in (self.root / "tmp").glob("verify*/scope-release.*")
+                  if not path.name.endswith(".output"))
         first.kill()
         self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGKILL)
-        operation = self.root / "manager-command"
-        wait_until(lambda: operation.is_file() and bool(operation.read_text()), self.root, watch_writes=True)
-        self.assertEqual(operation.read_text(), "stop")
-        self.wait_for_group_exit(step_group)
+        result = subprocess.run(["flock", "-x", "-w", "20", str(state), "cat", str(state)],
+                                capture_output=True, text=True, check=True, timeout=30)
+        self.assertEqual(result.stdout, "", "scope shutdown failed")
+        self.assertEqual(self.live_group_processes(step_group), [])
 
     def test_supervisor_stops_the_scope_when_cargo_output_is_blocked(self) -> None:
         release = self.root / "scope-release"
         release.touch()
         peak = self.root / "scope-peak"
         output_inode = self.root / "cargo-output-inode"
-        scope_shell = r'''exec 2>&3 3>&-
-cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"
-printf '%s\n' "$cgroup" > "$0.cgroup"
-exec "$@"
-'''
+        scope_shell = subprocess.check_output(
+            ["bash", "-c", 'source "$1"; printf "%s" "$BUILDLOG_SCOPE_SH"', "fixture",
+             str(VERIFY.parent.parent / "lint/invoke.sh")], cwd=self.root, env=self.environment, text=True)
         cargo = r'''
 import os
 from pathlib import Path
@@ -180,13 +166,7 @@ while True:
     def test_step_leader_death_defers_release_until_the_scope_is_empty(self) -> None:
         stop = self.root / "scope-stop"
         allow_stop = self.root / "allow-scope-stop"
-        systemctl = self.root / "stubs/systemctl"
-        _ = systemctl.write_text(systemctl.read_text().replace("#!/bin/sh\n", r'''#!/bin/sh
-if [ "$2" = stop ] || [ "$2" = kill ]; then
-    : > "$PACKAGE_ROOT/scope-stop"
-    python3 "$TEST_WAIT_HELPER" "$PACKAGE_ROOT/allow-scope-stop"
-fi
-''', 1))
+        self.environment["TEST_PAUSE_SCOPE_KILL"] = "1"
         flock = self.root / "stubs/flock"
         real_flock = flock.resolve()
         flock.unlink()
@@ -209,7 +189,7 @@ exec {shlex.quote(str(real_flock))} "$@"
         first, step_group = self.start_cargo()
         with mock.patch.object(admission.server, "handle_request", side_effect=handle):
             try:
-                os.kill(step_group, signal.SIGKILL)
+                self.stop_step_leader()
                 waiting = self.root / "scope-release-wait"
                 wait_until(lambda: (release.is_file() or first.poll() is not None
                                     or (stop.is_file() and waiting.is_file())), self.root, processes=(first,))
@@ -237,61 +217,46 @@ exec {shlex.quote(str(real_flock))} "$@"
             self.assertNotEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             self.wait_for_group_exit(step_group)
 
-    def test_failed_scope_stop_keeps_the_grant_and_returns_an_error(self) -> None:
-        systemctl = self.root / "stubs/systemctl"
-        _ = systemctl.write_text(systemctl.read_text().replace("#!/bin/sh\n", r'''#!/bin/sh
-if [ "$2" = stop ] || [ "$2" = kill ]; then
-    echo 'test manager refused the scope stop' >&2
-    exit 7
-fi
-''', 1))
+    def test_scope_stop_error_returns_while_a_descendant_keeps_output_open(self) -> None:
+        self.refuse_manager_stop()
+        cargo = self.root / "stubs/cargo"
+        original = cargo.read_text()
+        blocking = 'if [ "${TEST_BLOCK:-0}" = 1 ]; then'
+        self.assertEqual(original.count(blocking), 1)
+        _ = cargo.write_text(original.replace(blocking, blocking + r"""
+        python3 "$TEST_WAIT_HELPER" "$TEST_RELEASE.descendant" &
+        printf '%s\n' "$!" > "$PACKAGE_ROOT/cargo-descendant"
+"""))
         first, step_group = self.start_cargo()
         admission = caller_admission(self, self.root, self.environment)
         record, = admission.caller_reservations().values()
+        sidecar = Path(record.sidecar)
+        scope = Path(sidecar.read_text().strip())
+        kill_file = scope / "cgroup.kill"
+        child = int((self.root / "cargo-descendant").read_text())
+        self.assertIn(str(child), (scope / "cgroup.procs").read_text().split())
+        kill_file.chmod(0)
         try:
-            self.assertTrue(record.sidecar)
             _ = admission.run_pass()
-            os.kill(step_group, signal.SIGKILL)
-            status = first.wait(timeout=TEST_HANG_GUARD_SECS)
+            (self.root / "release").touch()
+            status = first.wait(timeout=30)
             log = (self.root / "first-output").read_text()
-            self.assertIn("test manager refused the scope stop", log)
+            self.assertIn("keeping the reservation", log)
+            self.assertIn("cgroup.kill", log)
             self.assertEqual(status, 125, log)
-            self.assertTrue(Path(record.sidecar).is_file())
+            self.assertIn(str(child), (scope / "cgroup.procs").read_text().split())
             with admission.loop_turn():
                 _ = admission.server.run_pass()
                 self.assertIn(record.episode, admission.server.reservations)
         finally:
-            self.end_group(step_group)
-            with admission.loop_turn():
-                _ = admission.server.run_pass()
-
-    def test_manager_stop_error_is_ignored_when_the_scope_is_empty(self) -> None:
-        systemctl = self.root / "stubs/systemctl"
-        setup, command, manager = systemctl.read_text().partition("\nexec ")
-        self.assertTrue(command)
-        executable = manager.removesuffix(' "$@"\n')
-        _ = systemctl.write_text(setup + f'''
-if [ "$2" = stop ] || [ "$2" = kill ]; then
-    for unit do :; done
-    {executable} --user stop "$unit" || exit $?
-    exit 7
-fi
-exec {manager}''')
-        first, step_group = self.start_cargo()
-        os.kill(step_group, signal.SIGKILL)
-        self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 137, (self.root / "first-output").read_text())
-        self.assert_next_build_starts_after_cargo_stops(step_group)
+            kill_file.chmod(0o200)
+            _ = kill_file.write_text("1\n")
+            self.wait_for_group_exit(step_group)
+            _ = admission.run_pass()
 
     def test_dead_caller_retains_its_memory_grant_until_the_scope_empties(self) -> None:
-        # Pause the manager command so the service observes the dead owner and live Cargo.
         stop = self.root / "scope-stop"
-        systemctl = self.root / "stubs/systemctl"
-        _ = systemctl.write_text(systemctl.read_text().replace("#!/bin/sh\n", r'''#!/bin/sh
-if [ "$2" = stop ] || [ "$2" = kill ]; then
-    : > "$PACKAGE_ROOT/scope-stop"
-    python3 "$TEST_WAIT_HELPER" "$PACKAGE_ROOT/allow-scope-stop"
-fi
-''', 1))
+        self.environment["TEST_PAUSE_SCOPE_KILL"] = "1"
         first, step_group = self.start_cargo()
         admission = caller_admission(self, self.root, self.environment)
         reservations = admission.caller_reservations()
