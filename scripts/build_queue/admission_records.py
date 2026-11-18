@@ -31,8 +31,19 @@ DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
 
 
 @dataclass(frozen=True)
+class RefusalSettings:
+    """The digest identifies the settings read immediately before a prelaunch refusal."""
+    digest: str
+
+
+@dataclass(frozen=True)
+class NoRefusalSettings:
+    """The report supplies no settings digest."""
+
+
+@dataclass(frozen=True)
 class SavedPlacementAssignment:
-    """The saved assignment holds its permission, claim, retry decision, and final report."""
+    """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState = placement.CurrentAssignment()
     permission: placement.LaunchPermission = placement.PermissionAvailable()
@@ -40,6 +51,9 @@ class SavedPlacementAssignment:
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = placement.ClaimHolderUnconfirmed("not consumed")
     retry: placement.RetryDecision = placement.DoNotRetry("attempt is not settled")
     terminal_report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
+    assigned_settings_generation: placement.AssignedSettingsGeneration | placement.UnknownAssignedSettingsGeneration = (
+        placement.UnknownAssignedSettingsGeneration())
+    refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125

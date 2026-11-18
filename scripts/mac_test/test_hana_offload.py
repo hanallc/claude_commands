@@ -21,6 +21,7 @@ from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_targets import target_config
 from scripts.buildlog import record
 from scripts.lib import process_start
+from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, offload
 
 
@@ -42,6 +43,7 @@ class HanaOffloadTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(self.root))))
         self.transport = hana.HanaControlTransport(self.root / 'hana.conf', 'fixture-host')
         source = Path(__file__).resolve().parents[2] / 'config' / 'hana_aws.conf'
         _ = self.transport.settings.write_text(source.read_text())

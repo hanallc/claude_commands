@@ -5,10 +5,12 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_runtime, copy_startup
 
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 import errno
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import select
@@ -320,10 +322,44 @@ class FastTrackTests(MergeCheckpointFixture):
         _ = self.config.write_text("\n".join(lines) + "\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        # The interruption wrapper must kill a child process.
-        if (self.control / "stop-git").exists() or process_boundary_for_case(self):
+        if process_boundary_for_case(self):
             return subprocess.run([sys.executable, str(COMMAND), *arguments], cwd=self.unit,
                                   env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        if (self.control / "stop-git").exists():
+            return self.interrupted_command(arguments)
+        return self.invoke_command(arguments)
+
+    def interrupted_command(self, arguments: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        """Keep the SIGKILL boundary while the child reuses loaded CLI imports."""
+        with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
+            def execute() -> None:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    result = self.invoke_command(arguments)
+                    _ = stdout.write(result.stdout)
+                    _ = stderr.write(result.stderr)
+                    stdout.flush()
+                    stderr.flush()
+                    raise SystemExit(result.returncode)
+
+            child = multiprocessing.get_context("fork").Process(target=execute)
+            try:
+                child.start()
+                child.join(TEST_HANG_GUARD_SECS)
+                status = child.exitcode
+                if status is None:
+                    raise subprocess.TimeoutExpired([str(COMMAND), *arguments], TEST_HANG_GUARD_SECS)
+            finally:
+                if child.pid is not None and child.is_alive():
+                    child.kill()
+                    child.join()
+                child.close()
+            _ = stdout.seek(0)
+            _ = stderr.seek(0)
+            return subprocess.CompletedProcess([sys.executable, str(COMMAND), *arguments],
+                                               status, stdout.read(), stderr.read())
+
+    def invoke_command(self, arguments: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        """Run the CLI with the fixture environment and real Git commands."""
         args = list(arguments)
         run_process = cast(Callable[..., subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]],
                            subprocess.run)

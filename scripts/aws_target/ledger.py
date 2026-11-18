@@ -10,6 +10,7 @@ from decimal import Decimal
 from enum import Enum
 import fcntl
 import json
+from math import ceil
 from pathlib import Path
 import subprocess
 import sys
@@ -454,6 +455,7 @@ SpendingDecision = SpendingAllowed | SpendingRefused | SpendingUnavailable
 class DeliveryState(str, Enum):
     PENDING = "pending"
     DELIVERED = "delivered"
+    EXPIRED = "expired"
 
 
 @dataclass(frozen=True)
@@ -480,6 +482,11 @@ class LimitEvent:
     delivery: DeliveryState = DeliveryState.PENDING
     retry_after: int = 0
     owner: DeliveryOwner | DeliveryUnowned = DeliveryUnowned()
+
+    def period_has_ended(self, at: float, zone: ZoneInfo) -> bool:
+        day = datetime.fromtimestamp(at, zone).date().isoformat()
+        period, _, key = self.event_id.partition(":")
+        return (period == "daily" and key < day) or (period == "monthly" and key < day[:7])
 
 
 @dataclass
@@ -557,7 +564,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
          for r in rows(row, "reconciliations")],
         [LimitEvent(text(r, "event_id"), instant(r, "at"), text(r, "period"), money(text(r, "estimate_usd")),
                     money(text(r, "limit_usd")), text(r, "recipient"), instant(r, "timeout_s"),
-                    DeliveryState(r.get("delivery", "pending")),
+                    DeliveryState.EXPIRED if r.get("delivery") == "delivered" and r.get("expired") is True
+                    else DeliveryState(r.get("delivery", "pending")),
                     instant(r, "retry_after") if "retry_after" in r else 0,
                     DeliveryOwner(text(r, "owner")) if r.get("owner") else DeliveryUnowned())
          for r in rows(row, "events")],
@@ -702,7 +710,9 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                             for r in state.reconciliations],
         "events": [{"event_id": r.event_id, "at": r.at, "period": r.period, "estimate_usd": str(r.estimate_usd),
                     "limit_usd": str(r.limit_usd), "recipient": r.recipient, "timeout_s": r.timeout_s,
-                    "delivery": r.delivery.value, "retry_after": r.retry_after,
+                    "delivery": "delivered" if r.delivery is DeliveryState.EXPIRED else r.delivery.value,
+                    **({"expired": True} if r.delivery is DeliveryState.EXPIRED else {}),
+                    "retry_after": r.retry_after,
                     "owner": r.owner.token if isinstance(r.owner, DeliveryOwner) else ""} for r in state.events],
         "price_refresh_at": state.price_refresh_at, "decision": state.decision,
         "charge_refresh_at": state.charge_refresh_at,
@@ -1433,10 +1443,11 @@ def send_limit_event(event: LimitEvent) -> bool:
     """Use the existing message interface after persisting the event identity."""
     # Keep the key active across every date that the message interface can represent.
     repeat_minutes = (datetime.max - datetime.min) // timedelta(minutes=1) + 1
+    _, _, period_key = event.event_id.partition(":")
     result = subprocess.run(session_send.send_argv("--to", event.recipient, "--from", "aws-spending-guard",
                              "--key", f"aws-limit:{event.event_id}", "--repeat-minutes", str(repeat_minutes), "--text",
-                             f"AWS spending guard: {event.period} limit refuses new work; drain the target. "
-                             + f"Estimate ${event.estimate_usd}; limit ${event.limit_usd}."),
+                             f"The AWS spending guard refused new work. The {event.period} limit for {period_key} applies. "
+                             + f"Drain the target. Estimate ${event.estimate_usd}. Limit ${event.limit_usd}."),
                             capture_output=True, text=True, timeout=event.timeout_s, check=False)
     return result.returncode == 0 and result.stdout.startswith(("SENT:", "SKIPPED:"))
 
@@ -1911,7 +1922,6 @@ class CostLedger:
             except BlockingIOError:
                 return
             try:
-                retry_s = read_settings(settings_path).notification_retry_s
                 with self._locked() as state:
                     pending = tuple(event for event in state.events
                                     if event.delivery is DeliveryState.PENDING)
@@ -1919,37 +1929,52 @@ class CostLedger:
                     owner = DeliveryOwner(uuid4().hex)
                     with self._locked() as state:
                         event = next(saved for saved in state.events if saved.event_id == candidate.event_id)
-                        attempt_at = int(clock())
-                        if event.delivery is not DeliveryState.PENDING or event.retry_after > attempt_at:
+                        if event.delivery is not DeliveryState.PENDING:
                             continue
-                        event = replace(event, retry_after=attempt_at + retry_s, owner=owner)
+                        settings = read_settings(settings_path)
+                        attempt_at = clock()
+                        expired = event.period_has_ended(attempt_at, settings.accounting_zone)
+                        if expired:
+                            event = replace(event, delivery=DeliveryState.EXPIRED, owner=DeliveryUnowned())
+                        elif event.retry_after > attempt_at:
+                            continue
+                        else:
+                            # Older readers require a whole-second retry deadline.
+                            event = replace(event, retry_after=ceil(attempt_at + settings.notification_retry_s),
+                                            owner=owner)
                         state.events = [event if saved.event_id == event.event_id else saved for saved in state.events]
                         self._save(state)
-                    try:
-                        delivered = notify(event)
-                    except Exception:
-                        delivered = False
+                    if expired:
+                        continue
+                    notice = replace(event, recipient=settings.notification_recipient,
+                                     timeout_s=settings.notification_timeout_s)
+                    delivery = DeliveryState.EXPIRED
+                    if not event.period_has_ended(clock(), settings.accounting_zone):
+                        try:
+                            delivery = DeliveryState.DELIVERED if notify(notice) else DeliveryState.PENDING
+                        except Exception:
+                            delivery = DeliveryState.PENDING
                     with self._locked() as state:
-                        state.events = [replace(saved, owner=DeliveryUnowned(),
-                                                delivery=DeliveryState.DELIVERED if delivered else DeliveryState.PENDING)
+                        state.events = [replace(saved, owner=DeliveryUnowned(), delivery=delivery)
                                         if saved.event_id == event.event_id and saved.owner == owner else saved
                                         for saved in state.events]
                         self._save(state)
             finally:
                 fcntl.flock(delivery_lock, fcntl.LOCK_UN)
 
-    def guard(self, settings_path: Path, purpose: SpendingPurpose, now: int,
+    def guard(self, settings_path: Path, purpose: SpendingPurpose, now: float,
               notify: Callable[[LimitEvent], bool] = send_limit_event, *,
               clock: Callable[[], float] = time.monotonic) -> SpendingDecision:
         clock_started = clock()
+        decision_at = int(now)
 
         def delivery_time() -> float:
-            return now + clock() - clock_started
+            return now + (clock() - clock_started)
 
         evidence = GuardEvidence(purpose, (), CostEvidenceUnavailable("ledger evidence is unavailable"))
         try:
             with self._locked() as state:
-                decision = self._decide(state, settings_path, purpose, now)
+                decision = self._decide(state, settings_path, purpose, decision_at)
                 evidence = decision.evidence
                 state.decision = decision_record(decision)
                 if isinstance(evidence.costs, CostEstimate):
@@ -1957,7 +1982,7 @@ class CostLedger:
                 else:
                     self._save(state)
         except (OSError, ValueError, ArithmeticError) as error:
-            return SpendingUnavailable(now, str(error), evidence)
+            return SpendingUnavailable(decision_at, str(error), evidence)
         try:
             self._deliver_pending(settings_path, delivery_time, notify)
         except (OSError, ValueError, ArithmeticError) as error:
@@ -1968,7 +1993,7 @@ class CostLedger:
 def spending_guard(settings_path: Path, directory: Path, purpose: SpendingPurpose = "admission", *,
                    clock: Callable[[], float] = time.time,
                    notify: Callable[[LimitEvent], bool] = send_limit_event) -> SpendingDecision:
-    return CostLedger(directory).guard(settings_path, purpose, int(clock()), notify, clock=clock)
+    return CostLedger(directory).guard(settings_path, purpose, clock(), notify, clock=clock)
 
 
 @dataclass(frozen=True)

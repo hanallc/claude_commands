@@ -3370,6 +3370,7 @@ class BuildFinalizerTests(BuildPromiseFixture):
                 fixture.scoped_peak(grant, int(15.76 * GIB))
                 owner = fixture.fixture_owner(400, "warmup")
                 fixture.free(0)
+                fixture.hold_starts()
                 replies: list[wire.Wait] = []
                 reads_at_expiry = 0
                 history_reader = step_estimator.anonymous_history_rows
@@ -3394,6 +3395,9 @@ class BuildFinalizerTests(BuildPromiseFixture):
                                 fixture.restart()
                             fixture.clock.advance(1)
                             fixture.free(18 * GIB)
+                            # An idle host can admit the head after start spacing ends.
+                            fixture.hold_starts()
+                            fixture.allow_next_start()
                             reads_at_expiry = history_scans
                         else:
                             self.assertEqual(len(replies), 3)
@@ -5330,13 +5334,14 @@ def queue_leave_client_main(argv: list[str]) -> int:
 
     class HeldWaitClock:
         def __init__(self) -> None:
-            self.offset: float = 0.0
+            self.epoch: float = time.time()
+            self.elapsed: float = 0.0
 
         def now(self) -> float:
-            return time.time() + self.offset
+            return self.epoch + self.elapsed
 
         def monotonic(self) -> float:
-            return time.monotonic() + self.offset
+            return self.elapsed
 
         def sleep(self, seconds: float) -> None:
             time.sleep(seconds)
@@ -5349,7 +5354,7 @@ def queue_leave_client_main(argv: list[str]) -> int:
         nonlocal advanced
         report(output, reply)
         if not advanced:
-            clock.offset += admission_records.read_memory_config().running_pass_seconds
+            clock.elapsed += admission_records.read_memory_config().running_pass_seconds
             advanced = True
 
     with patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held):
