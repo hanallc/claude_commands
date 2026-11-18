@@ -1,6 +1,7 @@
 """Test the agents CLI with private staff rows and temporary repositories."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import math
@@ -82,6 +83,7 @@ class AgentsUsageTests(unittest.TestCase):
             row = staff.initial_snapshot().rows[0]
             self.assertEqual((row.name, row.kind, row.current_session), ("dwight", "producer", world.identity))
             self.assertEqual(len(world.arguments), 1)
+            self.assertEqual(world.openings, [herdr.NoOpeningPrompt()])
 
     def test_status_excludes_a_retired_unit_whose_process_still_runs(self) -> None:
         from scripts.agents.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
@@ -128,9 +130,11 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray", "transfer"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move",
+                          "restart", "stop", "remove-stray", "transfer", "add-producer"])
         self.assertIn("resume NAME", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
+        self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)
@@ -1316,6 +1320,30 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree(remote.local_machine(), self.worktree, staff.ParkedBranch("alpha-branch")))
+
+    def test_retirement_releases_the_pair_when_the_lock_is_free(self) -> None:
+        for held in (False, True):
+            with self.subTest(held=held):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    lease = case.worktree.with_name(case.worktree.name + ".lease.json")
+                    lock = case.worktree.with_name(case.worktree.name + ".lock")
+                    _ = lease.write_text("{}\n")
+                    lock.touch()
+                    with lock.open("r+") as descriptor:
+                        if held:
+                            fcntl.flock(descriptor, fcntl.LOCK_EX)
+                        code, output = case.retire()
+
+                    self.assertEqual(code, 0, output)
+                    self.assertFalse(case.worktree.exists())
+                    self.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                    self.assertEqual(lease.exists(), held)
+                    self.assertEqual(lock.exists(), held)
+                    self.assertEqual(output.count("Worktree pair kept"), int(held))
+                finally:
+                    case.doCleanups()
 
     def test_retirement_removes_the_gate_copy_owned_by_the_unit_worktree(self) -> None:
         owner = copies.source_owner(self.worktree)
