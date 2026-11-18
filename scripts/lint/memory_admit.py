@@ -34,6 +34,7 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, MacOnly, PinnedTarget
 from scripts.build_hold.override_guard import require_shared_state_write
 from scripts.lib import conf
@@ -1332,6 +1333,8 @@ def read_reservation(path: Path) -> Reservation:
     row["test_threads"] = (RequestedTestWidth(width) if isinstance(width, int) else
                            UnspecifiedTestWidth() if row["step"] == "nextest" else NoTestWidth())
     row["call_id"] = CallRecord(call) if isinstance(call, str) else NoCallRecord()
+    if "job" in row:
+        row["job"] = codec.parse_snapshot_value(row["job"], StepJob)
     return cast(Reservation, cast(object, row))
 
 
@@ -1768,10 +1771,11 @@ def ended_step_slot(row: Reservation, ended_at: float,
     waiter = row.get("queue_waiter", {})
     identity = reservation_identity(row)
     absent = records.EndedStepFactNotRecorded()
-    facts = records.EndedStepFacts(identity["step"] or absent,
+    job = row.get("job", GATE_JOB_NOT_RECORDED)
+    facts = records.EndedStepFacts(job.step if isinstance(job, StepJob) else identity["step"] or absent,
         row.get("package") or waiter.get("package") or PackageNotRecorded(),
         step_project(waiter.get("repository_name", ""), row["repo"]) or absent,
-        identity["folder"] or absent, row.get("slot_staff", records.NoEndedStepStaff()))
+        identity["folder"] or absent, row.get("slot_staff", records.NoEndedStepStaff()), job=job)
     return BetweenStepsSlot(origin.run, row.get("reservation_id", ""), row["need"],
                             ended_at + policy.timing.slot_gap_seconds, facts)
 
@@ -2343,6 +2347,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            project=step_project(row.get("repository_name", "")),
                            run=row.get("build_run", NoLiveBuildRun()),
                            package=row["package"] if "package" in row else PackageNotRecorded(),
+                           job=row.get("job", GATE_JOB_NOT_RECORDED),
                            route=records.waiter_route(row))
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
@@ -2673,6 +2678,7 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                                    unit=identity.get("unit", ""), pid=row["pid"],
                                    project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"]),
                                    package=row["package"] if "package" in row else PackageNotRecorded(),
+                                   job=row.get("job", GATE_JOB_NOT_RECORDED),
                                    route=(records.waiter_route(row["queue_waiter"]) if "queue_waiter" in row
                                           else ANY_ELIGIBLE_TARGET)))
         rows.append(row)

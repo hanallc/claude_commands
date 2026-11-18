@@ -52,6 +52,10 @@ class QueueRowName(str):
         return str.__new__(cls, kind.value)
 
     @classmethod
+    def owner_only(cls, owner: str) -> QueueRowName:
+        return str.__new__(cls, public_queue_text(owner) or "—")
+
+    @classmethod
     def repository(cls, repository: str, folder: str = "") -> QueueRowName | NoNamedStep:
         repository = public_queue_text(Path(repository).name) or public_queue_text(Path(folder).name)
         return str.__new__(cls, f"{repository} build") if repository else NoNamedStep.FOUND
@@ -234,14 +238,16 @@ def verify_package(step: str, arguments: tuple[str, ...]) -> str:
 
 
 def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:
-    """Name the first verify step, or the first script in the command."""
+    """Name the first build job, or the first script in the command."""
     script = ""
     try:
         for argv in command_programs(command):
+            job = command_job(argv)
             verify = verify_command(argv)
-            if isinstance(verify, VerifyCommand):
-                job = command_job(argv)
-                if isinstance(job, StepJob) and job.step in VERIFY_VERBS:
+            if isinstance(job, StepJob):
+                if not isinstance(verify, VerifyCommand):
+                    return QueueRowName.step(job.step, "", names)
+                if job.step in VERIFY_VERBS:
                     arguments = verify.arguments
                     if arguments[:1] == ("--session-dir",):
                         arguments = arguments[2:]
