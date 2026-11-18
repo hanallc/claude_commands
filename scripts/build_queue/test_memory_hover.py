@@ -704,7 +704,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
 
-    def test_repository_slot_renders_the_unit_and_script_title(self) -> None:
+    def test_repository_slot_renders_the_unit_and_repository_title(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
@@ -721,7 +721,31 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertIsNotNone(unit)
         assert unit is not None
         self.assertEqual(unit[1], "startup")
-        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · check.service.sh")
+        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · hana build")
+
+    def test_a_tooltip_keeps_the_step_verb_with_or_without_a_title(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        page = fixture.copies_slot_page(("cargo", "test"), source="/fixture/widget", repository="widget",
+                                      unit="test", staff_id="staff-test", recorded_step="test hana")
+        for has_title, expected in ((True, "test · test hana"), (False, "test hana")):
+            with self.subTest(has_title=has_title):
+                data = cast(dict[str, list[dict[str, object]]], json.loads(memory_feed.page_json(page)))
+                row, = data["waiters"]
+                omit_title = "" if has_title else "delete data.waiters[0].title;"
+                expression = f"(() => {{ {omit_title} return tooltipHtml('wait:{row['key']}', data); }})()"
+                html = cast(str, self.page_expression(expression, data, walk=True))
+                self.assertEqual("".join(ElementTree.fromstring(html)[0].itertext()), expected)
+
+    def test_a_legacy_build_slot_tooltip_shows_the_unit_once(self) -> None:
+        expression = "(() => { delete data.walk[0].title; return tooltipHtml('row:fixture-run-0', data); })()"
+        for name in ("report integrate", "report", "integrate report", "reporting check", "integrate", "check.service.sh"):
+            with self.subTest(name=name):
+                data = {"read_at": 220, "walk": [{"name": name, "unit": "report", "slot_folder": "hana-slot1",
+                    "slot_machine": "natedev", "started_at": 100, "used": 2.0}]}
+                html = cast(str, self.page_expression(expression, data, walk=True))
+                self.assertEqual("".join(ElementTree.fromstring(html)[0].itertext()), name)
 
     def test_repository_slot_wait_has_no_memory_group(self) -> None:
         data = {"waiters": [{"kind": "repository-slot", "name": "widget build", "need": 0,

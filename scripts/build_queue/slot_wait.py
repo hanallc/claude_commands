@@ -5,7 +5,6 @@ from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from enum import Enum
 from functools import cache, cached_property, lru_cache
 import os
 from pathlib import Path
@@ -13,111 +12,12 @@ import re
 import subprocess
 
 from scripts.lib import conf
-from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
-                                     SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
-                                     command_script, is_recorded_step, queue_identifier, script_file, verify_command)
+from scripts.lib.build_steps import (LONG_VALUE_OPTIONS, QUEUE_WRAPPER_ARGUMENTS, RECORDED_STEP_NAMES,
+                                     SHELLS, SHELL_COMMAND_PREFIXES, VERIFY_VERBS,
+                                     NoNamedStep as NoNamedStep, QueueKind as QueueKind, QueueRowName as QueueRowName,
+                                     StepJob, StepNames, VerifyCommand, command_job, command_script,
+                                     is_recorded_step, verify_command)
 from scripts.build_queue import admission_wire as wire
-from scripts.message.owner_role import OwnerRole
-
-
-SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"})
-
-
-def public_queue_text(text: str) -> str:
-    """Return text that can appear in a queue name or owner field."""
-    text = " ".join(text.split())
-    if text in ("", "—", "owner not recorded") or "$" in text or RAW_ID.search(text):
-        return ""
-    return text
-
-
-class QueueKind(Enum):
-    """A fixed name for queue work without a verify or script name."""
-
-    MERGE_GATE = "merge gate"
-    CI = "hana CI"
-    COMPILER_CACHE = "compiler cache"
-    MAC = "Mac builds"
-    AWS = "AWS build"
-
-
-class QueueRowName(str):
-    """A display name from a queue record."""
-
-    def __new__(cls) -> QueueRowName:
-        raise TypeError("Choose a queue name source")
-
-    @classmethod
-    def fixed(cls, kind: QueueKind) -> QueueRowName:
-        return str.__new__(cls, kind.value)
-
-    @classmethod
-    def repository(cls, repository: str, folder: str = "") -> QueueRowName | NoNamedStep:
-        repository = public_queue_text(Path(repository).name) or public_queue_text(Path(folder).name)
-        return str.__new__(cls, f"{repository} build") if repository else NoNamedStep.FOUND
-
-    @classmethod
-    def script(cls, path: str) -> QueueRowName | NoNamedStep:
-        name = public_queue_text(Path(path).name) if script_file(path) else ""
-        return str.__new__(cls, name) if name else NoNamedStep.FOUND
-
-    @classmethod
-    def recorded_program(cls, program: str) -> QueueRowName | NoNamedStep:
-        if (program in ("", ".", "..", "unknown") or Path(program).name != program or RAW_ID.search(program)
-                or INTERPRETER.fullmatch(program) or not next(command_programs((program,)), ())):
-            return NoNamedStep.FOUND
-        return str.__new__(cls, program)
-
-    @classmethod
-    def recorded_step_text(cls, text: str) -> QueueRowName | NoNamedStep:
-        return str.__new__(cls, text) if text else NoNamedStep.FOUND
-
-    @classmethod
-    def step(cls, verb: str, package: str, names: StepNames) -> QueueRowName | NoNamedStep:
-        if verb not in RECORDED_VERBS:
-            return NoNamedStep.FOUND
-        shown = names.queue_name(verb)
-        if queue_identifier(package):
-            shown = f"{shown} {package}"
-        return str.__new__(cls, shown)
-
-    def for_owner(self, names: StepNames, step: str, unit: str, role: OwnerRole, *,
-                  prefix: str = "", ci: bool = False) -> QueueRowName:
-        """Apply the owner template to a recorded build verb."""
-        if not is_recorded_step(step):
-            return self
-        verb = step.partition(" ")[0]
-        return self.with_prefix(prefix)._show_owner(names, verb, unit, role, ci)
-
-    def _show_owner(self, names: StepNames, verb: str, unit: str, role: OwnerRole, ci: bool) -> QueueRowName:
-        step = names.queue_name(verb)
-        unit = public_queue_text(unit)
-        try:
-            shown = public_queue_text(names.for_owner(verb, unit, role, ci=ci, current_name=self, step_name=step))
-        except (ValueError, KeyError, AttributeError, IndexError):
-            return self
-        owner = "CI" if ci else "showrunner" if role is OwnerRole.SHOWRUNNER else unit
-        short = SHORT_OWNER_STEPS.get(verb, step)
-        if owner and shown in (f"{owner} {step}", f"{owner} {short}"):
-            return str.__new__(type(self), shown)
-        return self
-
-    def with_prefix(self, prefix: str) -> QueueRowName:
-        """Add a repository or a resolved staff name before the step."""
-        prefix = public_queue_text(prefix)
-        return str.__new__(type(self), f"{prefix} {self}") if prefix else self
-
-    def with_mac_status(self, status: str) -> QueueRowName:
-        """Add a fixed status to the Mac name."""
-        if status not in ("user", "hana-ci", "unplaced"):
-            return self
-        return str.__new__(type(self), f"{self} · {status}")
-
-
-class NoNamedStep(Enum):
-    """The caller supplied no step or script name."""
-
-    FOUND = "no named step"
 
 
 def recorded_step(text: str, names: StepNames, package: str = "") -> QueueRowName | NoNamedStep:
@@ -140,10 +40,15 @@ class SlotCaller:
 
     @cached_property
     def step(self) -> QueueRowName | NoNamedStep:
-        """Read the command only when the slot must wait."""
-        if self.command:
-            return command_slot_name(self.command, RECORDED_STEP_NAMES)
-        return recorded_step(self.work, RECORDED_STEP_NAMES)
+        """Read only the verify step when the slot must wait."""
+        try:
+            for argv in command_programs(self.command):
+                step = command_verify_step(argv, RECORDED_STEP_NAMES)
+                if isinstance(step, QueueRowName):
+                    return step
+        except (ValueError, RecursionError):
+            pass
+        return supplied_verify_step(self.work, RECORDED_STEP_NAMES)
 
 
 SLOT_CALLER: ContextVar[SlotCaller | None] = ContextVar("slot_caller", default=None)
@@ -157,6 +62,30 @@ def slot_caller(staff_id: str, showrunner: str, source: Path, command: Sequence[
         yield
     finally:
         SLOT_CALLER.reset(token)
+
+
+@dataclass(frozen=True)
+class ShellCommandText:
+    """The command text that a shell receives through its command option."""
+
+    text: str
+
+
+def shell_payload(arguments: Sequence[str]) -> ShellCommandText | tuple[str, ...]:
+    """Read the command text or the script arguments of a shell."""
+    words = iter(arguments)
+    for word in words:
+        if word == "-":
+            break
+        if word == "--":
+            return tuple(words)
+        if not word.startswith("-"):
+            return (word, *words)
+        if word in LONG_VALUE_OPTIONS:
+            _ = next(words, "")
+        elif word == "--command" or re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", word):
+            return ShellCommandText(next(words, ""))
+    return ()
 
 
 def command_programs(argv: Sequence[str]) -> Iterator[Sequence[str]]:
@@ -174,7 +103,7 @@ def command_programs(argv: Sequence[str]) -> Iterator[Sequence[str]]:
     elif program == "direnv":
         if len(argv) >= 3 and argv[1] == "exec":
             yield from command_programs(argv[3:])
-    elif program in ("exec", "command"):
+    elif program in QUEUE_WRAPPER_ARGUMENTS:
         index = 1
         while index < len(argv) and argv[index].startswith("-"):
             option = argv[index]
@@ -183,24 +112,22 @@ def command_programs(argv: Sequence[str]) -> Iterator[Sequence[str]]:
                 break
             if program == "command" and option in ("-v", "-V"):
                 return
-            if program == "exec" and option == "-a":
+            if option in QUEUE_WRAPPER_ARGUMENTS[program]:
                 index += 1
+        if program == "timeout":
+            index += 1
         yield from command_programs(argv[index:])
     elif program in SHELLS:
-        arguments = iter(argv[1:])
-        for word in arguments:
-            if word in ("-", "--") or not word.startswith("-"):
-                if word == "--":
-                    word = next(arguments, "")
-                if word and word != "-":
-                    yield [word, *arguments]
-                return
-            if word in LONG_VALUE_OPTIONS:
-                _ = next(arguments, "")
-            elif word == "--command" or re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", word):
-                for command in shell_commands(next(arguments, "")):
-                    yield from command_programs([shell_text(word) for word in without_redirections(command.words)])
-                return
+        payload = shell_payload(argv[1:])
+        if isinstance(payload, ShellCommandText):
+            for command in shell_commands(payload.text):
+                words = iter(without_redirections(command.words))
+                for word in words:
+                    if word not in SHELL_COMMAND_PREFIXES:
+                        yield from command_programs([shell_text(word), *(shell_text(word) for word in words)])
+                        break
+        elif payload and payload[0] != "-":
+            yield payload
     else:
         yield argv
 
@@ -233,25 +160,62 @@ def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
-def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:
-    """Name the first verify step, or the first script in the command."""
-    script = ""
+def supplied_verify_step(text: str, names: StepNames) -> QueueRowName | NoNamedStep:
+    """Recognize a verify step supplied without command arguments."""
+    if text.partition(" ")[0] in VERIFY_VERBS and is_recorded_step(text):
+        return recorded_step(text, names)
+    return NoNamedStep.FOUND
+
+
+def command_verify_step(argv: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:
+    """Read the verify step and package from one command."""
+    verify = verify_command(argv)
+    if not isinstance(verify, VerifyCommand):
+        return NoNamedStep.FOUND
+    job = command_job(argv)
+    if not isinstance(job, StepJob) or job.step not in VERIFY_VERBS:
+        return NoNamedStep.FOUND
+    arguments = verify.arguments[2:] if verify.arguments[:1] == ("--session-dir",) else verify.arguments
+    return QueueRowName.step(job.step, verify_package(job.step, arguments[1:]), names)
+
+
+def recorded_slot_step(text: str, names: StepNames) -> QueueRowName | NoNamedStep:
+    """Separate a recorded step from an old script or program fallback."""
+    words = text.split()
+    if len(words) < 2:
+        return supplied_verify_step(text, names)
+    if (isinstance(QueueRowName.recorded_program(words[0]), NoNamedStep)
+            or isinstance(QueueRowName.script(text), QueueRowName)):
+        return NoNamedStep.FOUND
+    step = recorded_step(text, names)
+    return QueueRowName.recorded_step_text(text) if isinstance(step, NoNamedStep) else step
+
+
+def command_slot_name(command: Sequence[str], names: StepNames, *, recorded: str = "",
+                      repository: str = "", folder: str = "") -> QueueRowName | NoNamedStep:
+    """Resolve a slot name in order from its step, repository, and command."""
+    step = recorded_slot_step(recorded, names)
+    if isinstance(step, QueueRowName):
+        return step
+    repository_name = QueueRowName.repository(repository, folder)
+    script = QueueRowName.script(recorded)
+    program: QueueRowName | NoNamedStep = NoNamedStep.FOUND
     try:
         for argv in command_programs(command):
-            verify = verify_command(argv)
-            if isinstance(verify, VerifyCommand):
-                job = command_job(argv)
-                if isinstance(job, StepJob) and job.step in VERIFY_VERBS:
-                    arguments = verify.arguments
-                    if arguments[:1] == ("--session-dir",):
-                        arguments = arguments[2:]
-                    package = verify_package(job.step, arguments[1:])
-                    return QueueRowName.step(job.step, package, names)
-            if not script:
-                script = command_script(argv)
+            step = command_verify_step(argv, names)
+            if isinstance(step, QueueRowName):
+                return step
+            if isinstance(repository_name, NoNamedStep):
+                if isinstance(script, NoNamedStep):
+                    script = QueueRowName.script(command_script(argv))
+                if isinstance(program, NoNamedStep):
+                    program = QueueRowName.recorded_program(Path(argv[0]).name)
     except (ValueError, RecursionError):
         pass
-    return QueueRowName.script(script) if script else NoNamedStep.FOUND
+    for name in (repository_name, script, program):
+        if isinstance(name, QueueRowName):
+            return name
+    return QueueRowName.recorded_program(recorded)
 
 
 class SlotWaitExpired(RuntimeError):
@@ -296,7 +260,8 @@ def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, ep
     caller = SLOT_CALLER.get()
     if caller is None:
         session = os.environ.get("CLAUDE_CODE_SESSION_ID", "") or os.environ.get("CODEX_THREAD_ID", "")
-        identity = wire.Identity(session, showrunner, work, "")
+        step = supplied_verify_step(work, RECORDED_STEP_NAMES)
+        identity = wire.Identity(session, showrunner, step if isinstance(step, QueueRowName) else "", "")
     else:
         step = caller.step
         identity = wire.Identity(caller.staff_id, caller.showrunner,

@@ -54,6 +54,7 @@ scripts/lib/build_slots.py
 scripts/lib/build_steps.py
 scripts/lib/cancellation.py
 scripts/lib/cargo_output.py
+scripts/lib/command_wrappers.py
 scripts/lib/conf.py
 scripts/lib/conf_reads.py
 scripts/lib/copy_record.py

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib import git_index
+from scripts.lib.command_wrappers import WRAPPER_ARGUMENTS
 
 
 SUBJECT = re.compile(r"^checkpoint\([^)]*\):")
@@ -249,14 +250,6 @@ def shell_commands(command: str) -> list[ShellCommand]:
 
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
 REDIRECTIONS = {"<", ">", ">>", "<<", "<<-", "<<<", "<&", ">&", "<>"}
-WRAPPER_ARGUMENTS = {
-    "env": {"-u", "--unset"},
-    "command": set[str](),
-    "exec": {"-a"},
-    "sudo": {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "-T"},
-    "nice": {"-n", "--adjustment"},
-    "time": {"-f", "--format", "-o", "--output"},
-}
 
 
 def without_redirections(words: tuple[str, ...]) -> list[str]:

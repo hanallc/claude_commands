@@ -3860,7 +3860,7 @@ done
             share_percent=configuration.peak_history_share_percent,
             build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
             location=step_estimator.RepositoryLocation(request.repository, request.worktree))
-        label = config.ci_label.format(runner=request.runner, job=request.job)
+        label = config.ci_label.label(request.runner, request.job)
         identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner)
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,

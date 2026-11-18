@@ -684,13 +684,14 @@ const localStorage={getItem:()=>null};
             builds = input.builds;
             result = tipFor("slot:hana-slot1");
         """, extra={"slots": {**SLOTS, "machine": "natedev"}, "now": NOW, "builds": builds}))
-        self.assertIn("report · integrate", body)
+        self.assertEqual("".join(ElementTree.fromstring(body)[0].itertext()), "report integrate")
 
     def test_each_row_and_card_title_has_a_tooltip_and_a_slot_in_use_shows_its_builds_step(self) -> None:
         # The user, 11-16: "every row should contain a tooltip that for slots should be the same tooltip that is shown in
         # the build queue so they share code and data".
         now = NOW
         step = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": now - 600, "used": 2.0,
+                "title": {"unit": "report", "step": "integrate"},
                 "slot": 1, "slot_folder": "hana-slot1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
         builds = {"read_at": now, "waiters": [], "swap_by": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE,
                   "walk": [{**step, "key": "mac-run", "slot_machine": "mac"}, {**step, "key": "run", "slot_machine": "natedev"},
@@ -722,6 +723,7 @@ const localStorage={getItem:()=>null};
             result.noTime = usedBy();
         """, extra={"slots": {**SLOTS, "machine": "natedev", "unused_days": 7}, "sessions": SESSIONS, "builds": builds,
                     "now": now, "wait": {"name": "report test named", "unit": "report", "showrunner": "builds", "pid": 4343,
+                                         "title": {"unit": "report", "step": "test named"},
                                          "since": now - 60, "need": 3.0, "reason": "its turn", "fits": False, "why": "turn",
                                          "place": 1}}))
         self.assertEqual(result["run"], result["shared"])

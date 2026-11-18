@@ -17,7 +17,8 @@ import sys
 from collections.abc import Sequence
 from typing import TypedDict, cast
 
-from scripts.hooks.checkpoint_gate import ASSIGNMENT, WRAPPER_ARGUMENTS, shell_commands, shell_text, without_redirections
+from scripts.hooks.checkpoint_gate import ASSIGNMENT, shell_commands, shell_text, without_redirections
+from scripts.lib.command_wrappers import WRAPPER_ARGUMENTS
 
 REASON = "run git push alone in its own Bash call"
 KEYWORDS = frozenset({"then", "do", "else", "elif", "if", "while", "until", "!", "{", "}"})

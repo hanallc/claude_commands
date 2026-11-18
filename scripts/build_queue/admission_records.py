@@ -23,6 +23,7 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
+from scripts.lib.build_steps import CINameTemplate, QueueKind
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
@@ -1329,7 +1330,7 @@ class MemoryConfig:
     """The configuration holds admission policy, service timings, and memory estimate settings."""
     policy: AdmissionPolicy
     ci_memory_slice: str
-    ci_label: str = field(kw_only=True)
+    ci_label: CINameTemplate = field(kw_only=True)
     test_phase_margin: float
     dev_size_factor: float
     dev_size_margin_bytes: int
@@ -1366,12 +1367,21 @@ def _ci_slice_name(value: str) -> str:
     return value
 
 
-def _ci_label(value: str) -> str:
+def read_ci_name_template(settings: conf.ConfigRead, messages: list[str]) -> CINameTemplate:
+    """Keep an invalid CI label separate from the admission policy."""
+    label = settings.origin("ci_label", str)
+    if isinstance(label, conf.UnavailableValue):
+        messages.append(f"warning: {label.reason}; using hana CI")
+        return CINameTemplate(QueueKind.CI.value)
     try:
-        _ = value.format(runner="runner", job="job")
-    except (KeyError, IndexError, AttributeError, TypeError, ValueError) as error:
-        raise ValueError("expected a CI label with only {runner} and {job} fields") from error
-    return value
+        template = CINameTemplate(label.value)
+    except ValueError:
+        messages.append(f"warning: {settings.source}: ci_label={label.value!r}: "
+                        + "expected a CI label with unformatted {runner} and {job} fields; using hana CI")
+        return CINameTemplate(QueueKind.CI.value)
+    if isinstance(label, conf.RecoveredValue):
+        messages.append(f"warning: {label.reason}")
+    return template
 
 
 def configuration_diagnostics(messages: Iterable[str]) -> tuple[ConfigurationDiagnostic, ...]:
@@ -1434,7 +1444,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                                        gpu_tests=GpuTestSlots(whole("gpu_test_slots"),
                                                               value("gpu_test_repositories", lambda raw: frozenset(raw.split())))),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
-                ci_label=value("ci_label", _ci_label),
+                ci_label=read_ci_name_template(settings_read, messages),
                 test_phase_margin=test_margin(),
                 dev_size_factor=number("dev_size_factor"),
                 dev_size_margin_bytes=value("dev_size_margin_gib", lambda raw: math.ceil(float(raw) * GIB)),

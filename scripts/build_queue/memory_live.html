@@ -119,6 +119,7 @@ __PAGE_FRAME_STYLE__
   background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
 .tip dt { text-align: left; white-space: nowrap; }
 .tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip dd.ci-caller { white-space: normal; overflow-wrap: anywhere; }
 .tip .title { font-weight: 700; padding-bottom: 4px; }
 .tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
@@ -765,15 +766,13 @@ function doneText(row) {
 function ownerFields(row) {
   const fields = [staffField('Showrunner', [ownerText(row.showrunner)])];
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
-  if (row.caller) fields.push(field('Caller', row.caller));
+  const caller = callerName(row);
+  if (caller) fields.push(field('Caller', caller, ciRow(row) ? 'ci-caller' : 'field'));
   return fields.filter(row => row.value);
 }
 function olderStepTitle(row) {
   if (ciRow(row)) return {unit: '', step: row.ci_label || `hana CI · ${row.detail || row.name}`};
-  const unit = ownerText(row.unit);
-  const name = publicText(row.name || '');
-  const step = unit && name.startsWith(unit + ' ') ? name.slice(unit.length).replace(/^\s*·\s*|^\s+/, '') : name;
-  return {unit, step};
+  return {unit: '', step: row.name};
 }
 function stepTitle(row, value) {
   const {unit, step} = row.title ?? olderStepTitle(row);
@@ -816,6 +815,7 @@ function stepTooltip(key, data) {
       return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
     }))];
   rows.push(...ownerFields(row));
+  if (ciRow(row) && !row.ci && row.detail) rows.push(field('Step', row.detail));
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
@@ -969,8 +969,13 @@ function publicParts(parts) {
 function rowUnit(row) {
   return ciRow(row) ? "CI" : row.unit;
 }
+function callerName(row) {
+  if (!row.caller) return "";
+  return ciRow(row) ? row.title?.step || row.ci_label || "hana CI" : row.caller;
+}
 function rowOwner(row, waiting = false) {
-  if (row.caller) return row.caller;
+  const caller = callerName(row);
+  if (caller) return caller;
   if (row.kind === "repository-slot") return "";
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
   if (macRow(row)) return publicText(row.showrunner || "");

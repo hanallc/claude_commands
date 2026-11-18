@@ -2292,15 +2292,36 @@ class RunnerAuthorizationTests(unittest.TestCase):
                 with self.subTest(label=label):
                     write_memory_config(config, ci_label=label)
                     resolved = records.read_memory_config(report=False)
-                    self.assertEqual(resolved.ci_label, "CI {runner} {job}")
+                    self.assertEqual(resolved.ci_label, "hana CI")
                     self.assertTrue(any("ci_label" in item.diagnostic for item in resolved.diagnostics))
                     fixture.allow_next_start()
                     request = fixture.service_request()
                     grant = only_admitted(fixture.connect(request).replies())
                     self.assertEqual(fixture.server.reservations[request.episode].queue_waiter.get("session_name", ""),
-                        f"CI {request.runner} {request.job}")
+                        "hana CI")
                     self.assertIsInstance(fixture.connect(wire.BuildHistoryRequest()).replies()[0], wire.BuildHistoryReply)
                     fixture.release(grant)
+
+    def test_ci_estimates_record_a_valid_session_name(self) -> None:
+        for label, job, expected in (
+            ("Unknown program", "compile", "hana CI"),
+            ("hana CI · {runner} · {job}", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", "hana CI"),
+            ("hana CI · {runner} · {job}", "compile", "hana CI · runner-a · compile"),
+            ("hana CI · {runner} · {job}", "timeout", "hana CI · runner-a · timeout"),
+            ("hana CI · {runner:>10} · {job}", "compile", "hana CI"),
+        ):
+            with self.subTest(label=label, job=job), AdmissionFixture() as fixture:
+                config = fixture.root / "build_admission.conf"
+                write_memory_config(config, ci_label=label)
+                if "{runner:>10}" in label:
+                    resolved = records.read_memory_config(report=False)
+                    self.assertEqual(resolved.ci_label, expected)
+                    self.assertEqual(sum("ci_label" in item.diagnostic for item in resolved.diagnostics), 1)
+                fixture.allow_next_start()
+                request = fixture.service_request(job=job)
+                _ = only_admitted(fixture.connect(request).replies())
+                recorded = fixture.server.reservations[request.episode].queue_waiter
+                self.assertEqual(recorded.get("session_name"), expected)
 
     def test_release_completes_when_the_runner_owns_a_read_only_sample_folder(self) -> None:
         with AdmissionFixture() as fixture:
