@@ -3901,7 +3901,7 @@ window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
  if(options.method!=='POST') return sendProbe(url,options);
  const key=new URLSearchParams(options.body).get('row');
- return new Promise(resolve=>finishSave.set(key,()=>resolve(Response.json({answer:'saved',state:'Done'}))));
+ return new Promise(resolve=>finishSave.set(key,resolve));
 };
 </script>"""
         probe = r"""<script>
@@ -3925,10 +3925,15 @@ window.fetch=(url,options={})=>{
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
   return form;
  }
- async function settle(key,form){
-  finishSave.get(key)();
+ async function settle(key,form,response=Response.json({answer:'saved',state:'Done'})){
+  finishSave.get(key)(response);
   while(form.dataset.sending) await new Promise(resolve=>requestAnimationFrame(resolve));
  }
+ const afterFades=async()=>{
+  const fades=[...content.querySelectorAll('.record-motion-clip')].flatMap(node=>node.getAnimations());
+  await Promise.allSettled(fades.map(animation=>animation.finished));
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ };
  try{
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   frameElement.style.width='1280px';frameElement.style.height='820px';
@@ -3943,28 +3948,49 @@ window.fetch=(url,options={})=>{
   exit.pause();exit.currentTime=100;
   const back=afterHash('Back');history.back();await back;
   if(item()!==change) failures.push('Back restores the pending Change link.');
-  const forward=afterHash('Forward');history.forward();await forward;
-  if(item()!==question) failures.push('Forward restores the pending Question link.');
-  await settle(change,changeForm);
-  if(!questionForm.dataset.sending || item()!==question)
-   failures.push('The Change save leaves the Question link pending.');
-  await settle(question,questionForm);
-  if(!clip.isConnected || row(question))
-   failures.push('The Question link waits for the fade after the save. Fade mounted: '+clip.isConnected+'.');
-  exit.finish();
-  const fades=[...content.querySelectorAll('.record-motion-clip')].flatMap(node=>node.getAnimations());
-  await Promise.allSettled(fades.map(animation=>animation.finished));
-  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-  const target=row(question);
-  if(item()!==question || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
-   failures.push('The Question save opens the Done card at the restored link. State: '+
+  if(REFUSE_QUESTION){
+   await settle(change,changeForm);
+   if(!clip.isConnected || row(change)) throw new Error('The Change link must wait for the Question fade.');
+   let returning;
+   const animate=Element.prototype.animate;
+   Element.prototype.animate=function(keyframes,options){
+    const motion=animate.call(this,keyframes,options);
+    if(this.classList.contains('record-motion-clip') && keyframes.at(-1).opacity===1){
+     motion.pause();motion.currentTime=100;returning={clip:this,motion};
+    }
+    return motion;
+   };
+   await settle(question,questionForm,Response.json({reason:'Try again.'},{status:503}));
+   Element.prototype.animate=animate;
+   if(!returning) throw new Error('The refused Question must start a return fade.');
+   if(!returning.clip.isConnected || row(change))
+    failures.push('F007: The deferred Change link waits for the Question return fade.');
+   if(returning.clip.isConnected) returning.motion.finish();
+  }else{
+   const forward=afterHash('Forward');history.forward();await forward;
+   if(item()!==question) failures.push('Forward restores the pending Question link.');
+   await settle(change,changeForm);
+   if(!questionForm.dataset.sending || item()!==question)
+    failures.push('The Change save leaves the Question link pending.');
+   await settle(question,questionForm);
+   if(!clip.isConnected || row(question))
+    failures.push('The Question link waits for the fade after the save. Fade mounted: '+clip.isConnected+'.');
+   exit.finish();
+  }
+  await afterFades();
+  const linked=REFUSE_QUESTION ? change : question,target=row(linked);
+  if(item()!==linked || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
+   failures.push('The save opens the Done card at the restored link. State: '+
     target?.dataset.state+', expanded: '+(target?.querySelector('[data-detail]').hidden===false)+'.');
  }catch(error){failures.push(String(error));}
  await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
         page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
-        self.assertEqual(firefox_probe_results(page.replace('</body>', probe+'</body>', 1).encode()), [[]])
+        for refuse_question in (False, True):
+            with self.subTest(refuse_question=refuse_question):
+                script = probe.replace('REFUSE_QUESTION', json.dumps(refuse_question))
+                self.assertEqual(firefox_probe_results(page.replace('</body>', script+'</body>', 1).encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_console_reload_preserves_show_and_an_explicit_link_opens_the_card(self) -> None:
