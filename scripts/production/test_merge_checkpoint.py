@@ -363,6 +363,33 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), origin_tip)
                         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_staff_parent_authorizes_a_checkpoint_in_the_units_repository(self) -> None:
+        parent = self.root / "parent"
+        parent_origin = self.root / "parent.git"
+        parent.mkdir()
+        _ = self.git("init", "--bare", str(parent_origin), cwd=self.root)
+        _ = self.git("init", "-b", "production", cwd=parent)
+        _ = self.git("commit", "--allow-empty", "-m", "Parent repository", cwd=parent)
+        _ = self.git("remote", "add", "origin", str(parent_origin), cwd=parent)
+        _ = self.git("push", "origin", "production", "production:main", cwd=parent)
+        foreign_commit = self.git("rev-parse", "HEAD", cwd=parent)
+        _ = self.doc.write_text(self.doc.read_text().replace(str(self.checkout), str(parent)))
+        checkpoint = self.checkpoint()
+
+        with self.subTest(commit="parent repository"):
+            result = self.run_checkpoint(foreign_commit)
+            self.assert_stopped_before_merge(result, "failed", f"commit {foreign_commit} is absent")
+
+        with self.subTest(commit="unit repository"):
+            result = self.run_checkpoint(checkpoint).process
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            landed = self.git("rev-parse", "production", cwd=self.origin)
+            self.assertEqual(self.git("rev-parse", f"{landed}^2", cwd=self.origin), checkpoint)
+            self.assertEqual(self.git("rev-parse", "production", cwd=parent_origin), foreign_commit)
+            self.assertEqual(self.git("rev-parse", "HEAD", cwd=parent), foreign_commit)
+            self.assertIn(landed, (parent / "production.log").read_text())
+            self.assertFalse(self.log.exists())
+
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
         for failure in ("push", "final-fetch", "rollback-fetch", "rollback-ref"):
             with self.subTest(failure=failure):

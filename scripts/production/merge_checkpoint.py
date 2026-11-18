@@ -26,6 +26,7 @@ import tempfile
 import time
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, redirect_stdout
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
@@ -285,6 +286,15 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
         raise Refusal(f"unit {name} is not a staff unit of this production")
     if isinstance(unit, UnitUnavailable):
         raise Refusal(f"unit {name}: {unit.reason}")
+    try:
+        checkout = worktrees.main_checkout(unit.worktree)
+        if checkout != worktrees.main_checkout(production.checkout):
+            branch = worktrees.git(checkout, "branch", "--show-current").stdout.strip()
+            if branch != production.merge_branch:
+                raise Refusal(f"{checkout}: merge checkout is on {branch}, expected {production.merge_branch}")
+            production = replace(production, checkout=checkout)
+    except worktrees.Refused as error:
+        raise Refusal(str(error)) from error
     push_field = production_doc.optional_field(lines, "Push")
     push_raw = cell_value(push_field.text) if isinstance(push_field, production_doc.FieldPresent) else "validate_and_push"
     if push_raw not in ("git", "validate_and_push"):
@@ -1243,7 +1253,7 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
         "production_doc": str(request.production.doc), "name": request.production.name,
         "owner_id": str(request.production.owner.id), "unit_id": str(unit.id),
         "merge_branch": request.production.merge_branch, "checkout": str(request.production.checkout),
-        "production_log": str(request.production.log.relative_to(request.production.checkout)),
+        "production_log": os.path.relpath(request.production.log, request.production.checkout),
         "zone": str(request.production.zone), "unit": request.unit.name,
         "delivered_to": [],
         "paths": list(paths), "merge_tests": [list(command) for command in request.merge_tests],
@@ -1309,9 +1319,7 @@ def resolved_checkpoint(request: MergeRequest) -> MergeRequest:
     """Resolve the checkpoint hash and retain its staff snapshot."""
     if request.staff_record is None:
         request = request._replace(staff_record=staff.snapshot())
-    checkpoint = git(request.production.checkout, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
-    if checkpoint.returncode:
-        checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+    checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
     if checkpoint.returncode:
         raise checkpoint_gate.Stop("ancestry", "failed", f"commit {request.commit} is absent",
                                    "push the checkpoint and send its hash again")
@@ -2078,6 +2086,8 @@ def batch_requests(path: Path, production: str) -> tuple[MergeRequest, ...]:
         requests.append(request_from(args))
     if not requests:
         raise Refusal("the batch file has no items")
+    if any(request.production.checkout != requests[0].production.checkout for request in requests):
+        raise Refusal("batch items use different merge checkouts; submit a batch for each checkout")
     return tuple(requests)
 
 
