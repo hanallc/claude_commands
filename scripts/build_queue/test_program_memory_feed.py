@@ -14,7 +14,10 @@ from scripts.build_queue.queue_fixture import fixture_reservation
 
 
 TRACE_NOW = 10 * 86_400
-TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 8, 65_536)
+TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 8, 65_536,
+                                            final_replay_bytes=100000,
+                                            max_pending_commands=8, prune_interval_seconds=7,
+                                            scope_loss_grace_seconds=4, seal_retry_count=2)
 TRACE_SHAPE = "a" * 64
 
 
@@ -151,6 +154,26 @@ class ProgramMemoryFeedTests(unittest.TestCase):
                 assert recorded is not None
                 self.assertEqual(recorded["live"]["compile"]["peak"], peak)
                 self.assertEqual(read.call_count, int(peak == (2000, 7)))
+
+    def test_program_memory_rejects_a_completed_sample_after_a_cached_limit(self) -> None:
+        store = self.trace_store()
+        writer = self.start_trace(store, "live-trace")
+        _ = writer.append(self.compile_trace_sample(2000, 7))
+        sample = memory_trace.encode_record(self.compile_trace_sample(4000, 8))
+        with writer.path.open("ab") as stream:
+            _ = stream.write(memory_trace.encode_record(memory_trace.TraceLimit.SAMPLE_COUNT) + sample[:-1])
+        feed = program_memory_feed.ProgramMemoryFeed(store)
+        rows = self.trace_rows("live-trace")
+        recorded = self.views(feed, rows).get(0)
+        assert recorded is not None
+        self.assertEqual(recorded["live"]["compile"]["peak"], (2000, 7))
+
+        with writer.path.open("ab") as stream:
+            _ = stream.write(b"\n")
+        with mock.patch.object(memory_trace, "read_trace", wraps=memory_trace.read_trace) as read:
+            self.assertEqual(self.views(feed, rows), {})
+            read.assert_not_called()
+        self.assertIsInstance(store.read_live("live-trace"), memory_trace.TraceUnavailable)
 
     def test_program_memory_enforces_exact_budget_in_page_order(self) -> None:
         store = self.trace_store()

@@ -112,8 +112,10 @@ __PAGE_FRAME_STYLE__
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 /* shared:step-tip:start — the Disks page uses these rules too (disks_page.shared_step_tip). */
-#tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
+#tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease;
+  width: max-content; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow: auto; border-radius: 8px; }
 #tip.on { opacity: 1; }
+#tip.on.scrollable { pointer-events: auto; }
 .tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
   width: max-content; min-width: 15rem; max-width: 24rem; padding: 10px 12px; border-radius: 8px;
   background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
@@ -124,8 +126,42 @@ __PAGE_FRAME_STYLE__
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
-#tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
+#tip > .tip { min-width: min(15rem, calc(100vw - 16px)); max-width: min(24rem, calc(100vw - 16px)); }
 /* shared:step-tip:end */
+.tip .program-memory {
+  --program-live: color-mix(in srgb, var(--accent) 72%, var(--bg));
+  --program-past: color-mix(in srgb, var(--agents) 72%, var(--bg));
+  --program-muted: color-mix(in srgb, var(--bg) 68%, var(--ink));
+  --program-rule: color-mix(in srgb, var(--bg) 22%, var(--ink));
+  grid-column: 1 / -1; width: min(344px, calc(100vw - 40px)); padding-left: 0;
+  text-align: left; white-space: normal; font-size: .75rem;
+}
+.program-memory p { margin: 0; color: var(--program-muted); font-size: .73rem; }
+.program-memory .program-key { display: flex; flex-wrap: wrap; gap: 0 18px; margin: 4px 0 6px; font-weight: 600; }
+.program-swatch { display: inline-block; width: 18px; margin-right: 6px; vertical-align: middle; border-top: 3px solid var(--program-live); }
+.program-swatch.past { border-color: var(--program-past); }
+.program-phase + .program-phase { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--program-rule); }
+.program-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.program-heading h2 { margin: 0; font-size: .85rem; }
+.program-heading span { color: var(--program-muted); }
+.program-phase svg { display: block; width: 100%; font-size: 10px; }
+.program-phase svg text { fill: var(--program-muted); dominant-baseline: middle; }
+.program-phase svg .past { fill: var(--program-past); }
+.program-phase svg .live { fill: var(--program-live); }
+.program-phase svg .program-past-line, .program-phase svg .program-live-line {
+  fill: none; stroke-linecap: round; stroke-linejoin: round;
+}
+.program-past-line { stroke: var(--program-past); stroke-width: 1.75; }
+.program-live-line { stroke: var(--program-live); stroke-width: 2.25; }
+.program-crate { fill: color-mix(in srgb, var(--program-past) 14%, var(--ink)); }
+.program-axis { stroke: var(--program-rule); }
+.program-reserve { stroke: var(--program-muted); stroke-dasharray: 4 3; }
+.program-marker { stroke: var(--program-muted); opacity: .65; }
+.program-times { display: flex; justify-content: space-between; width: 69%; padding: 0 4px; color: var(--program-muted); font-size: .68rem; }
+.program-values { display: grid; grid-template-columns: 1fr auto; gap: 0 8px; margin: 4px 0 0; }
+.tip .program-values dt { white-space: normal; }
+.tip .program-values dd { padding-left: 0; }
+.program-values .program-swatch { width: 10px; }
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
@@ -1000,13 +1036,14 @@ function ago(then, now) {
   const h = Math.floor(m / 60);
   return h < 24 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
 }
-// Put the tooltip above the pointer, or below it near the top, and keep it inside the window.
 function placeTipAt(tip, x, y) {
   const w = tip.offsetWidth, h = tip.offsetHeight;
   const left = Math.min(Math.max(8, x - w / 2), window.innerWidth - w - 8);
-  const top = y - h - 14 < 8 ? y + 18 : y - h - 14;
+  const above = y - h - 14;
+  const top = Math.min(above >= 8 ? above : y + 18, window.innerHeight - h - 8);
   tip.style.left = `${left}px`;
-  tip.style.top = `${top}px`;
+  tip.style.top = `${Math.max(8, top)}px`;
+  tip.classList.toggle("scrollable", tip.scrollHeight > tip.clientHeight || tip.scrollWidth > tip.clientWidth);
 }
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
@@ -1017,26 +1054,132 @@ function hoverTips(tip, content) {
   const show = (key, x, y) => {
     const html = content(key);
     if (!html) return;
-    shown = key;
     tip.innerHTML = html;
+    if (shown?.key !== key) {
+      tip.scrollTop = 0;
+      tip.scrollLeft = 0;
+    }
+    shown = {key, x, y};
     tip.classList.add("on");
     placeTipAt(tip, x, y);
   };
+  const refresh = () => { if (shown) show(shown.key, shown.x, shown.y); };
   const hide = () => { shown = null; tip.classList.remove("on"); };
   document.addEventListener("pointermove", (e) => {
+    if (e.pointerType !== "mouse" || tip.contains(e.target)) return;
     const el = e.target.closest("[data-tip]");
-    if (e.pointerType !== "mouse") return;
     if (el) show(el.dataset.tip, e.clientX, e.clientY); else if (shown) hide();
   });
   document.addEventListener("click", (e) => {
+    if (tip.contains(e.target)) return;
     const el = e.target.closest("[data-tip]");
-    if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
+    if (el && shown?.key !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
   });
-  return {show, hide, key: () => shown};
+  window.addEventListener("resize", () => {
+    if (shown) placeTipAt(tip, shown.x, shown.y);
+  });
+  return {show, hide, refresh, key: () => shown?.key ?? null};
 }
 // shared:step-tip:end
+const programMemoryMarkup = new WeakMap();
+function programSeconds(ms) { return `${Math.round(ms / 1000)} s`; }
+function programSwatch(series) { return `<span class="program-swatch ${series}" aria-hidden="true"></span>`; }
+function programValue(series, label, value) {
+  return `<dt>${programSwatch(series)}${label}</dt><dd>${value}</dd>`;
+}
+function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax) {
+  const plotTop = bands.length ? 20 : 9;
+  const base = bands.length ? 79 : 67;
+  const left = 4, right = 238;
+  const x = ms => left + ms / axisEnd * (right - left);
+  const y = bytes => base - bytes / memoryMax * (base - plotTop);
+  const coords = ([ms, bytes], factor = 1) => [x(ms * factor).toFixed(2), y(bytes).toFixed(2)];
+  const dot = (point, series, factor, radius) => {
+    const [cx, cy] = coords(point, factor);
+    return `<circle class="${series}" cx="${cx}" cy="${cy}" r="${radius}"/>`;
+  };
+  const lines = (phase, series, factor) => (phase?.segments ?? []).map(segment => {
+    if (segment.length === 1) return dot(segment[0], series, factor, 2);
+    return `<polyline class="program-${series}-line" points="${segment.map(point => coords(point, factor).join(',')).join(' ')}"/>`;
+  }).join('');
+  const rule = (height, kind) => `<line class="program-${kind}" x1="${left}" x2="${right}" y1="${height}" y2="${height}"/>`;
+  const last = live.segments.at(-1)?.at(-1);
+  const reserveY = reserve ? y(reserve.bytes) : null;
+  const peak = past?.peak ?? live.peak;
+  const peakSeries = past?.peak ? 'past' : 'live';
+  let peakLabel = '';
+  if (peak) {
+    const peakY = y(peak[1]);
+    const labelY = reserveY === null ? peakY : peakY <= reserveY
+      ? Math.max(7, Math.min(peakY, reserveY - 12))
+      : Math.min(base - 1, Math.max(peakY, reserveY + 12));
+    peakLabel = dot(peak, peakSeries, peakSeries === 'past' ? 1 : scale, 3) +
+      `<text class="${peakSeries}" x="245" y="${labelY}">${ramAmount(peak[1])} peak</text>`;
+  }
+  let crateBands = '';
+  if (bands.length) {
+    const widest = bands.reduce((a, b) => b[1] - b[0] > a[1] - a[0] ? b : a);
+    const center = Math.max(left + 24, Math.min(right - 24, x((widest[0] + widest[1]) / 2)));
+    crateBands = bands.map(([start, end]) =>
+      `<rect class="program-crate" x="${x(start)}" y="1" width="${Math.max(1, x(end) - x(start))}" height="${base - 1}"/>`).join('') +
+      `<text class="past" x="${center}" y="9" text-anchor="middle">hana crate</text>`;
+  }
+  return `<svg viewBox="0 0 344 ${base + 5}" role="img" aria-label="${name} program memory by elapsed time">
+    ${crateBands}${rule(base, 'axis')}
+    ${reserveY === null ? '' : rule(reserveY, 'reserve') + `<text x="245" y="${reserveY}">${ramAmount(reserve.bytes)} reserved</text>`}
+    ${last ? `<line class="program-marker" x1="${x(last[0] * scale)}" x2="${x(last[0] * scale)}" y1="${plotTop}" y2="${base}"/>` : ''}
+    ${lines(past, 'past', 1)}${lines(live, 'live', scale)}${peakLabel}${last ? dot(last, 'live', scale, 3.5) : ''}
+  </svg>`;
+}
+function programMemoryPhase(name, live, past, reserve, bands, hanaDuration, memoryMax) {
+  const last = live.segments.at(-1)?.at(-1);
+  const pastDuration = past?.duration_ms ?? 0;
+  const scaled = name === 'Compile' && pastDuration > 0 && live.duration_ms > 0 && !!last;
+  const axisEnd = (scaled ? pastDuration : Math.max(live.duration_ms, pastDuration)) || 1000;
+  const scale = scaled ? axisEnd / live.duration_ms : 1;
+  const caption = [
+    scaled ? `The chart scales ${programSeconds(live.duration_ms)} of this run to the ${programSeconds(axisEnd)} past-run axis.` : '',
+    reserve?.source === 'past' ? 'The line shows the past reserve.' :
+      (reserve && past?.reserve_bytes != null && reserve.bytes !== past.reserve_bytes ? 'The line shows this run’s reserve.' : ''),
+  ].filter(Boolean).join(' ');
+  const current = last ? ramAmount(last[1]) : live.state === 'not_started' ? 'Not started' : 'No samples';
+  const currentName = last && live.state !== 'sampling' ? 'This run, last sample' : 'This run now';
+  return `<section class="program-phase">
+    <div class="program-heading"><h2>${name}</h2>${last ? `<span>${programSeconds(live.duration_ms)} elapsed</span>` : ''}</div>
+    ${programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax)}
+    <div class="program-times"><span>0 s</span><span>time</span><span>${programSeconds(axisEnd)}</span></div>
+    ${caption ? `<p>${caption}</p>` : ''}
+    <dl class="program-values">
+      ${programValue('live', currentName, current)}
+      ${past?.peak ? programValue('past', 'Past run peak', ramAmount(past.peak[1])) : ''}
+      ${past?.above_half_reserve_ms != null ? programValue('past', 'Past run time above half the reserve', programSeconds(past.above_half_reserve_ms)) : ''}
+      ${bands.length ? programValue('past', 'Past run, hana crate', programSeconds(hanaDuration)) : ''}
+    </dl>
+  </section>`;
+}
+function programMemoryHtml(memory) {
+  if (programMemoryMarkup.has(memory)) return programMemoryMarkup.get(memory);
+  const {live, past, compile_reserve: compileReserve, test_reserve: testReserve} = memory;
+  const memoryMax = Math.max(GIB, compileReserve.bytes, testReserve?.bytes ?? 0,
+    live.compile.peak?.[1] ?? 0, live.test.peak?.[1] ?? 0, past?.compile.peak?.[1] ?? 0, past?.test.peak?.[1] ?? 0);
+  const html = `<dd class="program-memory group">
+    <p>Program memory excludes file cache.</p>
+    ${past ? '' : '<p>No past run yet</p>'}
+    <div class="program-key"><span>${programSwatch('live')}This run (live)</span><span>${programSwatch('past')}Past run</span></div>
+    ${programMemoryPhase('Compile', live.compile, past?.compile, compileReserve, past?.hana_crate_bands ?? [], past?.hana_compile_ms, memoryMax)}
+    ${programMemoryPhase('Test', live.test, past?.test, testReserve, [], 0, memoryMax)}
+  </dd>`;
+  programMemoryMarkup.set(memory, html);
+  return html;
+}
+function buildsTooltipHtml(key, data) {
+  const html = tooltipHtml(key, data);
+  const memory = key.startsWith('row:') && stepRow(key, data)?.program_memory;
+  return memory ? html.slice(0, -5) + programMemoryHtml(memory) + '</dl>' : html;
+}
+const currentBuildsTooltip = key => latest ? buildsTooltipHtml(key, latest) : "";
 const tip = document.getElementById("tip");
-const tips = hoverTips(tip, key => latest ? tooltipHtml(key, latest) : "");
+const tips = hoverTips(tip, currentBuildsTooltip);
 const showTip = tips.show, hideTip = tips.hide;
 function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
@@ -1084,7 +1227,7 @@ function restoreReportView(view) {
     if ((tipKey.startsWith('row:') || tipKey.startsWith('wait:')) && !stepRow(tipKey, latest)) {
       hideTip();
       tip.replaceChildren();
-    } else tip.innerHTML = tooltipHtml(tipKey, latest);
+    } else tips.refresh();
   }
 }
 function render(d) {

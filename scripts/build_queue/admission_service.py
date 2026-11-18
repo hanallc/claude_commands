@@ -628,11 +628,6 @@ class NoReadingFailure:
     """The reader has no exception for the loop."""
 
 
-@dataclass(frozen=True)
-class NoFullSystemReading:
-    """The trace tick has no new full system reading."""
-
-
 class SystemReader(Protocol):
     @property
     def latest(self) -> SystemEvidence: ...
@@ -662,8 +657,8 @@ class OperatingSystemReader:
         self.lock: threading.Lock = threading.Lock()
         self.stopped: threading.Event = threading.Event()
         self.requested: threading.Event = threading.Event()
-        self.full_requested: bool = False
-        self.traces: memory_trace.TraceCapture | memory_trace.TracesOff = traces
+        self.traces: memory_trace.TraceWorker | memory_trace.TracesOff = (
+            memory_trace.TraceWorker(traces) if isinstance(traces, memory_trace.TraceCapture) else traces)
         self.failure: Exception | NoReadingFailure = NoReadingFailure()
         self.thread: threading.Thread = threading.Thread(target=self._read, name="admission-readings", daemon=True)
         self.thread.start()
@@ -678,51 +673,38 @@ class OperatingSystemReader:
             faster = plan.waiting and not self.plan.waiting
             self.plan = plan
             if faster:
-                self.full_requested = True
                 self.requested.set()
 
     def request_read(self) -> None:
         with self.lock:
-            self.full_requested = True
             self.requested.set()
 
-    @staticmethod
-    def _trace_test_admission(record: ReservationRecord) -> memory_trace.TraceTestAdmission:
-        charge = record.charge_use
-        return memory_trace.TraceTestAdmission(record.test_phase_need,
-            memory_trace.TestReserveUnavailable() if isinstance(charge, test_phase.NoTestPhaseChargeUse) else charge["bytes"])
-
     def register_trace(self, record: ReservationRecord, argv: tuple[str, ...], host: str, wall: float) -> None:
-        if (isinstance(self.traces, memory_trace.TraceCapture) and isinstance(record.place, wire.LocalPlace)
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
                 and record.repo == "hana" and record.repo_identity and record.step == "nextest"
                 and record.sidecar and record.need > 0 and argv):
             width = records.UnspecifiedTestWidth() if isinstance(record.test_width, records.NoTestWidth) else record.test_width
             shape = memory_trace.HanaTraceShape(host, record.repo_identity, argv, width)
             self.traces.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
-                self._trace_test_admission(record), wall, self.clock.monotonic()))
-            self.requested.set()
+                                                       wall, self.clock.monotonic()))
 
     def release_trace(self, record: ReservationRecord, ending: ReleaseStatus | OwnerExited | NotEnding | TokenWaiting,
                       wall: float) -> None:
-        if (isinstance(self.traces, memory_trace.TraceCapture) and isinstance(record.place, wire.LocalPlace)
+        if (isinstance(self.traces, memory_trace.TraceWorker) and isinstance(record.place, wire.LocalPlace)
                 and record.repo == "hana" and record.step == "nextest" and record.sidecar):
             status = ending.status if isinstance(ending, ReleaseStatus) else memory_trace.ExitStatusUnavailable()
-            self.traces.submit(memory_trace.TraceRelease(record.reservation_id, wall, self.clock.monotonic(),
-                status, self._trace_test_admission(record)))
-            self.requested.set()
+            self.traces.release(record.reservation_id, wall, status)
 
-    def _collect_traces(self, traces: memory_trace.TraceCapture, tick: memory_trace.TraceTick,
-                        plan: SystemReadingPlan, reading: SystemEvidence | NoFullSystemReading) -> None:
-        if not tick.reservations:
-            traces.maintain(tick.wall)
-            return
-        due = set(tick.reservations)
-        rows = tuple(record for record in plan.reservations if record.reservation_id in due)
-        full = {record.reservation_id: memory_trace.TraceScopeReading(evidence.memory, evidence.phase)
-                for record in rows if isinstance(reading, SystemEvidence)
-                and (evidence := reading.reservations.get(record.episode)) is not None}
-        traces.collect(tick, full, {record.reservation_id: self._trace_test_admission(record) for record in rows})
-        traces.maintain(tick.wall)
+    def record_trace_reserves(self, explanation: records.QueueExplanation) -> None:
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            running = (entry for entry in explanation.running if gate.running_has_reservation(entry.step))
+            reserves = {row["reservation_id"]: entry.promise for row, entry in
+                        zip(explanation.decided_from.reservations, running, strict=True)
+                        if row["repo"] == "hana" and row["step"] == "nextest" and row.get("scoped", False)
+                        and "reservation_id" in row and isinstance(entry.step.measured, records.MeasuredMemory)
+                        and isinstance(entry.step.measured.peak_history, records.TestPhaseStarted)}
+            if reserves:
+                self.traces.submit(reserves)
 
     def raise_failure(self) -> None:
         with self.lock:
@@ -731,30 +713,18 @@ class OperatingSystemReader:
             raise failure
 
     def _read(self) -> None:
-        traces = self.traces
-        if isinstance(traces, memory_trace.TraceCapture):
-            traces.recover()
         last_read = self.clock.monotonic()
         while not self.stopped.is_set():
             with self.lock:
                 plan = self.plan
             interval = plan.config.waiting_pass_seconds if plan.waiting else plan.config.running_pass_seconds
             full_deadline = last_read + interval
-            trace_deadline = traces.deadline if isinstance(traces, memory_trace.TraceCapture) else float("inf")
-            signalled = self.requested.wait(max(0.0, min(full_deadline, trace_deadline) - self.clock.monotonic()))
+            _ = self.requested.wait(max(0.0, full_deadline - self.clock.monotonic()))
             if self.stopped.is_set():
                 break
             with self.lock:
                 self.requested.clear()
-                full_requested, self.full_requested = self.full_requested, False
                 plan = self.plan
-            now = self.clock.monotonic()
-            tick = traces.prepare(self.clock.now(), now) if isinstance(traces, memory_trace.TraceCapture) else None
-            if not (full_requested or now >= full_deadline or not signalled and full_deadline <= trace_deadline):
-                if isinstance(traces, memory_trace.TraceCapture) and tick is not None:
-                    self._collect_traces(traces, tick, plan, NoFullSystemReading())
-                continue
-            reading: SystemEvidence | NoFullSystemReading = NoFullSystemReading()
             try:
                 reading = read_system(plan, self.readings, self.proc, self.clock)
             except Exception as error:
@@ -765,15 +735,13 @@ class OperatingSystemReader:
                     self.reading = reading
             os.eventfd_write(self.wake, 1)
             last_read = self.clock.monotonic()
-            if isinstance(traces, memory_trace.TraceCapture) and tick is not None:
-                self._collect_traces(traces, tick, plan, reading)
-        if isinstance(traces, memory_trace.TraceCapture):
-            traces.close()
 
     def close(self) -> None:
         self.stopped.set()
         self.requested.set()
         self.thread.join()
+        if isinstance(self.traces, memory_trace.TraceWorker):
+            self.traces.close()
 
 
 @dataclass(frozen=True)
@@ -2320,6 +2288,9 @@ class AdmissionServer:
             return
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        if (isinstance(self.trace_policy, memory_trace.MemoryTracePolicy)
+                and isinstance(self.system_reader, OperatingSystemReader)):
+            self.system_reader.record_trace_reserves(reading.explanation)
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
@@ -4325,7 +4296,7 @@ done
             if not isinstance(initial, SystemEvidence):
                 initial = read_system(plan, self.readings, self.proc, self.clock)
             traces = (memory_trace.TraceCapture(memory_trace.TraceStore(self.state_dir / "memory_traces", self.trace_policy),
-                        self.progress_captures.root, self.boot_id)
+                        self.progress_captures.root, self.boot_id, self.clock)
                       if isinstance(self.trace_policy, memory_trace.MemoryTracePolicy) else self.trace_policy)
             self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock,
                                                        self.reading_events, traces=traces)

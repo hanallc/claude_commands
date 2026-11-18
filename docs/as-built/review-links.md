@@ -303,6 +303,20 @@ They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
+### Builds memory tooltip
+
+Hover over a running local Hana nextest step with a program memory trace to see Compile and Test charts.
+The charts show program memory without file cache.
+Blue shows this run, and purple shows the latest whole run with the same build shape.
+Each chart has its own elapsed time axis and a dashed line for the phase reserve when known.
+The Compile chart scales this run to the past run's time axis and labels the scale.
+It shades the time when the past run compiled the final `hana` crate.
+The values show the latest sample, the past peak, and the past time above half its reserve.
+The Test chart shows **Not started** until tests start.
+The tooltip shows **No past run yet** when no run matches.
+The open tooltip updates with each `memory.json` reading.
+Disks uses the shared step tooltip fields.
+
 ### Review page
 
 `/console/review.html` replaces the Changes, Questions and Investigations navigation pages.

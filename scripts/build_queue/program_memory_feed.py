@@ -5,7 +5,8 @@ import json
 import os
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Literal, TypedDict
 
@@ -81,47 +82,6 @@ class _PastTraceRead:
     trace: memory_trace.MemoryTrace | memory_trace.NoMatchingWholeRun
 
 
-def _append_trace_samples(trace: memory_trace.MemoryTrace, data: bytes, complete: int,
-                          policy: memory_trace.MemoryTracePolicy) -> memory_trace.MemoryTrace | None:
-    """Decode new observations. Let the full reader validate limit and end records."""
-    test_start = trace.test_start
-    compile_samples: list[memory_trace.CompileSample] = []
-    test_samples: list[memory_trace.TestSample] = []
-    previous = trace.test_samples or trace.compile_samples
-    last_sample = previous[-1].elapsed_ms if previous else -1
-    lines = data[:complete - 1].split(b"\n") if complete else ()
-    for line in lines:
-        record = memory_trace.decode_record(line)
-        if isinstance(record, memory_trace.TestStarted):
-            if isinstance(test_start, memory_trace.TestStarted) or record.elapsed_ms < last_sample:
-                return None
-            test_start = record
-        elif isinstance(record, memory_trace.TestReserveObserved):
-            if not isinstance(test_start, memory_trace.TestStarted) or isinstance(test_start.reserve_bytes, int):
-                return None
-            test_start = replace(test_start, reserve_bytes=record.reserve_bytes)
-        elif isinstance(record, (memory_trace.CompileSample, memory_trace.TestSample)):
-            if record.elapsed_ms <= last_sample:
-                return None
-            if isinstance(record, memory_trace.CompileSample):
-                if isinstance(test_start, memory_trace.TestStarted):
-                    return None
-                compile_samples.append(record)
-            else:
-                if not isinstance(test_start, memory_trace.TestStarted) or record.elapsed_ms < test_start.elapsed_ms:
-                    return None
-                test_samples.append(record)
-            last_sample = record.elapsed_ms
-        else:
-            return None
-    if (len(trace.compile_samples) + len(trace.test_samples) + len(compile_samples) + len(test_samples)
-            > policy.max_samples_per_run):
-        return None
-    return replace(trace, test_start=test_start, compile_samples=trace.compile_samples + tuple(compile_samples),
-                   test_samples=trace.test_samples + tuple(test_samples),
-                   state=memory_trace.TraceRecording() if complete == len(data) else memory_trace.TraceTailIncomplete())
-
-
 def _program_memory_phase(chart: memory_trace.PhaseChart | memory_trace.NoPhaseSamples, state: ProgramMemoryPhaseState,
                           reserve: int | None, duration_ms: int = 0) -> ProgramMemoryPhase:
     if isinstance(chart, memory_trace.NoPhaseSamples):
@@ -184,8 +144,8 @@ class ProgramMemoryFeed:
                         _ = stream.seek(previous.offset)
                         tail = stream.read(stamp.size - previous.offset)
                         complete = tail.rfind(b"\n") + 1
-                        trace = _append_trace_samples(previous.trace, tail, complete, self.store.policy)
-                        if trace is not None and _trace_file_stamp(path) == stamp:
+                        trace = previous.trace.read_body(BytesIO(tail), self.store.policy)
+                        if _trace_file_stamp(path) == stamp:
                             self.live[reservation_id] = _LiveTraceRead(stamp, previous.offset + complete, trace)
                             return trace
                 trace = self.store.read_live(reservation_id)

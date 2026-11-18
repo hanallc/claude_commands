@@ -1,21 +1,28 @@
 """Test the memory trace boundary with private files and fixed times."""
 from __future__ import annotations
 
+from collections.abc import Buffer, Iterator
 from dataclasses import replace
 from functools import cached_property
+from io import BytesIO, FileIO
 import os
 from pathlib import Path
 import tempfile
+from typing import override
 import unittest
+from unittest import mock
 
 from scripts.build_queue import memory_trace as traces
 from scripts.build_queue.admission_records import RequestedTestWidth, UnspecifiedTestWidth
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_bytes_atomic
 
 
 DAY_MS = 86_400_000
 NOW_MS = 10 * DAY_MS
-POLICY = traces.MemoryTracePolicy(2, 120, 8192, 2, 3, 3, 1024)
+POLICY = traces.MemoryTracePolicy(2, 120, 8192, 2, 3, 3, 1024, final_replay_bytes=100000,
+                                  scope_loss_grace_seconds=9, seal_retry_count=4,
+                                  max_pending_commands=12, shutdown_timeout_seconds=3, prune_interval_seconds=7)
 ARGV = ("cargo", "nextest", "run", "--bin", "hana", "--profile", "ci",
         "--features", "native", "--target", "target-a", "--package", "hana",
         "--test-threads", "8", "-E", "test(alpha)", "--", "--nocapture")
@@ -64,6 +71,12 @@ class MemoryTraceTests(unittest.TestCase):
             "max_finished_runs=3\n"
             "points_per_phase=3\n"
             "feed_bytes_per_refresh=1024\n"
+            "final_replay_bytes=100000\n"
+            "scope_loss_grace_seconds=9\n"
+            "seal_retry_count=4\n"
+            "max_pending_commands=12\n"
+            "shutdown_timeout_seconds=3\n"
+            "prune_interval_seconds=7\n"
         )
         path = self.root / "fixture.conf"
         settings = conf.ConfigRead(path, path, conf.settings(stored), repository_allowed=False)
@@ -71,10 +84,42 @@ class MemoryTraceTests(unittest.TestCase):
         for config in (stored.replace("sample_seconds=2", "sample_seconds=bad"),
                        stored.replace("retention_days=2\n", ""),
                        stored.replace("points_per_phase=3", "points_per_phase=2"),
-                       stored.replace("retention_days=2", "retention_days=-1")):
+                       stored.replace("retention_days=2", "retention_days=-1"),
+                       stored.replace("final_replay_bytes=100000\n", ""),
+                       stored.replace("final_replay_bytes=100000", "final_replay_bytes=0"),
+                       stored.replace("final_replay_bytes=100000", "final_replay_bytes=1048577"),
+                       stored.replace("scope_loss_grace_seconds=9\n", ""),
+                       stored.replace("scope_loss_grace_seconds=9", "scope_loss_grace_seconds=61"),
+                       stored.replace("seal_retry_count=4\n", ""),
+                       stored.replace("seal_retry_count=4", "seal_retry_count=-1"),
+                       stored.replace("seal_retry_count=4", "seal_retry_count=11"),
+                       stored.replace("max_pending_commands=12\n", ""),
+                       stored.replace("max_pending_commands=12", "max_pending_commands=0"),
+                       stored.replace("shutdown_timeout_seconds=3\n", ""),
+                       stored.replace("shutdown_timeout_seconds=3", "shutdown_timeout_seconds=61"),
+                       stored.replace("prune_interval_seconds=7\n", ""),
+                       stored.replace("prune_interval_seconds=7", "prune_interval_seconds=0")):
             with self.subTest(config=config):
                 self.assertIsInstance(traces.read_policy(replace(settings, settings=conf.settings(config))),
                                       traces.TracesOff)
+
+    def test_policy_enforces_byte_bounds_without_range_comments(self) -> None:
+        stored = (
+            "sample_seconds=2\nmax_samples_per_run=120\nretention_days=2\nmax_finished_runs=3\n"
+            "points_per_phase=3\nfeed_bytes_per_refresh=1024\nscope_loss_grace_seconds=9\nseal_retry_count=4\n"
+            "final_replay_bytes=100000\n"
+            "max_pending_commands=12\n"
+            "shutdown_timeout_seconds=3\n"
+            "prune_interval_seconds=7\n"
+        )
+        path = self.root / "fixture.conf"
+        for value in (1023, 4_194_305, 10**20):
+            with self.subTest(value=value):
+                settings = conf.ConfigRead(path, path, conf.settings(f"{stored}max_bytes_per_run={value}\n"),
+                                           repository_allowed=False)
+                self.assertIsInstance(traces.read_policy(settings), traces.TracesOff)
+        with self.assertRaisesRegex(ValueError, "max_bytes_per_run"):
+            _ = replace(POLICY, max_bytes_per_run=10**20)
 
     def test_shape_normalizes_known_value_flags_and_keeps_execution_details(self) -> None:
         equivalent = ARGV[:3] + (
@@ -145,6 +190,23 @@ class MemoryTraceTests(unittest.TestCase):
         with path.open("ab") as stream:
             _ = stream.write(b'["')
         self.assertIsInstance(self.store.newest_whole_run(KEY), traces.NoMatchingWholeRun)
+
+    def test_append_keeps_the_limit_when_it_completes_a_partial_end(self) -> None:
+        writer = self.store.start(self.header("partial-end"))
+        _ = writer.append(compile_sample(2000, 8))
+        end = traces.TraceEnd(NOW_MS, 4000, 0, traces.IncompleteRun(traces.TraceLimit.SAMPLE_COUNT))
+        end_line = traces.encode_record(end)
+        with writer.path.open("ab") as stream:
+            _ = stream.write(traces.encode_record(traces.TraceLimit.SAMPLE_COUNT) + end_line[:-1])
+        cached = traces.read_trace(writer.path, POLICY)
+        assert isinstance(cached, traces.MemoryTrace)
+        self.assertIsInstance(cached.state, traces.TraceTailIncomplete)
+
+        with writer.path.open("ab") as stream:
+            _ = stream.write(b"\n")
+        updated = cached.read_body(BytesIO(end_line), POLICY)
+        self.assertEqual(updated, traces.read_trace(writer.path, POLICY))
+        self.assertEqual(updated.state, end)
 
     def test_late_test_reserve_keeps_the_first_start_and_reserve(self) -> None:
         writer = self.store.start(self.header("late-reserve"))
@@ -227,6 +289,37 @@ class MemoryTraceTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             _ = self.store.start(writer.header)
 
+    def test_copy_after_failed_move_keeps_the_verified_end_record(self) -> None:
+        writer = self.store.start(self.header("copy"))
+        _ = writer.append(compile_sample(2000, 5))
+        _ = writer.append(traces.TestStarted(3000, UNKNOWN_RESERVE))
+        _ = writer.append(traces.TestSample(4000, 4))
+        end = traces.TraceEnd(NOW_MS, 5000, 0, WHOLE_RUN)
+        with mock.patch.object(Path, "replace", side_effect=OSError("trace move failed")):
+            with self.assertRaises(OSError):
+                _ = writer.seal(end)
+        expected = writer.path.read_bytes()
+        writer.seal_prefix(replace(end, ended_at_ms=NOW_MS + 1))
+        sealed = self.root / "finished" / KEY / f"{NOW_MS}-copy.jsonl"
+        self.assertEqual(list(sealed.parent.iterdir()), [sealed])
+        self.assertEqual(sealed.read_bytes(), expected)
+        self.assertFalse(writer.path.exists())
+
+    def test_seal_replaces_a_partial_end_at_the_last_verified_offset(self) -> None:
+        writer = self.store.start(self.header("torn-end"))
+        _ = writer.append(compile_sample(2000, 5))
+        _ = writer.append(traces.TestStarted(3000, UNKNOWN_RESERVE))
+        _ = writer.append(traces.TestSample(4000, 4))
+        prefix = writer.path.read_bytes()
+        end = traces.TraceEnd(NOW_MS, 5000, 0, traces.WholeRun())
+        line = traces.encode_record(end)
+        with writer.path.open("ab") as stream:
+            _ = stream.write(line[:len(line) // 2])
+
+        self.assertEqual(writer.seal(end), end)
+        sealed = self.root / "finished" / KEY / f"{NOW_MS}-torn-end.jsonl"
+        self.assertEqual(sealed.read_bytes(), prefix + line)
+
     def test_whole_run_requires_coverage_at_start_between_phases_and_at_end(self) -> None:
         for identifier, compile_ms, test_ms, elapsed_ms in (
             ("late", 4001, 6000, 8000), ("gap", 2000, 6001, 8000), ("end", 2000, 6000, 10001),
@@ -280,6 +373,104 @@ class MemoryTraceTests(unittest.TestCase):
         self.assertFalse((self.root / "finished" / ("5" * 64)).exists())
         self.store.prune(NOW_MS + 3 * DAY_MS, set())
         self.assertFalse(list((self.root / "finished").glob("*/")))
+
+    def test_recovery_continues_after_one_file_cannot_publish(self) -> None:
+        blocked = self.store.start(self.header("blocked"))
+        healthy = self.store.start(self.header("healthy"))
+        def deny_one(destination: Path, content: bytes, *, mode: int) -> None:
+            if destination.name.endswith("-blocked.jsonl"):
+                raise PermissionError("cannot publish this trace")
+            write_bytes_atomic(destination, content, mode=mode)
+
+        with mock.patch.object(traces, "write_bytes_atomic", side_effect=deny_one):
+            self.store.recover_abandoned()
+        self.assertTrue(blocked.path.exists())
+        self.assertFalse(healthy.path.exists())
+        path, = (self.root / "finished" / KEY).glob("*-healthy.jsonl")
+        trace = traces.read_trace(path, POLICY)
+        assert isinstance(trace, traces.MemoryTrace) and isinstance(trace.state, traces.TraceEnd)
+        self.assertEqual(trace.state.coverage, traces.IncompleteRun(traces.IncompleteReason.RESTART))
+
+    def test_recovery_keeps_the_verified_end_when_the_suffix_is_partial(self) -> None:
+        end = self.finished("torn-after-end", ended_at_ms=NOW_MS)
+        sealed = self.root / "finished" / KEY / f"{NOW_MS}-torn-after-end.jsonl"
+        live = self.root / "live" / "torn-after-end.jsonl"
+        _ = live.write_bytes(sealed.read_bytes() + b'["')
+        sealed.unlink()
+
+        self.store.recover_abandoned()
+
+        trace = traces.read_trace(sealed, POLICY)
+        assert isinstance(trace, traces.MemoryTrace) and isinstance(trace.state, traces.TraceEnd)
+        self.assertFalse(live.exists())
+        self.assertEqual(trace.state, replace(end, exit_status=traces.ExitStatusUnavailable(),
+                                              coverage=traces.IncompleteRun(traces.IncompleteReason.RESTART)))
+
+    def test_partial_header_is_removed_before_the_next_start(self) -> None:
+        header = self.header("partial")
+        path = self.root / "live" / "partial.jsonl"
+
+        class ShortHeader(FileIO):
+            @override
+            def write(self, data: Buffer, /) -> int | None:
+                return super().write(memoryview(data)[:5])
+
+        def short_header(target: Path, mode: str = "r") -> FileIO:
+            self.assertEqual(target, path)
+            return ShortHeader(target, mode)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=short_header):
+            with self.assertRaises(OSError):
+                _ = self.store.start(header)
+        self.assertFalse(path.exists())
+        writer = self.store.start(header)
+        self.assertEqual(writer.path.read_bytes(), traces.encode_record(header))
+
+    def test_prune_continues_after_one_finished_file_cannot_be_deleted(self) -> None:
+        _ = self.finished("blocked", ended_at_ms=NOW_MS - 3 * DAY_MS)
+        _ = self.finished("healthy", ended_at_ms=NOW_MS - 4 * DAY_MS)
+        folder = self.root / "finished" / KEY
+        blocked, = folder.glob("*-blocked.jsonl")
+        healthy, = folder.glob("*-healthy.jsonl")
+        unlink = Path.unlink
+
+        def deny_one(path: Path, missing_ok: bool = False) -> None:
+            if path == blocked:
+                raise PermissionError("cannot delete this trace")
+            unlink(path, missing_ok=missing_ok)
+
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=deny_one):
+            self.store.prune(NOW_MS, set())
+        self.assertTrue(blocked.exists())
+        self.assertFalse(healthy.exists())
+
+    def test_prune_continues_after_denied_directory_and_live_file_reads(self) -> None:
+        _ = self.finished("hidden", key="4" * 64, ended_at_ms=NOW_MS - 3 * DAY_MS)
+        _ = self.finished("visible", ended_at_ms=NOW_MS - 3 * DAY_MS)
+        blocked = self.store.start(self.header("blocked"))
+        healthy = self.store.start(self.header("healthy"))
+        timestamp = (NOW_MS - 3 * DAY_MS) * 1_000_000
+        os.utime(healthy.path, ns=(timestamp, timestamp))
+        folder = self.root / "finished" / ("4" * 64)
+        iterdir, file_stat = Path.iterdir, Path.stat
+
+        def scan(path: Path) -> Iterator[Path]:
+            if path == folder:
+                raise PermissionError("cannot scan this shape")
+            return iterdir(path)
+
+        def stat_path(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path == blocked.path:
+                raise PermissionError("cannot read this trace's metadata")
+            return file_stat(path, follow_symlinks=follow_symlinks)
+
+        with (mock.patch.object(Path, "iterdir", autospec=True, side_effect=scan),
+              mock.patch.object(Path, "stat", autospec=True, side_effect=stat_path)):
+            self.store.prune(NOW_MS, set())
+        self.assertTrue(blocked.path.exists())
+        self.assertFalse(healthy.path.exists())
+        self.assertTrue(list(folder.glob("*-hidden.jsonl")))
+        self.assertFalse(list((self.root / "finished" / KEY).glob("*-visible.jsonl")))
 
     def test_chart_keeps_endpoints_peak_and_gaps_and_totals_use_all_samples(self) -> None:
         writer = self.store.start(self.header("gaps"))

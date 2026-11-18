@@ -11,7 +11,8 @@ import unittest
 from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import memory_feed, program_memory_feed, progress_profile as progress
+from scripts.disks import disks_page
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
@@ -35,6 +36,40 @@ RAM_FIXTURE: dict[str, object] = {
 }
 SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * GIB, "builds_ci_bytes": GIB,
                                    "outside_bytes": 2 * GIB, "reserve_share_percent": 50}
+
+
+def program_memory_fixture(*, started: bool, with_past: bool = True) -> program_memory_feed.ProgramMemoryView:
+    compile_phase: program_memory_feed.ProgramMemoryPhase = {
+        "state": "complete", "duration_ms": 8000, "segments": (((2000, GIB), (8000, 4 * GIB)),),
+        "peak": (8000, 4 * GIB), "reserve_bytes": 5 * GIB, "above_half_reserve_ms": 2000,
+    }
+    test_phase: program_memory_feed.ProgramMemoryPhase = {
+        "state": "sampling", "duration_ms": 6000, "segments": (((2000, GIB), (6000, 2 * GIB)),),
+        "peak": (6000, 2 * GIB), "reserve_bytes": 3 * GIB, "above_half_reserve_ms": 0,
+    }
+    past: program_memory_feed.ProgramMemoryRun = {
+        "compile": {**compile_phase, "duration_ms": 12000, "reserve_bytes": 6 * GIB,
+                    "segments": (((2000, GIB), (4000, 7 * GIB)), ((10000, 4 * GIB), (12000, GIB))),
+                    "peak": (4000, 7 * GIB), "above_half_reserve_ms": 4000},
+        "test": {**test_phase, "state": "complete", "duration_ms": 10000, "reserve_bytes": 4 * GIB},
+        "hana_crate_bands": ((8000, 12000),), "hana_compile_ms": 4000,
+    }
+    not_started: program_memory_feed.ProgramMemoryPhase = {
+        "state": "not_started", "duration_ms": 0, "segments": (), "peak": None,
+        "reserve_bytes": None, "above_half_reserve_ms": None,
+    }
+    return {
+        "live": {"compile": compile_phase if started else {**compile_phase, "state": "sampling"},
+                 "test": test_phase if started else not_started, "hana_crate_bands": (), "hana_compile_ms": 0},
+        "past": past if with_past else None, "compile_reserve": {"bytes": 5 * GIB, "source": "live"},
+        "test_reserve": ({"bytes": 3 * GIB, "source": "live"} if started else
+                         {"bytes": 4 * GIB, "source": "past"} if with_past else None),
+    }
+
+
+def program_memory_row(memory: program_memory_feed.ProgramMemoryView) -> dict[str, object]:
+    return {"key": "hana", "name": "Hana · nextest", "used": 4, "reserved": 1, "queued": True,
+            "started_at": 390, "slot_folder": "hana-slot1", "slot_machine": "natedev", "program_memory": memory}
 
 
 class MemoryHoverTests(unittest.TestCase):
@@ -266,6 +301,117 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(amounts["Uses"], "4.7 GiB")
         self.assertEqual(amounts["+ Build reserved"], "0.5 GiB")
         self.assertEqual(amounts["= In queue cap"], "5.2 GiB")
+
+    def test_program_memory_draws_both_phases_with_separate_reserves_and_axes(self) -> None:
+        row = program_memory_row(program_memory_fixture(started=True))
+        html = self.page_expression("buildsTooltipHtml('row:hana', data)", {"read_at": 400, "walk": [row]}, walk=True)
+        tip = ElementTree.fromstring(str(html))
+        memory = tip.find("./dd[@class='program-memory group']")
+        assert memory is not None
+        self.assertEqual(["".join(item.itertext()) for item in memory.findall("./div[@class='program-key']/span")],
+                         ["This run (live)", "Past run"])
+        compile_phase, test_phase = memory.findall("section")
+        self.assertEqual(compile_phase.findtext("div/h2"), "Compile")
+        self.assertEqual(test_phase.findtext("div/h2"), "Test")
+        self.assertIn("The chart scales 8 s of this run to the 12 s past-run axis.", compile_phase.findtext("p", ""))
+        self.assertEqual(test_phase.findtext("./div[@class='program-times']/span[3]"), "10 s")
+        self.assertEqual(len(compile_phase.findall("./svg/polyline[@class='program-past-line']")), 2)
+        self.assertEqual(len(compile_phase.findall("./svg/rect[@class='program-crate']")), 1)
+        self.assertIn("hana crate", list(compile_phase.itertext()))
+        self.assertIn("7.0 GiB peak", list(compile_phase.itertext()))
+        self.assertIn("5.0 GiB reserved", list(compile_phase.itertext()))
+        self.assertIn("3.0 GiB reserved", list(test_phase.itertext()))
+        self.assertEqual([chart.get("x1") for chart in memory.findall(".//line[@class='program-marker']")],
+                         ["238", "144.4"])
+        self.assertEqual([dd.text for dd in test_phase.findall("dl/dd")], ["2.0 GiB", "2.0 GiB", "0 s"])
+
+    def test_program_memory_test_before_start_uses_the_past_reserve(self) -> None:
+        row = program_memory_row(program_memory_fixture(started=False))
+        html = self.page_expression("buildsTooltipHtml('row:hana', data)", {"walk": [row]}, walk=True)
+        test_phase = ElementTree.fromstring(str(html)).findall(".//section[@class='program-phase']")[1]
+        self.assertIn("Not started", list(test_phase.itertext()))
+        self.assertIn("4.0 GiB reserved", list(test_phase.itertext()))
+        self.assertEqual(test_phase.findtext("p"), "The line shows the past reserve.")
+        self.assertIsNone(test_phase.find("./svg/polyline[@class='program-live-line']"))
+
+    def test_program_memory_shows_live_compile_without_a_past_run(self) -> None:
+        row = program_memory_row(program_memory_fixture(started=False, with_past=False))
+        html = self.page_expression("buildsTooltipHtml('row:hana', data)", {"walk": [row]}, walk=True)
+        tip = ElementTree.fromstring(str(html))
+        compile_phase, test_phase = tip.findall(".//section[@class='program-phase']")
+        self.assertIn("No past run yet", list(tip.itertext()))
+        self.assertEqual(compile_phase.findtext("./div[@class='program-times']/span[3]"), "8 s")
+        self.assertIsNotNone(compile_phase.find("./svg/polyline[@class='program-live-line']"))
+        self.assertIsNone(compile_phase.find("./svg/polyline[@class='program-past-line']"))
+        self.assertIsNone(test_phase.find("./svg/line[@class='program-reserve']"))
+
+    def test_open_program_memory_tooltip_updates_with_the_next_reading(self) -> None:
+        before = program_memory_row(program_memory_fixture(started=False))
+        after = program_memory_row(program_memory_fixture(started=True))
+        source = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        restore = source[source.index("function restoreReportView("):source.index("function render(d)")]
+        expression = """(() => {
+          globalThis.latest = data;
+          globalThis.window = {innerWidth: 1600, innerHeight: 720, addEventListener() {}};
+          globalThis.document = {addEventListener() {}, querySelector: () => null};
+          const tip = {
+            classList: {add() {}, remove() {}, toggle() {}}, style: {}, offsetWidth: 368,
+            get offsetHeight() { return this.innerHTML.includes('Not started') ? 180 : 614; },
+          };
+          const bounds = () => {
+            const top = parseFloat(tip.style.top);
+            return [top, top + tip.offsetHeight];
+          };
+          const tips = hoverTips(tip, currentBuildsTooltip);
+          const hideTip = tips.hide;
+          tips.show('row:hana', 600, 350);
+          const before = tip.innerHTML;
+          const initialBounds = bounds();
+          latest = { ...data, walk: [data.next] };
+        """ + restore + """
+          restoreReportView({details: []});
+          const refreshed = tip.innerHTML;
+          const refreshedBounds = bounds();
+          const key = tips.key();
+          hideTip();
+          tips.show('row:hana', 600, 350);
+          return [before, refreshed, key, [initialBounds, refreshedBounds, bounds()]];
+        })()"""
+        opened, refreshed, key, positions = cast(tuple[str, str, str, list[tuple[int, int]]], self.page_expression(
+            expression, {"read_at": 400, "walk": [before], "next": after}, walk=True))
+        self.assertIn("Not started", opened)
+        self.assertNotIn("Not started", refreshed)
+        test_phase = ElementTree.fromstring(refreshed).findall(".//section[@class='program-phase']")[1]
+        self.assertIsNotNone(test_phase.find("./svg/polyline[@class='program-live-line']"))
+        self.assertEqual(key, "row:hana")
+        for stage, (top, bottom) in zip(("initial", "refreshed", "reopened"), positions, strict=True):
+            with self.subTest(stage=stage):
+                self.assertGreaterEqual(top, 8)
+                self.assertLessEqual(bottom, 712)
+
+    def test_disks_slot_tooltip_keeps_the_shared_fields_without_program_memory(self) -> None:
+        row = program_memory_row(program_memory_fixture(started=True))
+        builds_source = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        disks_source = Path(disks_page.__file__).with_name(disks_page.PAGE_NAME).read_text()
+        shared = disks_page.shared_step_tip(builds_source)
+        slot_tooltip = disks_source[disks_source.index("function slotStep("):disks_source.index("function slotsAbout(")]
+        expression = """(() => {
+          const builds = data;
+          const settings = {builds_max_age_seconds: 30};
+          const slotReport = {machine:'natedev', groups:[{slots:[{name:'hana-slot1', used_by:{}}]}]};
+          Date.now = () => data.read_at * 1000;
+          const stepTip = (() => {
+        """ + shared.script + """
+            return {tooltipHtml};
+          })();
+        """ + slot_tooltip + """
+          return [tipFor('slot:hana-slot1'), tooltipHtml('row:hana', data)];
+        })()"""
+        disks, shared_builds = cast(list[str], self.page_expression(expression, {"read_at": 400, "walk": [row]}, walk=True))
+        self.assertEqual(disks, shared_builds)
+        self.assertIn("<dt>Runs on</dt><dd>natedev</dd>", disks)
+        self.assertNotIn("program-memory", disks)
+        self.assertNotIn(".program-memory", shared.style)
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)

@@ -29,6 +29,7 @@ from scripts.buildlog import charts, cost_actions, costs
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue import memory_trace
+from scripts.build_queue.test_program_memory_feed import TRACE_POLICY
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
@@ -223,8 +224,7 @@ class MemoryFeedTests(unittest.TestCase):
     def test_program_memory_main_publishes_a_single_reservation(self) -> None:
         now = 10 * 86_400
         started = now - 8
-        policy = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 8, 65_536)
-        store = memory_trace.TraceStore(self.root / "buildlog" / "admission" / "memory_traces", policy)
+        store = memory_trace.TraceStore(self.root / "buildlog" / "admission" / "memory_traces", TRACE_POLICY)
         writer = store.start(memory_trace.TraceHeader("live-trace", "a" * 64, (now - 6) * 1000, 2000, 10))
         _ = writer.append(memory_trace.CompileSample(2000, 7, memory_trace.CargoProgress(1, 2), "hana"))
         reservation: admission_records.Reservation = {
@@ -238,7 +238,7 @@ class MemoryFeedTests(unittest.TestCase):
             admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB),
             admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), now)
         queue = gate.queue_read_from(inputs, admission_policy_fixture())
-        with (mock.patch.object(memory_trace, "read_policy", return_value=policy),
+        with (mock.patch.object(memory_trace, "read_policy", return_value=TRACE_POLICY),
               mock.patch.object(admission_client, "view", return_value=queue)):
             self.assertEqual(memory_feed.main(["--once"]), 0)
         page = cast(memory_feed.MemoryPage, json.loads((self.output / "memory.json").read_text()))
