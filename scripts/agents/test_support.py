@@ -7,7 +7,6 @@ import io
 import os
 import tempfile
 import shlex
-import shutil
 import socket
 import sys
 import unittest
@@ -27,12 +26,15 @@ from scripts.agents import shutdown
 from scripts.message import sessions
 from scripts.agents.unit_staff_test_support import isolated_parents
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 def write_machine_config(directory: Path) -> None:
-    """Copy the repository machine table into a private configuration folder."""
+    """Set the private workstation routes used by the tests."""
     directory.mkdir(parents=True, exist_ok=True)
-    _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/machines.conf", directory / "machines.conf")
+    _ = write_config_fixture(directory / "machines.conf",
+        "aliases=natedev mac\nnatedev.platform=linux\n"
+        + "mac.platform=darwin\nmac.hosts=Nates-MacBook-Pro-2023\n")
 
 
 class ShutdownSendLeaf(StrEnum):

@@ -135,10 +135,37 @@ def expected_systems(settings: RebuildSettings, previous: ExpectedSystems | NoEx
     return NoExpectedSystems()
 
 
-def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
-        run: Callable[[list[str]], str] = command_output) -> str:
-    """Compare running systems with the last evaluated system paths."""
+@dataclass(frozen=True)
+class RunningSystemProbes:
+    """Record which machines supplied a valid running system path."""
+
+    natedev: bool = False
+    mac: bool = False
+
+    def succeeded(self, machine: str) -> bool:
+        return {"natedev": self.natedev, "mac": self.mac}.get(machine, False)
+
+    @classmethod
+    def decode(cls, value: object) -> RunningSystemProbes:
+        if not isinstance(value, dict):
+            return cls()
+        fields = cast(dict[str, object], value)
+        return cls(fields.get("natedev") is True, fields.get("mac") is True)
+
+
+@dataclass(frozen=True)
+class RebuildComparison:
+    """Keep the existing status text and the availability of each running system."""
+
+    row: str
+    probes: RunningSystemProbes
+
+
+def compare(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
+            run: Callable[[list[str]], str] = command_output) -> RebuildComparison:
+    """Compare running systems and retain failed probes as unavailable."""
     items: list[str] = []
+    probes: dict[str, bool] = {}
     for machine, path, command in (
         ("natedev", expected.natedev if isinstance(expected, ExpectedSystems) else "",
          ["realpath", "/run/current-system"]),
@@ -146,9 +173,16 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
          ["ssh", "-o", "BatchMode=yes", settings.ssh, "realpath /run/current-system"]),
     ):
         running = run(command)
+        probes[machine] = system_path(running)
         if system_path(path) and system_path(running) and running != path:
             items.append(f"rebuild {machine}")
-    return ", ".join(items)
+    return RebuildComparison(", ".join(items), RunningSystemProbes(probes["natedev"], probes["mac"]))
+
+
+def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems,
+        run: Callable[[list[str]], str] = command_output) -> str:
+    """Return the existing status text for the current system comparison."""
+    return compare(settings, expected, run).row
 
 
 @dataclass(frozen=True)
@@ -157,6 +191,7 @@ class RebuildAnswer:
 
     `compared` holds the machines whose running system differs from main;
     `needs` holds the open rebuild needs that `read` joined into `machines`.
+    `probes` records whether each machine supplied a running system path.
     """
 
     machines: tuple[str, ...]
@@ -165,6 +200,7 @@ class RebuildAnswer:
     failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
     compared: tuple[str, ...] = ()
     needs: tuple[need.MachineNeeds, ...] = ()
+    probes: RunningSystemProbes = RunningSystemProbes()
 
     def row(self) -> str:
         return ", ".join(f"rebuild {machine}" for machine in self.machines)
@@ -331,9 +367,14 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
             return RebuildAnswer((), True)
         expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
         failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
+        probes = RunningSystemProbes()
         if len(lines) >= 4:
             try:
-                details = cast(dict[str, object], json.loads(lines[3]))
+                value = cast(object, json.loads(lines[3]))
+                if not isinstance(value, dict):
+                    raise ValueError("The comparison details must be an object.")
+                details = cast(dict[str, object], value)
+                probes = RunningSystemProbes.decode(details.get("running_system_probes"))
                 commit, source = details["commit"], details["source"]
                 if (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
                         and isinstance(source, list) and all(isinstance(value, str) for value in cast(list[object], source))):
@@ -347,7 +388,7 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
             except (ValueError, KeyError, TypeError):
                 pass
         compared = tuple(item.removeprefix("rebuild ") for item in items)
-        return RebuildAnswer(compared, refresh_due, expected, failure, compared)
+        return RebuildAnswer(compared, refresh_due, expected, failure, compared, probes=probes)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 
@@ -371,6 +412,7 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             return
         began = time.time_ns()
         line, due, details = "", "", ""
+        probes = answer.probes
         if isinstance(answer.failure, EvaluationFailure):
             line, details = answer.row(), answer.failure.details()
         try:
@@ -384,7 +426,8 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             elif re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
                 expected = expected_systems(settings, answer.expected, run, commit)
                 evaluated_at = clock()
-                line = row(settings, expected, run)
+                comparison = compare(settings, expected, run)
+                line, probes = comparison.row, comparison.probes
                 if isinstance(expected, ExpectedSystems) and system_path(expected.natedev) and system_path(expected.mac):
                     details = expected.details()
                 else:
@@ -392,6 +435,10 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             due = str(int(clock()) + settings.interval)
         except (OSError, ValueError, KeyError):
             pass
+        if details:
+            fields = cast(dict[str, object], json.loads(details))
+            fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
+            details = json.dumps(fields)
         counts_row.write_cache(cache, line, due, [config], began, details)
 
 

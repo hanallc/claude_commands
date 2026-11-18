@@ -117,10 +117,15 @@ class TmpSweepCase(unittest.TestCase):
             folder.mkdir(parents=True)
         registry = base / "sessions"
         registry.mkdir()
+        environment = copies_environment(base)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
+            "patterns.legacy-stable={purpose}\nprefixes.verify-copy=verify-copy.{owner}.\n"
+            + "prefixes.verify-hold=verify-hold.{owner}.\nnames.suffix_length=8\n"
+            + "patterns.legacy-unique={purpose}{suffix}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
             "BUILDLOG_DIR": str(base / "buildlog"),
-            **copies_environment(base),
+            **environment,
         })))
         self.addCleanup(self.pane_world.process_directory.cleanup)
         pane_patches = [
@@ -935,19 +940,15 @@ class TempFolderTests(TmpSweepCase):
     def test_verify_prefix_changes_after_import(self) -> None:
         config = self.tmp / "config"
         config.mkdir()
-        source = Path(build_folders.__file__).resolve().parents[2] / "config/build_folders.conf"
-        settings = source.read_text()
         name = "changed-hold.123.abcdefgh"
         folder = self.tmp / name
         _ = write(folder / "content")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), os.scandir(self.tmp) as entries:
             entry = next(entry for entry in entries if entry.name == name)
-            _ = write(config / "build_folders.conf", settings)
+            _ = write_config_fixture(config / "build_folders.conf", "prefixes.verify-hold=verify-hold.{owner}.\n")
             roots = self.roots()
             self.assertFalse(roots.judged_temp(str(self.tmp), entry))
-            _ = write(config / "build_folders.conf", settings.replace(
-                "prefixes.verify-hold=verify-hold.{owner}.",
-                "prefixes.verify-hold=changed-hold.{owner}."))
+            _ = write_config_fixture(config / "build_folders.conf", "prefixes.verify-hold=changed-hold.{owner}.\n")
             self.assertFalse(roots.judged_temp(str(self.tmp), entry))
             self.assertTrue(self.roots().judged_temp(str(self.tmp), entry))
 

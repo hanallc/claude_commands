@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 from scripts.agents import remote
 from scripts.herdr import herdr_types
 
@@ -107,8 +110,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
         case.setUp()
         world = ProducerAdmissionWorld(case, kind)
         staff_configuration = case.root / "configuration/staff.conf"
-        atomic_file.write_text_atomic(staff_configuration, staff_configuration.read_text().replace(
-            "PRODUCER_FOLDER_ROOT=~/rust/hanadocs", "PRODUCER_FOLDER_ROOT=" + str(world.folder.parent)))
+        _ = write_config_fixture(staff_configuration, f"PRODUCER_FOLDER_ROOT={world.folder.parent}\n")
         configuration = case.root / "configuration/models.conf"
         _ = write_registry(configuration, {"producers": {"dwight": kind + (":opus:high" if kind == "claude" else ":gpt-test:high")}}, update=True)
         result = case.client.result
@@ -2184,7 +2186,10 @@ class StopResumeTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = self.root / "configuration"
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            atomic_file.write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
+        write_machine_config(configuration)
+        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\nSTOP_GRACE_SECONDS=2\n")
         _ = write_registry(configuration / "models.conf", {"producers": {
             "alpha": "claude:opus:max", "renamed-alpha": "claude:opus:max",
             "TEST-account-home": "claude:opus:max", "row-name": "claude:opus:max",
@@ -4511,6 +4516,10 @@ class BuildWaitTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "VERIFY_STEPS_DIR": str(self.root / "records"), "VERIFY_PROC_ROOT": str(self.root / "proc"),

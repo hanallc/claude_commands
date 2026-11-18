@@ -3029,6 +3029,14 @@ subprocess.run = expire_gh
 
 
 class MacActivityScriptTests(NotificationGuardedTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = config_environment(folder)
+        _ = write_config_fixture(folder / "build_targets.conf", "platform.mac=macos\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+
     def test_app_is_active_without_work_but_deps_and_compilers_are_work(self) -> None:
         for executable, work in (("/mirror/target/debug/hana", 0),
                                  ("/mirror/target/debug/deps/hana-abc", 1),
@@ -3060,6 +3068,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.paths = mac_test.StatePaths(self.root / "state")
         self.paths.directory.mkdir()
         config = self.root / "mac_test.conf"
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
         _ = write_config_fixture(config, "host=config-mac\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "MAC_TEST_STATE_DIR": str(self.paths.directory),
@@ -3083,7 +3092,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
     def test_complete_idle_config_is_read_once_by_mac_test(self) -> None:
         selected = Path(os.environ["MAC_TEST_CONFIG"])
-        _ = selected.write_text((SCRIPT.parents[1].parent / "config/mac_test.conf").read_text())
+        _ = write_config_fixture(selected)
         with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as opened:
             _ = mac_test.read_config()
         self.assertEqual([call.args[0] for call in opened.call_args_list], [selected])

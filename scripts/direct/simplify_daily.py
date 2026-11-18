@@ -83,6 +83,7 @@ def review(run: Path, cwd: Path, settings: conf.ConfigRead) -> int:
             'The user said: "the scope of the simplify needs to be for everything that has changed '
             'since the last simplify run on codebase that the unit is working on".\n'
         ))
+        # The read-only review command has no queue step.
         with copies.standing(copies.source_owner(cwd), cwd, copies.CommittedSource(tip)) as clone:
             simplify_result.prepare(directory / "diff", directory / "source_prompt.md", prompt, report_path, settings)
             session = str(uuid4())
