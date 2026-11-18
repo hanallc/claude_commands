@@ -2795,6 +2795,8 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 3. A rollback to an old service refuses the test request with `owner already has a reservation`. If the shell's release of the build grant also fails, that grant stays until the owner exits (44bf F008).
 A refused or failed release gives a nonzero exit, and the caller cancels the reservation or ends the owner. After 44bk and 44bf merge.
 
+**Also in this phase, from builds, 2026-11-17 19:4x (go, no separate hash):** the admission service writes one journal line at each start and at each source replacement. The replacement line names the changed file. Under `build-admission.socket` a replacement is an in-place `os.execv`: the pid and start time stay the same, and systemd writes no line. Before this, the journal could not show whether the source watch fired.
+
 ### Phase 44bm — A local gate after a cloud fallback shows the gate route  · status: todo
 **From the gaterename gate, 2026-11-17 14:47:** the cloud box failed on its mode value, and natedev ran the gate locally. The local ask has no route field, so the Builds page shows the default label "a direct cargo command runs where it starts". The fallback ask names the local gate route. After natest 314 (the gate folder move) is on main.
 
