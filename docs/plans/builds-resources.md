@@ -2813,20 +2813,25 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 151 — A paired AWS trial takes all its cloud slots at once  · status: done
 
-Builds 11-18 09:04: the paired workers of trial 0bcb636d held 5 AWS cloud slots for 4 min with no box launched, while the other 2 modules of the trial waited for slots. The rows showed "progress missing".
+#### As-built
 
-1. A paired trial waits in the Queued table until all its slots are free; the admission service then admits all its members in one pass.
-2. No row shows as running before its box request starts; a reserved slot shows in Queued as "waits for launch" until the first `run-instances` call.
-3. A blocked group at the head holds its place; a group larger than the slot limit refuses at once; a dead member does not hang the group.
-4. Measure how long paired workers held slots before launch.
+- Cause (builds 11-18 09:04): each paired trial member took one cloud slot and then waited at a launch barrier. Trial 0bcb636d held 5 slots for 4 min with no box launched. Measured over 110 trials (11-13 to 11-18): 811 idle slot-minutes; 11 other gate requests waited 36.9 min in total while a trial held idle slots.
+- `CloudPlace` carries an optional `CloudGroup` (key, size, trial start, coordinator owner). Old requests decode as single, and the wire bytes for a single request are unchanged.
+- The admission service admits a group in one pass when all its slots are free. It saves every grant before any reply. Queue order uses the trial start time, so a reconnect or a service restart keeps the group's place. A group larger than `cloud_gate_slots` refuses at once. When the coordinator ends, the service refuses the whole group.
+- A reserved cloud slot is a distinct state. It counts as used, and Builds shows it in Queued as "waits for launch". The service records the first launch it sees, so a failed progress read never moves a row back. Running starts at the first `run-instances` call, for paired trials and single gates.
+- The coordinator holds the `paired-trial-slots` lock only for the cost reservation. It watches every worker pipe until launch. A worker that ends before launch, or a failed `launch` send, sends `abort` to every worker that has not launched, and the trial fails.
+- Blind review: 7 findings, all fixed in 3 rounds.
+- Checkpoint `770c0d704`; row `49dc19798` on main `78de4e3ec`.
 
 **Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/queue_view.py`, and their tests.
 
 ### Phase 152 — A date-boundary AWS test passes in any environment  · status: done
 
-Builds 11-18 11:5x: `scripts/aws_target` `test_measurement.MeasurementTests.test_wait_estimate_uses_the_report_local_day_instead_of_the_accounting_day` fails with `0 != 1` on unmodified main e436afeac and later. Its result changes with the time of day.
+#### As-built
 
-1. Find the clock read that the test does not control.
-2. Give the test a fixed clock. No skip.
+- Cause: not the time of day. The test set `TZ=America/New_York`. With `TZDIR` unset (NixOS), `tzset()` did not resolve that name, so `report.day_range()` used UTC and left out the departure.
+- The test now uses the fixed `EST5` offset and a fixed `time.time` for `index.update()`. It passes with `TZDIR` set, unset or wrong, on both sides of New York midnight.
+- Open for an owner: `scripts/buildlog/report.py:1571` and `cli.py:253` use UTC without a warning when `TZDIR` is unset.
+- Checkpoint `1454f2907`; row `b13507879` on main `78de4e3ec`.
 
-**Files:** `scripts/aws_target/test_measurement.py`, and the code under test only if the clock read is a code defect.
+**Files:** `scripts/aws_target/test_measurement.py`.
