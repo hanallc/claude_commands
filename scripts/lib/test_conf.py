@@ -217,6 +217,16 @@ conf_reads.record('disabled')
             self.assertEqual(origin.value, Decimal("2.5"))
             self.assertEqual(conf.read("example").values(), {"label": "changed", "amount": "9"})
 
+    def test_values_combines_requested_keys_with_host_only_prefix(self) -> None:
+        self.write("label=base\nlabel.testhost=local\nmodel.active.testhost=blue\n"
+                   + "model.other.anotherhost=green\naccount.active.testhost=red\n")
+        with mock.patch("socket.gethostname", return_value="testhost.example"):
+            settings = conf.read("example")
+            self.assertEqual(settings.values("label", "missing"), {"label": "local"})
+            self.assertEqual(settings.values(host_only_prefix="model."), settings.values() | {"model.active": "blue"})
+            self.assertEqual(settings.values("label", "missing", host_only_prefix="model."),
+                             {"label": "local", "model.active": "blue"})
+
     def test_each_reader_returns_its_type_and_preserves_text_after_the_first_equals(self) -> None:
         self.write("# range: ..\nfraction=2.5\n# whole: ..\ncount=-2\nlabel= a=b c # note\nnames= alpha  beta\tempty\n")
         self.assertEqual(conf.read("example").number("fraction"), 2.5)
@@ -639,6 +649,27 @@ conf_reads.record('disabled')
             ):
                 _ = conf.editable_line("example", "count")
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_editable_line_refuses_overrides_for_keys_outside_model_colors(self) -> None:
+        for stem, key in (("example", "model.provider"), ("example", "model.gpt-6.2-sol"),
+                          ("statusline", "model.provider")):
+            with self.subTest(stem=stem, key=key):
+                source = self.directory / f"{stem}.conf"
+                _ = source.write_text(f"{key}=3\n{key}.remote=4\n", encoding="utf-8")
+                with mock.patch("socket.gethostname", return_value="remote"):
+                    self.assertEqual(conf.effective_line(stem, key), (1, "4"))
+                with mock.patch("socket.gethostname", return_value="local"):
+                    with self.assertRaisesRegex(conf.Unusable, "has host override"):
+                        _ = conf.editable_line(stem, key)
+
+    def test_editable_line_keeps_each_dotted_model_key_independent(self) -> None:
+        source = self.directory / "statusline.conf"
+        keys = ("model.gpt-6", "model.gpt-6.2-sol", "model.gpt-6.2-sol.preview")
+        for order in (keys, keys[::-1]):
+            with self.subTest(order=order):
+                _ = source.write_text("".join(f"{key}=#123456\n" for key in order), encoding="utf-8")
+                for line, key in enumerate(order):
+                    self.assertEqual(conf.editable_line("statusline", key), (line, "#123456"))
 
     def test_installed_script_refuses_conf_dir_override(self) -> None:
         from scripts.build_hold import override_guard

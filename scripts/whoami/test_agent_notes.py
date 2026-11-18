@@ -900,8 +900,8 @@ class AgentNotesTests(unittest.TestCase):
         self.rows.return_value = session_table.ReadSessions({"claude1": (row,)}, frozenset())
         _ = self.snapshot([])
         notes = {current.label: current for current in note_file.read_notes()}
-        self.assertEqual(notes["claude1"].get_list("role"), ("showrunner", "unit"))
-        self.assertIn("role:\n  - showrunner\n  - unit\n", note.path.read_text())
+        self.assertEqual(notes["claude1"].get_list("role"), ("showrunner", "unit", "producer"))
+        self.assertIn("role:\n  - showrunner\n  - unit\n  - producer\n", note.path.read_text())
         self.assertEqual(notes["codex2"].get_list("role"), ("worker",))
         self.assertIn("role: []", notes["claude2"].text)
         self.assertTrue(all(current.get("state") is None for current in notes.values()))

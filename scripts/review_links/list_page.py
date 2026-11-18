@@ -11,7 +11,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
@@ -92,6 +92,13 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
     return the_list.eta_text(eta)
 
 
+def parked_label(moment: datetime, zone: tzinfo) -> str:
+    local = moment.astimezone(zone)
+    if local.hour or local.minute:
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    return local.date().isoformat()
+
+
 def field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames) -> str:
     if field in ("owner", "producer"):
         owner = cast(the_list.ItemOwner, value)
@@ -103,7 +110,7 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
             return "Not parked"
         zone = today.tzinfo
         assert zone is not None
-        return the_list.parking_date(value, zone)
+        return parked_label(value, zone)
     if isinstance(value, datetime):
         return html.escape(local_time(value, today))
     if isinstance(value, the_list.CheckCondition):
@@ -120,7 +127,7 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
     return html.escape(cast(str, value)) or "Not recorded"
 
 
-def log_entry_html(change: the_list.ItemChange, today: datetime, names: staff_names.StaffNames) -> str:
+def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames) -> str:
     content = change.what
     by = " <small>— " + names.html(change.source, owner_name(names.members, staff.StaffId(change.source))) + "</small>"
     if isinstance(content, the_list.FieldChange):
@@ -146,7 +153,7 @@ def log_entry_html(change: the_list.ItemChange, today: datetime, names: staff_na
         body = html.escape(content) + by
     else:
         return ""
-    return ('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
+    return (f'<li data-log-index="{index}"><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
             + '</time><div>' + body + '</div></li>')
 
 
@@ -194,8 +201,9 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     return ('<form method="post" data-feedback-form>' + hidden + '<div class="list-actions">' + read
             + '<button name="action" value="remove">Remove</button>'
-            + f'<label for="park-{key}">Park until</label><input type="date" name="until" id="park-{key}">'
-            + '<button name="action" value="park">Park</button></div>'
+            + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
+            + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
+            + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
@@ -258,10 +266,14 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
     sections += ''.join(page_question.open_question_html(question) if question.answer is None
                         else page_question.answered_question_html(question) for question in item.questions)
-    log = ''.join(log_entry_html(change, today, names) for change in reversed(item.log)
-                  if not the_list.is_page_request_receipt(change))
+    # The log appends entries in storage order. Each index stays stable when new entries arrive.
+    log = ''.join(reversed([log_entry_html(change, index, today, names) for index, change in enumerate(item.log)
+                            if not the_list.is_page_request_receipt(change)]))
+    log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
-            + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>')
+            + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
+            + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
+            + '<ol class="list-log">' + log + '</ol></div></section></div>')
 
 
 def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str,
@@ -336,6 +348,7 @@ class ListQuestionDelivery:
 
 class SavedActionState(TypedDict):
     unread: str
+    unread_sort: float
     item_state: str
     parked: str
     parked_until: str
@@ -345,9 +358,12 @@ def saved_action_state(keeper: str, identity: str) -> SavedActionState:
     item = the_list.load(staff.StaffId(keeper), identity)
     zone = user_zone()
     today = the_list.now()
-    parked_until = (the_list.parking_date(item.parked_until, zone)
+    parked_until = (parked_label(item.parked_until, zone)
                     if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
-    return {"unread": str(isinstance(item.unread_since, datetime)).lower(), "item_state": item.state.value,
+    unread = item.unread_since
+    return {"unread": str(isinstance(unread, datetime)).lower(),
+            "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
+            "item_state": item.state.value,
             "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
 
 
@@ -393,10 +409,13 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words)
         changed = the_list.close(morty.id, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "park":
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) is None:
-            raise question_record.AnswerRefused("enter a parking date")
-        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {until}.", "park", words)
-        changed = the_list.park(morty.id, identity, the_list.time_value(until), source=the_list.PAGE_SOURCE, notice=notice)
+        if the_list.ISO_TIME.fullmatch(until) is None:
+            raise question_record.AnswerRefused("enter a parking date or a time with a UTC offset")
+        parked_until = the_list.time_value(until)
+        assert isinstance(parked_until, datetime)
+        label = parked_label(parked_until, user_zone())
+        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
+        changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(morty.id, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
@@ -529,7 +548,8 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
     items = records()
     reviews = ({review.key: review for review in review_items.read(root, members=members)}
                if any(entry.item.reviews for entry in items) else {})
-    today = datetime.fromtimestamp(read_at, user_zone())
+    zone = user_zone()
+    today = datetime.fromtimestamp(read_at, zone)
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
     owners = staff_chips({str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}, names)
     producers = staff_chips({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items}, names)
@@ -537,11 +557,21 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
     shows = [record_table.Chip(value, label) for value, label in SHOWS if value != 'all']
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
-    seconds = conf.read("review_links").number("page_refresh_seconds")
+    settings = conf.read("review_links")
+    seconds = settings.number("page_refresh_seconds")
+    morning = record_table.clock_minutes(settings, "later_morning")
+    log_max_height = settings.whole("list_log_max_height_rem")
     counts = counts_strip(members, names) if include_counts else ''
+    expansion = ''.join(f'<button type="button" id="list-{action}-all" data-list-expansion="{action}"'
+                        + f' aria-label="{label}" title="{label}">' + page_frame.icon_svg(icon) + '</button>'
+                        for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
+                                                    ("collapse", "Collapse all", "chevrons-down-up")))
     content = (STYLE + page_frame.title("The List", "list")
-               + f'<div data-list data-refresh-seconds="{seconds}"><div data-record-filters>'
+               + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
+               + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
+               + '<div data-record-filters><div class="list-toolbar">'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
+               + '<div class="list-expansion">' + expansion + '</div></div>'
                + record_table.chip_row('Show', shows, 'open')
                + record_table.chip_row('State', states, 'all')
                + record_table.chip_row('Owner', owners, 'all')
@@ -557,8 +587,16 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
-STYLE = record_table.STYLE + '''<style>
+STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
+.list-toolbar{display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-bottom:10px}
+.list-toolbar .record-filter-words{min-width:0;margin:0}
+.list-expansion{display:flex;gap:6px}
+.list-expansion button{justify-content:center;width:36px;padding:0;cursor:pointer}
+.list-expansion svg{width:18px;height:18px}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
+.list-actions{position:relative}.list-park>[data-later-menu]{left:0;right:auto}
+.list-table:has(.list-park>[data-later-menu]:not([hidden])),
+.list-table tbody:has(.list-park>[data-later-menu]:not([hidden])){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
@@ -578,18 +616,49 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 }
 </style>'''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
 let saving=0;
 const drafts=new Map();
+/** @type {Map<string, {index: string, offset: number}>} */
+const logPositions=new Map();
+function visibleLogs(){
+ return content.querySelectorAll('[data-list-item]:not([hidden]) [data-detail]:not([hidden]) .list-log-scroll');
+}
+function rememberLogPositions(){
+ for(const log of visibleLogs()){
+  if(!log.clientHeight) continue;
+  const key=log.closest('[data-list-item]').dataset.key;
+  if(!log.scrollTop){logPositions.delete(key);continue;}
+  const top=log.getBoundingClientRect().top;
+  for(const entry of log.querySelector('.list-log').children){
+   const bounds=entry.getBoundingClientRect();
+   if(bounds.bottom<=top) continue;
+   logPositions.set(key,{index:entry.dataset.logIndex,offset:bounds.top-top});
+   break;
+  }
+ }
+}
+function restoreLogPositions(){
+ if(!logPositions.size) return;
+ for(const log of visibleLogs()){
+  const position=logPositions.get(log.closest('[data-list-item]').dataset.key);
+  if(!position || !log.clientHeight) continue;
+  const entry=log.querySelector('[data-log-index="'+position.index+'"]');
+  if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-position.offset;
+ }
+}
 function matchesWords(data,search){
  if(!search) return true;
  const number=search.replace(/^#?l?(?=\d)/,'');
  return [data.number,data.ownerName,data.title,data.state,data.parked==='true' ? 'Parked' : '']
   .some(value=>(value || '').toLowerCase().includes(value===data.number ? number : search));
 }
-function syncUnread(item,form,unread){
+function syncUnread(item,form,unread,unreadSort){
  item.dataset.unread=String(unread);
+ const sortValues=JSON.parse(item.dataset.sortValues);
+ sortValues[7]=unread ? unreadSort : 0;
+ item.dataset.sortValues=JSON.stringify(sortValues);
  const update=item.querySelector('[data-label="Update"]'),dot=update.querySelector('.list-dot');
  const read=form.querySelector('[value="read"]');
  if(unread){
@@ -607,6 +676,8 @@ function syncUnread(item,form,unread){
 const tableView=createRecordTable({content:()=>content,
  shows:['open','needs-me','unread','done','parked','closed','all'],
  filters:['state','producer'],
+ beforeApply:rememberLogPositions,
+ applied:restoreLogPositions,
  missingItem:key=>{
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
   return number ? 'Item #'+number+' is not on the List' : '';
@@ -626,14 +697,21 @@ const tableView=createRecordTable({content:()=>content,
   items.filter(item=>item.dataset.state==='Waiting for nate' && item.dataset.parked!=='true').length+' need you · '+
   items.filter(item=>item.dataset.unread==='true').length+' unread',
 });
-const apply=(write=true)=>tableView.apply(write),place=()=>tableView.place();
-function bind(){
- tableView.replace();
+function bindListControls(){
+ content.querySelectorAll('[data-list-expansion]').forEach(button=>button.addEventListener('click',()=>{
+  tableView.setShownExpanded(button.dataset.listExpansion==='expand');
+ }));
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
   notice.textContent=tableView.actionNotice(item);
-  const confirmed={state:item.dataset.state,parked:item.dataset.parked};
+  const confirmed={state:item.dataset.state,parked:item.dataset.parked,
+   unread:item.dataset.unread==='true',unreadSort:JSON.parse(item.dataset.sortValues)[7]};
+  const syncConfirmed=()=>{
+   item.dataset.state=confirmed.state;
+   item.dataset.parked=confirmed.parked;
+   syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
+  };
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
   const syncTell=()=>{ask.disabled=tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
@@ -653,23 +731,39 @@ function bind(){
   const retain=()=>{retainDraft();syncTell();};
   retain();
   words.addEventListener('input',retain);until.addEventListener('input',retain);
+  const zone=content.dataset.zone;
+  const parkToggle=form.querySelector('[data-later-toggle]');
+  bindDateTimePicker(form,{zone,defaultMinutes:()=>Number(content.dataset.parkMorning),summaryPrefix:'Parks until ',
+   retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const action=event.submitter?.value || 'tell';
    const usesWords=action==='tell' || action==='question';
    if(usesWords && !words.value.trim()) return;
-   if(action==='park' && !until.value){form.querySelector('[data-send-status]').textContent='Choose a parking date.';return;}
    const retry=matching(action);
-   const attempt=retry ?? {...fresh,action,words:words.value,until:until.value};
+   let parkingTime=retry?.parkingTime ?? until.value;
+   if(action==='park'){
+    if(!retry && !/^\d{4}-\d{2}-\d{2}$/.test(parkingTime)){
+     const at=dateTimeDraftEpoch(zone,parkingTime);
+     if(!(at>Date.now())){notice.textContent='Choose a future parking time.';return;}
+     parkingTime=new Date(at).toISOString();
+    }
+    closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+   }
+   const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',action);
+   if(action==='park') data.set('until',parkingTime);
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
    retainDraft();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    let buttons=[...item.querySelectorAll('button')],saved=false,refused=false;
    buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
-   if(action==='remove') item.dataset.state='Closed';
+   if(action==='remove'){
+    item.dataset.state='Closed';
+    syncUnread(item,form,false,0);
+   }
    if(action==='park') item.dataset.parked='true';
    if(clearsUnread) item.dataset.unread='false';
    const submission=tableView.startAction(item);
@@ -680,19 +774,21 @@ function bind(){
     const result=await response.json();
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
-    const unread=result.unread==='true';
+    if(typeof result.item_state==='string') confirmed.state=result.item_state;
+    const closed=confirmed.state==='Closed',unread=!closed && result.unread==='true';
     notice.textContent=action==='remove' ? 'Removed' : action==='park' ? 'Parked' : action==='read' ? 'Marked read' :
      action==='question' ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     if(usesWords && words.value===data.get('words')) words.value='';
-    if(typeof result.item_state==='string') confirmed.state=result.item_state;
     if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
-    Object.assign(item.dataset,confirmed);
+    if(closed || ['true','false'].includes(result.unread)){
+     confirmed.unread=unread;
+     confirmed.unreadSort=unread ? (result.unread_sort ?? confirmed.unreadSort) : 0;
+    }
+    syncConfirmed();
     const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
     state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
     const sortValues=JSON.parse(item.dataset.sortValues);sortValues[3]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
-    if(['true','false'].includes(result.unread)) syncUnread(item,form,unread);
-    else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(typeof result.parked_until==='string'){
      let note=item.querySelector('[data-parked-note]');
      if(result.parked_until){
@@ -702,34 +798,47 @@ function bind(){
     }
     tableView.applyAction();
    }catch(error){
-    if(clearsUnread) item.dataset.unread=unreadBefore;
-    if(refused) Object.assign(item.dataset,confirmed);
+    const wasHidden=item.hidden;
+    if(refused) syncConfirmed();
+    else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(refused || hidUnread) tableView.opened.add(key);
     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
     tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
+    // The return animation now has the confirmed sort keys.
+    if(refused && wasHidden && !item.hidden) tableView.applyAction();
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
     buttons=[...item.querySelectorAll('button')];
     delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);syncTell();
     retainDraft();
+    if(refused && action==='park'){
+     await tableView.settled();
+     if(document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
+      parkToggle.focus({preventScroll:true});
+     }
+    }
     if(saved) void pageRefresh.refresh(true);
    }
   });
  });
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving) return;
+ if(saving || dateTimePickerOpen(content)) return;
  const response=await fetch(location.pathname,{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
- if(saving || !current()) return;
+ if(saving || dateTimePickerOpen(content) || !current()) return;
  const top=scrollY,focus=document.activeElement?.id;
  const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;
- content.replaceWith(fresh);content=fresh;bind();apply(false);
+ rememberLogPositions();
+ const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
+ for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
+ content.replaceWith(fresh);content=fresh;
+ bindListControls();tableView.replace();
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
@@ -812,16 +921,16 @@ function restoreListRows(record){
 function restoreListScroll(top){
  requestAnimationFrame(()=>requestAnimationFrame(()=>scrollTo({top,behavior:'instant'})));
 }
-place();
+tableView.place();
 const listReturn=parent.performance.getEntriesByType('navigation')[0]?.type==='back_forward' ? listReturnForEntry() : undefined;
 if(listReturn) restoreListRows(listReturn);
-bind();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
+tableView.bind();bindListControls();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
 if(listReturn) restoreListScroll(listReturn.top);
 addEventListener('pageshow',event=>{
  if(!event.persisted) return;
  const record=listReturnForEntry();
  if(!record) return;
- place();restoreListRows(record);
+ tableView.place();restoreListRows(record);
  tableView.apply(true,{top:record.top,dismissMissingItem:true});
  restoreListScroll(record.top);
 });

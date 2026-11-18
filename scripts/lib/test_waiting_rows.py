@@ -1,6 +1,7 @@
 """A checkout moves to a new main and keeps each live setting row that main does not have yet."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,11 +10,12 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import conf, waiting_rows
+from scripts.lib import conf, live_settings, waiting_rows
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SETTINGS = "# whole: 1..\namount=2\n# whole: 1..\nlimit=5\n"
 REGISTRY = "[assignments]\ndirect=codex\nreview=gpt-a:high\n"
+STATUSLINE = "account.claude1=brown\n"
 
 
 class WaitingRowsTests(unittest.TestCase):
@@ -25,7 +27,8 @@ class WaitingRowsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="waiting-rows-")))
         environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-        environment.update(HOME=str(self.root), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+        environment.update(HOME=str(self.root), XDG_STATE_HOME=str(self.root / "state"),
+                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                            GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Rows Test", GIT_AUTHOR_EMAIL="rows@example.invalid",
                            GIT_COMMITTER_NAME="Rows Test", GIT_COMMITTER_EMAIL="rows@example.invalid")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
@@ -36,6 +39,7 @@ class WaitingRowsTests(unittest.TestCase):
         (self.checkout / "config").mkdir()
         _ = (self.checkout / "config/example.conf").write_text(SETTINGS)
         _ = (self.checkout / "config/models.conf").write_text(REGISTRY)
+        _ = (self.checkout / "config/statusline.conf").write_text(STATUSLINE)
         self.run_git(self.checkout, "add", ".")
         self.run_git(self.checkout, "commit", "-qm", "start")
         self.run_git(self.checkout, "push", "-q", "origin", "HEAD:main")
@@ -88,6 +92,39 @@ class WaitingRowsTests(unittest.TestCase):
                          SETTINGS.replace("amount=2", "amount=3").replace("limit=5", "limit=7"))
         self.assertEqual(self.output("diff", "--cached", "--name-only", "HEAD"), "")
         self.assertEqual(self.output("diff", "--name-only", "HEAD"), "config/example.conf\n")
+
+    def test_new_model_colors_stay_live_through_a_main_change_to_statusline(self) -> None:
+        catalog = self.root / ".claude/cache/model-catalog/fixture-cc.json"
+        catalog.parent.mkdir(parents=True)
+        _ = catalog.write_text(json.dumps({"catalog": {"config": {"models": [{"id": "claude-opus-5-5"}]}}}))
+        path = "config/statusline.conf"
+        published = "model.gpt-6.2-sol=#123456\n"
+        pending = "model.claude-opus-5-5=#abcdef\n"
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(self.checkout / "config")}):
+            self.assertEqual(live_settings.main(["statusline", "model.claude-opus-5-5", "#abcdef"]), 0)
+        self.edit(path, STATUSLINE + pending, STATUSLINE + pending + published)
+        catalog.unlink()
+        target = self.peer_change(path, STATUSLINE, "account.claude1=yellow\n" + published)
+        waiting_rows.move_to(self.checkout, "origin/main")
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
+        self.assertEqual((self.checkout / path).read_text(), "account.claude1=yellow\n" + published + pending)
+        self.assertEqual(self.output("diff", "--cached", "--name-only", "HEAD"), "")
+
+    def test_other_new_keys_refuse_the_move_and_change_nothing(self) -> None:
+        path = "config/statusline.conf"
+        _ = self.peer_change(path, STATUSLINE, "account.claude1=yellow\n")
+        head, index = self.output("rev-parse", "HEAD"), (self.checkout / ".git/index").read_bytes()
+        for added in ("account.claude2=#abcdef\n", "model.=#abcdef\n", "model.gpt-6.2-sol=blue\n",
+                      "model.gpt-6.2-sol=#abcdef\n",
+                      "model.sol=#abcdef\n", "model.unknown=#abcdef\n", "model.claude-fixture-1=#abcdef\n"):
+            with self.subTest(added=added):
+                text = STATUSLINE + added
+                _ = (self.checkout / path).write_text(text)
+                with self.assertRaisesRegex(OSError, "local edits other than setting values"):
+                    waiting_rows.move_to(self.checkout, "origin/main")
+                self.assertEqual(self.output("rev-parse", "HEAD"), head)
+                self.assertEqual((self.checkout / ".git/index").read_bytes(), index)
+                self.assertEqual((self.checkout / path).read_text(), text)
 
     def test_a_waiting_registry_row_stays_live_through_a_main_change_to_the_registry(self) -> None:
         self.edit("config/models.conf", "direct=codex", "direct=claude")
