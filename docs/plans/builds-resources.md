@@ -2630,3 +2630,88 @@ The cutover removal commit deletes the script after the run.
 - `test_admission_service.ServiceTests.test_caller_admission_serves_without_a_home_override` covers it.
 
 **Files:** `scripts/build_queue/admission_test_support.py`, `scripts/build_queue/test_admission_service.py`.
+
+### Phase 136 — Every worker that a hold stops gets the release notice  · status: todo
+**Source:** builds showrunner 2026-11-16 15:5x. The cables hold (11:36-11:43 EST, cycle `b4237a138a894d32b7ca989c90bb0839`) stopped an aws Codex worker's run. The worker ended its turn to wait for the release notice and sat idle until 15:50. The cycle's 24 recipients include the aws director `be0d886f` (Delivered) and no aws worker thread (`01a1…`).
+**Depends on:** Phase 8 (installed writers), Phase 129 (the stop ends the command group; the supervisor delivers the stopped result).
+
+#### Work Order
+
+**Goal:** a hold stop registers the agent that ran the stopped command, and the release notice reaches it, Codex thread or Claude session.
+
+**Cause:**
+- `audit_owner()` (`scripts/build_hold/build_hold.py:539`) asks `owning_session.owning_session()` first. A worker's command carries the run's `UNIT_SESSION_DIR`, so the owner is the unit director. Both stop paths register only that owner: `stop_waiting_run()` (`hold_enforcer.py:418`) and `StopBuildsAndTests.stop()` (`hold_enforcer.py:967`).
+- `send_cycle_notices()` (`build_hold.py:1643`) looks up each recipient with `socket_for()`, which finds only Claude sessions in the session registry. A Codex thread id gets `RecipientGone`.
+
+**Spec:**
+1. Add `build_hold.run_agent(process, ancestors)`. It returns the nearest lineage item's agent: `codex:<CODEX_THREAD_ID>` when that item has `CODEX_THREAD_ID`, else its `CLAUDE_CODE_SESSION_ID`. Return a typed absence when no item has either.
+2. Both stop paths register the owner as now. They also register `run_agent()` when it differs from the owner's session id. Register before the signal, as the owner is registered now.
+3. A recipient key that starts with `codex:` is delivered by `send.py --to codex:<thread> --text <notice>` (`session_send.send_argv`), not by `socket_for()`. Exit 0 is `Delivered`, 1 is `QueuedUnconfirmed`, any other exit is `DeliveryFailed` with the send.py detail. Claude session keys keep the socket path.
+4. The notice text is the same for both kinds. A closed worker pane needs no new code: `send.py` gives the text to the worker's holder with `Worker <name>: worker pane is closed`.
+5. Status rows, `release_entries()`, the release intent and cycle validation accept the `codex:` key as they accept a session id. Add no cycle field.
+
+**Constraints from prior phases:**
+- Phase 8: only the installed copy writes the shared hold, release, enforcer and admission state. Tests use private directories and patch the sender.
+- Phase 129: the stop ends the detached command group; the supervisor stays alive and delivers the stopped result to the worker. Keep that order.
+- No signal handler, mask or disposition. Add no config key.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — `run_agent()`, the `codex:` delivery in `send_cycle_notices()`.
+- `scripts/build_hold/hold_enforcer.py` — both stop paths register the run's agent.
+- `docs/as-built/build-memory-admission.md` — the stop registration (near line 1306) and the delivery paragraph (near line 1401).
+- `scripts/build_hold/test_build_hold.py`, `scripts/build_hold/test_hold_enforcer.py` — the rows below.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `build_hold.py`, `hold_enforcer.py` and the as-built doc.
+- `test` owns both test modules.
+
+**Acceptance gate:**
+1. A stopped command under a Codex worker (`CODEX_THREAD_ID=t1`, `UNIT_SESSION_DIR` naming a director run) registers both the director session and `codex:t1`, in both stop paths.
+2. A stopped command whose agent is the owner registers one recipient.
+3. Release sends the `codex:t1` notice through `send.py --to codex:t1`, never `socket_for()`; exit 0, 1 and 2 give `Delivered`, `QueuedUnconfirmed` and `DeliveryFailed`.
+4. A Claude worker under a director registers its own session id and gets the socket notice.
+5. The build_hold, hold_enforcer, override_guard and target_hold tests pass; basedpyright reports zero on the changed files.
+
+### Phase 137 — The Phase 8 private-home fixtures pass the gate  · status: done
+**Source:** builds showrunner 2026-11-16 16:1x: batch728 went red at 15:47 on Phase 8 (`f41980455`). Both failures reproduce alone on this branch.
+1. `scripts/lint/test_nextest_tokens.py` (4 failures): the test runs the checkout `invoke.sh` with a fixture `CONF_DIR` and the real `HOME`. Since Phase 8, `invoke.sh` sources `$HOME/.claude/scripts/lint/memory_gate.sh`, the installed copy, and that copy refuses `CONF_DIR` (exit 2).
+2. `scripts/mac_test/test_failed_probe_mark.py:594`: `FileExistsError` on `<tmp>/home/.claude`. `OffloadCommandFixture.setUp()` calls `caller_admission()`, which since Phase 8 installs the private helpers into the caller's `HOME`. The test then makes `home/.claude` again.
+**Depends on:** Phase 8, Phase 135.
+
+**Review 1 (REQUEST CHANGES):** a private-home link does not fix the gate box. `caller_admission()` also installs the helpers into `Path.home()`; on the gate box that is the real `/home/gate-trial`, so per-name links make the checkout the installed copy, and every later override is refused (the `test_build_hold` `ADMISSION_SOCKET` rows in the same log). On a host without an installed copy it leaves a lasting link in the real home.
+
+#### Work Order
+
+**Goal:** a test copy finds its helpers without any link in a home; the installed copy still refuses overrides; no test writes the real home.
+
+**Spec:**
+1. One rule picks the helper root, in `override_guard.sh` and its twin in `override_guard.py`: a caller with any `OVERRIDE_VARIABLES` name set (a test) uses the helpers beside its own file; a caller with none uses `$HOME/.claude/scripts`.
+2. `memory_gate.sh`, `invoke.sh`, `verify.sh`, `top_level.py` and `shutdown.py` take their Phase 8 installed-helper paths through that rule.
+3. Remove `install_private_admission_helpers()` and each call. Restore `test_failed_probe_mark.py` and `test_nextest_tokens.py` to their Phase 8 text.
+4. The installed copy's override refusal and the shared-state guards do not change.
+5. (builds, 16:30): no fixture HOME links `.claude` or `.claude/scripts` to a real checkout or to the installed copy. One shared fixture helper copies only the files a test reads. One test row proves that a write under the fixture HOME stays in the temp folder. Known sites: `test_failed_probe_mark`, `test_linux_runner`, `test_resume_command`, `test_disk`, `test_remote_copies`, `remote_test_support`, `verify_doc_test_support`, `verify_examples_test_support`, `verify_lint_scope_test_support`, `verify_mac_offload_test_support`, `verify_hold_wait_test_support`, `verify_token_wait_test_support`, `test_mac_run`, `test_unit_run`, `test_session_start_hook`, `test_worktrees`, and the `scripts/direct` tests `test_verify_checks_fail_closed`, `test_verify_token_fifo`, `test_verify_token_mac_step`, `test_verify_token_reservation`, `test_verify_token_renew` and `test_verify_run_place`; any other such site is in scope; a file link counts too. The shared helper is `scripts/lib/helper_tree_test_support.py`. Done when a search finds no link under a fixture HOME/.claude into a checkout or the installed copy.
+
+**Workers:** `1 writer`
+- `impl` owns the files above and every test file that calls the removed helper.
+
+**Acceptance gate:** `test_nextest_tokens`, `test_failed_probe_mark`, `test_admission_service`, `test_invoke_scope`, `test_memory_admit`, `test_override_guard`, `test_build_hold`, `test_top_level`, `test_shutdown_cli`, `test_offload`, `test_linux_runner`, `test_resume_command`, `test_disk` and `test_remote_copies` pass on natedev; no run adds a file under the checkout `scripts/`; no run creates a path under the real `~/.claude`; basedpyright reports zero on the changed Python files.
+
+### Phase 138 — test_offload keeps its proof folder in a temp folder  · status: todo
+**Source:** builds showrunner 2026-11-16 18:0x. A Phase 137 run without test startup showed the leak: `GeneratedSourceTests.test_no_envrc_source_requires_generated_source_outside_trusted_roots` (`scripts/mac_test/test_offload.py:54`) calls `scratch.new('gate:offload-generated-source', 'proof')`. It patches only `SCRATCH_ROOT`, so `scratch.new` puts `proof` under the live worker session (`/session/<worker>/proof`). Task cleanup by that name then removed a second worker's folder.
+**Depends on:** Phase 136 (queue order only).
+
+#### Work Order
+
+**Goal:** the test writes its proof folder only under its own temp folder, with or without test startup. Its cleanup touches only that folder.
+
+**Spec:**
+1. The test makes its `scratch.new` folder under its `TemporaryDirectory`, also when the live session folder resolves (no test startup).
+2. The test removes its own folder when it ends. It runs no task cleanup that can match another session's folder.
+3. One row runs the test with the live-session resolution in place and asserts that no path appears outside the temp folder.
+4. Change no product file unless the cause is in `scratch.new`; then fix it there and say so.
+
+**Files:** `scripts/mac_test/test_offload.py` (and `scripts/lib/scratch.py` only under Spec 4).
+
+**Workers:** `1 writer`
+
+**Acceptance gate:** `test_offload` passes alone and with the other `mac_test` modules, with and without test startup; no path appears under a live session folder; basedpyright reports zero on the changed files.
