@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import html
 import os
 import re
@@ -33,12 +34,12 @@ from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
-from scripts.production import change_routing, change_review, footer_counts, next_item, showrunners, staff, unrouted_alert, update_registration
+from scripts.production import change_routing, change_review, footer_counts, next_item, record_store, showrunners, staff, unrouted_alert, update_registration
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_link
-from scripts.review_links import question_record
+from scripts.review_links import question_record, review_items
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -1730,20 +1731,40 @@ class ChangePageTests(unittest.TestCase):
     def file_user_question(self, text: str = "Choose the layout", *, asker: staff.StaffRow | None = None,
                            question: str = "Which layout gives each review card enough space for its controls?\n"
                            + "1. Compact <layout>\n2. Wide layout") -> str:
-        """File a canonical question without a reviewer or a real message sender."""
+        """Write a legacy Question fixture without allocating an ID."""
         document = self.production.read_text()
         if "- **Merge branch:**" not in document:
             _ = self.production.write_text(document + "- **Merge branch:** main\n- **Log:** progress.log\n")
         record = staff.snapshot()
         identities = update_registration.QuestionStaff.for_record(record)
         owner = next(row for row in record.rows if row.name == "page-owner")
-        production = read_production(owner, record)
-        items = [item.item for item in update_registration.question_records(production, identities) if item.status == "open"]
+        folder = update_registration.question_folder(self.production, identities)
+        assert isinstance(folder, update_registration.QuestionFolder)
+        asker = asker or self.unit
+        digest = hashlib.sha256(f"{owner.id}:{asker.id}:{text}".encode()).hexdigest()[:16]
+        path = folder.path / f"question-{asker.id}-{digest}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
         item = update_registration.OutstandingItem(since="2026-11-12T12:00", text=text, question=question,
-                                                   asked_by=(asker or self.unit).id)
-        update_registration.store_questions(production, [*items, item], identities)
-        filed = next(item for item in update_registration.question_records(production, identities) if item.item["text"] == text)
-        return "question/" + owner.id + "/" + filed.path.name
+                                                   asked_by=asker.id)
+        update_registration.write_question_record(update_registration.QuestionRecord(path, owner.id, asker.id, item, "open"))
+        return "question/" + owner.id + "/" + path.name
+
+    def test_f075_open_shows_a_legacy_question_when_numbering_fails(self) -> None:
+        key = self.file_user_question()
+        other_key = self.file_user_question("Read the numbered Question?")
+        folder = update_registration.question_folder(self.production, update_registration.QuestionStaff.read())
+        assert isinstance(folder, update_registration.QuestionFolder)
+        path = folder.path / key.rsplit("/", 1)[-1]
+        numbered = folder.path / other_key.rsplit("/", 1)[-1]
+        _ = numbered.write_text(numbered.read_text().replace('registration: {', 'registration: {"review_id": "Q8", ', 1))
+        before = {record: record.read_bytes() for record in (path, numbered)}
+        blocked = record_store.default_question_folder(staff.StaffId("other-owner")) / "question-undecodable.md"
+        blocked.parent.mkdir(parents=True)
+        _ = blocked.write_bytes(b"---\n\xff\n")
+        items = review_items.read(self.root, show="open", kinds=(review_items.ReviewType.QUESTION,))
+        self.assertEqual({item.key: item.id for item in items}, {key: "", other_key: "page-owner/Q8"})
+        self.assertEqual({record: record.read_bytes() for record in before}, before)
+        self.assertFalse((record_store.state_root() / "record-ids" / "question.water").exists())
 
     def test_questions_page_renders_the_reviewed_memory_bar_record_without_changing_it(self) -> None:
         key = self.file_user_question(MEMORY_BAR_ASK, question=MEMORY_BAR_RAW)
@@ -3463,36 +3484,61 @@ class ChangePageTests(unittest.TestCase):
    check(!first.querySelector('details') && first.querySelector('.change-details').textContent.startsWith('change:'),'the details are always shown');
   }
  }catch(error){failures.push(String(error)+'\n'+(error.stack || ''));}
- await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+ await realFetch('/results'+location.search,{method:'POST',body:JSON.stringify(failures)});
+ parent.postMessage('finished',location.origin);
 })();
 </script>'''
-        pages = {kind: self.browser(kind)[2].replace('</body>', '<img src="/probe-complete" alt="" hidden>' + probe + '</body>').encode()
+        cases = (("changes", "light"), ("changes", "dark"), ("questions", "light"))
+        pages = {kind: self.browser(kind)[2].replace('</body>', probe + '</body>').encode()
                  for kind in ("changes", "questions")}
-        results: list[list[str]] = []
+        urls = [f"/case?scheme={mode}&kind={kind}" for kind, mode in cases]
+        page = f"""<!doctype html><meta charset="utf-8">
+        <style>body{{margin:0}}iframe{{display:block;border:0;width:390px;height:1200px}}</style>
+        <iframe title="Review probe"></iframe><img src="/probe-complete" alt="" hidden>
+        <script>
+        const urls={json.dumps(urls)}, frame=document.querySelector('iframe');
+        let next=0;
+        const load=()=>{{if(next<urls.length)frame.src=urls[next++];}};
+        addEventListener('message', event=>{{
+          if(event.origin===location.origin && event.source===frame.contentWindow && event.data==='finished')load();
+        }});
+        load();
+        </script>""".encode()
+        results: dict[tuple[str, str], list[list[str]]] = {}
         probe_complete = threading.Event()
 
         class BrowserProbe(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if self.path == "/probe-complete":
-                    # Keep Firefox alive until the asynchronous checks report their result.
+                address = urlsplit(self.path)
+                if address.path == "/probe-complete":
                     if not probe_complete.wait(20):
                         self.send_error(504, "The browser checks did not complete.")
                         return
                     self.send_response(204)
                     self.end_headers()
                     return
+                if address.path == "/":
+                    body = page
+                elif address.path == "/case":
+                    body = pages[parse_qs(address.query)["kind"][0]]
+                else:
+                    self.send_error(404)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                _ = self.wfile.write(pages[parse_qs(urlsplit(self.path).query)["kind"][0]])
+                _ = self.wfile.write(body)
 
             def do_POST(self) -> None:
                 payload = self.rfile.read(int(self.headers["Content-Length"]))
                 if self.path == "/measurements":
                     print("Review tab measurements:", payload.decode())
                 else:
-                    results.append(cast(list[str], json.loads(payload)))
-                    probe_complete.set()
+                    query = parse_qs(urlsplit(self.path).query)
+                    case = (query["kind"][0], query["scheme"][0])
+                    results.setdefault(case, []).append(cast(list[str], json.loads(payload)))
+                    if all(case in results for case in cases):
+                        probe_complete.set()
                 self.send_response(204)
                 self.end_headers()
 
@@ -3500,17 +3546,16 @@ class ChangePageTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                for kind, mode in (("changes", "light"), ("changes", "dark"), ("questions", "light")):
+                profile = self.temporary / "browser-profile"
+                profile.mkdir()
+                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                      "--window-size", "390,1200", "--screenshot", str(self.temporary / "browser.png"),
+                                      f"http://127.0.0.1:{server.server_port}/"], capture_output=True, text=True, timeout=45)
+                for kind, mode in cases:
                     with self.subTest(kind=kind, mode=mode):
-                        results.clear()
-                        probe_complete.clear()
-                        profile = self.temporary / f"browser-profile-{kind}-{mode}"
-                        profile.mkdir()
-                        run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                              "--window-size", "390,1200", "--screenshot", str(self.temporary / f"browser-{kind}-{mode}.png"),
-                                              f"http://127.0.0.1:{server.server_port}/?scheme={mode}&kind={kind}"], capture_output=True, text=True, timeout=45)
                         self.assertEqual(run.returncode, 0, run.stderr)
-                        self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
+                        self.assertEqual(results.get((kind, mode)), [[]],
+                                         "The browser must complete every check without a failure.")
             finally:
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)

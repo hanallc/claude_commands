@@ -5,14 +5,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 
-from scripts.production import staff, unit_lookup
+from scripts.agents.remote import local_machine
+from scripts.production import record_store, staff, unit_lookup
 from scripts.production import showrunner_tree
-from scripts.production.issues import ALL_FIELDS, Issue, open_issues
+from scripts.production.issues import ALL_FIELDS, Issue
 # Callers such as rename read the tag here.
 from scripts.production.issues import PROPOSAL_TAG as PROPOSAL_TAG
 from scripts.production.production_doc import Refusal, production_field
+from scripts.production.record_store import issues_folder as issues_folder
 
-PROPOSALS_FIELD = "Proposals"
 IMPROVEMENT_QUEUE_FIELD = "Improvement queue"
 
 
@@ -26,21 +27,6 @@ def ledger(doc: Path) -> Path | None:
         return Path(production_field(lines, IMPROVEMENT_QUEUE_FIELD)).expanduser()
     except Refusal:
         return None
-
-
-def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
-    """Return the configured folder, or None when the document has no proposals field."""
-    if lines is None:
-        try:
-            lines = doc.read_text(encoding="utf-8").splitlines()
-        except UnicodeError as error:
-            raise OSError(f"{doc}: {error}") from error
-    try:
-        folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
-    except Refusal:
-        return None
-    # A relative folder starts at the checkout that contains docs/plans.
-    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
 
 
 def owner_docs(doc: Path, *, record: staff.StaffSnapshot | None = None) -> list[Path]:
@@ -76,15 +62,30 @@ def proposer(issue: Issue) -> str:
 
 def proposal_issues(doc: Path, *, sources: list[Path] | None = None,
                     select: Callable[[Issue], bool] | None = None, keys: frozenset[str] = ALL_FIELDS) -> list[Issue]:
-    """The open proposal issues in the production's folder, of any proposer."""
-    folder = issues_folder(doc)
-    if folder is None or (sources is None and not folder.is_dir()):
-        return []
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG, sources=sources, select=select, keys=keys | {"record_type"}) if issue.value("record_type") != "question"]
+    """Read open proposals, including records in former folders."""
+    try:
+        row = staff.snapshot().by_doc(local_machine(), doc.resolve())
+    except (staff.StaffUnreadable, staff.StaffRefused, OSError):
+        row = None
+    owner = row.id if row is not None else staff.StaffId("")
+    roots = record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc)
+
+    def wanted(issue: Issue) -> bool:
+        return (issue.value("status") == "open" and PROPOSAL_TAG in issue.fields.get("tags", [])
+                and issue.value("record_type") != "question"
+                and record_store.record_owner(record_store.RecordKind.PROPOSAL, issue, owner) == owner
+                and (select is None or select(issue)))
+
+    found: list[Issue] = []
+    for path in sorted(record_store.stored_paths(roots, sources=sources)):
+        fields = record_store.read_header(path, sources=sources, keys=keys | {"status", "tags", "record_type", "production_id"}, select=wanted)
+        if fields:
+            found.append(Issue(path, fields))
+    return found
 
 
 def open_proposals(doc: Path, *, sources: list[Path] | None = None) -> list[Issue]:
     """The open proposal issues in the production's folder that are its own. Staff is read only when issues exist."""
     found = proposal_issues(doc, sources=sources)
     names = owners(doc) if found else frozenset[str]()
-    return [issue for issue in found if proposer(issue) in names]
+    return [issue for issue in found if issue.value("production_id") or proposer(issue) in names]

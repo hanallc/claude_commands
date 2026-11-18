@@ -1447,9 +1447,14 @@ def reply_command(key: str, question: str = '') -> str:
 
 
 def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) -> bool:
-    from scripts.review_links import decision_store, efficiency_reviews, review_items
+    from scripts.review_links import decision_store, efficiency_reviews, review_items, review_submissions
+    if key.startswith(review_submissions.KEY_PREFIX):
+        try:
+            return review_submissions.answer(key, words, question_id)
+        except review_submissions.SubmissionError as error:
+            raise question_record.AnswerRefused(str(error)) from error
     from scripts.production import investigation
-    item = next((item for item in review_items.read(status.root) if key in (item.key,item.id)),None)
+    item = next((item for item in review_items.read(status.root) if key and key in (item.key,item.id)),None)
     if item is None:
         raise question_record.AnswerRefused('the Review item does not exist')
     source = item.source
