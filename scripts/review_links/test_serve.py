@@ -204,6 +204,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.new_item_http(encoded(payload)).status, 503)
             self.assertEqual(cache.get().records, {})
 
+    def test_new_item_offers_a_producer_with_a_directory_document(self) -> None:
+        _ = self.review_fixture()
+        directory = self.root.parent / 'brain'
+        directory.mkdir()
+        producer = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
+        response = self.new_item_http()
+        self.assertEqual(response.status, 200)
+        fields = cast(dict[str, object], json.loads(response.body))
+        self.assertEqual(fields['recipients'], [{'id': producer.id, 'name': producer.name, 'proposal': False}])
+
     def test_new_item_publishes_native_records_before_success(self) -> None:
         from scripts.review_links.test_review_submissions import EVIDENCE, PNG, identify_fixture_image
 
@@ -1526,6 +1536,22 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(failed.status, 503)
             self.assertIn(b"The List page is not available.", failed.body)
 
+    def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
+        case = self.review_fixture(changes=2)
+        directory = self.root.parent / "brain"
+        directory.mkdir()
+        producer = fixture_member("producer", name="brain", doc=staff.LiveDoc(local_machine(), directory))
+        item = the_list.add(producer.id, "Read the linked changes", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(producer.id, item.id, ("page-owner/C1", "page-owner/C2"), source="nate")
+        with patch.object(self.server, "root", case.root):
+            self.assertEqual(self.request(list_page.PAGE_PATH).status, 200)
+            change_routing.delivery_path(case.root, case.fixture.review_list, "C1").mkdir()
+            response = self.request(list_page.PAGE_PATH)
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"Read the linked changes", response.body)
+        self.assertIn(b">page-owner/C2</a>", response.body)
+
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
             ("/abc123/console.html?page=questions", "/console/?page=questions"),
@@ -2814,8 +2840,9 @@ class ServerStartupTests(unittest.TestCase):
         store.mkdir()
         keeper = staff.StaffId(str(uuid4()))
         producer = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
-        _ = (store / "staff.json").write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
-        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records")}):
+        staff_file = store / "staff.json"
+        _ = staff_file.write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
+        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records"), "STAFF_FILE": str(staff_file)}):
             item = the_list.add(keeper, "Private List item", owner=the_list.UnassignedOwner.NATE,
                                 source="morty", changes={})
 
