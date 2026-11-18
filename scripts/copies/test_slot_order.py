@@ -256,9 +256,11 @@ class SlotOrderTests(unittest.TestCase):
                         self.assertNotIn("UNIT_DETACHED_RUN", os.environ)
 
     def test_affected_commands_reserve_memory_for_the_affected_gate(self) -> None:
-        for command in (
-            (sys.executable, str(self.source / "gate.py"), "--affected", "--full"),
-            (sys.executable, str(self.source / "targeted_test.py")),
+        gate = str(self.source / "gate.py")
+        for command, expected in (
+            ((sys.executable, gate, "--affected", "--full"), "test-affected"),
+            ((sys.executable, str(self.source / "targeted_test.py")), "test-affected"),
+            ((sys.executable, "-X", "--affected", gate, "--tests-only"), "gate"),
         ):
             with self.subTest(command=command):
                 offset = len(self.requests)
@@ -266,7 +268,7 @@ class SlotOrderTests(unittest.TestCase):
                     admitted.handoff(self.source)
                 requests = [request for request in self.requests[offset:] if isinstance(request, wire.AdmitRequest)]
                 self.assertTrue(requests)
-                self.assertEqual({request.profile.step for request in requests}, {"test-affected"})
+                self.assertEqual({request.profile.step for request in requests}, {expected})
 
     def test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time(self) -> None:
         arguments_file = self.root / "placement-arguments"
@@ -396,11 +398,26 @@ placement_once
         self.queue.release(occupied)
 
     def test_leaving_before_admission_returns_without_a_slot(self) -> None:
-        _ = write_config_fixture(self.queue.root / "build_admission.conf", "running_pass_seconds=0.05\n")
+        leave = self.root / "leave"
         self.queue.hold_starts()
-        with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "exit 0"}):
+        with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
             process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"))
+        self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the queue did not report a wait")
+        # The client prints this notice after it receives the wait reply.
+        assert process.stderr is not None
+        descriptor = process.stderr.fileno()
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        notice = bytearray()
+        while b"waiting for memory since " not in notice:
+            remaining = deadline - time.monotonic()
+            self.assertTrue(remaining > 0 and select.select([descriptor], [], [], remaining)[0],
+                notice.decode(errors="replace"))
+            chunk = os.read(descriptor, 4096)
+            self.assertTrue(chunk, notice.decode(errors="replace"))
+            notice.extend(chunk)
+        leave.touch()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        errors = notice.decode(errors="replace") + errors
         self.assertEqual(process.returncode, 75, output + errors)
         self.assertTrue(self.waiting.is_set(), errors)
         self.assertFalse(self.slot_root.exists())

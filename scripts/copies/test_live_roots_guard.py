@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 from scripts.copies import copies
-from scripts.lib import conf, session_folder
+from scripts.lib import build_folders, conf, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.production.cli_fixture import ImmutableGitSeed
 
@@ -26,7 +26,14 @@ class LiveRootsGuardTests(unittest.TestCase):
         live.append(str(session_folder.former_root().resolve()))
         registry = str(copies.remote_registry().resolve())
         live.append(registry)
-        with tempfile.TemporaryDirectory() as folder:
+        guarded = tuple(Path(path).resolve() for path in live)
+        candidates = (Path("/var/tmp"), Path("/tmp"), Path("/dev/shm"), Path.home(),
+                      build_folders.inherited_temporary_parent())
+        parents = [parent for parent in map(Path.resolve, candidates)
+                   if parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
+                   and not any(parent.is_relative_to(path) for path in guarded)]
+        self.assertTrue(parents, f"No writable fixture parent is outside the live roots: {guarded}")
+        with tempfile.TemporaryDirectory(dir=parents[0]) as folder:
             root = Path(folder).resolve()
             private = private_slot_config(root, repository="origin")
             source = ImmutableGitSeed.create(root, "main", "Copy Tests", "copy@example.invalid",

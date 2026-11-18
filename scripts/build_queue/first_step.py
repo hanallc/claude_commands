@@ -17,7 +17,7 @@ from scripts.buildlog import store
 from scripts.direct.local_release_wait import local_release_waiter
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
-from scripts.lib.build_steps import VerifyCommand, verify_command, command_program
+from scripts.lib.build_steps import OtherCommand, VerifyCommand, parse_command_program, verify_command
 
 
 class FirstStepRefused(RuntimeError):
@@ -134,7 +134,9 @@ def _placement_grant(request: wire.PlacementRequest) -> wire.LocalPlacementGrant
 
 def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
                    position: SlotQueuePosition, run: wire.RunIdentity) -> wire.Admitted:
-    affected = command_program(command) == 'targeted_test.py' or '--affected' in command
+    program = parse_command_program(command)
+    script, script_arguments = ('', ()) if isinstance(program, OtherCommand) else program
+    affected = script == 'targeted_test.py' or '--affected' in script_arguments
     name = 'test-affected' if affected else 'gate'
     config = records.read_memory_config()
     first = config.program_first_peaks.get(name)
@@ -143,10 +145,10 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
     profile = records.ProgramProfile(name, str(Path.home() / '.claude'), str(source),
         records.HistoryPeakSizing(first, records.FirstProgramPeak(first), 0.0))
     arguments = [name]
-    for index, word in enumerate(command):
+    for index, word in enumerate(script_arguments):
         if word in ('--type-dirs', '--type-dir'):
             arguments.append('--type-dirs')
-            for directory in command[index + 1:]:
+            for directory in script_arguments[index + 1:]:
                 if directory.startswith('-'):
                     break
                 arguments.append(directory)

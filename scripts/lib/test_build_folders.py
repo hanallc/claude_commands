@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from typing import ContextManager
 
 from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 
@@ -1605,13 +1605,11 @@ assert not loaded, loaded
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
+        admission = config.parent / ADMISSION_CONFIG_FIXTURE.name
+        self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
         for source in sources.glob("*.conf"):
-            private = config.parent / source.name
-            if source.name == "build_admission.conf":
-                shipped = conf.read(source).values()
-                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
-            else:
-                self.assertEqual(private.read_bytes(), source.read_bytes())
+            if source.name != ADMISSION_CONFIG_FIXTURE.name:
+                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))

@@ -16,6 +16,34 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 ROOT = Path(__file__).resolve().parents[2]
 FILE_LIST = ROOT / 'scripts/aws_target/hana_render.files'
+HANA_CONFIG = Path('config/hana_aws.conf')
+BUILD_TARGETS_CONFIG = Path('config/build_targets.conf')
+HANA_RENDER_SETTINGS = """\
+enabled=on
+# whole: 1..60
+guard_grace_seconds=19
+# whole: 1..60
+watchdog_check_seconds=2
+# whole: 1..1800
+permit_max_seconds=90
+# whole: 1..8
+step_cpu_limit=3
+# whole: 1..24
+step_memory_gib=12
+# whole: 1..60
+mount_timeout_seconds=8
+# whole: 1..
+aws_timeout_s=5
+# whole: 1..
+control_poll_seconds=3
+"""
+BUILD_TARGETS_SETTINGS = """\
+# range: 0.01..300
+hold_sender_timeout_seconds=17
+loopback.shell_timeout_s=13
+# range: 1..3600
+loopback.command_timeout_s=43
+"""
 
 
 class HanaRenderTests(unittest.TestCase):
@@ -30,7 +58,12 @@ class HanaRenderTests(unittest.TestCase):
                 self.assertNotIn('..', relative.parts)
                 destination = checkout / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                _ = shutil.copyfile(ROOT / relative, destination)
+                if relative == HANA_CONFIG:
+                    _ = destination.write_text(HANA_RENDER_SETTINGS, encoding='utf-8')
+                elif relative == BUILD_TARGETS_CONFIG:
+                    _ = destination.write_text(BUILD_TARGETS_SETTINGS, encoding='utf-8')
+                else:
+                    _ = shutil.copyfile(ROOT / relative, destination)
             result = subprocess.run([sys.executable, '-E', '-m', 'scripts.aws_target.hana_render',
                                      '--device', '/dev/sdf', 'rendered'], cwd=checkout,
                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
@@ -42,7 +75,7 @@ class HanaRenderTests(unittest.TestCase):
                 'var-lib-hana.mount': 0o644, 'hana-work.slice': 0o644, 'hana-receiver.service': 0o644,
             }
             self.assertEqual({path.name for path in output.iterdir()}, {*expected_modes, 'runtime'})
-            configuration = conf.read(ROOT / 'config/hana_aws.conf')
+            configuration = conf.read(checkout / HANA_CONFIG)
             files = (*hana_guest.render_files(hana_guest.read_settings(configuration), device=Path('/dev/sdf')),
                      *hana_receiver.render_files(hana_receiver.read_settings(configuration)))
             for file in files:
@@ -51,8 +84,9 @@ class HanaRenderTests(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(actual.stat().st_mode), expected_modes[actual.name])
                     self.assertEqual(actual.read_bytes(), file.content.encode('utf-8'))
             runtime = output / 'runtime'
-            self.assertEqual((runtime / 'config/build_targets.conf').read_bytes(),
-                             (ROOT / 'config/build_targets.conf').read_bytes())
+            self.assertEqual((runtime / HANA_CONFIG).read_bytes(), HANA_RENDER_SETTINGS.encode('utf-8'))
+            self.assertEqual((runtime / BUILD_TARGETS_CONFIG).read_bytes(),
+                             (checkout / BUILD_TARGETS_CONFIG).read_bytes())
             self.assertIn('Environment=CONF_DIR=/var/lib/hana-runtime/config',
                           (output / 'hana-receiver.service').read_text())
             self.assertEqual({str(path.relative_to(runtime)) for path in runtime.rglob('*') if path.is_file()},

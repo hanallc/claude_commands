@@ -78,7 +78,7 @@ class VerifyCommand:
 
 def verify_command(argv: Sequence[str]) -> VerifyCommand | OtherCommand:
     """Read verify arguments through the same interpreter rules as command_job."""
-    program = _program(argv)
+    program = parse_command_program(argv)
     if isinstance(program, OtherCommand) or program[0] != "verify.sh":
         return OTHER_COMMAND
     return VerifyCommand(tuple(program[1]))
@@ -86,7 +86,7 @@ def verify_command(argv: Sequence[str]) -> VerifyCommand | OtherCommand:
 
 def command_program(argv: Sequence[str]) -> str:
     """Name the script after interpreter arguments."""
-    program = _program(argv)
+    program = parse_command_program(argv)
     return "" if isinstance(program, OtherCommand) else program[0]
 
 
@@ -110,10 +110,10 @@ VALUE_OPTIONS = frozenset("XW")
 LONG_VALUE_OPTIONS = frozenset({"--check-hash-based-pycs", "--init-file", "--rcfile"})
 
 
-def _program(argv: Sequence[str]) -> tuple[str, Sequence[str]] | OtherCommand:
-    """The script a command runs and its arguments, after a python or shell interpreter.
+def parse_command_program(argv: Sequence[str]) -> tuple[str, Sequence[str]] | OtherCommand:
+    """Return the program name and arguments after Python or shell interpreter options.
 
-    Code from -c or standard input ("-") runs no named script, so it is OtherCommand.
+    Return OtherCommand for inline code, standard input, or a missing program.
     """
     index = 0
     while index < len(argv):
@@ -162,7 +162,7 @@ def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
 
 def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
     """Name the job of a merge gate, targeted test or verify.sh command."""
-    program = _program(argv)
+    program = parse_command_program(argv)
     if isinstance(program, OtherCommand):
         return program
     name, arguments = program
