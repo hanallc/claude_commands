@@ -562,10 +562,16 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
     morning = record_table.clock_minutes(settings, "later_morning")
     log_max_height = settings.whole("list_log_max_height_rem")
     counts = counts_strip(members, names) if include_counts else ''
+    expansion = ''.join(f'<button type="button" id="list-{action}-all" data-list-expansion="{action}"'
+                        + f' aria-label="{label}" title="{label}">' + page_frame.icon_svg(icon) + '</button>'
+                        for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
+                                                    ("collapse", "Collapse all", "chevrons-down-up")))
     content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
-               + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem"><div data-record-filters>'
+               + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
+               + '<div data-record-filters><div class="list-toolbar">'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
+               + '<div class="list-expansion">' + expansion + '</div></div>'
                + record_table.chip_row('Show', shows, 'open')
                + record_table.chip_row('State', states, 'all')
                + record_table.chip_row('Owner', owners, 'all')
@@ -582,6 +588,11 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
+.list-toolbar{display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-bottom:10px}
+.list-toolbar .record-filter-words{min-width:0;margin:0}
+.list-expansion{display:flex;gap:6px}
+.list-expansion button{justify-content:center;width:36px;padding:0;cursor:pointer}
+.list-expansion svg{width:18px;height:18px}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-actions{position:relative}.list-park>[data-later-menu]{left:0;right:auto}
 .list-table:has(.list-park>[data-later-menu]:not([hidden])),
@@ -686,7 +697,10 @@ const tableView=createRecordTable({content:()=>content,
   items.filter(item=>item.dataset.state==='Waiting for nate' && item.dataset.parked!=='true').length+' need you · '+
   items.filter(item=>item.dataset.unread==='true').length+' unread',
 });
-function bindForms(){
+function bindListControls(){
+ content.querySelectorAll('[data-list-expansion]').forEach(button=>button.addEventListener('click',()=>{
+  tableView.setShownExpanded(button.dataset.listExpansion==='expand');
+ }));
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
@@ -824,7 +838,7 @@ async function refresh(_supersede=false,current=()=>true){
  const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
  for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
  content.replaceWith(fresh);content=fresh;
- bindForms();tableView.replace();
+ bindListControls();tableView.replace();
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
@@ -910,7 +924,7 @@ function restoreListScroll(top){
 tableView.place();
 const listReturn=parent.performance.getEntriesByType('navigation')[0]?.type==='back_forward' ? listReturnForEntry() : undefined;
 if(listReturn) restoreListRows(listReturn);
-tableView.bind();bindForms();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
+tableView.bind();bindListControls();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
 if(listReturn) restoreListScroll(listReturn.top);
 addEventListener('pageshow',event=>{
  if(!event.persisted) return;

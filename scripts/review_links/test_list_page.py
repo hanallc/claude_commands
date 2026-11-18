@@ -88,6 +88,95 @@ class ListPageTests(unittest.TestCase):
         self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
         self.assertIn('.list-toggle{white-space:nowrap}', body)
 
+    def test_bulk_controls_show_lucide_icons_and_accessible_labels(self) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        header = markup.split('data-record-filters>', 1)[1].split('<span data-list-count', 1)[0]
+        for label, icon in (("Expand all", "chevrons-up-down"), ("Collapse all", "chevrons-down-up")):
+            with self.subTest(label=label):
+                self.assertRegex(header, rf'<button\b[^>]*aria-label="{label}"[^>]*>\s*<svg\b')
+                control = header.split(f'aria-label="{label}"', 1)[1].split('</button>', 1)[0]
+                self.assertIn(f'title="{label}"', control)
+                self.assertIn(f'class="lucide lucide-{icon}"', control)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_expands_only_items_that_match_show_chips_and_words(self) -> None:
+        for title in ("Deploy alpha", "Deploy beta", "Inspect logs"):
+            _ = self.add(title, the_list.ItemState.WAITING_FOR_NATE)
+        _ = self.add("Deploy gamma", the_list.ItemState.WAITING_FOR_NATE, owner=OTHER.id)
+        _ = self.add("Deploy delta")
+        self.browser_bulk_expansion(r'''
+ chip('show','needs-me').click();
+ chip('owner',OWNER).click();
+ const words=document.querySelector('#list-search');
+ const filtered=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
+ words.value='deploy';words.dispatchEvent(new Event('input'));
+ await filtered;
+ check(rows.filter(row=>!row.hidden).length===2,'Two items match all filters.');
+ document.querySelector('[aria-label="Expand all"]').click();
+ for(const row of rows) check(isExpanded(row,!row.hidden),'Expand all leaves hidden items closed.');
+'''.replace('OWNER', json.dumps(OWNER.id)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_collapses_shown_items_and_preserves_hidden_items(self) -> None:
+        _ = self.add("Deploy alpha")
+        _ = self.add("Deploy beta")
+        _ = self.add("Deploy gamma", owner=OTHER.id)
+        self.browser_bulk_expansion(r'''
+ for(const row of rows) row.querySelector('.list-toggle').click();
+ check(rows.every(row=>isExpanded(row,true)),'All items start open.');
+ chip('owner',OWNER).click();
+ check(rows.filter(row=>!row.hidden).length===2,'Two items match the owner filter.');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ for(const row of rows) check(isExpanded(row,row.hidden),'Collapse all leaves hidden items open.');
+ chip('owner','all').click();
+ check(rows.find(row=>row.dataset.owner!==OWNER).querySelector('[data-detail]').hidden===false,
+  'The hidden item remains open after the filter clears.');
+'''.replace('OWNER', json.dumps(OWNER.id)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_bulk_controls_apply_words_before_the_search_timer_ends(self) -> None:
+        _ = self.add("Deploy alpha", number=1)
+        _ = self.add("Deploy beta", number=2)
+        self.browser_bulk_expansion(r'''
+ const alpha=rows.find(row=>row.dataset.number==='1'),beta=rows.find(row=>row.dataset.number==='2');
+ const words=document.querySelector('#list-search');
+ let changes=0;
+ words.addEventListener('filterchange',()=>changes++);
+ const search=value=>{words.value=value;words.dispatchEvent(new Event('input'));};
+ search('alpha');
+ document.querySelector('[aria-label="Expand all"]').click();
+ check(changes===0,'Expand all runs before the search timer fires.');
+ check(!alpha.hidden && isExpanded(alpha,true) && beta.hidden && isExpanded(beta,false),
+  'Expand all opens only the match for the new search.');
+ const cleared=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
+ search('');await cleared;
+ beta.querySelector('.list-toggle').click();
+ const beforeCollapse=changes;
+ search('beta');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ check(changes===beforeCollapse,'Collapse all runs before the search timer fires.');
+ check(alpha.hidden && isExpanded(alpha,true) && !beta.hidden && isExpanded(beta,false),
+  'Collapse all closes only the match for the new search.');
+''')
+
+    def browser_bulk_expansion(self, steps: str) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = r'''<script>
+(async()=>{
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const rows=[...document.querySelectorAll('[data-list-item]')];
+const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+value+'"]');
+const isExpanded=(row,expanded)=>row.querySelector('[data-detail]').hidden===!expanded &&
+ row.querySelector('.list-toggle').getAttribute('aria-expanded')===String(expanded);
+try{
+''' + steps + '''
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');
+result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>'''
+        self.browser_actions(markup, "", probe)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_jump_inside_the_full_review_list(self) -> None:
         source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1830", "How to check": "Read the card."},
@@ -1902,6 +1991,27 @@ window.fetch=async(_path,options={})=>{
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_bulk_controls_move_a_lost_remove_notice(self) -> None:
+        self.browser_action_sequence('''
+ show('all');
+ submit('remove');
+ losePost();await flush();
+ const above=document.querySelector('[data-hidden-action-status]');
+ const inline=form.querySelector('[data-send-status]');
+ const message='Save not confirmed: Fixture lost response';
+ const inlineOnly=()=>above.hidden && inline.textContent===message && inline.getClientRects().length>0;
+ const aboveOnly=()=>!above.hidden && above.textContent==='Item 1: '+message && !inline.getClientRects().length;
+ check(inlineOnly(),'The open row shows the warning only in its details.');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ check(aboveOnly(),'Collapse all moves the warning above the table.');
+ const toggle=row.querySelector('.list-toggle');
+ toggle.click();toggle.click();
+ check(aboveOnly(),'Closing the row also moves the warning above the table.');
+ document.querySelector('[aria-label="Expand all"]').click();
+ check(inlineOnly(),'Expand all shows the warning only in the row details.');
+''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_shows_only_the_latest_hidden_remove_notice(self) -> None:
         _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
@@ -2920,6 +3030,14 @@ try{
  check(refreshed.querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
  check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
+ check(refreshed!==selected,'refresh replaces the row');
+ document.querySelector('[aria-label="Expand all"]').click();
+ check(visible().length===2 && visible().every(row=>!row.querySelector('[data-detail]').hidden),
+  'Expand all opens both matching rows after refresh');
+ document.querySelector('[aria-label="Collapse all"]').click();
+ check(visible().length===2 && visible().every(row=>row.querySelector('[data-detail]').hidden),
+  'Collapse all closes both matching rows after refresh');
+ refreshed.querySelector('.list-toggle').click();
  realFeedback=true;loseResponse=true;
  const tellRow=rows().find(row=>row.dataset.number==='105');tellRow.querySelector('.list-toggle').click();
  check(tellRow.dataset.unread==='true' && tellRow.querySelector('[value="read"]'),'Tell starts with a fresh unread row');
