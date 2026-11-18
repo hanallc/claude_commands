@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,12 +39,23 @@ def path(ledger: Path) -> Path:
     return ledger.with_name(ledger.stem+'.review.json')
 
 
+_held_ledger_locks: ContextVar[frozenset[Path]] = ContextVar('held_ledger_locks', default=frozenset())
+
+
 @contextmanager
 def ledger_lock(ledger: Path, *, check: Callable[[], object] | None = None) -> Generator[None]:
-    with file_lock.exclusive(path(ledger).with_suffix('.lock')):
-        if check is not None:
-            _ = check()
-        yield
+    """Serialize ledger writes and check the revision under the lock."""
+    lock = path(ledger).with_suffix('.lock').resolve()
+    held = _held_ledger_locks.get()
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with (nullcontext() if lock in held else file_lock.exclusive(lock)):
+        token = _held_ledger_locks.set(held | {lock})
+        try:
+            if check is not None:
+                _ = check()
+            yield
+        finally:
+            _held_ledger_locks.reset(token)
 
 
 def stored_reviews(target: Path) -> dict[str, object]:

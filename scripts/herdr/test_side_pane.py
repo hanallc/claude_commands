@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.herdr import herdr, pane_launch, side_pane, worker_panes
 from scripts.herdr import herdr_types
+from scripts.herdr.test_herdr import ClaudeForegroundSocket, codex_foreground_cases
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -108,6 +109,33 @@ class SidePaneTests(StaffTestCase):
         assert isinstance(result, side_pane.OpenSidePane)
         return result
 
+    def test_side_pane_recovers_only_the_proved_codex_owner(self) -> None:
+        self.caller("codex")
+        first = self.start()
+        _, _, arguments = self.world.foreground[first.pane]
+        observed = self.world.processes[self.world.foreground[first.pane][0]]
+        self.world.processes[456] = observed
+        self.world.processes[457] = herdr.NativeAgentProcess(
+            herdr.EnvironmentThread(fixture_runtime_id("consultation-child")), "fixture-start", {})
+        self.world.foreground[first.pane] = 456, "codex", arguments
+        read = self.world.result
+
+        with codex_foreground_cases(self.root) as cases:
+            for case in cases:
+                def result(*args: str, deadline: float = math.inf) -> dict[str, object]:
+                    if args == ("pane", "process-info", "--pane", first.pane):
+                        return {"process_info": case.info}
+                    return read(*args, deadline=deadline)
+
+                with (self.subTest(case=case.name), patch.object(self.world, "result", side_effect=result),
+                      redirect_stderr(io.StringIO())):
+                    recovered = side_pane.open("consultation", self.policy(), cwd=self.root)
+                    if case.owner_proved:
+                        self.assertEqual(recovered, first)
+                    else:
+                        self.assertIsInstance(recovered, side_pane.UnknownSidePane)
+                    self.assertEqual(len(self.world.launches), 1)
+
     def test_codex_side_pane_keeps_the_native_compaction_limit_after_a_restart(self) -> None:
         self.caller("codex")
         first = self.start()
@@ -138,12 +166,14 @@ class SidePaneTests(StaffTestCase):
                                                agent=agent, reported_unknown=reported_unknown)
                     pid = case.world.foreground[result.pane][0]
                     identity = case.world.processes[pid].current_identity
+                    proof = ClaudeForegroundSocket(name, result.pane, pid)
                     with (patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_SESSION": name,
                               "HERDR_PANE_ID": result.pane}),
                           patch.object(sys, "stdin", io.StringIO(json.dumps({
                               "source": "startup", "session_id": identity, "cwd": str(prepared.directory)}))),
+                          patch.object(herdr, "session_socket_request", side_effect=proof.request),
                           patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()),
-                          patch.object(pane_record, "claude_arguments", return_value=["claude", *arguments]),
+                          patch.object(pane_record, "process_arguments", return_value=["claude", *arguments]),
                           patch.object(os, "getppid", return_value=pid),
                           patch.object(staff, "runtime_id", return_value=identity)):
                         record_start()

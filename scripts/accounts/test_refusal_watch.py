@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from scripts.whoami.note_file import note_name
 
 from scripts.production import staff_sources, staff, staff_test_support
+from scripts.message import session_records
 from scripts.message import sessions as status_sessions
 import io
 import fcntl
@@ -21,7 +22,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from functools import partial
@@ -140,6 +141,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"))
         (self.home / ".claude").mkdir()
         (self.home / "notifier").mkdir()
+        (self.home / "sessions").mkdir()
         _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         for label, login in (("claude1", SOURCE_LOGIN), ("claude2", "main@example.invalid"), ("claude3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
@@ -153,8 +155,11 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(refusal_watch, "datetime", WatchTime))
         # Readings are stored at NOW; status re-reads a login live once its reading is older than STALE_AFTER.
         _ = self.enterContext(patch.object(accounts, "datetime", WatchTime))
-        _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=lambda: self.live))
-        _ = self.enterContext(patch.object(status_sessions, "running_sessions", side_effect=lambda: self.live))
+        _ = self.enterContext(patch.object(sessions, "live_sessions",
+            side_effect=lambda: self.running_registry_records(self.read_session_registry())))
+        _ = self.enterContext(patch.object(status_sessions, "read_registry", side_effect=self.read_session_registry))
+        _ = self.enterContext(patch.object(status_sessions, "running_sessions", side_effect=self.running_registry_sessions))
+        _ = self.enterContext(patch.object(status_sessions, "running_records", side_effect=self.running_registry_records))
         _ = self.enterContext(patch.object(staff, "local_snapshot", side_effect=self.membership))
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_dir))
         _ = self.enterContext(patch.object(account, "account_of", side_effect=self.process_account))
@@ -175,6 +180,43 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading("main@example.invalid", 80, reset=NOW + timedelta(days=6))
         self.reading(SOURCE_LOGIN, 0)
         self.reading(TARGET_LOGIN, 1, reset=NOW + timedelta(days=1))
+
+    def read_session_registry(self, *, dependencies: Callable[[Path], None] | None = None,
+                              observe: Callable[[], list[status_sessions.SessionRecord]] | None = None,
+                              ) -> status_sessions.RegistryRead:
+        directory = status_sessions.sessions_dir()
+        try:
+            _ = tuple(directory.iterdir())
+        except OSError:
+            return status_sessions.RegistryRead((), (directory,))
+        records = self.live if observe is None else observe()
+        if dependencies is not None:
+            for record in records:
+                dependencies(directory / f"{record['pid']}.json")
+        entries = tuple(status_sessions.RegistryObservation(record.copy(), {}) for record in records)
+        return status_sessions.RegistryRead(entries, ())
+
+    @staticmethod
+    def running_registry_records(registry: status_sessions.RegistryRead) -> list[status_sessions.SessionRecord]:
+        return [entry.record for entry in registry.entries]
+
+    def running_registry_sessions(self, *,
+                                  registry: status_sessions.RegistryRead | session_records.ReadCurrentRegistry =
+                                      session_records.CURRENT_REGISTRY,
+                                  ) -> list[status_sessions.SessionRecord]:
+        observed = status_sessions.read_registry() if isinstance(registry, session_records.ReadCurrentRegistry) else registry
+        return self.running_registry_records(observed)
+
+    def test_absent_registry_keeps_the_running_session_list_incomplete(self) -> None:
+        _ = self.owner("fixture")
+        directory = status_sessions.sessions_dir()
+        self.assertEqual(len(status_sessions.running_sessions()), 1)
+        directory.rmdir()
+        registry = status_sessions.read_registry()
+        self.assertEqual(registry.unreadable, (directory,))
+        self.assertEqual(status_sessions.running_records(registry), [])
+        self.assertEqual(status_sessions.running_sessions(), [])
+        self.assertEqual(status_sessions.live_sessions(), [])
 
     def membership(self) -> staff.StaffSnapshot:
         try:
@@ -1080,7 +1122,7 @@ class RefusalWatchTests(unittest.TestCase):
             return self.live if herdr.herdr_processes() else []
         processes: list[herdr.HerdrProcess] = []
         with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)),
-              patch.object(status_sessions, "running_sessions", side_effect=observed),
+              patch.object(status_sessions, "read_registry", side_effect=partial(self.read_session_registry, observe=observed)),
               herdr.process_snapshot()):
             self.assertEqual(herdr.herdr_processes(), [])
             processes.append(fresh)
@@ -1101,7 +1143,7 @@ class RefusalWatchTests(unittest.TestCase):
             return self.live if herdr.herdr_processes() else []
 
         with (patch.object(herdr, "_scan_herdr_processes", side_effect=lambda: list(processes)) as scans,
-              patch.object(status_sessions, "running_sessions", side_effect=observed),
+              patch.object(status_sessions, "read_registry", side_effect=partial(self.read_session_registry, observe=observed)),
               refusal_watch.session_observation(), herdr.process_snapshot()):
             self.assertEqual(herdr.herdr_processes(), [])
             owner = self.owner("new-unit", host="unit")
@@ -1127,7 +1169,7 @@ class RefusalWatchTests(unittest.TestCase):
             return self.live
 
         with (patch.object(herdr, "_scan_herdr_processes", return_value=[]) as scans,
-              patch.object(status_sessions, "running_sessions", side_effect=observed),
+              patch.object(status_sessions, "read_registry", side_effect=partial(self.read_session_registry, observe=observed)),
               refusal_watch.session_observation(), herdr.process_snapshot()):
             _ = herdr.herdr_processes()
             _ = herdr.herdr_processes()
@@ -1150,7 +1192,7 @@ class RefusalWatchTests(unittest.TestCase):
         for changed in ("pid", "procStart"):
             with (self.subTest(identity_field=changed),
                   patch.object(herdr, "_scan_herdr_processes", return_value=[]) as scans,
-                  patch.object(status_sessions, "running_sessions", side_effect=observed),
+                  patch.object(status_sessions, "read_registry", side_effect=partial(self.read_session_registry, observe=observed)),
                   refusal_watch.session_observation(), herdr.process_snapshot()):
                 _ = herdr.herdr_processes()
                 if changed == "pid":
@@ -2532,8 +2574,6 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_status_names_off_account_group_member_as_moving(self) -> None:
         from scripts.production.staff_test_support import fixture_member
-        from scripts.message import sessions as status_sessions
-
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.home / "staff.json")})))
         parent = fixture_member("showrunner", name="fixture")
         member = fixture_member("unit", name="unit", parent=parent.id)
@@ -2541,9 +2581,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner(member.current_session, host="unit")
         self.live[-1]["name"] = "owner unit"
         output, error = io.StringIO(), io.StringIO()
-        with (patch.object(status_sessions, "live_sessions", return_value=self.live),
-              patch.object(status_sessions, "running_sessions", return_value=self.live),
-              redirect_stdout(output), redirect_stderr(error)):
+        with redirect_stdout(output), redirect_stderr(error):
             code = accounts.main(["--detail"])
         self.assertEqual((code, error.getvalue()), (0, ""))
         line = next(line for line in output.getvalue().splitlines() if "owner unit" in line)

@@ -66,6 +66,13 @@ class UnitStatusTests(UnitStatusFixture):
         self.assertIn("SESSION GONE", gone)
         self.assertIn("CLAUDE NOT RUNNING", live)
 
+    def test_unreadable_registry_without_a_pane_reports_unknown(self) -> None:
+        outputs, _, _ = self.run_statuses(
+            None, "ok", 0, panes=({},), missing_units=("hook",), unreadable_registry=True,
+        )
+        self.assertIn("CLAUDE STATE UNKNOWN", outputs[0])
+        self.assertNotIn("SESSION GONE", outputs[0])
+
     def test_herdr_units_report_activity_and_tick_health(self) -> None:
         outputs, calls, seen = self.run_statuses(
             "/tmp/native-run\n", "failing: no instance", 1,

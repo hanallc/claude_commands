@@ -799,26 +799,14 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         previous_slots = status.slots(page, page.rows[0])
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt, "verdict", recipients=(recipient,))
-        status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
+        slots = change_page.DeliverySlots(change_page.NoDelivery(), intent)
+        status.write_slots(page, page.rows[0], slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
         try:
             if exact_record:
                 save_question_record(production, question, outcome, words, verify_revision)
             else:
                 relay = save_outcome(production, question, outcome, words, identities)
-            if not exact_record and outcome != "skip":
-                update_registration.record_review_log(question.record.path,
-                    ('feedback sent' if outcome == 'feedback' else outcome)+": "+words, owner=question.owner)
-            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
-            if outcome in ('feedback','question'):
-                recipient = question.owner
-            intent = replace(intent, recipients=(recipient,))
-            page = replace(page, saved={**saved, "saved": True})
-            if exact_record:
-                with review_items.after_store_write(question.key):
-                    status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
-            else:
-                status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
         except BaseException as error:
             try:
                 if exact_record:
@@ -830,6 +818,15 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
             if isinstance(error, update_registration.RegistrationFailure):
                 raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page") from error
             raise
+        if outcome not in ('feedback', 'question'):
+            recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
+        intent = replace(intent, recipients=(recipient,))
+        page = replace(page, saved={**saved, "saved": True})
+        status.mark_review_saved(page, page.rows[0], replace(slots, verdict=intent), intent)
+        if not exact_record and outcome != "skip":
+            with review_items.after_store_write(question.key):
+                update_registration.record_review_log(question.record.path,
+                    ('feedback sent' if outcome == 'feedback' else outcome)+": "+words, owner=question.owner)
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 

@@ -55,8 +55,28 @@ Python callers pass slot lease descriptors to their build and test children.
 Its Git children inherit the destination lease and busy lock.
 Removal retries take the busy lock again, even if an earlier attempt removed the mark.
 Recovery ignores the timestamps of busy marks that the current attempt creates.
-A removal retry keeps the checkout when its `.git` file, its `commondir` or an external `HEAD` is unreadable.
-A retry does not yet check the other metadata files inside the checkout's Git directory, such as an internal `HEAD` or the `index`.
+A removal retry checks `.git`, `commondir`, and `HEAD` at the removal path and in descendant checkouts.
+An external `HEAD` must exist. An interrupted removal can leave an internal `HEAD` absent.
+Both scans check the types of present Git metadata, including `index`, `packed-refs`, and loose refs.
+One walker reports each entry's path, type, device, inode, and ctime before the scan applies its checks.
+The walker opens the removal root directly and opens each child directory through its parent descriptor.
+The walker checks each directory's identity before it reads the entries and again before it closes the descriptor.
+Checkout inspection supplies the expected identities of the Git directories.
+The scan reads a symbolic ref's target without following the link.
+The scan accepts the link only if the target names a valid `refs/` path.
+The retry checks work again if a regular file or link has a ctime newer than the intent.
+Equal timestamps count as unchanged.
+The retry checks directories by type and recorded evidence.
+It keeps a checkout if a directory occupies the recorded path of a loose ref.
+For a legacy intent, it keeps an empty ref directory outside `refs`, `refs/heads`, `refs/tags`, and `refs/remotes`.
+At those paths, it keeps an empty directory if a regular reflog or `packed-refs` names the exact ref.
+Without that evidence, a legacy intent cannot distinguish an empty standard namespace from a loose ref that a directory replaced.
+The retry accepts the empty standard namespace in that case.
+Deletion is safe only when writers honor the removal locks until deletion completes.
+`save_cargo_outputs` reads Cargo metadata with `--locked` to preserve source lockfiles.
+`clean_cargo_outputs` deletes only build output outside the source tree.
+A retry with Cargo work validates the source again after these helpers.
+A first removal records source evidence after these helpers.
 Linked checkout creation refuses a source with a removal mark.
 Recursive removal checks the busy locks and recorded borrowers of existing descendant clones.
 Busy marks and copy records must be regular files.

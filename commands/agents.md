@@ -113,7 +113,7 @@ Transfer runs in a session that has no staff row, on the producer's machine.
 It stops the old conversation and closes its tab. It keeps the row id, the document, and the message queue.
 It sets the row's session, account home, and launch folder, then restarts the caller as the producer.
 `--model` and `--effort` replace `[producers].NAME`; the caller supplies the family.
-A Claude caller must use the producers account. The refusal gives the `agents move` command.
+A Claude caller must use the producers account, or the showrunners account while the producers group has no selection. The refusal gives the `agents move` command.
 After a failure, run the same command again.
 
 Before a power-off, run `agents stop --all`.
