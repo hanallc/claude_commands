@@ -2814,8 +2814,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             hana_result.LogicalStepLink(request.call_id, assignment.episode),
             current_source_key=lambda: hana_source_key(request), environment=dict(request.environment),
             features=tuple(dict.fromkeys(features)))
-    except (OSError, ValueError, RuntimeError, ConnectionError):
-        prepared = execution.ExecutionPreparationRefused('The Hana source capture failed')
+    except (OSError, ValueError, RuntimeError, ConnectionError) as error:
+        prepared = execution.ExecutionPreparationRefused(f'The Hana source capture failed: {error}')
     if isinstance(prepared, execution.ExecutionPreparationRefused):
         closed = execution.settle_unpublished_claim(lifecycle.directory, claim.reserved.claim.reference,
             release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=prepared.reason)
@@ -2871,12 +2871,12 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                     continue
                 else:
                     reason = 'The captured Hana source needs a complete bundle'
-                    complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
                     source_update_sent = True
                     try:
+                        complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
                         _ = execution.publish_source_update(lifecycle.directory, prepared, complete, objects)
-                    except (OSError, ValueError, RuntimeError, ConnectionError):
-                        reason = 'The Hana source update publication is unresolved'
+                    except (OSError, ValueError, RuntimeError, ConnectionError) as error:
+                        reason = f'The Hana source update publication is unresolved: {error}'
                         break
                     time.sleep(configuration.whole('control_poll_seconds'))
                     continue

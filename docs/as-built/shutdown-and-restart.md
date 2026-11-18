@@ -63,6 +63,8 @@ Stall-watch retires the saved prompt keys on its next pass, even after launch de
 A cancellation error prints a separate warning and does not change the stop result.
 Workers keep their threads.
 Staff membership selects worker children for stop and restart.
+A retained worker pane at its shell or a closed pane still needs proof that the conversation stopped.
+An incomplete conversation read returns `StopUnproved`.
 These operations do not read a transport pin.
 
 `release_source(row, backend)` uses the current native conversation evidence.
@@ -153,6 +155,8 @@ Pane input waits up to ten seconds for the target shell to finish its startup wo
 Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
+Worker stop uses the backend in the staff snapshot for both native checks when that backend is available.
+Full restart and full stop require complete Claude registry discovery before they act.
 
 `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` delegates to the accounts move command.
 It normalizes the account label and preserves the result and output.
@@ -324,7 +328,7 @@ It publishes a retained binding when the live session has a proved pane.
 Two live sessions cause refusal before any staff write or launch.
 An unproved live session also causes refusal.
 The refusal names each conflicting session ID and pane on one line.
-An unreadable daemon registry also refuses admission.
+An unreadable Claude registry or daemon registry refuses producer admission.
 Recovery checks live sessions before it resumes a retained conversation.
 Recovery adopts a different proved live session and removes the pending admission record.
 Recovery resumes the retained conversation only when no other live session carries the producer name.

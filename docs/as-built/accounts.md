@@ -262,6 +262,8 @@ Only proof that the producer runs on the target permits a skip.
 Unreadable live account evidence prevents the stop, start, and home change.
 The [producer launch contract](shutdown-and-restart.md#producer-launch-and-admission) defines the shared move and publication checks.
 An empty group can still select its account.
+The preview and move report an incomplete member list when the Claude registry is unreadable.
+The move saves the group selection and limits session moves to members with live evidence.
 Each member has an independent result.
 A single-session move refuses a grouped session and names the group operation.
 The move path creates no ready mark, conductor, follow command, or cancellation step.
