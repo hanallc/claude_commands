@@ -15,9 +15,9 @@ from scripts.aws_target import ledger
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
+from scripts.lib.build_steps import read_step_names
 
-KINDS = (('gate', 'merge gates'), ('test-affected', 'targeted tests'))
-EVERY_KIND = tuple(mode for mode, _label in KINDS)
+KINDS = ('gate', 'test-affected')
 _MODE_ALIASES = {'merge-gate': 'gate', 'targeted-test': 'test-affected'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
@@ -38,9 +38,11 @@ class RunScope:
     modes: tuple[str, ...]
 
 
-SCOPES = (RunScope('gate', 'Merge gates', 'merge gate', ('gate',)),
-          RunScope('test-affected', 'Targeted runs', 'targeted test', ('test-affected',)),
-          RunScope('both', 'Both', 'run', EVERY_KIND))
+def scopes() -> tuple[RunScope, ...]:
+    gate = read_step_names().shown('gate')
+    return (RunScope('gate', gate.capitalize() + 's', gate, ('gate',)),
+            RunScope('test-affected', 'Targeted runs', 'targeted test', ('test-affected',)),
+            RunScope('both', 'Both', 'run', KINDS))
 
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})
@@ -290,7 +292,7 @@ class RunEvidence:
         Requests without a mode count only when the modes cover every kind.
         """
         kinds = tuple(dict.fromkeys(map(_run_kind, modes)))
-        counted = (*kinds, NO_MODE) if set(EVERY_KIND) <= set(kinds) else kinds
+        counted = (*kinds, NO_MODE) if set(KINDS) <= set(kinds) else kinds
         refused = sum(self.refused.get((size, region, mode), 0) for mode in counted)
         launched = sum(self.launched.get((size, region, mode), 0) for mode in counted)
         if not refused + launched:
@@ -307,7 +309,7 @@ class RunEvidence:
         box = ((Decimal(median(seconds)) if seconds else default_seconds)
                + (Decimal(0) if source is BoxTimeSource.OWN else unmeasured_extra_s))
         # Capacity refusals do not depend on the run kind, so every request counts.
-        refusals = self.refusals_per_launch(size, region, EVERY_KIND)[0] or Decimal(0)
+        refusals = self.refusals_per_launch(size, region, KINDS)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
 
 

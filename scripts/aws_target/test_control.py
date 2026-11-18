@@ -63,6 +63,7 @@ class ControlTests(CostFixture):
         self.notice_accepted = True
         self.failure_reason = 'AccessDenied: account 123456789012'
         self.omitted = ''
+        _ = (self.root / 'build_steps.conf').write_text('names.gate=gate\n')
         values_path = self.root / 'cloud_gate.conf'
         _ = write_config_fixture(values_path, """spot_candidate_regions=us-east-1 us-west-1 us-east-1
 instance_types=c7a.4xlarge m7a.2xlarge
@@ -366,10 +367,10 @@ gate_wait_usd_per_minute=0
                              * len(self.regions))
         # Every column after the region holds a number.
         self.assertEqual(tables[fast].headers[-1], 'paid runs')
-        self.assertIn('merge gate (minutes)', tables[fast].headers)
+        self.assertIn('gate (minutes)', tables[fast].headers)
         self.assertEqual(tables[fast].right, frozenset(range(1, len(tables[fast].headers))))
         self.assertEqual(merge_gates.summary_of(merge_gates.cheapest),
-                         f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
+                         f'Cheapest gate: {fast} in {home}, 0.0250 USD (estimate)')
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
         self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
         self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
@@ -475,7 +476,10 @@ gate_wait_usd_per_minute=0
         self.assertGreater(data["render_seconds"], 0)
         self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
-                         [('gate', 'Merge gates'), ('test-affected', 'Targeted runs'), ('both', 'Both')])
+                         [('gate', 'Gates'), ('test-affected', 'Targeted runs'), ('both', 'Both')])
+        self.assertTrue(data['runs'][0]['explanation'].startswith('USD per gate, '))
+        self.assertEqual(data['runs'][0]['refused']['title'], 'Refused gate requests (capacity and quota)')
+        self.assertEqual(data['runs'][0]['launched']['title'], 'Launched gate boxes')
         self.assertEqual([table['right'] for table in data['prices']],
                          [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
         # The fixture lowest zone price is 0.25 USD/h for every type and region; the region column has no number.
@@ -484,11 +488,12 @@ gate_wait_usd_per_minute=0
         self.assertEqual(prices['values'], [[None, *(0.25 for _ in prices['headers'][1:])] for _ in self.regions])
         # The run tables leave out the Spot price and the estimate, which the Cost per gate view shows.
         run_headers = data['runs'][0]['tables'][0]['headers']
+        self.assertIn('gate (minutes)', run_headers)
         self.assertNotIn(spot_table.SPOT_HEADER, run_headers)
         self.assertNotIn(spot_table.ESTIMATE_HEADER, run_headers)
         self.assertEqual(data['runs'][0]['tables'][0]['right'], list(range(1, len(run_headers))))
         self.assertEqual([table['title'] for table in data['runs'][0]['prices']],
-                         ['Standard cost per merge gate (USD; estimate)', 'GPU cost per merge gate (USD; estimate)'])
+                         ['Standard cost per gate (USD; estimate)', 'GPU cost per gate (USD; estimate)'])
         self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
         self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
         self.assertEqual(data['regions'], sorted(self.regions, key=aws_page.region_filter_key))

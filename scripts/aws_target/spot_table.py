@@ -117,7 +117,7 @@ class SpotTables:
     # The standard types, then the GPU types.
     prices: tuple[Table, ...]
     quotas: tuple[Table, ...]
-    # One entry for each scope in run_cost.SCOPES, in that order.
+    # One entry for each scope in run_cost.scopes(), in that order.
     runs: tuple[RunCosts, ...]
     hours: Table
     hours_note: str
@@ -232,7 +232,7 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
     default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
-    for scope in run_cost.SCOPES:
+    for scope in run_cost.scopes():
         explanation = (f'USD per {scope.noun}, last {days} days. Estimate: lowest zone Spot price x median box '
                        + f'time (boot included), plus refusal wait at {wait_cost} USD/min '
                        + f'({evidence.refusal_wait_s:.0f} s each). Paid: the AWS bill for the type and region, '
