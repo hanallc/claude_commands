@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import NamedTuple, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
@@ -154,18 +154,38 @@ def item_link(keeper: staff.StaffId, number: int) -> str:
     return '#' + urlencode({"item": f"{keeper}/L{number}"})
 
 
-def signed_token(secret: str, keeper: str, identity: str, request: str) -> str:
-    return hmac.new(secret.encode(), f"list:{keeper}:{identity}:{request}".encode(), hashlib.sha256).hexdigest()
+@dataclass(frozen=True)
+class ListFormRequestPrefix:
+    """Identify the rendered form and the unread update it shows."""
+
+    nonce: str
+    seen_update: the_list.UnreadUpdate | the_list.NoUnreadUpdate
+
+    @classmethod
+    def parse(cls, request: str) -> ListFormRequestPrefix:
+        match = re.fullmatch(r"(?P<nonce>[a-f0-9]{32})(?P<update>[a-f0-9]{64})?(?:\.[a-f0-9]{32})?", request)
+        if match is None:
+            raise question_record.AnswerRefused("the List request does not match this page")
+        fingerprint = match["update"]
+        return cls(match["nonce"], the_list.UnreadUpdate(fingerprint) if fingerprint else the_list.NoUnreadUpdate.ABSENT)
+
+    def format(self) -> str:
+        update = self.seen_update
+        return self.nonce + (update.fingerprint if isinstance(update, the_list.UnreadUpdate) else "")
 
 
-def request_token(root: Path, keeper: str, identity: str, request: str) -> str:
-    """Authorize a request within the signed form for this item."""
+def signed_token(secret: str, keeper: str, identity: str, prefix: str) -> str:
+    return hmac.new(secret.encode(), f"list:{keeper}:{identity}:{prefix}".encode(), hashlib.sha256).hexdigest()
+
+
+def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
+    """Authorize the form prefix for this item."""
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
-    return signed_token(secret, keeper, identity, request.partition(".")[0])
+    return signed_token(secret, keeper, identity, prefix)
 
 
 def feedback_form(entry: ListRecord, secret: str) -> str:
-    request = secrets.token_hex(16)
+    request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item)).format()
     token = signed_token(secret, entry.keeper, entry.item.id, request)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
     hidden = ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
@@ -314,16 +334,30 @@ class ListQuestionDelivery:
     status: change_page.DeliveryStatus
 
 
-def fresh_request(root: Path, keeper: str, identity: str) -> dict[str, str]:
-    request = secrets.token_hex(16)
+class SavedActionState(TypedDict):
+    unread: str
+    item_state: str
+    parked: str
+    parked_until: str
+
+
+def saved_action_state(keeper: str, identity: str) -> SavedActionState:
     item = the_list.load(staff.StaffId(keeper), identity)
     zone = user_zone()
     today = the_list.now()
     parked_until = (the_list.parking_date(item.parked_until, zone)
                     if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
-    return {"request": request, "token": request_token(root, keeper, identity, request),
-            "unread": str(isinstance(item.unread_since, datetime)).lower(), "item_state": item.state.value,
+    return {"unread": str(isinstance(item.unread_since, datetime)).lower(), "item_state": item.state.value,
             "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
+
+
+def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
+                           update: the_list.UnreadUpdate | the_list.NoUnreadUpdate) -> None:
+    if isinstance(update, the_list.UnreadUpdate) and update == the_list.unread_update(item):
+        try:
+            _ = the_list.mark_read(keeper, item.id, source=the_list.PAGE_SOURCE, update=update)
+        except (OSError, the_list.ListError):
+            pass
 
 
 def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None
@@ -333,24 +367,28 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     keeper, identity, request = fields["keeper"][0], fields["id"][0], fields["request"][0]
-    if re.fullmatch(r"[a-f0-9]{32}(?:\.[a-f0-9]{32})?", request) is None or re.fullmatch(r"L[1-9]\d*", identity) is None:
+    if re.fullmatch(r"L[1-9]\d*", identity) is None:
         raise question_record.AnswerRefused("the List request does not match this page")
-    expected = request_token(root, keeper, identity, request)
+    prefix = ListFormRequestPrefix.parse(request)
+    expected = request_token(root, keeper, identity, prefix.format())
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
         raise question_record.AnswerRefused("the List token does not match this page")
     morty = staff.snapshot().by_id(staff.StaffId(keeper))
     if morty is None or morty.kind != "producer" or morty.name != "morty":
         raise question_record.AnswerRefused("the item has no morty producer")
     action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
-    if action == "question":
-        status = change_page.DeliveryStatus(root) if status is None else status
-        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
-        return ListQuestionDelivery(question, status) if isinstance(question, change_page.MessageDelivery) else question
     if action == "read":
         _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE,
                                page_request=the_list.PageRequest(request, "read", words))
         return change_page.NoMessageDelivery()
     item = the_list.load(morty.id, identity)
+    if action == "question":
+        status = change_page.DeliveryStatus(root) if status is None else status
+        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
+        if isinstance(question, change_page.MessageDelivery):
+            _mark_seen_update_read(morty.id, item, prefix.seen_update)
+            return ListQuestionDelivery(question, status)
+        return question
     if action == "remove":
         notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words)
         changed = the_list.close(morty.id, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
@@ -360,13 +398,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {until}.", "park", words)
         changed = the_list.park(morty.id, identity, the_list.time_value(until), source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "tell" and words and len(words) <= 10000:
-        target = the_list.unread_update(item)
-        saved = the_list.save_feedback(morty.id, identity, the_list.PageFeedback(request, words, read_update=target))
-        if isinstance(saved.read_update, the_list.UnreadUpdate) and saved.read_update == target:
-            try:
-                _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE, update=saved.read_update)
-            except (OSError, the_list.ListError):
-                pass
+        saved = the_list.save_feedback(morty.id, identity,
+                                       the_list.PageFeedback(request, words, read_update=prefix.seen_update))
+        _mark_seen_update_read(morty.id, item, saved.read_update)
         return ListFeedbackDelivery(morty.id, identity, request) if saved.state == "pending" else change_page.NoMessageDelivery()
     else:
         raise question_record.AnswerRefused("enter words for morty")
@@ -602,6 +636,7 @@ function bind(){
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
   const syncTell=()=>{ask.disabled=tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();};
+  // Keep the signed update from the rendered row until the row refreshes.
   const signed={request:form.elements.request.value,token:form.elements.token.value};
   let fresh=signed;
   const newRequest=()=>({
@@ -632,7 +667,7 @@ function bind(){
    form.dataset.sending='true';saving++;pageRefresh.abandon();
    let buttons=[...item.querySelectorAll('button')],saved=false,refused=false;
    buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
-   const clearsUnread=action==='read' || action==='tell',unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
+   const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove') item.dataset.state='Closed';
    if(action==='park') item.dataset.parked='true';
    if(clearsUnread) item.dataset.unread='false';
@@ -646,9 +681,8 @@ function bind(){
     saved=true;
     const unread=result.unread==='true';
     notice.textContent=action==='remove' ? 'Removed' : action==='park' ? 'Parked' : action==='read' ? 'Marked read' :
-     action==='question' ? 'Question saved' :
+     action==='question' ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
-    signed.request=result.request;signed.token=result.token;fresh=signed;
     if(usesWords && words.value===data.get('words')) words.value='';
     if(typeof result.item_state==='string') confirmed.state=result.item_state;
     if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;

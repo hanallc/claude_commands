@@ -703,21 +703,24 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry without sending a message.
-Tell morty also marks an unread update read through the same path.
-It saves the feedback before it marks the update read.
-Each request keeps the identity of the update it saw.
+Ask question and Tell morty use the same path to mark the update read after the action saves.
+The form signature includes the identity of the unread update that the row shows.
+A new Ask question or Tell morty request can mark only that update read.
 A repeated request cannot mark a newer update read.
+An exact Tell morty retry uses the read target saved with the feedback.
 The store checks the update identity under its lock.
-This check also preserves an update that arrives between feedback storage and the read write.
+This check preserves an update that arrives between the action save and the read write.
 An update identity includes its time and log history.
 Two updates with the same time keep separate identities.
-Tell morty adds no read entry when the item has no unread update.
+Ask question and Tell morty add no read entry when the form shows no unread update.
 The POST response includes the current unread state.
+The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
-If the read write fails, the feedback remains saved and the sender can deliver it.
-The page shows “sent to morty; update remains unread” and keeps the unread controls.
-The same notice appears when a newer update remains unread.
+If the read write fails, the question or feedback remains saved and the sender can deliver it.
+The page keeps the unread controls when the read write fails or a newer update remains unread.
+Ask question shows “Question saved; update remains unread” in both cases.
+Tell morty shows “sent to morty; update remains unread” in both cases.
 It applies the current filter again, so a read item leaves the Unread view at once.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
@@ -743,7 +746,7 @@ A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove leaves Open at once when the user presses the button.
 Park leaves Open and enters Parked at once.
-The row leaves Unread as soon as the user presses Mark read or Tell morty.
+The row leaves Unread when the user presses Mark read, Ask question, or Tell morty.
 The row returns if the server reports an unread update.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
@@ -752,7 +755,7 @@ A second press sends no request.
 The page applies the saved state and parking status from the response.
 The page uses the saved date to update one parking label.
 A refusal restores the last state and parking status from the server.
-A failed Mark read or Tell morty request restores the unread state.
+A failed Mark read, Ask question, or Tell morty request restores the unread state.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
 Each row keeps its own inline failure notice.
