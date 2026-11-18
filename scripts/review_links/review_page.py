@@ -726,7 +726,8 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
               'Investigations and Bugs <b></b></button>')
     chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
                      +' <b></b></button>' for kind in TYPES)
-    chips += '<button class="review-new" type="button" data-review-new><span aria-hidden="true">+</span>New</button>'
+    chips = ('<div class="review-type-options">'+chips+'</div>'
+             +'<button class="review-new" type="button" data-review-new><span aria-hidden="true">+</span>New</button>')
     shows = ''.join('<button id="review-show-'+value.lower().replace(' ', '-')+'" type="button" data-show-chip="'
                     +value+'" aria-pressed="'+str(value == show).lower()+'">'+label
                     +' <b></b></button>' for value, label in SHOWS)
@@ -891,6 +892,13 @@ STYLE = '''<style>
 .review-types button{max-width:100%;overflow-wrap:anywhere}
 :is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
+.review-type-options button,.review-types .review-new{padding-inline:8px;gap:5px;font-size:13px;white-space:nowrap}
+.review-type-options .review-icon{margin-right:0}
+.review-type-options{display:contents}
+@media(min-width:961px){
+.record-filter-row>.review-types:has(>.review-type-options){display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start}
+.review-type-options{display:flex;flex-wrap:wrap;gap:inherit}
+}
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}

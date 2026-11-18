@@ -811,18 +811,6 @@ def proposal_belongs_to(issue: Issue, owner: staff.StaffId, proposers: set[staff
     return proposal_issue.proposal_owner(issue, legacy_owner) == owner
 
 
-def proposal_store_folders(owner: staff.StaffId, member: staff.StaffRow | None, doc: Path | None,
-                           sources: list[Path] | None) -> tuple[Path, ...]:
-    current: tuple[Path, ...] = ()
-    if member is not None and member.kind == 'producer' and isinstance(member.doc, staff.LiveDoc):
-        with guard_source(member.doc.path, sources, skip=(FileNotFoundError,)):
-            folder = review_submissions.proposal_folder(member)
-            if isinstance(folder, Path):
-                current = (folder,)
-    return record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, current, document=doc,
-                                      strict=sources is not None, sources=sources)
-
-
 def read_proposal_prerequisite(path: Path, dependency: str, owner: staff.StaffId,
                                proposers: set[staff.StaffId], retained: Path | None,
                                sources: list[Path] | None) -> str:
@@ -886,14 +874,14 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     if own is None:
         folders: dict[Path, list[Path | staff.StaffId]] = {}
         for scope, owner in scopes.items():
-            member = members.by_id(owner)
-            doc = scope if isinstance(scope, Path) else record_store.local_document(member)
             if exact:
                 if selection.key == 'proposal/'+str(selection.path):
                     paths_by_scope.setdefault(selection.path, []).append(scope)
                 continue
+            doc = scope if isinstance(scope, Path) else record_store.local_document(members.by_id(owner))
             with guard_source(doc if doc is not None else state_root(), sources):
-                for folder in proposal_store_folders(owner, member, doc, sources):
+                for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc,
+                                                         strict=sources is not None, sources=sources):
                     folders.setdefault(folder, []).append(scope)
         for folder, owners in folders.items():
             for path in store_paths((folder,), sources):

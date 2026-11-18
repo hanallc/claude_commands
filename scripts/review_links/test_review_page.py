@@ -321,7 +321,8 @@ class ReviewPageTests(unittest.TestCase):
         archive_snapshot = archive_cache.get()
         record = archive_snapshot.records[created.key]
         self.assertEqual(record.queue_after, str(archived))
-        with (patch.object(review_items, 'proposal_store_folders', side_effect=AssertionError('The exact read scanned folders.')),
+        with (patch('scripts.production.record_store.known_folders',
+                    side_effect=AssertionError('The exact read scanned folders.')),
               patch.object(review_items, 'store_paths', side_effect=AssertionError('The exact read listed records.'))):
             self.assertEqual(review_items.read_current(self.root, record, archive_snapshot.members), record)
             retry = archive_cache.create_submission(request)
@@ -698,6 +699,21 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertTrue(any(str(proposal_path) in notice for notice in broken.notices))
                 with self.assertRaises(PermissionError):
                     _ = review_items.read_current(self.root, moved.records[issue], staff.snapshot())
+
+    def test_snapshot_ignores_producer_documents_and_reports_missing_production(self) -> None:
+        directory = self.fixture.temporary / 'brain'
+        directory.mkdir()
+        missing_producer = self.fixture.temporary / 'current.md'
+        missing_production = self.fixture.temporary / 'production-missing.md'
+        _ = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
+        _ = fixture_member('producer', name='morty', doc=staff.LiveDoc(local_machine(), missing_producer))
+        _ = fixture_member('showrunner', name='missing', doc=staff.LiveDoc(local_machine(), missing_production))
+
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertIn(f'Could not load {missing_production}.', snapshot.notices)
+        for path in (directory, missing_producer):
+            self.assertNotIn(f'Could not load {path}.', snapshot.notices)
+            self.assertNotIn(path, snapshot.source_stamps)
 
     def test_change_projection_isolates_an_unreadable_production_path(self) -> None:
         doc = self.fixture.temporary / 'unreadable.md'
@@ -3564,6 +3580,34 @@ window.fetch=async(url)=>{
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_button_stays_on_the_type_row_at_desktop_width(self) -> None:
+        markup = review_page.build_snapshot(self.root).page.decode()
+        probe = r'''<script>
+(async()=>{
+ const failures=[];
+ frameElement.style.width='1280px';
+ await document.fonts.ready;
+ const group=document.querySelector('[role="group"][aria-label="Type"]');
+ const chips=[...group.querySelectorAll('[data-type-chip]:not([hidden])')];
+ const button=group.querySelector('[data-review-new]');
+ const singleLine=()=>{
+  const bounds=button.getBoundingClientRect(),right=group.getBoundingClientRect().right;
+  return innerWidth===1280 && bounds.width>0 && bounds.right<=right+1 && chips.every(chip=>{
+   const rect=chip.getBoundingClientRect();
+   return Math.abs(rect.top-bounds.top)<=1 && rect.right<=bounds.left && rect.height<=bounds.height+1;
+  });
+ };
+ if(!singleLine()) failures.push('The New button must fit on the Type row at 1280 px.');
+ const counts=['3606','512','2709','1','219','165','0'];
+ chips.forEach((chip,index)=>chip.querySelector('b').textContent=counts[index]);
+ if(!singleLine()) failures.push('The Type row must fit when the counts have more digits.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        markup = markup.replace('</body>', probe + '</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:
