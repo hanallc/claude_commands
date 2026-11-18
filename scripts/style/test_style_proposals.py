@@ -42,7 +42,7 @@ from scripts.production.issues import Issue, frontmatter, open_issues
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id
 from scripts.style.style_proposals import FilingResult
 from scripts.production.staff_test_support import isolated_staff_file, recorded_unit, fixture_member, fixture_runtime_id
-from scripts.production import staff, unit_names
+from scripts.production import record_store, staff, unit_names
 
 from scripts.style.style_reader_test_support import oracle_reader
 
@@ -143,6 +143,7 @@ class StyleProposalsTests(unittest.TestCase):
         self.template = self.root / "issue.yaml"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
         })))
@@ -299,6 +300,221 @@ class StyleProposalsTests(unittest.TestCase):
                              {first.finding_id, later.finding_id})
             self.assertEqual(tuple(item.path for item in style_proposals.approved_decisions(self.proposals, "names")), (issue,))
 
+    def test_f066_style_readers_keep_decisions_in_the_former_folder(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue, = self.file(ledger)
+            owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+            assert isinstance(owner.doc, staff.LiveDoc)
+            current = self.proposals.with_name("new-issues")
+            current.mkdir()
+            _ = owner.doc.path.write_text(owner.doc.path.read_text() + f"\n- **Proposals:** {current}\n")
+            registry = record_store.state_root() / "review-folders" / owner.id / "proposal.json"
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            _ = registry.write_text(json.dumps([str(self.proposals)]))
+            _ = issue.write_text(re.sub(r"Proposed ranking: .*", "Proposed ranking: ", issue.read_text()))
+            with redirect_stdout(io.StringIO()):
+                style_proposals.rank_proposals(ledger, current)
+            self.assertRegex(issue.read_text(), r"Proposed ranking: goal ")
+            _ = proposal_issue.approve(issue, {"unit": "names"}, "user", owner.name, date(2026, 11, 17))
+            with mock.patch.object(style_proposals, "owned_decision_rules", return_value=frozenset({self.rename})):
+                self.assertEqual([decision.path for decision in style_proposals.approved_decisions(current, "names")], [issue])
+            late = self.hold(ledger, line=2)
+            ledger.file_held(late.finding_id, issue)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(style_proposals.file_proposals(ledger, current, "parent").filed, ())
+            self.assertEqual(frontmatter(issue)["style_count"], ["2"])
+
+    def test_f080_style_create_files_for_the_standing_production(self) -> None:
+        with self.ledger() as ledger:
+            members = staff.snapshot()
+            owner = next(row for row in members.find(kind="showrunner") if row.name == "sample-style")
+            other = next(row for row in members.find(kind="showrunner") if row.id != owner.id)
+            caller = fixture_member("unit", name="caller", parent=other.id)
+            finding = self.hold(ledger)
+            writer = style_proposals.decision_writer(ledger, self.proposals, "parent")
+            key = style_proposals.DecisionKey(finding.rule, "alpha", finding.rule_blob)
+            with mock.patch.object(staff, "caller_identity", return_value=caller.current_session):
+                path = writer.create(key, (finding,), {})
+            self.assertEqual(frontmatter(path)["production_id"], [owner.id])
+            self.assertEqual(frontmatter(path)["proposed_by"], [caller.id])
+            self.assertEqual(style_proposals.find_decision(self.proposals, key, owner=owner.id), path)
+            self.assertEqual(writer.create(key, (finding,), {}), path)
+            self.assertEqual(list(self.proposals.glob("*.md")), [path])
+
+    def test_f088_moved_unit_keeps_its_legacy_decision_in_the_registered_store(self) -> None:
+        self.check_moved_unit_legacy_decision(registered=True)
+
+    def test_f091_moved_unit_keeps_its_legacy_decision_in_the_documents_store(self) -> None:
+        self.check_moved_unit_legacy_decision(registered=False)
+
+    def check_moved_unit_legacy_decision(self, *, registered: bool) -> None:
+        with self.ledger() as ledger:
+            members = staff.snapshot()
+            owner = next(row for row in members.find(kind="showrunner") if row.name == "sample-style")
+            former = next(row for row in members.find(kind="showrunner") if row.id != owner.id)
+            unit = next(row for row in members.find(kind="unit", parent=owner.id))
+            former_store = self.root / "former" / "issues"
+            archive = former_store / "archive"
+            archive.mkdir(parents=True)
+            registry = record_store.state_root() / "review-folders" / former.id / "proposal.json"
+            if registered:
+                registry.parent.mkdir(parents=True)
+                _ = registry.write_text(json.dumps([str(former_store)]))
+            else:
+                former_doc = self.root / "former.md"
+                _ = former_doc.write_text(f"- **Proposals:** {former_store}\n")
+                _ = staff.set_doc(former.id, staff.LiveDoc(remote.local_machine(), former_doc))
+                self.assertFalse(registry.exists())
+            finding = self.hold(ledger)
+            key = style_proposals.DecisionKey(finding.rule, "alpha", finding.rule_blob)
+            legacy = archive / style_proposals.batch_name(key)
+            original = (f"---\ntags: [issue, proposal, style]\nstatus: open\nproposed_by: {unit.id}\n"
+                        f'proposal_id: P7\nstyle_rule: "{key.rule}"\nstyle_crate: {key.crate}\n'
+                        f"style_rule_blob: {key.blob}\n---\nKeep this legacy decision.\n")
+            _ = legacy.write_text(original)
+            ordinary = former_store / "ordinary proposal.md"
+            _ = ordinary.write_text(f"---\nstatus: open\ntags: [proposal]\nproposed_by: {unit.id}\n---\n")
+            self.assertEqual(style_proposals.find_decision(self.proposals, key, owner=owner.id), legacy)
+            self.assertEqual([issue.path for issue in proposal_issue.proposal_store_issues(
+                self.proposals, owner=owner.id)], [legacy])
+            writer = style_proposals.decision_writer(ledger, self.proposals, "parent")
+            self.assertEqual(writer.create(key, (finding,), {}), legacy)
+            self.assertEqual(style_proposals.find_decision(former_store, key, owner=former.id), legacy)
+            self.assertEqual(legacy.read_text(), original)
+            self.assertEqual(list(self.proposals.glob("*.md")), [])
+
+    def test_f094_create_refuses_an_unreadable_former_production_document(self) -> None:
+        members = staff.snapshot()
+        owner = next(row for row in members.find(kind="showrunner") if row.name == "sample-style")
+        former = next(row for row in members.find(kind="showrunner") if row.id != owner.id)
+        unit = next(row for row in members.find(kind="unit", parent=owner.id))
+        former_store = self.root / "former" / "issues"
+        archive = former_store / "archive"
+        archive.mkdir(parents=True)
+        doc = self.root / "former.md"
+        _ = doc.write_text(f"- **Proposals:** {former_store}\n")
+        _ = staff.set_doc(former.id, staff.LiveDoc(remote.local_machine(), doc))
+        legacy = archive / "legacy.md"
+        original = (f"---\ntags: [issue, proposal, style]\nstatus: open\nproposed_by: {unit.id}\n"
+                    "proposal_id: P7\nstyle_rule: names\nstyle_crate: alpha\n"
+                    "style_rule_blob: blob\n---\nKeep this decision.\n")
+        _ = legacy.write_text(original)
+        requested = self.proposals / "decision.md"
+        result = self.root / "filed-path"
+        read = Path.read_text
+        for failure in (PermissionError, FileNotFoundError):
+            with self.subTest(failure=failure):
+                attempted = False
+
+                def fail_first_read(path: Path, *args: str, **kwargs: str) -> str:
+                    nonlocal attempted
+                    if path == doc and not attempted:
+                        attempted = True
+                        raise failure("Cannot read the former production document.")
+                    return read(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "read_text", autospec=True, side_effect=fail_first_read):
+                    with self.assertRaisesRegex(failure, "Cannot read the former production document"):
+                        _ = proposal_issue.create(requested, "sample", "sample", unit.id, ["style"], "names",
+                                                  "alpha", "blob", 1, "Details", self.template, date(2026, 11, 18),
+                                                  initial_fields={}, owner=owner.id, result_file=result)
+                self.assertFalse(result.exists())
+                self.assertEqual(list(self.proposals.glob("*.md")), [])
+                self.assertEqual(legacy.read_text(), original)
+
+    def test_f097_create_refuses_the_first_failed_read_of_the_current_document(self) -> None:
+        owner = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "sample-style")
+        doc = self.root / "current.md"
+        configured = self.root / "configured" / "proposals"
+        archive = configured / "archive"
+        archive.mkdir(parents=True)
+        _ = doc.write_text(f"- **Proposals:** {configured}\n")
+        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
+        legacy = archive / "legacy.md"
+        original = (f"---\ntags: [issue, proposal, style]\nstatus: open\nproduction_id: {owner.id}\n"
+                    "proposal_id: P7\nstyle_rule: names\nstyle_crate: alpha\n"
+                    "style_rule_blob: blob\n---\nKeep this decision.\n")
+        _ = legacy.write_text(original)
+        result = self.root / "filed-path"
+        read = Path.read_text
+        attempted = False
+
+        def fail_first_read(path: Path, *args: str, **kwargs: str) -> str:
+            nonlocal attempted
+            if path == doc and not attempted:
+                attempted = True
+                raise FileNotFoundError("Cannot read the current production document.")
+            return read(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=fail_first_read):
+            with self.assertRaisesRegex(FileNotFoundError, "Cannot read the current production document"):
+                _ = proposal_issue.create(self.proposals / "decision.md", "sample", "sample", owner.id,
+                                          ["style"], "names", "alpha", "blob", 1, "Details", self.template,
+                                          date(2026, 11, 18), initial_fields={}, owner=owner.id, result_file=result)
+        self.assertFalse(result.exists())
+        self.assertEqual(list(self.proposals.glob("*.md")), [])
+        self.assertEqual(legacy.read_text(), original)
+
+    def test_f084_style_reader_and_create_skip_another_proposers_archive(self) -> None:
+        with self.ledger() as ledger:
+            members = staff.snapshot()
+            owner = next(row for row in members.find(kind="showrunner") if row.name == "sample-style")
+            other = next(row for row in members.find(kind="showrunner") if row.id != owner.id)
+            assert isinstance(owner.doc, staff.LiveDoc)
+            archive = self.proposals.parent / proposal_issue.ARCHIVE
+            archive.mkdir(parents=True)
+            finding = self.hold(ledger)
+            key = style_proposals.DecisionKey(finding.rule, "alpha", finding.rule_blob)
+            legacy = archive / style_proposals.batch_name(key)
+            original = (f"---\ntags: [issue, proposal, style]\nstatus: open\nproposed_by: {other.name}\n"
+                        f'proposal_id: P7\nstyle_rule: "{key.rule}"\nstyle_crate: {key.crate}\n'
+                        f"style_rule_blob: {key.blob}\n---\nThe other production decided.\n")
+            _ = legacy.write_text(original)
+            self.assertNotIn(legacy, [issue.path for issue in proposal_issue.proposal_store_issues(
+                self.proposals, owner=owner.id)])
+            self.assertIsInstance(style_proposals.find_decision(self.proposals, key, owner=owner.id),
+                                  proposal_issue.DecisionNotFiled)
+            filed, = self.file(ledger)
+            self.assertEqual(filed.parent, self.proposals)
+            self.assertEqual(frontmatter(filed)["production_id"], [owner.id])
+            self.assertEqual(legacy.read_text(), original)
+
+    def test_f077_shared_folder_selects_the_style_productions_decision(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue, = self.file(ledger)
+            members = staff.snapshot()
+            owner = next(row for row in members.find(kind="showrunner") if row.name == "sample-style"
+                         and isinstance(row.doc, staff.LiveDoc))
+            other = next(row for row in members.find(kind="showrunner") if row.id != owner.id)
+            assert isinstance(owner.doc, staff.LiveDoc)
+            current = self.proposals.with_name("shared")
+            current.mkdir()
+            _ = owner.doc.path.write_text(owner.doc.path.read_text() + f"\n- **Proposals:** {current}\n")
+            other_doc = self.root / "docs" / "plans" / "another.md"
+            other_doc.parent.mkdir(parents=True, exist_ok=True)
+            _ = other_doc.write_text(f"- **Proposals:** {current}\n")
+            other = replace(other, doc=staff.LiveDoc(remote.local_machine(), other_doc))
+            shared = staff.StaffSnapshot((other, *(row for row in members.rows if row.id != other.id)))
+            _ = proposal_issue.approve(issue, {"unit": "names"}, "user", owner.name, date(2026, 11, 17))
+            fields = Issue(issue, frontmatter(issue))
+            occupied = current / issue.name
+            content, _ = proposal_issue.set_fields(issue.read_text(), {"production_id": other.id, "proposal_id": "P2"}, occupied)
+            _ = occupied.write_text(content)
+            with (mock.patch.object(staff, "snapshot", return_value=shared),
+                  mock.patch.object(style_proposals, "owned_decision_rules", return_value=frozenset({self.rename}))):
+                self.assertEqual([decision.path for decision in style_proposals.approved_decisions(current, "names")], [issue])
+                filed: list[Path] = []
+                created = proposal_issue.create(
+                    occupied, "sample", "s", owner.name, ["style"], fields.value("style_rule"),
+                    fields.value("style_crate"), fields.value("style_rule_blob"), 1, "Examples", self.template,
+                    date(2026, 11, 17), initial_fields={}, filed_at=filed.append)
+            self.assertFalse(created)
+            self.assertEqual(filed, [issue])
+            self.assertEqual(frontmatter(issue)["production_id"], [owner.id])
+            self.assertEqual(occupied.read_text(), content)
+
     def test_refiling_writes_no_unchanged_decision_and_repairs_a_stale_count(self) -> None:
         with self.ledger() as ledger:
             _, _ = self.hold(ledger), self.hold(ledger, crate="beta")
@@ -422,6 +638,30 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertNotEqual(new, old)
             self.assertNotEqual(frontmatter(new)["style_rule_blob"], frontmatter(old)["style_rule_blob"])
 
+    def reserve_archived_decision_name(self, key: style_proposals.DecisionKey) -> Path:
+        archive = self.proposals / "archive"
+        archive.mkdir(parents=True)
+        occupied = archive / style_proposals.batch_name(key)
+        _ = occupied.write_text("An archived document uses this name.\n")
+        return occupied
+
+    def test_filing_uses_the_alternate_decision_path(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            key = style_proposals.decision_key(finding, style_proposals.workspace_directories(ledger))
+            self.proposals.mkdir(parents=True)
+            occupied = self.proposals / style_proposals.batch_name(key)
+            _ = occupied.write_text("---\nproposal_id: P1\ntags: [proposal]\n---\nAn active proposal uses this name.\n")
+            before = occupied.read_bytes()
+            with redirect_stdout(io.StringIO()) as output:
+                result = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            actual, = self.proposals.glob(f"{occupied.stem} p*.md")
+            self.assertEqual(result.filed, (actual,))
+            self.assertEqual(style_proposals.find_decision(self.proposals, key), actual)
+            self.assertEqual([item.finding_id for item in ledger.proposal_findings(actual)], [finding.finding_id])
+            self.assertIn(f"filed {actual}", output.getvalue())
+            self.assertEqual(occupied.read_bytes(), before)
+
     def test_decision_body_limits_examples_and_chooses_short_pairs_from_distinct_files(self) -> None:
         with self.ledger() as ledger:
             first = self.hold(ledger)
@@ -447,6 +687,22 @@ class StyleProposalsTests(unittest.TestCase):
         for finding in findings:
             ledger.file_held(finding.finding_id, issue)
         return issue
+
+    def test_migration_uses_the_alternate_decision_path(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            key = style_proposals.decision_key(finding, style_proposals.workspace_directories(ledger))
+            occupied = self.reserve_archived_decision_name(key)
+            original = self.legacy_issue(ledger, "old", finding)
+            with redirect_stdout(io.StringIO()) as output:
+                style_proposals.migrate(ledger, self.proposals, "parent")
+            actual, = self.proposals.glob(f"{occupied.stem} p*.md")
+            self.assertEqual([item.finding_id for item in ledger.proposal_findings(actual)], [finding.finding_id])
+            self.assertIn(f"move 1 findings to {actual}", output.getvalue())
+            self.assertEqual(frontmatter(original)["status"], ["closed"])
+            self.assertIn(actual.name, original.read_text())
+            self.assertFalse((self.proposals / occupied.name).exists())
+            self.assertEqual(occupied.read_text(), "An archived document uses this name.\n")
 
     def test_migration_dry_run_moves_nothing_and_merges_three_issues_idempotently(self) -> None:
         with self.ledger() as ledger:
@@ -598,7 +854,10 @@ class StyleProposalsTests(unittest.TestCase):
     def test_migration_stopped_before_its_moves_ends_like_one_clean_run(self) -> None:
         results: list[tuple[dict[str, bytes], dict[str, tuple[str, str]]]] = []
         for name, stopped in (("clean", False), ("stopped", True)):
-            with mock.patch.dict(os.environ, {"STYLE_LEDGER_STATE_DIR": str(self.root / name / "state")}):
+            with mock.patch.dict(os.environ, {
+                "STYLE_LEDGER_STATE_DIR": str(self.root / name / "state"),
+                "SHOWRUNNER_STATE_DIR": str(self.root / name / "showrunner-state"),
+            }):
                 self.proposals = self.root / name / "vault/issues"
                 with self.ledger() as ledger:
                     ledger.set_tip(self.tip, "style/main")

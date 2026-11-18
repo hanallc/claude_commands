@@ -15,7 +15,7 @@ from typing import TypedDict, cast
 import unittest
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
 
@@ -121,6 +121,9 @@ fi
             run = self.identity(fixture, outer)
             first = fixture.request(run=run)
             _ = fixture.finish_step(first)
+            fixture.allow_next_start()
+            # A live reservation keeps the oversized continuation in the queue.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.free(0)
             fixture.clock.advance(1)
             peer = fixture.request()
