@@ -33,6 +33,7 @@ SERVER_TIMEOUT_MS = 60_000
 
 def _resume_saved(session: str, client: herdr.Herdr, pane: herdr.TabSession,
                   original: pane_record.PaneLaunch, entry: pane_launch.CurrentLaunch, *, reported_unknown: str) -> None:
+    # Check occupancy before the launch path checks the selected owner.
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr_types.HerdrFailure("the pane runs a program")
     kind = pane_launch.saved_kind(entry)
