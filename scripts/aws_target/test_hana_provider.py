@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.test_hana_box import write_lifecycle_configuration
 from scripts.lib import conf
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -29,6 +30,7 @@ class FakeAws:
     userdata: str = ''
     failure: str = ''
     lose_response: str = ''
+    puts_before_timeout: int = -1
     status: str = 'instance-stopped-by-user'
     ownership: str = IDENTITY.deployment
     objects: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -67,6 +69,9 @@ class FakeAws:
         elif operation in ('put-object', 'get-object'):
             key = arguments[arguments.index('--key') + 1]
             if operation == 'put-object':
+                if self.puts_before_timeout == 0:
+                    raise subprocess.TimeoutExpired('fixture put', timeout)
+                self.puts_before_timeout -= 1
                 self.objects[key] = ledger.mapping(cast(object, json.loads(Path(arguments[arguments.index('--body') + 1]).read_text())))
             elif key in self.objects:
                 _ = Path(arguments[-3]).write_text(json.dumps(self.objects[key]))
@@ -94,7 +99,7 @@ class HanaProviderTests(CostFixture):
         super().setUp()
         self.clock = TestClock()
         self.workload = self.root / 'hana_aws.conf'
-        _ = self.workload.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
+        write_lifecycle_configuration(self.workload)
         self.fake = FakeAws(self.clock)
         settings = conf.read(self.workload)
         self.provider = provider.AwsHanaProvider(aws_target.AwsCli('fixture-scaler', IDENTITY.region,
@@ -206,13 +211,100 @@ class HanaProviderTests(CostFixture):
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertIsInstance(self.provider.recover(IDENTITY, self.start(), operation), box.MutationUnresolved)
 
+    def test_stopped_bootstrap_reuses_the_saved_descriptor_before_start(self) -> None:
+        controller = box.HanaController(self.state, self.settings, self.workload, self.provider, clock=self.clock)
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
+        book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
+        controller.register(IDENTITY)
+        _ = controller.request('fixture-execution')
+        self.fake.failure = 'put-object'
+        self.fake.userdata = 'fixture-old-data'
+        with self.assertRaises(provider.ProviderPending):
+            _ = controller.tick()
+        pending = controller.inspect()
+        assert isinstance(pending, box.HanaLifecycleEvidence) and isinstance(pending.operation, box.PendingOperation)
+        self.assertEqual(pending.operation.action, box.Action.BOOTSTRAP)
+        saved_path = self.state / 'hana/provider' / (pending.operation.token + '.json')
+        saved = ledger.mapping(cast(object, json.loads(saved_path.read_text())))
+        self.assertEqual(saved['dispatched'], True)
+        self.fake.failure = ''
+        self.clock.advance(1)
+        self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
+        accepted = ledger.mapping(cast(object, json.loads(saved_path.read_text())))
+        self.assertEqual(accepted['accepted'], True)
+        self.assertEqual(accepted['descriptor'], saved['descriptor'])
+        self.assertEqual(accepted['token'], pending.operation.token)
+        self.assertEqual(cast(object, json.loads(base64.b64decode(self.fake.userdata))), saved['descriptor'])
+        self.assertEqual(len(self.fake.objects), 3)
+        operations = [op for _, op, _ in self.fake.calls]
+        self.assertEqual(operations.count('export-credentials'), 1)
+        self.assertNotIn('start-instances', operations)
+        ready_to_start = controller.inspect()
+        assert isinstance(ready_to_start, box.HanaLifecycleEvidence)
+        assert isinstance(ready_to_start.operation, box.PendingOperation)
+        self.assertEqual(ready_to_start.operation.action, box.Action.START)
+
+    def test_bootstrap_restarts_at_the_next_unconfirmed_put(self) -> None:
+        operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
+        for _step in range(2):
+            self.fake.puts_before_timeout = 1
+            with self.assertRaises(provider.ProviderPending):
+                _ = self.provider.step(IDENTITY, start, operation)
+            self.assertEqual(self.fake.userdata, '')
+        self.fake.puts_before_timeout = 1
+        self.assertEqual(self.provider.step(IDENTITY, start, operation), box.OperationAccepted(operation.token))
+        self.assertEqual(len(self.fake.objects), 3)
+        operations = [op for _, op, _ in self.fake.calls]
+        self.assertEqual(operations.count('export-credentials'), 1)
+        self.assertEqual(operations.count('put-object'), 5)
+        self.assertEqual(operations.count('modify-instance-attribute'), 1)
+
     def test_bootstrap_recovery_reads_the_saved_user_data(self) -> None:
         operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
         self.fake.lose_response = 'modify-instance-attribute'
         with self.assertRaises(provider.ProviderPending):
             _ = self.provider.step(IDENTITY, start, operation)
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
-        self.assertIn('describe-instance-attribute', [op for _, op, _ in self.fake.calls])
+        before = len(self.fake.calls)
+        self.assertEqual(self.provider.step(IDENTITY, start, operation), box.OperationAccepted(operation.token))
+        operations = [op for _, op, _ in self.fake.calls[before:]]
+        self.assertIn('describe-instance-attribute', operations)
+        self.assertNotIn('modify-instance-attribute', operations)
+        self.assertNotIn('put-object', operations)
+
+    def test_bootstrap_recovery_leaves_a_running_box_unchanged(self) -> None:
+        operation, start = self.operation(box.Action.BOOTSTRAP), self.start()
+        self.fake.failure = 'put-object'
+        with self.assertRaises(provider.ProviderPending):
+            _ = self.provider.step(IDENTITY, start, operation)
+        self.fake.failure, self.fake.state = '', 'running'
+        before = len(self.fake.calls)
+        with self.assertRaisesRegex(provider.ProviderPending, 'bootstrap operation remains unresolved'):
+            _ = self.provider.step(IDENTITY, start, operation)
+        self.assertNotIn('put-object', [op for _, op, _ in self.fake.calls[before:]])
+        self.assertEqual(self.fake.userdata, '')
+
+    def test_abandoned_stopped_mutations_refuse_a_late_dispatch(self) -> None:
+        for action, failure in ((box.Action.BOOTSTRAP, 'put-object'), (box.Action.START, 'start-instances')):
+            with self.subTest(action=action):
+                operation, start = self.operation(action), self.start()
+                self.fake.failure = failure
+                with self.assertRaises(provider.ProviderPending):
+                    _ = self.provider.step(IDENTITY, start, operation)
+                self.fake.failure = ''
+                self.assertIsInstance(self.provider.recover(IDENTITY, start, operation, abandon_start=True), box.MutationSettled)
+                before = len(self.fake.calls)
+                with self.assertRaisesRegex(provider.ProviderPending, 'operation is cancelled'):
+                    _ = self.provider.step(IDENTITY, start, operation)
+                self.assertEqual(len(self.fake.calls), before)
+                self.assertEqual(self.fake.state, 'stopped')
+
+    def test_abandoned_accepted_start_can_still_need_a_stop(self) -> None:
+        operation, start = self.operation(box.Action.START), self.start()
+        _ = self.provider.step(IDENTITY, start, operation)
+        self.fake.state = 'stopped'
+        self.assertIsInstance(self.provider.recover(IDENTITY, start, operation, abandon_start=True), box.StartMayBeRunning)
 
     def test_ownership_mismatch_and_errors_reveal_no_private_data(self) -> None:
         self.fake.ownership = 'other-deployment'

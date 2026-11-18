@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import json
+import os
 from pathlib import Path
 import time
 from typing import Protocol, cast
@@ -12,7 +13,7 @@ from uuid import uuid4
 
 from scripts.aws_target import hana_guest, hana_spend, ledger
 from scripts.aws_target.controller_lock import control_lock
-from scripts.lib import conf
+from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -88,11 +89,23 @@ class BootUnverified:
 
 
 @dataclass(frozen=True)
+class LocalClaimOwner:
+    pid: int
+    start: str
+
+
+@dataclass(frozen=True)
+class UnrecordedClaimOwner:
+    """The lifecycle journal has no process identity for this claim."""
+
+
+@dataclass(frozen=True)
 class WorkClaim:
     execution: str
     token: str
     requested_at: int
     active: bool = False
+    owner: LocalClaimOwner | UnrecordedClaimOwner = UnrecordedClaimOwner()
 
 
 @dataclass(frozen=True)
@@ -212,7 +225,15 @@ class MutationSettled:
     observed: BoxObservation
 
 
-MutationRecovery = MutationUnresolved | MutationSettled
+@dataclass(frozen=True)
+class StartMayBeRunning:
+    """The provider fenced a start that AWS already accepted."""
+
+    token: str
+    observed: BoxObservation
+
+
+MutationRecovery = MutationUnresolved | MutationSettled | StartMayBeRunning
 
 
 ProviderReply = BoxObservation | OperationAccepted | PermitAccepted
@@ -226,8 +247,8 @@ class HanaProvider(Protocol):
         ...
 
     def recover(self, identity: DeploymentIdentity, start: DemandStart | NoDemandStart,
-                operation: PendingOperation) -> MutationRecovery:
-        """Read the mutation outcome without starting, bootstrapping, or publishing a permit."""
+                operation: PendingOperation, *, abandon_start: bool = False) -> MutationRecovery:
+        """Read the outcome and fence an abandoned start before it can run again."""
         ...
 
 
@@ -241,8 +262,8 @@ class ProviderNotInstalled:
 
 
     def recover(self, identity: DeploymentIdentity, start: DemandStart | NoDemandStart,
-                operation: PendingOperation) -> MutationRecovery:
-        _ = identity, start, operation
+                operation: PendingOperation, *, abandon_start: bool = False) -> MutationRecovery:
+        _ = identity, start, operation, abandon_start
         raise RuntimeError('The Hana provider transport is not installed; preserve the pending operation')
 
 
@@ -259,7 +280,6 @@ class ClaimRefused:
 @dataclass(frozen=True)
 class ClaimWaiting:
     claim: WorkClaim
-    timed_out: bool
 
 
 @dataclass(frozen=True)
@@ -277,7 +297,9 @@ def _record(row: BoxRecord) -> dict[str, object]:
         'version': 1, 'identity': dict(deployment=row.identity.deployment, instance=row.identity.instance,
             spot_request=row.identity.spot_request, region=row.identity.region), 'state': row.state.value,
         'generation': row.generation, 'claims': [dict(execution=c.execution, token=c.token,
-            requested_at=c.requested_at, active=c.active) for c in row.claims],
+            requested_at=c.requested_at, active=c.active,
+            owner=dict(pid=c.owner.pid, start=c.owner.start) if isinstance(c.owner, LocalClaimOwner) else None)
+            for c in row.claims],
         'start': dict(token=row.start.token, at=row.start.at, deadline=row.start.deadline)
             if isinstance(row.start, DemandStart) else None,
         'boot': dict(boot_id=row.boot.boot_id, start_token=row.boot.start_token) if isinstance(row.boot, VerifiedBoot) else None,
@@ -304,6 +326,31 @@ def _empty_text(document: dict[str, object], key: str) -> str:
     return value
 
 
+def _claim_owner(document: dict[str, object]) -> LocalClaimOwner | UnrecordedClaimOwner:
+    if document.get('owner') is None:
+        return UnrecordedClaimOwner()
+    owner = ledger.mapping(document['owner'])
+    pid = ledger.instant(owner, 'pid')
+    if not pid:
+        raise ValueError('The Hana claim owner has no process ID')
+    return LocalClaimOwner(pid, ledger.text(owner, 'start'))
+
+
+def _start_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str:
+    if not row.claims:
+        return 'The Hana start has no owner'
+    claim = row.claims[0]
+    deadline = row.start.deadline if isinstance(row.start, DemandStart) else claim.requested_at + settings.start_timeout_seconds
+    if now >= deadline:
+        return 'The Hana start deadline expired'
+    if isinstance(claim.owner, LocalClaimOwner):
+        owner = process_start.process_start(claim.owner.pid)
+        if isinstance(owner, (process_start.Gone, process_start.Zombie)) or (
+                isinstance(owner, process_start.Started) and owner.start != claim.owner.start):
+            return 'The Hana start owner exited'
+    return ''
+
+
 def _decode(document: dict[str, object]) -> BoxRecord:
     if document.get('version') != 1:
         raise ValueError('The Hana lifecycle journal version is unknown')
@@ -313,7 +360,8 @@ def _decode(document: dict[str, object]) -> BoxRecord:
         raise ValueError('The Hana deployment identity is incomplete')
     row = BoxRecord(DeploymentIdentity(*names), Lifecycle(ledger.text(document, 'state')),
         ledger.instant(document, 'generation'),
-        [WorkClaim(ledger.text(c, 'execution'), ledger.text(c, 'token'), ledger.instant(c, 'requested_at'), c['active'] is True)
+        [WorkClaim(ledger.text(c, 'execution'), ledger.text(c, 'token'), ledger.instant(c, 'requested_at'),
+                   c['active'] is True, _claim_owner(c))
          for c in ledger.rows(document, 'claims')], idle_since=ledger.instant(document, 'idle_since'),
         observed_at=ledger.instant(document, 'observed_at'), stop_cause=StopCause(ledger.text(document, 'stop_cause')),
         reason=_empty_text(document, 'reason'))
@@ -404,7 +452,10 @@ class HanaController:
                 return ClaimRefused('The idle stop already owns the machine')
             if row.claims:
                 return ClaimCommitted(row.claims[0]) if row.claims[0].execution == execution else ClaimRefused('Hana is busy')
-            claim = WorkClaim(execution, uuid4().hex, int(self.clock()))
+            pid = os.getpid()
+            process = process_start.process_start(pid)
+            owner = LocalClaimOwner(pid, process.start) if isinstance(process, process_start.Started) else UnrecordedClaimOwner()
+            claim = WorkClaim(execution, uuid4().hex, int(self.clock()), owner=owner)
             row.claims = [claim]
             row.reason = ''
             self._save(row)
@@ -415,9 +466,13 @@ class HanaController:
             row = self._read()
             if isinstance(row, NoDeployment) or not row.claims or row.claims[0].execution != execution:
                 return ClaimRefused(row.reason if isinstance(row, BoxRecord) and row.reason else 'No current claim owns this execution')
-            settings = read_settings(conf.read(self.workload_path))
             claim = row.claims[0]
-            return ClaimWaiting(claim, int(self.clock()) >= claim.requested_at + settings.start_timeout_seconds)
+            if row.state == Lifecycle.STARTING:
+                settings = read_settings(conf.read(self.workload_path))
+                reason = _start_refusal(row, int(self.clock()), settings)
+                if reason:
+                    return ClaimRefused(reason)
+            return ClaimWaiting(claim)
 
     def bind_execution(self, execution: str) -> None:
         """Retain an assigned execution before its dispatch journal exists."""
@@ -511,13 +566,18 @@ class HanaController:
             spending = self._spending()
             if isinstance(row.operation, NoOperation):
                 if row.state == Lifecycle.IDLE_STOPPED and row.claims and spending.settings.enabled:
+                    refusal = _start_refusal(row, now, settings)
+                    if refusal:
+                        row.reason, row.claims = refusal, []
+                        self._save(row)
+                        return row.state
                     reserved = spending.reserve_start(now, now + spending.settings.permit_max_seconds)
                     if isinstance(reserved, hana_spend.PermitRefused):
                         row.reason, row.claims = reserved.reason, []
                         self._save(row)
                         return row.state
                     row.generation = reserved.exposure.generation
-                    row.start = DemandStart(uuid4().hex, now, now + settings.start_timeout_seconds)
+                    row.start = DemandStart(uuid4().hex, now, row.claims[0].requested_at + settings.start_timeout_seconds)
                     row.boot, row.delivered = BootUnverified(), NoDeliveredPermit()
                     row.state, row.stop_cause = Lifecycle.STARTING, StopCause.UNKNOWN
                     _ = self._intent(row, Action.BOOTSTRAP, now)
@@ -525,15 +585,21 @@ class HanaController:
                     _ = self._intent(row, Action.OBSERVE, now)
             operation = row.operation
             assert isinstance(operation, PendingOperation)
-            recover = False
-            if operation.action in (Action.BOOTSTRAP, Action.START, Action.PUBLISH):
+            abandonment = ''
+            if row.state == Lifecycle.STARTING and operation.action in (Action.BOOTSTRAP, Action.START):
+                abandonment = _start_refusal(row, now, settings)
+            recover = bool(abandonment)
+            if abandonment:
+                row.reason = abandonment
+                self._save(row)
+            elif operation.action in (Action.BOOTSTRAP, Action.START, Action.PUBLISH):
                 allowed = spending.check_start(now, operation.generation)
                 if isinstance(allowed, hana_spend.PermitRefused):
                     row.reason = allowed.reason
                     self._save(row)
                     recover = True
             identity, start = row.identity, row.start
-        reply = (self.provider.recover(identity, start, operation) if recover
+        reply = (self.provider.recover(identity, start, operation, abandon_start=bool(abandonment)) if recover
                  else self.provider.step(identity, start, operation))
         with control_lock(self.directory):
             current = self._read()
@@ -542,8 +608,8 @@ class HanaController:
                 return current.state if isinstance(current, BoxRecord) else Lifecycle.UNPROVISIONED
             row = current
             now = int(self.clock())
-            if isinstance(reply, (MutationUnresolved, MutationSettled)):
-                self._recover(row, operation, reply, settings, now)
+            if isinstance(reply, (MutationUnresolved, MutationSettled, StartMayBeRunning)):
+                self._recover(row, operation, reply, settings, now, abandon_start=bool(abandonment))
             elif isinstance(reply, BoxObservation):
                 if operation.action != Action.OBSERVE or reply.identity != row.identity or not operation.at <= reply.at <= now:
                     raise ValueError('The provider observation has a stale identity or time')
@@ -551,6 +617,12 @@ class HanaController:
             elif isinstance(reply, OperationAccepted):
                 if reply.token != operation.token or operation.action not in (Action.BOOTSTRAP, Action.START, Action.STOP):
                     raise ValueError('The provider accepted a different operation')
+                if row.state == Lifecycle.STARTING and operation.action in (Action.BOOTSTRAP, Action.START):
+                    reason = _start_refusal(row, now, settings)
+                    if reason:
+                        row.reason = reason
+                        self._save(row)
+                        return row.state
                 row.operation = NoOperation()
                 if operation.action == Action.BOOTSTRAP:
                     _ = self._intent(row, Action.START, now)
@@ -562,7 +634,7 @@ class HanaController:
             return row.state
 
     def _recover(self, row: BoxRecord, operation: PendingOperation, reply: MutationRecovery,
-                 settings: LifecycleSettings, now: int) -> None:
+                 settings: LifecycleSettings, now: int, *, abandon_start: bool) -> None:
         observed = reply.observed
         if (reply.token != operation.token or observed.identity != row.identity
                 or not max(operation.at, row.observed_at) <= observed.at <= now):
@@ -576,10 +648,22 @@ class HanaController:
         if isinstance(reply, MutationUnresolved):
             # A stopped observation cannot close exposure while the original mutation can still complete.
             return
-        if active:
+        if active or isinstance(reply, StartMayBeRunning):
+            if abandon_start:
+                row.claims = []
             valid_boot = _boot_is_current(row, observed.boot)
             self._stop(row, now, StopCause.IDLE if valid_boot else StopCause.UNKNOWN)
+        elif abandon_start and observed.state == 'stopped':
+            spending = self._spending()
+            spending.reconcile(observed.at, 'stopped', generation=row.generation)
+            if any(isinstance(r.state, ledger.HanaExposureOpen) for r in spending.book.read_snapshot().hana_compute):
+                return
+            row.state, row.claims, row.operation = Lifecycle.IDLE_STOPPED, [], NoOperation()
+            row.start, row.boot, row.delivered = NoDemandStart(), BootUnverified(), NoDeliveredPermit()
+            row.idle_since, row.observed_at = now, observed.at
         else:
+            if abandon_start:
+                row.claims = []
             self._observe(row, observed, settings, now)
 
     def _stop(self, row: BoxRecord, now: int, cause: StopCause) -> None:
@@ -608,6 +692,12 @@ class HanaController:
             elif row.state != Lifecycle.IDLE_STOPPED:
                 row.state = Lifecycle.STOPPED_UNKNOWN
             return
+        if row.state == Lifecycle.STARTING:
+            reason = _start_refusal(row, now, settings)
+            if reason:
+                row.reason, row.claims = reason, []
+                self._stop(row, now, StopCause.IDLE if _boot_is_current(row, observed.boot) else StopCause.UNKNOWN)
+                return
         if observed.state != 'running':
             return
         valid_boot = _boot_is_current(row, observed.boot)
@@ -650,5 +740,5 @@ class HanaController:
             raise ValueError('The permit acknowledgment has a stale operation, claim, boot identity, or generation')
         row.delivered = DeliveredPermit(reply.generation, int(operation.permit.expires_at), reply.execution)
         claim = row.claims[0]
-        row.claims = [WorkClaim(claim.execution, claim.token, claim.requested_at, True)]
+        row.claims = [replace(claim, active=True)]
         row.state, row.operation = Lifecycle.READY, NoOperation()

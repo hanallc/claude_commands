@@ -210,6 +210,30 @@ class AwsHanaProvider:
             'report_url': url('PUT', '/report.json'), 'command_url': url('GET', '/command.json'),
             'fence_url': url('GET', '/fence.json')}
 
+    def _write_bootstrap(self, identity: box.DeploymentIdentity, start: box.DemandStart,
+                         path: Path, saved: dict[str, object]) -> None:
+        prefix = self._prefix(identity, start)
+        objects: tuple[tuple[str, dict[str, object]], ...] = (
+            ('/permit.json', {'version': 1}),
+            ('/command.json', {'version': 1, 'action': 'idle'}),
+            ('/fence.json', {'version': 1, 'action': 'idle'}),
+        )
+        completed = saved.get('bootstrap_puts', 0)
+        if type(completed) is not int or not 0 <= completed <= len(objects):
+            raise ValueError('The saved Hana bootstrap progress is invalid')
+        descriptor = ledger.mapping(saved['descriptor'])
+        for index, (suffix, document) in enumerate(objects[completed:], start=completed + 1):
+            _ = self._object(prefix + suffix, document)
+            # Save each write so the next tick can continue after a timeout.
+            saved['bootstrap_puts'] = index
+            self._save_mutation(path, saved)
+        encoded = base64.b64encode(json.dumps(descriptor, sort_keys=True).encode()).decode()
+        _ = self._call('modify-instance-attribute', '--instance-id', identity.instance,
+            '--attribute', 'userData', '--value', encoded)
+
+    def _save_mutation(self, path: Path, saved: dict[str, object]) -> None:
+        write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n', new_file_mode=0o600)
+
     def step(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
              operation: box.PendingOperation) -> box.ProviderReply:
         path, lock_path = self._paths(operation)
@@ -220,48 +244,51 @@ class AwsHanaProvider:
                     return self._observation(identity, start)
                 saved: dict[str, object] = remote.read_record(path) if path.exists() else {}
                 if saved.get('cancelled') is True:
-                    raise ProviderPending('Hana mutation was fenced before dispatch')
+                    raise ProviderPending('The Hana ' + operation.action.value + ' operation is cancelled')
                 if saved.get('accepted') is True:
                     return self._accepted(identity, start, operation)
                 if saved:
                     recovered = self._recover(identity, start, operation, saved)
                     if isinstance(recovered, box.MutationUnresolved):
-                        raise ProviderPending('Hana mutation remains unresolved')
-                    return self._accepted(identity, start, operation)
-                saved = {'version': 1, 'token': operation.token, 'action': operation.action.value,
-                    'deployment': identity.deployment, 'dispatched': True}
-                if operation.action == box.Action.BOOTSTRAP:
-                    if not isinstance(start, box.DemandStart):
-                        raise ValueError('Hana bootstrap needs a demand start')
-                    saved['descriptor'] = self._bootstrap(identity, start)
-                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
-                if operation.action == box.Action.BOOTSTRAP:
-                    descriptor = ledger.mapping(saved['descriptor'])
-                    _ = self._object(self._prefix(identity, cast(box.DemandStart, start)) + '/permit.json', {'version': 1})
-                    for suffix in ('/command.json', '/fence.json'):
-                        _ = self._object(self._prefix(identity, cast(box.DemandStart, start)) + suffix,
-                                        {'version': 1, 'action': 'idle'})
-                    encoded = base64.b64encode(json.dumps(descriptor, sort_keys=True).encode()).decode()
-                    _ = self._call('modify-instance-attribute', '--instance-id', identity.instance,
-                        '--attribute', 'userData', '--value', encoded)
-                elif operation.action == box.Action.START:
-                    _ = self._call('start-instances', '--instance-ids', identity.instance)
-                elif operation.action == box.Action.STOP:
-                    _ = self._call('stop-instances', '--instance-ids', identity.instance)
-                elif operation.action == box.Action.PUBLISH:
-                    if not isinstance(start, box.DemandStart) or not isinstance(operation.permit, hana_guest.WorkPermit):
-                        raise ValueError('Hana publication needs a boot permit')
-                    _ = self._object(self._prefix(identity, start) + '/permit.json', {
-                        'token': operation.token, 'deployment': identity.deployment, 'start_token': start.token,
-                        'permit': asdict(operation.permit), 'expected_generation': operation.expected_generation,
-                        'execution': operation.execution})
+                        if (operation.action != box.Action.BOOTSTRAP or recovered.observed.state != 'stopped'
+                                or not isinstance(start, box.DemandStart)):
+                            raise ProviderPending('The Hana ' + operation.action.value + ' operation remains unresolved')
+                        self._write_bootstrap(identity, start, path, saved)
+                    elif operation.action != box.Action.BOOTSTRAP:
+                        return self._accepted(identity, start, operation)
+                else:
+                    saved = {'version': 1, 'token': operation.token, 'action': operation.action.value,
+                        'deployment': identity.deployment, 'dispatched': True}
+                    if operation.action == box.Action.BOOTSTRAP:
+                        if not isinstance(start, box.DemandStart):
+                            raise ValueError('Hana bootstrap needs a demand start')
+                        saved['descriptor'] = self._bootstrap(identity, start)
+                    self._save_mutation(path, saved)
+                    self._dispatch(identity, start, operation, path, saved)
                 saved['accepted'] = True
-                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+                self._save_mutation(path, saved)
                 return self._accepted(identity, start, operation)
             except (OSError, AwsUnavailable, subprocess.SubprocessError):
-                raise ProviderPending('Hana mutation response is unavailable') from None
+                raise ProviderPending('The Hana ' + operation.action.value + ' response is unavailable') from None
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _dispatch(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
+                  operation: box.PendingOperation, path: Path, saved: dict[str, object]) -> None:
+        if operation.action == box.Action.BOOTSTRAP:
+            assert isinstance(start, box.DemandStart)
+            self._write_bootstrap(identity, start, path, saved)
+        elif operation.action == box.Action.START:
+            _ = self._call('start-instances', '--instance-ids', identity.instance)
+        elif operation.action == box.Action.STOP:
+            _ = self._call('stop-instances', '--instance-ids', identity.instance)
+        elif operation.action == box.Action.PUBLISH:
+            if not isinstance(start, box.DemandStart) or not isinstance(operation.permit, hana_guest.WorkPermit):
+                raise ValueError('Hana publication needs a boot permit')
+            _ = self._object(self._prefix(identity, start) + '/permit.json', {
+                'token': operation.token, 'deployment': identity.deployment, 'start_token': start.token,
+                'permit': asdict(operation.permit), 'expected_generation': operation.expected_generation,
+                'execution': operation.execution})
 
     def _accepted(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
                   operation: box.PendingOperation) -> box.ProviderReply:
@@ -278,7 +305,9 @@ class AwsHanaProvider:
             operation.generation, operation.execution)
 
     def recover(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
-                operation: box.PendingOperation) -> box.MutationRecovery:
+                operation: box.PendingOperation, *, abandon_start: bool = False) -> box.MutationRecovery:
+        if abandon_start and operation.action not in (box.Action.BOOTSTRAP, box.Action.START):
+            raise ValueError('The Hana operation cannot be cancelled as a start')
         path, lock_path = self._paths(operation)
         with lock_path.open('a') as lock:
             try:
@@ -286,7 +315,15 @@ class AwsHanaProvider:
             except BlockingIOError:
                 return box.MutationUnresolved(operation.token, self._observation(identity, start))
             try:
-                return self._recover(identity, start, operation, remote.read_record(path) if path.exists() else {})
+                saved = remote.read_record(path) if path.exists() else {}
+                if abandon_start:
+                    observed = self._observation(identity, start)
+                    self._save_mutation(path, {**saved, 'version': 1, 'token': operation.token, 'cancelled': True})
+                    if (operation.action == box.Action.START and saved.get('accepted') is True
+                            and observed.state == 'stopped'):
+                        return box.StartMayBeRunning(operation.token, observed)
+                    return box.MutationSettled(operation.token, observed)
+                return self._recover(identity, start, operation, saved)
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
@@ -294,8 +331,8 @@ class AwsHanaProvider:
                  operation: box.PendingOperation, saved: dict[str, object]) -> box.MutationRecovery:
         if not saved:
             path, _ = self._paths(operation)
-            write_text_atomic(path, json.dumps({'version': 1, 'token': operation.token, 'cancelled': True}) + '\n')
-        observed = self._observation(identity, start)
+            self._save_mutation(path, {'version': 1, 'token': operation.token, 'cancelled': True})
+        observed = self._observation(identity, box.NoDemandStart() if operation.action == box.Action.BOOTSTRAP else start)
         settled = not saved or saved.get('accepted') is True or saved.get('cancelled') is True
         if saved and saved.get('accepted') is not True and saved.get('cancelled') is not True:
             if operation.action == box.Action.START:
@@ -304,7 +341,9 @@ class AwsHanaProvider:
                 settled = observed.state in ('stopped', 'stopping', 'terminated')
             elif operation.action == box.Action.BOOTSTRAP:
                 actual = self._call('describe-instance-attribute', '--instance-id', identity.instance, '--attribute', 'userData')
-                encoded = ledger.text(ledger.mapping(actual['UserData']), 'Value')
+                encoded = ledger.mapping(actual.get('UserData', {})).get('Value', '')
+                if not isinstance(encoded, str):
+                    raise ProviderPending('The Hana bootstrap user data is unreadable')
                 expected = base64.b64encode(json.dumps(saved['descriptor'], sort_keys=True).encode()).decode()
                 settled = encoded == expected
             elif operation.action == box.Action.PUBLISH:
