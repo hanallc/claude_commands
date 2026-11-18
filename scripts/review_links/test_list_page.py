@@ -18,7 +18,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast, override
+from typing import BinaryIO, cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
@@ -30,7 +30,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, staff_names
+from scripts.review_links import console, list_page, serve, staff_names
 from scripts.review_links import change_browser, change_page, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
@@ -820,7 +820,7 @@ frame.addEventListener('load',async()=>{
             self.assertIn("Parked until 2026-11-17</small>", body)
             self.assertIn("Parked until</dt><dd>2026-11-17</dd>", body)
         with self.subTest(view="response"):
-            self.assertEqual(list_page.fresh_request(root, MORTY.id, item.id)["parked_until"], "2026-11-17")
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-11-17")
 
     def test_old_closed_log_uses_the_closing_words_renderer(self) -> None:
         log = self.legacy_log("- 2026-11-16 18:10:00+00:00 Closed: The **check** passed. — nate")
@@ -1218,10 +1218,11 @@ frame.addEventListener('load',async()=>{
         self.assertNotIn("efficiencies", body)
 
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
-        request = uuid4().hex
-        return {"keeper": MORTY.id, "id": item.id, "request": request,
-                "token": list_page.request_token(self.root / "reviews", MORTY.id, item.id, request),
-                "action": action, "words": "", "until": "", **changes}
+        folder = change_page.console_folder(self.root / "reviews")
+        secret = change_browser.browser_manifest(folder)[0]
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
+        fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
+        return {**fields, "action": action, "words": "", "until": "", **changes}
 
     def test_remove_closes_before_delivery_and_repeated_requests_do_nothing(self) -> None:
         item = self.add("Remove this item now")
@@ -1330,7 +1331,7 @@ window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
  requests.push(new URLSearchParams(options.body));
  return new Promise(resolve=>finishPost=result=>resolve({ok:result.ok!==false,status:result.ok===false ? 400 : 200,
-  json:async()=>({request:String(requests.length).padStart(32,'0'),token:'b'.repeat(64),unread:'false',...result})}));
+  json:async()=>({unread:'false',...result})}));
 };
 </script>'''
         probe = '''<script>
@@ -1408,7 +1409,7 @@ window.fetch=async(_path,options={})=>{
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
   finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
-   json:async()=>({request:'a'.repeat(32),token:'b'.repeat(64),unread:'true',...result})});
+   json:async()=>({unread:'true',...result})});
  });
 };
 </script>'''
@@ -1566,11 +1567,38 @@ window.fetch=async(_path,options={})=>{
  check(words.value==='' && ask.disabled,'a saved question clears the box');
 ''')
 
+    def test_ask_marks_the_seen_update_read_after_it_saves(self) -> None:
+        item = self.add("Read the update before asking")
+        root = self.root / "reviews"
+        fields = self.fields(item, "question", words="Which check passed?")
+        with patch.object(the_list, "mark_read", wraps=the_list.mark_read) as mark:
+            for _ in range(2):
+                _ = list_page.submit(root, urlencode(fields))
+        mark.assert_called_once_with(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=the_list.unread_update(item))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertIsInstance(saved.log[-2].what, the_list.QuestionRequestReceipt)
+        self.assertEqual(saved.log[-1].what, the_list.MarkedRead())
+
+    def test_words_actions_keep_updates_that_arrive_after_render_unread(self) -> None:
+        root = self.root / "reviews"
+        for action in ("question", "tell"):
+            with self.subTest(action=action):
+                item = self.add("Keep the update that arrives after render")
+                fields = self.fields(item, action, words="Which check passed?")
+                newer = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                _ = list_page.submit(root, urlencode(fields))
+                saved = the_list.load(MORTY.id, item.id)
+                self.assertEqual(the_list.unread_update(saved), the_list.unread_update(newer))
+                self.assertFalse(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
+                _ = list_page.submit(root, urlencode(self.fields(saved, action, words="Which check is next?")))
+                self.assertIs(the_list.load(MORTY.id, item.id).unread_since, the_list.NoTimestamp.UNSET)
+
     def test_saved_question_and_answer_appear_on_the_item_and_the_answer_is_unread(self) -> None:
         root = self.root / "reviews"
         item = self.add("Inspect the List", number=106)
-        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
-        _ = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed in <List>?")))
+        fields = self.fields(item, "question", words="What changed in <List>?")
+        _ = list_page.submit(root, urlencode(fields))
         opened = list_page.render(root).decode()
         self.assertIn("Question Q1 — waiting for an answer", opened)
         self.assertIn("What changed in &lt;List&gt;?", opened)
@@ -1578,6 +1606,7 @@ window.fetch=async(_path,options={})=>{
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
               redirect_stdout(io.StringIO())):
             self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
+        _ = list_page.submit(root, urlencode(fields))
         answered = list_page.render(root).decode()
         self.assertNotIn("<h3>Question Q1 — waiting for an answer</h3>", answered)
         self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", answered)
@@ -1692,6 +1721,130 @@ window.fetch=async(_path,options={})=>{
  check(row.hidden,'Tell morty keeps the row outside Unread after confirmation');
 """, add_item=False)
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_ask_leaves_unread_and_clears_the_dot_after_saving(self) -> None:
+        self.browser_action_sequence(r"""
+ show('unread');
+ check(!row.hidden && row.querySelector('.list-dot'),'the item starts unread');
+ form.elements.words.value='Which check passed?';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit('question');
+ check(row.hidden,'Ask question starts the fade before the response in Unread');
+ finishPost({unread:'false'});await flush();
+ check(row.hidden && row.dataset.unread==='false','the saved question keeps the row outside Unread');
+ show('open');
+ check(!row.hidden && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
+  'the same row in Open has no unread controls');
+""")
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
+        item = self.add("Check the current result")
+        root = self.root / "reviews"
+        results: list[list[str]] = []
+        complete = threading.Event()
+        probe = b"""<!doctype html><iframe></iframe><img hidden src="/complete"><script>
+const frame=document.querySelector('iframe'), errors=[];
+const check=(ok,message)=>{if(!ok) errors.push(message);};
+const open=show=>new Promise(resolve=>{
+ frame.onload=resolve;
+ frame.src='LIST_PATH?fixture='+show+'#show='+show;
+});
+const row=()=>frame.contentDocument.querySelector('[data-list-item]');
+const hasDot=()=>Boolean(row().querySelector('.list-dot'));
+const ask=async words=>{
+ const win=frame.contentWindow, current=row();
+ const form=current.querySelector('form'), input=form.elements.words;
+ const fetch=win.fetch.bind(win);
+ let post, observer;
+ const settled=new Promise(resolve=>{
+  observer=new win.MutationObserver(()=>{if(!form.dataset.sending) resolve();});
+  observer.observe(form,{attributeFilter:['data-sending']});
+ });
+ win.fetch=(url,options)=>options?.method==='POST'
+  ? (post=fetch(url,options))
+  : Promise.resolve(new win.Response('',{status:503}));
+ try{
+  current.querySelector('.list-toggle').click();
+  input.value=words;input.dispatchEvent(new win.Event('input'));
+  form.querySelector('[value="question"]').click();
+  if(!post || !(await post).ok) throw new Error('The question POST must succeed.');
+  await settled;
+  return form.querySelector('[data-send-status]').textContent;
+ }finally{observer.disconnect();win.fetch=fetch;}
+};
+const change=async path=>{
+ if(!(await fetch(path,{method:'POST'})).ok) throw new Error('Fixture update failed: '+path);
+};
+(async()=>{
+ try{
+  await open('unread');
+  check(!row().hidden && hasDot(),'the item starts in Unread');
+  check(await ask('Which check passed?')==='Question saved','the first question saves');
+  check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
+  await open('open');
+  check(row().textContent.includes('Which check passed?'),'the saved question appears in the row');
+  await change('/newer');
+  check(await ask('Which check is next?')==='Question saved; update remains unread',
+   'the notice says the newer update remains unread');
+  check(hasDot() && row().querySelector('[value="read"]'),'the newer update shows both unread controls');
+  await change('/answer');
+  await open('unread');
+  check(!row().hidden && hasDot() && row().textContent.includes('The gate passed.'),
+   'the answer appears and the item returns to Unread');
+ }catch(error){errors.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
+})();
+</script>""".replace(b'LIST_PATH', list_page.PAGE_PATH.encode())
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == '/proof':
+                    self.html_response(200, probe)
+                elif self.path == '/complete':
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                    self.json_response(200, {})
+                else:
+                    return super().send_head()
+                return None
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == '/newer':
+                    _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                    self.json_response(200, {})
+                elif self.path == '/answer':
+                    result = the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."])
+                    self.json_response(200 if result == 0 else 500, {})
+                elif self.path == '/results':
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                    self.json_response(200, {})
+                    complete.set()
+                else:
+                    super().do_POST()
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+              patch.object(change_page, "send_to_staff"),
+              serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.root / "ask-profile"
+                profile.mkdir()
+                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                    '--window-size', '1440,900', '--screenshot', str(self.root / 'ask.png'),
+                    f'http://127.0.0.1:{server.server_port}/proof'], capture_output=True, text=True, timeout=45)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join()
+
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True) -> None:
         if add_item:
             _ = self.add("Test List action retries", number=1)
@@ -1705,7 +1858,7 @@ window.fetch=async(_path,options={})=>{
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
   finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
-   json:async()=>({request:String(requests.length).padStart(32,'0'),token:'b'.repeat(64),unread:'true',...result})});
+   json:async()=>({unread:'true',...result})});
  });
 };
 </script>'''
@@ -1869,7 +2022,7 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(saved.unread_since, item.unread_since)
         self.assertFalse(any(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log))
         self.assertEqual(the_list.feedback_requests(saved)[fields["request"]].words, "Keep this result.")
-        self.assertEqual(list_page.fresh_request(root, MORTY.id, item.id)["unread"], "true")
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["unread"], "true")
         with patch.object(change_page, "send_to_staff") as send:
             list_page.deliver(delivery)
         send.assert_called_once()
@@ -1885,6 +2038,27 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(saved, newer)
         self.assertEqual(len(the_list.feedback_requests(saved)), 1)
         self.assertEqual(sum(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log), 1)
+
+    def test_legacy_tell_retry_uses_only_its_saved_read_target(self) -> None:
+        root = self.root / "reviews"
+        for case in ("saved", "newer", "first_send"):
+            with self.subTest(case=case):
+                item = self.add("Keep the legacy read target")
+                request = uuid4().hex
+                words = "Keep this result."
+                token = list_page.request_token(root, MORTY.id, item.id, request)
+                body = urlencode(self.fields(item, "tell", request=request, token=token, words=words))
+                if case != "first_send":
+                    feedback = the_list.PageFeedback(request, words, read_update=the_list.unread_update(item))
+                    _ = the_list.save_feedback(MORTY.id, item.id, feedback)
+                if case == "newer":
+                    item = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                _ = list_page.submit(root, body)
+                saved = the_list.load(MORTY.id, item.id)
+                expected = the_list.NoTimestamp.UNSET if case == "saved" else item.unread_since
+                self.assertEqual(saved.unread_since, expected)
+                self.assertEqual(len(the_list.feedback_requests(saved)), 1)
+                self.assertEqual(sum(isinstance(entry.what, the_list.MarkedRead) for entry in saved.log), int(case == "saved"))
 
     def test_conflicting_tell_keeps_a_newer_update_unread(self) -> None:
         item = self.add("Refuse new words under the saved request")
@@ -1922,7 +2096,7 @@ window.fetch=async(_path,options={})=>{
         setup = '''<script>
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
- return {ok:true,json:async()=>({unread:'UNREAD',request:'a'.repeat(32),token:'b'.repeat(64)})};
+ return {ok:true,json:async()=>({unread:'UNREAD'})};
 };
 </script>'''
         probe = '''<script>
@@ -2106,7 +2280,7 @@ window.fetch=async(_path,options={})=>{
    row.dataset.unread='false';row.querySelector('.list-dot')?.remove();row.querySelector('[value="read"]')?.remove();
    original=page.documentElement.outerHTML;
   }
-  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',request:String(posts.length).padStart(32,'0'),token:'b'.repeat(64)})};
+  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false'})};
   if(holdPost) return await new Promise(resolve=>finishPost=()=>resolve(result));
   return result;
  }
@@ -2374,7 +2548,7 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                             delivery = list_page.submit(root, body)
                             list_page.deliver(delivery)
                             fields = parse_qs(body)
-                            result = {"state": "sent", **list_page.fresh_request(root, fields["keeper"][0], fields["id"][0])}
+                            result = {"state": "sent", **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])}
                             self.send_response(200)
                             self.send_header('Content-Type', 'application/json')
                             self.end_headers()
