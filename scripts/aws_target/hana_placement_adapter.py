@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 from typing import TYPE_CHECKING
 
 from scripts.aws_target.hana_placement import (
-    ExecutionTransport, SshCommandTransport, HanaControlTransport, HanaHostGeneration,
+    ExecutionTransport, HanaControlTransport, HanaHostGeneration,
     DisabledHanaRoute, EnabledHanaRoute, HanaRouteSettings, HanaCheck, HanaClippyJudgment,
     HanaStepRefused, HanaStepPolicy, HanaLifecycleEvidence, HanaUnprovisioned,
     HanaLifecycleUnavailable, HanaClaimResult, HanaClaimPending, HanaClaimAdopted,
@@ -21,42 +20,40 @@ if TYPE_CHECKING:
 
 def read_execution_transport(target: SshTarget) -> ExecutionTransport:
     """Select the configured transport before reading SSH settings."""
-    from scripts.lib import conf
+    from scripts.build_targets import target_config
 
-    values = conf.read(target.settings).values()
-    transport = values.get('execution_transport', 'ssh')
-    if transport == 'ssh':
-        return SshCommandTransport(target.settings)
-    if transport != 'hana-control' or target.platform != 'linux':
-        raise conf.Unusable('execution_transport: expected ssh or Linux hana-control')
-    host = values.get('host', '')
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', host):
-        raise conf.Unusable('host: expected a safe Hana reporting alias')
-    return HanaControlTransport(target.settings, host)
-
+    return target_config.read_execution_transport(target)
 
 def read_settings(configuration: conf.ConfigRead) -> HanaRouteSettings:
     """Read the workload without reading credentials or deployment records."""
     from scripts.buildlog.repository import remote_identity
     from scripts.lib import conf
 
-    enabled = configuration.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise conf.Unusable('enabled: expected on or off')
-    if enabled == 'off':
+    def repository_key(value: str) -> str:
+        if value != remote_identity(value, str(configuration.source.parent)):
+            raise ValueError('expected a normalized repository identity')
+        return value
+
+    def permitted_kinds(value: str) -> tuple[placement.CommandKind, ...]:
+        from typing import cast
+
+        kinds = tuple(part.strip() for part in value.split(','))
+        if len(set(kinds)) != len(kinds) or any(kind not in ('check', 'lint') for kind in kinds):
+            raise ValueError('Hana permits only check and lint judgments')
+        return cast('tuple[placement.CommandKind, ...]', kinds)
+
+    if not configuration.value('enabled', conf.on_off):
         return DisabledHanaRoute()
-    key = configuration.text('repository_identity')
-    if not key or key != remote_identity(key, str(configuration.source.parent)):
-        raise conf.Unusable('repository_identity: expected a normalized repository identity')
-    kinds = tuple(part.strip() for part in configuration.text('kinds').split(','))
-    if not kinds or len(set(kinds)) != len(kinds) or any(kind not in ('check', 'lint') for kind in kinds):
-        raise conf.Unusable('kinds: Hana permits only check and lint judgments')
-    maximum, floor = configuration.whole('max_steps'), configuration.whole('free_floor_gib')
-    if maximum != 1 or floor < 1:
-        raise conf.Unusable('Hana requires one step and a positive free disk floor')
-    # The checks above narrow external strings at the configuration boundary.
-    from typing import cast
-    return EnabledHanaRoute(key, cast('tuple[placement.CommandKind, ...]', kinds), maximum, floor)
+    key = configuration.value('repository_identity', repository_key)
+    kinds = configuration.value('kinds', permitted_kinds)
+    def single_step(value: str) -> int:
+        if conf.positive_whole(value) != 1:
+            raise ValueError('Hana requires one step')
+        return 1
+
+    maximum = configuration.value('max_steps', single_step)
+    floor = configuration.value('free_floor_gib', conf.positive_whole)
+    return EnabledHanaRoute(key, kinds, maximum, floor)
 
 
 def classify_command(step: str, kind: str, command: tuple[str, ...]) -> HanaStepPolicy:
@@ -258,16 +255,19 @@ def _release_claims(controller: box.HanaController, execution: str, matching: tu
 def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
     """Apply configuration and repository capabilities without lifecycle reads."""
     from scripts.lib import conf
+    return configured_route(conf.read(transport.settings), repository, kind)
+
+
+def configured_route(configuration: conf.ConfigRead, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
     from scripts.mac_test import eligibility
 
-    configuration = conf.read(transport.settings)
     settings = read_settings(configuration)
     if isinstance(settings, DisabledHanaRoute):
         return HanaStepRefused('off')
     identity = eligibility.repository_identity(Path(repository))
     if isinstance(identity, eligibility.UnknownRepository) or identity.key != settings.repository_key:
         return HanaStepRefused('repo')
-    if kind not in settings.kinds or not eligibility.linux_kind_permitted(configuration.values(), kind):
+    if kind not in settings.kinds:
         return HanaStepRefused('command')
     return settings
 
@@ -278,22 +278,22 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
     from scripts.aws_target.hana_execution import HanaSettled, read_claim_execution, settle_unpublished_claim
-    from scripts.build_queue import placement
+    from scripts.build_queue import admission_records, placement
     from scripts.build_targets import target_config
-    from scripts.lib import process_start
+    from scripts.lib import conf, process_start
     from scripts.mac_test import claim_state, mac_test
     from scripts.build_hold.owning_session import NoOwningSession, OwningSession
     from scripts.buildlog import store
 
     now = time.time()
-    target = target_config.configured_ssh_target(key.destination.target)
-    if isinstance(key.settings, placement.ExplicitProviderSettings):
-        from dataclasses import replace
-        target = replace(target, settings=key.settings.path)
-    transport = read_execution_transport(target)
+    target = admission_records.effective_target(key.destination.target, key.settings)
+    if not isinstance(target, target_config.SshTarget):
+        return placement.HostEvidenceUnavailable(key, now, 'The SSH target is no longer configured')
+    configuration = conf.read(target.settings, load=conf.read_bytes)
+    transport = target_config.read_execution_transport(target, configuration=configuration)
     if not isinstance(transport, HanaControlTransport):
         return placement.HostEvidenceUnavailable(key, now, 'The target does not use Hana control')
-    policy = fixed_policy(transport, request.constraints.repository,
+    policy = configured_route(configuration, request.constraints.repository,
         request.constraints.command_kind if isinstance(request.constraints.command_kind, str) else '')
     if isinstance(policy, HanaStepRefused):
         return placement.FreshHostEvidence(key, now, '', placement.FixedExclusion(policy.reason))
@@ -374,7 +374,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
         eligibility = placement.TemporaryExclusion('starting')
     elif snapshot.state == box.Lifecycle.IDLE_STOPPED:
         preview = hana_spend.preview_placement_start(ledger.CostLedger(controller.directory),
-            controller.settings_path, transport.settings, controller.path)
+            controller.settings_path, configuration, controller.path)
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,
