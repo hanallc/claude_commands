@@ -52,6 +52,14 @@ from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+ROLE_COLOR_CONFIG = (
+    "role.showrunner=#a379fd\n"
+    "role.unit-director=#ffaf02\n"
+    "role.producer=#90fe42\n"
+    "role.worker=#ff0404\n"
+)
+
+
 @dataclass(frozen=True)
 class HttpReply:
     status: int
@@ -70,7 +78,9 @@ def setUpModule() -> None:
         + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
-    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+    _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
 
 
 class ReviewLinksServerTests(unittest.TestCase):
@@ -1538,6 +1548,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
         case = self.review_fixture(changes=2)
+        _ = conf.path("statusline").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
         directory = self.root.parent / "brain"
         directory.mkdir()
         producer = fixture_member("producer", name="brain", doc=staff.LiveDoc(local_machine(), directory))
