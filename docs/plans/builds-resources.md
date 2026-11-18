@@ -2862,12 +2862,20 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 155 — The hourly snapshot keeps Spot placement scores  · status: done
 
-User via builds 11-18 10:04: an analysis of 32-vCPU availability and a price for gate time. This phase collects the availability data.
+#### As-built
 
-1. Check the AWS limit for `get-spot-placement-scores` and fit the request set inside it.
-2. Ask for 4, 8 and 20 boxes of each gate type, per region and per zone, in all 19 regions.
-3. Store the scores beside the Spot prices; show them on the AWS page.
-4. Read-only call. Name the IAM permission (`ec2:GetSpotPlacementScores`) before any setup step reaches the user.
-5. No config change for gate placement and no gate placement code change.
+- `aws_target.hourly()` runs the price snapshot, the billed-hours check and `placement_snapshot` independently. An error in one never skips another.
+- `spot_placement_requests` is a fixed list of 10 request bodies, because AWS allows about 10 new bodies per 24 h. Each shape covers 19 regions in two batches (10 and 9):
+  1. regional, 8 boxes, the two 32-vCPU types;
+  2. regional, 8 boxes, all four gate types;
+  3. zonal, 8 boxes, the 32-vCPU pair;
+  4. zonal, 8 boxes, all four types;
+  5. regional, 20 boxes, all four types.
+- `collect_spot_placement` starts a new shape (both batches) only inside the 24-hour budget and after the earlier shapes were accepted. A refusal is a missing sample; no new shape starts after it in that hour. The lock file claims the hour before any AWS call.
+- `spot-placement-scores.json` keeps 72 h of samples and failures. `ledger.read_spot_placement_scores` reads it; unreadable history reads as empty and is replaced. Requests key on the type set and a sorted type tuple.
+- The AWS page table below Spot prices: one row per region or zone; cells for 32 vCPU (8 boxes), all types (8 boxes) and all types (20 boxes) as latest / 72 h median / samples; stale, missing and not-sampled cells marked. A note says AWS scores a request with fewer than three types lower.
+- IAM: the aws unit added `ec2:GetSpotPlacementScores` to the scaler policy (main `e3f230ea1`). Collection starts after the user's setup run.
+- Blind review: 7 findings, all fixed in 2 rounds.
+- Checkpoint `55ec0458a`; row `76a31d93a` stacked on the Phase 153 row `b763ff7f7`.
 
-**Files:** `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/aws_page.py`, and their tests.
+**Files:** `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/aws_page.py`, `scripts/aws_target/aws_prices.html`, and their tests.
