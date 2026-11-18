@@ -2879,3 +2879,14 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `55ec0458a`; row `76a31d93a` stacked on the Phase 153 row `b763ff7f7`.
 
 **Files:** `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/aws_page.py`, `scripts/aws_target/aws_prices.html`, and their tests.
+
+### Phase 156 — The AWS page shows the gate-time price at which a 32-vCPU box wins  · status: done
+
+User via builds 11-18 10:04: per region, the price per minute of gate time at which the gate takes a 32-vCPU box.
+
+1. Per region, compare the cheapest 32-vCPU variant with the cheapest 16-vCPU variant. Use the expected box USD of one run that `cloud_gate.rank_variants` uses, and the median gate minutes from the same run evidence.
+2. Break-even USD per minute = (USD 32 − USD 16) / (minutes 16 − minutes 32). Show "always" when the 32-vCPU box is cheaper and not slower, "never" when it is not faster, and "no measurement" when a median is missing.
+3. One AWS page table, a row per region: both prices, both median minutes, both run USD, and the break-even.
+4. Display only. No config change and no gate placement code change.
+
+**Files:** `scripts/aws_target/aws_page.py`, `scripts/aws_target/aws_prices.html`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_run_cost.py`.
