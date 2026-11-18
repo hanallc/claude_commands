@@ -81,8 +81,8 @@ class MemorySegment:
 
 @dataclass(frozen=True)
 class MemoryReading:
-    free_for_next_gib: float
-    queue_cap_gib: float
+    free_for_next_gib: float | None
+    queue_cap_gib: float | None
     segments: tuple[MemorySegment, ...]
 
 
@@ -250,6 +250,10 @@ def _gib(value: object) -> float:
     return float(cast(float, value))
 
 
+def _optional_gib(value: object) -> float | None:
+    return None if value is None else _gib(value)
+
+
 def _time(value: str) -> datetime:
     result = datetime.fromisoformat(value)
     if result.utcoffset() is None:
@@ -302,7 +306,8 @@ def read_evidence(value: object) -> Evidence:
                 captured_at, _text(data.get("step_id"), "Step ID", 300),
                 _text(data.get("title"), "Step title", 300),
                 _text(data.get("owner"), "Step owner", 300, allow_empty=True), cells,
-                MemoryReading(_gib(memory.get("free_for_next_gib")), _gib(memory.get("queue_cap_gib")),
+                MemoryReading(_optional_gib(memory.get("free_for_next_gib", "")),
+                              _optional_gib(memory.get("queue_cap_gib", "")),
                               segments),
                 _text(data.get("tip_title"), "Tooltip title", 300),
                 _text(data.get("tip_status"), "Tooltip status", 300, allow_empty=True),
@@ -388,7 +393,7 @@ KINDS = ((SubmissionKind.QUESTION, "Question", "circle-help"),
 
 
 def render() -> str:
-    """Mount once and open with window.reviewNewItem.open({trigger, kind, evidence})."""
+    """Mount the dialog once for window.reviewNewItem.open({trigger, kind, recipientName, evidence, tipPreview})."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
         + f'<span>{page_frame.icon_svg(icon)}{label}</span></label>'
@@ -585,7 +590,7 @@ SCRIPT = r'''(() => {
   return row;
  }
 
- function showEvidence() {
+ function showEvidence(tipPreview) {
   const box = evidenceSection.querySelector('.new-item-evidence');
   box.replaceChildren();
   evidenceSection.hidden = evidence.kind !== 'build-step';
@@ -598,9 +603,9 @@ SCRIPT = r'''(() => {
   const memory = node('div', '', 'new-item-memory');
   memory.append(node('h4', 'Overall memory'));
   const figures = node('div', '', 'new-item-evidence-heading'), free = node('p');
-  free.append(node('strong', evidence.memory.free_for_next_gib.toFixed(1) + ' GiB'),
-              ' Free for the next step');
-  figures.append(free, node('p', 'Queue cap ' + evidence.memory.queue_cap_gib.toFixed(1) + ' GiB', 'new-item-cap'));
+  const amount = gib => gib === null ? 'unavailable' : gib.toFixed(1) + ' GiB';
+  free.append(node('strong', amount(evidence.memory.free_for_next_gib)), ' Free for the next step');
+  figures.append(free, node('p', 'Queue cap ' + amount(evidence.memory.queue_cap_gib), 'new-item-cap'));
   memory.append(figures);
   const bar = node('div', '', 'new-item-memory-bar');
   bar.setAttribute('aria-hidden', 'true');
@@ -614,6 +619,10 @@ SCRIPT = r'''(() => {
   }
   if (legend.childElementCount) memory.append(bar, legend);
 
+  if (tipPreview) {
+   box.append(heading, cells, memory, tipPreview);
+   return;
+  }
   const tip = node('div', '', 'new-item-tip'), tipHeading = node('div', '', 'new-item-evidence-heading');
   tipHeading.append(node('h4', evidence.tip_title), node('strong', evidence.tip_status));
   tip.append(tipHeading);
@@ -640,10 +649,11 @@ SCRIPT = r'''(() => {
                   !words.value.trim() || words.value.length > words.maxLength;
  }
 
- function showRecipients() {
+ function showRecipients(recipientName) {
   if (!recipients) return;
-  const selected = recipientChips.querySelector('input:checked')?.value;
   const available = recipients.filter(recipient => form.elements.kind.value !== 'proposal' || recipient.proposal);
+  const selected = recipientChips.querySelector('input:checked')?.value ??
+                   available.find(recipient => recipient.name === recipientName)?.id;
   recipientChips.replaceChildren();
   for (const recipient of available) {
    const chip = node('label', '', 'new-item-chip'), input = node('input');
@@ -763,7 +773,7 @@ SCRIPT = r'''(() => {
   updateSend();
  }
 
- async function open({trigger, kind = 'question', evidence: capture = {kind: 'none'}} = {}) {
+ async function open({trigger, kind = 'question', recipientName, evidence: capture = {kind: 'none'}, tipPreview} = {}) {
   if (dialog.open || sending) return;
   launcher = trigger || document.activeElement;
   token = '';
@@ -776,7 +786,7 @@ SCRIPT = r'''(() => {
    recipientChips.replaceChildren();
    const kinds = [...form.querySelectorAll('input[name="kind"]')];
    (kinds.find(input => input.value === kind) || kinds[0]).checked = true;
-   showEvidence();
+   showEvidence(tipPreview);
   }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
@@ -792,7 +802,7 @@ SCRIPT = r'''(() => {
    if (controller.signal.aborted) return;
    token = data.token;
    recipients = data.recipients;
-   showRecipients();
+   showRecipients(keepDraft ? undefined : recipientName);
    updateSend();
   } catch (failure) {
    if (!controller.signal.aborted) recipientStatus.textContent = failure.message;

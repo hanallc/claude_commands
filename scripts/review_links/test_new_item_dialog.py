@@ -167,9 +167,11 @@ function untilError() {
    check((await created).detail.id === 'I1', 'The event reports the saved item ID.');
    check(closeToLauncher(), 'A successful send closes the dialog and returns focus.');
 
-   await open({kind:'question', evidence:{kind:'none'}});
+   await open({kind:'question', evidence:{kind:'none'}, recipientName:'builds'});
    check(document.activeElement.value === 'question' && evidence.hidden && !textarea.value &&
          dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft and accepts empty evidence.');
+   check(recipient().checked && recipient().value === 'builds-staff',
+         'The launcher can select a recipient by name when the staff ID differs.');
    const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
    const kinds = dialog.querySelector('[name="kind"][value="proposal"]');
    to()[1].click();
@@ -180,7 +182,8 @@ function untilError() {
    check(to().length === 9, 'The other types include all recipients.');
    dialog.requestClose();
    check(closeToLauncher(), 'The native cancel action closes the modal and restores focus.');
-   await open({evidence:{kind:'none'}});
+   await open({evidence:{kind:'none'}, recipientName:'absent'});
+   check(!dialog.querySelector('[name="recipient_id"]:checked'), 'A missing default leaves the selection empty.');
    const attempted = [], originalFetch = window.fetch;
    window.fetch = (url, options) => {
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);

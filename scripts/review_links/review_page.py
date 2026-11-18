@@ -213,14 +213,15 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
                         for cell in evidence.cells)
         memory = evidence.memory
         segments = ' · '.join(f'{part.label} {part.gib:g} GiB' for part in memory.segments)
+        free = 'unavailable' if memory.free_for_next_gib is None else f'{memory.free_for_next_gib:g} GiB'
+        cap = 'unavailable' if memory.queue_cap_gib is None else f'{memory.queue_cap_gib:g} GiB'
         tip = ''.join('<div><dd>'+html.escape(part.text)+'</dd></div>'
                       if isinstance(part, (new_item_dialog.TipDetail, new_item_dialog.TipCaption))
                       else '<div><dt>'+html.escape(part.label)+'</dt><dd>'+html.escape(part.value)+'</dd></div>'
                       for part in evidence.tip)
         body = ('<section data-submission-evidence><h3>Evidence</h3><strong>'+html.escape(evidence.title)
                 +'</strong><p>'+html.escape(evidence.owner)+' · '+html.escape(evidence.captured_at)
-                +'</p><dl>'+cells+'</dl><p>'+f'{memory.free_for_next_gib:g} GiB free for the next step · '
-                +f'Queue cap {memory.queue_cap_gib:g} GiB</p><p>'+html.escape(segments)
+                +'</p><dl>'+cells+'</dl><p>'+f'{free} free for the next step · Queue cap {cap}</p><p>'+html.escape(segments)
                 +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
                 +'</p><dl>'+tip+'</dl></section>')
     if origin.images:

@@ -10,6 +10,7 @@
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
 // Use --headcount to compare the Running and Queued headers.
+// Use --rowask to capture the rows and the New item dialog.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
@@ -44,6 +45,7 @@ try {
   const waitTipComparison = process.argv[4] === '--wait-tip';
   const macrouteComparison = process.argv[4] === '--macroute';
   const headcountComparison = process.argv[4] === '--headcount';
+  const rowAskComparison = process.argv[4] === '--rowask';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -118,7 +120,22 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
-  const server = createServer((req, res) => {
+  let submittedItem;
+  const server = createServer(async (req, res) => {
+    if (req.url === '/console/review/new-item') {
+      res.writeHead(200, {'Content-Type':'application/json'});
+      if (req.method === 'POST') {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        submittedItem = JSON.parse(Buffer.concat(chunks));
+        res.end(JSON.stringify({id:'Q1'}));
+      } else {
+        res.end(JSON.stringify({token:'proof-token',recipients:[
+          {id:'fixture-hana',name:'hana',proposal:true}, {id:'fixture-builds',name:'builds',proposal:true}
+        ]}));
+      }
+      return;
+    }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
     res.end(isData ? JSON.stringify({...servedReading,read_at:Date.now()/1000}) : isReport ? JSON.stringify(base.report)
@@ -608,11 +625,11 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens','']);
             assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
             assert.equal(proof.queuedSlots,0);
             assert.equal(proof.answer,'Free for the next step');
-            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
+            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU','']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
@@ -711,7 +728,7 @@ try {
                 tokens:rows.map(row=>row.querySelector('.tokens').textContent),
                 pool:[...document.querySelectorAll('#walk-tokens dt')].map(label=>[label.textContent,label.nextElementSibling.textContent]),
                 poolAlignment:[...document.querySelectorAll('#walk-tokens dd')].map(value=>getComputedStyle(value).textAlign),
-                lastColumns:rows.map(row=>[...row.children].slice(-3).map(cell=>cell.className)),
+                lastColumns:rows.map(row=>[...row.children].slice(-4).map(cell=>cell.className)),
                 overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
                 clip:{x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1}};
@@ -720,7 +737,7 @@ try {
             assert.deepEqual(slotColumn.tokens,['6','—']);
             assert.deepEqual(slotColumn.pool,[['Total','31'],['Available','4']]);
             assert.deepEqual(slotColumn.poolAlignment,['right','right']);
-            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot','tokens'],['vcpus','slot','tokens']]);
+            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot','tokens','row-action'],['vcpus','slot','tokens','row-action']]);
             assert.equal(slotColumn.overflow,false);
             if(theme==='dark'&&width===1400) {
               const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:slotColumn.clip});
@@ -908,7 +925,7 @@ try {
                 slots:tipText(proofTip('wait',latest.waiters.findIndex(row=>row.kind==='cloud')),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens','']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -1638,7 +1655,8 @@ try {
               const headers=[...document.querySelectorAll('.walk-table thead th')].map(cell=>cell.textContent);
               const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th')].map(cell=>cell.textContent);
               const spacings=[...document.querySelectorAll('.walk-table thead th,.walk-table tr.queue-head th')]
-                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling)
+                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling &&
+                  !cell.nextElementSibling.matches('.action-spacer,.row-action'))
                 .map(cell=>parseFloat(getComputedStyle(cell).paddingRight));
               const table=document.querySelector('tr[data-tip="'+proofTip('row',index)+'"]');
               return {index,name:chart.querySelector('.name').textContent,small:chart.querySelector('.owner').textContent,
@@ -1652,8 +1670,8 @@ try {
               assert.equal(state.unit,'CI');
               assert.equal(state.waitingUnit,'CI');
               assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
-              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
-              assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens','']);
+              assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU','']);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
               assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
               assert.ok(state.scroll<=state.client, 'The owner table overflows.');
@@ -2075,7 +2093,7 @@ try {
             [['showrunner','builds'],['unit','this run is from the showrunner']]);
           assert.equal(lefts(showrunnerState).length,1);
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison && !rowAskComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
@@ -2188,6 +2206,7 @@ try {
           await navigate(version==='before' ? 'before.html' : 'memory_live.html');
           const reading=structuredClone(readings.macroute_running);
           const row=reading.walk.find(row=>row.kind==='mac-build');
+          row.started_at=Date.now()/1000-600;
           if(version==='before') row.name += ' · '+row.gate_label;
           await show(reading);
           const index=reading.walk.findIndex(row=>row.kind==='mac-build');
@@ -2531,6 +2550,89 @@ try {
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
         assert.ok(gateFit,'The gate tooltip clips its text.');
         await capture('gate-tooltip-dark-desktop','#tip');
+        await call('Emulation.setDeviceMetricsOverride', {width:1440,height:1100,deviceScaleFactor:1,mobile:false});
+        servedReading = gateReading;
+        const dataColumns = () => evaluate(`[...document.querySelectorAll('.walk-table th[scope="col"]:not(.row-action)')].map(cell => {
+          const box = cell.getBoundingClientRect();
+          return {text:cell.textContent,left:box.left,width:box.width};
+        })`);
+        let beforeColumns;
+        if (rowAskComparison) {
+          assert.ok(beforePage, 'The row comparison needs the previous page.');
+          await navigate('before.html');
+          assert.equal(await evaluate("document.querySelectorAll('.row-add').length"), 0);
+          beforeColumns = await dataColumns();
+          await capture('before-rows-dark','#walk');
+        }
+        await navigate('memory_live.html');
+        const gateButton = `'tr[data-tip="' + proofTip('row', ${gateIndex}) + '"] .row-add'`;
+        assert.deepEqual(await evaluate(`(() => {
+          const button = document.querySelector(${gateButton});
+          return {label:button.getAttribute('aria-label'),icon:!!button.querySelector('.lucide-plus'),
+            queued:document.querySelectorAll('tr.wait .row-add').length};
+        })()`), {label:'New item for natemerge integrate',icon:true,queued:gateReading.waiters.length});
+        const actions = await evaluate(`[...document.querySelectorAll('.row-add')].map(button => {
+          const cell = button.closest('td');
+          const box = button.getBoundingClientRect();
+          return {last:cell === cell.parentElement.lastElementChild, column:cell.className,
+            left:box.left, right:box.right, width:box.width};
+        })`);
+        assert.ok(actions.length > 1);
+        for (const action of actions) {
+          assert.equal(action.last, true);
+          assert.equal(action.column, 'row-action');
+          assert.equal(action.left, actions[0].left);
+          assert.equal(action.width, 22);
+          assert.ok(action.right <= 1440, 'The action column is outside the desktop view.');
+        }
+        if (rowAskComparison) {
+          assert.deepEqual(await dataColumns(), beforeColumns, 'The action column moved a data column.');
+          await capture('after-rows-dark','#walk');
+        }
+        const dialog = await evaluate(`(async () => {
+          const dialog = document.querySelector('#review-new-item');
+          const loaded = new Promise(resolve => {
+            const options = dialog.querySelector('[data-recipients]');
+            const observer = new MutationObserver(() => {
+              if (options.querySelector('input')) { observer.disconnect(); resolve(); }
+            });
+            observer.observe(options, {childList:true});
+          });
+          document.querySelector(${gateButton}).click();
+          await loaded;
+          const preview = dialog.querySelector('.new-item-evidence .tip');
+          const tooltip = tooltipHtml(proofTip('row', ${gateIndex}), latest);
+          return {open:dialog.matches(':modal'),
+            recipient:dialog.querySelector('[name="recipient_id"]:checked').value,
+            kind:dialog.querySelector('[name="kind"]:checked').value,
+            sameTip:preview.outerHTML === tooltip, fits:preview.scrollWidth <= preview.clientWidth,
+            evidence:dialog.querySelector('.new-item-evidence').textContent};
+        })()`);
+        assert.deepEqual({...dialog,evidence:undefined},
+          {open:true,recipient:'fixture-builds',kind:'question',sameTip:true,fits:true,evidence:undefined});
+        assert.ok(dialog.evidence.includes(gateAbout) && dialog.evidence.includes('Overall memory'));
+        if (rowAskComparison) await capture('after-dialog-dark','#review-new-item');
+        await evaluate(`(async () => {
+          const dialog = document.querySelector('#review-new-item');
+          const created = new Promise(resolve => dialog.addEventListener('review-item-created', resolve, {once:true}));
+          const words = dialog.querySelector('textarea');
+          words.value = 'Can we check this gate?';
+          words.dispatchEvent(new Event('input', {bubbles:true}));
+          dialog.querySelector('[type="submit"]').click();
+          await created;
+        })()`);
+        assert.equal(submittedItem.recipient_id, 'fixture-builds');
+        assert.equal(submittedItem.words, 'Can we check this gate?');
+        const evidence = submittedItem.evidence;
+        assert.equal(evidence.kind, 'build-step');
+        assert.equal(evidence.step_id, gateRow.key);
+        assert.equal(evidence.title, gateRow.name);
+        assert.equal(evidence.owner, gateRow.showrunner);
+        assert.ok(evidence.cells.some(cell => cell.label === 'Target' && cell.value === 'natedev'));
+        assert.ok(evidence.cells.every(cell => cell.label), 'Evidence includes the action column.');
+        assert.ok(evidence.memory.segments.some(segment => segment.label === 'Queued builds' && segment.gib > 0));
+        assert.ok(evidence.tip.some(entry => entry.label === 'Changes' && entry.value === 'sdlc branch'));
+        assert.ok(evidence.tip.some(entry => entry.kind === 'caption' && entry.text === gateAbout));
         await show(base);
         await evaluate('hideTip()');
         const endClip=await evaluate(`(() => {
