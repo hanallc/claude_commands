@@ -17,7 +17,6 @@ from typing import cast, override
 from unittest import mock
 
 
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.buildlog import ci
 from scripts.buildlog import cli
 from scripts.lib import conf, land_main, main_push_lock
@@ -42,6 +41,11 @@ raise SystemExit(status)
 '''
 
 GIT_STAND_IN = '''#!/bin/sh
+if [ "$3 $4 $5 $6" = "rev-parse --path-format=absolute --git-path index" ] &&
+   [ -n "$VAULT_TEST_INDEX" ]; then
+  printf '%s\\n' "$VAULT_TEST_INDEX"
+  exit 0
+fi
 if [ "$3" = "$VAULT_TEST_OPERATION" ]; then
   count=0
   [ ! -f "$VAULT_TEST_COUNTER" ] || read -r count < "$VAULT_TEST_COUNTER"
@@ -79,6 +83,7 @@ class VaultPullTests(unittest.TestCase):
     reject_push: bool = False
     lock_operation: str = ""
     lock_failures: int = 0
+    index_path: str = ""
     unknown_remote_error: bool = False
     lock_detail: str = "fatal: Unable to create 'rust/hanadocs/.git/index.lock': File exists"
     push_rejection: str = "[rejected]"
@@ -129,10 +134,16 @@ class VaultPullTests(unittest.TestCase):
             _ = self.git(repository, "remote", "set-url", "origin", str(self.github))
         settings = self.folder / "config"
         settings.mkdir()
-        _ = write_config_fixture(settings / "build_targets.conf",
+        build_targets = settings / "build_targets.conf"
+        _ = build_targets.write_text(
             "# whole: 0..10\nvault.lock_retries=2\n# range: 0..5\nvault.lock_retry_delay_s=0\n"
-            + "vault.question_production=natedev\n")
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(settings)}))
+            + "vault.question_production=natedev\n"
+            + "# range: 1..86400\nvault.lock_question_age_s=3600\n"
+            + "sync.connect_timeout_s=10\n"
+        )
+        self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(settings), "BUILD_TARGETS_CONFIG": str(build_targets),
+        }))
         point_root_at(self, self.root)
         script = self.folder / "update_registration.py"
         _ = script.write_text(QUESTION_STAND_IN)
@@ -198,6 +209,7 @@ class VaultPullTests(unittest.TestCase):
                 "VAULT_TEST_COUNTER": str(self.folder / "lock_count"),
                 "VAULT_TEST_LOCK_FAILURES": str(self.lock_failures),
                 "VAULT_TEST_FAILURE_DETAIL": self.lock_detail,
+                "VAULT_TEST_INDEX": self.index_path,
             }
             result = subprocess.run(["/bin/sh", "-c", args[-1]], cwd=self.mac.parents[1], env=environment,
                                     capture_output=True, text=True, check=False, timeout=timeout)
@@ -360,7 +372,8 @@ class VaultPullTests(unittest.TestCase):
 
     def test_a_second_stop_in_one_outage_files_no_second_question(self) -> None:
         for outcome in (vault_pull.VaultConflict(("shared.md",)), vault_pull.NotOnMain(),
-                        vault_pull.VaultLocked(self.lock_detail), vault_pull.MacUnreachable(),
+                        vault_pull.VaultLocked(self.lock_detail, vault_pull.IndexLockIdentity("1:2:3")),
+                        vault_pull.MacUnreachable(),
                         vault_pull.VaultCommandFailed("fixture command error")):
             with self.subTest(outcome=outcome):
                 for name in ("questions.jsonl", "attempts.jsonl"):
@@ -641,23 +654,48 @@ class VaultPullTests(unittest.TestCase):
                 self.assertEqual(self.git(self.github, "show", "main:note.md"), operation)
                 self.assertEqual(self.questions(), [])
 
-    def test_exhausted_commit_and_merge_locks_file_a_question(self) -> None:
+    def test_exhausted_commit_and_merge_locks_ask_only_after_the_same_lock_ages(self) -> None:
         settings = self.folder / "config/build_targets.conf"
         _ = settings.write_text(settings.read_text().replace("vault.lock_retries=2", "vault.lock_retries=5"))
         for operation in ("commit", "merge"):
-            with self.subTest(operation=operation):
-                vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
-                questions_before = len(self.questions())
-                status, line = self.locked_hour(operation, 6)
-                self.assertEqual(status, 0)
-                self.assertEqual(len(self.questions()), questions_before)
-                self.assertEqual(line.count(self.lock_detail), 1)
-                self.assertEqual((self.folder / "lock_count").read_text().strip(), "6")
-                self.assertEqual(self.locked_hour(operation, 6)[0], 0)
-                self.assertEqual((self.folder / "lock_count").read_text().strip(), "6")
-                self.assertIn("index.lock", self.question())
-                self.assertEqual(self.question().count(self.lock_detail), 1)
-        self.assertEqual(len(self.questions()), 2)
+            for case in ("same lock", "replacement lock", "no identity", "identity appears", "identity disappears"):
+                with self.subTest(operation=operation, case=case):
+                    vault_pull.write_state(vault_pull.VaultState(vault_pull.NeverPulled(), vault_pull.NoOutage()))
+                    index = self.folder / f"{operation} {case} index"
+                    self.index_path = str(index)
+                    lock = index.with_suffix(".lock")
+                    if case not in ("no identity", "identity appears"):
+                        lock.touch()
+                    questions_before = len(self.questions())
+                    status, line = self.locked_hour(operation, 6)
+                    self.assertEqual(status, 0)
+                    self.assertEqual(len(self.questions()), questions_before)
+                    self.assertEqual(line.count(self.lock_detail), 1)
+                    self.assertEqual((self.folder / "lock_count").read_text().strip(), "6")
+
+                    if case == "replacement lock":
+                        _ = lock.rename(lock.with_suffix(".old"))
+                        lock.touch()
+                    elif case == "identity appears":
+                        lock.touch()
+                    elif case == "identity disappears":
+                        lock.unlink()
+                    same_observation = case in ("same lock", "no identity")
+                    self.now += 3599 if same_observation else 3600
+                    status, line = self.locked_hour(operation, 6)
+                    self.assertEqual(status, 0)
+                    self.assertEqual((self.folder / "lock_count").read_text().strip(), "6")
+                    self.assertEqual(len(self.questions()), questions_before)
+                    self.assertIn("the next hour retries", line)
+
+                    self.now += 1 if same_observation else 3600
+                    self.assertEqual(self.locked_hour(operation, 6)[0], 0)
+                    self.assertEqual(len(self.questions()), questions_before + 1)
+                    self.assertIn("index.lock", self.question())
+                    self.assertEqual(self.question().count(self.lock_detail), 1)
+                    self.assertEqual(self.locked_hour(operation, 6)[0], 0)
+                    self.assertEqual(len(self.questions()), questions_before + 1)
+        self.assertEqual(len(self.questions()), 10)
 
     def test_vault_retry_delay_limit_stays_below_one_minute(self) -> None:
         production = Path(__file__).resolve().parents[2] / "config/build_targets.conf"
