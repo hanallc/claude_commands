@@ -187,9 +187,10 @@ Approve and Decline make the item Done at once.
 Approve sends the user's words and the record command to the owner showrunner.
 Run that command when the message arrives.
 Decline records the answer at once: a proposal's declined answer, or an efficiency's `declined` outcome.
-Send feedback sends the words to the owner and closes the item.
-Ask question moves it to Waiting.
+Send feedback closes questions, investigations, proposals and efficiencies.
+Ask question moves those items to Waiting.
+On a change, Send feedback and Ask question send the words to the showrunner and move the change to Validating.
 Answer it with `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
 Use the question ID from the request message for all five Review types.
-The item returns to For you with the answer in its log.
+The item returns to Open with the answer in its log.
 Later takes a date and time and hides the item from Review, the count and `/next` until then.
