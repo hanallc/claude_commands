@@ -4784,19 +4784,12 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - aws pair (3 rounds, c7a.4xlarge): 37.97 -> 26.12 CPU s, a paired median saving of 11.83 s; peak 139.8 -> 139.9 MiB; all passed.
 - Largest cost left: 59 local `copies.py` starts (7.2 CPU s). Main-based commit 0bd91aa39 (branch `natest-macrun342`) is on the merge line as "builds natest342".
 
-### Phase 343 — the gate rename chain merges with main and passes the full suite  · status: todo
+### Phase 343 — the gate rename chain merges with main and passes the full suite  · status: done
 **Depends on:** Phase 340
 
-#### Work Order
+#### As-built
 
-**Goal:** one chain commit of phases 314-322 and the wire fix 340, merged with builds main 07e10771d, passes the full local suite.
-
-**Spec:**
-1. Worktree `~/worktrees/claude-natedev-natest-gatechain`, branch `natest-gatechain`, at fc5ff3758 (merge of 0622a8585 with 07e10771d, no conflicts).
-2. `build_queue/first_step.py:137` (from main 44ax/44ay) names the steps 'merge-gate' and 'targeted-test'; the chain renamed the config keys to `program_first_peak_gib.gate` and `.test-affected`. Use the new step names; `copies/test_slot_order.py` uses them too.
-3. `aws_target/test_hana_render.py` fails in its guest checkout: `cannot import name 'program_start' from 'scripts.build_queue'`. Find why the chain's guest file list lacks what main's `slot_wait` now imports, and fix it where the list lives.
-4. Find every other main caller that uses an old gate name.
-
-**Files:** as found; the fix goes where each defect lives.
-
-**Acceptance gate:** the full local suite passes on the repaired chain commit; basedpyright clean on changed files.
+- Chain hash 10b35a56e on branch `natest-gatechain`: phases 314-322 and wire fix 340, merged with builds main 07e10771d (fc5ff3758), plus one repair commit.
+- `build_queue/first_step.py` names the steps `gate` and `test-affected`; `copies/test_slot_order.py` checks both affected command forms. `aws_target/hana_render.files` lists `program_start.py`, `package_root.py`, `process_start.py` and `python_startup/sitecustomize.py`.
+- Full suite (`merge_gate.py --tests-only`): 843 modules, all exit 0, 362 s. Old names stay only at the AWS wire boundary and in build folder prefixes, by design.
+- Review found three defects already on main, outside the chain; they wait in the add-on list: `test_slot_order.py:82` and `test_hana_render.py:33,45` read tunable config; `first_step.py:137` reads a `-X` value as a gate flag.
