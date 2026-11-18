@@ -41,12 +41,15 @@ window.fetch=(_path,options={})=>{
   check(clear(),'reload clears the failure');
  }else try{
   const [first,second,third,older,newer,next,reload,anchor]=document.querySelectorAll('[data-list-item]');
+  const liveRow=row=>document.querySelector('[data-list-item][data-key="'+CSS.escape(row.dataset.key)+'"]');
   const open=row=>{
+   row=liveRow(row);
    if(row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+   return row;
   };
-  const startSave=row=>{
-   open(row);
-   const form=row.querySelector('form');
+  const startSave=async row=>{
+   row=open(row);
+   const form=action==='works' ? await readyReviewCard(row) : row.querySelector('form');
    const settled=new Promise(resolve=>{
     const observe=new MutationObserver(()=>{
      if(!form.dataset.sending){observe.disconnect();resolve();}
@@ -58,20 +61,22 @@ window.fetch=(_path,options={})=>{
    if(!finishPost) throw new Error('The save did not start.');
    check(clear(),'the next save clears the notice at submission');
    const finish=finishPost;
-   return async reason=>{finish(reason);await settled;};
+   return {row,form,finish:async reason=>{finish(reason);await settled;}};
   };
   const save=async(row,reason='')=>{
-   const finish=startSave(row);
+   const save=await startSave(row);
+   row=save.row;
    if(!reason){
-    const motion=row.nextElementSibling;
+    const motion=row.nextElementSibling ?? [...document.querySelectorAll('[data-record-motion]')].find(
+     node=>node.querySelector('.list-toggle').textContent===row.querySelector('.list-toggle').textContent);
     check(row.hidden && motion?.matches('[data-record-motion]') &&
       motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===200),
       'a successful save starts the 200 ms row fade');
    }else if(action==='works') open(anchor);
-   await finish(reason);
+   await save.finish(reason);
   };
   const failure=(row,reason)=>{
-   const label=action==='works' ? row.querySelector('form').elements.row.value : 'Item '+row.dataset.number;
+   const label=action==='works' ? row.dataset.key : 'Item '+row.dataset.number;
    const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
    check(!status.hidden && status.textContent===label+': '+prefix+reason,
     'the table shows only '+reason);
@@ -85,16 +90,16 @@ window.fetch=(_path,options={})=>{
   await save(next);
   check(clear(),'a later success leaves no notice');
   for(const newerReason of ['Fixture newer overlapping failure','']){
-   const finishOlder=startSave(older),finishNewer=startSave(newer);
+   const olderSave=await startSave(older),newerSave=await startSave(newer);
    if(action==='works') open(anchor);
-   await finishNewer(newerReason);
-   await finishOlder('Fixture older overlapping failure');
+   await newerSave.finish(newerReason);
+   await olderSave.finish('Fixture older overlapping failure');
    if(newerReason){
     failure(newer,newerReason);
-    check(newer.querySelector('[data-send-status]').textContent.includes(newerReason),
+    check(newerSave.form.querySelector('[data-send-status]').textContent.includes(newerReason),
      'the newer failure stays on its row');
    }else check(clear(),'an older failure adds no notice after a newer success');
-   check(older.querySelector('[data-send-status]').textContent.includes('Fixture older overlapping failure'),
+   check(olderSave.form.querySelector('[data-send-status]').textContent.includes('Fixture older overlapping failure'),
     'the older failure stays on its row');
   }
   await save(reload,'Fixture failure before reload');
@@ -158,8 +163,9 @@ assert.deepEqual(changes,['two']);
 class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str, *, closed_item: str = '', park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        _, start, callbacks = review_page.SCRIPT.partition('function matchesOwner(')
-        callbacks = start + callbacks.split('\nfunction loadBodies()', 1)[0]
+        _, start, callbacks = review_page.SCRIPT.partition('function matches(entry,')
+        callbacks = start + callbacks.split("\naddEventListener('scroll'", 1)[0]
+        callbacks = callbacks.replace('const view=createRecordTable(', 'const view=createStaticTable(')
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
                   + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
@@ -193,9 +199,9 @@ const rows=[
 });
 const index=new Map(rows.map(({dataset})=>[dataset.key,{...dataset,id:dataset.key,
  hiddenUntil:dataset.parked==='true' ? Date.now()+60000 : 0}]));
-const table={append(){},getAttribute:()=> 'Review'};
+const table={append(){},addEventListener(){},getAttribute:()=> 'Review'};
 const content={
- addEventListener(){},
+ dataset:{},addEventListener(){},
  querySelector:selector=>({'#list-owner':owner,'#list-show':show,'#list-search':search,
   '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
  querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
@@ -203,9 +209,11 @@ const content={
 const document={createElement:element};
 const location={search:'',hash:fragment,pathname:'/console/review.html'};
 const history={replaceState(_state,_title,url){this.url=url;}};
-const window={},parent=window,departures=new Map();
-let selectedShow='all',requestedShow='all';
-const reviewPlace=()=>{},loadBodies=()=>{},pageRefresh={refresh(){}};
+const window={},parent=window,pendingSaves=new Map(),saved=new Map();
+let selectedShow='all';
+const reviewPlace=()=>{},loadBodies=()=>{},allEntries=()=>[...index.values()];
+const summary=()=>{throw new Error('The static fixture must use its existing rows.');};
+function createStaticTable(options){return createRecordTable({...options,entries:undefined,mount:undefined});}
 ''' + record_table.SCRIPT + '\n' + callbacks + r'''
 view.place();view.apply(false);
 if(parkOpenCard){
