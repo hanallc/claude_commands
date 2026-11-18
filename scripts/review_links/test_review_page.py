@@ -40,7 +40,7 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import question_record
-from scripts.review_links import list_page, staff_names, test_change_page
+from scripts.review_links import list_page, page_frame, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
@@ -3664,6 +3664,37 @@ window.fetch=async(url)=>{
 </script>'''
         markup = markup.replace('</body>', probe + '</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_owner_and_new_share_the_title_line(self) -> None:
+        owner = replace(self.ready_submission_recipient(), name='Review and console delivery')
+        markup = page_frame.with_owner(review_page.build_snapshot(self.root).page, 'review', owner,
+                                       staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  const title=document.querySelector('h1.page-title'), row=title.closest('.page-heading');
+  const name=document.querySelector('.page-owner-name'), owner=document.querySelector('[data-owner-new]');
+  const button=document.querySelector('[data-review-new]');
+  const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
+  await document.fonts.ready;
+  for(const width of [1280,390]){
+   frameElement.style.width=width+'px';
+   const t=bounds(title), n=bounds(name), o=bounds(owner), b=bounds(button), r=bounds(row);
+   const beside=Math.abs(center(t)-center(b))<=1;
+   if(innerWidth!==width || !row.contains(owner) || !row.contains(button) ||
+      Math.abs(center(o)-center(b))>1 || Math.abs(center(n)-center(b))>1 ||
+      Math.abs((o.left-n.right)-(b.left-o.right))>1 || o.left<n.right+4 ||
+      n.left<r.left-1 || Math.abs(b.right-r.right)>1 ||
+      (beside ? n.left<t.right+4 : width===1280 || b.top<t.bottom+4)){
+    failures.push('The title and both controls must fit at '+width+' px.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:

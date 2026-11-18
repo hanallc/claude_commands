@@ -62,6 +62,8 @@ class PageStatusTests(unittest.TestCase):
               patch.object(subprocess, "Popen", side_effect=AssertionError("The owner launched a process."))):
             page = serve.owned_document(b'<html><head></head><body><main><h1>The List</h1></main></body></html>', "list")
         self.assertIn(b'data-page-owner="list"', page)
+        self.assertIn(b'<div class="page-heading"><h1>The List</h1><div class="page-heading-actions">', page)
+        self.assertIn(page_frame.HEADING_STYLE.encode(), page)
         self.assertIn(b'class="staff-name" data-color-text="role.showrunner"', page)
         self.assertIn(b'aria-label="New item for Current &amp; name" title="New item for Current &amp; name"', page)
         self.assertEqual(page.count(b'<dialog id="review-new-item"'), 1)
@@ -376,14 +378,15 @@ window.fetch=async(url,options={})=>{
   check(positions.length===4 && positions[0].matches('.page-status-state') && positions[1]===part('age') &&
    positions[2]===part('trip') && positions[3]===part('render'),'the Live line has the same four positions');
   const title=document.querySelector('.page-title'),titleBox=title.getBoundingClientRect(),lineBox=line.getBoundingClientRect();
+  const headingBox=(title.closest('.page-heading') || title).getBoundingClientRect();
   const main=document.querySelector('main'),mainBox=main.getBoundingClientRect(),width=document.documentElement.clientWidth;
   // A wide page uses the pane width; a text page keeps the 1124 px column.
   check(mainBox.width===(main.classList.contains('page-wide')?width:Math.min(width,1124)) &&
    Math.abs(mainBox.left-(width-mainBox.right))<1,'the page uses the shared centered column');
   check(main.classList.contains('page-wide')===(document.title==='Builds'),'only the Builds page is wide');
-  check(titleBox.x===mainBox.x+32 && titleBox.y+scrollY===32,'the title starts at the shared column edge');
-  check(lineBox.x===titleBox.x && lineBox.y===titleBox.bottom+8,'the line follows the title in the same column');
-  check(lineBox.width===titleBox.width && lineBox.height===21,'the line uses the full title width and shared height');
+  check(titleBox.x===mainBox.x+32 && headingBox.y+scrollY===32,'the title starts at the shared column edge');
+  check(lineBox.x===titleBox.x && lineBox.y===headingBox.bottom+8,'the line follows the title row in the same column');
+  check(lineBox.width===headingBox.width && lineBox.height===21,'the line uses the full title row width and shared height');
   check(getComputedStyle(title).fontSize==='26px' && getComputedStyle(title).fontWeight==='700',
    'the title uses the shared size and weight');
   check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px' &&

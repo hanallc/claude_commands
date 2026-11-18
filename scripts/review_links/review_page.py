@@ -954,9 +954,7 @@ STYLE = '''<style>
 .review-types button{max-width:100%;overflow-wrap:anywhere}
 :is(.review-types button,[data-clear-linked-reviews],.review-new){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
-.page-heading:has(>.review-new)>.page-title{padding-inline-end:6rem}
-.page-heading>.review-new{position:absolute;inset-inline-end:0;inset-block-start:50%;transform:translateY(-50%);
-color:var(--accent);white-space:nowrap}
+.page-heading-actions>.review-new{flex:none;color:var(--accent);white-space:nowrap}
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}

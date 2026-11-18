@@ -17,6 +17,8 @@ from scripts.production import staff
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "rebuilds", "review"))
+TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
+HEADING_ACTIONS = '<div class="page-heading-actions">'
 
 
 def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.StaffSnapshot,
@@ -29,22 +31,41 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.
         return content
     name = staff_names.StaffNames(members).html(owner.id, owner.name)
     label = html.escape(f"New item for {owner.name}", quote=True)
-    header = (f'<div class="page-owner" data-page-owner="{page}">{name}'
-              + f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
-              + icon_svg("message-circle-question") + '</button></div>').encode()
-    content = content[:main.end()] + header + content[main.end():]
+    control = (f'<div class="page-owner" data-page-owner="{page}"><span class="page-owner-name">{name}</span>'
+               + f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
+               + icon_svg("message-circle-question") + '</button></div>').encode()
+    actions = HEADING_ACTIONS.encode()
+    heading = TITLE_ELEMENT.search(content, main.end())
+    if heading is not None and content.startswith(actions, heading.end()):
+        at = heading.end() + len(actions)
+        content = content[:at] + control + content[at:]
+    elif heading is not None:
+        row = b'<div class="page-heading">' + heading[0] + actions + control + b'</div></div>'
+        content = content[:heading.start()] + row + content[heading.end():]
+    else:
+        content = content[:main.end()] + actions + control + b'</div>' + content[main.end():]
     head = re.search(rb"<head(?=[\s>])[^>]*>", content)
     if head is not None:
         content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
-    content = content.replace(b'</head>', OWNER_STYLE.encode() + b'</head>', 1)
+    row_style = HEADING_STYLE.encode()
+    style = OWNER_STYLE.encode()
+    if row_style not in content:
+        style = b'<style>' + row_style + b'</style>' + style
+    content = content.replace(b'</head>', style + b'</head>', 1)
     if b'id="review-new-item"' not in content:
         content = content.replace(b'</body>', dialog().encode() + b'</body>', 1)
     return content
 
 
+HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}'
+                 + '.page-heading>h1{margin:0}'
+                 + '.page-heading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;'
+                 + 'max-width:100%;margin-inline-start:auto}')
+
+
 OWNER_STYLE = """<style>
-.page-owner{float:right;display:flex;align-items:center;justify-content:flex-end;gap:8px;
-margin:0 0 6px 12px;max-width:50%;font:600 14px/1.4 system-ui,sans-serif;position:relative;z-index:1}
+.page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
+.page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
 margin:0;padding:7px;background:var(--card);color:var(--ink-2);border:1px solid var(--line);border-radius:8px;cursor:pointer}
 .page-owner button:hover{color:var(--ink);background:var(--hover)}
@@ -93,7 +114,7 @@ def title(text: str, page: str, *, action: str = "") -> str:
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     if action:
-        heading = f'<div class="page-heading">{heading}{action}</div>'
+        heading = f'<div class="page-heading">{heading}{HEADING_ACTIONS}{action}</div></div>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
@@ -257,8 +278,7 @@ STYLE = (':root{scrollbar-gutter:stable}'
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
          + 'main:has(>.page-status):not(.page-wide){max-width:1124px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
-         + '.page-heading{position:relative;margin-bottom:8px}'
-         + '.page-heading>.page-title{margin:0}'
+         + HEADING_STYLE
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
          + r'''
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;
