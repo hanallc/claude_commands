@@ -57,6 +57,7 @@ from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
+from scripts.lib.transcripts import claude_transcript_candidates
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
@@ -428,15 +429,12 @@ class TranscriptCursor:
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
 
     def _paths(self) -> Iterable[Path]:
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
-            self.readability = TranscriptUnreadable()
-            return
         try:
-            for project in (self.transcript.config_dir / "projects").iterdir():
-                yield project / f"{self.transcript.session_id}.jsonl"
-        except OSError as error:
-            if not isinstance(error, FileNotFoundError):
-                self.readability = TranscriptUnreadable()
+            yield from claude_transcript_candidates(self.transcript.config_dir, self.transcript.session_id)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            self.readability = TranscriptUnreadable()
 
     def skip_existing_turns(self) -> None:
         """Skip complete rows before launch without parsing historical JSON."""

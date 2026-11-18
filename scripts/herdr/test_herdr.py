@@ -1518,6 +1518,17 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIn("transcript unreadable", outcome.reason)
         self.assertEqual((self.typed, self.enters), ([], []))
 
+    def test_cursor_distinguishes_missing_projects_from_an_invalid_session_id(self) -> None:
+        cases = (
+            (herdr.SessionTranscript(self.root / "missing", self.transcript.session_id), herdr.TranscriptReadable),
+            (herdr.SessionTranscript(self.transcript.config_dir, "invalid/id"), herdr.TranscriptUnreadable),
+        )
+        for transcript, expected in cases:
+            with self.subTest(transcript=transcript):
+                cursor = herdr.TranscriptCursor(transcript, self.launched_at)
+                self.assertEqual(cursor.read_turns(), [])
+                self.assertIsInstance(cursor.readability, expected)
+
     def test_staff_publication_inherits_the_remaining_launch_deadline(self) -> None:
         from scripts.lib import operation_deadline
 
