@@ -826,8 +826,8 @@ let selectedShow=content.dataset.show;
 const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
 const kinds=['question','change','investigation','proposal','efficiency'],states=['Open','Waiting','Done','Validating'];
-let initialIndex=JSON.parse(content.querySelector('[data-review-index]').textContent);
-let index=new Map(),focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
+let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
+let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
@@ -837,15 +837,7 @@ function indexEntry(payload,row,at){
 function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
-function allEntries(){
- if(initialIndex){
-  const initial=index;
-  index=readIndex(initialIndex);
-  for(const [key,entry] of initial) index.set(key,entry);
-  initialIndex=null;
- }
- return [...index.values()];
-}
+function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 function summary(entry){
  const node=document.createElement('tbody'),panel='review-detail-'+encodeURIComponent(entry.key);
@@ -903,7 +895,12 @@ const view=createRecordTable({content:()=>content,single:true,
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
  hasKey:key=>allEntries().some(entry=>entry.key===key),
  shows:['open','Validating','Done','all'],
- visible:(data,filters)=>!pendingSaves.get(data.key)?.departing && (!saved.has(data.key) || index.get(data.key)?.handoff) && index.has(data.key) && matches(index.get(data.key),filters),
+ visible:(data,filters)=>{
+  const key=data.key,entry=index.get(key),departure=saved.get(key);
+  if(!entry || pendingSaves.get(key)?.departing) return false;
+  const reopened=departure?.closes && view.linkedItem===key && view.opened.has(key);
+  return (!departure || entry.handoff || reopened) && matches(entry,filters);
+ },
  sortValues:data=>{
   const entry=index.get(data.key);
   return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
@@ -976,6 +973,9 @@ function loadBodies(){
    const current=mountedRow(key);
    if(!current || current.dataset.bodyLoaded) return;
    current.dataset.bodyLoaded='true';current.querySelector('[data-detail]>td').innerHTML=text;
+   const departure=saved.get(key);
+   if(departure?.closes && departure.awaitingSnapshot)
+    current.querySelector('[data-review-form]')?.remove();
    const panel=current.querySelector('.review-panel');if(panel) updateTitleFallback(panel);
    bindForm(current);restoreFocus(key);view.drawWindow();
   };
@@ -1063,7 +1063,7 @@ function bindForm(row){
      handed,state:result.state ?? (handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:data.get('outcome')==='question',
-     closes:!handed && !['question','later'].includes(outcome)});
+     closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true});
     savedEntry(key,saved.get(key));
     pendingSaves.delete(key);
     view.closeCard(key);
@@ -1075,6 +1075,7 @@ function bindForm(row){
    }
    finally{
     pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
+    followItemLink({inheritFilters:true,unappliedOnly:true});
     if(!pendingSaves.size) void pageRefresh.refresh(true);
    }
   };
@@ -1151,7 +1152,7 @@ async function refresh(_supersede=false,current=()=>true){
  if(pendingSaves.size || !current()) return;
  const top=scrollY;focusAfterLoad=rememberFocus();
  content.querySelectorAll('[data-review-form]').forEach(rememberForm);
- initialIndex=null;index=readIndex(payload.index);content.dataset.version=payload.version;
+ index=readIndex(payload.index);content.dataset.version=payload.version;
  if(payload.presentation){
   content.dataset.zone=payload.presentation.zone;
   content.dataset.later=JSON.stringify(payload.presentation.later);
@@ -1186,9 +1187,8 @@ async function refresh(_supersede=false,current=()=>true){
   // The index supplies the state and update time for each row.
   const submitted=entry.state===result.previousState && entry.updated===result.updated;
   if(!submitted && (result.handed || entry.state!==result.state)){saved.delete(key);continue;}
-  if(!result.closes && !result.question && !result.later && !submitted){
-   saved.delete(key);
-  }
+  if(!result.closes && !result.question && !result.later && !submitted) saved.delete(key);
+  else result.awaitingSnapshot=submitted;
  }
  for(const [key,result] of saved) savedEntry(key,result);
  const revealed=revealConflict();bind();view.apply(false);
@@ -1199,26 +1199,19 @@ async function refresh(_supersede=false,current=()=>true){
  if(!revealed) scrollTo({top,behavior:'instant'});
  return {...payload.facts,answeredAt:version.facts.answeredAt};
 }
-view.place();bind();
+bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
-const entryJump=new URLSearchParams(location.hash.slice(1)).get('jump');
-const start=firstRequest ? initialIndex.r.findIndex(row=>row[0]===firstRequest.key) : -1;
-if(entryJump) view.jump(entryJump,{pushPlace:false});
-else if(start>=0){
- const entry=indexEntry(initialIndex,initialIndex.r[start],start);
- index.set(entry.key,entry);
- if(view.openInitial(entry)){
-  loadBodies();
-  requestAnimationFrame(()=>requestAnimationFrame(()=>{
-   if(initialIndex){view.place();view.apply();}
-  }));
- }else view.apply();
-}else view.apply();
+function followItemLink(options){
+ return view.followItemLink({...options,beforeJump:key=>{
+  if(pendingSaves.has(key)) return false;
+  if(!saved.get(key)?.closes && !saved.get(key)?.question) saved.delete(key);
+  return true;
+ }});
+}
+if(!followItemLink()){view.place();view.apply();}
 function restorePlace(event){
- const fragment=new URLSearchParams(location.hash.slice(1)),jump=fragment.get('jump'),item=jump || fragment.get('item');
- if(item && !saved.get(item)?.closes && !saved.get(item)?.question) saved.delete(item);
- if(jump){view.place();view.jump(jump,{pushPlace:false});}
- else view.restorePlace(event);
+ if(event.type==='hashchange' && !history.state?.recordTable && followItemLink({inheritFilters:true})) return;
+ view.restorePlace(event);
 }
 addEventListener('popstate',restorePlace);
 addEventListener('hashchange',restorePlace);
