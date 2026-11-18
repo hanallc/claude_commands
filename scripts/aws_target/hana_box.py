@@ -336,7 +336,7 @@ def _claim_owner(document: dict[str, object]) -> LocalClaimOwner | UnrecordedCla
     return LocalClaimOwner(pid, ledger.text(owner, 'start'))
 
 
-def _start_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str:
+def _start_deadline_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str:
     if not row.claims:
         return 'The Hana start has no owner'
     claim = row.claims[0]
@@ -344,12 +344,20 @@ def _start_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str
                 else claim.requested_at + settings.start_timeout_seconds)
     if not claim.active and now >= deadline:
         return 'The Hana start deadline expired'
-    if isinstance(claim.owner, LocalClaimOwner):
-        owner = process_start.process_start(claim.owner.pid)
+    return ''
+
+
+def _claim_owner_refusal(row: BoxRecord) -> str:
+    if row.claims and isinstance(claim_owner := row.claims[0].owner, LocalClaimOwner):
+        owner = process_start.process_start(claim_owner.pid)
         if isinstance(owner, (process_start.Gone, process_start.Zombie)) or (
-                isinstance(owner, process_start.Started) and owner.start != claim.owner.start):
+                isinstance(owner, process_start.Started) and owner.start != claim_owner.start):
             return 'The Hana start owner exited'
     return ''
+
+
+def _start_refusal(row: BoxRecord, now: int, settings: LifecycleSettings) -> str:
+    return _start_deadline_refusal(row, now, settings) or _claim_owner_refusal(row)
 
 
 def _decode(document: dict[str, object]) -> BoxRecord:
@@ -563,11 +571,15 @@ class HanaController:
             row = self._read()
             if isinstance(row, NoDeployment):
                 return Lifecycle.UNPROVISIONED
+            owner_refusal = _claim_owner_refusal(row)
+            if owner_refusal and row.state not in (Lifecycle.STARTING, Lifecycle.READY):
+                row.reason, row.claims, row.delivered = owner_refusal, [], NoDeliveredPermit()
+                self._save(row)
             settings = read_settings(conf.read(self.workload_path))
             spending = self._spending()
             if isinstance(row.operation, NoOperation):
                 if row.state == Lifecycle.IDLE_STOPPED and row.claims and spending.settings.enabled:
-                    refusal = _start_refusal(row, now, settings)
+                    refusal = _start_deadline_refusal(row, now, settings)
                     if refusal:
                         row.reason, row.claims = refusal, []
                         self._save(row)
@@ -588,7 +600,7 @@ class HanaController:
             assert isinstance(operation, PendingOperation)
             abandonment = ''
             if row.state == Lifecycle.STARTING or (row.state == Lifecycle.READY and row.claims):
-                abandonment = _start_refusal(row, now, settings)
+                abandonment = _start_deadline_refusal(row, now, settings) or owner_refusal
             if abandonment and operation.action not in (Action.BOOTSTRAP, Action.START):
                 self._stop_abandoned(row, now, abandonment)
                 return row.state
