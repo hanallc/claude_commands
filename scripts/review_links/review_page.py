@@ -1234,7 +1234,7 @@ function bindForm(row){
     pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
     if(isDeferredLink(key)){
      const link=deferredLink;
-     await view.settled();
+     while(deferredLink===link && isDeferredLink(key) && view.hasActiveRowAnimations) await view.settled();
      if(deferredLink===link && isDeferredLink(key)){
       deferredLink=null;
       followItemLink({inheritFilters:true});
