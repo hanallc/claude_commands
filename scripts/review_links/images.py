@@ -184,6 +184,10 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
+    closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
+                       '<button type="submit" name="action" value="not approved">Not Approved</button>'
+                       '<button type="submit" name="action" value="feedback">Send Feedback</button>')
+    returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>'
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
             + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
@@ -199,11 +203,8 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
             + f'<label for="feedback-{record["id"]}">Feedback</label>'
             + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
-            + '<div class="image-actions"><button type="submit" name="action" value="approved">Approved</button>'
-            + '<button type="submit" name="action" value="not approved">Not Approved</button>'
-            + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
-            + '<button type="submit" name="action" value="question">Ask question</button>'
-            + '<span role="status" data-image-status></span></div></form></article>')
+            + page_frame.review_action_groups(closing_buttons, returning_buttons)
+            + '<span role="status" data-image-status></span></form></article>')
 
 
 def question_delivery_view(status: change_page.DeliveryStatus, page: change_page.ReviewPage,
@@ -372,9 +373,9 @@ STYLE = """<style>[hidden]{display:none!important}
 .image-details dt{white-space:pre}.image-details dd{margin:0}
 [data-images] form{display:grid;gap:8px;margin-top:12px}
 [data-images] textarea{font:inherit;width:100%;box-sizing:border-box;color:CanvasText;background:Canvas}
-.image-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.image-actions button{margin:0}
+[data-image-form] .review-actions button{margin:0}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
-@media (max-width:480px){.image-actions{gap:6px}.image-actions button{font-size:15px;padding:6px 8px}}
+@media (max-width:480px){[data-image-form] .review-actions button{font-size:15px;padding:6px 8px}}
 [data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;display:grid;
 grid-template-columns:minmax(0,max-content) max-content max-content;font-size:14px;border:1px solid #8886;border-radius:8px}

@@ -492,11 +492,13 @@ class ImagesTests(ImagesFixture):
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
             + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
-            + '<div class="image-actions"><button type="submit" name="action" value="approved">Approved</button>'
+            + '<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
+            + '<button type="submit" name="action" value="approved">Approved</button>'
             + '<button type="submit" name="action" value="not approved">Not Approved</button>'
             + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
-            + '<button type="submit" name="action" value="question">Ask question</button>'
-            + '<span role="status" data-image-status></span></div></form></article>'))
+            + '</div></div><div class="review-action-group"><span>The item returns to you</span><div>'
+            + '<button type="submit" name="action" value="question">Ask question</button></div></div></div>'
+            + '<span role="status" data-image-status></span></form></article>'))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
             self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot(), 3))
 
