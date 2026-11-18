@@ -77,7 +77,7 @@ main{font-size:15px;line-height:1.5}
 .list-filters label{display:inline;color:var(--ink-2)}
 .list-filters select,.list-filters input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);
 background:var(--card);color:var(--ink);border-radius:8px;max-width:100%;min-width:0}
-.list-filters input{width:260px}[data-list-count]{margin-left:auto;color:var(--ink-2);font-size:13px}
+.list-filters input{width:260px}
 .list-search-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 .record-filter-words{display:flex;justify-content:flex-end;margin-bottom:10px}
 .record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
@@ -94,7 +94,6 @@ color:var(--filter-selected-ink)}
 .record-filter-row button[data-filter-count="0"][aria-pressed=true]{
 background:color-mix(in srgb,var(--filter-selected-bg) 75%,var(--card))}
 .record-filter-row b{font-variant-numeric:tabular-nums}.record-filter-row b:empty{display:none}
-.record-filter-row+[data-list-count]{display:block;margin:8px 0 12px;text-align:right}
 .list-table{border:1px solid var(--line);border-radius:12px;background:var(--card);overflow:hidden}
 .list-table table{width:100%;border-collapse:collapse;table-layout:fixed}
 .list-table th{text-align:left;color:var(--ink-2);font-size:13px;border-bottom:1px solid var(--line)}
@@ -160,7 +159,7 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-table .list-row td:last-child{text-align:left;padding-bottom:14px}.list-table .list-row td:last-child::before{content:'Update: ';color:var(--ink-3)}
 [data-detail]{display:block}[data-detail]>td{display:block}.list-panel{grid-template-columns:1fr;padding:0 14px 16px;gap:4px}
 .list-log-panel{contain:none}.list-log-scroll{max-height:var(--list-log-max-height)}
-.list-log li{grid-template-columns:105px minmax(0,1fr)}[data-list-count]{width:100%;margin-left:0}
+.list-log li{grid-template-columns:105px minmax(0,1fr)}
 }
 @media(prefers-reduced-motion:reduce){.list-chevron{transition:none}}
 </style>'''

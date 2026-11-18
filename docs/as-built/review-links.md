@@ -670,7 +670,7 @@ Each row starts with All.
 Each chip count reflects the other rows and the words box.
 A zero-count chip stays visible and dimmed.
 
-The Expand all and Collapse all buttons sit next to the words box.
+The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
 They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.
 Each button applies to all items that match the current filters.
 Each button applies the current text in the words box before it selects the items.
