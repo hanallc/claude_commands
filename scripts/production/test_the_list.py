@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +12,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -22,21 +23,35 @@ from scripts.review_links import change_page, question_record, review_items
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
+BOB = staff.StaffRow(staff.StaffId("a02a55c8-a2c4-47d9-bf99-fd30ffe75247"), "producer", "bob", staff.StaffRoot(),
+                     current_session=staff.StaffId("32c954ea-25b3-44e7-9eed-3218ce9df1d6"))
 START = datetime(2026, 11, 16, 18, tzinfo=UTC)
 
 
+@final
 class TheListTests(unittest.TestCase):
     root: Path = Path()
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.notices: list[tuple[staff.StaffId, str]] = []
+        self.send_patch = patch.object(the_list, "_send_assignment_notice", side_effect=self.record_notice)
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         staff_file = self.root / "staff.json"
-        _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [row.to_json() for row in (MORTY, RUNNER, OWNER, OTHER)]}))
+        rows = [row.to_json() for row in (MORTY, RUNNER, OWNER, OTHER, BOB)]
+        _ = staff_file.write_text(json.dumps({"schema": 1, "rows": rows}))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "STAFF_FILE": str(staff_file),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "CODEX_THREAD_ID": "",
             "CLAUDE_CODE_SESSION_ID": MORTY.current_session}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
+        _ = self.send_patch.start()
+        self.addCleanup(self.send_patch.stop)
+
+    def record_notice(self, recipient: staff.StaffRow, text: str) -> None:
+        self.notices.append((recipient.id, text))
 
     def command(self, *args: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -110,6 +125,237 @@ class TheListTests(unittest.TestCase):
         self.assertIn("| 1 | show | dwight | Plan the year |", table)
         self.assertIn("| 2 | show | morty | Ship it |", table)
 
+    def test_assignment_sends_both_notices_after_save(self) -> None:
+        item = self.add("Old title", changes={"latest_status": "The build is complete."})
+        _ = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="morty")
+        launcher = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
+
+        def check_saved(recipient: staff.StaffRow, text: str) -> None:
+            identity = "L2" if "item 2:" in text else item.id
+            saved = the_list.load(MORTY.id, identity)
+            self.assertEqual((saved.title, saved.owner, saved.producer), ("Build plan", RUNNER.id, OTHER.id))
+            self.record_notice(recipient, text)
+
+        with patch.object(the_list, "_send_assignment_notice", side_effect=check_saved):
+            self.assertEqual(self.command("update", "--id", item.id, "--title", "Build plan", "--producer", OTHER.id,
+                                          "--source", "morty"), (0, "", ""))
+            self.assertEqual(self.command("add", "--title", "Build plan", "--owner", RUNNER.id, "--producer", "dwight",
+                                          "--source", "morty"), (0, "L2\n", ""))
+
+        for number in (1, 2):
+            with self.subTest(number=number):
+                producer, showrunner = self.notices[(number - 1) * 2:number * 2]
+                self.assertEqual(producer, (OTHER.id, f"You are the producer of item {number}: Build plan. "
+                    + f"Its showrunner is show.\nRun `{launcher} list --all --latest-status` to read it. "
+                    + f"Run `{launcher} update --id L{number}` with `--latest-status`, `--next-step`, "
+                    + "or `--eta` to update it."))
+                self.assertEqual(showrunner, (RUNNER.id, f"dwight is the producer of item {number}: Build plan. "
+                    + "Send design questions on this item to dwight."))
+        self.assertEqual(len(self.notices), 4)
+        read_command = self.notices[0][1].split("`")[1]
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            result, output, error = self.command(*read_command.split()[2:])
+        self.assertEqual((result, error), (0, ""))
+        self.assertIn("| Latest status |", output)
+        self.assertIn("| 1 | show | dwight | Build plan | New; parked until", output)
+        self.assertIn("| The build is complete. |", output)
+
+    def test_assignment_sends_no_notice_for_same_producer_or_morty(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        self.assertEqual(self.command("update", "--id", item.id, "--producer", "dwight", "--next-step", "Read the plan.",
+                                      "--source", "morty"), (0, "", ""))
+        self.assertEqual(self.command("update", "--id", item.id, "--producer", "morty", "--source", "morty"), (0, "", ""))
+        self.assertEqual(self.command("add", "--title", "New item", "--owner", RUNNER.id, "--producer", "morty",
+                                      "--source", "morty"), (0, "L2\n", ""))
+        self.assertEqual(self.notices, [])
+
+    def test_assignment_reports_failed_notice_and_keeps_assignment(self) -> None:
+        item = self.add()
+
+        def refuse_producer(recipient: staff.StaffRow, text: str) -> None:
+            self.record_notice(recipient, text)
+            if recipient.id == OTHER.id:
+                raise OSError("Sender failed")
+
+        args = ("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        with patch.object(the_list, "_send_assignment_notice", side_effect=refuse_producer):
+            result, output, error = self.command(*args)
+            self.assertEqual((result, output), (1, ""))
+            self.assertEqual(error, f"the_list: {item.id} was saved. The producer notice to {OTHER.id} failed. Sender failed\n")
+            saved = the_list.load(MORTY.id, item.id)
+            self.assertEqual(saved.producer, OTHER.id)
+            self.assertEqual([recipient for recipient, _ in self.notices], [OTHER.id, RUNNER.id])
+            self.assertEqual(self.command(*args), (0, "", ""))
+            self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+        self.assertEqual(len(self.notices), 2)
+
+    def test_assignment_reports_queued_notice(self) -> None:
+        item = self.add()
+        self.send_patch.stop()
+        with patch.object(subprocess, "run", side_effect=(
+            subprocess.CompletedProcess([], 0, "SENT: delivered\n", ""),
+            subprocess.CompletedProcess([], 1, "QUEUED: showrunner is away\n", ""),
+        )) as send:
+            result, output, error = self.command("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        self.assertEqual((result, output), (1, ""))
+        self.assertIn(f"The showrunner notice to {RUNNER.id} failed. QUEUED: showrunner is away", error)
+        self.assertEqual(the_list.load(MORTY.id, item.id).producer, OTHER.id)
+        self.assertEqual([call.args[0][2:8] for call in send.call_args_list],
+                         [["--to", OTHER.id, "--recipient-kind", "producer", "--from", "morty"],
+                          ["--to", RUNNER.id, "--recipient-kind", "showrunner", "--from", "morty"]])
+
+    def test_assignment_notifies_showrunner_if_the_producer_retires_after_save(self) -> None:
+        item = self.add()
+        members = staff.snapshot()
+        retired = replace(members, rows=tuple(row for row in members.rows if row.id != OTHER.id))
+        with patch.object(staff, "snapshot", side_effect=(members, retired)):
+            result, output, error = self.command("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        self.assertEqual((result, output), (1, ""))
+        self.assertEqual(error, f"the_list: {item.id} was saved. The producer notice to {OTHER.id} failed. "
+                         + "The producer has no current producer staff row.\n")
+        self.assertEqual(the_list.load(MORTY.id, item.id).producer, OTHER.id)
+        self.assertEqual(self.notices, [(RUNNER.id,
+            f"The saved assignment for item {item.number}: {item.title} needs a new producer.")])
+
+    def test_assignment_reports_both_unsent_notices_if_staff_refresh_fails(self) -> None:
+        item = self.add()
+        members = staff.snapshot()
+        args = ("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        with patch.object(staff, "snapshot", side_effect=(members, staff.StaffUnreadable("Staff unavailable."), members)):
+            result, output, error = self.command(*args)
+            self.assertEqual((result, output), (1, ""))
+            self.assertEqual(error, f"the_list: {item.id} was saved. The producer and showrunner notices were not sent. "
+                             + "Staff unavailable.\n")
+            self.assertEqual(the_list.load(MORTY.id, item.id).producer, OTHER.id)
+            self.assertEqual(self.command(*args), (0, "", ""))
+        self.assertEqual(self.notices, [])
+
+    def test_assignment_sends_nothing_if_save_fails(self) -> None:
+        item = self.add()
+        with patch.object(os, "replace", side_effect=OSError("The disk refused replacement")):
+            result, _, error = self.command("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        self.assertEqual(result, 1)
+        self.assertIn("The disk refused replacement", error)
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+        self.assertEqual(self.notices, [])
+
+    def test_assignment_reports_missing_showrunner(self) -> None:
+        result, output, error = self.command("add", "--title", "Build plan", "--owner", "nate", "--producer", "dwight",
+                                            "--source", "morty")
+        self.assertEqual((result, output), (1, "L1\n"))
+        self.assertIn("The showrunner notice to nate failed. the item has no assigned showrunner", error)
+        self.assertEqual(the_list.load(MORTY.id, "L1").producer, OTHER.id)
+        self.assertEqual([recipient for recipient, _ in self.notices], [OTHER.id])
+        self.assertIn("The item has no assigned showrunner.", self.notices[0][1])
+
+    def test_assignment_refuses_notice_to_an_owner_without_a_current_showrunner_row(self) -> None:
+        missing = staff.StaffId("4bd6593c-bd3b-4de7-ae06-bd5186db2f4a")
+        for owner in (OWNER.id, missing):
+            with self.subTest(owner=owner):
+                item = the_list.add(MORTY.id, "Build plan", owner=owner, source="morty", changes={})
+                self.notices.clear()
+                result, output, error = self.command(
+                    "update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+                self.assertEqual((result, output), (1, ""))
+                self.assertEqual(error, f"the_list: {item.id} was saved. The showrunner notice to {owner} failed. "
+                                 + "the owner has no current showrunner staff row\n")
+                self.assertEqual(the_list.load(MORTY.id, item.id).producer, OTHER.id)
+                self.assertEqual([recipient for recipient, _ in self.notices], [OTHER.id])
+                self.assertIn("The item has no assigned showrunner.", self.notices[0][1])
+
+    def test_producer_lists_only_its_items_from_mortys_store(self) -> None:
+        own = self.add("Dwight's item", changes={"producer": OTHER.id})
+        _ = self.add("Morty's item")
+        foreign = self.add("Bob's item", changes={"producer": BOB.id})
+        path = the_list.folder(MORTY.id) / f"{foreign.id}.md"
+        _ = path.write_text(path.read_text().replace("## Next step", "## Invalid heading"))
+        _ = the_list.add(OTHER.id, "Wrong store", owner=RUNNER.id, source="dwight", changes={})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            result, output, error = self.command("list", "--all")
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(output.splitlines()[2:], [f"| {own.number} | show | dwight | Dwight's item | New |  | Not asked | ● |"])
+
+    def test_producer_reports_an_incomplete_list_without_record_details(self) -> None:
+        damaged = self.add("Private title", changes={"producer": OTHER.id})
+        path = the_list.folder(MORTY.id) / f"{damaged.id}.md"
+        _ = path.write_text(path.read_text().replace('title: "Private title"', 'title: invalid private text'))
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            for visible in ((), ("| 2 | show | dwight | Visible item | New |  | Not asked | ● |",)):
+                with self.subTest(visible=visible):
+                    if visible:
+                        _ = self.add("Visible item", changes={"producer": OTHER.id})
+                    result, output, error = self.command("list", "--all")
+                    self.assertEqual(result, 1)
+                    self.assertEqual(error, "the_list: The List results are incomplete. Could not read every record.\n")
+                    self.assertEqual(tuple(output.splitlines()[2:]), visible)
+
+    def test_producer_reports_an_incomplete_list_if_the_directory_cannot_be_read(self) -> None:
+        _ = self.add("Private title", changes={"producer": OTHER.id})
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}),
+              patch.object(Path, "iterdir", side_effect=PermissionError("private path"))):
+            result, output, error = self.command("list", "--all")
+        self.assertEqual(result, 1)
+        self.assertEqual(error, "the_list: The List results are incomplete. Could not read every record.\n")
+        self.assertEqual(output.splitlines()[2:], [])
+
+    def test_producer_updates_its_fields_with_its_name_as_source(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", str(item.number), "--latest-status", "The plan is ready.",
+                                          "--next-step", "Review the plan.", "--eta", "Pending"), (0, "", ""))
+            self.assertEqual(self.command("update", "--id", item.id, "--eta", "Delivered", "--source", "morty"), (0, "", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual((saved.latest_status, saved.next_step, saved.eta),
+                         ("The plan is ready.", "Review the plan.", the_list.EtaStatus.DELIVERED))
+        self.assertEqual([entry.source for entry in saved.log], ["nate", "dwight", "dwight"])
+        self.assertEqual(saved.log[-2].what, the_list.FieldChange("Updated", {
+            "latest_status": "The plan is ready.", "next_step": "Review the plan.", "eta": the_list.EtaStatus.PENDING}))
+        self.assertEqual(self.notices, [])
+
+    def test_producer_cannot_update_another_producers_item(self) -> None:
+        item = self.add(changes={"producer": BOB.id})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", item.id, "--eta", "Pending"),
+                             (1, "", f"the_list: {item.id} is assigned to another producer\n"))
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def test_producer_cannot_update_other_fields(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        fields = (("--title", "New title"), ("--owner", "invalid owner"), ("--producer", "invalid producer"),
+                  ("--unit", "unit-board"), ("--next-check", "Pending"), ("--evidence", "evidence"),
+                  ("--done-when", "Done"), ("--state", "Working"), ("--requested-by", "nate"),
+                  ("--blocked-by",), ("--related-to",))
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            for field, *values in fields:
+                with self.subTest(field=field):
+                    result, output, error = self.command("update", "--id", item.id, "--eta", "Pending", field, *values)
+                    self.assertEqual((result, output), (1, ""))
+                    self.assertIn(f"Refused options: {field}", error)
+                    self.assertEqual(the_list.load(MORTY.id, item.id), item)
+        self.assertEqual(self.notices, [])
+
+    def test_producer_cannot_run_other_commands(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        commands = (
+            ("add", "--title", "New item", "--owner", RUNNER.id),
+            ("park", "--id", item.id, "--until", START.isoformat()),
+            ("close", "--id", item.id, "--words", "Done"),
+            ("reopen", "--id", item.id),
+            ("mark-read", "--id", item.id),
+            ("clean-evidence",),
+            ("link", item.id, "--review", "C1"),
+            ("unlink", item.id, "--review", "C1"),
+        )
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            for name, *args in commands:
+                with self.subTest(command=name):
+                    self.assertEqual(self.command(name, *args, "--source", "dwight"),
+                                     (1, "", f"the_list: only morty can run {name}\n"))
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer"),
+                             (1, "", "the_list: only morty can run answer\n"))
+        self.assertEqual(the_list.records(MORTY.id), [item])
+        self.assertEqual(self.notices, [])
+
     def test_close_reopen_and_repeats_keep_the_record_and_number(self) -> None:
         item = self.add(number=70)
         path = the_list.folder(MORTY.id) / "L70.md"
@@ -179,7 +425,7 @@ class TheListTests(unittest.TestCase):
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OWNER.current_session}):
             self.assertEqual(self.command("clean-evidence", "--source", "morty"),
-                             (1, "", "the_list: the current session must be the morty producer\n"))
+                             (1, "", "the_list: the current session must be a producer\n"))
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
         moment = START + timedelta(minutes=1)
         with patch.object(the_list, "now", return_value=moment):
@@ -923,8 +1169,8 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(path.read_text(), before)
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "missing"}):
             self.assertEqual(self.command("list"), (1, "", "the_list: the current session has no staff row\n"))
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
-            self.assertEqual(self.command("list"), (1, "", "the_list: the current session must be the morty producer\n"))
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": RUNNER.current_session}):
+            self.assertEqual(self.command("list"), (1, "", "the_list: the current session must be a producer\n"))
 
     def test_shared_records_preserve_investigation_format_and_separate_folders(self) -> None:
         investigation_item = investigation.file(MORTY.id, "Find the cause", "Why?\n\n## Answer\n\nKeep this text.", waiting_why='The owner must complete the investigation.')

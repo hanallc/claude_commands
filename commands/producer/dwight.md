@@ -10,6 +10,12 @@ Read the family, model, and effort from `[producers].dwight` in `~/.claude/confi
 Use the `dwight` tab in the `producers` herdr workspace.
 Resume the same conversation.
 
+## The List
+
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status` to read your items.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py update --id L<n>` with `--latest-status`, `--next-step`, or `--eta`.
+Morty keeps add, close, park, and reassign for all items.
+
 ## Questions
 
 File your own questions with this command:
