@@ -4816,3 +4816,32 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The module uses a private pane store, zone file and TZDIR, and clears inherited Git variables. `statusline.sh` strips trailing slashes before its legacy home check.
 - AWS pair (3 rounds, c7a.4xlarge): 131.8 -> 41.9 CPU s, a saving of 89.9 s; 113 tests pass.
 - Floor: Python starts and jq. Architecture proposal: one Python entry point reads the For you count and the assignment before it starts jq.
+
+### Phase 346 — the crate run tests use less aws CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `style/test_crate_run.py` costs at most half its AWS CPU (47.7 s median, 98 tests) with every assertion kept.
+
+**Spec:**
+1. Base: origin/main 23b4483cb, worktree `~/worktrees/claude-natedev-natest-craterun`, branch `natest-craterun346`.
+2. Profile first: `python3 scripts/test_times/module_cost.py --tree <worktree> style/test_crate_run.py --tests 20 --commands 20`. Name the costs by test and by command.
+3. The slowest kept test is `CrateRunTests.test_crate_trees_keep_ownership_and_use_two_standing_caches` (5.2 s).
+4. Cut repeated process starts and Git calls: share one fixture build per class, call Python in process where the test checks Python output, and keep real subprocess runs only where the test proves process behavior.
+5. Tests read no value /tune can change. No signal handlers, no lazy imports, no test-count goals.
+6. If the floor stays above half, name the architecture change that would cut it.
+
+**Files:** `scripts/style/test_crate_run.py` and its test support; production code only where a defect lives.
+
+**Acceptance gate:** the module passes; AWS pair (3 rounds) shows the saving; basedpyright clean on changed files.
+
+### Phase 347 — two red tests on main pass again  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Hash b16338a2d on branch `natest-basered`, parent origin/main 61eb71411.
+- `staff_test_support.fixture_unit_saved_name` also accepts the private staff file that `isolated_staff_file` set up, and reads `STAFF_FILE` before `STAFF_TEST_OWNER_FILE`. A leased tmpfs staff file outside the Python temporary folder failed before.
+- `test_verify_token_wait.test_no_token_records_zero` uses a warm build folder. Cargo seeding (7f9f08a71) adds a valid metadata call on a cold folder.
+- The AWS gate passed both modules: its TMPDIR holds the staff fixture, and Cargo seeding is off on AWS. Only natedev showed the red.
