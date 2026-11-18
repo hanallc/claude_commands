@@ -365,8 +365,9 @@ function showActionResult(item,submission,label,{kind,message}){
  apply(false,{animate:true});
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
+function isLinkedOnly(item){return options.linkedOnly?.(item.dataset);}
 function matches(item,selection,counts){
- if(!isSelected(item)) return false;
+ if(isLinkedOnly(item) || !isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
  const values=options.filterValues(item.dataset,selection.query);
  if(!values) return false;
@@ -400,6 +401,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   opened.delete(linkedItem);
   if(dismissMissingItem) linkedItem='';
  }
+ if(dismissMissingItem && rows.some(item=>item.dataset.key===linkedItem && isLinkedOnly(item))){
+  opened.delete(linkedItem);
+  linkedItem='';
+ }
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
  const search=query.trim().toLowerCase();
@@ -417,17 +422,20 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare(sortValue(a),sortValue(b)) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0;
+ const table=content.querySelector('table');let count=0,linkedVisible=false;
  if(items.some((item,index)=>item!==rows[index])) for(const item of items){
   table.append(item);
   const spacer=rowMotion.get(item)?.spacer;
   if(spacer) table.append(spacer);
  }
  items.forEach(item=>{
-  const showRow=matches(item,active,counts),wasShown=!item.hidden;
+  const expanded=opened.has(item.dataset.key);
+  const linked=expanded && item.dataset.key===linkedItem && isLinkedOnly(item);
+  const matched=matches(item,active,counts),showRow=matched || linked,wasShown=!item.hidden;
   if(motion && wasShown && !showRow) animateRow(table,item,false);
-  item.hidden=!showRow;if(showRow) count++;
-  const expanded=opened.has(item.dataset.key),expansionChanged=setExpanded(item,expanded);
+  item.hidden=!showRow;if(matched) count++;
+  if(linked) linkedVisible=true;
+  const expansionChanged=setExpanded(item,expanded);
   const transition=rowMotion.get(item);
   if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(table,item,true);
   else if(expansionChanged && transition) setExpanded(transition.copy,expanded);
@@ -448,7 +456,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || missing.length>0;
+ empty.hidden=count>0 || linkedVisible || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -457,7 +465,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  }
  const group=content.querySelector('[data-clear-linked-reviews]');
  if(group) group.hidden=!keys.size;
- const selection=keys.size ? items.filter(isSelected) : items;
+ const selection=items.filter(item=>!isLinkedOnly(item) && isSelected(item));
  if(counts) for(const [name,values] of Object.entries(counts)) filterControl.setCounts(chipRow(name),values);
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys});
@@ -500,7 +508,7 @@ function jump(key,{pushPlace=true}={}){
   if(keys.size) keys.add(key);
   if(options.single) opened.clear();
   opened.add(key);
-  if(!matches(target,currentSelection())){
+  if(!isLinkedOnly(target) && !matches(target,currentSelection())){
    const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
    owner='';sourceOwner='';show='all';
    if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
@@ -598,6 +606,7 @@ return {place,apply,bind,opened,restorePlace,jump,saveDeparturePlace,get linkedI
  showActionResult,
  actionNotice(item){return actionNotices.get(item.dataset.key) ?? '';},
  applyAction(){apply(false,{animate:true});},
+ async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(){
   const previous=words(),previousQuery=query;

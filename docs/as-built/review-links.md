@@ -814,20 +814,55 @@ The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
-The page keeps the unread controls when the read write fails or a newer update remains unread.
-Ask question shows “Question saved; update remains unread” in both cases.
+The store keeps the unread update if the read write fails or a newer update exists.
 Tell morty shows “sent to morty; update remains unread” in both cases.
-It applies the current filter again, so a read item leaves the Unread view at once.
+Tell morty applies the current filter again, so a read item leaves Unread at once.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
 The page uses the question and delivery code shared with Images.
 The server replies to the browser before it sends morty the item number, title, question, and answer command.
-Equal words retry an open question. Different words create a new question.
+Equal words select the open question. Different words create a new question.
 An exact request retry uses the same question ID, even after morty answers it.
-The expanded row shows each question and its answer when available.
+The row leaves every Show view while every unanswered question has a live sender or confirmed acceptance.
+Acceptance includes a confirmed place in the transport queue.
+The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
+The console updates its unread indicator on its own news refresh.
+The next List refresh shows the row if any unanswered question has an uncertain send, failed send, or no sender.
+An unknown result shows “Question Qn may not have reached morty.”
+The List shows why Resend is unavailable if the previous sender is active or cannot be checked.
+Images shows the same reason when it cannot retry the question.
+All attempts for one question use the same sender lock.
+A damaged delivery record keeps the question visible and cannot grant Resend while the lock is held.
+A released sender lock lets Resend proceed even if the previous process identity is unreadable.
+Resend uses the saved question, its ID, and the current recipient to repair a mismatched delivery record.
+The question reader checks the stored question words and answer command.
+A List title edit preserves the delivery state. Recovery sends the prepared message with its original title.
+Only an explicit Resend question action can retry that delivery on the List.
+Repeating the same signed resend request does not authorize another send.
+If Ask removes the focused row, focus moves to a nearby row with an available toggle or to Search.
+After a failed POST restores the row, the List waits for the animation before it returns focus to the submit button.
+After a successful Ask keeps the row visible, the row toggle receives lost focus and keeps it through refresh.
+Focus stays on the user's selection if they move it during the request, including to the parent console.
+On refresh, the List restores focus to an available action button with the same item key and action.
+Column sort buttons keep focus through refresh.
+A direct or related-item link opens a waiting row with “The producer will answer” and no action buttons.
+A related-item link keeps the current filters.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one log entry and marks the item unread if it is not Closed.
+The answer adds one log entry. It marks the item unread if the item is not Closed.
+After the last answer, the next refresh returns the row to the applicable views.
+The log shows each answered question with its answer.
 The command refuses an unknown ID, a second answer, and empty text.
+
+List and Images questions share one delivery record for each question and recipient.
+The record stores the source, stable message ID, revision, attempt ID, job owner, transport receipt, and error.
+The delivery lock protects every atomic update.
+A job holds the question's sender lock from claim through result publication.
+The sender publishes `sending` before it calls the transport.
+The transport can confirm `sent`, `queued`, or `failed`.
+A missing confirmation leaves the outcome `unknown`.
+Recovery claims unsent work only after the shared question reader verifies the delivery.
+Recovery leaves uncertain outcomes for the user.
+An older pending attempt with no live sender appears as uncertain.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 **Park until** opens the shared calendar and 24-hour time field directly.
 The page refresh waits while the picker is open.
@@ -849,7 +884,7 @@ Tell morty sends the user's words without changing the item's state or parking t
 Remove leaves Open at once when the user presses the button.
 Park leaves Open and enters Parked at once.
 The row leaves Unread when the user presses Mark read, Ask question, Tell morty, or Remove.
-The row returns if the server reports an unread update.
+The row returns to Unread if the server reports an unread update and the row is visible in The List.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
@@ -988,6 +1023,10 @@ The server checks the token.
 **Approved** and **Not Approved** need no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Otherwise the card leaves the page at once, and the request runs in the background.
 The page skips its refresh while a send runs.
+An image leaves the page while each open question has a live sender or confirmed acceptance.
+The page also hides an image while the server recovers its verified delivery on startup.
+A failed or uncertain delivery returns the card with a delivery notice.
+When the owner answers the last open question, the card returns and the console shows a new update.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
