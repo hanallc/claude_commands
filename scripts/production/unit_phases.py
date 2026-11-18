@@ -22,7 +22,8 @@ from contextvars import copy_context
 from pathlib import Path
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
+from types import MappingProxyType
 from typing import Literal, NamedTuple, TypedDict, cast
 from enum import Enum
 
@@ -469,11 +470,22 @@ def pending_checkpoint_land(land: land_queue.LandView, commit: str) -> land_queu
     return state
 
 
+class RecordedDestinationLand(NamedTuple):
+    """Merge queue evidence from a checkpoint's recorded destination."""
+
+    production: str
+    view: land_queue.LandView
+
+
+NO_RECORDED_DESTINATION_LANDS: Mapping[str, RecordedDestinationLand] = MappingProxyType({})
+
+
 def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
                on_main: Callable[[str], bool], unit_waits: Sequence[phase_waits.UnitWait] = (),
                done_ids: tuple[str, ...] = (), phase_titles: tuple[tuple[str, str], ...] = (),
                production: str = "", merged_ids: Collection[str] = (), dropped_ids: Collection[str] = (),
-               repository_available: bool = True) -> UnitMergeNotes:
+               repository_available: bool = True,
+               destination_lands: Mapping[str, RecordedDestinationLand] = NO_RECORDED_DESTINATION_LANDS) -> UnitMergeNotes:
     """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
     hidden = set(merged_ids) | set(dropped_ids)
@@ -495,13 +507,21 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
         return "" if helper(phase) or phase in hidden else phase
 
+    def phase_land(phase: str) -> land_queue.LandView:
+        destination = destination_lands.get(phase)
+        return destination.view if destination is not None else land
+
+    def phase_production(phase: str) -> str:
+        destination = destination_lands.get(phase)
+        return destination.production if destination is not None else production
+
     open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase) and phase not in hidden}
     merging: list[str] = []
     items: dict[int, list[str]] = {}
     for phase, sent in open_sent.items():
         if not isinstance(sent, SentCommit):
             continue
-        state = land_queue.land_state(land, sent.commit)
+        state = land_queue.land_state(phase_land(phase), sent.commit)
         if isinstance(state, land_queue.LandRunning):
             merging.append(phase)
         elif isinstance(state, land_queue.InLine):
@@ -537,7 +557,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         if (wait.target in queued or wait.target in merging
                 or result is not None and (not isinstance(sent, SentCommit) or result["commit"] == sent.commit)):
             continue
-        if isinstance(sent, SentCommit) and not isinstance(pending_checkpoint_land(land, sent.commit),
+        if isinstance(sent, SentCommit) and not isinstance(pending_checkpoint_land(phase_land(wait.target), sent.commit),
                                                           land_queue.NotInLine | land_queue.LineUnused):
             continue
         if isinstance(sent, SentCommit) and on_main(sent.commit):
@@ -549,15 +569,19 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     shown = set(open_merging)
     for phases in open_items.values():
         shown.update(phases)
-    if merging:
-        for index, phase in enumerate(merging):
-            text = merge_state_text(land_queue.LandRunning(), production) if index == 0 else f"Merges with {phase_reference(merging[0])}"
+    running_by_production: dict[str, list[str]] = {}
+    for phase in merging:
+        running_by_production.setdefault(phase_production(phase), []).append(phase)
+    for actor, phases in running_by_production.items():
+        for index, phase in enumerate(phases):
+            text = (merge_state_text(land_queue.LandRunning(), actor) if index == 0
+                    else f"Merges with {phase_reference(phases[0])}")
             parts.append(WorkItem(named(phase), text))
-        if len(merging) > 1:
-            grouped.update(open_merging)
+        if len(phases) > 1:
+            grouped.update(open_merging.intersection(phases))
     for number, phases in sorted(items.items()):
         for index, phase in enumerate(phases):
-            text = (f"{ordinal(number)} in {production or 'the production'}'s merge line" if index == 0
+            text = (f"{ordinal(number)} in {phase_production(phase) or 'the production'}'s merge line" if index == 0
                     else f"Merges with {phase_reference(phases[0])}")
             parts.append(WorkItem(named(phase), text))
         if len(phases) > 1:
@@ -567,22 +591,23 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
             continue
         state: land_queue.LandState = land_queue.LineUnused()
         if isinstance(sent, SentCommit):
-            state = land_queue.land_state(land, sent.commit)
+            state = land_queue.land_state(phase_land(phase), sent.commit)
             if isinstance(state, land_queue.LandEnded) and state.result["landed"]:
                 if checkpoint_result_key(state.result) == (unit, phase, sent.commit.lower()):
                     continue
-                state = pending_checkpoint_land(land, sent.commit)
+                state = pending_checkpoint_land(phase_land(phase), sent.commit)
         if phase in holds:
             text = unit_wait_state(holds[phase], now=now, zone=zone)
         elif isinstance(sent, SentCommit) and isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
             when = event_time({"timestamp_epoch": sent.timestamp_epoch}, now=now, zone=zone)
-            if not repository_available:
+            if not repository_available and phase not in destination_lands:
                 parts.append(WorkItem(named(phase), f"Checkpoint {sent.commit[:9]} at {when}; merge evidence unavailable"))
                 continue
-            line = f"{production}'s merge line" if production else "the merge line"
+            actor = phase_production(phase)
+            line = f"{actor}'s merge line" if actor else "the merge line"
             text = f"Checkpoint {sent.commit[:9]} at {when}; not in {line}"
         else:
-            text = merge_state_text(state, production)
+            text = merge_state_text(state, phase_production(phase))
         parts.append(WorkItem(named(phase), text))
         pending = True
     for phase, wait in holds.items():
@@ -1459,6 +1484,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     current_evidence = repository_evidence(repository)
     recorded_land = current_evidence.land._replace(carried_running=frozenset(), carried_line={})
     results = {checkpoint_result_key(row): row for row in recorded_land.results.values()}
+    landed_checkpoints = {(row["unit"], row["phase"]): row["commit"] for row in results.values() if row["landed"]}
     pending_results = {commit: row for commit, row in recorded_land.results.items() if not row["landed"]}
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
@@ -1529,6 +1555,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         target = repository_evidence(source) if isinstance(source, Path) else current_evidence
         return target.names_checkpoint(unit, phase, commit) or isinstance(source, Path) and target.on_main(commit)
 
+    def pending_land_at(source: Path | CheckpointRepositoryUnavailable) -> land_queue.LandView:
+        land = repository_evidence(source).land if isinstance(source, Path) else recorded_land
+        return land._replace(results=pending_results)
+
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
     newest = newest_unit_runs(snapshot)
     runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
@@ -1553,13 +1583,18 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                     else:
                         result = results.get((unit_name, phase, commit.lower()))
                         target = checkpoint_source(result, source)
-                        if isinstance(target, Path):
-                            land = repository_evidence(target).land
-                        land = land._replace(results=pending_results)
+                        land = pending_land_at(target)
                         if (isinstance(target, CheckpointRepositoryUnavailable)
                                 and isinstance(observed.wait, phase_waits.NoUnitWait)
                                 and isinstance(land_queue.land_state(land, commit), land_queue.NotInLine | land_queue.LineUnused)):
                             found = target
+                elif isinstance(observed, waits_on.PhaseNotStarted):
+                    if landed := landed_checkpoints.get((unit_name, phase)):
+                        found = waits_on.OnMain(landed)
+                    elif isinstance(source, Path):
+                        named = repository_evidence(source).phase_merges.get((unit_name, phase))
+                        if named is not None:
+                            found = waits_on.OnMain(named.commit)
             elif isinstance(source, Path):
                 target = repository_evidence(source)
                 land = target.land
@@ -1646,10 +1681,18 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             if (wait.target in done and wait.target not in open_sent
                     and not isinstance(done[wait.target], SentCommit)):
                 open_sent[wait.target] = done[wait.target]
+        destination_lands: dict[str, RecordedDestinationLand] = {}
+        if not repository_available:
+            for phase, sent in open_sent.items():
+                if phase in merged_phases or not isinstance(sent, SentCommit):
+                    continue
+                result = results.get((unit.unit, phase, sent.commit.lower()))
+                if result is not None and isinstance(target := checkpoint_source(result, source), Path):
+                    destination_lands[phase] = RecordedDestinationLand(result.get("production", ""), pending_land_at(target))
         merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main,
                            unit_waits=waits, done_ids=tuple(done), phase_titles=tuple(titles.items()),
                            production=production_name, merged_ids=frozenset(merged_phases), dropped_ids=dropped,
-                           repository_available=repository_available)
+                           repository_available=repository_available, destination_lands=destination_lands)
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan,

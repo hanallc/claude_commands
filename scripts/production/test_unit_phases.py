@@ -843,6 +843,11 @@ class UnitPhasesTests(unittest.TestCase):
                 for entry in matching:
                     self.assertEqual(entry.state_text, expected)
                     self.assertFalse(entry.state_text.endswith("."), entry)
+        legacy_view = land_queue.LandView({}, {}, {legacy["commit"]: legacy}, frozenset(), {})
+        without_parent = unit_phases.unit_lands("shells", legacy_view, open_sent={}, now=now, zone=ZoneInfo("UTC"),
+                                               on_main=lambda _: False)
+        self.assertEqual(without_parent.entries, (unit_phases.WorkItem(
+            "Images", "The production cannot merge it: test_cards red"),))
         for kind in ("phase_started", "pass_started", "activity_started"):
             with self.subTest(restarted=kind):
                 self.assertIsInstance(unit_phases.phase_sent_work([*events, {"event_type": kind}]), unit_phases.NoSentWork)
@@ -1147,6 +1152,31 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertCountEqual([call.args[1] for call in dependencies.call_args_list],
                                       ["open-copied", *["spendtool"] * 5])
 
+        retry = commit_repository(foreign, "Unmerged remote checkpoint", allow_empty=True)
+        retry_carrier = commit_repository(foreign, "Carry the remote checkpoint", allow_empty=True)
+        remote_member = targets[1]
+        land_runs.record_result(commit=retry, production=foreign_owner.name, unit=remote_member.name,
+                                phase="spendtool", landed=False, detail="Earlier failure")
+        _ = self.write_run(remote_member, remote_member.name, [("spendtool", "Spend tool")], [
+            self.phase_event("checkpoint", "spendtool", checkpoint_commit=retry)])
+        retry_units = [unit(member.name, live(member.name)) for member in (members[0], remote_member)]
+        for running, merge_state, dependency_state in (
+            (False, "1st in aws-owner's merge line", "merges with aws-owner retry; 1st in the merge line"),
+            (True, "aws-owner merges it now", "merging now"),
+        ):
+            with self.subTest(remote_retry_running=running):
+                with land_queue.edited() as items:
+                    items.clear()
+                if running:
+                    with land_runs.landing([retry_carrier], ["aws-owner retry"]):
+                        rendered = table_of(retry_units, {}, repository)
+                else:
+                    land_queue.add("aws-owner retry", batch="", commits=[retry_carrier], first=False, before=None)
+                    rendered = table_of(retry_units, {}, repository)
+                self.assertIn(("Now", "Spend tool (spendtool)", merge_state), detail_rows(rendered, remote_member.name))
+                self.assertTrue(any(row.work == "Review other (other)" and row.state.endswith(dependency_state)
+                                    for row in detail_rows(rendered, members[0].name)), rendered)
+
     def test_finished_phases_stay_visible_when_merge_records_name_other_hashes(self) -> None:
         member = self.member("finished")
         _ = self.repository()
@@ -1245,6 +1275,13 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertNotIn("old failed attempt", rendered)
                     self.assertEqual(subjects.call_count, 1)
                     self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+            with self.subTest(evidence=evidence, attempt="next run"):
+                _ = self.write_run(member, "next-run", [("later", "Later work")], started=merge_at + 600)
+                results = {published: landed} if evidence == "result" else {}
+                view = land_queue.LandView({}, {}, results, frozenset(), {})
+                with patch.object(land_queue, "land_view", return_value=view):
+                    rendered = self.blocks([member, dependent], {})
+                self.assertIn(("Next", "Review delivery", "Ready"), detail_rows(rendered, dependent.name))
 
     def test_undated_checkpoints_require_the_merged_checkpoint_hash(self) -> None:
         member = self.member("finished")
