@@ -1,6 +1,7 @@
 """Build complete runtime copies and Python tools inside test fixtures."""
 
 import ast
+import importlib.util
 import os
 from functools import cache
 from pathlib import Path
@@ -24,6 +25,17 @@ def runtime_files() -> tuple[Path, ...]:
                  and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
 
 
+def copy_with_bytecode(source: Path, destination: Path) -> None:
+    """Copy a source file and its cached Python bytecode when present."""
+    _ = shutil.copy2(source, destination)
+    if source.suffix == ".py":
+        bytecode = Path(importlib.util.cache_from_source(str(source)))
+        if bytecode.exists():
+            target = Path(importlib.util.cache_from_source(str(destination)))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copy2(bytecode, target)
+
+
 def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
     """Copy missing runtime files and keep the fixture's existing tools."""
     for relative in runtime_files():
@@ -32,7 +44,7 @@ def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
         destination = checkout / relative
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = shutil.copy2(SOURCE / relative, destination)
+            copy_with_bytecode(SOURCE / relative, destination)
 
 
 def copy_startup(checkout: Path) -> None:
@@ -42,7 +54,7 @@ def copy_startup(checkout: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_symlink():
             destination.unlink()
-        _ = shutil.copy2(SOURCE / relative, destination)
+        copy_with_bytecode(SOURCE / relative, destination)
 
 
 def copy_test_runner(checkout: Path) -> None:
@@ -52,7 +64,7 @@ def copy_test_runner(checkout: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_symlink():
             destination.unlink()
-        _ = shutil.copy2(SOURCE / relative, destination)
+        copy_with_bytecode(SOURCE / relative, destination)
 
 
 def python_tool_source(source: str) -> str:

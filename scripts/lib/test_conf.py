@@ -10,12 +10,13 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
 
 from scripts.lib import conf, conf_reads
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -30,6 +31,15 @@ class ConfTests(unittest.TestCase):
         self.directory = self.root / "config"
         self.directory.mkdir()
         self.path = self.directory / "example.conf"
+        repository = self.root / "repository-config"
+        _ = write_config_fixture(repository / "accounts.conf",
+                                 "usage_stale_minutes=10\nnotes_directory=~/rust/hanadocs/agents\n")
+        original = cast(Callable[[str], Path], getattr(conf, "_repository_path"))
+
+        def repository_path(stem: str) -> Path:
+            return repository / "accounts.conf" if stem == "accounts" else original(stem)
+
+        _ = self.enterContext(mock.patch.object(conf, "_repository_path", side_effect=repository_path))
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.directory), "HOME": str(self.root / "home"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -629,6 +639,27 @@ conf_reads.record('disabled')
             ):
                 _ = conf.editable_line("example", "count")
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_editable_line_refuses_overrides_for_keys_outside_model_colors(self) -> None:
+        for stem, key in (("example", "model.provider"), ("example", "model.gpt-6.2-sol"),
+                          ("statusline", "model.provider")):
+            with self.subTest(stem=stem, key=key):
+                source = self.directory / f"{stem}.conf"
+                _ = source.write_text(f"{key}=3\n{key}.remote=4\n", encoding="utf-8")
+                with mock.patch("socket.gethostname", return_value="remote"):
+                    self.assertEqual(conf.effective_line(stem, key), (1, "4"))
+                with mock.patch("socket.gethostname", return_value="local"):
+                    with self.assertRaisesRegex(conf.Unusable, "has host override"):
+                        _ = conf.editable_line(stem, key)
+
+    def test_editable_line_keeps_each_dotted_model_key_independent(self) -> None:
+        source = self.directory / "statusline.conf"
+        keys = ("model.gpt-6", "model.gpt-6.2-sol", "model.gpt-6.2-sol.preview")
+        for order in (keys, keys[::-1]):
+            with self.subTest(order=order):
+                _ = source.write_text("".join(f"{key}=#123456\n" for key in order), encoding="utf-8")
+                for line, key in enumerate(order):
+                    self.assertEqual(conf.editable_line("statusline", key), (line, "#123456"))
 
     def test_installed_script_refuses_conf_dir_override(self) -> None:
         from scripts.build_hold import override_guard

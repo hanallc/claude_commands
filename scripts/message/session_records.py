@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
-from scripts.lib.transcripts import transcript_paths
+from scripts.lib.transcripts import config_dirs as config_dirs, transcript_paths
 from scripts.lib.session_paths import sessions_directory
 from scripts.message.process_identity import process_start as process_start
 from scripts.message.relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
@@ -351,14 +351,6 @@ def live_sessions() -> list[SessionRecord]:
         (record for record in _readable_records() if live_session(record)),
         key=lambda record: record["updatedAt"], reverse=True,
     )
-
-
-def config_dirs() -> list[Path]:
-    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
-    override = os.environ.get("CLAUDE_CONFIG_DIR")
-    if override:
-        directories.add(Path(override).expanduser())
-    return sorted(directories)
 
 
 def transcript_locations(session_id: str) -> list[Path]:

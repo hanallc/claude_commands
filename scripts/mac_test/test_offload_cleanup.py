@@ -20,7 +20,7 @@ from scripts.mac_test import eligibility, offload, mac_test
 from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import test_hang_guard
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
@@ -81,9 +81,9 @@ class MacCleanupProtocolTests(unittest.TestCase):
                 output = io.StringIO()
                 with redirect_stdout(output):
                     offload.report_cleanup(offload.CleanupDone(size, free), "",
-                                           path="~/.local/state/mac-test/mirror/hana/target", free_floor_gib=100)
+                                           path="~/.local/state/mac-test/test-mirror/hana/target", free_floor_gib=100)
                 self.assertEqual(output.getvalue(),
-                                 "Mac build output removed: ~/.local/state/mac-test/mirror/hana/target, "
+                                 "Mac build output removed: ~/.local/state/mac-test/test-mirror/hana/target, "
                                  + text + " under the 100 GiB floor\n")
 
 
@@ -99,6 +99,10 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "build_targets.conf", "platform.mac=macos\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.home_directory = self.root / "home with spaces"
         self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
         self.mirror.mkdir(parents=True)
@@ -411,6 +415,11 @@ class MacActivityShellTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(configuration / "mac_test.conf", "mirror_root=~/.local/state/mac-test/test-mirror\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         for name in ("pgrep", "lsof", "ps", "id"):
@@ -445,8 +454,8 @@ class MacActivityShellTests(unittest.TestCase):
     def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
         responses = {
             "id": (0, "501\n"), "pgrep": (0, "101\n102\n"),
-            "lsof": (0, "p102\nn/Users/test/.local/state/mac-test/mirror/hana\n"
-                     + "p103\nn/Users/test/.local/state/mac-test/mirror\np104\nn/Users/test/rust/hana\n"),
+            "lsof": (0, "p102\nn/Users/test/.local/state/mac-test/test-mirror/hana\n"
+                     + "p103\nn/Users/test/.local/state/mac-test/test-mirror\np104\nn/Users/test/rust/hana\n"),
             "ps": (0, "101 501 /opt/rust/bin/cargo\n105 501 /opt/rust/bin/rustc\n106 501 cargo-nextest\n"
                    + "107 501 /Users/test/rust/hana/target/debug/app\n108 999 /opt/cargo\n"
                    + "109 501 /bin/zsh\n110 501 /opt/cargo-helper\n112 501 /Users/test/my project/target/debug/app\n"),
@@ -462,7 +471,7 @@ class MacActivityShellTests(unittest.TestCase):
                 self.assertEqual(len(pgrep), 1)
                 self.assertIn("-u", pgrep[0]["args"])
                 self.assertIn("501", pgrep[0]["args"])
-                self.assertIn("[.]local/state/mac-test/mirror/", pgrep[0]["args"])
+                self.assertIn("[.]local/state/mac-test/test-mirror/", pgrep[0]["args"])
                 self.assertEqual(lsof[0]["args"], ["-a", "-u", "501", "-d", "cwd", "-Fpn"])
                 self.assertEqual(len(ps), 1)
 
@@ -500,11 +509,11 @@ class MacActivityShellTests(unittest.TestCase):
     def test_repository_selector_stops_at_its_own_mirror_under_sh_and_zsh(self) -> None:
         responses = {
             "id": (0, "501\n"), "pgrep": (1, ""),
-            "lsof": (0, "p201\nn/Users/test/.local/state/mac-test/mirror/hana\n"
-                     + "p202\nn/Users/test/.local/state/mac-test/mirror/hana/crates/hana\n"
-                     + "p203\nn/Users/test/.local/state/mac-test/mirror/hana_other\n"
-                     + "p204\nn/Users/test/.local/state/mac-test/mirror/cargo-liner\n"
-                     + "p205\nn/Users/test/.local/state/mac-test/mirror\n"
+            "lsof": (0, "p201\nn/Users/test/.local/state/mac-test/test-mirror/hana\n"
+                     + "p202\nn/Users/test/.local/state/mac-test/test-mirror/hana/crates/hana\n"
+                     + "p203\nn/Users/test/.local/state/mac-test/test-mirror/hana_other\n"
+                     + "p204\nn/Users/test/.local/state/mac-test/test-mirror/cargo-liner\n"
+                     + "p205\nn/Users/test/.local/state/mac-test/test-mirror\n"
                      + "p206\nn/Users/test/rust/hana\n"),
         }
         for shell in (["/bin/sh"], ["zsh", "-f"]):
@@ -523,16 +532,16 @@ class MacActivityShellTests(unittest.TestCase):
         calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
         pattern = next(call["args"][-1] for call in calls if call["command"] == "pgrep")
         matching = [
-            "sh -c cd .local/state/mac-test/mirror/hana && cargo nextest run",
-            "cargo build --manifest-path /Users/test/.local/state/mac-test/mirror/hana/Cargo.toml",
-            "sh -c cd '/Users/test/.local/state/mac-test/mirror/hana' && cargo test",
-            "sh -c cd \"/Users/test/.local/state/mac-test/mirror/hana\"",
-            "ls /Users/test/.local/state/mac-test/mirror/hana",
+            "sh -c cd .local/state/mac-test/test-mirror/hana && cargo nextest run",
+            "cargo build --manifest-path /Users/test/.local/state/mac-test/test-mirror/hana/Cargo.toml",
+            "sh -c cd '/Users/test/.local/state/mac-test/test-mirror/hana' && cargo test",
+            "sh -c cd \"/Users/test/.local/state/mac-test/test-mirror/hana\"",
+            "ls /Users/test/.local/state/mac-test/test-mirror/hana",
         ]
         other = [
-            "sh -c cd .local/state/mac-test/mirror/hana_other && cargo nextest run",
-            "sh -c cd .local/state/mac-test/mirror/cargo-liner && cargo nextest run",
-            "sh -c cd .local/state/mac-test/mirror/hanabi && cargo test",
+            "sh -c cd .local/state/mac-test/test-mirror/hana_other && cargo nextest run",
+            "sh -c cd .local/state/mac-test/test-mirror/cargo-liner && cargo nextest run",
+            "sh -c cd .local/state/mac-test/test-mirror/hanabi && cargo test",
             "sh -c cd /Users/test/rust/hana && cargo test",
         ]
         selected = subprocess.run(["grep", "-E", "-e", pattern], input="\n".join(matching + other) + "\n",

@@ -2,11 +2,12 @@
 """Tests for candidates.py: the nightly review's open candidates and the ledger lines a report adds."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 import contextlib
 import io
 import os
 import socket
-import shutil
 import tempfile
 import unittest
 from datetime import datetime
@@ -77,7 +78,9 @@ class CandidatesTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(staff, "caller_identity", return_value=""))
         configuration = self.root / "config"
         configuration.mkdir()
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/nightly_review.conf", configuration / "nightly_review.conf")
+        _ = write_config_fixture(configuration / "nightly_review.conf",
+                                 "review_modes=config rust messages\ncommand_path=~/.claude/commands/nightly_review.md\n"
+                                 + "title_characters=90\nmessage_sample_rows=20\nstate_folder=nightly-review\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         self.note = self.root / "nightly improvement list.md"
         with contextlib.ExitStack() as environment:
@@ -209,7 +212,7 @@ class CandidatesTests(unittest.TestCase):
         other = "- 2026-10-05 config: Other [gain/week: 2 min waiting] — proposed"
         moment = datetime(2026, 10, 13, 9, 0, tzinfo=ZoneInfo("America/New_York"))
         cases: tuple[tuple[str, list[str], str], ...] = (("accepted", ["--applied", "claude abc123"], "accepted 2026-10-13, applied (claude abc123)"),
-                 ("declined", [], "declined"), ("deferred", [], "deferred"),
+                 ("declined", [], "declined"), ("deferred", ["--waiting-why", "The owner must finish the earlier check."], "deferred"),
                  ("done", [], "done 2026-10-13"), ("relayed", [], "relayed 2026-10-13"))
         with mock.patch.object(candidates, "now", return_value=moment):
             for state, options, words in cases:
@@ -398,6 +401,8 @@ class CandidatesTests(unittest.TestCase):
 
     def test_empty_or_unset_note_path_uses_the_default_under_a_temporary_home(self) -> None:
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        _ = write_config_fixture(self.root / "config/nightly_review.conf",
+            "note_path=~/rust/hanadocs/nightly improvement list.md\n")
         default = self.root / "rust" / "hanadocs" / "nightly improvement list.md"
         default.parent.mkdir(parents=True)
         for value in ("", None):
@@ -651,19 +656,22 @@ class NightlyReviewConfigTests(unittest.TestCase):
                 _ = settings.write_text("# whole: 1..\ntitle_characters=5\n")
                 self.assertEqual(candidates.escaped("A longer title", conf.read("nightly_review").whole("title_characters")), "A lo…")
 
-    def test_config_keeps_the_existing_values(self) -> None:
-        from scripts.lib import conf
-
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/nightly_review.conf")
-        for key, expected in {'state_directory': '~/.local/state', 'state_folder': 'nightly-review', 'sessions_directory': '~/.claude/sessions', 'review_modes': 'config rust messages', 'note_path': '~/rust/hanadocs/nightly improvement list.md', 'primary_showrunner_name': 'natedev', 'command_path': '~/.claude/commands/nightly_review.md'}.items():
+    def test_shipped_config_supplies_the_settings_used_by_nightly_review(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = folder / "nightly_review.conf"
+        _ = write_config_fixture(path)
+        settings = conf.read(path)
+        values = settings.values()
+        for key in ("state_directory", "state_folder", "sessions_directory", "review_modes", "note_path",
+                    "primary_showrunner_name", "command_path"):
             with self.subTest(key=key):
-                self.assertEqual(settings.text(key), expected)
-        for key, expected in {'message_sample_rows': 20, 'title_characters': 90}.items():
+                self.assertEqual(settings.text(key), values[key])
+        for key in ("message_sample_rows", "title_characters"):
             with self.subTest(key=key):
-                self.assertEqual(settings.whole(key), expected)
-        for key, expected in {'sample_timeout_overhead_seconds': 15.0, 'message_history_hours': 24.0}.items():
+                self.assertEqual(settings.whole(key), int(values[key]))
+        for key in ("sample_timeout_overhead_seconds", "message_history_hours"):
             with self.subTest(key=key):
-                self.assertEqual(settings.number(key), expected)
+                self.assertEqual(settings.number(key), float(values[key]))
 
 if __name__ == "__main__":
     _ = unittest.main()

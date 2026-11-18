@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 from scripts.production import staff
+from scripts.review_links.review_events import require_waiting_why as require_waiting_why
+from scripts.review_links.review_events import waiting_why
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class DeliverySlots:
     validation: DeliveryIntent | ValidationRequested | NoDelivery
     verdict: DeliveryIntent | NoDelivery
     question: NoQuestion | OpenQuestion | AnsweredQuestion = NoQuestion()
+    waiting_why: str = ""
 
     @property
     def validation_requested(self) -> bool:
@@ -143,17 +146,18 @@ def decode(content: str) -> DeliverySlots:
 
 def decode_value(value: object) -> DeliverySlots:
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    reason = waiting_why(fields.get("waiting_why"))
     if "validation" in fields or "verdict" in fields or "question" in fields:
         return DeliverySlots(decode_validation(fields.get("validation")),
                              decode_slot(fields.get("verdict"), "verdict"),
-                             decode_question(fields.get("question")))
+                             decode_question(fields.get("question")), reason)
     # Older records contain one intent.
     kind = fields.get("kind")
     if kind == "validation":
-        return DeliverySlots(decode_validation(fields), NoDelivery())
+        return DeliverySlots(decode_validation(fields), NoDelivery(), waiting_why=reason)
     if kind == "verdict":
-        return DeliverySlots(NoDelivery(), decode_slot(fields, "verdict"))
+        return DeliverySlots(NoDelivery(), decode_slot(fields, "verdict"), waiting_why=reason)
     feedback = fields.get("feedback")
     if isinstance(feedback, str):
-        return DeliverySlots(ValidationRequested("", feedback), NoDelivery())
-    return DeliverySlots(NoDelivery(), NoDelivery())
+        return DeliverySlots(ValidationRequested("", feedback), NoDelivery(), waiting_why=reason)
+    return DeliverySlots(NoDelivery(), NoDelivery(), waiting_why=reason)

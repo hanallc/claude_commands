@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import atomic_file
 from scripts.production import investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import review_items
+from scripts.review_links import change_page, question_record, review_items
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -66,12 +66,14 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(item.eta, the_list.EtaRange(START + timedelta(hours=2), START + timedelta(hours=3)))
         path = the_list.folder(MORTY.id) / "L106.md"
         initial_log = item.log[0]
-        self.assertIn("- 2026-11-16 18:00:00+00:00 Added; ", path.read_text())
+        self.assertEqual(initial_log.time, START)
+        self.assertIn('"action": "Added"', path.read_text())
         self.assertNotIn("keeper:", path.read_text())
-        self.assertIn('state: "Working"', initial_log.what)
-        self.assertIn("eta: " + json.dumps(str(item.eta)), initial_log.what)
-        for key in ("next_step", "latest_status"):
-            self.assertIn(key + ": " + json.dumps(content), initial_log.what)
+        self.assertEqual(initial_log.what, the_list.FieldChange("Added", {
+            "title": item.title, "owner": RUNNER.id, "producer": MORTY.id, "state": the_list.ItemState.WORKING,
+            "eta": item.eta, "next_step": content, "latest_status": content, "unit": "unit-board",
+            "next_check": START + timedelta(hours=1), "done_when": content, "evidence": content,
+            "requested_by": the_list.RequestedBy.DWIGHT}))
         self.assertEqual(self.command("mark-read", "--id", item.id, "--source", "nate"), (0, "", ""))
         self.assertIs(the_list.load(MORTY.id, item.id).unread_since, the_list.NoTimestamp.UNSET)
         with patch.object(the_list, "now", return_value=START + timedelta(minutes=10)):
@@ -82,10 +84,13 @@ class TheListTests(unittest.TestCase):
                          (the_list.ItemState.DELIVERED, the_list.EtaStatus.DELIVERED, "The page is available."))
         self.assertEqual(item.unread_since, START + timedelta(minutes=10))
         self.assertEqual([entry.source for entry in item.log], ["nate", "nate", "sdlc report"])
-        self.assertIn("Delivered", item.log[-1].what)
+        self.assertEqual(item.log[-1].what, the_list.FieldChange("Updated", {
+            "state": the_list.ItemState.DELIVERED, "eta": the_list.EtaStatus.DELIVERED,
+            "next_step": "Review the page.", "latest_status": "The page is available."}))
         self.assertEqual(item.log[0], initial_log)
         self.assertEqual(item.next_step, "Review the page.")
-        self.assertLess(path.read_text().index("Added; "), path.read_text().index("Marked read — nate"))
+        self.assertIn('"action": "Marked read"', path.read_text())
+        self.assertEqual(item.log[1], the_list.ItemChange(START, the_list.MarkedRead(), "nate"))
         self.assertIn("| # | Owner | Producer | Item | State | Next step | ETA | Update |", self.command("list")[1])
         self.assertIn('| 106 | show | morty | The page: "List" | Delivered;', self.command("list")[1])
 
@@ -98,7 +103,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("update", "--id", "L2", "--producer", OTHER.id, "--source", "morty"), (0, "", ""))
         item = the_list.load(MORTY.id, "L2")
         self.assertEqual(item.producer, OTHER.id)
-        self.assertIn("producer: " + json.dumps(OTHER.id), item.log[-1].what)
+        self.assertEqual(item.log[-1].what, the_list.FieldChange("Updated", {"producer": OTHER.id}))
         self.assertEqual(self.command("update", "--id", "L2", "--producer", "morty", "--source", "morty"), (0, "", ""))
         self.assertEqual(the_list.load(MORTY.id, "L2").producer, MORTY.id)
         table = self.command("list")[1]
@@ -132,7 +137,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(reopened.closing_words, "")
         self.assertIs(reopened.closed, the_list.NoTimestamp.UNSET)
         self.assertEqual(reopened.log[:-1], closed.log)
-        self.assertEqual(reopened.log[-1].what, "Reopened")
+        self.assertEqual(reopened.log[-1].what, the_list.Reopened())
         before = path.read_bytes(), path.stat().st_mtime_ns
         _ = the_list.reopen(MORTY.id, item.id, source="nate")
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
@@ -184,7 +189,7 @@ class TheListTests(unittest.TestCase):
                 cleaned = the_list.load(MORTY.id, original.id)
                 self.assertEqual(cleaned.evidence, expected)
                 if original.evidence != expected:
-                    entry = the_list.ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", "morty")
+                    entry = the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("checkins.json"), "morty")
                     self.assertEqual(cleaned, replace(original, evidence=expected, updated=moment, log=(*original.log, entry)))
                 else:
                     self.assertEqual(cleaned, original)
@@ -225,9 +230,9 @@ class TheListTests(unittest.TestCase):
         for original, expected, json_entries, row_entries in originals:
             with self.subTest(item=original.id):
                 entries = (
-                    (the_list.ItemChange(moment, "Removed the migration copy of checkins.json from Evidence", "morty"),)
+                    (the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("checkins.json"), "morty"),)
                     * json_entries
-                    + (the_list.ItemChange(moment, "Removed the migration copy of the List row from Evidence", "morty"),)
+                    + (the_list.ItemChange(moment, the_list.EvidenceCopyRemoved("the List row"), "morty"),)
                     * row_entries
                 )
                 cleaned = the_list.load(MORTY.id, original.id)
@@ -255,8 +260,8 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("clean-evidence", "--source", "morty"), (0, "0 changed; 1 unchanged\n", ""))
 
     def test_review_links_keep_order_history_and_repeat_without_writes(self) -> None:
-        first = investigation.file(OWNER.id, "First review", "Read the first result.")
-        second = investigation.file(OWNER.id, "Second review", "Read the second result.")
+        first = investigation.file(OWNER.id, "First review", "Read the first result.", waiting_why='The owner must complete the investigation.')
+        second = investigation.file(OWNER.id, "Second review", "Read the second result.", waiting_why='The owner must complete the investigation.')
         identities = (f"{OWNER.name}/{first.id}", f"{OWNER.name}/{second.id}")
         keys = tuple(f"investigation/{OWNER.id}/{review.id}" for review in (first, second))
         item = self.add()
@@ -269,7 +274,8 @@ class TheListTests(unittest.TestCase):
         linked = the_list.load(MORTY.id, item.id)
         self.assertEqual(linked.reviews, keys[::-1])
         self.assertEqual(linked.log[:-1], item.log)
-        self.assertEqual(linked.log[-1], the_list.ItemChange(START, "Linked reviews: " + ", ".join(keys[::-1]), "morty"))
+        self.assertEqual(linked.log[-1],
+                         the_list.ItemChange(START, the_list.ReviewLinksChanged("Linked reviews", keys[::-1]), "morty"))
         self.assertEqual(replace(linked, reviews=item.reviews, log=item.log), item)
         before = path.read_bytes(), path.stat().st_mtime_ns
         with patch.object(review_items, "read", return_value=[]) as read:
@@ -281,7 +287,7 @@ class TheListTests(unittest.TestCase):
         unlinked = the_list.load(MORTY.id, item.id)
         self.assertEqual(unlinked.reviews, (keys[0],))
         self.assertEqual(unlinked.log[:-1], linked.log)
-        self.assertEqual(unlinked.log[-1].what, "Unlinked reviews: " + keys[1])
+        self.assertEqual(unlinked.log[-1].what, the_list.ReviewLinksChanged("Unlinked reviews", (keys[1],)))
         before = path.read_bytes(), path.stat().st_mtime_ns
         with patch.object(review_items, "read", return_value=[]):
             self.assertEqual(self.command("unlink", item.id, "--review", "missing/C9", "--source", "morty"), (0, "", ""))
@@ -308,7 +314,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_review_commands_resolve_keys_and_refuse_ambiguous_shown_ids(self) -> None:
-        _ = investigation.file(OWNER.id, "First review", "Read the result.")
+        _ = investigation.file(OWNER.id, "First review", "Read the result.", waiting_why='The owner must complete the investigation.')
         first = review_items.investigation_items(staff.snapshot())[0]
         second = replace(first, key="proposal/other/I1", type=review_items.ReviewType.PROPOSAL,
                          source=review_items.ProposalLedgerSource(self.root / "proposals.md"))
@@ -347,17 +353,18 @@ class TheListTests(unittest.TestCase):
         read.assert_called_once()
         linked_item = the_list.load(MORTY.id, item.id)
         self.assertEqual(linked_item.reviews, (second.key, third.key, first.key, fourth.key))
-        self.assertEqual(linked_item.log[-1].what, "Linked reviews: " + ", ".join(linked_item.reviews))
+        self.assertEqual(linked_item.log[-1].what, the_list.ReviewLinksChanged("Linked reviews", linked_item.reviews))
         with patch.object(review_items, "read", return_value=[first, second, third, fourth]) as read:
             self.assertEqual(self.command("unlink", item.id, "--review", third.id, "--review-key", second.key,
                 "--review", third.id, "--review-key", first.key, "--source", "morty"), (0, "", ""))
         read.assert_called_once()
         unlinked_item = the_list.load(MORTY.id, item.id)
         self.assertEqual(unlinked_item.reviews, (fourth.key,))
-        self.assertEqual(unlinked_item.log[-1].what, "Unlinked reviews: " + ", ".join((third.key, second.key, first.key)))
+        self.assertEqual(unlinked_item.log[-1].what,
+                         the_list.ReviewLinksChanged("Unlinked reviews", (third.key, second.key, first.key)))
 
     def test_review_options_keep_shown_ids_separate_from_exact_keys(self) -> None:
-        _ = investigation.file(OWNER.id, "Review the result", "Read the result.")
+        _ = investigation.file(OWNER.id, "Review the result", "Read the result.", waiting_why='The owner must complete the investigation.')
         base = review_items.investigation_items(staff.snapshot())[0]
         first = replace(base, id="natedev/C1", key="natedev/C1")
         second = replace(base, id=first.id, key="hanadocs/C1", type=review_items.ReviewType.PROPOSAL,
@@ -391,13 +398,13 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("mark-read", "--id", item.id, "--source", "nate")[0], 1)
             read = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE)
         self.assertEqual(replace(read, unread_since=item.unread_since, log=item.log), item)
-        self.assertEqual(read.log[-1].what, "Marked read")
+        self.assertEqual(read.log[-1].what, the_list.MarkedRead())
         words = 'Explain this simply.\nKeep "these" words.'
         self.assertEqual(the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback("request", words)),
                          the_list.PageFeedback("request", words))
         sent = the_list.load(MORTY.id, item.id)
         self.assertEqual(replace(sent, log=read.log), read)
-        self.assertIn(json.dumps(words), sent.log[-1].what)
+        self.assertEqual(sent.log[-1].what, the_list.PageFeedback("request", words))
         self.assertEqual(the_list.sent_to_morty(sent), START)
         self.assertIs(sent.unread_since, the_list.NoTimestamp.UNSET)
         again = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE)
@@ -405,6 +412,346 @@ class TheListTests(unittest.TestCase):
         with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
             changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
         self.assertIs(the_list.sent_to_morty(changed), the_list.NoTimestamp.UNSET)
+
+    def test_answer_refusals_leave_the_record_unchanged(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_bytes()
+        for identity, text, error in (("Q2", "The check passed.", "Unknown question id."),
+                                      ("Q1", " \t ", "Enter an answer first.")):
+            with self.subTest(identity=identity, text=text):
+                self.assertEqual(self.command("answer", item.id, "--question", identity, "--text", text),
+                                 (1, "", f"the_list: {error}\n"))
+                self.assertEqual(path.read_bytes(), before)
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("request-1", "question", "Which check passed?"), status)
+        opened = the_list.load(MORTY.id, item.id)
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "The check passed."),
+                         (0, f"answered {item.id} Q1\n", ""))
+        answered = the_list.load(MORTY.id, item.id)
+        answer = answered.questions[0].answer
+        assert isinstance(answer, question_record.Answer)
+        self.assertEqual(answer.text, "The check passed.")
+        self.assertEqual(answered.unread_since, START)
+        self.assertEqual(len(answered.log), len(opened.log) + 1)
+        self.assertIn('"action": "Answered", "question_id": "Q1"', path.read_text())
+        self.assertEqual(answered.log[-1].what, the_list.QuestionAnswered("Q1"))
+        before = path.read_bytes()
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "A second answer."),
+                         (1, "", "the_list: This question already has an answer.\n"))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_answer_round_trips_unicode_separators(self) -> None:
+        item = self.add()
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Which checks passed?"), status)
+        text = "First result\u2028Second result\u2029Third result"
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", text),
+                         (0, f"answered {item.id} Q1\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        answer = saved.questions[0].answer
+        assert isinstance(answer, question_record.Answer)
+        self.assertEqual(answer.text, text)
+        self.assertEqual(saved.unread_since, START)
+
+    def test_close_clears_unread_and_reopen_marks_a_new_update(self) -> None:
+        item = self.add()
+        self.assertIsInstance(the_list.unread_update(item), the_list.UnreadUpdate)
+        closed = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        self.assertIs(closed.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertIs(the_list.unread_update(closed), the_list.NoUnreadUpdate.ABSENT)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        self.assertIn('unread_since: ""\n', path.read_text())
+
+        reopened_at = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=reopened_at):
+            reopened = the_list.reopen(MORTY.id, item.id, source="nate")
+        self.assertEqual(reopened.unread_since, reopened_at)
+        self.assertIsInstance(the_list.unread_update(reopened), the_list.UnreadUpdate)
+
+    def test_answer_updates_a_closed_item_without_marking_it_unread(self) -> None:
+        item = self.add()
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        answered_at = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=answered_at):
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "The page check passed."),
+                             (0, f"answered {item.id} Q1\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.CLOSED)
+        self.assertEqual(saved.updated, answered_at)
+        self.assertIsInstance(saved.questions[0].answer, question_record.Answer)
+        self.assertIs(saved.unread_since, the_list.NoTimestamp.UNSET)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        self.assertIn('unread_since: ""\n', path.read_text())
+
+    def test_load_reads_a_legacy_closed_record_without_an_unread_update(self) -> None:
+        item = self.add(changes={"latest_status": "The report is ready.", "next_step": "Review the report.",
+                                 "evidence": "The page check passed.", "done_when": "The report closes."})
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id,
+                                  the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        field = f'unread_since: {json.dumps(START.isoformat())}\n'
+        stored = path.read_text().replace('unread_since: ""\n', field, 1)
+        self.assertIn(field, stored)
+        _ = path.write_text(stored)
+        closed = the_list.load(MORTY.id, item.id)
+        self.assertIs(closed.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertIs(the_list.unread_update(closed), the_list.NoUnreadUpdate.ABSENT)
+        self.assertEqual(path.read_text(), stored)
+        answered_at = START + timedelta(minutes=1)
+        words = "The page check passed."
+        with patch.object(the_list, "now", return_value=answered_at):
+            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", words),
+                             (0, f"answered {item.id} Q1\n", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIn('unread_since: ""\n', path.read_text())
+        self.assertEqual(saved.log, (*closed.log, the_list.ItemChange(answered_at, the_list.QuestionAnswered("Q1"), "morty")))
+        self.assertEqual(saved.updated, answered_at)
+        answer = saved.questions[0].answer
+        assert isinstance(answer, question_record.Answer)
+        self.assertEqual(answer.text, words)
+        self.assertEqual(saved.questions, (replace(closed.questions[0], answer=answer),))
+        self.assertEqual(replace(saved, updated=closed.updated, log=closed.log, questions=closed.questions), closed)
+
+    def test_typed_log_refuses_invalid_fields(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_text()
+        activity = {"request": "request", "action": "tell", "words": "Read this.", "state": "pending"}
+        cases: tuple[tuple[str, dict[str, object]], ...] = (
+            ("added", {"action": "Added", "fields": {"title": "Only a title"}}),
+            ("updated", {"action": "Updated", "fields": {}}),
+            ("empty title", {"action": "Updated", "fields": {"title": ""}}),
+            ("multiline title", {"action": "Updated", "fields": {"title": "First\nSecond"}}),
+            ("mismatched ETA kind", {"action": "Updated", "fields":
+                {"eta": {"kind": "time or status", "value": "After the check"}}}),
+            ("spaced request ID", {"feedback": dict(activity, request="bad id")}),
+            ("parked", {"action": "Parked", "fields": {"title": "Only a title"}}),
+            ("closed", {"action": "Closed", "fields": {"state": "Closed"}}),
+            ("blank closing words", {"action": "Closed", "fields": {"closing_words": " "}}),
+            ("blank request", {"feedback": dict(activity, request="")}),
+            ("blank feedback", {"feedback": dict(activity, words=" ")}),
+            ("missing request", {"feedback": {key: value for key, value in activity.items() if key != "request"}}),
+            ("missing feedback", {"feedback": {key: value for key, value in activity.items() if key != "words"}}),
+            ("missing state", {"feedback": {key: value for key, value in activity.items() if key != "state"}}),
+            ("missing action", {"feedback": {key: value for key, value in activity.items() if key != "action"}}),
+            ("blank receipt request", {"receipt": {"request": "", "action": "read", "words": ""}}),
+            ("blank question", {"receipt": {"request": "ask", "action": "question", "words": "", "question_id": "Q1"}}),
+            ("wrong feedback source", {"source": "morty", "feedback": activity}),
+            ("wrong receipt source", {"source": "morty", "receipt": {
+                "request": "request", "action": "read", "words": ""}}),
+            ("wrong question receipt source", {"source": "morty", "receipt": {
+                "request": "ask", "action": "question", "words": "Which check?", "question_id": "Q1"}}),
+            ("missing review keys", {"action": "Linked reviews", "keys": []}),
+            ("invalid review key", {"action": "Unlinked reviews", "keys": [""]}),
+            ("unknown Evidence copy", {"action": "Removed Evidence copy", "copy": "another copy"}),
+        )
+        for label, entry in cases:
+            with self.subTest(label=label):
+                row = {"time": START.isoformat(), "source": the_list.PAGE_SOURCE, **entry}
+                _ = path.write_text(before.removesuffix("\n") + "\n- " + json.dumps(row) + "\n")
+                with self.assertRaises(the_list.ListError):
+                    _ = the_list.load(MORTY.id, item.id)
+
+    def test_log_reader_and_item_validator_refuse_the_same_field_values(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_text()
+        cases: tuple[tuple[str, object, object], ...] = (
+            ("title", "", ""),
+            ("owner", "../owner", "../owner"),
+            ("producer", "../producer", "../producer"),
+            ("unit", "first\nsecond", "first\nsecond"),
+            ("state", "Unknown", "Unknown"),
+            ("next_check", the_list.CheckCondition("first\nsecond"), "first\nsecond"),
+            ("eta", the_list.EtaDescription(""), {"kind": "text", "value": ""}),
+            ("blocked_by", (the_list.ItemDependency(0, ""),), [[0, ""]]),
+            ("blocked_by", (the_list.ItemDependency(item.number, "ready"),), [[item.number, "ready"]]),
+            ("blocked_by", (the_list.ItemDependency(2, "one"), the_list.ItemDependency(2, "two")),
+             [[2, "one"], [2, "two"]]),
+            ("related_to", (0,), [0]),
+            ("related_to", (item.number,), [item.number]),
+            ("requested_by", "Unknown", "Unknown"),
+            ("next_step", 1, 1),
+            ("latest_status", 1, 1),
+            ("evidence", 1, 1),
+            ("done_when", 1, 1),
+            ("parked_until", START.replace(tzinfo=None), START.replace(tzinfo=None).isoformat()),
+            ("closing_words", " ", " "),
+        )
+        self.assertEqual({field for field, _, _ in cases}, set(the_list.LogFields.__annotations__))
+        for field, native, stored in cases:
+            action = {"parked_until": "Parked", "closing_words": "Closed"}.get(field, "Updated")
+            with self.subTest(field=field, value=stored, path="item"):
+                if action == "Parked":
+                    assert isinstance(native, datetime)
+                    with self.assertRaises(the_list.ListError):
+                        _ = the_list.park(MORTY.id, item.id, native, source="nate")
+                elif action == "Closed":
+                    assert isinstance(native, str)
+                    with self.assertRaises(the_list.ListError):
+                        _ = the_list.close(MORTY.id, item.id, native, source="nate")
+                else:
+                    changes = cast(the_list.ItemChanges, cast(object, {field: native}))
+                    with self.assertRaises(the_list.ListError):
+                        _ = the_list.update(MORTY.id, item.id, changes, source="morty")
+            with self.subTest(field=field, value=stored, path="log"):
+                row = {"time": START.isoformat(), "source": "morty", "action": action, "fields": {field: stored}}
+                _ = path.write_text(before.removesuffix("\n") + "\n- " + json.dumps(row) + "\n")
+                try:
+                    with self.assertRaises(the_list.ListError):
+                        _ = the_list.load(MORTY.id, item.id)
+                finally:
+                    _ = path.write_text(before)
+
+    def test_every_log_writer_saves_a_typed_entry_that_reloads(self) -> None:
+        evidence = ('Source checkins.json item:\n\n{"owner": "sdlc"}\n\n'
+                    + "## 1. Former title\n\n**List state:** Working\n\n- **Owner:** sdlc\n")
+        item = self.add(number=1, changes={"evidence": evidence})
+        path = the_list.folder(MORTY.id) / "L1.md"
+        seen = 0
+
+        def check(*tags: str) -> None:
+            nonlocal seen
+            entries = the_list.load(MORTY.id, item.id).log
+            _, marker, body = path.read_text().partition("## Log\n\n")
+            self.assertTrue(marker)
+            rows = [cast(dict[str, object], json.loads(line[2:])) for line in body.split("\n") if line]
+            self.assertEqual(len(entries), len(rows))
+            self.assertEqual(len(entries) - seen, len(tags))
+            first, seen = seen, len(entries)
+            for entry, row, tag in zip(entries[first:], rows[first:], tags, strict=True):
+                with self.subTest(event=tag):
+                    self.assertNotIsInstance(entry.what, str)
+                    self.assertNotIn("note", row)
+                    self.assertEqual(row.get("action", tag if tag in row else ""), tag)
+
+        check("Added")
+        _ = the_list.update(MORTY.id, item.id, {"title": "New title"}, source="morty")
+        check("Updated")
+        _ = the_list.link(MORTY.id, item.id, ("card-1",), source="morty")
+        check("Linked reviews")
+        _ = the_list.unlink(MORTY.id, item.id, ("card-1",), source="morty")
+        check("Unlinked reviews")
+        until = START + timedelta(days=1)
+        _ = the_list.park(MORTY.id, item.id, until, source=the_list.PAGE_SOURCE,
+                          notice=the_list.PageItemNotice("park", "Park this item.", "park"))
+        check("Parked", "feedback")
+        _ = the_list.park(MORTY.id, item.id, until, source=the_list.PAGE_SOURCE,
+                          notice=the_list.PageItemNotice("park-again", "Keep it parked.", "park"))
+        check("receipt")
+        _ = the_list.close(MORTY.id, item.id, "Works.", source=the_list.PAGE_SOURCE,
+                           notice=the_list.PageItemNotice("remove", "Remove this item.", "remove"))
+        check("Closed", "feedback")
+        _ = the_list.reopen(MORTY.id, item.id, source="morty")
+        check("Reopened")
+        _ = the_list.clean_evidence(MORTY.id, source="morty")
+        check("Removed Evidence copy", "Removed Evidence copy")
+        _ = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE,
+                               page_request=the_list.PageRequest("read", "read", ""))
+        check("receipt", "Marked read")
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Ready?"), status)
+        check("receipt")
+        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask-again", "question", "Ready?"), status)
+        check("receipt")
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Ready."),
+                         (0, "answered L1 Q1\n", ""))
+        check("Answered")
+        _ = the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback("tell", "Read this."))
+        check("feedback")
+        the_list.deliver_feedback(MORTY.id, item.id, "tell", lambda _, entry: replace(entry, state="sent"))
+        check("feedback")
+
+    def test_legacy_fields_keep_the_existing_unread_update_identity(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before, marker, _ = path.read_text().partition("## Log\n\n")
+        dependencies = ("(ItemDependency(number=105, condition='on main'), "
+                        + "ItemDependency(number=106, condition='first page on main'))")
+        note = f'Updated blocked_by: {json.dumps(dependencies)}; related_to: "(112, 113)"'
+        _ = path.write_text(before + marker + f"- 2026-11-16 18:00:00+00:00 {note} — morty\n")
+        previous = the_list.unread_update(replace(item, log=(the_list.ItemChange(START, note, "morty"),)))
+        restored = the_list.load(MORTY.id, item.id)
+        self.assertEqual(restored.log[0].what, the_list.LegacyFieldChange("Updated", {
+            "blocked_by": (the_list.ItemDependency(105, "on main"), the_list.ItemDependency(106, "first page on main")),
+            "related_to": (112, 113)}, note))
+        self.assertEqual(the_list.unread_update(restored), previous)
+
+        _ = the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback("legacy-request", "Read the log."))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.log[0], restored.log[0])
+        self.assertEqual(the_list.unread_update(saved), previous)
+
+    def test_feedback_refuses_invalid_request_ids_without_writing(self) -> None:
+        for request in (" ", "bad id", "bad\tid"):
+            with self.subTest(request=request):
+                item = self.add()
+                path = the_list.folder(MORTY.id) / f"{item.id}.md"
+                before = path.read_bytes(), path.stat().st_mtime_ns
+                with self.assertRaises(the_list.ListError):
+                    _ = the_list.save_feedback(MORTY.id, item.id, the_list.PageFeedback(request, "Keep this result."))
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_feedback_keeps_its_original_update_target_across_delivery(self) -> None:
+        item = self.add()
+        target = the_list.unread_update(item)
+        feedback = the_list.PageFeedback("request", "Keep this result.", read_update=target)
+        _ = the_list.save_feedback(MORTY.id, item.id, feedback)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)["request"], feedback)
+        self.assertEqual(the_list.unread_update(saved), target)
+        the_list.deliver_feedback(MORTY.id, item.id, "request", lambda _item, pending: replace(pending, state="sent"))
+        sent = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(sent)["request"].read_update, target)
+        self.assertEqual(the_list.unread_update(sent), target)
+
+    def test_mark_read_checks_the_update_target_inside_the_store_lock(self) -> None:
+        item = self.add()
+        target = the_list.unread_update(item)
+        self.assertIsInstance(target, the_list.UnreadUpdate)
+        assert isinstance(target, the_list.UnreadUpdate)
+        newer = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+        self.assertEqual(newer.unread_since, item.unread_since)
+        self.assertNotEqual(the_list.unread_update(newer), target)
+        unchanged = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=target)
+        self.assertEqual(unchanged, newer)
+        current = the_list.unread_update(newer)
+        assert isinstance(current, the_list.UnreadUpdate)
+        read = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=current)
+        self.assertIs(read.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(read.log[-1].what, the_list.MarkedRead())
+
+    def test_page_item_actions_save_the_notice_in_the_same_write(self) -> None:
+        for action in ("remove", "park"):
+            with self.subTest(action=action):
+                item = self.add("One write for " + action)
+                notice = the_list.PageItemNotice("request-" + action, "The item action is complete.", action)
+                with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+                    if action == "remove":
+                        saved = the_list.close(MORTY.id, item.id, "Removed by nate.", source=the_list.PAGE_SOURCE, notice=notice)
+                    else:
+                        saved = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source=the_list.PAGE_SOURCE, notice=notice)
+                save.assert_called_once()
+                feedback = the_list.feedback_requests(saved)[notice.request]
+                self.assertEqual((feedback.action, feedback.words, feedback.state), (action, notice.words, "pending"))
+                self.assertEqual(saved.log[-1].time, saved.log[-2].time)
+
+    def test_repeated_remove_request_does_not_close_a_reopened_item(self) -> None:
+        item = self.add()
+        notice = the_list.PageItemNotice("request", "The item was removed.", "remove")
+        _ = the_list.close(MORTY.id, item.id, "Removed by nate.", source=the_list.PAGE_SOURCE, notice=notice)
+        reopened = the_list.reopen(MORTY.id, item.id, source="morty")
+        with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+            repeated = the_list.close(MORTY.id, item.id, "Removed by nate.", source=the_list.PAGE_SOURCE, notice=notice)
+        save.assert_not_called()
+        self.assertEqual(repeated, reopened)
 
     def test_parking_hides_the_item_until_its_time_without_changing_state(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
@@ -415,7 +762,7 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(item.state, the_list.ItemState.WORKING)
         self.assertNotIn("| 1 |", self.command("list")[1])
         self.assertIn("| 1 |", self.command("list", "--include-parked")[1])
-        self.assertIn("parked until", self.command("list", "--include-parked")[1])
+        self.assertIn("parked until 2026-11-17 |", self.command("list", "--include-parked")[1])
         with patch.object(the_list, "now", return_value=datetime(2026, 11, 17, 5, tzinfo=UTC)):
             self.assertIn("| 1 |", self.command("list")[1])
         self.assertEqual(self.command("park", "--id", item.id, "--until", "", "--source", "nate"), (0, "", ""))
@@ -550,6 +897,14 @@ class TheListTests(unittest.TestCase):
                 with self.assertRaises(the_list.ListError):
                     _ = the_list.load(MORTY.id, item.id)
                 _ = path.write_text(before)
+        for fields in ({"eta": 1}, {"state": "Parked"}, {"unknown": "value"}, {"related_to": [True]}):
+            with self.subTest(log_fields=fields):
+                base, _, _ = before.partition("## Log\n\n")
+                entry = {"time": START.isoformat(), "source": "nate", "action": "Updated", "fields": fields}
+                _ = path.write_text(base + "## Log\n\n- " + json.dumps(entry) + "\n")
+                with self.assertRaises(the_list.ListError):
+                    _ = the_list.load(MORTY.id, item.id)
+                _ = path.write_text(before)
         for args in (("add", "--title", "Bad\ntitle", "--owner", RUNNER.id, "--source", "nate"),
                      ("add", "--title", "Title", "--owner", OWNER.id, "--source", "nate"),
                      ("add", "--title", "Title", "--owner", RUNNER.id, "--number", "1", "--source", "nate"),
@@ -572,7 +927,7 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("list"), (1, "", "the_list: the current session must be the morty producer\n"))
 
     def test_shared_records_preserve_investigation_format_and_separate_folders(self) -> None:
-        investigation_item = investigation.file(MORTY.id, "Find the cause", "Why?\n\n## Answer\n\nKeep this text.")
+        investigation_item = investigation.file(MORTY.id, "Find the cause", "Why?\n\n## Answer\n\nKeep this text.", waiting_why='The owner must complete the investigation.')
         item = self.add()
         self.assertEqual((investigation_item.id, item.id), ("I1", "L1"))
         self.assertEqual(the_list.load(MORTY.id, item.id), item)

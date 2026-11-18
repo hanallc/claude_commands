@@ -11,20 +11,125 @@ try:
 except FileNotFoundError:
     pass
 
-from dataclasses import dataclass
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+import fcntl
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import conf, git_index, registry_rows
+from scripts.lib import conf, conf_reads, git_index, registry_rows
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.transcripts import config_dirs
 
 WAITING_GLOB = "config/*.conf"
 WAITING_PATHS = f":(glob){WAITING_GLOB}"
 REGISTRY_PATH = "config/models.conf"
+STATUSLINE_PATH = "config/statusline.conf"
+
+
+def model_color_host(key: str) -> str:
+    """Return the reserved host suffix of a model color key, if present."""
+    base = key.rpartition(".")[0]
+    if conf.full_model_color_key("statusline", base):
+        return conf.host_suffix(key, conf.known_host_names())
+    return ""
+
+
+def model_color_key(stem: str, key: str) -> bool:
+    """Allow a new color only for a full model ID in its catalog."""
+    if not conf.full_model_color_key(stem, key):
+        return False
+    model = key.removeprefix("model.")
+    if model.startswith("gpt-"):
+        override = os.environ.get("MODELS_CONFIG_FILE")
+        source = Path(override) if override else conf.path("models")
+        try:
+            if not override and not source.exists():
+                source = Path(__file__).resolve().parents[2] / REGISTRY_PATH
+            registry = registry_rows.parse_registry(conf_reads.read_text(source))
+        except (OSError, UnicodeError):
+            return False
+        return model in registry.get("codex.agents", {}) and model not in registry.get("codex.families", {})
+    return _claude_model_listed(model)
+
+
+def _claude_model_listed(model: str) -> bool:
+    for directory in config_dirs():
+        for path in (directory / "cache/model-catalog").glob("*-cc.json"):
+            try:
+                value = cast(object, json.loads(path.read_bytes()))
+            except (OSError, ValueError):
+                continue
+            for key in ("catalog", "config", "models"):
+                value = cast(dict[str, object], value).get(key) if isinstance(value, dict) else None
+            if isinstance(value, list) and any(isinstance(entry, dict)
+                    and cast(dict[str, object], entry).get("id") == model for entry in cast(list[object], value)):
+                return True
+    return False
+
+
+def model_color_value(value: str) -> bool:
+    """Check the hex format that tune accepts for a new model color."""
+    return re.fullmatch(r"#[0-9a-f]{6}", value) is not None
+
+
+def append_model_color(source: str, key: str, value: str) -> str:
+    """Append one validated model color to the config text."""
+    ending = "\n" if source and not source.endswith("\n") else ""
+    return f"{source}{ending}{key}={value}\n"
+
+
+@dataclass(frozen=True)
+class WaitingChange:
+    """An accepted live change that waits for publication or the Mac pull."""
+
+    stem: str
+    key: str
+    value: str
+    message: str
+    publish_on_main: bool = True
+
+
+class WaitingChangeRecord(TypedDict):
+    stem: str
+    key: str
+    value: str
+    message: str
+    publish_on_main: NotRequired[bool]
+
+
+def journal_path() -> Path:
+    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    return Path(state) / "live-settings" / "waiting.json"
+
+
+def _read_journal(path: Path) -> list[WaitingChange]:
+    try:
+        records = cast(list[WaitingChangeRecord], json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return []
+    return [WaitingChange(**record) for record in records]
+
+
+@contextmanager
+def journal(path: Path | None = None) -> Generator[list[WaitingChange]]:
+    """Hold the journal lock while a caller changes the accepted rows."""
+    path = journal_path() if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        changes = _read_journal(path)
+        before = list(changes)
+        yield changes
+        if changes != before:
+            write_text_atomic(path, json.dumps([asdict(change) for change in changes], indent=2) + "\n")
 
 
 def replace_value(source: str, index: int, value: str) -> str:
@@ -47,15 +152,20 @@ def replace_value(source: str, index: int, value: str) -> str:
     return "".join(lines)
 
 
-def replay(path: str, head: str, local: str, target: str) -> str:
+def replay(path: str, head: str, local: str, target: str, *,
+           accepted_colors: dict[str, str] | None = None) -> str:
     """Put the rows that local changed from head onto target."""
     if path == REGISTRY_PATH:
         return registry_rows.replay_pending(head, local, target)
     before, wanted, base = conf.settings(head), conf.settings(local), conf.settings(target)
     text = target
     for key, setting in wanted.items():
-        if key in base and (key not in before or before[key].value != setting.value):
+        if key in before and before[key].value == setting.value:
+            continue
+        if key in base:
             text = replace_value(text, base[key].line, setting.value)
+        elif key not in before and accepted_colors is not None and accepted_colors.get(key) == setting.value:
+            text = append_model_color(text, key, setting.value)
     return text
 
 
@@ -81,12 +191,25 @@ def waiting_files(checkout: Path) -> list[str]:
 
 @dataclass(frozen=True)
 class WaitingRows:
-    """The waiting files that a move to target changes, with their texts before the move."""
+    """The checked index entries and file text for a move to the target."""
 
-    target: str
     entries: str
-    head: dict[str, str]
-    local: dict[str, str]
+    restored: dict[str, str]
+    mac_pulls: tuple[WaitingChange, ...]
+
+
+def _accepted_colors(head: str, local: str, target: str,
+                     changes: Sequence[WaitingChange]) -> dict[str, str]:
+    before, incoming = conf.settings(head), conf.settings(target)
+    pending = {change.key: change.value for change in changes if change.stem == "statusline"}
+    accepted: dict[str, str] = {}
+    for key, setting in conf.settings(local).items():
+        if key in before or not conf.full_model_color_key("statusline", key) or not model_color_value(setting.value):
+            continue
+        published = incoming.get(key)
+        if pending.get(key) == setting.value or (published is not None and published.value == setting.value):
+            accepted[key] = setting.value
+    return accepted
 
 
 def hold(checkout: Path, target: str, *, skip: tuple[str, ...] = ()) -> WaitingRows:
@@ -96,12 +219,26 @@ def hold(checkout: Path, target: str, *, skip: tuple[str, ...] = ()) -> WaitingR
     entries = git(checkout, "ls-tree", "-z", target, "--", *touched).replace("\0", "\n") if touched else ""
     if len(entries.splitlines()) != len(touched):
         raise OSError(f"{target} removes a file with waiting rows: {', '.join(touched)}")
-    head = {path: show(checkout, "HEAD", path) for path in touched}
-    local = {path: (checkout / path).read_text(encoding="utf-8") for path in touched}
+    restored: dict[str, str] = {}
+    mac_pulls: tuple[WaitingChange, ...] = ()
     for path in touched:
-        if path != REGISTRY_PATH and replay(path, head[path], local[path], head[path]) != local[path]:
+        head = show(checkout, "HEAD", path)
+        local = (checkout / path).read_text(encoding="utf-8")
+        incoming = show(checkout, target, path)
+        colors = None
+        if path == STATUSLINE_PATH:
+            try:
+                changes = _read_journal(journal_path())
+            except (ValueError, TypeError) as error:
+                raise OSError(f"cannot read accepted colors: {error}") from error
+            colors = _accepted_colors(head, local, incoming, changes)
+            published = conf.settings(incoming)
+            mac_pulls = tuple(change for change in changes if not change.publish_on_main
+                              and change.key in published and published[change.key].value == change.value)
+        if path != REGISTRY_PATH and replay(path, head, local, head, accepted_colors=colors) != local:
             raise OSError(f"{path} has local edits other than setting values")
-    return WaitingRows(target, entries, head, local)
+        restored[path] = replay(path, head, local, incoming, accepted_colors=colors)
+    return WaitingRows(entries, restored, mac_pulls)
 
 
 def give(checkout: Path, rows: WaitingRows, environment: dict[str, str] | None = None) -> None:
@@ -112,10 +249,12 @@ def give(checkout: Path, rows: WaitingRows, environment: dict[str, str] | None =
 
 def restore(checkout: Path, rows: WaitingRows) -> None:
     """Put the waiting rows onto the target's text of each file after the move."""
-    for path in rows.head:
-        text = replay(path, rows.head[path], rows.local[path], show(checkout, rows.target, path))
+    for path, text in rows.restored.items():
         if (checkout / path).read_text(encoding="utf-8") != text:
             write_text_atomic(checkout / path, text)
+    if rows.mac_pulls:
+        with journal() as changes:
+            changes[:] = [change for change in changes if change not in rows.mac_pulls]
 
 
 def move_to(checkout: Path, target: str) -> None:
