@@ -53,6 +53,11 @@ Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
 Its callers retain their existing task cleanup.
 
+The borrow check keeps sources with recorded borrowers or unreadable copy records.
+An unregistered folder keeps the source unless its parent is a Git checkout and the folder has no Git entries.
+The check uses `.git` on the parent and checks `.git`, `HEAD`, `objects`, and `commondir` on the folder.
+The check does not descend into an ordinary worktree subfolder or a registered copy to find nested clones.
+
 `copies.py list` reads slot leases and remote mirror rows.
 `copies.py remove` removes owned editable and remote copies; it never removes a shared slot.
 The nightly slot sweep removes old free slots.

@@ -847,6 +847,134 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertEqual(scratch.end("until:2000-01-01T0000Z"), [])
         self.assertTrue(parent.is_dir())
 
+    def test_an_ordinary_worktree_subfolder_does_not_keep_a_task_clone(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        task = "until:2000-01-01T0000Z"
+        clone = copies.clone(source, task)
+        worktree = copy_record.copies_root() / "ordinary-worktree"
+        worktree.parent.mkdir(exist_ok=True)
+        self.git(source, "worktree", "add", "--detach", str(worktree))
+        settings = worktree / ".claude"
+        settings.mkdir()
+        _ = (settings / "settings.local.json").write_text("{}")
+
+        self.assertIsInstance(scratch.record_lifetime(clone, time.time()), scratch.Ended)
+        self.assertEqual(scratch.end(task), [clone])
+        self.assertTrue(settings.is_dir())
+
+    def test_an_unregistered_plain_folder_in_a_copies_pair_keeps_the_source(self) -> None:
+        source = self.copy("source", task="until:2000-01-01T0000Z")
+        candidate = source.parent / "candidate"
+        candidate.mkdir()
+
+        self.assertEqual(scratch.record_lifetime(source, time.time()),
+                         scratch.Unknown(f"repair record {candidate / copy_record.RECORD}: cannot rule out borrowed objects"))
+
+    def ordinary_worktree(self) -> Path:
+        source = self.base / "worktree-source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        worktree = copy_record.copies_root() / "ordinary-worktree"
+        self.git(source, "worktree", "add", "--detach", str(worktree))
+        return worktree
+
+    def test_an_unregistered_repository_with_a_common_directory_keeps_the_source(self) -> None:
+        source = self.copy("source", task="until:2000-01-01T0000Z")
+        candidate = self.ordinary_worktree() / "candidate"
+        candidate.mkdir()
+        _ = (candidate / "HEAD").write_text("ref: refs/heads/main\n")
+        _ = (candidate / "commondir").write_text(str(source / ".git") + "\n")
+
+        self.assertEqual(scratch.record_lifetime(source, time.time()),
+                         scratch.Unknown(f"repair record {candidate / copy_record.RECORD}: cannot rule out borrowed objects"))
+
+    def test_an_unregistered_git_repository_keeps_a_possible_borrowed_source(self) -> None:
+        source = self.copy("source", task="until:2000-01-01T0000Z")
+        worktree = self.ordinary_worktree()
+        for options in ((), ("--bare",)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory(dir=worktree) as temporary:
+                candidate = Path(temporary)
+                self.git(candidate, "init", "-q", *options)
+                state = scratch.record_lifetime(source, time.time())
+                self.assertIsInstance(state, scratch.Unknown)
+                assert isinstance(state, scratch.Unknown)
+                self.assertIn(str(candidate / copy_record.RECORD), state.reason)
+
+    def test_unreadable_git_metadata_keeps_a_possible_borrowed_source(self) -> None:
+        source = self.copy("source", task="until:2000-01-01T0000Z")
+        candidate = self.ordinary_worktree() / "candidate"
+        candidate.mkdir()
+        git = candidate / ".git"
+        git.mkdir()
+        candidate_inode = candidate.stat().st_ino
+        stat_entry = os.stat
+
+        def unreadable(path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | int, *,
+                       dir_fd: int | None = None, follow_symlinks: bool = True) -> os.stat_result:
+            if path == ".git" and dir_fd is not None and os.fstat(dir_fd).st_ino == candidate_inode:
+                raise PermissionError(f"{git}: Git metadata is unreadable")
+            return stat_entry(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+        with mock.patch.object(os, "stat", unreadable):
+            state = scratch.record_lifetime(source, time.time())
+
+        self.assertIsInstance(state, scratch.Unknown)
+        assert isinstance(state, scratch.Unknown)
+        self.assertIn(str(git), state.reason)
+
+    def test_git_entry_links_keep_a_possible_borrowed_source(self) -> None:
+        source = self.copy("source", task="until:2000-01-01T0000Z")
+        candidate = self.ordinary_worktree() / "candidate"
+        candidate.mkdir()
+        for name in (".git", "HEAD", "objects", "commondir"):
+            with self.subTest(name=name):
+                entry = candidate / name
+                entry.symlink_to("missing")
+                self.assertEqual(scratch.record_lifetime(source, time.time()),
+                                 scratch.Unknown(f"repair record {candidate / copy_record.RECORD}: cannot rule out borrowed objects"))
+                entry.unlink()
+
+    def test_a_directory_link_added_during_the_borrow_check_keeps_the_source(self) -> None:
+        source = self.copy("source", task="until:2000-01-01T0000Z")
+        pair = self.ordinary_worktree()
+        candidate = pair / "candidate"
+        candidate.mkdir()
+        self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
+        open_directory = os.open
+        moved = self.base / "moved"
+
+        for replaced, open_path in ((candidate, candidate.name), (pair, pair)):
+            with self.subTest(replaced=replaced):
+                def replace_with_link(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                                      flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+                    if path == open_path:
+                        _ = replaced.rename(moved)
+                        replaced.symlink_to(moved, target_is_directory=True)
+                    return open_directory(path, flags, mode, dir_fd=dir_fd)
+
+                with mock.patch.object(os, "open", replace_with_link):
+                    state = scratch.record_lifetime(source, time.time())
+
+                self.assertTrue(replaced.is_symlink())
+                self.assertIsInstance(state, scratch.Unknown)
+                replaced.unlink()
+                _ = moved.rename(replaced)
+
+    def test_registered_borrow_evidence_keeps_the_source(self) -> None:
+        source = self.copy("source", task="until:2000-01-01T0000Z")
+        borrower = source.parent / "borrower"
+        borrower.mkdir()
+        self.git(borrower, "init", "-q")
+        scratch.atomic_record(borrower / copy_record.RECORD,
+                              {"task": "gate:borrower", "borrows_from": str(source / ".git")})
+
+        self.assertEqual(scratch.record_lifetime(source, time.time()),
+                         scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+
     def test_outside_checkout_does_not_inspect_the_copies_root(self) -> None:
         copies = self.base / "unrelated-copies"
         resolve = Path.resolve

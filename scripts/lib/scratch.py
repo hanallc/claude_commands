@@ -83,7 +83,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -928,6 +928,35 @@ def registered_copy_paths() -> Iterator[Path]:
     yield from sorted(paths)
 
 
+class UnregisteredBorrowCandidate(Enum):
+    POSSIBLE_BORROWER = "possible borrower"
+    WORKTREE_SUBFOLDER = "worktree subfolder"
+
+
+def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
+    """Check the pair and candidate for Git entries without reading their targets."""
+    pair = path.parent
+    if pair.parent != copy_record.copies_root():
+        return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as descriptors:
+        pair_fd = os.open(pair, flags)
+        _ = descriptors.callback(os.close, pair_fd)
+        candidate_fd = os.open(path.name, flags, dir_fd=pair_fd)
+        _ = descriptors.callback(os.close, candidate_fd)
+        try:
+            _ = os.stat(".git", dir_fd=pair_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+        for name in (".git", "HEAD", "objects", "commondir"):
+            try:
+                _ = os.stat(name, dir_fd=candidate_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            return UnregisteredBorrowCandidate.POSSIBLE_BORROWER
+    return UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER
+
+
 def record_lifetime(path: Path, now: float, ending_task: str = "", *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Live | Ended | Unknown:
@@ -945,12 +974,19 @@ def record_lifetime(path: Path, now: float, ending_task: str = "", *,
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
         for child in registered_copy_paths():
-            if child.resolve() == path.resolve():
+            try:
+                mode = child.lstat().st_mode
+            except FileNotFoundError:
                 continue
-            if not child.exists():
+            if stat.S_ISLNK(mode):
+                protection = Unknown(f"{child}: cannot check borrowed objects through a link")
+                break
+            if child.resolve() == path.resolve():
                 continue
             other = task_of(child, scratch_settings=scratch_settings)
             if isinstance(other, copy_record.NotRegistered):
+                if _unregistered_borrow_candidate(child) is UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER:
+                    continue
                 protection = Unknown(f"repair record {child / copy_record.RECORD}: cannot rule out borrowed objects")
                 break
             if isinstance(other, copy_record.UnreadableRecord):
