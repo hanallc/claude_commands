@@ -1271,6 +1271,7 @@ class ClientArguments(argparse.Namespace):
     episode: str = ""
     attempt: str = ""
     repo_root: str = ""
+    cargo_folder: Path | None = None
     package: str = ""
     kind: str = ""
     source_key: str = ""
@@ -1351,6 +1352,12 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             return step_request(step_argv, os.getcwd(), wire.Owner(args.pid, start), args.since,
                                 args.sidecar, episode, run=parse_run_identity(args.run))
 
+        cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
+        if args.cargo_folder is not None:
+            if not args.cargo_folder.is_absolute():
+                raise CheckerFailure("the Cargo folder must be an absolute path")
+            cargo_folder = placement.CargoFolder(args.cargo_folder.resolve())
+
         local = refresh_local()
         session = OwningSession(args.session_id) if args.session_id else NoOwningSession()
         # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
@@ -1370,6 +1377,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             placement.SourceKeyKnown(args.source_key) if args.source_key else placement.SourceKeyUnavailable("source key is unavailable"),
             routing, selection,
             writes_tree=args.writes_tree)
+        constraints = replace(constraints, cargo_folder=cargo_folder)
         if args.mac_only and not args.writes_tree:
             constraints = replace(constraints, selection=placement.MacOnlyHost())
         prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())
@@ -1469,6 +1477,7 @@ def main(argv: list[str] | None = None) -> int:
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
         _ = placement_parser.add_argument("--" + name, default="")
+    _ = placement_parser.add_argument("--cargo-folder", type=Path)
     _ = placement_parser.add_argument("--pid", type=int, default=os.getppid())
     _ = placement_parser.add_argument("--since", type=float, required=True)
     _ = placement_parser.add_argument("--call-started", type=float, default=0.0)

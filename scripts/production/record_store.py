@@ -292,7 +292,7 @@ def store_owners(kind: RecordKind, members: staff.StaffSnapshot | None = None, *
 
 def local_document(row: staff.StaffRow | None) -> Path | None:
     """Identify the production document on this machine, if present."""
-    doc = row.doc if row is not None and row.kind in ("showrunner", "producer") else None
+    doc = row.doc if row is not None and row.kind == "showrunner" else None
     return doc.path if isinstance(doc, (staff.LiveDoc, staff.WrappedDoc)) and doc.machine == local_machine() else None
 
 

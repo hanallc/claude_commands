@@ -119,7 +119,7 @@ class ConfigRead:
     settings: dict[str, Setting] | _UnreadableFile
     repository_allowed: bool
 
-    def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool
+    def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool, recover_invalid: bool = True
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
         repository_allowed = False
@@ -133,6 +133,8 @@ class ConfigRead:
         except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
             repository_allowed = repository_allowed or isinstance(error, _MissingKey)
             reason = f"{self.source}: {key}={bad!r}: {error}"
+        if not recover_invalid and not repository_allowed:
+            return UnavailableValue(reason)
         if repository_allowed and self.repository_allowed and isinstance(self.file, str):
             repository = _repository_path(self.file)
             if repository != self.source:
@@ -158,14 +160,19 @@ class ConfigRead:
         """Distinguish live values from recovered values without a warning."""
         return self._resolve(key, convert, warn=False)
 
-    def _value(self, key: str, convert: Callable[[str], Result]) -> Result:
-        result = self._resolve(key, convert, warn=True)
+    def _value(self, key: str, convert: Callable[[str], Result], *, recover_invalid: bool = True) -> Result:
+        result = self._resolve(key, convert, warn=True, recover_invalid=recover_invalid)
         if isinstance(result, UnavailableValue):
-            raise Unusable(f"{result.reason}; no usable committed value")
+            raise Unusable(f"{result.reason}; no usable committed value" if recover_invalid else result.reason)
         return result.value
 
-    def text(self, key: str) -> str:
-        return self._value(key, str)
+    def text(self, key: str, *, recover_invalid: bool = True) -> str:
+        """Read text and allow defaults for missing values."""
+        return self._value(key, str, recover_invalid=recover_invalid)
+
+    def effective_key(self, key: str) -> str:
+        """Return the host override key when the live file has one."""
+        return _effective_key(self.settings, key) if isinstance(self.settings, dict) else key
 
     def number(self, key: str) -> float:
         return self._value(key, _number)
@@ -176,20 +183,23 @@ class ConfigRead:
     def words(self, key: str) -> tuple[str, ...]:
         return self._value(key, lambda value: tuple(value.split()))
 
-    def values(self, *, host_only_prefix: str = "") -> dict[str, str]:
-        """Return the values. Include host-only base keys with the given prefix."""
+    def values(self, *keys: str, host_only_prefix: str = "") -> dict[str, str]:
+        """Return all values when no keys are given. Add base keys for host overrides that match the prefix."""
         settings = self.settings
         if isinstance(settings, _UnreadableFile):
             settings = self._recover_file(settings)
-        keys = dict.fromkeys(settings)
+        selected = dict.fromkeys(keys or settings)
         if host_only_prefix:
             suffix = f".{_local_host_name()}"
             for key in settings:
                 if key.startswith(host_only_prefix) and key.endswith(suffix):
-                    keys[key.removesuffix(suffix)] = None
+                    selected[key.removesuffix(suffix)] = None
         result: dict[str, str] = {}
-        for key in keys:
-            setting = _setting(settings, key)
+        for key in selected:
+            try:
+                setting = _setting(settings, key)
+            except _MissingKey:
+                continue
             if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
                 result[key] = setting.value
                 continue
@@ -273,11 +283,16 @@ def _local_host_name() -> str:
     return socket.gethostname().partition(".")[0]
 
 
+def _effective_key(settings: dict[str, Setting], key: str) -> str:
+    candidate = f"{key}.{_local_host_name()}"
+    return candidate if candidate in settings else key
+
+
 def _setting(settings: dict[str, Setting], key: str) -> Setting:
-    for candidate in (f"{key}.{_local_host_name()}", key):
-        if candidate in settings:
-            return settings[candidate]
-    raise _MissingKey("key is missing")
+    try:
+        return settings[_effective_key(settings, key)]
+    except KeyError:
+        raise _MissingKey("key is missing") from None
 
 
 def _limits(setting: Setting) -> None:

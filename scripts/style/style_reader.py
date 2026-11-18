@@ -1,4 +1,4 @@
-"""Build the local reader on use and read tree inventories and blob names."""
+"""Check the installed cargo-style and read tree inventories and blob names."""
 
 from __future__ import annotations
 
@@ -8,34 +8,27 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-import fcntl
+from functools import cache
 import json
 import os
 from pathlib import Path
-import platform
+import re
 import shutil
 import subprocess
 import tempfile
-import time
+from threading import Lock
 from typing import TYPE_CHECKING, BinaryIO, Literal, cast
-from uuid import uuid4
 import zlib
 
-from scripts.lib import time_limit
 from scripts.style import style_config
-from scripts.style.git_process import GitReadFailed, TreeEntry, run_git
+from scripts.style.git_process import TreeEntry
 
 if TYPE_CHECKING:
     from scripts.style import declarations, style_footprint
 
 
-CHECKOUT = Path(__file__).resolve().parents[2]
-VERIFY_SCRIPT = Path.home() / ".claude/scripts/direct/verify.sh"
-BUILD_ARGUMENTS = ("build", "style_reader", "--release", "--attached")
-
-
 class ReaderError(RuntimeError):
-    """The reader cannot build, execute, or provide the requested facts."""
+    """The reader installation is incompatible or cannot provide the requested facts."""
 
 
 class NameWordClass(Enum):
@@ -396,98 +389,125 @@ class ReaderClient:
             raise ReaderError(f"the reader returned invalid module sites: {error}") from error
 
 
+class ReaderInstallFailure(Enum):
+    """The installed cargo-style cannot meet the client's requirements."""
+
+    MISSING_BINARY = "missing binary"
+    OLDER_VERSION = "older version"
+    DIFFERENT_PROTOCOL = "different protocol"
+    UNREADABLE_VERSION = "unreadable version"
+
+
 @dataclass(frozen=True)
-class ReaderBuildNeeded:
-    """The local installation does not match the requested reader source."""
+class UnavailableReader:
+    """The installation failure and its specific cause."""
+
+    state: ReaderInstallFailure
+    detail: str
 
 
-def _installed(folder: Path, tree: str) -> Path | ReaderBuildNeeded:
-    """Return a complete installation with the requested stamp."""
-    current = (folder / "current").resolve()
+@dataclass(frozen=True)
+class CompatibleReader:
+    """An installed binary with a checked crate version and protocol."""
+
+    binary: Path
+    version_line: str
+
+
+type CrateVersion = tuple[int, int, int]
+
+
+class ReaderSearch(Enum):
+    """Find the installed reader when no explicit binary is selected."""
+
+    PATH = "path"
+
+
+_installation_lock = Lock()
+
+
+def _reader_location() -> Path | ReaderSearch:
+    """Distinguish an explicit reader from the normal PATH search."""
+    selected = os.environ.get("STYLE_READER_BINARY")
+    return Path(selected) if selected else ReaderSearch.PATH
+
+
+def _crate_version(value: str) -> CrateVersion:
+    """Parse the major, minor and patch integers of a crate version."""
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", value)
+    if match is None:
+        raise ValueError(f"invalid crate version {value!r}")
+    return int(match[1]), int(match[2]), int(match[3])
+
+
+def _inspect_reader_installation(location: Path | ReaderSearch) -> CompatibleReader | UnavailableReader:
+    """Check the selected binary against the configured version and protocol."""
+    selected = str(location) if isinstance(location, Path) else shutil.which("cargo-style")
+    if selected is None:
+        return UnavailableReader(ReaderInstallFailure.MISSING_BINARY, "cargo-style is not on PATH")
+    binary = Path(selected)
     try:
-        if (current / "stamp").read_text(encoding="ascii").strip() == tree:
-            binary = current / "style_reader"
-            if os.access(binary, os.X_OK):
-                return binary
-    except (OSError, UnicodeError):
-        pass
-    return ReaderBuildNeeded()
+        result = subprocess.run([str(binary), "--version"], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, check=False)
+    except FileNotFoundError as error:
+        return UnavailableReader(ReaderInstallFailure.MISSING_BINARY, str(error))
+    except (OSError, UnicodeError) as error:
+        return UnavailableReader(ReaderInstallFailure.UNREADABLE_VERSION, str(error))
+    line = result.stdout.strip()
+    match = re.fullmatch(r"cargo-style (\S+) protocol ([0-9]+)", line)
+    if result.returncode or match is None:
+        detail = f"{binary} --version exited {result.returncode}: {line!r}; {result.stderr.strip()}"
+        return UnavailableReader(ReaderInstallFailure.UNREADABLE_VERSION, detail)
+    try:
+        version = _crate_version(match[1])
+    except ValueError as error:
+        return UnavailableReader(ReaderInstallFailure.UNREADABLE_VERSION, str(error))
+    protocol = style_config.reader_protocol()
+    if int(match[2]) != protocol:
+        return UnavailableReader(ReaderInstallFailure.DIFFERENT_PROTOCOL,
+                                 f"installed protocol {match[2]}; required protocol {protocol}")
+    minimum = style_config.reader_minimum_version()
+    if version < _crate_version(minimum):
+        return UnavailableReader(ReaderInstallFailure.OLDER_VERSION,
+                                 f"installed version {match[1]}; minimum version {minimum}")
+    return CompatibleReader(binary, line)
 
 
-def _source_tree() -> str:
-    """Read the source stamp from the current checkout."""
-    return run_git(("git", "-C", str(CHECKOUT), "rev-parse", "HEAD:rust/style_reader")).stdout.decode().strip()
+@cache
+def _reader_installation(location: Path | ReaderSearch) -> CompatibleReader | UnavailableReader:
+    """Retain the selected installation's success or failure for this process."""
+    return _inspect_reader_installation(location)
 
 
-@dataclass(frozen=True)
-class ReaderSourceChanged:
-    """The build finished after the checkout changed to another source tree."""
+def _require_reader(installation: CompatibleReader | UnavailableReader) -> CompatibleReader:
+    """Return the checked installation or name its failure and install command."""
+    if isinstance(installation, UnavailableReader):
+        raise ReaderError(f"cargo-style {installation.state.value}: {installation.detail}. "
+                          + "Run scripts/install-cargo-style.sh in cargo-liner.")
+    return installation
 
 
-def _build(folder: Path, tree: str) -> Path | ReaderSourceChanged:
-    limit = style_config.reader_build_limit_seconds()
-    grace = style_config.reader_build_stop_grace_seconds()
-    runner = Path(time_limit.__file__).resolve()
-    command = [str(runner.with_name("py")), str(runner), f"{limit:g}", f"{grace:g}",
-               "bash", str(VERIFY_SCRIPT), *BUILD_ARGUMENTS]
-    if platform.system() == "Darwin":
-        command.extend(("--mac", "build the local style reader"))
-    environment = {key: value for key, value in os.environ.items() if key != "CONF_DIR"}
-    # The limit runner has its own session, so the limit holds after this process ends. Files, not pipes,
-    # take the output: a process that outlives the build cannot keep this call waiting.
-    with tempfile.TemporaryFile("w+") as output, tempfile.TemporaryFile("w+") as errors:
-        started = time.monotonic()
-        returncode = subprocess.run(command, cwd=CHECKOUT, stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
-                                    env=environment, start_new_session=True, check=False).returncode
-        if returncode == time_limit.TIMED_OUT and time.monotonic() - started >= limit:
-            raise ReaderError(f"reader build passed its {limit:g} s limit (style_reader build_limit_seconds); "
-                              + "its process group was ended")
-        _ = output.seek(0)
-        _ = errors.seek(0)
-        stdout, stderr = output.read(), errors.read()
-    if _source_tree() != tree:
-        return ReaderSourceChanged()
-    if returncode:
-        raise ReaderError(f"reader build exited {returncode}: {stdout}\n{stderr}")
-    paths = [line.removeprefix("binary: ") for line in stdout.splitlines() if line.startswith("binary: ")]
-    if len(paths) != 1 or not Path(paths[0]).is_absolute():
-        raise ReaderError(f"the reader build did not return one local binary path: {stdout}")
-    with tempfile.TemporaryDirectory(prefix=".install-", dir=folder) as temporary:
-        staged = Path(temporary) / "bundle"
-        staged.mkdir()
-        _ = shutil.copy2(paths[0], staged / "style_reader")
-        _ = (staged / "stamp").write_text(tree + "\n", encoding="ascii")
-        installed = folder / f"{tree}-{uuid4().hex}"
-        _ = staged.rename(installed)
-        link = Path(temporary) / "current"
-        link.symlink_to(installed.name, target_is_directory=True)
-        os.replace(link, folder / "current")
-    return installed / "style_reader"
+def reset_reader_cache() -> None:
+    """Clear the process installation check for tests with a different environment."""
+    with _installation_lock:
+        _reader_installation.cache_clear()
 
 
 def reader_binary() -> Path:
-    """Resolve the source stamp and install one matching binary under the build lock."""
-    if binary := os.environ.get("STYLE_READER_BINARY"):
-        return Path(binary)
-    try:
-        tree = _source_tree()
-        folder = style_config.reader_install_folder()
-        installed = _installed(folder, tree)
-        if isinstance(installed, Path):
-            return installed
-        folder.mkdir(parents=True, exist_ok=True)
-        with (folder / "build.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            while True:
-                tree = _source_tree()
-                installed = _installed(folder, tree)
-                if isinstance(installed, Path):
-                    return installed
-                built = _build(folder, tree)
-                if isinstance(built, Path):
-                    return built
-    except (OSError, UnicodeError, GitReadFailed) as error:
-        raise ReaderError(f"cannot resolve the local reader: {error}") from error
+    """Resolve the compatible installed cargo-style without building it."""
+    with _installation_lock:
+        return _require_reader(_reader_installation(_reader_location())).binary
+
+
+def reader_version_line() -> str:
+    """Read the version line from the same installation check as reader_binary."""
+    with _installation_lock:
+        return _require_reader(_reader_installation(_reader_location())).version_line
+
+
+def observe_reader_version_line() -> str:
+    """Check the live installation without changing the cached execution prerequisite."""
+    return _require_reader(_inspect_reader_installation(_reader_location())).version_line
 
 
 class ReaderSelection(Enum):
