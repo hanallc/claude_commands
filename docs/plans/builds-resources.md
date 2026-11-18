@@ -2892,3 +2892,15 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `f194deaf1`; row `039bb9706` stacked on the Phase 155 row `76a31d93a`.
 
 **Files:** `scripts/aws_target/aws_page.py`, `scripts/aws_target/aws_prices.html`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_run_cost.py`.
+
+### Phase 157 — The AWS page and the AWS report survive a run kind they do not know  · status: done
+
+**Cause:** On 11-17, 38 gate launches recorded the mode `test-affected` (a job name) instead of `merge-gate`. The 11-17 bill arrived at 14:29 EST on 11-18. `run_cost.billed_allocations` divides a day's bill by the box time of the known kinds only (`KINDS`). For c7a.4xlarge in us-east-2 on 11-17 that sum is 0, so the division fails. The hourly AWS page publish fails each hour from 14:29 (`decimal.DivisionByZero`). `buildlog/aws_report.py` calls the same function.
+
+**Writer:** the natest gate-rename chain (`origin/natest-gatechain`, phase 320 `cf4ac06c4`) renames the stored names: merge-gate becomes gate, targeted-test becomes test-affected. Its gate trials wrote 93 rows with the new name into the live ledger (11-16 20:26 to 11-17 11:54 EST). After that chain merges, the ledger holds both names.
+
+**Fix:** the bill of a type, region and day splits by box time over every run of that day, whatever its mode. `run_cost` reads each row mode through one alias table: gate reads as merge-gate, test-affected as targeted-test. A mixed ledger can no longer drop or split a kind. No config change and no gate change.
+
+**Files:** `scripts/aws_target/run_cost.py`, `scripts/buildlog/test_aws_report.py`.
+
+**Proof:** a test row with an unknown-mode run on a billed day; the live page publishes at the next hourly run.
