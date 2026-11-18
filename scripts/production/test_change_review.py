@@ -1310,6 +1310,38 @@ class ReadyListTests(ProducerFixture):
     def live(self, merged: str, step: str = "restart") -> tuple[int, str, str]:
         return run("live", "--repo", str(self.repo), "--production", "top", "--merged", merged, "--step", step)
 
+    def test_add_list_ready_and_live_fill_optional_cells_in_the_pending_table(self) -> None:
+        _ = self.listing.write_text("""## To review
+
+| # | Change | Merged | Review log | How to check | Notes |
+| --- | --- | --- | --- | --- | --- |
+| C1 | Earlier change | 2026-11-13 | Earlier review | Read | Earlier note |
+""", encoding="utf-8")
+        merged = self.merge_change("Change-Review: Ready change | Read | Ready\n"
+                                   + "Change-Review: Held change | Read | Live | after restart")
+        self.promote()
+
+        with self.subTest(command="add"):
+            result = run("add", "--production", "top", "--repo", str(self.repo),
+                         "--change", "Manual change", "--check", "Read", "--see", "Manual")
+            self.assertEqual(result, (0, "C2\n", ""))
+        with self.subTest(command="list-ready"):
+            code, output, error = self.ready()
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("Ready change", output)
+        with self.subTest(command="live"):
+            code, output, error = self.live(merged)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("Held change", output)
+
+        self.assertEqual([(row["Change"], row["Review log"], row["Notes"], row[change_review.CHECK])
+                          for row in change_review.pending(self.listing)], [
+            ("Earlier change", "Earlier review", "Earlier note", "Read"),
+            ("Manual change", "", "", "Read. You see: Manual"),
+            ("Ready change", "", "", "Read. You see: Ready"),
+            ("Held change", "", "", "Read. You see: Live"),
+        ])
+
     def test_list_ready_and_live_keep_images_and_report_a_missing_image(self) -> None:
         shot = self.root / "shot.png"
         _ = shot.write_bytes(b"fixture image")
@@ -2213,6 +2245,18 @@ class ActionTest(unittest.TestCase):
         self.path = Path(directory.name) / "change-review.md"
         _ = self.path.write_text(LIST, encoding="utf-8")
         self.fresh = Path(directory.name) / "change-review" / "change-review - natedev.md"
+
+    def test_add_accepts_a_row_without_an_image_on_a_list_without_an_image_column(self) -> None:
+        _ = self.path.write_text("""## To review
+
+| # | Change | Merged |
+| --- | --- | --- |
+""", encoding="utf-8")
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path),
+                             "--change", "Manual change", "--check", "Read", "--see", "Result"), (0, "C1\n", ""))
+        row, = change_review.pending(self.path)
+        self.assertEqual(row["Change"], "Manual change")
+        self.assertNotIn(change_review.IMAGE, row)
 
     def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
         rows = change_review.append_rows(self.fresh, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION, record=staff.snapshot())

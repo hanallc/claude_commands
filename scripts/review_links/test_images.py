@@ -14,7 +14,7 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode
 
@@ -753,6 +753,75 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(len(image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])), 1)
 
+    def test_refused_resends_keep_the_first_send_result_unknown(self) -> None:
+        record = self.register()
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        write = self.status.write_slots
+
+        def fail_confirmation(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            if self.sent:
+                raise OSError('Cannot write the send confirmation.')
+            write(page, row, slots)
+
+        with patch.object(self.status, 'write_slots', side_effect=fail_confirmation):
+            with self.assertRaisesRegex(OSError, 'Cannot write the send confirmation'):
+                change_page.deliver(delivery, self.status)
+
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                self.status = change_page.DeliveryStatus(self.root)
+                change_page.recover_review_messages(self.status)
+                self.assertEqual(len(self.sent), 1)
+                with patch.object(change_page, 'send_message', side_effect=RuntimeError('owner offline')) as send:
+                    self.ask(record)
+                self.assertEqual(send.call_count, 4)
+                content = images.render(change_page.DeliveryStatus(self.root)).decode()
+                self.assertIn('The send result is unknown.', content)
+                self.assertNotIn('Not sent.', content)
+
+        self.ask(record)
+        self.assertEqual(len(self.sent), 2)
+        self.assertNotIn('The send result is unknown.', images.render(self.status).decode())
+        questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
+        self.assertEqual([question.question_id for question in questions], ['Q1'])
+
+    def test_a_saved_question_without_a_send_intent_shows_the_resend_notice(self) -> None:
+        record = self.register()
+        write = self.status.write_slots
+
+        def fail_intent_update(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            if isinstance(page, change_page.ReviewMessagePage) and page.saved['saved']:
+                raise OSError('Cannot update the send intent.')
+            write(page, row, slots)
+
+        with patch.object(self.status, 'write_slots', side_effect=fail_intent_update):
+            with self.assertRaisesRegex(OSError, 'Cannot update the send intent'):
+                self.ask(record)
+
+        self.status = change_page.DeliveryStatus(self.root)
+        change_page.recover_review_messages(self.status)
+        self.assertEqual(self.sent, [])
+        notice = 'Not sent. Press Ask question again with the same words.'
+        self.assertIn(notice, images.render(self.status).decode())
+        self.ask(record)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('--question Q1', self.sent[0][2])
+        self.assertNotIn(notice, images.render(self.status).decode())
+
+    def test_malformed_question_delivery_metadata_renders_without_a_resend_notice(self) -> None:
+        record = self.register()
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        change_page.deliver(delivery, self.status)
+        path = self.status.path(delivery.page, delivery.row)
+
+        for saved in (None, {'source': str(delivery.page.review_list)}):
+            with self.subTest(saved=saved):
+                _ = path.write_text(json.dumps({'review_message': saved}))
+                content = images.render(self.status).decode()
+                self.assertIn('Question Q1 — waiting for an answer', content)
+                self.assertNotIn('Not sent.', content)
+                self.assertNotIn('The send result is unknown.', content)
+
     def test_a_failed_send_mark_sync_allows_only_a_user_resend(self) -> None:
         record = self.register()
         words = 'Which check passed?'
@@ -917,17 +986,21 @@ class ImageQuestionTests(ImagesFixture):
     def test_timed_refresh_keeps_focus_and_selection_on_another_image(self) -> None:
         _ = self.register('Feedback fixture')
         probe = r'''
-async (find, until, check) => {
+async (find, whenPageShows, check, controlRefresh) => {
+ const tickRefresh = controlRefresh();
  const question = find('Question fixture').querySelector('form');
  question.elements.feedback.value = 'Is this ready?';
  question.requestSubmit(question.querySelector('button[value="question"]'));
- await until(() => document.querySelector('[data-question]'));
+ await whenPageShows('the saved question', () => document.querySelector('[data-question]'));
  const draft = () => find('Feedback fixture').querySelector('textarea');
  const old = draft();
  old.value = 'Keep editing this draft';
  old.focus();
  old.setSelectionRange(2, 9, 'backward');
- await until(() => !old.isConnected);
+ await Promise.all([
+  whenPageShows('the replacement draft field', () => !old.isConnected),
+  tickRefresh()
+ ]);
  const fresh = draft();
  check(document.activeElement === fresh, 'The timed refresh keeps focus on the other card.');
  check(fresh.value === 'Keep editing this draft', 'The timed refresh keeps the draft.');
@@ -935,9 +1008,15 @@ async (find, until, check) => {
        'The timed refresh keeps the selection and its direction.');
  fresh.setSelectionRange(4, 4);
  document.dispatchEvent(new Event('visibilitychange'));
- await until(() => !fresh.isConnected);
+ await whenPageShows('the visibility refresh', () => !fresh.isConnected);
  check(document.activeElement === draft() && draft().selectionStart === 4 && draft().selectionEnd === 4,
        'The visibility refresh keeps the caret.');
+ // The visibility refresh still has to present its result on two render frames.
+ const visible = draft();
+ await Promise.all([
+  whenPageShows('a timed refresh after the active visibility refresh', () => !visible.isConnected),
+  tickRefresh()
+ ]);
  check((await fetch('/fixture-delivery', {method: 'POST'})).ok, 'The fixture completes delivery.');
 }'''
         _ = self.run_question_browser(self.question_probe(probe))
@@ -945,7 +1024,7 @@ async (find, until, check) => {
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
     def test_a_sent_question_stops_refresh_and_does_not_send_again_after_the_result_write_fails(self) -> None:
         probe = r'''
-async (find, until, check) => {
+async (find, whenPageShows, check) => {
  const form = () => find('Question fixture').querySelector('form');
  const ask = () => {
   form().elements.feedback.value = 'Is this ready?';
@@ -953,12 +1032,12 @@ async (find, until, check) => {
  };
  const notice = () => document.querySelector('[data-question="Q1"] [role="status"]')?.textContent;
  ask();
- await until(() => notice() === 'Question saved. Sending to the owner.', 'the sending notice');
+ await whenPageShows('the sending notice', () => notice() === 'Question saved. Sending to the owner.');
  check((await fetch('/fixture-delivery', {method: 'POST'})).ok, 'The fixture interrupts the result write.');
- await until(() => document.querySelector('[data-images]').dataset.refreshSeconds === '0', 'that polling stopped');
+ await whenPageShows('the stopped refresh timer', () => document.querySelector('[data-images]').dataset.refreshSeconds === '0');
  check(!notice(), 'The sent question has no delivery notice.');
  ask();
- await until(() => form().elements.feedback.value === '', 'that the second submission cleared the draft');
+ await whenPageShows('the cleared draft after resubmission', () => form().elements.feedback.value === '');
  check(document.querySelectorAll('[data-question]').length === 1, 'The retry preserves the question ID.');
 }'''
         requests = self.run_question_browser(self.question_probe(probe), fail_result_write=True)
@@ -968,14 +1047,18 @@ async (find, until, check) => {
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser questions')
     def test_successful_question_retries_the_first_failed_refresh(self) -> None:
         probe = r'''
-async (find, until, check) => {
+async (find, whenPageShows, check, controlRefresh) => {
+ const tickRefresh = controlRefresh();
  const form = () => find('Question fixture').querySelector('form');
  const status = () => form().querySelector('[data-image-status]').textContent;
  form().elements.feedback.value = 'Is this ready?';
  form().requestSubmit(form().querySelector('button[value="question"]'));
- await until(() => status().startsWith('Update failed:'), 'the first refresh error');
+ await whenPageShows('the first refresh error', () => status().startsWith('Update failed:'));
  check(!document.querySelector('[data-question]'), 'The first refresh fails before the question appears.');
- await until(() => document.querySelector('[data-question]')?.textContent.includes('Is this ready?'), 'the saved question');
+ await Promise.all([
+  whenPageShows('the saved question', () => document.querySelector('[data-question]')?.textContent.includes('Is this ready?')),
+  tickRefresh()
+ ]);
  check(status() === '', 'The automatic refresh clears the refresh error.');
  check(form().elements.feedback.value === '', 'The saved draft stays clear.');
  check((await fetch('/fixture-delivery', {method: 'POST'})).ok, 'The fixture completes delivery.');
@@ -990,15 +1073,74 @@ async (find, until, check) => {
  const check = (ok, message) => {if (!ok) failures.push(message);};
  const find = caption => [...document.querySelectorAll('[data-image]')]
   .find(card => card.querySelector('.caption').textContent === caption);
- const until = async (predicate, state = 'the expected state') => {
-  const deadline = performance.now() + 12000;
-  while (performance.now() < deadline) {
-   if (predicate()) return;
-   await new Promise(resolve => setTimeout(resolve, 30));
+ const browserNow = performance.now.bind(performance);
+ const waitLimit = 12000;
+ const whenPageShows = (name, predicate) => new Promise((resolve, reject) => {
+  const observer = new MutationObserver(read);
+  const timeout = setTimeout(() => {
+   observer.disconnect();
+   reject(new Error('The page did not show ' + name + '.'));
+  }, waitLimit);
+  function stop() {
+   observer.disconnect();
+   clearTimeout(timeout);
   }
-  throw new Error('The page did not show ' + state + '.');
+  function read() {
+   try {
+    if (!predicate()) return;
+    stop();
+    resolve();
+   } catch (error) {
+    stop();
+    reject(error);
+   }
+  }
+  observer.observe(document.body, {attributes: true, childList: true, characterData: true, subtree: true});
+  read();
+ });
+ const controlRefresh = () => {
+  // Capture only the image refresh timer. Leave the page status clock active.
+  const period = Number(document.querySelector('[data-images]').dataset.deliveryRefreshSeconds) * 1000;
+  const startInterval = window.setInterval.bind(window);
+  const stopInterval = window.clearInterval.bind(window);
+  let nextId = 0, elapsed = 0, timer = null;
+  performance.now = () => browserNow() + elapsed;
+  window.setInterval = (run, delay) => {
+   if (delay !== period) return startInterval(run, delay);
+   timer = {id: --nextId, run};
+   return timer.id;
+  };
+  window.clearInterval = id => {
+   if (timer?.id === id) timer = null;
+   else stopInterval(id);
+  };
+  function startRefresh() {
+   if (!timer) throw new Error('The page did not schedule a refresh.');
+   const fetchFromPage = window.fetch;
+   let started = false;
+   window.fetch = (url, options) => {
+    if (url === location.pathname && options?.cache === 'no-store') started = true;
+    return fetchFromPage.call(window, url, options);
+   };
+   try {
+    elapsed += period;
+    timer.run();
+   } finally {
+    window.fetch = fetchFromPage;
+   }
+   return started;
+  }
+  return async () => {
+   // An active refresh can skip a tick until it presents its result.
+   const deadline = browserNow() + waitLimit;
+   while (browserNow() < deadline) {
+    if (startRefresh()) return;
+    await new Promise(resolve => requestAnimationFrame(resolve));
+   }
+   throw new Error('The scheduled refresh did not start.');
+  };
  };
- try {await (CHECK_PAGE)(find, until, check);}
+ try {await (CHECK_PAGE)(find, whenPageShows, check, controlRefresh);}
  catch (error) {failures.push(String(error));}
  await fetch('/results', {method: 'POST', body: JSON.stringify(failures)});
 })();'''.replace('CHECK_PAGE', check_page)
@@ -1027,9 +1169,11 @@ async (find, until, check) => {
             fixture.capture(recipient, sender, message)
 
         class Probe(BaseHTTPRequestHandler):
+            timeout: ClassVar[float | None] = 5
+
             def do_GET(self) -> None:
                 if self.path == '/complete':
-                    _ = complete.wait(20)
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
                     self.send_response(204)
                     self.end_headers()
                     return
@@ -1083,7 +1227,7 @@ async (find, until, check) => {
                     self.wfile.flush()
                 finally:
                     if is_first_delivery:
-                        if first_delivery_released.wait(15):
+                        if first_delivery_released.wait(TEST_HANG_GUARD_SECS):
                             if fail_result_write:
                                 with patch.object(delivery_status, 'record_result_locked',
                                                   side_effect=OSError('Cannot write the delivery result.')):
@@ -1104,6 +1248,8 @@ async (find, until, check) => {
                 pass
 
         with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+            # Join the handlers before the fixture folder is deleted.
+            server.daemon_threads = False
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -1111,9 +1257,10 @@ async (find, until, check) => {
                 profile.mkdir()
                 done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--window-size', '1200,900', '--screenshot', str(self.temporary/'question-browser.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=30)
+                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=60)
                 self.assertEqual(done.returncode, 0, done.stderr)
             finally:
+                complete.set()
                 first_delivery_released.set()
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)

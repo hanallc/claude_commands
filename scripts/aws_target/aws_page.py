@@ -1,5 +1,9 @@
 """Publish the AWS page: the spend totals and the spot_table tables as data for the admin console."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 import json
@@ -7,10 +11,11 @@ import os
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from html import escape
 from pathlib import Path
 from typing import TypedDict
 
-from scripts.aws_target import config as aws_config, spend as aws_spend, spot_table
+from scripts.aws_target import config as aws_config, console_help, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -161,6 +166,19 @@ def output_folder() -> Path:
     return Path(os.path.expandvars(conf.read('aws_page').text('output_folder'))).expanduser()
 
 
+def quota_help() -> str:
+    """Render the shared instructions with links to AWS settings and the case list."""
+    steps: list[str] = []
+    for step in console_help.QUOTA_CASE_STEPS:
+        text = escape(step)
+        for url in (console_help.SETTINGS_URL, console_help.CASE_LIST_URL):
+            link = escape(url)
+            text = text.replace(link, f'<a href="{link}">{link}</a>')
+        steps.append(f'<li>{text}</li>')
+    notes = ''.join(f'\n<p>{escape(note)}</p>' for note in (console_help.WRONG_ACCOUNT, console_help.PASSKEY_NOTE))
+    return '<ol>' + ''.join(steps) + '</ol>' + notes
+
+
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
     started = time.perf_counter()
@@ -173,6 +191,7 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     # A '</' in a cell must not end the script element.
     data['render_seconds'] = time.perf_counter() - started
     page = (page_frame.template(source, 'AWS', 'aws')
+            .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/')))
     page_path = folder / PAGE_NAME
     folder.mkdir(parents=True, exist_ok=True)
