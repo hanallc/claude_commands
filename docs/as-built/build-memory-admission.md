@@ -201,14 +201,17 @@ The first routed probe sends `TokenRequired(TokenReadinessUnchecked)` to let a f
 A repeat request for that episode sends `TokenNotRequired`.
 A request with `--local` starts with `TokenNotRequired`.
 A local grant starts the step without a unit board token.
-The placement request includes the resolved Cargo build folder for the local candidate.
-Verify refuses local-capable placement when Cargo cannot resolve the folder.
+The placement request includes the resolved Cargo build folder even when the caller pins a target.
+Verify refuses placement when Cargo cannot resolve the folder.
 The queue checks that folder together with memory before a local grant.
 Verify sets `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the paths it resolved for the local grant.
 On Linux, a local placement grant names the build scope through its sidecar.
 The scope publishes that path before Cargo starts.
 The step supervisor stops the scope if the verify caller or step shell exits.
-On normal completion, the supervisor waits for the scope to empty before verify releases the grant.
+Verify closes the launch before it releases or cancels the grant.
+The supervisor holds the launch lock until the scope is empty.
+If shutdown fails, verify reports the error and keeps the reservation for the service to reclaim.
+After a local build, verify reports the binary from the pinned target folder.
 Remote candidates use their target slots.
 An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 

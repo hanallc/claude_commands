@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.direct.verify_scope_test_support import write_test_scope_launcher
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
 
@@ -227,6 +228,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         (claude / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
         bin_directory = self.root / "bin"
         bin_directory.mkdir()
+        write_test_scope_launcher(bin_directory)
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.config = self.root / "lint.conf"
@@ -250,7 +252,7 @@ def main():
 if __name__ == "__main__":
     main()
 ''')
-        for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
+        for name in ("ssh", "rsync", "scp", "gh"):
             self.write_shell(bin_directory / name, "exit 99\n")
         write_unconfigured_berth(bin_directory)
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
@@ -318,7 +320,6 @@ if __name__ == "__main__":
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_OFF": "1",
-            "BUILDLOG_SCOPE": "0",
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
@@ -425,7 +426,7 @@ raise SystemExit(128 + signal if signal else result.returncode)
         hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
             "bash", "python3", "awk", "cat", "cmp", "cut", "date", "dirname", "env", "grep",
-            "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
+            "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep", "flock",
             "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):
             executable = shutil.which(name)

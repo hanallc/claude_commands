@@ -1,6 +1,7 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
+from scripts.direct.verify_scope_test_support import write_test_scope_launcher
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import placement
 from scripts.lib.berth_test_support import write_unconfigured_berth
@@ -142,13 +143,14 @@ class VerifyDocFixture(unittest.TestCase):
         _ = write_config_fixture(self.config, "doc=on\nsweep=off\n")
         tools = self.root / "bin"
         tools.mkdir()
+        write_test_scope_launcher(tools)
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", '#!/bin/sh\nprintf "rustc fixture\\n"\n')
         targets = tools / "build-targets.py"
         self.executable(targets, f'import runpy\nrunpy.run_path({str(SCRIPTS / "build_targets/build_targets.py")!r}, run_name="__main__")\n')
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
+        for name in ("ssh", "rsync", "scp", "gh"):
             self.executable(tools / name, "#!/bin/sh\nexit 99\n")
         write_unconfigured_berth(tools)
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
@@ -189,7 +191,7 @@ class VerifyDocFixture(unittest.TestCase):
             "XDG_CACHE_HOME": str(self.root / "cache"), "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "CARGO_HOME": str(self.root / "cargo-home"), "CARGO_TARGET_DIR": str(self.root / "target"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
-            "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
+            "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1",
             **memory_environment,
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),

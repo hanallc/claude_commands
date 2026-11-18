@@ -60,7 +60,7 @@ settings.mac=mac_test.conf
         _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n",
                                  template="mac_test")
 
-    def test_first_step_passes_the_build_folder_only_for_local_placement(self) -> None:
+    def test_first_step_passes_the_build_folder_even_with_a_remote_pin(self) -> None:
         output = self.root / "cargo build output"
         output.mkdir()
         alias = self.root / "build alias"
@@ -78,11 +78,9 @@ settings.mac=mac_test.conf
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 request = cast(list[str], json.loads(request_file.read_text()))
                 self.assertEqual(request[0], "place-step")
-                if target == "natedev":
-                    folder_arg = request.index("--cargo-folder")
-                    self.assertEqual(request[folder_arg + 1], str(output.resolve()))
-                else:
-                    self.assertNotIn("--cargo-folder", request)
+                self.assertIn("--cargo-folder", request)
+                folder_arg = request.index("--cargo-folder")
+                self.assertEqual(request[folder_arg + 1], str(output.resolve()))
                 self.assertFalse((self.root / "cargo-calls").exists())
 
     def prepare_lint_request(self) -> dict[str, str]:
@@ -218,6 +216,7 @@ BUILDLOG_MEM_ADMIT_SCRIPT=admission
 BUILDLOG_MEM_WAIT_SINCE=200
 PLACEMENT_SINCE=100
 PLACEMENT_CARGO_FOLDER=$PWD
+PLACEMENT_CARGO_TARGET=$PWD
 PLACEMENT_EPISODE=parent-episode
 placements=0
 route_compiling_step() {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.direct.verify_scope_test_support import write_test_scope_launcher
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
@@ -82,6 +83,8 @@ def stub_build_tool_path(directory: Path) -> str:
         if not target.exists():
             _ = target.write_text('#!/bin/sh\necho "Unexpected build tool: $0" >&2\nexit 99\n')
             target.chmod(0o755)
+    if not (directory / "systemd-run").exists():
+        write_test_scope_launcher(directory)
     return str(directory)
 
 
@@ -1125,7 +1128,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.write_executable(self.runner, RUNNER_STUB)
         self.write_executable(self.root / "free-now.py", FREE_NOW_STUB)
         blocker = "#!/bin/sh\nexit 99\n"
-        for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
+        for name in ("ssh", "rsync", "scp", "gh"):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
@@ -1228,7 +1231,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_OFF": "1",
-            "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),

@@ -874,15 +874,19 @@ run_step() {
         started="$(date '+%Y-%m-%d %H:%M:%S %z')"
         monitor=0
         [[ $- != *m* ]] || monitor=1
+        if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] && verify_uses_build_scope; then
+            PLACEMENT_SCOPE_STATE=$(mktemp "$HOLD_WAIT_DIR/scope-release.XXXXXX") || return 125
+        fi
         set -m
         (
             set +m
             if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
                 export CARGO_TARGET_DIR="$PLACEMENT_CARGO_TARGET"
                 export CARGO_BUILD_BUILD_DIR="$PLACEMENT_CARGO_FOLDER"
-                if [[ -n "${BUILDLOG_PEAK:-}" && "${OSTYPE:-}" == linux* ]]; then
+                if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then
                     local step_leader=$BASHPID
                     buildlog_exec() { run_placed_scope "$step_leader" "$@"; }
+                    buildlog_finish_memory() { finish_placed_scope "$@"; }
                 fi
             fi
             if (
@@ -897,6 +901,7 @@ run_step() {
             fi
         ) &
         RUN_STEP_PID=$!
+        BUILDLOG_PLACEMENT_PREPARED=0
         if [[ "$monitor" == 0 ]]; then set +m; fi
         # The Mac copy watcher (copy_watch.py) reads the step's group and log here.
         if [[ -n "${VERIFY_STEP_INFO_FILE:-}" ]]; then
@@ -910,6 +915,7 @@ run_step() {
         fi
         RUN_STEP_PID=""
         if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
+        if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then settle_placed_scope || status=125; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
@@ -1891,11 +1897,7 @@ cancel_tree_run() {
         collect_child "$runner_pid" TERM
         MAC_RUNNER_PID=""
     fi
-    if [[ -n "${RUN_STEP_PID:-}" ]]; then
-        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" KILL 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
-        wait "$RUN_STEP_PID" 2>/dev/null || true
-        RUN_STEP_PID=""
-    fi
+    stop_run_step KILL
     exec 9>&-
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
@@ -2468,7 +2470,7 @@ route_compiling_step() {
         exit "$request_status"
     fi
     buildlog_begin "$@" || true
-    if [[ "${OSTYPE:-}" == linux* && "${BUILDLOG_SCOPE:-1}" != 0 && -z "$BUILDLOG_PEAK" ]]; then
+    if [[ -z "$BUILDLOG_PEAK" ]] && verify_uses_build_scope; then
         BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
     fi
     BUILDLOG_PLACEMENT_PREPARED=1
@@ -2608,6 +2610,7 @@ PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
 PLACEMENT_OUTCOME=""
+PLACEMENT_SCOPE_STATE=""
 MAC_BACKOFF_PROBED=0
 
 apply_placement_outcome() {
@@ -2661,10 +2664,19 @@ place_compiling_step() {
         route_compiling_step "$@" || return $?
         [[ "$STEP_RAN_ON_MAC" == 0 && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] || return 0
     fi
+    if [[ -z "${PLACEMENT_CARGO_FOLDER:-}" || -z "${PLACEMENT_CARGO_TARGET:-}" ]]; then
+        build_check_stop 2 'the local placement has no Cargo output paths'
+        return 2
+    fi
+    if [[ "$CMD" == build ]]; then BUILD_TARGET_DIR=$PLACEMENT_CARGO_TARGET; fi
     if [[ "$CMD" == test && "${LOCAL_ONLY:-0}" == 0 && -z "${COPY_WATCH_PID:-}" ]]; then
         start_copy_watch
     fi
     return 0
+}
+
+verify_uses_build_scope() {
+    [[ -r /proc/self/cgroup || "${OSTYPE:-}" == linux* ]]
 }
 
 run_placed_scope() {
@@ -2673,7 +2685,44 @@ run_placed_scope() {
     printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
         "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
     export BUILDLOG_RESERVED_STEP
-    "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@" 3>&2
+    "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
+        "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@"
+}
+
+finish_placed_scope() {
+    local status=$1 sampler=$2
+    if [[ -n "$sampler" ]]; then
+        kill "$sampler" 2>/dev/null || true
+        wait "$sampler" 2>/dev/null || true
+    fi
+    close_scope_launch || return 0
+    buildlog_release_memory "$status"
+    rm -f "$BUILDLOG_PEAK.cgroup" || true
+}
+
+# Serialize release with the supervisor, even if the step shell died.
+close_scope_launch() (
+    flock -x -w 35 8 || return 1
+    if [[ ! -s "$PLACEMENT_SCOPE_STATE" ]]; then
+        printf 'closed\n' > "$PLACEMENT_SCOPE_STATE"
+    else
+        [[ "$(< "$PLACEMENT_SCOPE_STATE")" == closed ]]
+    fi
+) 8<"$PLACEMENT_SCOPE_STATE"
+
+settle_placed_scope() {
+    [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]] || return 0
+    local status=0
+    if ! close_scope_launch; then
+        PLACEMENT_OUTCOME=unresolved
+        PLACEMENT_CLEANUP_ERROR="the build scope did not confirm exit; keeping the reservation"
+        local reason=""
+        if [[ -s "$PLACEMENT_SCOPE_STATE" ]]; then reason=$(< "$PLACEMENT_SCOPE_STATE"); fi
+        printf 'verify.sh: %s%s\n' "$PLACEMENT_CLEANUP_ERROR" "${reason:+ ($reason)}" >&2
+        status=125
+    fi
+    PLACEMENT_SCOPE_STATE=""
+    return "$status"
 }
 
 placement_once() {
@@ -2681,18 +2730,14 @@ placement_once() {
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "$target" && "${STEP_FORCE_MAC:-0}" != 0 ]]; then target=mac; fi
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
-        PLACEMENT_CARGO_FOLDER="" PLACEMENT_CARGO_TARGET=""
-        # Tree writes and --local take precedence over remote pins.
-        if [[ "${STEP_WRITES_TREE:-0}" == 1 || "${LOCAL_ONLY:-0}" == 1 ||
-                ( "${MAC_ONLY:-0}" == 0 && "${target:-natedev}" == natedev ) ]]; then
-            roots=$(local_cargo_build_folder "${PLACEMENT_COMMAND[@]}") || {
-                status=$?
-                placement_failed "$status"
-                return "$status"
-            }
-            PLACEMENT_CARGO_TARGET=${roots%%$'\n'*}
-            PLACEMENT_CARGO_FOLDER=${roots#*$'\n'}
-        fi
+        # The target registry can change before the client submits the request.
+        roots=$(local_cargo_build_folder "${PLACEMENT_COMMAND[@]}") || {
+            status=$?
+            placement_failed "$status"
+            return "$status"
+        }
+        PLACEMENT_CARGO_TARGET=${roots%%$'\n'*}
+        PLACEMENT_CARGO_FOLDER=${roots#*$'\n'}
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
         PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER}"
         PLACEMENT_OWNER_PID=$$
@@ -2721,9 +2766,8 @@ placement_once() {
         --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$prerequisite"
-        --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
-    # This folder constrains the local candidate only. Remote candidates use their slots.
-    [[ -z "${PLACEMENT_CARGO_FOLDER:-}" ]] || placement_args+=(--cargo-folder "$PLACEMENT_CARGO_FOLDER")
+        --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE"
+        --cargo-folder "$PLACEMENT_CARGO_FOLDER")
     [[ -z "${BUILDLOG_RUN:-}" ]] || placement_args+=(--run "$BUILDLOG_RUN")
     [[ -z "$target" ]] || placement_args+=(--target "$target")
     [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
@@ -3420,10 +3464,23 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     fi
 fi
 
+stop_run_step() {
+    if [[ -n "${RUN_STEP_PID:-}" ]]; then
+        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
+        wait "$RUN_STEP_PID" 2>/dev/null || true
+        RUN_STEP_PID=""
+    fi
+}
+
 # Close progress records and release the placement when verify ends.
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
     if [[ "$EXIT_STATUS" == "$TREE_CHANGED_STATUS" ]]; then status=cancelled; fi
+    if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then stop_run_step KILL; fi
+    apply_placement_outcome
+    if ! settle_placed_scope && (( EXIT_STATUS == 0 )); then
+        EXIT_STATUS=125 code=125 status=error
+    fi
     stop_tree_watch
     [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
@@ -3442,7 +3499,6 @@ verify_cleanup() {
         interrupted) outcome=interrupted ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
-    apply_placement_outcome
     finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "${MEM_KILL_FILE}.stopped"
@@ -3488,11 +3544,7 @@ verify_interrupted() {
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
     interrupt_hold_wait
-    if [[ -n "$RUN_STEP_PID" ]]; then
-        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
-        wait "$RUN_STEP_PID" 2>/dev/null || true
-        RUN_STEP_PID=""
-    fi
+    stop_run_step "$1"
     verify_cleanup interrupted
     finish_verify_run "$EXIT_STATUS"
     stop_interrupted_run_log

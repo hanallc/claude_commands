@@ -225,7 +225,6 @@ esac
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_ZRAM": str(self.root / "zram"),
             "BUILDLOG_OFF": "1",
-            "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "hold-release"),
             "STAFF_FILE": str(self.root / "staff.json"),

@@ -1,6 +1,8 @@
 """Real verify.sh token build behavior."""
 from __future__ import annotations
 
+import json
+from typing import cast
 import unittest
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
 
@@ -19,6 +21,26 @@ class VerifyTokenBuildTests(VerifyTokenWaitFixture):
         self.assertEqual((self.root / "cargo-calls").read_text(), "build --workspace --bin sample-app\n")
         self.assertFalse((self.root / "board" / "board.log").exists())
         self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
+
+    def test_build_reports_the_pinned_target_after_a_symlink_change(self) -> None:
+        original = self.root / "target"
+        replacement = self.root / "replacement-target"
+        replacement.mkdir()
+        alias = self.root / "target-link"
+        alias.symlink_to(original, target_is_directory=True)
+        environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]}])
+        metadata = cast(dict[str, object], json.loads(environment["TEST_METADATA"]))
+        metadata["target_directory"] = str(alias)
+        environment.update(TEST_METADATA=json.dumps(metadata), CARGO_TARGET_DIR=str(alias))
+        cargo = self.root / "stubs/cargo"
+        _ = cargo.write_text(cargo.read_text().replace(
+            'profile=debug;', 'ln -sfn "$TEST_REPLACEMENT" "$TEST_ALIAS"\nprofile=debug;', 1))
+        environment.update(TEST_REPLACEMENT=str(replacement), TEST_ALIAS=str(alias))
+
+        result = self.build(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(alias.resolve(), replacement)
+        self.assertIn(f"binary: {original / 'debug/sample-app'}\n", result.stdout)
 
     def test_build_of_an_example_turns_on_its_required_features(self) -> None:
         environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]},

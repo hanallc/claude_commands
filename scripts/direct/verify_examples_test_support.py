@@ -202,7 +202,6 @@ esac
             "BUILDLOG_MEMINFO": str(meminfo),
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_OFF": "1",
-            "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),

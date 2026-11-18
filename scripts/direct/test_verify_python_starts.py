@@ -45,8 +45,10 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assertEqual(counts["step_context.py"], 0, rows)
         # The live helper serves context and folder calls without new interpreters.
         self.assertEqual(counts["build_folders.py"], 0, rows)
-        # The dev features read also runs in the helper, so no inline Python starts for it.
-        self.assertEqual(len(rows), 6, counts)
+        # Each local compile starts a scope supervisor on Linux.
+        supervised_steps = 4 if sys.platform == "linux" else 0
+        self.assertEqual(counts["verify_scoped_step.py"], supervised_steps, rows)
+        self.assertEqual(len(rows), 6 + supervised_steps, counts)
         # The per-run helper reads the dev features; no Python process of its own starts.
         calls = [line.split("\t") for line in Path(str(trace) + ".calls").read_text().splitlines()]
         in_helper = Counter(call[0] for call in calls)

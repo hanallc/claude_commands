@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import errno
+import fcntl
 import os
 from pathlib import Path
 import select
 import subprocess
 import sys
+import time
 
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -16,6 +18,9 @@ except FileNotFoundError:
     pass
 
 from scripts.build_queue.admission_records import process_start_time
+
+
+SCOPE_STOP_TIMEOUT_SECONDS = 10
 
 
 # The scope shell publishes its path before this check. A dead owner permits no start.
@@ -41,7 +46,12 @@ def open_pidfd(pid: int, cleanup: ExitStack) -> int:
 def scope_populated(events: int) -> bool:
     try:
         _ = os.lseek(events, 0, os.SEEK_SET)
-        return b"populated 1" in os.read(events, 4096).splitlines()
+        fields = os.read(events, 4096).splitlines()
+        if b"populated 1" in fields:
+            return True
+        if b"populated 0" in fields:
+            return False
+        raise ValueError("cgroup.events has no populated state")
     except OSError as error:
         if error.errno == errno.ENODEV:
             return False
@@ -57,51 +67,98 @@ def drain_scope(sidecar: Path) -> None:
         return
     try:
         if scope_populated(events):
-            try:
-                _ = subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", "--kill-whom=all",
-                                    scope.name], check=False)
-            except OSError as error:
-                print(f"verify.sh: cannot stop the build scope ({error})", file=sys.stderr)
+            result = subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", "--kill-whom=all",
+                                     scope.name], stderr=subprocess.PIPE, text=True, check=False,
+                                    timeout=SCOPE_STOP_TIMEOUT_SECONDS)
+            if result.returncode:
+                detail = result.stderr.strip() or f"systemctl exited with status {result.returncode}"
+                raise OSError(f"cannot stop scope {scope.name}: {detail}")
             ready = select.poll()
             ready.register(events, select.POLLPRI | select.POLLERR)
+            deadline = time.monotonic() + SCOPE_STOP_TIMEOUT_SECONDS
             while scope_populated(events):
-                _ = ready.poll()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"build scope {scope.name} is still populated")
+                _ = ready.poll(round(remaining * 1000))
     finally:
         os.close(events)
 
 
-def run_scoped_step(caller: int, leader: int, peak: str, scope_shell: str, command: list[str]) -> int:
-    caller_start = process_start_time(caller)
-    leader_start = process_start_time(leader)
-    if caller_start is None or leader_start is None:
-        return 125
+def copy_scope_output(descriptor: int) -> bool:
+    try:
+        data = os.read(descriptor, 65536)
+    except BlockingIOError:
+        return False
+    if not data:
+        return False
+    _ = sys.stdout.buffer.write(data)
+    _ = sys.stdout.buffer.flush()
+    return True
 
-    # Keep the launcher in the step group. The supervisor must survive a stop of that group.
+
+def watch_scope(owners: select.poll, descriptor: int) -> None:
+    _ = owners.register(descriptor, select.POLLIN)
+    while (ready := owners.poll()) and all(fd == descriptor for fd, _ in ready):
+        if not copy_scope_output(descriptor):
+            owners.unregister(descriptor)
+
+
+def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
+                    scope_shell: str, command: list[str]) -> int:
+    # The supervisor survives a stop of the step group. The launcher stays in it.
     os.setpgid(0, 0)
     unit = f"verify-step-{os.getpid()}.scope"
     sidecar = Path(peak + ".cgroup")
-    with ExitStack() as cleanup:
+    with release_state.open("r+b", buffering=0) as release, ExitStack() as cleanup:
+        fcntl.flock(release, fcntl.LOCK_EX)
+        if release.read(1):
+            return 125
+        caller_start = process_start_time(caller)
+        leader_start = process_start_time(leader)
+        if caller_start is None or leader_start is None:
+            return 125
         owners = select.poll()
         owners.register(open_pidfd(caller, cleanup), select.POLLIN)
         owners.register(open_pidfd(leader, cleanup), select.POLLIN)
         if owners.poll(0):
             return 125
-        with subprocess.Popen(
-            ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-             "--slice=builds.slice", f"--unit={unit}", "--",
-             "/bin/sh", "-c", scope_shell, peak, "/bin/sh", "-c", CHECK_SCOPE_OWNER,
-             "verify-scope-owner", str(sidecar), unit, str(caller), caller_start, str(leader), leader_start,
-             *command],
-            stderr=subprocess.DEVNULL, pass_fds=(3,), process_group=leader,
-        ) as process:
-            try:
-                owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
-                _ = owners.poll()
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                status = process.wait()
-                drain_scope(sidecar)
+        # Keep this state if the scope cannot be proved empty.
+        _ = release.write(b"scope may be populated\n")
+        try:
+            process = subprocess.Popen(
+                ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
+                 "--slice=builds.slice", f"--unit={unit}", "--",
+                 "/bin/sh", "-c", 'exec 3>&1; ' + scope_shell, peak, "/bin/sh", "-c", CHECK_SCOPE_OWNER,
+                 "verify-scope-owner", str(sidecar), unit, str(caller), caller_start, str(leader), leader_start,
+                 *command],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, process_group=leader,
+            )
+            assert process.stdout is not None
+            # The scope cannot hold verify's output stream open after a failed kill.
+            with process.stdout as output:
+                descriptor = output.fileno()
+                os.set_blocking(descriptor, False)
+                try:
+                    owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
+                    watch_scope(owners, descriptor)
+                except (ProcessLookupError, BrokenPipeError):
+                    pass
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    status = process.wait(timeout=SCOPE_STOP_TIMEOUT_SECONDS)
+                    drain_scope(sidecar)
+                    _ = release.truncate(0)
+                while copy_scope_output(descriptor):
+                    pass
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            # The step's log readers can die before the scope stops.
+            if release.seek(0, os.SEEK_END):
+                _ = release.seek(0)
+                _ = release.write(f"cannot finish the local build scope: {error}\n".encode())
+                _ = release.truncate()
+            return 125
     if not sidecar.is_file():
         print("verify.sh: the local step did not enter its build scope", file=sys.stderr)
         return 125
@@ -109,11 +166,11 @@ def run_scoped_step(caller: int, leader: int, peak: str, scope_shell: str, comma
 
 
 def main(argv: list[str]) -> int:
-    caller, leader, peak, scope_shell, *command = argv
+    caller, leader, release_state, peak, scope_shell, *command = argv
     try:
-        return run_scoped_step(int(caller), int(leader), peak, scope_shell, command)
+        return run_scoped_step(int(caller), int(leader), Path(release_state), peak, scope_shell, command)
     except (OSError, ValueError) as error:
-        print(f"verify.sh: cannot run the local step in its build scope ({error})", file=sys.stderr)
+        print(f"verify.sh: cannot finish the local build scope ({error})", file=sys.stderr)
         return 125
 
 
