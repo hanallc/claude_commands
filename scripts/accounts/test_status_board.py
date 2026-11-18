@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts, next_moves, role_map
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.whoami import agent_accounts
 
 NOW = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
@@ -58,7 +59,10 @@ def text(spans: list[accounts.BoardSpan]) -> str:
 class StatusBoardTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")})))
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(configuration / "accounts.conf", "next_move_percent=1\nusage_stale_minutes=10\n")
+        _ = write_config_fixture(configuration / "statusline.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_the_table_matches_the_plugin_columns_lines_and_totals(self) -> None:
         board = accounts.status_board(fixture())

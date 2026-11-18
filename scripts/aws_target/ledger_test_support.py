@@ -77,6 +77,14 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
     text_setting(path, "notification_recipient", "fixture-showrunner")
 
 
+def install_hana_spending_settings(path: Path) -> None:
+    """Set the private Hana prices, budget, and permit window."""
+    _ = write_config_fixture(path,
+        "enabled=on\nregion=us-east-2\ninstance_type=m7a.2xlarge\n"
+        + "spot_max_usd_per_hour=0.15\nroot_gib=40\ndata_gib=300\n"
+        + "daily_budget_usd=6\ngp3_usd_per_gib_month=0.08\npermit_max_seconds=1800\n")
+
+
 def account_reply(arguments: Sequence[str], amount: str = '0') -> dict[str, object]:
     """Return daily usage costs for the requested UTC period."""
     period = arguments[arguments.index('--time-period') + 1]

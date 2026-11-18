@@ -181,7 +181,14 @@ def board(reading: accounts.StatusReading) -> str:
                 + f'data-color-name="{name}" data-saved-color="{css}" style="background:{css}" '
                 + f'aria-label="Change {name} color" aria-haspopup="dialog"></button>')
     # A headerless swatch column follows each column whose first span can carry a configured color.
-    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
+    def heading(column: accounts.BoardColumn) -> str:
+        key = {"label": "account", "roles": "role"}.get(column["key"], column["key"])
+        if key not in ("account", "left", "role", "busy"):
+            return f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>'
+        direction = "ascending" if key == "account" else "none"
+        return (f'<th class="{column["align"]}" data-account-sort="{key}" tabindex="0" aria-sort="{direction}">'
+                + f'{html.escape(column["heading"])}<span class="sort-arrow" aria-hidden="true">▲</span></th>')
+    head = "".join(heading(column)
                    + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "")
                    + ('<th class="left">next</th>' if column["key"] == "roles" else "") for column in table["columns"])
     rows = "".join(
@@ -195,6 +202,7 @@ def board(reading: accounts.StatusReading) -> str:
     moves = "".join(f"<li>{html.escape(line)}</li>" for line in reading.upcoming_moves if line)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
     return (f'<section class="card" data-move-percent="{percent}" '
+            + f'data-sort-orders="{html.escape(json.dumps(accounts.account_board_sort_orders(reading, table)), quote=True)}" '
             + f'data-move-targets="{html.escape(json.dumps(targets), quote=True)}"><div class="scroll"><table>'
             + f"<thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>"
             + (f'<ul class="moves">{moves}</ul>' if moves else "")
@@ -244,8 +252,11 @@ table{border-collapse:collapse;font-size:.86rem;font-variant-numeric:tabular-num
 .card{width:fit-content;max-width:100%}
 th,td{padding:5px 0 5px 18px;white-space:nowrap}th:first-child,td:first-child{padding-left:0}
 th{color:var(--ink-2);font-weight:600;border-bottom:1px solid var(--line)}
+th[data-account-sort]{cursor:pointer}th[data-account-sort]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.sort-arrow{display:inline-block;width:1em;margin-left:.25em;text-align:center;visibility:hidden}
+th[aria-sort=ascending] .sort-arrow,th[aria-sort=descending] .sort-arrow{visibility:visible}
 .left{text-align:left}.right{text-align:right}
-tr.account td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
+tbody tr td{border-top:1px solid var(--line)}tbody tr:last-child td{border-top:1px solid var(--ink-3)}
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
 .inactive{color:var(--ink-3)}
@@ -398,6 +409,59 @@ let menuRow=null, menuButton=null;
 const pendingMoves=new Set();
 const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
  : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
+const sortColumns=['account','left','role','busy'], sortTables=new WeakMap();
+let chosenSort={column:'account',reverse:false};
+try{
+ const saved=JSON.parse(localStorage.getItem('accounts-sort'));
+ if(saved && sortColumns.includes(saved.column) && typeof saved.reverse==='boolean') chosenSort=saved;
+}catch{}
+function applySort(){
+ const card=view.querySelector('[data-sort-orders]');
+ if(!card) return;
+ const table=card.querySelector('table'), body=table.tBodies[0];
+ if(!sortTables.has(table)){
+  let account='';
+  sortTables.set(table,[...body.rows].slice(0,-1).map(node=>{
+   account=node.cells[1].textContent || account;
+   return {node,account};
+  }));
+ }
+ const sources=sortTables.get(table), details=new Map();
+ // Account details occupy the first four and last three cells.
+ const width=table.tHead.rows[0].cells.length;
+ const columns=[0,1,2,3,width-3,width-2,width-1];
+ for(const {node,account} of sources) if(node.cells[1].textContent){
+  details.set(account,columns.map(index=>node.cells[index].innerHTML));
+ }
+ const order=JSON.parse(card.dataset.sortOrders)[chosenSort.column+(chosenSort.reverse ? '-reverse' : '')];
+ const total=body.lastElementChild;
+ for(const place of order){
+  const {node,account}=sources[place.index];
+  columns.forEach((index,offset)=>{node.cells[index].innerHTML=place.details ? details.get(account)[offset] : '';});
+  node.classList.toggle('account',place.details);body.insertBefore(node,total);
+ }
+ for(const header of table.querySelectorAll('[data-account-sort]')){
+  const selected=header.dataset.accountSort===chosenSort.column;
+  const descending=(chosenSort.column==='busy')!==chosenSort.reverse;
+  header.setAttribute('aria-sort',selected ? descending ? 'descending' : 'ascending' : 'none');
+  header.querySelector('.sort-arrow').textContent=descending ? '▼' : '▲';
+ }
+}
+function chooseSort(column){
+ if(hold()) return;
+ chosenSort={column,reverse:chosenSort.column===column ? !chosenSort.reverse : false};
+ try{localStorage.setItem('accounts-sort',JSON.stringify(chosenSort));}catch{}
+ applySort();
+}
+document.addEventListener('click',event=>{
+ const header=event.target instanceof Element ? event.target.closest('[data-account-sort]') : null;
+ if(header) chooseSort(header.dataset.accountSort);
+});
+document.addEventListener('keydown',event=>{
+ const header=event.target instanceof Element ? event.target.closest('[data-account-sort]') : null;
+ if(header && event.key==='Enter'){event.preventDefault();chooseSort(header.dataset.accountSort);}
+});
+applySort();
 async function refresh(supersede=false,current=()=>true) {
   if (hold()) return;
   const request = ++newestRequest;
@@ -409,6 +473,7 @@ async function refresh(supersede=false,current=()=>true) {
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
   view.replaceWith(fresh);view = fresh;
+  applySort();
   scrollTo({top, behavior: 'instant'});
   return pageRefreshFacts(page);
 }

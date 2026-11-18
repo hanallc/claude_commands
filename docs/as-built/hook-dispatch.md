@@ -53,7 +53,8 @@ The user sees only "Continuing the unit run".
 The hook wakes above the threshold only when the final line differs from the last wake.
 The hook permits a stop when the final status matches `paused_status_pattern`.
 Holding and blocked prefixes alone do not prevent the wake.
-A merge unit stops without a wake when it has no live runner, active dispatch, or queued message.
+A merge unit stops without a wake when it has no worker run, active worker dispatch, background task, or queued message.
+An own detached run supplies a later completion notice and does not count as merge work.
 An open recorder phase or an old worker status file alone does not prove that the merge unit has work.
 The hook reads the staff unit type, active dispatches, live detached runs, and CLI background tasks.
 It reads queued messages for the fixed staff ID and the current session without consuming them.
