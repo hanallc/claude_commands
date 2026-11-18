@@ -99,10 +99,11 @@ Run this command in a terminal on natedev.
 deploy.py hana-setup --plan
 ```
 
-The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
-It refuses first-time Hana setup, pending instance or volume work, and direct-owned boxes.
+The plan reports whether the deployed Hana image is current or stale.
+It refuses first-time Hana setup and setup with pending instance or volume work.
+It can preview one policy update for an idle, stopped, stack-owned Hana box.
 
-The plan checks the local credential file and reads the scaler identity with STS.
+The policy preview checks the local credential file and reads the scaler identity with STS.
 It uses the same stack, instance, disk, and parameter checks as approved setup.
 It previews one modification to `ScalerPolicy` without resource replacement.
 The plan deletes the change set and confirms its removal with CloudFormation.
@@ -448,6 +449,73 @@ If that history has no match, `down` reports it and continues with any disk or b
 After a failed ordinary setup update, setup deletes resources retained during rollback and keeps the stack and record.
 Run `prepare --workload hana` again before retrying with changed inputs.
 The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
+
+### Hana image freshness
+
+`hana_render` hashes the paths, modes, and bytes of the rendered guest files.
+It adds this digest to the rendered `safety.json` that the image installs during activation.
+The digest excludes its own field.
+The renderer copies only the Hana settings used by the guest.
+
+- Safety reads `enabled`, `guard_grace_seconds`, `watchdog_check_seconds`, and `permit_max_seconds`.
+- The guest also reads `step_cpu_limit`, `step_memory_gib`, and `mount_timeout_seconds`.
+- The receiver reads `aws_timeout_s` and `control_poll_seconds`.
+- The runner reads `execution_shell` and `free_floor_gib`.
+- Source materialization reads `source_max_bytes`, `source_download_timeout_s`, `source_git_timeout_s`, and `source_allowed_environment`.
+
+The renderer writes the resolved values under plain keys.
+The renderer selects overrides by the Hana target alias in `hana_aws.conf`.
+The renderer and runner use one list of timeout keys from `build_targets.conf`.
+The digest covers the guest files that this repository renders.
+NixOS sets the slot settings, compiler version, and runner environment outside those files.
+Changes to those NixOS settings take effect when a new image uses them.
+
+The guest uses `enabled` as an independent admission switch in addition to the live permit.
+Removing the guest switch would avoid an image rebuild for this setting.
+That change would leave an already issued permit usable until the guest revokes it or it expires.
+
+`hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
+Registration requires the build derivation and the renderer output to be present in the local store.
+The registered image description and the local registration record carry the same digest.
+Setup records the digest for the instance after EC2 confirms its image identity.
+Registering another image does not refresh the digest of an existing instance.
+A missing or mismatched digest makes the deployed image stale.
+
+The queue excludes a stale Hana box before assignment.
+The controller checks the image before accepting a claim, starting the box, or granting command permission.
+A stale image detected after assignment records `HanaCommandAdmissionRefused` with `DoNotRetry`.
+The queue can place that build on another eligible target after it settles the Hana attempt.
+The build and target status report this message.
+
+> The Hana image is stale. Run deploy.py hana-setup --plan to review replacement.
+
+After it saves an effective guest setting, `tune.py` reports this message.
+
+> The Hana image is now stale. Build and register a current Hana image.
+
+### Replace a Hana image
+
+The NixOS configuration builds the guest files from its pinned `claude-commands` input.
+Use a reviewed pin that contains the current rendered guest files.
+Use the following sequence only when deletion of the Hana data disk is approved.
+
+1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
+2. Register it with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
+3. Delete the saved deployment with `scripts/aws_target/deploy.py down --workload hana --approve-destroy`.
+4. Prepare the new deployment with `scripts/aws_target/deploy.py prepare --workload hana`.
+5. Provision the new box with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
+
+The third command deletes the data disk and its data.
+Direct setup refuses changed image parameters on a saved box.
+The stack update also refuses replacement of an instance, volume, or attachment.
+
+A replacement that keeps the disk requires a separate setup procedure.
+It must hold the box idle, journal the replacement intent, and launch the replacement in the disk's zone.
+It must detach the same disk, attach it to the replacement, then verify the attachment and stopped state.
+It must persist the new lifecycle identity before it ends the old Spot request.
+Each rerun must confirm the saved intent and resume its last unfinished step.
+Stack-owned boxes also need a separate change that retains the disk and replaces the attachment.
+A combined build and registration command needs an explicit source pin and the local build evidence that registration checks.
 
 ## Ending persistent Spot boxes
 

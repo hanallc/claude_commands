@@ -218,7 +218,7 @@ class HanaGuestEndedRun(LostMacRun):
 
 @dataclass(frozen=True)
 class HanaCommandAdmissionRefused:
-    """The Hana guest refused to start the command."""
+    """The Hana admission check refused the command."""
     reason: str
     seconds: float
 
@@ -1244,11 +1244,14 @@ def write_result(
         else:
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
     elif isinstance(result, HanaCommandAdmissionRefused):
-        mac = placement.HANA_COMMAND_ADMISSION_REFUSED
+        mac = "hana_command_admission_refused"
         reason = result.reason
         status = 75
         if not isinstance(destination, ResultFile) or os.environ.get('BUILDLOG_PINNED_TARGET') != target:
-            print(f"mac_test: The Hana command did not start on {label}. {reason}")
+            from scripts.build_queue.admission_client import first_hana_image_notice
+
+            if reason != placement.HANA_IMAGE_STALE or first_hana_image_notice():
+                print(f"mac_test: The Hana command did not start on {label}. {reason}")
     elif isinstance(result, LostMacRun):
         mac = "lost"
         reason = result.detail if target else ""
@@ -2797,8 +2800,14 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         reference = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
             assignment.destination.scope, placement.assigned_claim_id(assignment.episode, assignment.attempt),
             assignment.episode, assignment.attempt)
+        refusal = placement.HanaCommandAdmissionRefused(reason) if reason == placement.HANA_IMAGE_STALE else reason
         closed = execution.settle_unpublished_claim(lifecycle.directory, reference,
-            release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=reason)
+            release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=refusal)
+        if isinstance(closed, execution.HanaAdmissionRefusalSettled):
+            evidence.provider = reference
+            evidence.execution = closed.evidence
+            controller.hana_settlement = closed
+            return HanaCommandAdmissionRefused(closed.outcome.reason, elapsed_seconds(started))
         if isinstance(closed, execution.HanaSettled):
             controller.hana_settlement = closed
             controller.pending = SettledDispatchOperations()
@@ -2851,11 +2860,18 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             evidence.unresolved_count = 0
         return DeclinedMacRun('source_changed', elapsed_seconds(started), prepared.reason)
 
+    admission_refusal: placement.HanaCommandAdmissionRefused | execution.NoCommandAdmissionRefusal = (
+        execution.NoCommandAdmissionRefusal())
+
     def permission() -> box.CommandPermission | box.ClaimRefused:
+        nonlocal admission_refusal
         snapshot = lifecycle.inspect()
         if not isinstance(snapshot, hana.HanaLifecycleEvidence) or not isinstance(snapshot.permit, box.DeliveredPermit):
             return box.ClaimRefused('The Hana acknowledged permit is unavailable')
-        return lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
+        result = lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
+        if isinstance(result, box.ClaimRefused) and result.reason == placement.HANA_IMAGE_STALE:
+            admission_refusal = placement.HanaCommandAdmissionRefused(result.reason)
+        return result
 
     def release() -> bool:
         return hana.release_assigned(assignment, holder, lifecycle)
@@ -2960,7 +2976,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             min(deadline, time.monotonic() + settlement_seconds), control_poll)
         settlement = execution.settle_execution(lifecycle.directory, prepared, objects, release_claim=release,
                                                 reason=reason, fence_window=fence_window, cancelled=cancelled,
-                                                result_transfer_lost=result_transfer_lost)
+                                                result_transfer_lost=result_transfer_lost,
+                                                admission_refusal=admission_refusal)
         evidence.evidence_at = time.time()
         if isinstance(settlement, execution.HanaAdmissionRefusalSettled):
             controller.hana_settlement = settlement

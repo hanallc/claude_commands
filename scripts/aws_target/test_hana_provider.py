@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
-from scripts.aws_target.test_hana_box import write_lifecycle_configuration
+from scripts.aws_target.test_hana_box import record_lifecycle_image, write_lifecycle_configuration
 from scripts.lib import conf
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -62,6 +62,7 @@ class FakeAws:
                 self.clock.advance(self.stop_during_instance_read_seconds)
                 self.state = 'stopped'
             value = {'Reservations': [{'Instances': [{'InstanceId': IDENTITY.instance, 'SpotInstanceRequestId': IDENTITY.spot_request,
+                'ImageId': 'fixture-image',
                 'State': {'Name': self.state}, 'LaunchTime': 'fixture-launch',
                 'Tags': [{'Key': 'HanaDeployment', 'Value': self.ownership}, {'Key': 'Workload', 'Value': 'hana'}]}]}]}
         elif operation == 'describe-spot-instance-requests':
@@ -306,6 +307,7 @@ class HanaProviderTests(CostFixture):
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
         controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         _ = controller.request('fixture-execution')
         self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
         self.fake.lose_response = 'start-instances'
@@ -334,6 +336,7 @@ class HanaProviderTests(CostFixture):
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
         controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         _ = controller.request('fixture-execution')
         self.assertEqual(controller.tick(), box.Lifecycle.STARTING)
         self.clock.advance(1)
@@ -369,6 +372,7 @@ class HanaProviderTests(CostFixture):
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture account inventory'))
         controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload)
         _ = controller.request('fixture-execution')
         self.fake.failure = 'put-object'
         self.fake.userdata = 'fixture-old-data'
