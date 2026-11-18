@@ -4,7 +4,7 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -254,6 +254,121 @@ def read_spot_prices(directory: Path) -> tuple[RegionalSpotPrice, ...]:
     if any(not row.region or not row.zone or not row.instance_type or row.usd_per_hour < 0 or row.read_at < 0 for row in prices):
         raise ValueError('The regional Spot price snapshot has invalid rows')
     return prices
+
+
+SPOT_PLACEMENT_RETENTION_SECONDS = 72 * 3600
+SPOT_PLACEMENT_AWS_24_HOUR_CONFIGURATION_LIMIT = 10
+SPOT_PLACEMENT_FILE = 'spot-placement-scores.json'
+
+
+class SpotPlacementScope(str, Enum):
+    REGION = 'region'
+    ZONE = 'zone'
+
+
+class SpotPlacementTypeSet(str, Enum):
+    GATE_32_VCPU = 'gate_32_vcpu'
+    ALL_GATE_TYPES = 'all_gate_types'
+
+
+@dataclass(frozen=True)
+class SpotPlacementRequest:
+    scope: SpotPlacementScope
+    type_set: SpotPlacementTypeSet
+    boxes: int
+    instance_types: tuple[str, ...]
+    regions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'instance_types', tuple(sorted(self.instance_types)))
+
+
+@dataclass(frozen=True)
+class SpotPlacementRegion:
+    region: str
+
+
+@dataclass(frozen=True)
+class SpotPlacementZone:
+    region: str
+    zone_id: str
+
+
+SpotPlacementLocation = SpotPlacementRegion | SpotPlacementZone
+
+
+@dataclass(frozen=True)
+class SpotPlacementScore:
+    location: SpotPlacementLocation
+    score: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.score <= 10:
+            raise ValueError('The Spot placement score must be between 1 and 10')
+
+
+@dataclass(frozen=True)
+class SpotPlacementSample:
+    request: SpotPlacementRequest
+    at: int
+    scores: tuple[SpotPlacementScore, ...]
+
+
+@dataclass(frozen=True)
+class SpotPlacementFailure:
+    request: SpotPlacementRequest
+    at: int
+    reason: str
+
+
+SpotPlacementReading = SpotPlacementSample | SpotPlacementFailure
+
+
+def _placement_request_words(row: dict[str, object], key: str) -> tuple[str, ...]:
+    value = row.get(key)
+    if not isinstance(value, list):
+        raise LedgerUnavailable(f'{key}: expected text entries')
+    words = cast(list[object], value)
+    if not words or any(not isinstance(word, str) or not word for word in words):
+        raise LedgerUnavailable(f'{key}: expected nonempty text entries')
+    return tuple(cast(list[str], words))
+
+
+def _decode_spot_placement(row: dict[str, object]) -> SpotPlacementReading:
+    saved = mapping(row['request'])
+    request = SpotPlacementRequest(SpotPlacementScope(text(saved, 'scope')),
+        SpotPlacementTypeSet(text(saved, 'type_set')), instant(saved, 'boxes'),
+        _placement_request_words(saved, 'instance_types'), _placement_request_words(saved, 'regions'))
+    at = instant(row, 'at')
+    if 'reason' in row:
+        return SpotPlacementFailure(request, at, text(row, 'reason'))
+
+    scores: list[SpotPlacementScore] = []
+    for score in rows(row, 'scores'):
+        location = mapping(score['location'])
+        region = text(location, 'region')
+        place = (SpotPlacementZone(region, text(location, 'zone_id')) if request.scope is SpotPlacementScope.ZONE
+                 else SpotPlacementRegion(region))
+        scores.append(SpotPlacementScore(place, instant(score, 'score')))
+    return SpotPlacementSample(request, at, tuple(scores))
+
+
+def read_spot_placement_scores(directory: Path) -> tuple[SpotPlacementReading, ...]:
+    """Read saved Spot placement results without making an AWS request."""
+    try:
+        document = mapping(cast(object, json.loads((directory / SPOT_PLACEMENT_FILE).read_text())))
+    except FileNotFoundError:
+        return ()
+    if document.get('version') != 1:
+        raise LedgerUnavailable('Unsupported Spot placement score file version')
+    return tuple(_decode_spot_placement(row) for row in rows(document, 'readings'))
+
+
+def write_spot_placement_scores(directory: Path, readings: Sequence[SpotPlacementReading], now: int) -> None:
+    """Save the last 72 hours of Spot placement results atomically."""
+    first = now - SPOT_PLACEMENT_RETENTION_SECONDS
+    kept = [asdict(reading) for reading in readings if first <= reading.at <= now]
+    write_text_atomic(directory / SPOT_PLACEMENT_FILE, json.dumps({'version': 1, 'readings': kept}) + '\n')
 
 
 class SpotQuotaClass(str, Enum):

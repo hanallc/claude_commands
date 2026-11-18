@@ -2860,7 +2860,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/buildlog/cli.py`, `scripts/buildlog/test_report.py`.
 
-### Phase 155 — The hourly snapshot keeps Spot placement scores  · status: todo
+### Phase 155 — The hourly snapshot keeps Spot placement scores  · status: done
 
 User via builds 11-18 10:04: an analysis of 32-vCPU availability and a price for gate time. This phase collects the availability data.
 
