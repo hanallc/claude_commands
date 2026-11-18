@@ -86,11 +86,13 @@ def check_inputs(source: Path, configuration: conf.ConfigRead) -> None:
     if any(row.startswith(b'160000 ') for row in copies.git(source, 'ls-files', '--stage', '-z').split(b'\0')):
         raise hana_source.SourceRefused('SubmoduleInput: source contains an unsupported Git link')
     forbidden = configuration.words('source_forbidden_paths')
-    inputs = copies.git(source, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
-    for raw in inputs.split(b'\0'):
-        path = os.fsdecode(raw)
-        if raw and (path_matches(path, 'target/') or any(path_matches(path, pattern) for pattern in forbidden)):
-            raise hana_source.SourceRefused('CredentialOrBuildInput: source contains a forbidden path')
+    # A tracked target/ folder is source; only an untracked one is build output.
+    for build_output, selection in ((False, '--cached'), (True, '--others')):
+        for raw in copies.git(source, 'ls-files', selection, '--exclude-standard', '-z').split(b'\0'):
+            path = os.fsdecode(raw)
+            if raw and (build_output and path_matches(path, 'target/')
+                        or any(path_matches(path, pattern) for pattern in forbidden)):
+                raise hana_source.SourceRefused('CredentialOrBuildInput: source contains the forbidden path ' + path)
 
 
 class SourceSender:
