@@ -126,7 +126,7 @@ class UnitUnavailable(NamedTuple):
     reason: str
 
 
-class MergeUnderRepoOwner(NamedTuple):
+class StaffParentIsDestination(NamedTuple):
     pass
 
 
@@ -164,11 +164,11 @@ class MergeRequest(NamedTuple):
     excluded: str
     bump: bool = False
     staff_record: staff.StaffSnapshot | None = None
-    staff_parent: Production | MergeUnderRepoOwner = MergeUnderRepoOwner()
+    staff_parent: Production | StaffParentIsDestination = StaffParentIsDestination()
 
     @property
     def parent_production(self) -> Production:
-        return self.production if isinstance(self.staff_parent, MergeUnderRepoOwner) else self.staff_parent
+        return self.production if isinstance(self.staff_parent, StaffParentIsDestination) else self.staff_parent
 
 
 def end_pushed_worktrees(production: ProductionDocument) -> None:
@@ -181,11 +181,12 @@ def end_pushed_worktrees(production: ProductionDocument) -> None:
 
 @contextmanager
 def merge_lock(checkout: Path, name: str) -> Generator[None]:
-    """Hold one lock per checkout for the whole merge gate."""
-    directory = git(checkout, "rev-parse", "--absolute-git-dir")
-    if directory.returncode:
-        raise OSError(f"{checkout}: no git directory for the merge lock: {directory.stderr.strip()}")
-    with (Path(directory.stdout.strip()) / "showrunner-merge.lock").open("a") as lock:
+    """Held for a whole merge gate. A unit rename takes it before it writes the merge branch, so
+    neither lands a commit inside the other's run."""
+    common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.returncode:
+        raise OSError(f"{checkout}: no git directory for the merge lock: {common.stderr.strip()}")
+    with (Path(common.stdout.strip()) / f"showrunner-merge-{name}.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -329,7 +330,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
         main_checkout = worktrees.main_checkout(production.checkout)
     except worktrees.Refused as error:
         raise Refusal(str(error)) from error
-    parent_production: Production | MergeUnderRepoOwner = MergeUnderRepoOwner()
+    parent_production: Production | StaffParentIsDestination = StaffParentIsDestination()
     if selected.parent != staff.ReportsTo(production.owner.id):
         parent = record.parent_of(selected)
         if parent is None or parent.kind != "showrunner" or not worktree_in_repo(selected, main_checkout):
@@ -1359,7 +1360,12 @@ def resolved_checkpoint(request: MergeRequest) -> MergeRequest:
     """Resolve the checkpoint hash and retain its staff snapshot."""
     if request.staff_record is None:
         request = request._replace(staff_record=staff.snapshot())
-    checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+    same_parent = isinstance(request.staff_parent, StaffParentIsDestination)
+    checkout = request.production.checkout if same_parent else request.unit.worktree
+    commit = f"{request.commit}^{{commit}}"
+    checkpoint = git(checkout, "rev-parse", "--verify", commit)
+    if checkpoint.returncode and same_parent:
+        checkpoint = git(request.unit.worktree, "rev-parse", "--verify", commit)
     if checkpoint.returncode:
         raise checkpoint_gate.Stop("ancestry", "failed", f"commit {request.commit} is absent",
                                    "push the checkpoint and send its hash again")

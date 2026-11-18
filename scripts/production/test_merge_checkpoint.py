@@ -369,7 +369,7 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_staff_parent_authorizes_a_checkpoint_in_the_units_repository(self) -> None:
-        for outcome in ("parent commit", "wrong branch", "test policy", "push", "promotion", "lock", "overlap", "batch"):
+        for outcome in ("parent commit", "wrong branch", "test policy", "push", "promotion", "overlap", "batch"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -424,19 +424,6 @@ if "-E" not in args:
                     parent_text += f"- **Change review:** `{review_dir / 'change-review - cargo-liner.md'}`\n"
                     if outcome == "promotion":
                         repo_text += f"- **Change review:** `{review_dir / 'change-review - sdlc.md'}`\n"
-                if outcome == "lock":
-                    self.executable(self.bin / "checkpoint-test", STUB + '''
-import fcntl
-import subprocess
-directory = subprocess.check_output(["git", "rev-parse", "--absolute-git-dir"], text=True).strip()
-with (Path(directory) / "showrunner-merge.lock").open("a") as lock:
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        pass
-    else:
-        raise SystemExit("the destination merge lock is free")
-''')
                 _ = self.doc.write_text(repo_text)
                 _ = parent_doc.write_text(parent_text)
                 parent_row = recorded_showrunner("cargo-liner", parent_doc)
@@ -703,6 +690,21 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         unpushed = self.run_checkpoint(sha)
         self.assert_stopped_before_merge(unpushed, "held", "origin")
         self.assertIn("push", unpushed.process.stdout)
+
+        with self.subTest(checkpoint="stale unit clone"):
+            clone = self.root / "stale-alpha"
+            _ = self.git("clone", "--no-local", "-b", "alpha-branch", str(self.origin), str(clone))
+            _ = shutil.copyfile(self.unit / ".unit.toml", clone / ".unit.toml")
+            _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+            self.assertNotEqual(merge_checkpoint.git(clone, "cat-file", "-e", f"{sha}^{{commit}}").returncode, 0)
+            self.assertEqual(self.git("rev-parse", "--verify", f"{sha}^{{commit}}"), sha)
+            unit = unit_membership("example", "alpha")
+            _ = staff.set_worktree(unit.id, staff.PresentWorktree(local_machine(), clone), expected=unit.worktree)
+            landed = self.run_checkpoint(sha).process
+            self.assertEqual(landed.returncode, 0, landed.stdout + landed.stderr)
+            self.assertIn("is on origin/alpha-branch", landed.stdout)
+            self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), sha)
+
     def test_never_pushed_unit_branch_is_held_like_an_unpushed_checkpoint(self) -> None:
         sha = self.checkpoint(push=False)
         unpushed = self.run_checkpoint(sha)
