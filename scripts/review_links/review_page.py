@@ -955,6 +955,7 @@ let content=document.querySelector('[data-review]');
 let selectedShow=content.dataset.show;
 const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
+const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 const kinds=['question','change','investigation','proposal','efficiency','bug'],states=['Open','Waiting','Done','Validating'];
 let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
@@ -973,8 +974,9 @@ function readIndex(payload){
 function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
+const detailId=key=>'review-detail-'+encodeURIComponent(key);
 function summary(entry){
- const node=document.createElement('tbody'),panel='review-detail-'+encodeURIComponent(entry.key);
+ const node=document.createElement('tbody'),panel=detailId(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
   order:entry.order,updated:entry.updated,parked:'false'});
@@ -1082,11 +1084,25 @@ const view=createRecordTable({content:()=>content,single:true,
   });
  }
 });
+async function afterRowAnimations(run,current=()=>true){
+ while(current() && view.hasActiveRowAnimations) await view.settled();
+ if(current()) return run();
+}
 addEventListener('scroll',()=>{
- const departing=[...pendingSaves.values()].filter(save=>save.departing && Math.abs(scrollY-save.top)>=innerHeight);
- if(!departing.length) return;
- for(const save of departing) save.departing=false;
- view.apply(false);
+ const waiting=scrollDepartures.size>0;
+ for(const save of pendingSaves.values()){
+  if(save.departing && !save.saved && Math.abs(scrollY-save.top)>=innerHeight) scrollDepartures.add(save);
+ }
+ if(waiting || !scrollDepartures.size) return;
+ void afterRowAnimations(()=>{
+  let redraw=false;
+  for(const save of pendingSaves.values()){
+   if(!scrollDepartures.has(save) || save.saved) continue;
+   save.departing=false;redraw=true;
+  }
+  scrollDepartures.clear();
+  if(redraw) view.apply(false);
+ });
 },{passive:true});
 function mountedRow(key){return content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');}
 function rememberFocus(){
@@ -1220,12 +1236,16 @@ function bindForm(row){
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:data.get('outcome')==='question',
      closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true};
-    saved.set(key,marker);savedEntry(key,marker);
-    if(marker.closes) storeSavedVerdicts();
-    pendingSaves.delete(key);
-    if(!isDeferredLink(key)) view.closeCard(key);
-    view.showActionResult(row,submission,key,{kind:'success',message:'Saved: '+result.answer});
-    if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
+    const applySaved=()=>{
+     saved.set(key,marker);savedEntry(key,marker);
+     if(marker.closes) storeSavedVerdicts();
+     pendingSaves.delete(key);
+     if(!isDeferredLink(key)) view.closeCard(key);
+     view.showActionResult(row,submission,key,{kind:'success',message:'Saved: '+result.answer});
+     if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
+    };
+    if(outcome==='later') await afterRowAnimations(applySaved);
+    else applySaved();
    }catch(error){
     pendingSaves.delete(key);
     view.showActionResult(row,submission,key,{kind:'failure',message:'Not saved: '+error.message});
@@ -1234,11 +1254,10 @@ function bindForm(row){
     pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
     if(isDeferredLink(key)){
      const link=deferredLink;
-     while(deferredLink===link && isDeferredLink(key) && view.hasActiveRowAnimations) await view.settled();
-     if(deferredLink===link && isDeferredLink(key)){
+     await afterRowAnimations(()=>{
       deferredLink=null;
       followItemLink({inheritFilters:true});
-     }
+     },()=>deferredLink===link && isDeferredLink(key));
     }else if(deferredLink?.href!==location.href){
      deferredLink=null;
      followItemLink({inheritFilters:true,unappliedOnly:true});
@@ -1310,23 +1329,28 @@ function revealNewItem(){
 }
 async function refresh(_supersede=false,current=()=>true){
  if(pendingSaves.size || dateTimePickerOpen(content)) return;
+ const canApply=()=>!pendingSaves.size && current();
  const response=await fetch(location.pathname+'?'+new URLSearchParams({version:'1'}),{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const version=await response.json();
- if(pendingSaves.size || dateTimePickerOpen(content) || !current()) return;
+ if(!canApply() || dateTimePickerOpen(content)) return;
  if(version.version===content.dataset.version){
-  await view.settled();
-  if(pendingSaves.size || !current()) return;
-  for(const [key,result] of saved) if(result.later && Date.now()>=result.later) saved.delete(key);
-  content.querySelectorAll('[data-body-loaded="failed"]').forEach(row=>delete row.dataset.bodyLoaded);
-  revealConflict();view.apply(false);revealNewItem();content.dispatchEvent(new Event('review-refreshed'));return version.facts;
+  return afterRowAnimations(()=>{
+   for(const [key,result] of saved) if(result.later && Date.now()>=result.later) saved.delete(key);
+   content.querySelectorAll('[data-body-loaded="failed"]').forEach(row=>delete row.dataset.bodyLoaded);
+   revealConflict();view.apply(false);revealNewItem();content.dispatchEvent(new Event('review-refreshed'));return version.facts;
+  },canApply);
  }
  const fresh=await fetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version}),{cache:'no-store'});
  if(!fresh.ok) throw new Error('HTTP '+fresh.status);
  const payload=await fresh.json();
- if(pendingSaves.size || dateTimePickerOpen(content) || !current()) return;
- await view.settled();
- if(pendingSaves.size || !current()) return;
+ if(!canApply() || dateTimePickerOpen(content)) return;
+ return afterRowAnimations(()=>{
+  applyReviewIndex(payload);
+  return {...payload.facts,answeredAt:version.facts.answeredAt};
+ },canApply);
+}
+function applyReviewIndex(payload){
  const top=scrollY;focusAfterLoad=rememberFocus();
  content.querySelectorAll('[data-review-form]').forEach(rememberForm);
  index=readIndex(payload.index);content.dataset.version=payload.version;
@@ -1382,7 +1406,6 @@ async function refresh(_supersede=false,current=()=>true){
  content.dataset.loaded='true';
  if(!revealNewItem() && !revealed) scrollTo({top,behavior:'instant'});
  content.dispatchEvent(new Event('review-refreshed'));
- return {...payload.facts,answeredAt:version.facts.answeredAt};
 }
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
@@ -1394,13 +1417,24 @@ document.addEventListener('review-item-created',event=>{
  revealCreated=event.detail.key;
  void pageRefresh.refresh(true);
 });
+function itemLinkKey(){
+ const fragment=new URLSearchParams(location.hash.slice(1)),search=new URLSearchParams(location.search);
+ const field=name=>fragment.get(name) ?? search.get(name);
+ return field('jump') || (field('item') ?? field('row'));
+}
 function followItemLink(options){
- return view.followItemLink({...options,beforeJump:key=>{
+ const applyLink=unappliedOnly=>view.followItemLink({...options,unappliedOnly,beforeJump:key=>{
   if(pendingSaves.has(key)) return false;
   const marker=saved.get(key);
   if(marker && !marker.closes && !marker.question && !marker.handed) saved.delete(key);
   return true;
  }});
+ const key=view.hasActiveRowAnimations ? itemLinkKey() : null;
+ if(!key || !content.querySelector('[data-record-motion] .list-toggle[aria-controls="'+CSS.escape(detailId(key))+'"]'))
+  return applyLink(options?.unappliedOnly);
+ const href=location.href;
+ void afterRowAnimations(()=>applyLink(true),()=>location.href===href);
+ return true;
 }
 const frame=window.frameElement;
 if(frame?.reviewPlace){
@@ -1413,8 +1447,7 @@ if(history.state?.recordTable) view.restorePlace();
 else if(!followItemLink()){view.place();view.apply();}
 function isDeferredLink(key){return deferredLink?.key===key && deferredLink.href===location.href;}
 function restorePlace(event){
- const params=new URLSearchParams(location.hash.slice(1));
- const key=params.get('jump') || params.get('item') || new URLSearchParams(location.search).get('item');
+ const key=itemLinkKey();
  if(pendingSaves.has(key)){
   deferredLink={key,href:location.href};return;
  }

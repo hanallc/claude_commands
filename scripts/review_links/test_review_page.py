@@ -3662,9 +3662,68 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  exit.currentTime=100;dispatchEvent(new Event('scroll'));await frame();
  check(near(top(clip),before),'The shrinking copy keeps its place after a redraw.');
  check(next.isConnected && top(next)<following,'The next card stays mounted while it moves up.');
+ const saveTop=scrollY,height=clip.getBoundingClientRect().height,key=row.dataset.key;
+ let redraws=0;
+ const observer=new MutationObserver(records=>redraws+=records.length);
+ observer.observe(document.querySelector('[data-owner-chip=""] b'),{childList:true});
+ scrollBy(0,innerHeight+50);await frame();
+ check(scrollY-saveTop>=innerHeight,'The page scrolls one viewport during the save.');
+ check(copy(panel)===clip && near(clip.getBoundingClientRect().height,height),
+  'A scroll during the save keeps the same fade at the same height.');
+ scrollTo(0,saveTop);await frame();
+ check(redraws===0 && !rows().some(row=>row.dataset.key===key),
+  'The pending card stays out of the window during the fade.');
  exit.finish();await exit.finished;await frame();
  check(!copy(panel),'The tall copy disappears when the fade ends.');
+ check(redraws===1,'The deferred redraw runs once after the fade.');
+ observer.disconnect();
 """)
+
+    def last_owner_card_markup(self) -> str:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        other = fixture_member('showrunner', name='builds')
+        origin = change.source
+        assert isinstance(origin, review_items.ChangeSource)
+        change = replace(change, source=replace(origin, row={**origin.row, 'Image': ''}),
+                         log=tuple(replace(entry, who='page-owner') for entry in change.log))
+        records = [
+            replace(change, source_unit=change.owner, title='Review the console layout'),
+            replace(change, key='builds/C1', id='builds/C1', owner=other.id, source_unit=other.id, title='Check the build'),
+        ]
+        with patch.object(review_items, 'read', return_value=records):
+            return browser_markup(self.root)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_later_keeps_the_last_owner_through_the_fade(self) -> None:
+        source = self.last_owner_card_markup()
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                self.check_card_motion(source, r"""
+ const owner=document.querySelector('[data-owner-name="page-owner"]');
+ const selected=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+ document.querySelector('[data-sort="3"]').click();
+ owner.click();
+ const [row]=rows(),panel=panelId(row);
+ const form=await openCard(row);
+ form.querySelector('[data-later-toggle]').click();
+ form.querySelector('[data-later-preset="soon"]').click();
+ const clip=copy(panel),exit=clip.getAnimations()[0];
+ exit.currentTime=100;
+ const position=top(clip);
+ posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
+ await frame();
+ check(selected()===owner && !owner.hidden,'The last owner stays selected and visible during the fade.');
+ check(copy(panel)===clip && near(top(clip),position) && !rows().length,
+  'The fading card keeps its position and the other owner’s card stays out of view.');
+ if(CANCEL) document.querySelector('[data-sort="3"]').click();
+ else exit.finish();
+ await frame();
+ check(!copy(panel) && selected()?.dataset.ownerChip==='' && owner.hidden,
+  'The Owner filter resets when the fade ends or the redraw cancels it.');
+ check(rows().length===1 && rows()[0].dataset.key==='builds/C1' && posts.size===1,
+  'The deferred save hides the card and shows the other owner’s card after one POST.');
+ check(postCount===1,'Later sends exactly one POST.');
+""".replace('CANCEL', json.dumps(cancel)))
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
@@ -3684,6 +3743,35 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check(restored && near(restored.getBoundingClientRect().height,height) &&
    near(Number(getComputedStyle(restored).opacity),opacity,0.01),'The reverse starts at the current height and opacity.');
  check(near(top(next),following),'The next card does not jump when the fade reverses.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_link_to_a_returning_card_waits_for_both_fades(self) -> None:
+        self.check_card_motion(browser_markup(self.root), r"""
+ const [first,second]=rows(),firstPanel=panelId(first),secondPanel=panelId(second);
+ const firstKey=first.dataset.key;
+ send(await openCard(first));
+ const firstExit=copy(firstPanel).getAnimations()[0];
+ firstExit.currentTime=100;
+ send(await openCard(second));
+ const secondClip=copy(secondPanel),secondExit=secondClip.getAnimations()[0];
+ secondExit.currentTime=100;
+ posts.get(firstKey)({ok:false,json:async()=>({reason:'Try again.'})});
+ await frame();
+ const returning=copy(firstPanel),returnFade=returning.getAnimations()[0];
+ check(returnFade!==firstExit,'The refused card starts its return fade.');
+ const jumped=()=>rows().find(row=>row.dataset.key===firstKey)?.querySelector('[data-record-highlight]');
+ const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ location.hash=new URLSearchParams({jump:firstKey});
+ await changed;await frame();
+ check(copy(firstPanel)===returning && copy(secondPanel)===secondClip && !jumped(),
+  'The link waits while both cards fade.');
+ returnFade.finish();await returnFade.finished;await frame();
+ check(!copy(firstPanel) && copy(secondPanel)===secondClip && !jumped(),
+  'The link waits for the second card after the first card returns.');
+ if(secondClip.isConnected) secondExit.finish();
+ await frame();
+ check(!copy(secondPanel) && jumped(),'The link opens the first card after both fades end.');
 """)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -3708,10 +3796,13 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
     def check_card_motion(self, source: str, steps: str) -> None:
         setup = r"""<script>
 const realFetch=fetch,posts=new Map(),animate=Element.prototype.animate;
+let postCount=0;
 window.setInterval=()=>0;
-window.fetch=(url,options)=>options?.method==='POST'
- ? new Promise(resolve=>posts.set(new URLSearchParams(options.body).get('row'),resolve))
- : realFetch(url,options);
+window.fetch=(url,options)=>{
+ if(options?.method!=='POST') return realFetch(url,options);
+ postCount++;
+ return new Promise(resolve=>posts.set(new URLSearchParams(options.body).get('row'),resolve));
+};
 Element.prototype.animate=function(...args){
  const motion=animate.apply(this,args);
  if(this.classList.contains('record-motion-clip')){motion.pause();motion.currentTime=0;}
