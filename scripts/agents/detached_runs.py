@@ -271,17 +271,20 @@ def stop_command(path: Path, reason: str) -> bool:
     """Save the reason and TERM the command group while the supervisor and command leader are current."""
     record = worker_lifecycle.read_json_object(path)
     supervisor = _integer(record.get("pid"))
+    verified_group: CommandGroup | None = None
 
     def still_current() -> bool:
+        nonlocal verified_group
         command = command_group(path)
-        return (command is not None and detached_run_process.supervisor_match(supervisor, path) is True
-                and process_start.process_start(command.group) == process_start.Started(command.started))
+        if (command is None or detached_run_process.supervisor_match(supervisor, path) is not True
+                or process_start.process_start(command.group) != process_start.Started(command.started)):
+            return False
+        verified_group = command
+        return True
 
     def signal_run() -> None:
-        command = command_group(path)
-        if command is None:
-            raise ProcessLookupError(f"{path.name}: no running command group")
-        process_group.send_process_group(command.group, signal.SIGTERM)
+        assert verified_group is not None
+        process_group.send_process_group(verified_group.group, signal.SIGTERM)
 
     try:
         return stop_with_reason(path, reason, still_current=still_current, signal_run=signal_run)
@@ -1032,8 +1035,10 @@ def command_supervise(args: argparse.Namespace) -> int:
     marker = log.with_suffix(".scope")
     prefix = scope_prefix(marker, environment)
     exit_code = _run(prefix + record["command"], environment, log)
-    record = _read_record(record_path)
-    if prefix and not marker.exists() and not record.get("stop_reason"):
+    with record_lock(record_path):
+        record = _read_record(record_path)
+        retry_without_scope = bool(prefix) and not marker.exists() and not record.get("stop_reason")
+    if retry_without_scope:
         exit_code = _run(record["command"], environment, log)
         record = _read_record(record_path)
     marker.unlink(missing_ok=True)

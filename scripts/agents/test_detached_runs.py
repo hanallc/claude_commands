@@ -26,7 +26,7 @@ from pathlib import Path
 from threading import Event, current_thread
 from types import SimpleNamespace
 from typing import IO, Literal, cast, override
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production.staff_test_support import isolated_staff_file
@@ -1182,6 +1182,28 @@ sys.exit(status)
             send.assert_not_called()
             self.assertEqual(cast(object, json.loads(path.read_text())), saved)
 
+        with self.subTest(case="signal uses the group from the final identity check"):
+            checks = 0
+            read_record = worker_lifecycle.read_json_object
+
+            def check_start(group: int) -> process_start.Started:
+                nonlocal checks
+                self.assertEqual(group, os.getpid())
+                checks += 1
+                return started
+
+            def read_before_signal(record_path: Path) -> dict[str, object]:
+                self.assertLess(checks, 2, "The final identity check must be the last operation before TERM")
+                return read_record(record_path)
+
+            with (patch.object(detached_run_process, "supervisor_match", return_value=True),
+                  patch.object(process_start, "process_start", side_effect=check_start),
+                  patch.object(worker_lifecycle, "read_json_object", side_effect=read_before_signal),
+                  patch.object(process_group, "send_process_group") as send):
+                self.assertTrue(detached_runs.stop_command(path, "new stop"))
+            self.assertEqual(checks, 2)
+            send.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
     def test_updates_do_not_write_missing_or_invalid_records(self) -> None:
         with self.subTest(update="stop after prune"):
             path = self.finished_run("pruned-before-stop")
@@ -1581,8 +1603,8 @@ send.deliver_worker_text = fake_sender
     def test_cancelled_stop_reason_is_absent_from_the_delivered_result(self) -> None:
         reason = "stopped for service deploy; run again after the release"
         record_lock = detached_runs.record_lock
-        for timing, previous in (("before publication", ""),
-                                 ("before publication", "stopped for an earlier hold"), ("during recheck", "")):
+        for timing, previous in (("before publication", ""), ("before publication", "stopped for an earlier hold"),
+                                 ("during recheck", ""), ("during scope retry", "")):
             with self.subTest(cancellation=timing, previous=previous):
                 session_staff.inbox_path(self.worker_id).unlink(missing_ok=True)
                 path = self.record([sys.executable, "-c", "pass"])
@@ -1607,8 +1629,8 @@ send.deliver_worker_text = fake_sender
                 else:
                     done = self.root / "done.txt"
                     _ = done.write_text("Result: PASS (exit 0)\nStage 2: go")
-                    self.update_record(path, done_message_file=str(done))
-                    proc = self.root / "proc"
+                    self.update_record(path, done_message_file=str(done), command_group=10, command_started="2000")
+                    proc = self.root / f"proc-{timing.replace(' ', '-')}"
                     for pid, parent, start in ((100, 1, "1000"), (10, 100, "2000")):
                         directory = proc / str(pid)
                         directory.mkdir(parents=True)
@@ -1628,7 +1650,6 @@ send.deliver_worker_text = fake_sender
                     write_attempted, supervisor_blocked = Event(), Event()
                     flock = fcntl.flock
                     read_start = build_hold.process_start_time
-                    checks = 0
 
                     @contextlib.contextmanager
                     def observe_record_lock(path: Path) -> Generator[None]:
@@ -1652,10 +1673,9 @@ send.deliver_worker_text = fake_sender
                             flock(descriptor, operation)
 
                     def reuse_at_recheck(pid: int, proc_root: Path = build_hold.PROC_ROOT) -> str:
-                        nonlocal checks
                         if pid == 10:
-                            checks += 1
-                            if checks == 2:
+                            stopping = cast(dict[str, object], json.loads(path.read_text()))
+                            if stopping.get("stop_reason") == reason:
                                 rechecking.set()
                                 self.assertTrue(write_attempted.wait(timeout=guard.remaining()))
                                 self.assertTrue(supervisor_blocked.is_set(), "the drain must hold the record lock")
@@ -1667,12 +1687,14 @@ send.deliver_worker_text = fake_sender
                         self.assertTrue(rechecking.wait(timeout=guard.remaining()))
                         return self.supervise(path)
 
+                    prefix = ["fixture-scope"] if timing == "during scope retry" else []
                     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="supervisor-race") as executor, \
                          patch.object(detached_runs, "record_lock", side_effect=observe_record_lock), \
                          patch.object(fcntl, "flock", side_effect=observe_flock), \
                          patch.object(build_hold, "process_start_time", side_effect=reuse_at_recheck), \
                          patch.object(hold_enforcer, "record_build"), patch.object(hold_enforcer, "set_stop_status"), \
-                         patch.object(detached_runs, "_run", return_value=0):
+                         patch.object(detached_runs, "scope_prefix", return_value=prefix), \
+                         patch.object(detached_runs, "_run", side_effect=[1, 0] if prefix else [0]) as run_command:
                         publication = executor.submit(supervise_at_recheck)
                         try:
                             result = hold_enforcer.stop_waiting_run(
@@ -1684,6 +1706,9 @@ send.deliver_worker_text = fake_sender
                         finally:
                             rechecking.set()
                         record = publication.result(timeout=guard.remaining())
+                        self.assertEqual(run_command.call_count, 2 if prefix else 1)
+                        if prefix:
+                            run_command.assert_called_with([sys.executable, "-c", "pass"], ANY, Path(record["log"]))
                 message, = cast(list[str], self.pending()["messages"])
                 self.assertTrue(cancelled.is_set())
                 self.assertIn("Result: PASS (exit 0)", message)
