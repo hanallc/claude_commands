@@ -10,7 +10,7 @@ from functools import lru_cache
 import math
 from pathlib import Path
 from types import UnionType
-from typing import Callable, Literal, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
 
 # Literal unions use typing.Union on Python 3.13.
 LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
@@ -69,10 +69,12 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
             source = ({"kind": "SourceKeyKnown", "key": source} if source else
                       {"kind": "SourceKeyUnavailable", "reason": "older request has no source key"})
         return {**record, "source_key": source}
-    if (writing and schema.__module__ == "scripts.build_queue.admission_records"
-            and schema.__name__ == "QueueInputs"):
-        # Pinned clients require this inactive field in the wire record.
-        record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
+    if schema.__module__ == "scripts.build_queue.admission_records":
+        if writing and schema.__name__ == "QueueInputs":
+            # Pinned clients require this inactive field in the wire record.
+            record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
+        elif not writing and schema.__name__ == "BetweenStepsSlot":
+            record = {**record, "identity": ended_step_facts(record.get("identity", {"kind": "HoldPredatesStepFacts"}))}
     if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
         if writing:
             running = record["running"]
@@ -84,6 +86,20 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         elif "running_with_remote" in record:
             return {**record, "running": record["running_with_remote"]}
     return record
+
+
+def ended_step_facts(value: object) -> object:
+    """Recover the facts that an older name record retained."""
+    if not isinstance(value, dict):
+        return value
+    identity = cast(dict[str, object], value)
+    if identity.get("kind") != "EndedStepIdentity":
+        return identity
+    name, source = identity["name"], identity["source"]
+    absent = {"kind": "EndedStepFactNotRecorded"}
+    return {"kind": "EndedStepFacts", "step": name if source in ("step", "script") else absent,
+            "package": {"kind": "PackageNotRecorded"}, "project": name if source == "repository" else absent,
+            "folder": absent, "staff_id": identity["staff_id"]}
 
 
 def remote_memory_row(value: object) -> bool:
@@ -212,6 +228,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
     if schema is str or schema is int or schema is float or schema is bool:
         # Profile records hold millions of scalars; this check comes before the typing lookups.
         return parse_scalar(value, schema)
+    if isinstance(schema, NewType):
+        return parse_snapshot_value(value, schema.__supertype__)
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
     if schema is object:
         return value

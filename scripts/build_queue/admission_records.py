@@ -23,6 +23,7 @@ from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, Li
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
+from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
 
@@ -334,6 +335,7 @@ class Reservation(TypedDict):
     test_phase_charge_use: NotRequired[TestPhaseChargeUse]
     build_run: NotRequired[LiveBuildRun | NoLiveBuildRun]
     run_origin: NotRequired[CallerRun | FoundRun]
+    slot_staff: NotRequired[StaffId | NoEndedStepStaff]
 
 
 @dataclass(frozen=True)
@@ -713,12 +715,39 @@ class RunUseUnavailable:
 
 
 @dataclass(frozen=True)
+class NoEndedStepStaff:
+    """The ended step has no recorded staff owner."""
+
+
+@dataclass(frozen=True)
+class EndedStepFactNotRecorded:
+    """The reservation did not record this fact about the ended step."""
+
+
+@dataclass(frozen=True)
+class EndedStepFacts:
+    """The reservation's work and staff facts survive until the hold ends."""
+
+    step: str | EndedStepFactNotRecorded
+    package: str | PackageNotRecorded
+    project: str | EndedStepFactNotRecorded
+    folder: str | EndedStepFactNotRecorded
+    staff_id: StaffId | NoEndedStepStaff
+
+
+@dataclass(frozen=True)
+class HoldPredatesStepFacts:
+    """The saved hold records its memory but has no facts about the ended step."""
+
+
+@dataclass(frozen=True)
 class BetweenStepsSlot:
     """The run retains memory between steps until the slot expires."""
     run: LiveBuildRun
     reservation: str
     bytes: int
     expires_at: float
+    identity: EndedStepFacts | HoldPredatesStepFacts
 
 
 @dataclass(frozen=True)

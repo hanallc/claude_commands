@@ -642,7 +642,10 @@ class WaitHolderRulesTests(unittest.TestCase):
         continuation = self.waiter(200, session="continuation", need=10 * GIB)
         continuation["build_run"] = run
         inputs = self.inputs(self.running(1, GIB, session="other"))
-        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10)
+        absent = admission_records.EndedStepFactNotRecorded()
+        identity = admission_records.EndedStepFacts("check", admission_records.PackageNotRecorded(),
+                                                    absent, absent, admission_records.NoEndedStepStaff())
+        slot = admission_records.BetweenStepsSlot(run, "previous", 2 * GIB, NOW_EPOCH + 10, identity)
         inputs = replace(inputs, ordered=[(Path("head"), head), (Path("continuation"), continuation)],
             slots=(admission_records.ContinuationSlot(slot, admission_records.waiter_owner(continuation)),))
         result = gate.admission_pass(inputs, inputs.now, admission_policy_fixture())
