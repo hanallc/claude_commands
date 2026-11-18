@@ -93,6 +93,7 @@ _BOUNDARY = re.compile(r"(?<!\\)\|")
 _BREAK_TAG = re.compile(r"<(\\*)br>")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
+_REVERT_TARGET = re.compile(r"^This reverts commit ([0-9a-f]{40}|[0-9a-f]{64})(?:\.$|, reversing\b)", re.MULTILINE)
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
 lists_directory = change_routing.lists_directory
@@ -1711,6 +1712,32 @@ def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
     return RecordedMerge(text) if text else MergeNotRecorded()
 
 
+def _move_to_reviewed(path: Path, lines: list[str], cells: dict[str, str], verdict: str, day: date) -> None:
+    """Write a closed row with its merge, history and recorded production."""
+    identity = staff.initial_snapshot()
+    member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
+    if member is not None:
+        parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
+        cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
+    if not any(line.strip() == REVIEWED for line in lines):
+        reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
+        _insert(lines, len(lines), reviewed_rows)
+    _add_column(path, lines, REVIEWED, "Merged")
+    for column in ("Review log", IMAGE):
+        if cells.get(column):
+            _add_column(path, lines, REVIEWED, column)
+    if member is not None:
+        _add_column(path, lines, REVIEWED, PRODUCTION)
+    if PRODUCER in cells:
+        _add_column(path, lines, REVIEWED, PRODUCER)
+    if cells.get(KIND):
+        for column in (KIND, CHECK, PRODUCTION):
+            _add_column(path, lines, REVIEWED, column)
+    reviewed, top, _ = _table(path, lines, REVIEWED)
+    _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells,
+                                               "Verdict": _cell(verdict), "Date": day.isoformat()})])
+
+
 def _verdict_write(
     path: Path, row: str, verdict: str, day: date, *, superseded: str = '',
 ) -> RowWrite[VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict]:
@@ -1735,32 +1762,9 @@ def _verdict_write(
         if image:
             removed_image = image
             cells[IMAGE] = ""
-        identity = staff.initial_snapshot()
-        member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
-        if member is not None:
-            parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
-            cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
-        if not any(line.strip() == REVIEWED for line in lines):
-            reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
-            _insert(lines, len(lines), reviewed_rows)
-        _add_column(path, lines, REVIEWED, "Merged")
         if superseded:
             append_row_review_log(cells, superseded, "nate", datetime.now().astimezone(user_zone()))
-        if cells.get("Review log"):
-            _add_column(path, lines, REVIEWED, "Review log")
-        if member is not None:
-            _add_column(path, lines, REVIEWED, PRODUCTION)
-        if PRODUCER in cells:
-            _add_column(path, lines, REVIEWED, PRODUCER)
-        # Page rows retain their description and proof in the same record after
-        # answering. Older lists keep their existing Reviewed table shape.
-        if cells.get(KIND):
-            for column in (KIND, CHECK, PRODUCTION):
-                _add_column(path, lines, REVIEWED, column)
-        reviewed, top, _ = _table(path, lines, REVIEWED)
-        _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells, "#": row,
-                                                   "Verdict": _cell(verdict), "Date": day.isoformat(),
-                                                   "Merged": cells.get("Merged", "")})])
+        _move_to_reviewed(path, lines, cells, verdict, day)
         return VerdictRecorded(row_merge(cells))
 
     def after() -> None:
@@ -1785,6 +1789,57 @@ def record_verdict(
     except Exception as error:
         report_warning(f"{path} {row}: the verdict is saved. Image cleanup failed: {error}")
     return result
+
+
+def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: Path) -> bool:
+    """Close a row as withdrawn and keep its earlier verdict in the log."""
+    prefix = "Withdrawn: "
+    event = review_events.ReviewLog(stamp, "nate", prefix + _words("reason", words))
+    verdict = "withdrawn"
+
+    def write(lines: list[str]) -> bool:
+        for section in (SECTION, REVIEWED):
+            if not any(line.strip() == section for line in lines):
+                continue
+            columns, first, end = _table(path, lines, section)
+            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+            if index is None:
+                continue
+            cells = dict(zip(columns, _cells(lines[index])))
+            events = review_events.decode(_plain(cells.get("Review log", "")))
+            previous = _plain(cells.get("Verdict", ""))
+            if previous == verdict:
+                for earlier in reversed(events):
+                    if earlier.who == event.who and earlier.words.startswith(prefix):
+                        if earlier.words == event.words:
+                            return False
+                        raise ChangeReviewError(f"{row} is already withdrawn")
+            if previous:
+                previous_date = _plain(cells.get("Date", ""))
+                try:
+                    previous_time = datetime.fromisoformat(previous_date)
+                    if previous_time.tzinfo is None:
+                        previous_time = previous_time.replace(tzinfo=stamp.tzinfo)
+                except ValueError:
+                    previous_time = stamp
+                    previous = f"Previous verdict ({previous_date or 'date unavailable'}) — {previous}"
+                events = (*events, review_events.ReviewLog(previous_time, event.who, previous))
+            cells["Review log"] = _cell(review_events.encode((*events, event)))
+            if section == SECTION:
+                del lines[index]
+                _move_to_reviewed(path, lines, cells, verdict, stamp.date())
+            else:
+                _add_column(path, lines, REVIEWED, "Review log")
+                reviewed, _, _ = _table(path, lines, REVIEWED)
+                cells.update({"Verdict": verdict, "Date": stamp.date().isoformat()})
+                lines[index] = _row(path, reviewed, cells) + "\n"
+            return True
+        raise RowNotListed(f"{row} is not on the change review list")
+
+    root = change_routing.review_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with review_delivery_lock(root):
+        return _edit(path, production, stamp.date(), write, lambda _: f"withdraw {row}")
 
 
 def review_rows(path: Path) -> list[dict[str, str]]:
@@ -2338,6 +2393,13 @@ def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
     return frozenset(foreign)
 
 
+def _reverted_on_main(repo: Path) -> set[str]:
+    """Read the commit targets of Git revert messages on origin/main."""
+    messages = _git(repo, "log", "--format=%B", "--fixed-strings", "--grep=This reverts commit ",
+                    "origin/main", "--")
+    return set(_REVERT_TARGET.findall(messages))
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
@@ -2360,6 +2422,9 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     else:
         merges = _git(repo, "log", "--reverse", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z",
                       "--format=%H%x09%s", f"origin/{merge_branch}", "--").splitlines()
+    if not merges:
+        return []
+    reverted = _reverted_on_main(repo)
     record = staff.snapshot() if record is None else record
     own_list = _line_value(production)
     scoped: set[Path] = set()
@@ -2385,11 +2450,15 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             continue
         if merge in foreign or not on_main(repo, merge):
             continue
+        if merge in reverted:
+            if isinstance(selection, CompletedStep):
+                raise ChangeReviewError(f"{merge} was reverted on origin/main. No row added.")
+            continue
         commits = merge_commits(repo, merge, excluded_refs=_publication_exclusions(repo, merge, outside_refs))
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
         write_commits = [replace(commit, timestamp=max(commit.timestamp, IMAGES_CHECKED_FROM)) for commit in commits]
         for commit, reason in _uncovered_problems(write_commits):
-            if entries(commit.message):
+            if commit.sha not in reverted and entries(commit.message):
                 print(f"{short}: {commit.sha[:SHORT]} {commit.subject}: {reason}", file=sys.stderr)
         if isinstance(selection, CompletedStep):
             matched_step |= any(isinstance(item.readiness, AfterStep) and item.readiness.step == selection.step
@@ -2456,9 +2525,9 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             print(f"{short}: {commit.sha[:SHORT]} {commit.subject}: {reason}", file=sys.stderr)
 
         for (path, owner_doc), changes in routed.items():
-            selected = changes
+            selected = [change for change in changes if change.checkpoint not in reverted]
             if isinstance(selection, CompletedStep):
-                selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
+                selected = [change for change in selected if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
             rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
@@ -2502,6 +2571,7 @@ class CommandLine(argparse.Namespace):
     see: str = ""
     row: str = ""
     verdict: str = ""
+    reason: str = ""
     validation: str = ""
     kind: str = ""
     production: str = ""
@@ -2796,6 +2866,7 @@ ACTION_OPTIONS: dict[str, tuple[str, ...]] = {
     "mark-important": ("list", "production", "row"),
     "set-kind": ("list", "production", "row", "kind"),
     "verdict": ("list", "production", "row", "verdict", "validation"),
+    "withdraw": ("list", "production", "row", "reason"),
     "list-path": ("production",),
     "showrunner": ("production",),
     "backfill-production": ("list", "write"),
@@ -2880,6 +2951,11 @@ def _run(options: CommandLine) -> int:
                 print(line)
             if isinstance(result, VerdictRefused):
                 return 1
+        case "withdraw":
+            target = _row_option(options)
+            shown = row_display_id(target.path, target.row)
+            written = withdraw_row(target.path, target.row, options.reason, now(), production_doc(options.production))
+            print(f"{shown} withdrawn" if written else f"{shown} already withdrawn")
         case "list-path":
             print(production_list(options.production))
         case "showrunner":
@@ -2917,12 +2993,12 @@ def _run(options: CommandLine) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict",
+    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict", "withdraw",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production", "image", "batch"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
-                 "row", "verdict", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
+                 "row", "verdict", "reason", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

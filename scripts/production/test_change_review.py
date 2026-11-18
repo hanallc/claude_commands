@@ -43,7 +43,7 @@ from scripts.production.change_review import Invisible, Malformed, Visible
 from scripts.production.change_review_test_support import (
     fixture_image, fixture_row_image, pictured_changes, pictured_publication, pictured_review_lines,
 )
-from scripts.review_links import image_store
+from scripts.review_links import image_store, review_events
 
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
@@ -1543,8 +1543,12 @@ class ReadyListTests(ProducerFixture):
         _ = self.git("push", "origin", "integration")
         _ = self.doc.write_text(self.doc.read_text().replace("`main`", "`integration`"))
 
-    def merge_change(self, lines: str, *, branch: str = "old-branch", day: str = "2026-11-13T12:00:00Z") -> str:
+    def merge_change(self, lines: str, *, branch: str = "old-branch", day: str = "2026-11-13T12:00:00Z",
+                     changed_file: str = "") -> str:
         _ = self.git("checkout", "-b", branch)
+        if changed_file:
+            _ = (self.repo / changed_file).write_text("A visible change\n")
+            _ = self.git("add", changed_file)
         environment = {**os.environ, "GIT_AUTHOR_DATE": day, "GIT_COMMITTER_DATE": day}
         message = pictured_review_lines(f"checkpoint({branch}): visible change\n\n{lines}")
         for arguments in (("commit", "--allow-empty", "-m", message),
@@ -1568,6 +1572,20 @@ class ReadyListTests(ProducerFixture):
 
     def live(self, merged: str, step: str = "restart") -> tuple[int, str, str]:
         return run("live", "--repo", str(self.repo), "--production", "top", "--merged", merged, "--step", step)
+
+    def test_list_ready_skips_a_checkpoint_or_merge_reverted_on_main(self) -> None:
+        first = self.merge_change("Change-Review: Reverted checkpoint | Read | Proof", changed_file="checkpoint.txt")
+        second = self.merge_change("Change-Review: Reverted merge | Read | Proof", branch="second", changed_file="merge.txt")
+        _ = self.merge_change("Change-Review: Still live | Read | Proof", branch="live")
+        self.promote()
+        checkpoint = self.git("rev-parse", first + "^2")
+        revert = ("-C", str(self.promotion), "-c", "user.name=Ready fixture", "-c", "user.email=ready@example.invalid",
+                  "-c", "commit.gpgsign=false", "revert", "--no-edit")
+        _ = self.git(*revert, checkpoint)
+        _ = self.git(*revert, "-m", "1", second)
+        _ = self.git("-C", str(self.promotion), "push", "origin", "main")
+        self.assertEqual(self.ready()[0], 0)
+        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Still live"])
 
     def test_add_list_ready_and_live_fill_optional_cells_in_the_pending_table(self) -> None:
         _ = self.listing.write_text("""## To review
@@ -2996,6 +3014,35 @@ class ActionTest(unittest.TestCase):
         self.assertNotIn("| C76 | Panels keep shields | 2026-10-14", text.split("## Reviewed")[0])
         self.assertIn("| # | Change | Verdict | Date | Merged |", text)
         self.assertIn("| --- | --- | --- | --- | --- |\n| C76 | Panels keep shields | Works, thanks | 2026-10-15 | 2026-10-14 |\n| C70 |", text)
+
+    def test_withdraw_an_open_row_and_keep_the_users_words_and_time(self) -> None:
+        words = "The panels are back | Keep the old behavior"
+        arguments = ("withdraw", "--production", DOC, "--list", str(self.path), "--row", "C76", "--reason", words)
+        self.enterContext(mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.path.parent / "review-links")}))
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            for _ in range(2):
+                code, _, error = run(*arguments)
+                self.assertEqual(code, 0, error)
+        snapshot = change_review.review_snapshot(self.path)
+        self.assertEqual([row["#"] for row in snapshot.pending], ["C77"])
+        row = next(row for row in snapshot.reviewed if row["#"] == "C76")
+        self.assertEqual((row["Verdict"], row["Date"], row["Merged"]), ("withdrawn", "2026-11-13", "2026-10-14"))
+        self.assertEqual(review_events.decode(row["Review log"]),
+                         (review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"),))
+
+    def test_withdraw_a_reviewed_row_and_keep_its_previous_verdict(self) -> None:
+        words = "The change was reverted"
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            code, _, error = run("withdraw", "--production", DOC, "--list", str(self.path),
+                                 "--row", "C70", "--reason", words)
+            self.assertEqual(code, 0, error)
+        snapshot = change_review.review_snapshot(self.path)
+        self.assertEqual([row["#"] for row in snapshot.pending], ["C76", "C77"])
+        row, = snapshot.reviewed
+        self.assertEqual((row["#"], row["Verdict"], row["Date"]), ("C70", "withdrawn", "2026-11-13"))
+        previous, withdrawal = review_events.decode(row["Review log"])
+        self.assertEqual((previous.words, previous.time.date()), ("works", date(2026, 10, 13)))
+        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"))
 
     def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
         for action in ("edit", "verdict"):

@@ -152,6 +152,7 @@ The server deletes unclaimed images after `change_image_unclaimed_days`, which s
 All merge callers use `list_ready` after the final promotion step succeeds, including the Mac pull.
 It fetches `origin main` and scans merge commits from 2026-11-06.
 It adds each uncovered checkpoint line, including after an interrupted call.
+It skips any checkpoint or merge named in a Git revert message on `origin/main`.
 A row covers a text-matched change when its merge contains that checkpoint or its merge is unknown.
 An edited row covers a change from the same merge only when its Producer matches the checkpoint unit's fixed staff id.
 Within each producer, pair ready changes first, in commit order.
@@ -411,6 +412,19 @@ The fix returns as a new row.
 Rerunning the same verdict prints `already has this verdict`, the first run's
 line and the scratch removal lines. A different verdict for a Reviewed row is
 refused; it still ends the row's scratch folders.
+
+## withdraw
+
+Use this action when the user withdraws an open or reviewed change.
+
+```sh
+… withdraw [--production <name>] --row <id> --reason "<the user's words>"
+```
+
+Pass the displayed ID, such as `hana/C386`.
+The row moves to Reviewed with the verdict `withdrawn`.
+The Review log keeps the user's words, the withdrawal time and any previous verdict.
+A repeat with the same words leaves the history unchanged.
 
 ## Validate
 
