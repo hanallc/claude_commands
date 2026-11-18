@@ -2810,3 +2810,14 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `74b5acf8d`.
 
 **Files:** none.
+
+### Phase 151 — A paired AWS trial takes all its cloud slots at once  · status: done
+
+Builds 11-18 09:04: the paired workers of trial 0bcb636d held 5 AWS cloud slots for 4 min with no box launched, while the other 2 modules of the trial waited for slots. The rows showed "progress missing".
+
+1. A paired trial waits in the Queued table until all its slots are free; the admission service then admits all its members in one pass.
+2. No row shows as running before its box request starts; a reserved slot shows in Queued as "waits for launch" until the first `run-instances` call.
+3. A blocked group at the head holds its place; a group larger than the slot limit refuses at once; a dead member does not hang the group.
+4. Measure how long paired workers held slots before launch.
+
+**Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/build_queue/admission_wire.py`, `scripts/build_queue/admission_service.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/queue_view.py`, and their tests.

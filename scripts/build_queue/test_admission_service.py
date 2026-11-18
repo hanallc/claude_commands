@@ -3315,7 +3315,8 @@ class CloudAdmissionTests(unittest.TestCase):
                 _ = sidecar.write_text("")
                 request = replace(self.cloud_request(fixture), sidecar=str(sidecar))
                 grant = only_admitted(fixture.server.handle_request(request))
-                cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 32, 0, fixture.clock.now() - 15))
+                cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 32, 0, fixture.clock.now()))
+                fixture.clock.advance(15)
                 waiting = self.cloud_request(fixture)
                 self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
                 local_requests: list[wire.AdmitRequest] = []
@@ -3430,8 +3431,170 @@ class CloudAdmissionTests(unittest.TestCase):
         return reply.reading
 
     def cloud_request(self, fixture: AdmissionFixture, *, step: str = "merge-gate",
-                      run: wire.RunIdentity | wire.NoRun = wire.NO_RUN) -> wire.AdmitRequest:
-        return replace(fixture.request(need=40 * GIB, step=step, run=run), place=wire.CloudPlace("aws"))
+                      run: wire.RunIdentity | wire.NoRun = wire.NO_RUN,
+                      group: status_wire.CloudGroup | status_wire.NoCloudGroup = status_wire.NO_CLOUD_GROUP
+                      ) -> wire.AdmitRequest:
+        return replace(fixture.request(need=40 * GIB, step=step, run=run), place=wire.CloudPlace("aws", group))
+
+    def cloud_group(self, fixture: AdmissionFixture, key: str, size: int) -> status_wire.CloudGroup:
+        return status_wire.CloudGroup(key, size, fixture.clock.now(), fixture.proc.spawn())
+
+    def test_cloud_group_waits_for_all_members_and_slots_before_it_admits(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=3)
+            blocker = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            group = self.cloud_group(fixture, "trial", 3)
+            requests = [replace(self.cloud_request(fixture, group=group), sidecar=str(fixture.root / f"{i}.cgroup"))
+                        for i in range(3)]
+            for request in requests:
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            follower = self.cloud_request(fixture)
+            self.assertIsInstance(fixture.server.handle_request(follower)[0], wire.Wait)
+            self.assertEqual(len(fixture.server.reservations), 1)
+            queued = self.reading(fixture)
+            assert isinstance(queued, wire.CloudQueueRead)
+            self.assertEqual(sum(isinstance(row.wait.state, status_wire.WaitingForCloudSlot)
+                                 for row in queued.cloud if isinstance(row.wait, wire.CloudSlotWait)), 4)
+
+            fixture.release(blocker)
+            _ = fixture.run_pass()
+            episodes = {request.episode for request in requests}
+            self.assertEqual(set(fixture.server.reservations), episodes)
+            saved = wire.parse_record(fixture.state_text(), service.ServiceState)
+            self.assertEqual(set(saved.reservations), episodes)
+            self.assertEqual(len({record.admitted_at for record in saved.reservations.values()}), 1)
+            self.assertFalse(saved.pending_cloud_groups)
+            self.assertIn(follower.episode, fixture.server.waiters)
+            waiting = self.reading(fixture)
+            assert isinstance(waiting, wire.CloudQueueRead)
+            self.assertTrue(all(isinstance(row.wait, wire.CloudSlotWait) for row in waiting.cloud))
+            self.assertEqual(sum(isinstance(row.wait.state, status_wire.ReservedCloudSlot) for row in waiting.cloud
+                                 if isinstance(row.wait, wire.CloudSlotWait)), 3)
+
+            launched = requests[0]
+            requesting = cloud_progress.CloudProgress("requesting", 0, 0, fixture.clock.now(), stage="launch")
+            cloud_progress.publish(Path(launched.sidecar), requesting)
+            _ = fixture.run_pass()
+            reading = self.reading(fixture)
+            assert isinstance(reading, wire.CloudQueueRead)
+            running, = (row for row in reading.cloud if isinstance(row.wait, records.ReadyForAdmission))
+            self.assertEqual(running.owner, launched.owner)
+            self.assertEqual(running.progress, requesting)
+
+    def test_cloud_progress_failure_preserves_the_launch_state(self) -> None:
+        from scripts.build_queue import cloud_progress
+
+        for launch_seen in (False, True):
+            with self.subTest(launch_seen=launch_seen), AdmissionFixture() as fixture:
+                sidecar = fixture.root / "cloud.cgroup"
+                request = replace(self.cloud_request(fixture), sidecar=str(sidecar))
+                _ = only_admitted(fixture.server.handle_request(request))
+                if launch_seen:
+                    cloud_progress.publish(sidecar,
+                        cloud_progress.CloudProgress("requesting", 0, 0, fixture.clock.now()))
+                    _ = fixture.run_pass()
+                    visible = self.reading(fixture)
+                    assert isinstance(visible, wire.CloudQueueRead)
+                    self.assertIsInstance(visible.cloud[0].wait, records.ReadyForAdmission)
+
+                _ = sidecar.with_suffix(".cgroup.cloud.json").write_text("{")
+                for restart in (False, True):
+                    if restart:
+                        fixture.restart()
+                    else:
+                        _ = fixture.run_pass()
+                    reading = self.reading(fixture)
+                    assert isinstance(reading, wire.CloudQueueRead)
+                    row, = reading.cloud
+                    self.assertEqual(row.progress, cloud_progress.NoCloudProgress("missing"))
+                    if launch_seen:
+                        self.assertIsInstance(row.wait, records.ReadyForAdmission)
+                    else:
+                        assert isinstance(row.wait, wire.CloudSlotWait)
+                        self.assertEqual(row.wait, wire.CloudSlotWait(1, reading.cloud_slots,
+                            status_wire.ReservedCloudSlot()))
+                        self.assertEqual(row.wait.text, "waits for launch")
+
+    def test_cloud_group_refuses_if_it_is_larger_than_the_limit(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=2)
+            waiting = self.cloud_request(fixture, group=self.cloud_group(fixture, "blocked", 2))
+            self.assertIsInstance(fixture.server.handle_request(waiting)[0], wire.Wait)
+            too_large = self.cloud_request(fixture, group=self.cloud_group(fixture, "too-large", 3))
+            self.assertEqual(fixture.server.handle_request(too_large),
+                             [wire.Refused("cloud group needs 3 slots but only 2 are configured")])
+            self.assertEqual(set(fixture.server.waiters), {waiting.episode})
+            self.assertFalse(fixture.server.reservations)
+
+    def test_cloud_group_keeps_order_during_reconnect_and_restart(self) -> None:
+        for restart in (False, True):
+            with self.subTest(restart=restart), AdmissionFixture() as fixture:
+                fixture.configure(cloud_gate_slots=2)
+                group = self.cloud_group(fixture, "first", 2)
+                first = self.cloud_request(fixture, group=group)
+                peer = fixture.connect(first)
+                self.assertIsInstance(peer.replies()[0], wire.Wait)
+                if restart:
+                    fixture.restart()
+                else:
+                    peer.close()
+                    fixture.server.run_once(0)
+                self.assertFalse(fixture.server.waiters)
+                fixture.clock.advance(1)
+                later = self.cloud_group(fixture, "second", 1)
+                follower = self.cloud_request(fixture, group=later)
+                self.assertIsInstance(fixture.server.handle_request(follower)[0], wire.Wait)
+                fixture.clock.advance(299)
+                second = self.cloud_request(fixture, group=group)
+                self.assertIsInstance(fixture.server.handle_request(second)[0], wire.Wait)
+                reading = self.reading(fixture)
+                assert isinstance(reading, wire.CloudQueueRead)
+                self.assertEqual([row.owner for row in reading.cloud], [second.owner, follower.owner])
+                self.assertTrue(all(isinstance(row.wait, wire.CloudSlotWait) for row in reading.cloud))
+                reconnected = replace(first, since=fixture.clock.now())
+                _ = only_admitted(fixture.server.handle_request(reconnected))
+                self.assertEqual(set(fixture.server.reservations), {first.episode, second.episode})
+                self.assertIn(follower.episode, fixture.server.waiters)
+
+    def test_dead_cloud_member_is_dropped_and_dead_coordinator_refuses_the_group(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.configure(cloud_gate_slots=3)
+            blocker = only_admitted(fixture.server.handle_request(self.cloud_request(fixture)))
+            group = self.cloud_group(fixture, "trial", 3)
+            first, second, dead = (self.cloud_request(fixture, group=group) for _ in range(3))
+            for request in (first, second, dead):
+                self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
+            fixture.end_owner(dead.owner)
+            fixture.release(blocker)
+            _ = fixture.run_pass()
+            self.assertNotIn(dead.episode, fixture.server.waiters)
+            self.assertEqual(set(fixture.server.waiters), {first.episode, second.episode})
+            self.assertFalse(fixture.server.reservations)
+            fixture.clock.advance(300)
+            _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.waiters), {first.episode, second.episode})
+            fixture.end_owner(group.coordinator)
+            _ = fixture.run_pass()
+            for surviving in (first, second):
+                self.assertEqual(fixture.server.handle_request(surviving),
+                    [wire.Refused("cloud group coordinator no longer exists")])
+            self.assertFalse(fixture.server.waiters)
+            self.assertFalse(fixture.server.reservations)
+            self.assertFalse(fixture.server.pending_cloud_groups)
+
+    def test_cloud_request_wire_keeps_the_legacy_single_slot_shape(self) -> None:
+        with AdmissionFixture() as fixture:
+            single = self.cloud_request(fixture)
+            encoded = status_wire.encode_request(single)
+            self.assertIn('"place":{"kind":"CloudPlace","target":"aws"}', encoded)
+            self.assertEqual(status_wire.parse_request(encoded), single)
+            grouped = self.cloud_request(fixture, group=self.cloud_group(fixture, "trial", 3))
+            encoded_group = status_wire.encode_request(grouped)
+            self.assertEqual(status_wire.parse_request(encoded_group), grouped)
+            with self.assertRaisesRegex(ValueError, "invalid admission envelope"):
+                _ = status_wire.parse_envelope(encoded_group, {"admit": wire.AdmitRequest})
 
     def test_cloud_starts_with_full_local_memory_and_charges_zero(self) -> None:
         for step in ("merge-gate", "targeted-test"):

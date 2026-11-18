@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_startup, copy_test_runner
 
-from collections.abc import Callable, Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
 import json
+import multiprocessing
+from multiprocessing.connection import Connection
 import os
 import pathlib
 import re
@@ -30,6 +32,8 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
+from scripts.build_queue import cloud_progress
+from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
@@ -900,6 +904,152 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
                     '--modules', *[f'fixture/test_{number}.py' for number in range(10)]], self.state)
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(output.getvalue()), {'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True})
+
+    def test_paired_worker_exit_during_cost_check_aborts_the_survivor(self) -> None:
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        cohort = self.root / 'trial'
+        for name in ('first', 'second'):
+            folder = cohort / name
+            folder.mkdir(parents=True)
+            cloud_gate.save(folder / 'request.json', {'attempt': name, 'module': name, 'rounds': 1})
+        context = multiprocessing.get_context('fork')
+        cost_check = context.Event()
+        pipe_closed = context.Event()
+        received = cohort / 'received'
+
+        def module(folder: Path, _directory: Path, _settings: Path, connection: trial.LaunchBarrier,
+                   *, group: CloudGroup) -> None:
+            self.assertEqual(group.size, 2)
+            try:
+                connection.send('ready')
+                if folder.name == 'second':
+                    self.assertTrue(cost_check.wait(TEST_HANG_GUARD_SECS))
+                else:
+                    _ = received.write_text(str(connection.recv()))
+            finally:
+                connection.close()
+                if folder.name == 'second':
+                    pipe_closed.set()
+
+        def charges(_record_query: Callable[[Decimal], None]) -> None:
+            cost_check.set()
+            self.assertTrue(pipe_closed.wait(TEST_HANG_GUARD_SECS))
+
+        errors = StringIO()
+        with (mock.patch.object(trial, 'paired_module', new=module),
+              mock.patch.object(trial, 'cleanup_trial', return_value=True),
+              mock.patch.object(cloud_gate.GateWorker, 'reconcile'),
+              mock.patch.object(cloud_gate.GateWorker, 'charges', side_effect=charges),
+              redirect_stdout(StringIO()), redirect_stderr(errors)):
+            self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+        self.assertIn('second: The module ended before launch', errors.getvalue())
+        self.assertEqual(received.read_text(), 'abort')
+
+    def test_paired_launch_send_failure_aborts_only_workers_still_waiting(self) -> None:
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        cohort = self.root / 'trial'
+        names = ('first', 'second', 'third', 'fourth')
+        # The coordinator sends in the order of the request paths.
+        for index, name in enumerate(names):
+            folder = cohort / f'{index}-{name}'
+            folder.mkdir(parents=True)
+            cloud_gate.save(folder / 'request.json', {'attempt': folder.name, 'module': name, 'rounds': 1})
+        context = multiprocessing.get_context('fork')
+        exit_worker = context.Event()
+        pipe_closed = context.Event()
+        last_received = context.Event()
+
+        def module(folder: Path, _directory: Path, _settings: Path, connection: trial.LaunchBarrier,
+                   *, group: CloudGroup) -> None:
+            self.assertEqual(group.size, len(names))
+            try:
+                connection.send('ready')
+                if folder.name == '1-second':
+                    self.assertTrue(exit_worker.wait(TEST_HANG_GUARD_SECS))
+                    return
+                message = connection.recv()
+                if folder.name == '3-fourth':
+                    last_received.set()
+                if folder.name == '0-first':
+                    self.assertTrue(last_received.wait(TEST_HANG_GUARD_SECS))
+                _ = (folder / 'received').write_text(str(message))
+            finally:
+                connection.close()
+                if folder.name == '1-second':
+                    pipe_closed.set()
+
+        send = Connection.send
+
+        def send_then_stop_worker(connection: Connection, message: object) -> None:
+            send(connection, message)
+            if message == 'launch':
+                exit_worker.set()
+                self.assertTrue(pipe_closed.wait(TEST_HANG_GUARD_SECS))
+
+        errors = StringIO()
+        with (mock.patch.object(Connection, 'send', new=send_then_stop_worker),
+              mock.patch.object(trial, 'paired_module', new=module),
+              mock.patch.object(trial, 'reserve_trial'),
+              mock.patch.object(trial, 'cleanup_trial', return_value=True),
+              redirect_stdout(StringIO()), redirect_stderr(errors)):
+            self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+        self.assertIn('Broken pipe', errors.getvalue())
+        self.assertEqual((cohort / '0-first' / 'received').read_text(), 'launch')
+        for folder in ('2-third', '3-fourth'):
+            self.assertEqual((cohort / folder / 'received').read_text(), 'abort')
+
+    def test_paired_worker_leaves_launch_progress_to_the_box_request(self) -> None:
+        folder = self.root / 'trial' / 'module'
+        folder.mkdir(parents=True)
+        request: dict[str, object] = {'attempt': 'module'}
+        cloud_gate.save(folder / 'request.json', request)
+        cloud_gate.save(folder / 'deployment.json', {})
+        sidecar = folder / 'reservation.cgroup'
+        now = 1_800_000_000.0
+        trial_group = CloudGroup('trial', 3, now, Owner(1, 'fixture'))
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-1', 1), ledger.CostLedger(self.state),
+            self.settings, sidecar, clock=lambda: now)
+        slot = cloud_gate.CloudReservation(sidecar)
+        events: list[object] = []
+
+        @contextmanager
+        def reserve(repo: Path, path: Path, mode: merge_gate.SuiteMode, *,
+                    group: CloudGroup) -> Generator[cloud_gate.CloudReservation]:
+            self.assertEqual((repo, path, mode, group),
+                (folder, sidecar, merge_gate.SuiteMode.TARGETED_TEST, trial_group))
+            yield slot
+
+        testcase = self
+
+        class Barrier:
+            def send(self, obj: object, /) -> None:
+                events.append(obj)
+
+            def recv(self) -> str:
+                testcase.assertIsInstance(cloud_progress.read(sidecar), cloud_progress.NoCloudProgress)
+                events.append('launch')
+                return 'launch'
+
+            def close(self) -> None:
+                events.append('closed')
+
+        def execute(path: Path, saved: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
+            self.assertEqual((path, saved, deployment), (folder, request, {}))
+            self.assertIsInstance(cloud_progress.read(sidecar), cloud_progress.NoCloudProgress)
+            return {'status': 'complete'}
+
+        with (mock.patch.object(cloud_gate, 'GateWorker', return_value=worker),
+              mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=reserve),
+              mock.patch.object(worker, 'execute', side_effect=execute),
+              mock.patch.object(trial, 'cleanup_trial', return_value=True)):
+            trial.paired_module(folder, self.state, self.settings, Barrier(), group=trial_group)
+        self.assertEqual(events, ['ready', 'launch', 'closed'])
+        self.assertEqual(cloud_gate.read(folder / 'outcome.json'), {'status': 'complete'})
+        self.assertEqual(slot.status, 0)
 
     def test_terminal_exception_stops_the_owning_service(self) -> None:
         with (mock.patch.object(subprocess, 'call', side_effect=OSError('fixture')),
