@@ -33,7 +33,7 @@ from uuid import uuid4
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review, investigation, staff, the_list
-from scripts.review_links import accounts_page, change_browser, change_page, console, images, investigations_page, list_page, review_page, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, images, investigations_page, list_page, review_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -184,6 +184,31 @@ class ReviewLinksServerTests(unittest.TestCase):
         start.reset_mock()
         self.assertEqual(self.post("/disks/measure", "force=1"), (200, answer))
         start.assert_called_once_with(ANY, force=True)
+
+    def test_for_you_json_reads_global_actions_without_caching_the_response(self) -> None:
+        payload: console.ForYouPayload = {"available": True, "count": 0, "entries": []}
+        with patch.object(console, "for_you_payload", return_value=payload) as read:
+            status, headers, body = self.head("/console/for-you.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(read.call_count, 1)
+        with patch.object(console, "for_you_payload", side_effect=OSError("Fixture read failed.")):
+            reply = self.request("/console/for-you.json")
+        self.assertEqual(reply.status, 503)
+        self.assertEqual(json.loads(reply.body), {"available": False})
+
+    def test_for_you_count_view_sends_no_command_text(self) -> None:
+        row = for_you.ForYouRow("action/fixture", "action", "Long command", "x" * 70000,
+                               "mac", "/fixture", "sdlc", "Login", "Release", "", "open", "manual", "")
+        with patch.object(for_you, "read", return_value=for_you.ForYouSnapshot((row,), ())) as read:
+            status, headers, body = self.head("/console/for-you.json?view=count")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(sorted(cast(dict[str, object], json.loads(body))), ["available", "count"])
+        self.assertEqual(json.loads(body), {"available": True, "count": 1})
+        self.assertEqual(read.call_count, 1)
 
     def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {

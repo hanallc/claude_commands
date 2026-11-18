@@ -106,7 +106,7 @@ class ProducerQuestionTests(RegistrationFixture):
         self.assertNotIn("No showrunner owns this question.", body)
         instance = self.state / "notifier" / f"showrunner-{self.producer.id}"
         sources: list[Path] = []
-        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("For you: 1 question", ""))
+        self.assertEqual(counts_row.row(instance, sources, require_complete=True), ("Review: 1 question", ""))
         question = prepared.questions[0].record
         self.assertIn(question.path, sources)
         self.assertIn("Choose the next project?", next_item.show("question", urgency.URGENT, None))
@@ -408,7 +408,7 @@ class QuestionIdentityTests(RegistrationFixture):
                                                 questions=len(registration.read_open_items(self.outstanding())))
             sources = footer_counts.sources(self.doc)
         self.assertEqual(counts.questions, 1)
-        self.assertEqual(footer_counts.counts_line(counts), "For you: 1 question")
+        self.assertEqual(footer_counts.counts_line(counts), "Review: 1 question")
         for record in self.issues.glob("*.md"):
             self.assertIn(record, sources)
 
