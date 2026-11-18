@@ -150,6 +150,9 @@ def main() -> None:
                 if option == "--arg" and name == "pwd"), os.getcwd())
     branch = current_branch(payload, pwd) if role == "unit-director" else ""
     rebuild_config = Path(__file__).resolve().parents[2] / "config/statusline.conf"
+    system = os.environ.get("STATUSLINE_SYSTEM") or os.uname().sysname
+    action_count = (for_you_count.console_action_count() if system == "Darwin"
+                    else for_you_count.global_action_count(rebuild_config))
     rebuild = rebuild_row.read(rebuild_config)
     if rebuild.refresh_due:
         try:
@@ -160,9 +163,6 @@ def main() -> None:
             )
         except OSError:
             pass
-    system = os.environ.get("STATUSLINE_SYSTEM", os.uname().sysname)
-    action_count = (for_you_count.console_action_count() if system == "Darwin"
-                    else for_you_count.global_action_count(rebuild_config))
     os.execvp("jq", ["jq", "-n", "--argjson", "payload", json.dumps(payload),
                      "--arg", "assignment", label, "--arg", "role", role,
                      "--arg", "counts", counts_rows(record, session_id),

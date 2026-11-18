@@ -39,7 +39,7 @@ from scripts.statusline import adhoc_items, assignment, counts_row, for_you_coun
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
-CONSOLE_HOST_SHELL = "uname() { echo Linux; }; "
+CONSOLE_HOST_SHELL = "export STATUSLINE_SYSTEM=Linux; "
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Preserve the fixture PATH when NixOS starts a child shell.
@@ -511,12 +511,12 @@ class ForYouStatusTests(unittest.TestCase):
                 '#!/bin/sh\n[ "$*" = "ip -4 fixture-console" ] || exit 1\necho 127.0.0.1\n')
             tailscale.chmod(0o755)
             config = home / "config"
-            command = "uname() { echo Darwin; }; " + fixture_command(home)
+            command = fixture_command(home)
             seed_rebuild_cache(home, config / "statusline.conf")
             _ = write_config_fixture(config / "console.conf", "for_you.host=fixture-console\n")
             with ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHost) as server:
                 _ = write_config_fixture(config / "review_links.conf", f"server_port={server.server_port}\n")
-                env = {**SHELL_ENVIRONMENT, "HOME": directory, "CONF_DIR": str(config),
+                env = {**SHELL_ENVIRONMENT, "HOME": directory, "CONF_DIR": str(config), "STATUSLINE_SYSTEM": "Darwin",
                        "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home)),
                        "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
                 thread = Thread(target=server.serve_forever, daemon=True)
@@ -2386,17 +2386,23 @@ class RebuildRowTests(unittest.TestCase):
             staff_file = home / "staff.json"
             _ = staff_file.write_text(staff_text(), encoding="utf-8")
             built = cache.stat().st_mtime_ns
-            for unreadable in (False, True):
-                if unreadable:
+            for source in ("ready", "actions", "needs"):
+                actions = fixture_actions(home)
+                if source == "actions":
+                    actions = actions.with_name("malformed-actions")
+                    actions.mkdir(parents=True)
+                    depth = 2 * sys.getrecursionlimit()
+                    _ = (actions / "action.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+                elif source == "needs":
                     (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
                 for shell in SHELLS:
-                    with self.subTest(shell=shell, unreadable=unreadable):
+                    with self.subTest(shell=shell, source=source):
                         result = subprocess.run([shell, "-c", command], input="{}", capture_output=True, text=True,
                                                 check=True, env={**SHELL_ENVIRONMENT, "HOME": directory,
-                                                                 "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home)),
+                                                                 "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = "For you: Unavailable" if unreadable else "For you: \x1b[1m1\x1b[22m action"
+                        expected = "For you: \x1b[1m1\x1b[22m action" if source == "ready" else "For you: Unavailable"
                         self.assertEqual(result.stdout.splitlines()[-1], expected)
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)

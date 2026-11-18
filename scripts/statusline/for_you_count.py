@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from http.client import HTTPConnection, HTTPException
+from http.client import HTTPConnection
 from ipaddress import IPv4Address
 from pathlib import Path
 from typing import cast
@@ -17,9 +17,10 @@ def global_action_count(config: Path) -> str:
     """Return a complete action count or an explicit unavailable result."""
     try:
         count = for_you.read(config).open_count
-    except (OSError, ValueError):
+        return str(count.value) if isinstance(count, for_you.KnownOpenCount) else "unavailable"
+    except Exception:
+        # Keep the status line available when a count source fails.
         return "unavailable"
-    return str(count.value) if isinstance(count, for_you.KnownOpenCount) else "unavailable"
 
 
 def console_action_count() -> str:
@@ -41,11 +42,11 @@ def console_action_count() -> str:
             payload = cast(object, json.loads(response.read()))
         finally:
             connection.close()
-    except (HTTPException, OSError, ValueError, subprocess.SubprocessError):
+        if isinstance(payload, dict):
+            fields = cast(dict[str, object], payload)
+            count = fields.get("count")
+            if fields.get("available") is True and type(count) is int and count >= 0:
+                return str(count)
+    except Exception:
         return "unavailable"
-    if isinstance(payload, dict):
-        fields = cast(dict[str, object], payload)
-        count = fields.get("count")
-        if fields.get("available") is True and type(count) is int and count >= 0:
-            return str(count)
     return "unavailable"

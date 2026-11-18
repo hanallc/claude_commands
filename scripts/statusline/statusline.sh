@@ -45,7 +45,7 @@ export TZ="${zone:-America/New_York}"
 [ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
-STAFF_FILE="$staff" STATUSLINE_SYSTEM="$(uname -s)" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" \
+STAFF_FILE="$staff" exec "$statusline/../lib/py" --isolated "$statusline/assignment.py" \
   -r --arg pwd "$PWD" --arg account "$account" --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
   --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"
