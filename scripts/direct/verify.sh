@@ -842,8 +842,12 @@ run_step() {
     if [[ -n "${HOLD_WAIT_DIR:-}" && -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
         release_wait_claim
     fi
-    local attempt status started ended step_log monitor=0
+    local attempt status started ended step_log monitor=0 LINT_REPAIR_REUSED_GRANT=0
     local STEP_WRITES_TREE=0
+    if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
+        build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
+        return 2
+    fi
     if step_writes_tree "$@"; then
         STEP_WRITES_TREE=1
         # Keep the call's decision for the next step.
@@ -868,6 +872,7 @@ run_step() {
     RUN_LAST_ATTEMPT_KILLED=0
     step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
     for attempt in 1 2; do
+        LINT_REPAIR_REUSED_GRANT=0
         if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
         if buildlog_step_compiles "$@"; then
             route_compiling_step "$@" || { status=$?; rm -f "$step_log"; return "$status"; }
@@ -890,6 +895,9 @@ run_step() {
             set +m
             if (
                 step_token_before=${TOKEN_HELD:-0}
+                if (( LINT_REPAIR_REUSED_GRANT )) || [[ "${LINT_MEND_WAIT:-0}" == 1 ]]; then
+                    BUILDLOG_PRELAUNCH_OUTCOME=abandon
+                fi
                 # The pipeline shell owns tokens taken during memory admission.
                 trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
                 run_once "$@"
@@ -912,12 +920,17 @@ run_step() {
             status=$?
         fi
         RUN_STEP_PID=""
+        if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
             RUN_LAST_ATTEMPT_KILLED=0
             rm -f "$step_log"
             return 0
+        fi
+        if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]]; then
+            rm -f "$step_log"
+            return "$status"
         fi
         # A repairable tool failure may continue a lint pass. A failed check
         # must end the call even when that tool's caller handles failures.
@@ -937,9 +950,7 @@ run_step() {
             return "$status"
         fi
         if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]] || step_stopped_by_hold; }; then
-            if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
-                PLACEMENT_RETRY=1
-            else
+            if [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 echo 'verify.sh: natedev hold stopped this step; choosing its target again.' >&2
             fi
             status=0
@@ -2477,27 +2488,34 @@ initialize_step_record() {
 route_compiling_step() {
     local command=$1
     STEP_RAN_ON_MAC=0 MAC_PASSED=0
-    if [[ "${PLACEMENT_RETRY:-0}" != 1 ]]; then
-        PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
-        PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
-        PLACEMENT_OWNER_PID=$$
-        PLACEMENT_SINCE="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}"
-        PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+    if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
+        local token_status=0 reason
+        take_local_placement || token_status=$?
+        LINT_REPAIR_PENDING_GRANT=0
+        if (( token_status == 0 )); then
+            if reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
+                    "$PLACEMENT_ASSIGNMENT_FILE" "$PLACEMENT_GRANT_FILE" "$PLACEMENT_EPISODE" "$$" "${LINT_COPY_TREE:-}" "$@"); then
+                # Keep the sidecar that the grant uses to find its build scope.
+                local grant_peak=$BUILDLOG_PEAK
+                buildlog_begin "$@" || true
+                BUILDLOG_PEAK=$grant_peak
+                BUILDLOG_PLACEMENT_PREPARED=1
+                LINT_REPAIR_REUSED_GRANT=1
+                return 0
+            fi
+            echo "verify.sh: cannot reuse the judgment grant: ${reason:-grant check failed}. Requesting placement again." >&2
+            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+                --pid "$PLACEMENT_OWNER_PID" --reason "the judgment grant cannot cover the lint repair" >/dev/null || return $?
+        elif (( token_status != 10 )); then
+            return "$token_status"
+        fi
+        unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
     fi
-    PLACEMENT_RETRY=0
-    export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+    if [[ "${PLACEMENT_OUTCOME:-}" != retry ]]; then PLACEMENT_EPISODE=""; fi
     PLACEMENT_COMMAND=("$@")
-    PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
-    PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
-    if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
-        mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
-        LINT_MEMORY_WAIT_FILE=""
-    fi
     PLACEMENT_SESSION=$(verify_helper "$BUILD_TARGETS_SCRIPT" submitting-session) || return $?
     export PLACEMENT_SESSION
     if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
-        PLACEMENT_EPISODE="$BUILDLOG_FIRST_STEP_EPISODE"
-        PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
         local request_status=0
         placement_once || request_status=$?
         PLACEMENT_EPISODE=""
@@ -2643,7 +2661,29 @@ PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
+PLACEMENT_OUTCOME=""
 MAC_BACKOFF_PROBED=0
+
+apply_placement_outcome() {
+    [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]] || return 0
+    local episode="" outcome=""
+    IFS=$'\t' read -r episode outcome < "$PLACEMENT_GRANT_FILE.outcome" || true
+    rm -f -- "$PLACEMENT_GRANT_FILE.outcome" || true
+    unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
+    if [[ "$episode" != "$PLACEMENT_EPISODE" ]]; then outcome=unresolved; fi
+    case "$outcome" in
+        done|abandon)
+            PLACEMENT_EPISODE="" BUILDLOG_PLACEMENT_EPISODE=""
+            ;;
+        retry) ;;
+        *)
+            outcome=unresolved
+            PLACEMENT_CLEANUP_ERROR="could not cancel placement episode $PLACEMENT_EPISODE during step cleanup"
+            printf 'verify.sh: %s\n' "$PLACEMENT_CLEANUP_ERROR" >&2
+            ;;
+    esac
+    PLACEMENT_OUTCOME=$outcome
+}
 
 # A placement that fails before its step starts leaves the run without a
 # verdict. 78 (wait) and the left-queue status are not failures. A refusal (2)
@@ -2660,6 +2700,21 @@ placement_failed() {
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
+    if [[ -z "$PLACEMENT_EPISODE" ]]; then
+        PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
+        PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER}"
+        PLACEMENT_OWNER_PID=$$
+        PLACEMENT_SINCE="${BUILDLOG_FIRST_STEP_SINCE:-${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}}"
+        PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
+        PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
+        PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
+        if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
+            mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
+            LINT_MEMORY_WAIT_FILE=""
+        fi
+        export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
+    fi
+    PLACEMENT_OUTCOME=""
     # route_test released any token before placement; a local grant takes it.
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
@@ -2789,6 +2844,43 @@ wait_for_claim_recovery() {
     HOLD_WAITER_PID=""
 }
 
+take_local_placement() {
+    # The grant keeps its reservation while the call takes its unit's cargo token.
+    local token_status=0
+    TOKEN_WAIT_HOLD_CHECK=build_hold_check_local
+    acquire_token local || token_status=$?
+    TOKEN_WAIT_HOLD_CHECK=""
+    if (( token_status == 10 )); then
+        # A natedev hold started before the token came: give back the grant and place again.
+        record_token_wait
+        export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
+        export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
+        BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+        if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
+            buildlog_release_memory 10 abandon
+        else
+            source "$PLACEMENT_GRANT_FILE" || return $?
+            buildlog_release_memory 10
+        fi
+        apply_placement_outcome
+        if [[ "$PLACEMENT_OUTCOME" == unresolved ]]; then
+            build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
+            return 2
+        fi
+        echo 'verify.sh: natedev hold started during the cargo token wait; choosing its target again.' >&2
+        return 10
+    fi
+    if (( token_status != 0 )); then
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+            --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the cargo token wait ended" >/dev/null || true
+        return "$token_status"
+    fi
+    record_token_wait
+    if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
+    export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
+    export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
+}
+
 route_test() {
     local last_decline="" wait_reason="" name eligibility reason settings platform
     while IFS=$'\t' read -r name eligibility reason settings platform; do
@@ -2848,36 +2940,13 @@ route_test() {
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
             if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 ]]; then
-                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "local memory permits lint repair" >/dev/null || return $?
+                LINT_REPAIR_PENDING_GRANT=1
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
-            # The grant keeps its reservation while the call takes its unit's cargo token.
             local token_status=0
-            TOKEN_WAIT_HOLD_CHECK=build_hold_check_local
-            acquire_token local || token_status=$?
-            TOKEN_WAIT_HOLD_CHECK=""
-            if (( token_status == 10 )); then
-                # A natedev hold started before the token came: give back the grant and place again.
-                record_token_wait
-                export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
-                export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-                source "$PLACEMENT_GRANT_FILE" || return $?
-                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
-                buildlog_release_memory 10
-                echo 'verify.sh: natedev hold started during the cargo token wait; choosing its target again.' >&2
-                continue
-            fi
-            if (( token_status != 0 )); then
-                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the cargo token wait ended" >/dev/null || true
-                return "$token_status"
-            fi
-            record_token_wait
-            if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
-            export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
-            export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-            return 0
+            take_local_placement || token_status=$?
+            if (( token_status == 10 )); then continue; fi
+            return "$token_status"
         fi
         if [[ "${TOKEN_USED:-0}" == 1 ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" report-prerequisite --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
@@ -3965,6 +4034,7 @@ verify_cleanup() {
         interrupted) outcome=interrupted ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    apply_placement_outcome
     finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "${MEM_KILL_FILE}.stopped"
@@ -3976,7 +4046,7 @@ verify_cleanup() {
     fi
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "$TOKEN_WAIT_FILE" "${TOKEN_WAIT_FILE}.given_back"
     release_wait_claim
-    if [[ -n "${PLACEMENT_EPISODE:-}" ]]; then
+    if [[ -n "${PLACEMENT_EPISODE:-}" && "$PLACEMENT_OUTCOME" != unresolved ]]; then
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid "${PLACEMENT_OWNER_PID:-$$}" \
             --reason "verify ended" >/dev/null 2>&1 || true
     fi
@@ -4277,7 +4347,7 @@ run_lint_sequence() {
         MEND_LOG="$(mktemp)"
         # run_step() records diagnostics through its tee.
         # Keep this call in the parent so cleanup can stop the step.
-        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE=""
+        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE="" LINT_REPAIR_PENDING_GRANT=0
         lint_copy_begin
         while true; do
             if lint_rewrite invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then

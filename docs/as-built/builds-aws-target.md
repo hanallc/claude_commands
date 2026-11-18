@@ -1099,7 +1099,13 @@ The command policy rejects repairs, builds, nextest, final steps, path overrides
 The active target order remains unchanged, and `enabled=off` still prevents placement.
 
 Provider evidence reads lifecycle and execution records through the existing background worker.
-Spending previews use the account ledger lock without saving a reservation or changing the ledger.
+The stopped Hana target shares one spending preview across placement probes in the admission process.
+The preview expires after `preview_max_age_s` seconds, which defaults to two.
+Changes to the ledger, launch history, lifecycle journal, bills, or spending configuration invalidate the preview.
+The cache skips previews that use configuration recovered from Git.
+A full preview uses the account ledger lock and reads the launch history once.
+The preview gives placement evidence only.
+The controller still performs its full reservation and start checks.
 The controller alone owns demand starts, spending reservations, and idle-stop serialization.
 One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.
