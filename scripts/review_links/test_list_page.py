@@ -212,10 +212,9 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
             reviews.append(missing)
             listing = list_page.render(self.root / "reviews")
             _ = reviews.pop()
-            review = {show: review_page.render(self.root / "reviews", show=show)
-                      for show in ("open", "Waiting", "Done", "all")}
+            review = review_page.build_snapshot(self.root / "reviews")
             reviews[0] = replace(ready, times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))
-            parked_review = {show: review_page.render(self.root / "reviews", show=show) for show in ("open", "all")}
+            parked_review = review_page.build_snapshot(self.root / "reviews")
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
@@ -419,12 +418,25 @@ async function inspect(frame){
    }else{
     const target=doc.querySelector('[data-key="'+keys[0]+'"]');
     if(sessionStorage.getItem('later-reload')){
-     check(target.dataset.parked==='true' && target.hidden && target.querySelector('[data-detail]').hidden,
+     const response=await doc.defaultView.fetch('/console/review.html?index=1');
+     const payload=await response.json(),entry=payload.index.r.find(row=>row[0]===keys[0]);
+     check(entry?.[9]>Date.now() && !target && !new URLSearchParams(doc.location.hash.slice(1)).has('item'),
        'a parked linked card stays hidden and closed after reload');
      await finish();return;
     }
     check(!target.hidden && !target.querySelector('[data-detail]').hidden,'the card opens from List before Later');
-    const form=target.querySelector('form');
+    const form=await new Promise((resolve,reject)=>{
+     const observe=new doc.defaultView.MutationObserver(()=>{
+      const form=target.querySelector('form');
+      if(form){observe.disconnect();resolve(form);}
+     });
+     const form=target.querySelector('form');
+     if(form) resolve(form);
+     else{
+      observe.observe(target,{childList:true,subtree:true});
+      setTimeout(()=>{observe.disconnect();reject(new Error('The Review card body did not load.'));},8000);
+     }
+    });
     const settled=new Promise(resolve=>{
      const observer=new doc.defaultView.MutationObserver(()=>{
       if(!form.hasAttribute('data-sending')){observer.disconnect();resolve();}
@@ -473,13 +485,35 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
                         path = route.path
                         if path == '/complete':
                             _ = complete.wait(30)
-                        show = parse_qs(route.query).get("show", ["open"])[0]
-                        review_pages = parked_review if later_saved.is_set() else review
-                        body = (listing if path == list_page.PAGE_PATH else review_pages[show] if path == review_page.PAGE_PATH
-                                else b'{}' if path.endswith('.json') else shell.encode())
+                        fields = parse_qs(route.query)
+                        current = parked_review if later_saved.is_set() else review
+                        content_type = 'text/html; charset=utf-8'
+                        if path == review_page.PAGE_PATH:
+                            if 'body' in fields:
+                                try:
+                                    body = current.body(fields['body'][0])
+                                except LookupError:
+                                    self.send_error(404)
+                                    return
+                            elif 'index' in fields:
+                                body = current.index_response()
+                                content_type = 'application/json'
+                            elif 'version' in fields:
+                                body = json.dumps({'version':current.version, 'facts':current.facts()}).encode()
+                                content_type = 'application/json'
+                            else:
+                                body = current.render(show=fields.get('show', ['open'])[0])
+                        elif path == list_page.PAGE_PATH:
+                            body = listing
+                        elif path.endswith('.json'):
+                            body = b'{}'
+                            content_type = 'application/json'
+                        else:
+                            body = shell.encode()
                         self.send_response(200)
                         self.send_header('Cache-Control', 'no-store')
-                        self.send_header('Content-Type', 'application/json' if path.endswith('.json') else 'text/html; charset=utf-8')
+                        self.send_header('Content-Type', content_type)
+                        self.send_header('X-Review-Version', current.version)
                         self.end_headers()
                         try:
                             _ = self.wfile.write(body)
@@ -3177,6 +3211,13 @@ const submitted=(form,button)=>new Promise((resolve,reject)=>{
  form.requestSubmit(button);
  if(!form.dataset.sending){observer.disconnect();reject(new Error('The test submission did not start.'));}
 });
+const until=async (ready,label)=>{
+ const deadline=performance.now()+8000;
+ while(!ready()){
+  if(performance.now()>deadline) throw new Error('Timed out: '+label);
+  await flush();
+ }
+};
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
 const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
@@ -3345,10 +3386,11 @@ try{
   requestIds.push(form.elements.request.value);
   holdPost=action==='tell';
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
-  if(holdPost){await flush();form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
+  if(holdPost){await until(()=>typeof finishPost==='function','the held response');
+   form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
    check(form.querySelector('[value="tell"]').disabled,'editing words during delivery keeps Tell morty disabled');finishPost();}
   check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
-  await flush();await flush();
+  await until(()=>!form.dataset.sending,'the '+action+' response');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
