@@ -138,20 +138,17 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, settings: CardSet
     for index, action in enumerate(item.actions):
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 else '')+'>'+labels[action]+'</button>'
         (returns if action == 'question' else closes).append(button)
-    groups = '<div class="review-action-group"><span>Closes the item</span><div>'+''.join(closes)+'</div></div>' if closes else ''
-    if returns:
-        groups += '<div class="review-action-group"><span>The item returns to you</span><div>'+''.join(returns)+'</div></div>'
     presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
                       +f'<span>{html.escape(label or settings.soon_label)}</span><small></small></button>' for key, label in LATER_PRESETS)
-    groups += ('<div class="review-action-group review-later"><span>Hides it until</span><div class="later-menu">'
-               +'<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
+    later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
                +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
                +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
-               +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div></div></div>')
+               +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div>')
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
             + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{settings.words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
-            + '<div class="review-actions">'+groups+'</div><span role="status" data-send-status></span></form>')
+            + page_frame.review_action_groups(''.join(closes), ''.join(returns), later)
+            + '<span role="status" data-send-status></span></form>')
 
 
 def details(item: ReviewItem, browser: change_page.ReviewBrowser, members: staff.StaffSnapshot, settings: CardSettings,
@@ -360,9 +357,7 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 [data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
 [data-review-form] textarea{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
 color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
-.review-actions{display:flex;align-items:flex-end;gap:26px;margin-top:12px;flex-wrap:wrap}
-.review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
-.review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}.review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
+.review-actions{margin-top:12px}
 .review-later{margin-left:auto}
 .list-log span{white-space:pre-wrap}
 .review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
@@ -377,7 +372,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
 .list-table .list-row td:last-child{text-align:right}.list-table [data-detail]>td{text-align:left}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
-.review-panel{grid-template-columns:1fr;padding:0 14px 16px}.review-action-group+.review-action-group{padding-left:0;border:0}}
+.review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
 </style>'''
 
 SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + review_legacy.SCRIPT + r'''(() => {
