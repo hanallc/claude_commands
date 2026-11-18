@@ -1007,14 +1007,11 @@ def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | 
 def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, *, same_role: bool) -> bool | UncertainWorker:
     try:
         info = herdr.json_object(client.result("pane", "process-info", "--pane", worker.pane).get("process_info"), "worker launch policy")
-        commands = [herdr.json_object(item, "worker command") for item in herdr.json_items(info.get("foreground_processes"), "worker commands")]
-        arguments = [cast(list[str], item["argv"]) for item in commands if isinstance(item.get("argv"), list)
-                     and all(isinstance(arg, str) for arg in cast(list[object], item["argv"]))]
-        candidates = [args for args in arguments if any(Path(arg).name in ("codex", "claude") for arg in args)]
-        if len(candidates) != 1:
+        owner = herdr.foreground_pane_owner(info)
+        if isinstance(owner, (herdr.NoForegroundAgent, herdr.UnprovedForegroundOwner)) or owner.kind != policy.settings.kind:
             return _uncertain(worker.row, "running launch policy is unproved")
         expected = _policy_arguments(policy)
-        actual = candidates[0]
+        actual = owner.arguments
         required = ("--model", "--sandbox", "--ask-for-approval") if policy.settings.kind == "codex" else ("--model", "--permission-mode")
         if any(flag not in actual for flag in required):
             return _uncertain(worker.row, "running launch policy is incomplete")
@@ -1025,7 +1022,7 @@ def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, 
             hook_arguments = _turn_end_arguments(policy.settings.kind)
             return not hook_arguments or hook_arguments in pairs
         if policy.settings.kind == "claude" and ["--model", policy.settings.model] not in pairs:
-            launched = herdr.pane_native_process(info, "claude", {})
+            launched = herdr.read_foreground_pane_owner(owner, {})
             expected = models_registry.claude_arguments(expected, launched.environment)
         return all(expected[index:index + 2] in [actual[pos:pos + 2] for pos in range(len(actual) - 1)]
                    for index in range(0, len(expected), 2))

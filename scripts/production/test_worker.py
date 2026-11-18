@@ -2134,33 +2134,40 @@ class WorkerCommandTests(unittest.TestCase):
         wait = world.wait_turn_end
         result = world.result
         native_process = world.native_process
-        hook_running = False
+        hook_pid = 998088
+        hook_arguments = ["python3", str(Path(turn_end.__file__).resolve())]
+        hook_parent = 0
+        hook_input = self.fixture.root / "warmup-hook-stdin"
+        os.mkfifo(hook_input)
+        stdin = world.process_root / str(hook_pid) / "fd" / "0"
+        stdin.parent.mkdir(parents=True)
+        stdin.symlink_to(hook_input)
 
         def warmup_ended(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
-            nonlocal hook_running
+            nonlocal hook_parent
             ended = wait(pane, timeout_ms)
-            hook_running = True
+            hook_parent = world.foreground[pane][0]
+            fake_unit_host.process(os.environ, hook_pid, hook_parent, hook_arguments, {})
             return ended
 
         def fresh_codex(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
-            if hook_running and kind == "codex" and not reported:
+            if hook_parent and kind == "codex" and not reported:
                 raise ValueError("Codex launch identity is unavailable")
             return native_process(pid, kind, reported)
 
         def with_hook(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
             value = result(*arguments, deadline=deadline)
-            if hook_running and arguments[:2] == ("pane", "process-info") and arguments[-1] != "w1:p0":
+            if hook_parent and arguments[:2] == ("pane", "process-info") and arguments[-1] != "w1:p0":
                 info = cast(dict[str, object], value["process_info"])
                 foreground = cast(list[object], info["foreground_processes"])
-                info["foreground_processes"] = [{"pid": 998088, "argv": [
-                    "python3", str(Path(turn_end.__file__).resolve())]}, *foreground]
+                info["foreground_processes"] = [{"pid": hook_pid, "argv": hook_arguments}, *foreground]
             return value
 
-        with patch.object(world, "wait_turn_end", side_effect=warmup_ended), \
-                patch.object(world, "result", side_effect=with_hook), \
-                patch.object(herdr, "native_process", side_effect=fresh_codex):
+        with (patch.object(world, "wait_turn_end", side_effect=warmup_ended),
+              patch.object(world, "result", side_effect=with_hook),
+              patch.object(herdr, "native_process", side_effect=fresh_codex)):
             self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
-        self.assertTrue(hook_running)
+        self.assertGreater(hook_parent, 0)
         self.assertEqual(len(self.agent.submitted), 1)
         self.assertEqual(len(world.launches), 1)
         self.assertEqual(len([entry for entry in world.commands if entry[:2] == ("agent", "wait")]), 1)

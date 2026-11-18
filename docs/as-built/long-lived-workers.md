@@ -111,8 +111,40 @@ An empty turn reply writes no reply file and adds no `; reply <path>` text.
 
 A new Codex worker has no resume argument.
 Its pane session report supplies the first native identity.
-The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
-Every other foreground process prevents the pane report from proving a sole Codex process.
+`herdr.foreground_pane_owner` proves the owner for pane actions, retained launches, and status reports.
+`_pane_sessions` reads identities from that proof.
+Resume uses pane metadata to find candidates when the process scan is incomplete.
+It requires the proved conversation before it reports an existing Codex session.
+The roster uses the proved Codex PID for the conversation, account, and folder.
+Unit reports join the proved owner to staff.
+Inherited marks and retained launches can identify which unit has an unknown pane.
+The report records an anomaly when no eligible unit can receive an unknown pane.
+The report also records failures to list panes.
+A unit without owner proof remains unknown when either anomaly leaves its pane uncertain.
+A registry entry supplies activity only for a proved pane owner or a confirmed non-pane process.
+An inherited identity on a proved shell can associate a stopped unit with its pane.
+Session commands require a matching foreground owner before they read or route to a pane.
+The unit pane selector returns exit 3 without an address when the owner is unknown.
+The Claude SessionStart hook checks the nearest Claude ancestor against the foreground PID before either write.
+A worker roster needs a proved open pane before it uses a Claude registry entry for status and routing.
+A proved Codex PID can supply its account while its conversation address stays unknown.
+`process_placement` distinguishes a verified pane, a confirmed non-pane process, and unknown placement.
+The staff thread reader uses resume arguments only for a confirmed non-pane process.
+`pane_activity` checks whether the pane runs a program or sits at its shell.
+Program names from occupancy and startup checks are diagnostics.
+The list shows `unknown` for an unproved owner, including a live Node descendant with unreadable arguments.
+A shell with an inherited thread id has no foreground agent.
+The Linux placement scan and the owner check share each process state in the report, including failed reads.
+An input check reads fresh process state.
+During an input check, the ancestry read supplies each descendant's exit state.
+The terminal check uses that state to skip zombie processes.
+Codex launch capture refreshes the process state and uses one foreground proof.
+Launch diagnostics omit argument tokens.
+The function requires one foreground Codex process with known arguments.
+All other foreground processes must descend from that Codex process.
+A Claude child cannot claim the Codex pane.
+If a foreground Codex process has no arguments, the pane owner stays unproved.
+If the identity remains unknown, the pane notice lists the foreground program names.
 After its first turn, the launcher clears the cached pane list before it checks the published worker.
 This refresh includes the pane session report and the process evidence within an observation snapshot.
 An incomplete final scan names the state, the scan reason, and membership in the parent's tabs.
@@ -648,6 +680,12 @@ The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.
 The sender submits to a proved worker pane or sends the result and cause to the current holder.
+Before Herdr sends keys to Codex, `foreground_pane_owner` checks which descendants can hold the terminal.
+The function reads the kernel process state and skips each confirmed exited child.
+It checks stdin for the other descendants before Herdr checks the composer for a draft.
+A pipe permits input to Codex.
+If a descendant uses the pane terminal or its stdin is unreadable, Herdr rejects the prompt.
+The holder receives the result with one anomaly line that names the program.
 `check_patch` checks patch paths against the binding generation and phase reservation.
 It rejects patches outside the bound paths or repository.
 The check does not cover arbitrary shell or Python writes.
@@ -878,3 +916,22 @@ Read-only reviewers and writers have separate access policies.
 Checkpointed phases provide the comparison unit for usage reports.
 Staff owns worker identity and parent relationships.
 Native evidence owns current execution state.
+
+## Incomplete owner evidence
+
+The worker scan records incomplete evidence for each backend. Staff removal refuses an unreadable scan that could include the target worker.
+The scan skips a process when the pane proves a different foreground PID or an empty shell.
+The scan can exclude a different PID before it reads the foreground owner's conversation.
+
+A unit report records the staff lifecycle and current owner evidence separately. A unit can have a recorded pause or exit while the current owner is unknown. The watchdog preserves the outage and any recovery result when the owner is unknown. A direct resume checks current owner evidence for a unit in a production. Demotion selects a launch mode only after a fresh owner check.
+
+The unit list takes the status and address from the checked owner. It leaves the pane address blank for a standalone owner.
+The unit report uses activity from the same registry entry as the checked owner.
+Worker director lookup checks the staff member's current conversation.
+It returns `UnknownUnitDirector` when it cannot establish ownership.
+A standalone Claude director needs a recorded process start and matching native identity.
+A single proved owner takes precedence over incomplete registry records.
+Conflicting owner proofs for the same conversation return `UnknownUnitDirector`.
+A missing or unavailable messaging socket does not change proved ownership.
+Stall watch checks the unit owner before it reads a pane or retires prompt state. A retained launch alone supplies a candidate.
+An empty candidate pane stays unassigned to the unit. The unit's prompt state stays in place when its pane is unassigned or unknown.
