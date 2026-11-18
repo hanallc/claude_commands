@@ -207,8 +207,8 @@ class RootReplacement:
         reason = ledger.text(ledger.mapping(request['Status']), 'Code')
         return reason.startswith('instance-stopped-') and reason != 'instance-stopped-by-user'
 
-    def _reserve(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending, now: int,
-                 timeout: int) -> ReplacementAttempt:
+    def _reserve(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+                 now: int, timeout: int) -> ReplacementAttempt:
         def before_commit(exposure: ledger.HanaComputeExposure) -> None:
             hana_replacement_record.save(self.directory, replace(attempt, generation=exposure.generation))
 
@@ -273,8 +273,9 @@ class RootReplacement:
         except (AwsUnavailable, OSError, ValueError, subprocess.SubprocessError):
             return state
 
-    def apply(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending, clock: Callable[[], float],
-              timeout: int, checks: Generator[float], publish: Callable[[ReplacementAttempt, bool], None]) -> None:
+    def apply(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+              clock: Callable[[], float], timeout: int, checks: Generator[float],
+              publish: Callable[[ReplacementAttempt, bool], None]) -> None:
         """Read the instance and task before choosing the next operation."""
         started = False
         reserved = False
