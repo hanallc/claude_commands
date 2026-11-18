@@ -7,6 +7,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
 from scripts.lib import conf
@@ -223,11 +224,17 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''')
 
-def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "") -> str:
+class ReturningActionHeading(StrEnum):
+    ITEM_RETURNS = "The item returns to you"
+    SENDS_TO_SHOWRUNNER = "Sends to showrunner"
+
+
+def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,
+                         returning_heading: ReturningActionHeading = ReturningActionHeading.ITEM_RETURNS) -> str:
     """Render the Review action groups that have controls."""
     groups = (
         ("Closes the item", closing_buttons, "", ""),
-        ("The item returns to you", returning_buttons, "", ""),
+        (returning_heading, returning_buttons, "", ""),
         ("Hides it until", later_controls, " review-later", ' class="later-menu"'),
     )
     return '<div class="review-actions">' + "".join(

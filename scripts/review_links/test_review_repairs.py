@@ -182,7 +182,7 @@ class ReviewRepairsTests(unittest.TestCase):
                 finally:
                     case.doCleanups()
 
-    def test_recovery_sends_only_the_action_that_replaced_the_pending_request(self) -> None:
+    def test_recovery_sends_only_the_current_request(self) -> None:
         for kind in review_items.REVIEW_TYPES:
             with self.subTest(kind=kind):
                 case = test_review_page.ReviewPageTests('runTest')
@@ -198,18 +198,27 @@ class ReviewRepairsTests(unittest.TestCase):
                     else:
                         proposal, efficiency = case.decisions()
                         key = proposal if kind == review_items.ReviewType.PROPOSAL else efficiency
-                    old, _ = review_page.submit(case.root, case.body(key, 'question', 'OBSOLETE_REQUEST'), case.status)
-                    _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'CURRENT_ACTION'), case.status)
+                    old, _ = review_page.submit(case.root, case.body(key, 'question', 'FIRST_REQUEST'), case.status)
+                    if kind == review_items.ReviewType.CHANGE:
+                        with self.assertRaisesRegex(question_record.AnswerRefused, 'already with the showrunner'):
+                            _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
+                        expected_text, excluded_text = 'FIRST_REQUEST', 'SECOND_REQUEST'
+                        expected_state = review_items.ReviewState.VALIDATING
+                    else:
+                        _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
+                        expected_text, excluded_text = 'SECOND_REQUEST', 'FIRST_REQUEST'
+                        expected_state = review_items.ReviewState.DONE
                     restarted = change_page.DeliveryStatus(case.root)
                     change_page.recover_pending(restarted)
                     messages = tuple(case.fixture.messages)
-                    self.assertEqual(len(messages), 2 if kind == review_items.ReviewType.CHANGE else 1)
-                    self.assertTrue(all('CURRENT_ACTION' in text and 'OBSOLETE_REQUEST' not in text for _, _, text in messages))
+                    self.assertEqual(len(messages), 1)
+                    self.assertIn(expected_text, messages[0][2])
+                    self.assertNotIn(excluded_text, messages[0][2])
                     change_page.deliver(old, case.status)
                     change_page.recover_pending(restarted)
                     self.assertEqual(tuple(case.fixture.messages), messages)
                     updated = next(item for item in review_items.read(case.root) if item.key == key)
-                    self.assertEqual(updated.state, review_items.ReviewState.DONE)
+                    self.assertEqual(updated.state, expected_state)
                 finally:
                     case.doCleanups()
 
@@ -542,13 +551,13 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   form.requestSubmit(form.querySelector('[value="question"]'));await complete;
  };
  try{
-  for(const [id,selected] of [['C1','Waiting'],['C2','Done']]){
-   await show('open');const before=count('open');
+  for(const [id,selected] of [['C1','all'],['C2','Done']]){
+   await show('open');const before=count('open'),all=count('all');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
    row.querySelector('.list-toggle').click();await readyReviewCard(row);await save(row.querySelector('form'));
    await show(selected);await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
-   check(count('open')===before && count('Waiting')===0,
-    'F005: the fresh index keeps the owner answer Open while '+selected+' omits its row');
+   check(count('open')===before && count('all')===all,
+    'F005: the fresh index restores the counts after an owner answer in '+selected);
    await show('open');
    check(!document.querySelector('[data-key="'+key+'"]').hidden,
     'F005: Open shows the owner answer after refresh from '+selected);
@@ -616,17 +625,23 @@ window.fetch=(url,options={})=>{
  };
  try{
   row('C1').querySelector('.list-toggle').click();await readyReviewCard(row('C1'));
-  const counts=()=>['open','Waiting','Done','all'].map(value=>
+  const counts=()=>['open','Validating','Done','all'].map(value=>
    Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent));
   const before=counts();
   const form=row('C1').querySelector('form');await save(form,'validate');
   check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2],before[3]]),
-   'A save moves the entry from Open to Waiting without changing All.');
+   'A save moves the entry from Open to Validating without changing All.');
   check(!row('C1') || row('C1').hidden,'the saved check leaves Open');
-  await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the waiting check out of Open');
-  check(counts()[1]===before[1]+1 && counts()[3]===before[3],
+  await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the active check out of Open');
+  check(counts()[1]===before[1]+1 && counts()[2]===before[2] && counts()[3]===before[3],
    'F001: refresh replaces the counts with the saved state');
-  await show('Waiting');check(!row('C1').hidden,'Waiting can show the active check');await show('open');
+  await show('Validating');
+  check(row('C1') && !row('C1').hidden && row('C1').dataset.state==='Validating',
+   'Validating shows the saved check.');
+  await show('all');
+  check(!row('C1').hidden && !row('C1').querySelector('button') &&
+   row('C1').textContent.includes('With page-owner since'),'All shows the active check without buttons.');
+  await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
   row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
   const second=row('C2').querySelector('form');await save(second,'validate');
@@ -637,7 +652,7 @@ window.fetch=(url,options={})=>{
   check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
   for(let pass=0;pass<2;pass++){
    await refresh();
-   for(const choice of ['open','Waiting','Done','all']){
+   for(const choice of ['open','Done','all']){
     await show(choice);check(!row('C3') || row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
    }
   }
@@ -650,7 +665,7 @@ window.fetch=(url,options={})=>{
    await save(asking,'question');
    check(!asked() || asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
-    await refresh();check(!asked() || asked().hidden,'F021: Waiting stays hidden after refresh for '+key);
+    await refresh();check(!asked() || asked().hidden,'F021: the sent request stays out of Open after refresh for '+key);
    }
    await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
    const returnedState='Open';
@@ -730,7 +745,7 @@ window.fetch=(url,options={})=>{
         cases.extend({'url':'/console/investigations.html#'+urlencode({'owner':ready.owner,'show':old}),
                       'show':new,'count':count,'type':'investigation','item':''}
                      for old,new,count in (('not-read','open',1),('answer ready','open',1),
-                                           ('open','Waiting',1),('read','Done',1),('all','all',3)))
+                                           ('open','all',3),('read','Done',1),('all','all',3)))
         cases.extend(({'url':'/console/investigations.html#'+urlencode({'owner':owner.id,'show':'all'}),
                        'show':'all','count':1,'type':'investigation','item':''},
                       {'url':'/console/investigations.html#'+urlencode({'owner':ready.owner}),

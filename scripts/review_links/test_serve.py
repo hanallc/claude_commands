@@ -37,6 +37,7 @@ from scripts.aws_target import aws_page
 from scripts.agents.remote import local_machine
 from scripts.build_queue import memory_feed
 from scripts.production import change_review, change_routing, investigation, next_item, proposal_issue, staff, the_list, update_registration
+from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
@@ -541,21 +542,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture(changes=1)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        asked = cache.save(case.card_body(cache.get(), key, 'question', 'What changed?'), case.status).delivery
-        assert isinstance(asked, change_page.MessageDelivery)
-        original = case.status.slots(asked.page, 'C1').question
-        assert isinstance(original, change_page.OpenQuestion)
         with patch.object(change_review, 'prepared_replacement', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 _ = cache.save(case.card_body(cache.get(), key, 'works'), case.status)
+        page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ('C1',), '')
+        intent = change_review.PendingVerdictCleanup.for_row(case.root, page.review_list, 'C1')
+        self.assertTrue(intent.intent.exists())
+        # Recreate a legacy record with an interrupted verdict and an open question.
+        asked = case.status.ask(page, 'C1', 'What changed?')
+        assert isinstance(asked, change_page.QuestionDelivery)
+        self.assertIsInstance(case.status.slots(page, 'C1').verdict, change_page.DeliveryIntent)
         recovered = change_page.DeliveryStatus(case.root)
         with patch.object(change_page, 'send_to_staff'):
             change_page.recover_pending(recovered)
-        question = recovered.slots(asked.page, 'C1').question
+        self.assertFalse(intent.intent.exists())
+        slots = recovered.slots(page, 'C1')
+        self.assertIsInstance(slots.verdict, change_page.NoDelivery)
+        question = slots.question
         self.assertIsInstance(question, change_page.OpenQuestion)
         assert isinstance(question, change_page.OpenQuestion)
-        self.assertEqual(question.question_id, original.question_id)
-        self.assertTrue(change_page.answer_item(key, 'The layout changed.', original.question_id, recovered))
+        self.assertEqual(question.question_id, asked.question_id)
+        self.assertTrue(change_page.answer_item(key, 'The layout changed.', asked.question_id, recovered))
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
@@ -653,11 +660,26 @@ class ReviewLinksServerTests(unittest.TestCase):
         question = case.status.slots(asked.page, 'C1').question
         assert isinstance(question, change_page.OpenQuestion)
         original = case.fixture.production
+        event = f'Review {key}: works superseded the question {question.question_id} before the answer arrived.'
+        parent = case.fixture.unit.parent
+        assert isinstance(parent, staff.ReportsTo)
+        owner = staff.snapshot().by_id(parent.id)
+        assert owner is not None
+        listing = case.fixture.review_list
+        # Recreate a saved verdict and its legacy cleanup record.
+        cleanup = replace(change_review.PendingVerdictCleanup.for_row(case.root, listing, 'C1'),
+                          verdict='works', superseded_wait=event,
+                          wait_log=change_review.WaitSupersessionDestination(
+                              owner.id, read_new_production(original, owner.name)))
+        cleanup.save()
+        saved = change_review.save_verdict(listing, 'C1', 'works', original, cleanup=cleanup, superseded=event)
+        self.assertIsInstance(saved, change_review.VerdictSaved)
         moved_doc = case.fixture.temporary / 'destination.md'
         _ = moved_doc.write_text(original.read_text().replace('progress.log', 'destination.log'))
         destination = fixture_member('showrunner', name='destination', doc=staff.LiveDoc(local_machine(), moved_doc))
         with patch.object(change_page, 'log_wait_supersession', side_effect=OSError('The log is unavailable.')):
-            _ = cache.save(case.card_body(cache.get(), key, 'works'), case.status)
+            _ = change_page.finish_saved_verdict(cleanup, case.status)
+        self.assertTrue(cleanup.intent.exists())
         _ = staff.move(case.fixture.unit.id, staff.ReportsTo(destination.id))
         _ = original.write_text(original.read_text().replace('progress.log', 'renamed.log'))
         with patch.object(change_page, 'send_to_staff'):
@@ -665,12 +687,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                 change_page.recover_pending(change_page.DeliveryStatus(case.root))
         log_path = case.fixture.repo / 'progress.log'
         log = log_path.read_text() if log_path.exists() else ''
-        event = f'Review {key}: works superseded the question {question.question_id} before the answer arrived.'
         self.assertEqual(log.count(event), 1)
         self.assertFalse((case.fixture.repo / 'destination.log').exists())
         self.assertFalse((case.fixture.repo / 'renamed.log').exists())
 
-    def test_review_restores_a_pending_question_when_the_verdict_file_cannot_be_prepared(self) -> None:
+    def test_review_refuses_a_verdict_while_a_change_is_validating(self) -> None:
         case = self.review_fixture(changes=1)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
@@ -678,13 +699,18 @@ class ReviewLinksServerTests(unittest.TestCase):
         listing = case.fixture.review_list
         claim = change_routing.delivery_path(case.root, listing, 'C1')
         before = (listing.read_bytes(), claim.read_bytes(), dict(case.status.request_attempts))
-        with patch.object(self.server, 'review_cache', cache), patch.object(
-                self.server, 'delivery_status', case.status), patch.object(
-                change_review, 'prepared_replacement', side_effect=PermissionError('The fixture write failed.')):
-            status, body = self.post(review_page.PAGE_PATH, case.card_body(cache.get(), key, 'works'))
+        snapshot = cache.get()
+        revision = review_page.record_revision(snapshot.records[key], snapshot.assets)
+        request = case.body(key, 'works') + '&' + urlencode({'revision': revision})
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(change_review, 'prepared_replacement') as prepare):
+            status, body = self.post(review_page.PAGE_PATH, request)
+        prepare.assert_not_called()
         self.assertEqual(status, 400, body)
+        self.assertIn(change_page.WITH_SHOWRUNNER.encode(), body)
         self.assertEqual((listing.read_bytes(), claim.read_bytes(), case.status.request_attempts), before)
-        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.WAITING)
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.VALIDATING)
         self.assertEqual(list(case.root.glob('.review-link-scratch-*')), [])
 
     def test_review_recovery_isolates_unreadable_lists_and_releases_locks_before_cleanup(self) -> None:
@@ -781,7 +807,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         key = 'page-owner/C1'
         _ = review_page.submit(case.root, case.body(key, 'question', 'What did you see?'), case.status)
         before = review_page.build_snapshot(case.root)
-        self.assertEqual(before.records[key].state, review_items.ReviewState.WAITING)
+        self.assertEqual(before.records[key].state, review_items.ReviewState.VALIDATING)
         path = change_routing.delivery_path(case.root, case.fixture.review_list, 'C1')
         read_text = Path.read_text
 
@@ -806,6 +832,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         fields['followup'] = update_registration.PendingFollowup(text='Which layout works?', sent='2026-11-12T12:01')
         lines[index] = 'registration: '+json.dumps(fields)+'\n'
         _ = path.write_text(''.join(lines))
+        (investigation.state_root() / 'record-ids' / 'question.water').unlink()
         record, = update_registration.selected_question_records([path], (), None)
         identities = update_registration.QuestionStaff.for_record(staff.snapshot())
         native_write = update_registration.write_question_record
@@ -1140,7 +1167,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture(changes=2)
         question = case.question()
         other = case.question('A different question?')
-        _ = review_page.submit(case.root, case.body('page-owner/C2', 'question', 'What did you see?'), case.status)
+        request, _ = review_page.submit(case.root, case.body('page-owner/C2', 'question', 'What did you see?'), case.status)
+        assert isinstance(request, change_page.MessageDelivery)
+        pending = case.status.slots(request.page, request.row).question
+        assert isinstance(pending, change_page.OpenQuestion)
+        _ = change_page.answer_item('page-owner/C2', 'The check passed.', pending.question_id, case.status)
         path = case.question_path(other)
         _ = path.write_text(path.read_text().replace('registration: {', 'registration: {bad'))
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)

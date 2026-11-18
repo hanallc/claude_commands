@@ -889,6 +889,51 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     for worker in fixture.server.host_targets.values():
                         worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
+    def test_pass_reads_provider_configuration_once_as_the_queue_grows(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import target_config
+
+        with AdmissionFixture() as fixture:
+            settings = fixture.root / "linux.conf"
+            _ = write_config_fixture(settings, "probe_timeout_s=1\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, provider="ssh", target="linux")
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(replace(candidate, destination=destination),)))
+            fixture.server.placement_requests[request.episode] = request
+
+            with mock.patch.object(io, "open", wraps=io.open) as io_open, \
+                    mock.patch("builtins.open", wraps=open) as builtin_open, \
+                    mock.patch.object(target_config, "read_execution_transport",
+                                      wraps=target_config.read_execution_transport) as read_transport:
+                def settings_opens() -> int:
+                    return sum(cast(tuple[object, ...], call.args)[0] in (settings, str(settings))
+                               for opener in (io_open, builtin_open) for call in opener.call_args_list)
+
+                _ = fixture.run_pass()
+                first = fixture.server.placement_host_keys[(request.episode, destination)]
+                first_counts = settings_opens(), read_transport.call_count
+                self.assertEqual(fixture.server.host_readers[first].timeout, 1)
+                for index in range(12):
+                    extra = replace(request, episode=f"extra-{index}")
+                    fixture.server.placement_requests[extra.episode] = extra
+                _ = write_config_fixture(settings, "probe_timeout_s=4\n", template="mac_test")
+                io_open.reset_mock()
+                builtin_open.reset_mock()
+                read_transport.reset_mock()
+                _ = fixture.run_pass()
+                self.assertEqual((settings_opens(), read_transport.call_count), first_counts)
+                # The transport selector reads the file separately.
+                self.assertEqual(first_counts, (2, 1))
+                current = fixture.server.placement_host_keys[(request.episode, destination)]
+                self.assertNotEqual(current.configuration_generation, first.configuration_generation)
+                self.assertEqual(fixture.server.host_readers[current].timeout, 4)
+                self.assertEqual(len(fixture.server.placement_host_keys), 13)
+                self.assertEqual(set(fixture.server.placement_host_keys.values()), {current})
+
     def test_each_settings_file_controls_its_evidence_age(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request
@@ -3428,6 +3473,55 @@ class RoomAndSlotTests(unittest.TestCase):
                     self.assertIsInstance(replies[0], wire.Wait)
                     self.assertFalse(fixture.server.reservations)
 
+    def test_an_oversized_head_with_only_its_own_claim_starts_alone(self) -> None:
+        for bypass in (False, True):
+            with self.subTest(bypass=bypass), AdmissionFixture() as fixture:
+                run = fixture.run_owner()
+                first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+                fixture.release(first)
+                fixture.free(11 * GIB)
+                head = fixture.request(run=run, need=16 * GIB)
+
+                with mock.patch.object(gate, "CONTINUATION_MAY_PASS", bypass):
+                    replies = fixture.server.handle_request(head)
+
+                result = fixture.server.last_result
+                assert isinstance(result, gate.PassResult)
+                decision = result.rows[0].decision
+                self.assertEqual(decision.room.room, 2 * GIB)
+                self.assertEqual(decision.room.need, 10 * GIB)
+                self.assertEqual(decision.room.basis, records.StartsAlone())
+                grant = only_admitted(replies)
+                self.assertEqual(grant.need, 16 * GIB)
+                self.assertEqual(set(fixture.server.reservations), {head.episode})
+                self.assertFalse(fixture.server.slots)
+                room = fixture.run_pass().policy.room
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.used + room.kept, 16 * GIB)
+
+    def test_an_oversized_head_waits_for_another_runs_slot_to_expire(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+            fixture.allow_next_start()
+            other = only_admitted(fixture.server.handle_request(fixture.request(run=fixture.run_owner(), need=GIB)))
+            fixture.release(first)
+            fixture.release(other)
+            other_slot = gate.between_steps(fixture.server.slots[other.reservation])
+            fixture.free(11 * GIB)
+            head = fixture.request(run=run, need=16 * GIB)
+
+            reply, = fixture.server.handle_request(head)
+            self.assertIsInstance(reply, wire.Wait)
+            self.assertFalse(fixture.server.reservations)
+            self.assertIsInstance(fixture.server.slots[first.reservation], records.ContinuationSlot)
+
+            fixture.clock.advance(other_slot.expires_at - fixture.clock.now())
+            alone = fixture.run_pass()
+            self.assertEqual(alone.rows[0].decision.room.basis, records.StartsAlone())
+            self.assertEqual(fixture.server.reservations[head.episode].need, 16 * GIB)
+            self.assertFalse(fixture.server.slots)
+
     def test_existing_host_reading_gets_calm_pressure_without_erasing_deliberate_pressure(self) -> None:
         for blocked in (False, True):
             with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as directory:
@@ -3496,6 +3590,9 @@ class RoomAndSlotTests(unittest.TestCase):
             run = fixture.run_owner()
             first = fixture.request(run=run, need=6 * GIB)
             grant = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            # A live reservation prevents the continuation from starting alone.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.release(grant)
             fixture.allow_next_start()
             fixture.free(10 * GIB)
@@ -3513,7 +3610,7 @@ class RoomAndSlotTests(unittest.TestCase):
             self.assertIsInstance(held.reason, records.BehindHead)
             protected = next(row for row in result.rows if row.owner ==
                 f"{head.owner.pid}-{head.owner.start_time}")
-            self.assertEqual(protected.decision.room.room, -GIB)
+            self.assertEqual(protected.decision.room.room, GIB)
             claim = fixture.server.waiters[successor.episode].last_reply
             assert isinstance(claim, wire.Wait)
             assert isinstance(claim.reason, records.HeadAdmissionStatus)
@@ -3622,7 +3719,40 @@ class RoomAndSlotTests(unittest.TestCase):
             self.assertEqual(continuation.decision.room.need, 2 * GIB)
 
 
-    def test_slot_reuse_starts_under_pressure_without_order_or_spacing(self) -> None:
+    def test_a_continuation_held_behind_an_earlier_row_gives_its_claim_back(self) -> None:
+        for head_gib in (8, 16):
+            with self.subTest(head_gib=head_gib), AdmissionFixture() as fixture:
+                run = fixture.run_owner()
+                first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+                fixture.allow_next_start()
+                running = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+                fixture.release(first)
+                fixture.allow_next_start()
+                fixture.free(11 * GIB)
+                head = fixture.request(need=head_gib * GIB, since=fixture.clock.now() - 120)
+                initial, = fixture.server.handle_request(head)
+                assert isinstance(initial, wire.Wait)
+                self.assertEqual(initial.snapshot.decision.room.room, 2 * GIB)
+
+                successor = fixture.request(run=run, need=6 * GIB)
+                _ = fixture.server.handle_request(successor)
+                self.assertFalse(fixture.server.slots, "the earlier row needs the claim's memory")
+                result = fixture.server.last_result
+                assert isinstance(result, gate.PassResult)
+                self.assertEqual(result.rows[0].decision.room.room, 8 * GIB)
+                self.assertFalse(result.rows[1].decision.reused_slot)
+                self.assertEqual(result.rows[1].decision.room.need, 6 * GIB)
+                self.assertIn(successor.episode, fixture.server.waiters)
+                if head_gib == 8:
+                    self.assertIn(head.episode, fixture.server.reservations)
+                else:
+                    self.assertNotIn(head.episode, fixture.server.reservations)
+                    fixture.release(running)
+                    alone = fixture.run_pass()
+                    self.assertEqual(alone.rows[0].decision.room.basis, records.StartsAlone())
+                    self.assertIn(head.episode, fixture.server.reservations)
+
+    def test_slot_reuse_can_pass_under_pressure_when_the_switch_is_on(self) -> None:
         for need in (4 * GIB, 6 * GIB):
             for unreadable in (False, True):
                 with self.subTest(need=need, unreadable=unreadable), AdmissionFixture() as fixture:
@@ -3634,7 +3764,8 @@ class RoomAndSlotTests(unittest.TestCase):
                     head = fixture.request(need=GIB)
                     self.assertIsInstance(fixture.server.handle_request(head)[0], wire.Wait)
                     successor = fixture.request(run=run, need=need)
-                    next_grant = only_admitted(fixture.server.handle_request(successor))
+                    with mock.patch.object(gate, "CONTINUATION_MAY_PASS", True):
+                        next_grant = only_admitted(fixture.server.handle_request(successor))
                     result = fixture.server.last_result
                     assert isinstance(result, gate.PassResult)
                     reused = next(row for row in result.rows if row.owner ==
@@ -3678,6 +3809,9 @@ class RoomAndSlotTests(unittest.TestCase):
             run = fixture.run_owner()
             first = fixture.request(run=run, need=6 * GIB)
             grant = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            # A live reservation prevents the continuation from starting alone.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.release(grant)
             fixture.clock.advance(5)
             fixture.free(10 * GIB)
@@ -4861,11 +4995,11 @@ class ServiceTests(unittest.TestCase):
                     label = "hana · nextest" if owner_name == "folder" else f"{head.owner.pid} · nextest"
                 if owner_name == "continuation":
                     head = replace(request, identity=replace(request.identity, name="continuation"))
-                    label = "continuation · nextest"
+                    label = "ordinary · nextest"
                     ordinary = fixture.request(need=8 * GIB, since=fixture.clock.now() - 1)
                     ordinary = replace(ordinary, identity=replace(ordinary.identity, name="ordinary"))
                     ordinary_peer = fixture.connect(ordinary)
-                    peers = [fixture.connect(head), ordinary_peer]
+                    peers = [ordinary_peer, fixture.connect(head)]
                 else:
                     peers = [fixture.connect(head), fixture.connect(fixture.request(need=8 * GIB))]
                 for position, peer in enumerate(peers, 1):
@@ -4883,16 +5017,19 @@ class ServiceTests(unittest.TestCase):
                         if position == 1:
                             self.assertIn("this build is the queue head", output.getvalue())
                         else:
-                            self.assertEqual(waits[-1].snapshot.head_need, 12 * GIB)
-                            self.assertIn("head continuation · nextest needs 12.0 GiB", output.getvalue())
+                            self.assertEqual(waits[-1].snapshot.head_need, 8 * GIB)
+                            self.assertIn("head ordinary · nextest needs 8.0 GiB", output.getvalue())
                             self.assertNotIn("this build is the queue head", output.getvalue())
-                fixture.free(60 * GIB)
+                fixture.free((20 if owner_name == "continuation" else 60) * GIB)
+                if owner_name == "continuation":
+                    fixture.allow_next_start()
                 result = fixture.server.run_pass()
                 assert isinstance(result, gate.PassResult)
                 expected = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                                   key=lambda row: row.admission.rank if isinstance(row.admission, gate.ProposedAdmission) else -1)
                 first = only_admitted(peers[0].replies())
                 self.assertTrue(any(isinstance(reply, wire.Wait) for reply in peers[1].replies()))
+                fixture.free(60 * GIB)
                 fixture.allow_next_start()
                 next_result = fixture.server.run_pass()
                 assert isinstance(next_result, gate.PassResult)
@@ -5911,6 +6048,10 @@ class CutoverServiceTests(unittest.TestCase):
             grant = only_admitted(fixture.server.handle_request(owner_request))
             peak = int(15.76 * GIB)
             fixture.scoped_peak(grant, peak)
+            fixture.allow_next_start()
+            blocker = fixture.request(need=GIB // 8, step="check",
+                owner=fixture.proc.spawn(used=GIB // 8))
+            blocker_grant = only_admitted(fixture.server.handle_request(blocker))
             fixture.free(0)
             fixture.hold_starts()
             waiter = replace(fixture.request(need=12 * GIB, step="build",
@@ -5935,11 +6076,6 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertNotIn(waiter.episode, fixture.server.reservations)
             fixture.clock.advance(1)
             fixture.free(60 * GIB)
-            blocker = fixture.request(need=GIB // 8, step="check",
-                owner=fixture.proc.spawn(used=GIB // 8))
-            if blocker.episode not in fixture.server.reservations:
-                fixture.allow_next_start()
-            blocker_grant = only_admitted(fixture.server.handle_request(blocker))
             fixture.free(18 * GIB)
             with test_hang_guard.LauncherHangGuard(self.id()).protect(), fixture.serving(), \
                     mock.patch.object(client, "CLOCK", fixture.clock), \

@@ -312,7 +312,7 @@ function mount(data){
  let node=mounted.get(key);
  if(!node){node=options.mount(data);mounted.set(key,node);resize?.observe(node);}
  node.hidden=false;
- const expanded=opened.has(key);
+ const expanded=!node.hasAttribute('data-validating-change') && opened.has(key);
  node.querySelector('[data-detail]').hidden=!expanded;
  node.querySelector('.list-toggle').setAttribute('aria-expanded',String(expanded));
  node.querySelector('.list-row').classList.toggle('open',expanded);

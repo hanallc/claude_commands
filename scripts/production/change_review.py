@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
 from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
@@ -51,7 +51,7 @@ from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
 from scripts.production import change_routing, delivery_state, session_staff, showrunner_tree, showrunners, staff, unit_config, unit_lookup
 from scripts.production.production_doc import ProductionDocument, Refusal, production_field
-from scripts.review_links import image_store
+from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
 
 TRAILER = "Change-Review"
@@ -1869,31 +1869,33 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
 
 
 def append_row_review_log(cells: dict[str, str], words: str, who: str, now: datetime) -> None:
-    from scripts.review_links import review_events
     events = review_events.decode(_plain(cells.get("Review log", "")))
     event = review_events.ReviewLog(now, who, words)
     cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
 
 
+def _append_review_log(path: Path, lines: list[str], row: str, event: review_events.ReviewLog) -> None:
+    for section in (SECTION, REVIEWED):
+        if not any(line.strip() == section for line in lines):
+            continue
+        columns, first, end = _table(path, lines, section)
+        if not any(line.startswith(f"| {row} |") for line in lines[first:end]):
+            continue
+        _add_column(path, lines, section, "Review log")
+        columns, first, end = _table(path, lines, section)
+        index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
+        cells = dict(zip(columns, _cells(lines[index])))
+        append_row_review_log(cells, event.words, event.who, event.time)
+        lines[index] = _row(path, columns, cells)+"\n"
+        return
+
+
 def record_review_log(path: Path, row: str, words: str, production: Path, who: str = "nate") -> None:
     """Keep the user's Review action in the authoritative table row."""
     now = datetime.now().astimezone(user_zone())
-    def write(lines: list[str]) -> None:
-        for section in (SECTION, REVIEWED):
-            if not any(line.strip() == section for line in lines):
-                continue
-            columns, first, end = _table(path, lines, section)
-            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
-            if index is None:
-                continue
-            _add_column(path, lines, section, "Review log")
-            columns, first, end = _table(path, lines, section)
-            index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
-            cells = dict(zip(columns, _cells(lines[index])))
-            append_row_review_log(cells, words, who, now)
-            lines[index] = _row(path, columns, cells)+"\n"
-            return
-    _edit(path, production, now.date(), write, lambda _: f"review {row}")
+    event = review_events.ReviewLog(now, who, words)
+    _edit(path, production, now.date(), lambda lines: _append_review_log(path, lines, row, event),
+          lambda _: f"review {row}")
 
 
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
@@ -2080,6 +2082,54 @@ def _require_verdict_exchange(slots: delivery_state.DeliverySlots, verdict: str,
         raise ChangeReviewError(str(error)) from error
 
 
+def _validation_fault_event(production: Path, verdict: str) -> review_events.ReviewLog:
+    owner = unit_lookup.doc_owner(production, staff.snapshot()).name
+    return review_events.ReviewLog(datetime.now(user_zone()), owner, "Check found a problem: "+verdict)
+
+
+@contextmanager
+def clear_change_later(path: Path, row: str) -> Generator[None, None, None]:
+    """Clear the Later time before publishing the change state."""
+    target = review_later.path()
+    if not target.is_file():
+        yield
+        return
+    key = f"{_owner(path)}/{row}"
+    with file_lock.exclusive(target.with_suffix('.lock')):
+        stored = review_later.times()
+        if key not in stored:
+            yield
+            return
+        encoded = {key: until.isoformat() for key, until in stored.items()}
+        until = encoded.pop(key)
+        try:
+            write_text_atomic(target, json.dumps(encoded) + '\n')
+        except AtomicDurabilityUnconfirmed:
+            encoded[key] = until
+            write_text_atomic(target, json.dumps(encoded) + '\n')
+            raise
+        try:
+            yield
+        except AtomicDurabilityUnconfirmed:
+            raise
+        except OSError:
+            encoded[key] = until
+            write_text_atomic(target, json.dumps(encoded) + '\n')
+            raise
+
+
+def _cleared_validation(delivery: Path) -> str:
+    fields = cast(dict[str, object], json.loads(delivery.read_text()))
+    # A null slot prevents older fields from restoring the completed validation.
+    fields["validation"] = None
+    _ = fields.pop("handed_at", None)
+    return json.dumps(fields)+"\n"
+
+
+def _validation_fault_output(shown: str) -> list[str]:
+    return [f"{shown}: the check found a problem. The change returned to Open."]
+
+
 def save_verdict(path: Path, row: str, verdict: str, production: Path, *, validation_id: str = '',
                  cleanup: PendingVerdictCleanup | NoVerdictCleanup = NO_VERDICT_CLEANUP,
                  superseded: str = '') -> VerdictSaved | VerdictRefused:
@@ -2099,15 +2149,14 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
             _require_verdict_exchange(slots, verdict, validation_id)
         except ChangeReviewError as error:
             return VerdictRefused([], str(error))
-        empty_row: dict[str, str] = {}
-        pending_row = next((item for item in pending(path) if item["#"] == local_row), empty_row)
-        if slots.validation_requested and not lands(verdict) and pending_row.get("Review log"):
-            fields = cast(dict[str, object], json.loads(delivery.read_text()))
-            record_review_log(path, local_row, "Check found a problem: "+verdict, production,
-                              unit_lookup.doc_owner(production, staff.snapshot()).name)
-            _ = fields.pop("validation", None)
-            write_text_atomic(delivery, json.dumps(fields)+"\n")
-            return VerdictSaved([f"{shown}: the check found a problem; returned to For you"])
+        if slots.validation_requested and not lands(verdict) and any(item["#"] == local_row for item in pending(path)):
+            cleared = _cleared_validation(delivery)
+            event = _validation_fault_event(production, verdict)
+            _edit(path, production, event.time.date(), lambda lines: _append_review_log(path, lines, local_row, event),
+                  lambda _: f"review {local_row}", report_warning=warnings.append)
+            with clear_change_later(path, local_row):
+                write_text_atomic(delivery, cleared)
+            return VerdictSaved(_validation_fault_output(shown), warnings)
         def publish(target: Path, text: str) -> None:
             assert isinstance(cleanup, PendingVerdictCleanup)
             mode = stat.S_IMODE(target.stat().st_mode)
@@ -2587,7 +2636,8 @@ class BatchWrite:
     prepare: Callable[[], None]
 
 
-def _batch_item(value: object, index: int, day: date, review_root: Path) -> BatchWrite:
+def _batch_item(value: object, index: int, day: date, review_root: Path,
+                cleared_validations: dict[ReviewRowTarget, str]) -> BatchWrite:
     if not isinstance(value, dict):
         raise ChangeReviewError("expected an object")
     fields = cast(dict[str, object], value)
@@ -2645,7 +2695,14 @@ def _batch_item(value: object, index: int, day: date, review_root: Path) -> Batc
 
         def record(lines: list[str]) -> Callable[[], list[str]]:
             delivery = change_routing.delivery_path(review_root, path, target.row)
-            _require_verdict_exchange(change_routing.delivery_slots(delivery), verdict, validation_id)
+            slots = change_routing.delivery_slots(delivery)
+            _require_verdict_exchange(slots, verdict, validation_id)
+            if slots.validation_requested and not lands(verdict):
+                _, first, end = _table(path, lines, SECTION)
+                if any(line.startswith(f"| {target.row} |") for line in lines[first:end]):
+                    cleared_validations[target] = _cleared_validation(delivery)
+                    _append_review_log(path, lines, target.row, _validation_fault_event(doc, verdict))
+                    return lambda: _validation_fault_output(shown)
             result = change_verdict.write(lines)
             if isinstance(result, VerdictConflict):
                 raise ChangeReviewError(f'{target.row} has the verdict "{result.recorded}" from {result.day}')
@@ -2673,9 +2730,10 @@ def batch(file: Path) -> list[str]:
     items: list[BatchWrite] = []
     rows: dict[tuple[Path, str], int] = {}
     errors: list[str] = []
+    cleared_validations: dict[ReviewRowTarget, str] = {}
     for index, value in enumerate(cast(list[object], values)):
         try:
-            item = _batch_item(value, index, day, root)
+            item = _batch_item(value, index, day, root, cleared_validations)
             key = (item.path, item.row)
             if key in rows:
                 raise ChangeReviewError(f"row {item.row} is already item {rows[key]}")
@@ -2722,6 +2780,10 @@ def batch(file: Path) -> list[str]:
             owners[owner] = owners.get(owner, 0) + 1
         counts = ", ".join(f"{owner} {count}" for owner, count in owners.items())
         _commit(list(lines_by_path), f"batch {len(items)} writes ({counts})")
+        for target, cleared in cleared_validations.items():
+            delivery = change_routing.delivery_path(root, target.path, target.row)
+            with clear_change_later(target.path, target.row):
+                write_text_atomic(delivery, cleared)
     return [line for finish in after for line in finish()]
 
 

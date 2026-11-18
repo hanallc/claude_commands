@@ -14,13 +14,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 from collections.abc import Mapping
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
-from scripts.production import change_review, proposal_issue, staff, update_registration
+from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
 from scripts.production.record_store import state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
@@ -34,7 +34,8 @@ HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap'}
-SHOWS = (('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('all', 'All'))
+INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.DONE, ReviewState.VALIDATING)
+SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('Done', 'Done'), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies'}
 LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
@@ -61,6 +62,7 @@ class ReviewIndexEntry(TypedDict):
     ownerHtml: str
     sourceHtml: str
     urgency: str
+    handoff: NotRequired[tuple[str, str]]
 
 
 def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
@@ -87,8 +89,9 @@ def index_json(entries: list[ReviewIndexEntry]) -> str:
     rows = [[entry['key'], '' if entry['id']==entry['key'] else entry['id'], TYPES.index(entry['type']),
              references[(entry['owner'],entry['ownerName'],entry['ownerHtml'])],
              references[(entry['sourceOwner'],entry['sourceName'],entry['sourceHtml'])],
-             entry['title'], tuple(ReviewState).index(entry['state']), entry['filed'], entry['updated'],
-             entry['hiddenUntil'], '' if entry['urgency']=='normal' else entry['urgency']] for entry in entries]
+             entry['title'], INDEX_STATES.index(entry['state']), entry['filed'], entry['updated'],
+             entry['hiddenUntil'], '' if entry['urgency']=='normal' else entry['urgency'],
+             *([entry['handoff']] if 'handoff' in entry else [])] for entry in entries]
     return json.dumps({'n':list(names),'r':rows},ensure_ascii=False,separators=(',',':')).replace(
         '&','\\u0026').replace('<','\\u003c').replace('>','\\u003e')
 
@@ -152,7 +155,7 @@ class ReviewSnapshot:
         return self.payload
 
     def render(self, *, show: str = 'open') -> bytes:
-        selected = show if show in dict(SHOWS) else 'open'
+        selected = 'all' if show == 'Waiting' else show if show in dict(SHOWS) else 'open'
         page = self.page.replace(b'data-show="open"', ('data-show="'+selected+'"').encode(), 1)
         if selected != 'open':
             page = page.replace(b'data-show-chip="open" aria-pressed="true"',b'data-show-chip="open" aria-pressed="false"',1)
@@ -165,6 +168,8 @@ class ReviewSnapshot:
         item = self.records.get(key)
         if item is None:
             raise LookupError('This item is not in the current snapshot.')
+        if item.state == ReviewState.VALIDATING:
+            raise LookupError('This change is with the showrunner.')
         if key in self.unavailable_cards:
             return CARD_ERROR
         try:
@@ -190,7 +195,8 @@ def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
         assets['image:'+item.key] = change_review.image_path(source.row['Image'])
 
 
-def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames) -> ReviewIndexEntry:
+def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames, *,
+               root: Path | None = None) -> ReviewIndexEntry:
     owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
     entry = ReviewIndexEntry(key=item.key, id=item.id, type=item.type, owner=str(item.owner),
@@ -199,6 +205,13 @@ def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_name
         hiddenUntil=item.times.later.timestamp()*1000 if isinstance(item.times.later, datetime) else 0,
         sourceName=source, urgency=item.urgency.level, ownerHtml=names.html(item.owner, owner),
         sourceHtml=names.html(item.source_unit, source))
+    if item.state == ReviewState.VALIDATING and isinstance(item.source, review_items.ChangeSource):
+        requested = item.times.updated
+        if root is not None:
+            path = change_routing.delivery_path(root, item.source.path, item.source.row['#'])
+            requested = change_page.handoff_time(path, requested)
+        requested = requested.astimezone(user_zone())
+        entry['handoff'] = (requested.isoformat(), requested.strftime('%b %d %H:%M %Z'))
     validate_text(entry['title'])
     for value in entry.values():
         if isinstance(value, str):
@@ -249,7 +262,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     entries: list[ReviewIndexEntry] = []
     assets: dict[str, str] = {}
     unavailable_cards: set[str] = set()
-    for item in review_items.read(root, members=members, sources=sources):
+    for item in review_items.read(root, members=members, sources=sources, assign_ids=False):
         path = review_items.source_path(item)
         with guard_source(path, sources, entry=item.id):
             item = review_items.normalize_times(item, zone)
@@ -257,11 +270,11 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
                 record_assets: dict[str, str] = {}
                 retain_asset(item, record_assets)
                 validate_body_inputs(item, record_assets)
-                summary = card_entry(item, members, names)
+                summary = card_entry(item, members, names, root=root)
             except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
                 sources.skipped(path, item.id, error)
                 unavailable_cards.add(item.key)
-                summary = card_entry(replace(item, title='Card unavailable'), members, names)
+                summary = card_entry(replace(item, title='Card unavailable'), members, names, root=root)
             else:
                 assets.update(record_assets)
             entries.append(summary)
@@ -401,7 +414,7 @@ class ReviewSnapshotCache:
         else:
             records[key] = item
             validate_body_inputs(item, {name: assets[name] for name in (key, 'image:'+key) if name in assets})
-            updated_entry = card_entry(item, members, names)
+            updated_entry = card_entry(item, members, names, root=self.root)
             entries = [updated_entry if entry['key'] == key else entry for entry in current.entries]
             record_version = repr((item, assets.get(key), assets.get('image:'+key)))
         version = hashlib.sha256((current.version+record_version).encode()).hexdigest()[:20]
@@ -501,6 +514,8 @@ def answer_section(text: str) -> str:
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *, soon: str = "In 1 hour") -> str:
+    if item.state == ReviewState.VALIDATING:
+        return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -510,7 +525,10 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
               'approve': 'Approve', 'decline': 'Decline'}
     for index, action in enumerate(item.actions):
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 else '')+'>'+labels[action]+'</button>'
-        (returns if action == 'question' else closes).append(button)
+        (returns if action == 'question' or (item.type == ReviewType.CHANGE and action in change_page.CHANGE_HANDOFFS)
+         else closes).append(button)
+    heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
+               else page_frame.ReturningActionHeading.ITEM_RETURNS)
     presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
                       +f'<span>{html.escape(label or soon)}</span><small></small></button>' for key, label in LATER_PRESETS)
     later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
@@ -520,7 +538,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
             + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{words_rows}" '
             + 'placeholder="Type your words. They go with the button that you press."></textarea>'
-            + page_frame.review_action_groups(''.join(closes), ''.join(returns), later)
+            + page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
             + '<span role="status" data-send-status></span></form>')
 
 
@@ -651,6 +669,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         return current
 
     item = validate()
+    if item.state == ReviewState.VALIDATING:
+        raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
     if outcome == 'later':
         return change_page.NoMessageDelivery(), review_actions.later(
             item, fields.get('later', [''])[0], words, verify_revision=validate, root=root)
@@ -660,8 +680,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if isinstance(source, review_items.ChangeSource):
         with change_review.checked_review_write(source.path, root, validate) as current:
             delivery = change_browser.submit_review_change(current, snapshot.browser, outcome, words, status)
-        if isinstance(delivery, change_page.MessageDelivery):
-            label = 'feedback sent' if outcome == 'feedback' else outcome
+        if isinstance(delivery, change_page.MessageDelivery) and outcome not in ('validate', 'feedback'):
+            label = outcome
             with review_items.after_store_write(item.key):
                 change_review.record_review_log(delivery.page.review_list, delivery.row,
                                                 label+(': '+words if words else ''), delivery.page.production)
@@ -674,9 +694,14 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         scope = update_registration.question_scope(item.owner, members)
         question = change_browser.WaitingQuestion(key, review_items.name(item.owner, members), source.record,
             update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, members))
-        delivery, answer = change_browser.submit_question(
-            question, cast(change_page.QuestionOutcome, outcome), words, status, exact_record=True,
-            verify_revision=validate)
+        if 'review_submission' in source.record.item:
+            delivery, answer = review_actions.sent_question_action(
+                item, source.record, scope, cast(change_page.QuestionOutcome, outcome), words, status,
+                verify_revision=validate)
+        else:
+            delivery, answer = change_browser.submit_question(
+                question, cast(change_page.QuestionOutcome, outcome), words, status, exact_record=True,
+                verify_revision=validate)
     elif isinstance(source, review_items.InvestigationSource):
         delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
     else:
@@ -703,6 +728,12 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
         if item is None:
             raise question_record.AnswerRefused('this item is not on the page')
         if outcome == 'later':
+            if isinstance(item.source, review_items.ChangeSource):
+                source = item.source
+                with status.locked():
+                    path = change_routing.delivery_path(root, source.path, source.row['#'])
+                    change_page.require_user_turn(change_routing.delivery_slots(path))
+                    return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
             return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
         if outcome not in item.actions:
             raise question_record.AnswerRefused('choose an action on this card')
@@ -722,14 +753,14 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
             raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = review_actions.question_action(item, cast(change_page.QuestionOutcome, outcome), words, status)
     else:
-        delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status,
-                                                   feedback_closes=True)
+        delivery, answer = change_browser.submit(browser, urlencode({key:values[0] for key,values in fields.items()}), status)
     if key.startswith('question/') and outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
         delivery = review_actions.track_question(delivery, key, words, status)
-    words = ('feedback sent' if outcome == 'feedback' else outcome)+(': '+fields['feedback'][0] if fields['feedback'][0] else '')
-    if isinstance(delivery, change_page.MessageDelivery):
-        if not isinstance(delivery.page, change_page.UserQuestionPage):
-            change_review.record_review_log(delivery.page.review_list, delivery.row, words, delivery.page.production)
+    if isinstance(delivery, change_page.MessageDelivery) and not isinstance(delivery.page, change_page.UserQuestionPage):
+        if outcome not in ('validate', 'feedback'):
+            words = fields['feedback'][0]
+            log = outcome + (': ' + words if words else '')
+            change_review.record_review_log(delivery.page.review_list, delivery.row, log, delivery.page.production)
     return delivery, ('feedback sent' if outcome == 'feedback' else answer or
                      {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
@@ -740,6 +771,7 @@ STYLE = '''<style>
 :is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+#review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}
@@ -762,6 +794,12 @@ min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;colo
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
 .list-table .list-row td:last-child{text-align:right}.list-table [data-detail]>td{text-align:left}
+[data-validating-change] .list-row{cursor:default}
+[data-validating-change] [data-detail]{display:none}
+.review-handoff{display:block;margin-top:4px;color:var(--ink-2)}
+.review-handoff>:is(span,time){white-space:nowrap}
+.review-handoff>span{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
+@media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
 </style>'''
@@ -787,14 +825,14 @@ let content=document.querySelector('[data-review]');
 let selectedShow=content.dataset.show;
 const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
-const kinds=['question','change','investigation','proposal','efficiency'],states=['Open','Waiting','Done'];
+const kinds=['question','change','investigation','proposal','efficiency'],states=['Open','Waiting','Done','Validating'];
 let initialIndex=JSON.parse(content.querySelector('[data-review-index]').textContent);
 let index=new Map(),focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
   ownerName:owner[1],sourceName:source[1],title:row[5],state:states[row[6]],filed:row[7],updated:row[8],
-   hiddenUntil:row[9],ownerHtml:owner[2],sourceHtml:source[2],urgency:row[10] || 'normal',order:at+row[6]*payload.r.length};
+   hiddenUntil:row[9],ownerHtml:owner[2],sourceHtml:source[2],urgency:row[10] || 'normal',handoff:row[11],order:at+row[6]*payload.r.length};
 }
 function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
@@ -819,11 +857,16 @@ function summary(entry){
  const age=Math.max(0,Math.floor(Date.now()/1000-entry.filed));
  const stamp=age>=86400 ? Math.floor(age/86400)+' d' : age>=3600 ? Math.floor(age/3600)+' h' : Math.floor(age/60)+' min';
  const icon=content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML;
- const cells=['<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
+ const validating=entry.state==='Validating' && entry.type==='change';
+ if(validating) node.dataset.validatingChange='';
+ const handoff=entry.handoff;
+ const handoffLine=validating && handoff ? '<span class="review-handoff">With <span title="'+escapeText(entry.ownerName)+
+  '">'+escapeText(entry.ownerName)+'</span> since <time datetime="'+escapeText(handoff[0])+'">'+escapeText(handoff[1])+'</time></span>' : '';
+ const cells=[validating ? '<span class="list-toggle" tabindex="-1">'+escapeText(entry.id)+'</span>' : '<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
   +'<span class="list-chevron" aria-hidden="true">›</span>'+escapeText(entry.id)+'</button>',
   icon+entry.type[0].toUpperCase()+entry.type.slice(1),colored(entry.ownerName,entry.ownerHtml)
   +(entry.sourceName!==entry.ownerName ? '<small>· '+colored(entry.sourceName,entry.sourceHtml)+'</small>' : ''),
-  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+(entry.urgency!=='normal' ? '<small>'+escapeText({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'}[entry.urgency])+'</small>' : ''),
+  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+(entry.urgency!=='normal' ? '<small>'+escapeText({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'}[entry.urgency])+'</small>' : ''),
   '<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+entry.state+'</span>',stamp];
  node.innerHTML='<tr class="list-row">'+cells.map((cell,at)=>'<td'+(at===0 ? ' class="record-id"' : '')+' data-label="'+['Id','Type','Owner','Item','State','Age'][at]+'">'+cell+'</td>').join('')
   +'</tr><tr data-detail id="'+panel+'" hidden><td colspan="6"><p role="status">Loading the item…</p></td></tr>';
@@ -837,7 +880,7 @@ function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
-function matching(filters){return [...index.values()].filter(entry=>!pendingSaves.has(entry.key) && matches(entry,filters));}
+function matching(filters){return allEntries().filter(entry=>!pendingSaves.has(entry.key) && matches(entry,filters));}
 function savedEntry(key,result){
  const entry=index.get(key);if(!entry) return;
  entry.state=result.state;entry.hiddenUntil=result.later;
@@ -846,7 +889,10 @@ const view=createRecordTable({content:()=>content,single:true,
  entries:allEntries,mount:summary,mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
  unmount:row=>{if(!saved.has(row.dataset.key)) rememberForm(row.querySelector('[data-review-form]'));},
- place:reviewPlace,
+ place:params=>{
+  reviewPlace(params);
+  if(params.get('show')==='Waiting') params.set('show','all');
+ },
  persistLinkedTarget:true,
  missingItem:()=> 'This review is no longer on the Review page.',
  resolveOwner:owner=>{
@@ -856,8 +902,8 @@ const view=createRecordTable({content:()=>content,single:true,
  },
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
  hasKey:key=>allEntries().some(entry=>entry.key===key),
- shows:['open','Waiting','Done','all'],
- visible:(data,filters)=>!pendingSaves.get(data.key)?.departing && !saved.has(data.key) && index.has(data.key) && matches(index.get(data.key),filters),
+ shows:['open','Validating','Done','all'],
+ visible:(data,filters)=>!pendingSaves.get(data.key)?.departing && (!saved.has(data.key) || index.get(data.key)?.handoff) && index.has(data.key) && matches(index.get(data.key),filters),
  sortValues:data=>{
   const entry=index.get(data.key);
   return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
@@ -873,7 +919,10 @@ const view=createRecordTable({content:()=>content,single:true,
    button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
   });
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
-   button.querySelector('b').textContent=matching({type,owner,query,sourceOwner,keys,show:button.dataset.showChip}).length;
+   const show=button.dataset.showChip;
+   const count=matching({type,owner,query,sourceOwner,keys,show}).length;
+   button.querySelector('b').textContent=count;
+   button.toggleAttribute('data-empty-count',count===0);
   });
   content.querySelectorAll('[data-type-chip]').forEach(button=>{
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
@@ -922,7 +971,7 @@ function updateTitleFallback(panel){
 function loadBodies(){
  view.opened.forEach(key=>{
   const row=mountedRow(key);
-  if(!row || row.dataset.bodyLoaded) return;
+  if(!row || row.hasAttribute('data-validating-change') || row.dataset.bodyLoaded) return;
   const install=text=>{
    const current=mountedRow(key);
    if(!current || current.dataset.bodyLoaded) return;
@@ -1009,15 +1058,17 @@ function bindForm(row){
     }
     pending.saved=true;
     drafts.delete(key);
+    const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
     saved.set(key,{updated:row.dataset.updated,previousState:row.dataset.state,
-     state:result.state ?? (['validate','question'].includes(outcome) ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
+     handed,state:result.state ?? (handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:data.get('outcome')==='question',
-     closes:!['validate','question','later'].includes(data.get('outcome'))});
+     closes:!handed && !['question','later'].includes(outcome)});
     savedEntry(key,saved.get(key));
     pendingSaves.delete(key);
     view.closeCard(key);
     view.showActionResult(row,submission,key,{kind:'success',message:'Saved: '+result.answer});
+    if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
    }catch(error){
     pendingSaves.delete(key);
     view.showActionResult(row,submission,key,{kind:'failure',message:'Not saved: '+error.message});
@@ -1066,6 +1117,9 @@ function bindLater(form,pick){
   summaryPrefix:'Hides until ',prepareMenu});
 }
 function bind(){view.replace(false);}
+content.addEventListener('click',event=>{
+ if(event.target.closest('[data-validating-change] .list-row')) event.stopPropagation();
+},true);
 function revealConflict(){
  const key=conflictKey;conflictKey='';
  const entry=index.get(key);
@@ -1131,7 +1185,7 @@ async function refresh(_supersede=false,current=()=>true){
   if(!entry || (result.later && Date.now()>=result.later)) {saved.delete(key);continue;}
   // The index supplies the state and update time for each row.
   const submitted=entry.state===result.previousState && entry.updated===result.updated;
-  if(!submitted && entry.state!==result.state){saved.delete(key);continue;}
+  if(!submitted && (result.handed || entry.state!==result.state)){saved.delete(key);continue;}
   if(!result.closes && !result.question && !result.later && !submitted){
    saved.delete(key);
   }

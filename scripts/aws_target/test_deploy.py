@@ -31,6 +31,7 @@ from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
+from scripts.aws_target.test_hana_setup import write_hana_config
 from scripts.aws_target.test_spot_end import FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
@@ -441,7 +442,7 @@ class HanaSetupFailureTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         self.clock = TestClock()
-        self.workload = self.root / 'hana_aws.conf'
+        self.workload = write_hana_config()
         self.setup_path = self.state / 'hana/setup.json'
         self.book = ledger.CostLedger(self.state)
         self.calls = []
@@ -470,7 +471,8 @@ class HanaSetupFailureTests(CostFixture):
         _ = self.enterContext(mock.patch.object(deploy.Deployment, '_check_credentials'))
         _ = self.enterContext(mock.patch.object(deploy.Deployment, '_validate_inputs'))
 
-    def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False) -> deploy.Deployment:
+    def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False,
+                spot_prices: tuple[tuple[str, str], ...] = (('us-east-2b', '0.10'),)) -> deploy.Deployment:
         status = 'CREATE_IN_PROGRESS'
         created = self.clock.now
         stack_id = 'active-stack'
@@ -481,6 +483,14 @@ class HanaSetupFailureTests(CostFixture):
             self.calls.append(list(arguments))
             offset = arguments.index('--region') + 2
             operation = arguments[offset + 1]
+            if operation == 'describe-spot-price-history':
+                if fake.fail == operation:
+                    return subprocess.CompletedProcess(arguments, 1, '', 'fixture Spot read failed')
+                size = conf.read(self.workload).text('instance_type')
+                rows = [{'InstanceType': size, 'AvailabilityZone': zone, 'SpotPrice': price,
+                         'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat()}
+                        for zone, price in spot_prices]
+                return subprocess.CompletedProcess(arguments, 0, json.dumps({'SpotPriceHistory': rows}), '')
             if operation == 'create-change-set':
                 created = self.clock.now
                 stack_id = f'active-stack-{len(self.deleted_stacks)}'
@@ -540,6 +550,96 @@ class HanaSetupFailureTests(CostFixture):
         self.clock.advance(limits.permit_max_seconds + 1)
         _ = subject.prepare_hana()
         return generation
+
+    def assert_spot_price_refusal(self, subject: deploy.Deployment) -> str:
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaises(deploy.DeploymentRefused) as failure:
+            _ = subject.hana_setup(approve_resources=True)
+        call, = self.calls
+        self.assertIn('describe-spot-price-history', call)
+        self.assertIn('us-east-2', call)
+        self.assertIn('--instance-types', call)
+        self.assertIn(conf.read(self.workload).text('instance_type'), call)
+        self.assertNotIn('--availability-zone', call)
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        return str(failure.exception)
+
+    def test_hana_setup_refuses_price_above_ceiling_and_suggests_a_new_ceiling(self) -> None:
+        text_setting(self.workload, 'spot_max_usd_per_hour', '0.15')
+        text_setting(self.workload, 'spot_ceiling_margin', '0.27')
+        subject = self.subject(FakeEc2(), spot_prices=(
+            ('us-east-2a', '0.1610'), ('us-east-2b', '0.1828'), ('us-east-2c', '0.1210')))
+        message = self.assert_spot_price_refusal(subject)
+        self.assertIn('The current Spot price for m7a.2xlarge in us-east-2b is 0.1828 USD/hour.', message)
+        self.assertIn('The ceiling is 0.15 USD/hour.', message)
+        self.assertIn('The cheapest zone is us-east-2c at 0.1210 USD/hour.', message)
+        self.assertIn('use a subnet in the new zone', message)
+        self.assertEqual(message.splitlines()[-3:], [
+            '1. Run /tune hana_aws spot_max_usd_per_hour 0.24',
+            '2. Run deploy.py prepare --workload hana',
+            '3. Run deploy.py hana-setup --approve-resources',
+        ])
+
+    def test_hana_setup_suggests_tuning_the_effective_host_ceiling(self) -> None:
+        key = 'spot_max_usd_per_hour.hana-test'
+        text_setting(self.workload, key, '0.15')
+        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2b', '0.18'),))
+        with mock.patch('socket.gethostname', return_value='hana-test.example'):
+            message = self.assert_spot_price_refusal(subject)
+            _ = conf.editable_line(self.workload, key)
+        self.assertIn('The ceiling is 0.15 USD/hour.', message)
+        self.assertIn(f'1. Run /tune hana_aws {key} 0.23', message.splitlines())
+
+    def test_hana_setup_reports_another_host_override_that_blocks_tune(self) -> None:
+        key = 'spot_max_usd_per_hour'
+        text_setting(self.workload, key, '0.15')
+        text_setting(self.workload, f'{key}.other-host', '0.20')
+        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2b', '0.18'),))
+        with mock.patch('socket.gethostname', return_value='hana-test.example'):
+            with self.assertRaises(conf.Unusable) as refusal:
+                _ = conf.editable_line(self.workload, key)
+            message = self.assert_spot_price_refusal(subject)
+        self.assertIn('The suggested ceiling is 0.23 USD/hour.', message.splitlines())
+        self.assertIn(str(refusal.exception), message.splitlines())
+        self.assertNotIn('/tune hana_aws', message)
+
+    def test_hana_setup_and_the_configuration_validator_refuse_a_zero_margin(self) -> None:
+        key = 'spot_ceiling_margin'
+        source = self.workload.read_text()
+        conf.check(self.workload, key, '0.25')
+        with self.assertRaises(conf.Unusable):
+            conf.check(self.workload, key, '0')
+        _ = self.workload.write_text(source.replace('spot_ceiling_margin=0.25', 'spot_ceiling_margin=0'))
+        subject = self.subject(FakeEc2())
+        _ = subject.prepare_hana()
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'positive spot_ceiling_margin'):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+
+    def test_hana_setup_continues_at_the_price_ceiling(self) -> None:
+        text_setting(self.workload, 'spot_max_usd_per_hour', '0.15')
+        fake = FakeEc2(fail_wait='stack-create-complete')
+        subject = self.subject(fake, spot_prices=(('us-east-2b', '0.15'),))
+        _ = subject.prepare_hana()
+
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(deploy.HanaCreateRolledBack):
+            _ = subject.hana_setup(approve_resources=True)
+        self.assertIn('create-change-set', fake.operations)
+        self.assertIn('hana-setup: The current Spot price for m7a.2xlarge in us-east-2b is 0.15 USD/hour. '
+                      + 'The ceiling is 0.15 USD/hour.', output.getvalue().splitlines())
+
+    def test_hana_setup_refuses_a_zone_with_no_price_and_lists_priced_zones(self) -> None:
+        subject = self.subject(FakeEc2(), spot_prices=(('us-east-2c', '0.14'), ('us-east-2a', '0.15')))
+        message = self.assert_spot_price_refusal(subject)
+        self.assertIn('AWS lists no Spot price for m7a.2xlarge in us-east-2b.', message)
+        self.assertIn('Zones with a price in us-east-2: us-east-2a, us-east-2c.', message)
+
+    def test_hana_setup_refuses_when_the_price_read_fails(self) -> None:
+        subject = self.subject(FakeEc2(fail='describe-spot-price-history'))
+        message = self.assert_spot_price_refusal(subject)
+        self.assertIn('Could not read Spot prices for m7a.2xlarge in us-east-2.', message)
 
     def policy_update_fixture(self, changes: list[dict[str, object]], *, fail_update: bool = False,
                               change_status: str = 'CREATE_COMPLETE', next_token: str = '',
@@ -1201,6 +1301,11 @@ class HanaSetupFailureTests(CostFixture):
         self.assertLess(fake.operations.index('wait instance-terminated'), create)
         self.assertLess(fake.operations.index('delete-volume'), create)
         self.assertLess(fake.operations.index('delete-bucket'), create)
+        price_read = next(index for index, call in enumerate(self.calls) if 'describe-spot-price-history' in call)
+        bucket_delete = next(index for index, call in enumerate(self.calls) if 'delete-bucket' in call)
+        create_call = next(index for index, call in enumerate(self.calls) if 'create-change-set' in call)
+        self.assertLess(bucket_delete, price_read)
+        self.assertLess(price_read, create_call)
         self.assertEqual(fake.leftovers(), ([], [], [], [], False))
         evidence = self.book.read_snapshot()
         first, second = evidence.hana_compute
@@ -1208,6 +1313,26 @@ class HanaSetupFailureTests(CostFixture):
         self.assertIsInstance(first.state, ledger.HanaExposureClosed)
         self.assertGreater(second.generation, previous_generation)
         self.assertIsInstance(evidence.hana_storage[0].state, ledger.HanaExposureClosed)
+
+    def test_hana_setup_cleans_up_a_missing_requested_stack_before_image_validation(self) -> None:
+        fake = FakeEc2()
+        fake.create_retained()
+        fake.roll_back()
+        self.deleted_stacks['previous-stack'] = (self.clock.now, fake.events.copy())
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+
+        with mock.patch.object(subject, '_validate_inputs', side_effect=aws_cli.AwsUnavailable('Image is unavailable')), \
+                redirect_stdout(StringIO()), self.assertRaisesRegex(aws_cli.AwsUnavailable, 'Image is unavailable'):
+            _ = subject.hana_setup(approve_resources=True)
+
+        self.assertEqual(fake.operations[:3], ['describe-stacks', 'list-stacks', 'describe-stack-events'])
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+        self.assertFalse(self.setup_path.exists())
+        state = self.book.read_snapshot()
+        self.assertIsInstance(state.hana_compute[0].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(state.hana_storage[0].state, ledger.HanaExposureClosed)
+        self.assertFalse(any('describe-spot-price-history' in call for call in self.calls))
 
     def test_hana_setup_refuses_to_clear_a_record_without_deleted_stack_evidence(self) -> None:
         fake = FakeEc2()
@@ -2958,8 +3083,6 @@ sys.exit(7)
         for key in ('VpcId', 'NotificationEmail'):
             self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
         self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
-        self.assertEqual(by_name['GateGpuInstanceTypes']['ParameterValue'],
-                         ','.join(gpu_size_trial.settings().spot_max_usd_per_hour))
         self.assertEqual(by_name['GateRootGiB']['ParameterValue'], '40')
         self.assertEqual(by_name['GateSpotMaxPrice']['ParameterValue'], '0.8')
         saved = remote.read_record(self.state / 'gate-deployment.json')
@@ -2969,6 +3092,19 @@ sys.exit(7)
         after = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
         self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
         self.assertTrue(any('execute-change-set' in args for args in commands))
+
+    def test_gate_setup_grants_and_records_the_sorted_union_of_gpu_trial_types(self) -> None:
+        subject, commands = self.gate_fixture()
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+            'regions=us-east-2\nhana_gpu_instance_types=g6.2xlarge g4dn.2xlarge\n' +
+            'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.98,"g4dn.xlarge":0.5}')
+        self.assertTrue(subject.gate_up(approve_resources=True))
+        arguments = next(args for args in commands if 'create-change-set' in args)
+        parameters = ledger.rows({'rows': cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))}, 'rows')
+        applied = next(row['ParameterValue'] for row in parameters if row['ParameterKey'] == 'GateGpuInstanceTypes')
+        expected = ['g4dn.2xlarge', 'g4dn.xlarge', 'g6.2xlarge']
+        self.assertEqual(applied, ','.join(expected))
+        self.assertEqual(remote.read_record(self.state / 'gate-deployment.json')['gpu_instance_types'], expected)
 
     def test_gpu_trial_command_requires_approval_and_checks_credentials(self) -> None:
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output')

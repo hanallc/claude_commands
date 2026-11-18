@@ -170,7 +170,9 @@ class LinkedTableTests(unittest.TestCase):
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
                   + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
- setAttribute(key,value){this[key]=value;},classList:{toggle(){}},
+ setAttribute(key,value){this[key]=value;},
+ toggleAttribute(key,present){if(present)this[key]='';else delete this[key];return present;},
+ classList:{toggle(){}},
  addEventListener(type,listener){this[type]=listener;}});
 let notice=null;
 const empty=element();empty.after=value=>{notice=value;};

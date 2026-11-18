@@ -13,7 +13,7 @@ from collections.abc import Callable, Sequence, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from enum import StrEnum
 from hashlib import sha256
 import json
@@ -448,18 +448,23 @@ class Deployment:
         print('Hana placement remains disabled')
         if not approve_resources:
             return False
+        stop_timeout = workload.whole('stop_wait_timeout_s')
+        stop_interval = workload.whole('stop_poll_seconds')
+        if min(stop_timeout, stop_interval) <= 0:
+            raise DeploymentRefused('Hana setup requires positive values for stop_wait_timeout_s and stop_poll_seconds.')
         self._authorize(True)
         child = self._hana_output()
         with control_lock(self.directory):
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
-            settings, parameters, template = self._hana_inputs()
+            settings, parameters, template = self._hana_inputs(workload)
             if not saved:
                 prepared = cast(object, json.loads((child.output / 'parameters.json').read_text()))
                 prepared_parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
                                        for row in ledger.rows({'parameters': prepared}, 'parameters')}
                 parameters['DeploymentId'] = ledger.text(prepared_parameters, 'DeploymentId')
-            child.confirm_preparation_evidence(settings, parameters, template)
+            resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
+            child.confirm_preparation_evidence(settings, parameters, template, allow_expired=resume_stop)
             book = ledger.CostLedger(self.directory)
             spending = hana_spend.HanaSpending(book, self.settings_path, limits)
             outputs: dict[str, str] = {}
@@ -538,6 +543,8 @@ class Deployment:
             api = self._api(settings)
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
                 self._validate_inputs(settings)
+                if not outputs:
+                    self._check_hana_spot_price(api, settings.availability_zone, limits, workload)
             if 'generation' not in saved:
                 # Explicit setup approval reserves resources without enabling command admission.
                 now = int(self.clock())
@@ -585,16 +592,30 @@ class Deployment:
                     or requests[0].get('Type') != 'persistent'
                     or requests[0].get('InstanceInterruptionBehavior') != 'stop'):
                 raise DeploymentRefused('Hana requires a persistent Spot request with stop behavior')
-            saved.update(instance=instance, spot_request=request, bucket=bucket, data_volume=outputs['DataVolume'])
+            saved.update(instance=instance, spot_request=request, bucket=bucket, data_volume=outputs['DataVolume'],
+                         stop_pending=True)
             write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
             with step('hana-setup', 'confirming the idle stop', self.settings_path):
                 if observed.state not in ('stopped', 'stopping'):
                     _ = api.call('stop-instances', '--instance-ids', instance)
-                _ = api.call('wait', 'instance-stopped', '--instance-ids', instance)
-                confirmed = api.observe(instance, int(self.clock()))
-                if confirmed.state != 'stopped':
-                    raise DeploymentRefused('Hana stop confirmation is incomplete; repeat approved setup')
+                started = time.monotonic()
+                deadline = started + stop_timeout
+                while time.monotonic() < deadline:
+                    confirmed = api.observe(instance, int(self.clock()))
+                    now = time.monotonic()
+                    print(f'waiting for the Hana box to stop: {confirmed.state}, {int(now - started)} s of {stop_timeout} s',
+                          flush=True)
+                    if confirmed.state == 'stopped':
+                        break
+                    remaining = deadline - now
+                    if remaining > 0:
+                        self.pause(min(stop_interval, remaining))
+                else:
+                    raise DeploymentRefused('The Hana box is not yet stopped. '
+                                            + 'Run deploy.py hana-setup --approve-resources again to resume setup.')
                 spending.reconcile(int(self.clock()), 'stopped', generation=ledger.instant(saved, 'generation'))
+                del saved['stop_pending']
+                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
         provider = self._hana_provider()
         identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region)
         hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
@@ -658,6 +679,46 @@ class Deployment:
             if body.read_bytes() != content:
                 raise ValueError('The probe object differs from the value sent')
         return passed
+
+    def _check_hana_spot_price(self, api: AwsCli, zone: str, limits: hana_spend.PermitSettings,
+                               workload: conf.ConfigRead) -> None:
+        try:
+            margin = conf.decimal(workload.text('spot_ceiling_margin', recover_invalid=False))
+        except ValueError as error:
+            raise DeploymentRefused(f'Hana setup requires a positive spot_ceiling_margin. {error}') from error
+        if margin <= 0:
+            raise DeploymentRefused('Hana setup requires a positive spot_ceiling_margin.')
+        size = limits.instance_type
+        try:
+            rows = fetch_spot_prices(api, (size,), int(self.clock()))
+        except (AwsUnavailable, OSError, ValueError, subprocess.SubprocessError) as error:
+            raise DeploymentRefused(f'Could not read Spot prices for {size} in {api.region}.') from error
+
+        prices = {row.zone: row.usd_per_hour for row in rows}
+        if zone not in prices:
+            priced_zones = ', '.join(sorted(prices)) or 'none'
+            raise DeploymentRefused(f'AWS lists no Spot price for {size} in {zone}. '
+                                    + f'Zones with a price in {api.region}: {priced_zones}.')
+        price = prices[zone]
+        ceiling = limits.spot_max_usd_per_hour
+        summary = f'The current Spot price for {size} in {zone} is {price:f} USD/hour. The ceiling is {ceiling:f} USD/hour.'
+        if price > ceiling:
+            cheapest = min(prices, key=prices.__getitem__)
+            suggested = format((price * (1 + margin)).quantize(Decimal('0.01'), rounding=ROUND_CEILING), 'f')
+            ceiling_key = workload.effective_key('spot_max_usd_per_hour')
+            details = (f'{summary}\n'
+                + f'The cheapest zone is {cheapest} at {prices[cheapest]:f} USD/hour. '
+                + 'To change zones, use a subnet in the new zone.\n')
+            try:
+                _ = conf.editable_line('hana_aws', ceiling_key)
+                conf.check('hana_aws', ceiling_key, suggested)
+            except conf.Unusable as error:
+                raise DeploymentRefused(f'{details}The suggested ceiling is {suggested} USD/hour.\n{error}') from error
+            raise DeploymentRefused(details
+                + f'1. Run /tune hana_aws {ceiling_key} {suggested}\n'
+                + '2. Run deploy.py prepare --workload hana\n'
+                + '3. Run deploy.py hana-setup --approve-resources')
+        print(f'hana-setup: {summary}')
 
     @staticmethod
     def _hana_setup_started(book: ledger.CostLedger, saved: dict[str, object]) -> int:
@@ -963,12 +1024,13 @@ class Deployment:
               + f'{len(kept.volumes)} disks and {len(kept.buckets)} buckets deleted')
         return True
 
-    def _hana_inputs(self) -> tuple[DeploymentSettings, dict[str, str], bytes]:
+    def _hana_inputs(self, workload: conf.ConfigRead | None = None) -> tuple[DeploymentSettings, dict[str, str], bytes]:
         """Share the existing deployment validation and use only Hana sizes and prices."""
-        workload = conf.read_or_repository('hana_aws')
+        if workload is None:
+            workload = conf.read_or_repository('hana_aws')
         limits = hana_spend.read_settings(workload)
         # Empty identity values are allowed here; text() refuses an empty value.
-        present = workload.values()
+        present = workload.values('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')
         names = {key: workload.text(key) for key in ('stack_name', 'availability_zone')}
         names.update({key: present.get(key, '') for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')})
         registered = hana_image.saved(self.directory)
@@ -1235,12 +1297,13 @@ class Deployment:
             current_fingerprint=fingerprint(current, current_parameters, TEMPLATE.read_bytes()))
 
     def confirm_preparation_evidence(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
-                                    *, renew: bool = False, current_fingerprint: str = '') -> None:
+                                    *, renew: bool = False, current_fingerprint: str = '', allow_expired: bool = False) -> None:
         """Verify saved preparation before either workload can create resources."""
         preflight = remote.read_record(self.output / 'preflight.json')
         at = ledger.instant(preflight, 'at')
         expected = current_fingerprint or fingerprint(settings, parameters, template)
-        if ((not renew and not 0 <= int(self.clock()) - at <= settings.preflight_max_age_s)
+        age = int(self.clock()) - at
+        if ((not renew and (age < 0 or (not allow_expired and age > settings.preflight_max_age_s)))
                 or preflight.get('fingerprint') != expected
                 or fingerprint(settings, parameters, template) != expected
                 or (self.output / 'template.json').read_bytes() != template):
@@ -1700,13 +1763,15 @@ class Deployment:
             for position, region in enumerate(additional, 1):
                 with timings.measure(GateRegionOperation.NETWORK, region, position, len(additional), self.settings_path):
                     networks.append(self.regional_network(api, settings, region))
+            gpu_types = sorted(gpu_size_trial.settings().spot_max_usd_per_hour.keys() |
+                               set(values.words('hana_gpu_instance_types')))
             parameters = {
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
                                       *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
                 'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
                 'GateInstanceTypes': ','.join(values.words('instance_types')),
-                'GateGpuInstanceTypes': ','.join(gpu_size_trial.settings().spot_max_usd_per_hour),
+                'GateGpuInstanceTypes': ','.join(gpu_types),
                 'GateRootGiB': str(values.whole('root_gib')),
                 'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
                 'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
@@ -1736,6 +1801,7 @@ class Deployment:
             manifest: dict[str, object] = {
                 'deployment_id': ledger.text(saved, 'deployment_id'), 'revision': revision,
                 'instance_types': values.words('instance_types'),
+                'gpu_instance_types': gpu_types,
                 'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
                 'regions': [{'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
                     'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],

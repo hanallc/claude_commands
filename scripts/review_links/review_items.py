@@ -1,17 +1,18 @@
 """Read the five review stores through one model of whose turn it is."""
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
+import json
 import logging
 from pathlib import Path
 import re
 import sys
 from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING, Literal, cast, override
+from typing import TYPE_CHECKING, cast, override
 
 from scripts.production import unit_lookup, showrunner_tree
 from scripts.agents.remote import local_machine
@@ -23,10 +24,10 @@ from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
 from scripts.production import issues as issue_store
-from scripts.production import proposals_folder, proposals_table
+from scripts.production import proposal_issue, proposals_folder, proposals_table, record_store
 from scripts.production.record_store import state_root
 from scripts.production.issues import Issue, PROPOSAL_TAG, source_paths
-from scripts.production.proposal_issue import AwaitingApproval, DeclinedDecision, InProgress, decision_answer, proposal_progress
+from scripts.production.proposal_issue import DeclinedDecision, InProgress, decision_answer, proposal_progress
 from scripts.production.proposal_issue import REVIEW_MARK_FIELD, review_log, review_mark
 from scripts.production.production_doc import production_field, Refusal
 from scripts.review_links import efficiency_reviews, review_events, review_later
@@ -107,13 +108,14 @@ class ReviewType(StrEnum):
 
 class ReviewState(StrEnum):
     OPEN = 'Open'
+    VALIDATING = 'Validating'
     WAITING = 'Waiting'
     DONE = 'Done'
 
 
 REVIEW_TYPES = tuple(ReviewType)
 REVIEW_STATES = tuple(ReviewState)
-PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "style_answer_words", "proposed_by", "record_type",
+PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "style_answer_words", "proposed_by", "production_id", "record_type",
                                    REVIEW_MARK_FIELD))
 # Approve and Decline close the item; Send feedback closes it; Ask question returns it.
 DECISION_ACTIONS = ('approve', 'decline', 'feedback', 'question')
@@ -141,6 +143,46 @@ class ReviewTimes:
 
 
 @dataclass(frozen=True)
+class OpenFeedback(delivery_state.OpenQuestion):
+    """The showrunner must act before this change returns to the user."""
+
+
+@dataclass(frozen=True)
+class CompletedFeedback(delivery_state.AnsweredQuestion):
+    """The showrunner's note returns this change to the user."""
+
+
+def decode_change_delivery(value: object) -> delivery_state.DeliverySlots:
+    slots = delivery_state.decode_value(value)
+    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    saved = fields.get("question")
+    question = slots.question
+    if isinstance(saved, dict) and cast(dict[str, object], saved).get("kind") == "feedback":
+        if isinstance(question, delivery_state.OpenQuestion):
+            return replace(slots, question=OpenFeedback(question.question_id, question.text, question.delivery))
+        if isinstance(question, delivery_state.AnsweredQuestion):
+            return replace(slots, question=CompletedFeedback(question.question_id, question.text, question.answer))
+    return slots
+
+
+def read_change_delivery(path: Path, *, sources: list[Path] | None = None) -> delivery_state.DeliverySlots:
+    """Read change exchanges with their request type."""
+    if sources is not None:
+        sources.append(path)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    try:
+        value = cast(object, json.loads(content))
+    except ValueError:
+        if sources is not None:
+            raise
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+    return decode_change_delivery(value)
+
+
+@dataclass(frozen=True)
 class ChangeSource:
     path: Path
     row: dict[str, str]
@@ -156,6 +198,7 @@ class QuestionSource:
 @dataclass(frozen=True)
 class InvestigationSource:
     record: investigation.Investigation
+    path: Path
 
 
 @dataclass(frozen=True)
@@ -223,8 +266,6 @@ def source_path(item: ReviewItem) -> Path:
     source = item.source
     if isinstance(source, (ProposalSource, QuestionSource, UnownedQuestionSource)):
         return source.record.path
-    if isinstance(source, InvestigationSource):
-        return investigation.folder(source.record.owner)/(source.record.id+'.md')
     return source.path
 
 
@@ -295,7 +336,7 @@ def name(identity: staff.StaffId, members: staff.StaffSnapshot) -> str:
 def change_state(row: dict[str, str], slots: delivery_state.DeliverySlots) -> ReviewState:
     if row.get('Verdict'):
         return ReviewState.DONE
-    return ReviewState.OPEN if slots.waits_for_user(False) else ReviewState.WAITING
+    return ReviewState.OPEN if slots.waits_for_user(False) else ReviewState.VALIDATING
 
 
 def question_state(record: update_registration.QuestionRecord) -> ReviewState:
@@ -308,6 +349,13 @@ def investigation_state(item: investigation.Investigation) -> ReviewState:
     return {investigation.InvestigationState.OPEN: ReviewState.WAITING,
             investigation.InvestigationState.ANSWER_READY: ReviewState.OPEN,
             investigation.InvestigationState.READ: ReviewState.DONE}[item.state]
+
+
+def change_delivery(root: Path, path: Path, row: str) -> delivery_state.DeliverySlots:
+    try:
+        return read_change_delivery(change_routing.delivery_path(root, path, row))
+    except OSError:
+        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
 
 
 def change_item(path: Path, row: dict[str, str], assignment: change_routing.ChangeAssignment,
@@ -325,14 +373,16 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     logs = [ReviewLog(filed, name(source, members), 'Filed for your check')]
     saved_log = review_events.decode(row.get('Review log', ''))
     words = {entry.words.casefold() for entry in saved_log}
-    if isinstance(slots.question, delivery_state.OpenQuestion):
-        if ('question: '+slots.question.text).casefold() not in words:
-            logs.append(ReviewLog(filed, 'nate', 'Question: ' + slots.question.text))
-    elif isinstance(slots.question, delivery_state.AnsweredQuestion):
-        if ('question: '+slots.question.text).casefold() not in words:
-            logs.append(ReviewLog(filed, 'nate', 'Question: ' + slots.question.text))
-        if ('answer: '+slots.question.answer).casefold() not in words:
-            logs.append(ReviewLog(filed, name(identity, members), 'Answer: ' + slots.question.answer))
+    request = slots.question
+    if isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)) and not isinstance(
+            request, (OpenFeedback, CompletedFeedback)):
+        event = 'Question: ' + request.text
+        if event.casefold() not in words:
+            logs.append(ReviewLog(filed, 'nate', event))
+    if isinstance(request, delivery_state.AnsweredQuestion):
+        answer = 'Answer: ' + request.answer
+        if answer.casefold() not in words:
+            logs.append(ReviewLog(filed, name(identity, members), answer))
     if slots.validation_requested and not any(entry.words.startswith('validate') for entry in saved_log):
         logs.append(ReviewLog(filed, 'nate', 'Asked the showrunner to check'))
     if row.get('Verdict') and row['Verdict'].casefold() not in words and not any(
@@ -344,7 +394,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     local = path.absolute() == current.absolute()
     return ReviewItem(prefix+'/'+row['#'], shown, ReviewType.CHANGE, identity, source,
         row['Change'], state, ReviewTimes(filed, logs[-1].time), tuple(logs),
-        ('works', 'not works', 'validate', 'feedback', 'question') if state != ReviewState.DONE else (),
+        ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN else (),
         ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
@@ -376,7 +426,7 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                 continue
             path = change_routing.delivery_path(root, listing.path, row['#'])
             with guard_source(path, sources, entry=row['#']):
-                slots = change_routing.delivery_slots(path, sources=sources)
+                slots = read_change_delivery(path, sources=sources)
                 scoped.append(change_item(listing.path, row, change_routing.ChangeAssignment(owner, document),
                                          members, queue, current, slots))
         return scoped
@@ -421,7 +471,7 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                     continue
                 if not row.get('Verdict') and states == (ReviewState.DONE,):
                     continue
-                slots = change_routing.delivery_slots(delivery_path, sources=sources)
+                slots = read_change_delivery(delivery_path, sources=sources)
                 if change_state(row, slots) not in states:
                     continue
                 assignment = routing.owner_and_production(path, row)
@@ -437,7 +487,8 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
     return found
 
 
-def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *, unowned: bool = False) -> ReviewItem:
+def question_item(record: update_registration.QuestionRecord, members: staff.StaffSnapshot, *,
+                  unowned: bool = False, assign_ids: bool = False) -> ReviewItem:
     owner, fields, path = record.owner, record.item, record.path
     parsed = update_registration.parse_outstanding_entries([fields], path)[0]
     filed = moment(fields['since'])
@@ -460,7 +511,14 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     logs.extend(saved_log)
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
     key = 'question/'+owner+'/'+path.name
-    identity = name(owner, members)+'/'+fields.get('review_id',path.stem)
+    review_id = fields.get('review_id', path.stem)
+    if assign_ids:
+        try:
+            review_id = update_registration.question_review_id(record)
+            fields['review_id'] = review_id
+        except (OSError, ValueError, staff.StaffRefused, update_registration.RegistrationFailure):
+            review_id = ''
+    identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
     return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
@@ -469,15 +527,27 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
         review_events.waiting_why(fields.get('waiting_why', '')))
 
 
+def store_paths(folders: tuple[Path, ...], sources: list[Path] | None) -> Iterator[Path]:
+    """Watch each store and archive before reading its paths."""
+    seen: set[Path] = set()
+    for folder in folders:
+        with guard_source(folder, sources):
+            for path in record_store.stored_paths((folder,), sources=sources, strict=sources is not None):
+                if path not in seen:
+                    seen.add(path)
+                    yield path
+
+
 def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    owners: tuple[staff.StaffRow, ...] = (), sources: list[Path] | None = None,
-                   include_unowned: bool = True,
+                   include_unowned: bool = True, assign_ids: bool = False,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
                    owner_options: dict[staff.StaffId, str] | None = None,
                    selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
     identities = update_registration.QuestionStaff.for_record(members)
     selected = owners or tuple(member for member in members.rows if member.kind == 'producer' or
-        member.kind == 'showrunner' and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents)
+        member.kind == 'showrunner' and (include_unowned or
+            isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path in documents))
     if isinstance(selection, ExactReviewRecord):
         selected = tuple(member for member in selected if member.id == selection.owner)
     found: list[ReviewItem] = []
@@ -493,56 +563,56 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
         if question_state(record) not in states or not selection.includes(
                 record.path, 'question/'+record.owner+'/'+record.path.name):
             return
-        found.append(question_item(record, members, unowned=unowned))
+        item = (question_item(record, members, unowned=unowned, assign_ids=True) if assign_ids
+                else question_item(record, members, unowned=unowned))
+        found.append(item)
 
-    def read_folder(location: Path, owner: str = '', *, unowned: bool = False) -> None:
-        with guard_source(location, sources):
-            if isinstance(selection, ExactReviewRecord):
-                paths = [selection.path] if selection.path.parent == location else []
-            else:
-                paths = source_paths(location, 'question-*.md', sources=sources)
-            for path in paths:
-                with guard_source(path, sources):
-                    for record in update_registration.selected_question_records(
-                            [path], statuses, identities_found, sources, owner):
-                        append(record, unowned=unowned)
+    scopes: dict[Path, list[staff.StaffId]] = {}
+    unowned_ids: set[staff.StaffId] = set()
 
-    for owner in selected:
-        if isinstance(owner.doc,(staff.LiveDoc,staff.WrappedDoc)) and owner.doc.machine != local_machine():
-            print(f'questions: {owner.name}: ownership evidence is unavailable',file=sys.stderr)
-            continue
-        document = owner if owner.kind == 'producer' else cast(staff.LiveDoc, owner.doc).path
-        if sources is not None and isinstance(document, Path):
-            sources.append(document)
-        if isinstance(sources, ReviewSourceStamps) or isinstance(selection, ExactReviewRecord):
-            with guard_source(document if isinstance(document, Path) else state_root(), sources):
+    def add_owner(identity: staff.StaffId, document: Path | None) -> None:
+        location = document if document is not None else state_root()
+        current: tuple[Path, ...] = ()
+        if document is not None:
+            with guard_source(document, sources, skip=(FileNotFoundError,)):
                 folder = update_registration.question_folder(document, identities)
                 if isinstance(folder, update_registration.QuestionFolder):
-                    read_folder(folder.path, folder.owner)
-                else:
-                    location = proposals_folder.issues_folder(folder.document)
-                    if location is not None:
-                        read_folder(location)
-        else:
-            for record in update_registration.question_records_for_document(
-                    document, identities, include_unrouted=True, sources=sources,
-                    statuses=statuses, owner_ids=identities_found):
-                append(record)
-    if include_unowned:
-        if isinstance(sources, ReviewSourceStamps) or isinstance(selection, ExactReviewRecord):
-            root = state_root()
-            owned = {row.id for row in members.rows if row.kind == 'showrunner'}
-            with guard_source(root, sources):
-                paths = [selection.path.parent.parent] if isinstance(selection, ExactReviewRecord) else sorted(root.glob('*'))
-                for path in paths:
-                    with guard_source(path, sources):
-                        if path.parent == root and path.is_dir() and path.name not in owned:
-                            read_folder(path/'questions', unowned=True)
-        else:
-            for record in update_registration.unowned_question_records(identities, statuses=statuses, owner_ids=identities_found):
-                if sources is not None:
-                    sources.extend((record.path,record.path.parent))
-                append(record, unowned=True)
+                    current = (folder.path,)
+        with guard_source(location, sources, skip=(FileNotFoundError,)):
+            for folder in record_store.known_folders(record_store.RecordKind.QUESTION, identity, current,
+                                                     document=document, strict=sources is not None, sources=sources):
+                scopes.setdefault(folder, []).append(identity)
+
+    for owner in selected:
+        doc = record_store.local_document(owner)
+        if (owner.kind == 'showrunner' and doc is None and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
+                and not include_unowned):
+            print(f'questions: {owner.name}: ownership evidence is unavailable', file=sys.stderr)
+            continue
+        add_owner(owner.id, doc)
+    if include_unowned and isinstance(selection, AllReviewRecords):
+        with guard_source(state_root() / "review-folders", sources):
+            for identity, member in record_store.store_owners(record_store.RecordKind.QUESTION, members).items():
+                if member is None or member.kind not in ('showrunner', 'producer'):
+                    unowned_ids.add(identity)
+                    add_owner(identity, None)
+    if isinstance(selection, ExactReviewRecord):
+        if include_unowned and not selected:
+            unowned_ids.add(selection.owner)
+        paths = {selection.path: [selection.owner]}
+    else:
+        paths: dict[Path, list[staff.StaffId]] = {}
+        for folder, identities_in_folder in scopes.items():
+            for path in store_paths((folder,), sources):
+                paths.setdefault(path, []).extend(identities_in_folder)
+    for path, identities_in_path in paths.items():
+        with guard_source(path, sources, skip=(FileNotFoundError,)):
+            allowed = tuple(dict.fromkeys(identities_in_path))
+            legacy_owner = allowed[0] if len(allowed) == 1 else ''
+            for record in update_registration.selected_question_records(
+                    [path], statuses, identities_found, sources, legacy_owner, strict=sources is not None,
+                    allowed_owners=allowed):
+                append(record, unowned=record.owner in unowned_ids)
     if owner_options is not None:
         for identity in identities_found:
             member = members.by_id(identity)
@@ -559,40 +629,32 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
     selected = owners
     with guard_source(root, sources):
         if isinstance(selection, ExactReviewRecord):
-            owner_folder = selection.path.parent.parent
-            identity = staff.StaffId(owner_folder.name)
-            selected = (identity,) if owner_folder.parent == root and selection.path.parent == investigation.folder(identity) else ()
-        elif not selected and root.exists():
-            selected = tuple(staff.StaffId(path.name) for path in sorted(root.iterdir())
-                             if path.is_dir() and not path.is_symlink())
+            selected = (staff.StaffId(selection.key.split('/')[1]),)
+        elif not selected:
+            selected = tuple(sorted(record_store.store_owners(record_store.RecordKind.INVESTIGATION)))
     found: list[ReviewItem] = []
-    investigation_states = tuple(state for state,review_state in (
-        (investigation.InvestigationState.OPEN, ReviewState.WAITING),
-        (investigation.InvestigationState.ANSWER_READY, ReviewState.OPEN),
-        (investigation.InvestigationState.READ, ReviewState.DONE)) if review_state in states)
     for identity in selected:
         folder = investigation.folder(identity)
         with guard_source(folder, sources):
-            if owner_options is not None and any(folder.glob('I*.md')):
-                for owner in (identity, owner_for(identity, members)):
-                    owner_options[owner] = name(owner, members)
-            if isinstance(sources, ReviewSourceStamps) or isinstance(selection, ExactReviewRecord):
-                paths = ([selection.path] if isinstance(selection, ExactReviewRecord)
-                         else source_paths(folder, 'I*.md', sources=sources))
-                for path in paths:
-                    with guard_source(path, sources):
-                        if isinstance(selection, ExactReviewRecord):
-                            _ = path.stat()
-                        record = investigation.load(identity, path.stem, sources=sources)
-                        if record.state in investigation_states:
-                            found.append(investigation_item(record, members))
-            else:
-                for record in investigation.records(identity, include_read=True, sources=sources, states=investigation_states):
-                    found.append(investigation_item(record, members))
+            folders = record_store.known_folders(record_store.RecordKind.INVESTIGATION, identity,
+                                                strict=sources is not None, sources=sources)
+            paths = [selection.path] if isinstance(selection, ExactReviewRecord) else store_paths(folders, sources)
+            for path in paths:
+                with guard_source(path, sources, skip=(FileNotFoundError, investigation.InvestigationError)):
+                    if not path.is_file():
+                        continue
+                    record = investigation.read_review_record(path)
+                    if record.owner != identity:
+                        continue
+                    if owner_options is not None:
+                        for owner in (identity, owner_for(identity, members)):
+                            owner_options[owner] = name(owner, members)
+                    if investigation_state(record) in states:
+                        found.append(investigation_item(record, members, path))
     return found
 
 
-def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot) -> ReviewItem:
+def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot, path: Path) -> ReviewItem:
     filed = moment(record.filed)
     logs = [ReviewLog(filed, name(record.owner, members), 'Filed')]
     if record.answered and not any(entry.words.startswith('Answer: ') for entry in record.log):
@@ -606,7 +668,7 @@ def investigation_item(record: investigation.Investigation, members: staff.Staff
     identity_text = name(record.owner, members)+'/'+record.id
     return ReviewItem(key, identity_text, ReviewType.INVESTIGATION, owner, record.owner, record.title, state,
         ReviewTimes(filed, logs[-1].time), tuple(logs),
-        ('read', 'feedback', 'question') if state != ReviewState.DONE else (), InvestigationSource(record),
+        ('read', 'feedback', 'question') if state != ReviewState.DONE else (), InvestigationSource(record, path),
         queue='investigation-'+owner, queue_key=key,
         text=identity_text+' '+record.title+'\n'+record.question+'\n\nAnswer\n'+record.answer,
         waiting_why=review_events.waiting_why(record.waiting_why))
@@ -648,100 +710,84 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    sources: list[Path] | None = None, own: list[Issue] | None = None,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
                    owner_options: dict[staff.StaffId, str] | None = None,
+                   include_registered: bool = False,
                    selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
-    reads_issues = isinstance(selection, AllReviewRecords) or selection.key == 'proposal/'+str(selection.path)
-    exact_fields: dict[str, list[str]] = {}
-    if isinstance(selection, ExactReviewRecord):
-        owner = selection.owner
-        if reads_issues:
-            exact_fields = issue_store.frontmatter(selection.path, sources=sources, select=is_open_proposal,
-                                                   keys=PROPOSAL_STATE_FIELDS | {'tags'})
-            if not exact_fields:
-                return []
-            proposer = members.by_id(staff.StaffId(Issue(selection.path, exact_fields).value('proposed_by')))
-            if proposer is None:
-                return []
-            if proposer.kind == 'unit':
-                proposer = members.parent_of(proposer)
-            if proposer is None or proposer.kind != 'showrunner':
-                return []
-            owner = proposer.id
-        member = members.by_id(owner)
-        documents = (member.doc.path,) if member is not None and isinstance(member.doc, staff.LiveDoc) else ()
     found: dict[str, ReviewItem] = {}
-    owners: dict[Path, staff.StaffId] = {}
+    scopes: dict[Path | staff.StaffId, staff.StaffId] = {}
     for doc in documents:
-        try:
-            owners[doc] = unit_lookup.doc_owner(doc, members).id
-        except staff.StaffUnreadable:
-            owners[doc] = staff.StaffId('')
-    proposers = {doc:{owner, *(member.id for member in members.find(kind='unit', parent=owner))}
-                 for doc, owner in owners.items()}
-    references: dict[Path, dict[str, str]] = {doc:{} for doc in documents}
-    selected_issues: dict[Path, list[Issue]] = {doc:[] for doc in documents}
-    if own is None and reads_issues:
-        folders: dict[Path, list[Path]] = {}
-        for doc in documents:
-            with guard_source(doc, sources):
-                folder = proposals_folder.issues_folder(doc)
-                if folder is not None and (isinstance(selection, AllReviewRecords) or selection.path.parent == folder):
-                    folders.setdefault(folder, []).append(doc)
-        for folder, scoped_documents in folders.items():
-            documents_by_proposer: dict[str, list[Path]] = {}
-            for doc in scoped_documents:
-                for proposer in proposers[doc]:
-                    documents_by_proposer.setdefault(proposer, []).append(doc)
+        with guard_source(doc, sources):
+            member = members.by_doc(local_machine(), doc.resolve())
+            if member is not None and member.kind == 'showrunner':
+                scopes[doc] = member.id
+    if include_registered:
+        with guard_source(state_root() / "review-folders", sources):
+            for owner, row in record_store.store_owners(record_store.RecordKind.PROPOSAL, members).items():
+                if owner not in scopes.values() and (row is None or row.kind in ('showrunner', 'producer')):
+                    scopes[owner] = owner
 
-            def selected(issue: Issue) -> bool:
-                if not is_open_proposal(issue):
-                    return False
-                scoped = documents_by_proposer.get(issue.value('proposed_by'), [])
-                for doc in scoped:
-                    references[doc][issue.path.stem] = str(issue.path)
-                return bool(scoped) and proposal_state(issue) in states
+    exact = isinstance(selection, ExactReviewRecord)
+    paths_by_scope: dict[Path, list[Path | staff.StaffId]] = {}
+    if own is None:
+        folders: dict[Path, list[Path | staff.StaffId]] = {}
+        for scope, owner in scopes.items():
+            doc = scope if isinstance(scope, Path) else record_store.local_document(members.by_id(owner))
+            if exact:
+                if selection.key == 'proposal/'+str(selection.path):
+                    paths_by_scope.setdefault(selection.path, []).append(scope)
+                continue
+            with guard_source(doc if doc is not None else state_root(), sources):
+                for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, document=doc,
+                                                         strict=sources is not None, sources=sources):
+                    folders.setdefault(folder, []).append(scope)
+        for folder, owners in folders.items():
+            for path in store_paths((folder,), sources):
+                paths_by_scope.setdefault(path, []).extend(owners)
 
-            paths: list[Path] = []
-            if isinstance(selection, ExactReviewRecord):
-                paths = [selection.path]
-            else:
-                with guard_source(folder, sources):
-                    paths = source_paths(folder, '*.md', sources=sources)
-            for path in sorted(paths):
-                with guard_source(path, sources, skip=(ValueError, FileNotFoundError)):
-                    if not path.is_file():
-                        continue
-                    if isinstance(selection, ExactReviewRecord):
-                        fields = exact_fields if selected(Issue(path, exact_fields)) else {}
-                    else:
-                        fields = issue_store.frontmatter(path, sources=sources, select=selected,
-                                                         keys=PROPOSAL_STATE_FIELDS | {'tags'})
-                    if not fields:
-                        continue
-                    issue = Issue(path, fields)
-                    for doc in documents_by_proposer[issue.value('proposed_by')]:
-                        selected_issues[doc].append(issue)
-                    if isinstance(selection, ExactReviewRecord):
-                        dependency = issue.value('depends_on')
-                        if dependency and Path(dependency).name == dependency and dependency != path.stem:
-                            prerequisite = folder/(dependency+'.md')
-                            with guard_source(prerequisite, sources, skip=(OSError, UnicodeError, ValueError)):
-                                if prerequisite.is_file():
-                                    _ = issue_store.frontmatter(prerequisite, sources=sources, select=selected,
-                                                                keys=PROPOSAL_STATE_FIELDS | {'tags'})
-    elif own is not None:
-        for doc in documents:
-            references[doc] = {issue.path.stem:str(issue.path) for issue in own
-                               if issue.value('proposed_by') in proposers[doc]}
-            selected_issues[doc] = [issue for issue in own if proposal_state(issue) in states]
-    for doc in documents:
-        owner = owners[doc]
+    proposers = {owner:{owner, *(member.id for member in members.find(kind='unit', parent=owner))}
+                 for owner in set(scopes.values())}
+    references: dict[Path | staff.StaffId, dict[str, str]] = {scope:{} for scope in scopes}
+    selected_issues: dict[Path | staff.StaffId, list[Issue]] = {scope:[] for scope in scopes}
+
+    def add_issue(issue: Issue, candidates: Iterable[Path | staff.StaffId], *, collect: bool = True) -> None:
+        if not is_open_proposal(issue):
+            return
+        for scope in dict.fromkeys(candidates):
+            owner = scopes[scope]
+            legacy = owner if issue.value('proposed_by') in proposers[owner] else issue.value('proposed_by')
+            if proposal_issue.proposal_owner(issue, legacy) != owner:
+                continue
+            references[scope][issue.path.stem] = str(issue.path)
+            if collect and proposal_state(issue) in states:
+                selected_issues[scope].append(issue)
+
+    if own is None:
+        for path, candidates in sorted(paths_by_scope.items()):
+            with guard_source(path, sources, skip=(FileNotFoundError, ValueError)):
+                if not path.is_file():
+                    continue
+                fields = (issue_store.frontmatter(path, sources=sources) if exact else
+                          record_store.read_header(path, sources=sources, strict=sources is not None))
+                issue = Issue(path, fields)
+                add_issue(issue, candidates)
+                if exact:
+                    dependency = issue.value('depends_on')
+                    if dependency and Path(dependency).name == dependency and dependency != path.stem:
+                        prerequisite = path.parent/(dependency+'.md')
+                        with guard_source(prerequisite, sources, skip=(OSError, UnicodeError, ValueError)):
+                            if prerequisite.is_file():
+                                fields = record_store.read_header(prerequisite, sources=sources, strict=sources is not None)
+                                add_issue(Issue(prerequisite, fields), candidates, collect=False)
+    else:
+        for issue in own:
+            add_issue(issue, scopes)
+    for scope, owner in scopes.items():
         queue = 'proposal-'+owner
-        for issue in selected_issues[doc]:
+        for issue in selected_issues[scope]:
             with guard_source(issue.path, sources):
                 row = proposals_table.issue_row(issue, members, sources=sources)
                 key = 'proposal/'+str(issue.path)
-                if isinstance(row.progress, AwaitingApproval):
-                    entry = replace(row.entry, after=references[doc].get(row.entry.after, ''))
+                if isinstance(row.progress, proposal_issue.AwaitingApproval):
+                    entry = replace(row.entry, after=references[scope].get(row.entry.after, ''))
                     filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
                     item = proposal_item(key, issue, owner, staff.StaffId(issue.value('proposed_by')), issue.path.stem,
                                          filed, members, entry, queue)
@@ -751,11 +797,11 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                                          issue.path.stem, filed, members)
                 if item.state in states:
                     found[key] = item
-        if isinstance(selection, ExactReviewRecord) and reads_issues:
+        if not isinstance(scope, Path) or exact and (owner != selection.owner or selection.key == 'proposal/'+str(selection.path)):
             continue
         ledgers: list[Path] = []
-        with guard_source(doc, sources):
-            ledgers = proposals_table.improvement_ledgers(doc)
+        with guard_source(scope, sources):
+            ledgers = proposals_table.improvement_ledgers(scope)
         for path in ledgers:
             if not selection.includes(path):
                 continue
@@ -791,7 +837,7 @@ def efficiency_ledger(doc: Path) -> Path | NoEfficiencyLedger:
     """Read the ledger path or name its absence."""
     try:
         return Path(production_field(doc.read_text(encoding='utf-8').splitlines(), EFFICIENCY_LEDGER_FIELD)).expanduser()
-    except Refusal:
+    except (Refusal, OSError, UnicodeError):
         return NoEfficiencyLedger()
 
 
@@ -955,29 +1001,28 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None = None) -> list[
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None, assign_ids: Literal[False] = False) -> list[ReviewItem]:
+         sources: list[Path] | None = None, assign_ids: bool = True) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
-    _ = assign_ids
-    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS)
+    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, assign_ids=assign_ids)
 
 
 def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, ...], states: tuple[ReviewState, ...],
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
-            selection: ReviewSelection) -> list[ReviewItem]:
+            selection: ReviewSelection, *, assign_ids: bool = False) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
     documents = tuple(dict.fromkeys(member.doc.path for member in members.rows
                       if member.kind == 'showrunner' and isinstance(member.doc, staff.LiveDoc)))
     items: list[ReviewItem] = []
     if ReviewType.QUESTION in kinds:
         items.extend(question_items(members,documents,states=states,owner_options=owner_options,
-                                   sources=sources,selection=selection))
+                                   sources=sources,selection=selection,assign_ids=assign_ids))
     if ReviewType.CHANGE in kinds:
         items.extend(change_items(root,members,states=states,owner_options=owner_options,sources=sources,selection=selection))
     if ReviewType.INVESTIGATION in kinds:
         items.extend(investigation_items(members,states=states,owner_options=owner_options,sources=sources,selection=selection))
     if ReviewType.PROPOSAL in kinds:
-        items.extend(proposal_items(members,documents,states=states,owner_options=owner_options,sources=sources,selection=selection))
+        items.extend(proposal_items(members,documents,states=states,owner_options=owner_options,sources=sources,include_registered=True,selection=selection))
     if ReviewType.EFFICIENCY in kinds:
         items.extend(efficiency_items(members,documents,states=states,owner_options=owner_options,sources=sources,selection=selection))
     return ordered(with_later(items,sources), sources)
@@ -1003,7 +1048,8 @@ def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> li
 
     times = review_later.times(sources, skipped=skip_time if sources is not None else None)
     return [replace(item, times=replace(item.times, later=times.get(item.key, item.times.later)))
-            for item in items if item.key not in invalid]
+            if item.state != ReviewState.VALIDATING else item
+            for item in items if item.key not in invalid or item.state == ReviewState.VALIDATING]
 
 
 def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,
