@@ -316,9 +316,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
                     self.assertEqual(json.loads(body)["state"], "read" if action == "read" else "sent")
                     response = cast(dict[str, str], json.loads(body))
-                    self.assertNotEqual(response["request"], fields["request"])
-                    self.assertEqual(response["token"], list_page.request_token(self.root, morty.id, item.id, response["request"]))
-                    fields.update(request=response["request"], token=response["token"])
+                    self.assertNotIn("request", response)
+                    self.assertNotIn("token", response)
+                    fields["request"] = f"{request}.{uuid4().hex}"
                     if action == "read":
                         delivery.assert_not_called()
                     else:
@@ -498,10 +498,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(the_list.load(morty.id, item.id), opened)
             for different in ({"action": "tell"}, {"words": "What else changed?"}):
                 self.assertEqual(self.post(list_page.PAGE_PATH, urlencode({**fields, **different}))[0], 400)
-            response = cast(dict[str, str], json.loads(body))
             finished.clear()
             self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(
-                {**fields, "request": response["request"], "token": response["token"]}))[0], 200)
+                {**fields, "request": f"{request}.{uuid4().hex}"}))[0], 200)
             self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
             self.assertEqual(len(deliveries), 1)
             with (patch.object(staff, "caller_identity", return_value=morty.current_session),

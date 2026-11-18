@@ -687,7 +687,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             fields = parse_qs(body)
             state = {"read": "read", "question": "saved"}.get(fields["action"][0], "sent")
             self.json_response(200, {"state": state,
-                **list_page.fresh_request(server.root, fields["keeper"][0], fields["id"][0])})
+                **list_page.saved_action_state(fields["keeper"][0], fields["id"][0])})
         finally:
             try:
                 list_page.deliver(delivery)
