@@ -903,7 +903,12 @@ const view=createRecordTable({content:()=>content,single:true,
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
  hasKey:key=>allEntries().some(entry=>entry.key===key),
  shows:['open','Validating','Done','all'],
- visible:(data,filters)=>!pendingSaves.get(data.key)?.departing && (!saved.has(data.key) || index.get(data.key)?.handoff) && index.has(data.key) && matches(index.get(data.key),filters),
+ visible:(data,filters)=>{
+  const key=data.key,entry=index.get(key),departure=saved.get(key);
+  if(!entry || pendingSaves.get(key)?.departing) return false;
+  const reopened=departure?.closes && entry.type==='change' && view.opened.has(key);
+  return (!departure || entry.handoff || reopened) && matches(entry,filters);
+ },
  sortValues:data=>{
   const entry=index.get(data.key);
   return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];

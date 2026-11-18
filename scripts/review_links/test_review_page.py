@@ -3027,8 +3027,8 @@ window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
  if(options.method!=='POST') return nativeFetch(url,options);
  const fields=new URLSearchParams(options.body);
- if(fields.get('row')!=='page-owner/C1' || fields.get('outcome')!=='works')
-  throw new Error('The form did not close Change C1.');
+ if(!['page-owner/C1','page-owner/C2'].includes(fields.get('row')) || fields.get('outcome')!=='works')
+  throw new Error('The form did not submit a verdict for the expected Change.');
  return Promise.resolve(new Response(JSON.stringify({answer:'works',state:'Done'})));
 };
 </script>"""
@@ -3036,37 +3036,46 @@ window.fetch=(url,options={})=>{
 (async()=>{
  const failures=[];
  const check=(ok,message)=>{if(!ok) failures.push(message);};
- const change=()=>document.querySelector('[data-key="page-owner/C1"]');
+ const change=key=>document.querySelector('[data-key="'+key+'"]');
+ const read=fetch;
+ window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
+  ? Promise.resolve(Response.json({version:document.querySelector('[data-review]').dataset.version,facts:pageRefreshFacts()}))
+  : read(url,options);
  try{
-  const row=change();
-  check(!row.hidden,'Change C1 is visible before the save.');
-  row.querySelector('.list-toggle').click();
-  const form=row.querySelector('[data-review-form]');
-  const saved=new Promise(resolve=>{
-   const observer=new MutationObserver(()=>{
-    if(form.dataset.sending) return;
-    observer.disconnect();resolve();
+  for(const key of ['page-owner/C2','page-owner/C1']){
+   const row=change(key);
+   check(row && !row.hidden,key+' is visible before the save.');
+   row.querySelector('.list-toggle').click();
+   const form=await readyReviewCard(row);
+   const saved=new Promise(resolve=>{
+    const observer=new MutationObserver(()=>{
+     if(form.dataset.sending) return;
+     observer.disconnect();resolve();
+    });
+    observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
    });
-   observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
-  });
-  form.requestSubmit(form.querySelector('button[value="works"]'));
-  if(!form.dataset.sending) throw new Error('The save of Change C1 did not start.');
-  await saved;
-  check(form.querySelector('[data-send-status]').textContent==='Saved: works','The save succeeded.');
-  check(row.hidden,'The save hides Change C1.');
+   form.requestSubmit(form.querySelector('button[value="works"]'));
+   if(!form.dataset.sending) throw new Error('The save did not start for '+key+'.');
+   await saved;
+   check(form.querySelector('[data-send-status]').textContent==='Saved: works',key+' saved.');
+   check(row.hidden,'The save hides '+key+'.');
+  }
 
   const link=document.createElement('a');
-  link.href='#'+new URLSearchParams({show:'all',item:row.dataset.key});
+  link.href='#'+new URLSearchParams({show:'all',item:'page-owner/C1'});
   link.textContent='Open Change C1';
   document.body.append(link);
   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   link.click();
   await navigated;
-  check(change() && !change().hidden,'The same-tab link shows the closed Change C1.');
+  const linked=change('page-owner/C1');
+  check(linked?.dataset.state==='Done' && !linked.hidden && !linked.querySelector('[data-detail]').hidden,
+   'The same-tab link shows the closed Change C1.');
+  check(!change('page-owner/C2'),'The unlinked Change C2 stays hidden.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
-        markup = review_page.render(self.root, show='all').decode()
+        markup = browser_markup(self.root, show='all')
         page = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
@@ -3199,7 +3208,10 @@ window.fetch=async(_url,options={})=>{
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
-  check(target.hidden,'F010: a fragment change keeps the saved row hidden');
+  const reopened=liveRow(target.dataset.key);
+  check(reopened && !reopened.hidden && !reopened.querySelector('[data-detail]').hidden,
+   'A same-tab link shows and opens the saved Change.');
+  check(!liveRow(allTarget.dataset.key),'F010: the unlinked saved Change stays hidden in All.');
   const reloaded=document.createElement('iframe');reloaded.src='/console/review.html#'+new URLSearchParams({item:target.dataset.key});
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
