@@ -18,7 +18,7 @@ import threading
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import ContextManager
 
 from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
@@ -1004,6 +1004,28 @@ print('signals')
         self.assertFalse(path.exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+
+    def test_collector_scans_the_folder_path_after_the_parent_changes(self) -> None:
+        old_parent = self.root / "old-parent"
+        old_parent.mkdir()
+        (old_parent / "tree.lock").touch()
+        path = self.root / "new-parent" / "tree"
+        (path / "child").mkdir(parents=True)
+        directory = os.open(old_parent, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, directory)
+
+        with ((path / "child.lock").open("wb") as child_lock,
+              mock.patch("scripts.lib.build_folders._folder_parent", return_value=nullcontext(directory))):
+            fcntl.flock(child_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with folders.collector_lease(path, children=True) as free:
+                self.assertFalse(free)
+
+    def test_collector_keeps_the_reservation_when_the_folder_is_absent(self) -> None:
+        path = self.root / "tree"
+        path.with_suffix(".lock").touch()
+
+        with folders.folder_removal_lease(path, children=True) as lease:
+            self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
 
     def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
         path = self.root / "absent-parent" / "tree"

@@ -16,7 +16,7 @@ import time
 from typing import TYPE_CHECKING, cast
 
 from scripts.aws_target import admin_secrets, hana_box as box, hana_guest, ledger, remote, s3_presign
-from scripts.aws_target.aws_cli import AwsCli, AwsExecutor, AwsUnavailable, execute_command
+from scripts.aws_target.aws_cli import AwsCli, AwsExecutor, AwsUnavailable, aws_error_code, execute_command
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -60,14 +60,15 @@ class AwsHanaProvider:
 
     @classmethod
     def from_settings(cls, account_path: Path, directory: Path, workload_path: Path,
-                      *, execute: AwsExecutor = execute_command) -> AwsHanaProvider:
+                      *, execute: AwsExecutor = execute_command,
+                      credentials_file: Callable[[], Path] = admin_secrets.credentials_file) -> AwsHanaProvider:
         account, workload = conf.read(account_path), conf.read(workload_path)
         timeout, seconds = workload.whole('aws_timeout_s'), workload.whole('control_url_seconds')
         if not 0 < timeout < workload.whole('controller_tick_timeout_s') or not 0 < seconds <= 604800:
             raise ValueError('Hana provider time bounds are invalid')
         # Ignore inherited admin credentials and use the installed scaler profile.
         environment = {key: value for key, value in os.environ.items() if not key.startswith('AWS_')}
-        environment.update(AWS_SHARED_CREDENTIALS_FILE=str(admin_secrets.credentials_file()),
+        environment.update(AWS_SHARED_CREDENTIALS_FILE=str(credentials_file()),
             AWS_CONFIG_FILE=os.devnull, AWS_EC2_METADATA_DISABLED='true')
 
         def scaler(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
@@ -84,8 +85,18 @@ class AwsHanaProvider:
         action = PROVIDER_OPERATIONS[operation]
         try:
             return self.api.call(operation, *arguments, service='s3api' if action.startswith('s3:') else 'ec2')
-        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
-            raise ProviderPending('Hana provider call failed: ' + action) from None
+        except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            message = 'Hana provider call failed: ' + action
+            if isinstance(error, AwsUnavailable):
+                code = aws_error_code(error)
+                if code:
+                    message += f' ({code})'
+            raise ProviderPending(message) from None
+
+    def signing_key(self) -> s3_presign.SigningKey:
+        credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
+        return s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
+                                    str(credentials.get('SessionToken', '')))
 
     def _object(self, key: str, document: dict[str, object] | None = None) -> dict[str, object]:
         if not self.bucket:
@@ -119,9 +130,7 @@ class AwsHanaProvider:
         from scripts.aws_target.hana_execution import HanaExecutionAccess
 
         prefix = self._execution_prefix(key)
-        credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
-        signing = s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
-                                     str(credentials.get('SessionToken', '')))
+        signing = self.signing_key()
         now = self.clock()
         def signed(suffix: str) -> str:
             return s3_presign.presign('PUT', self.bucket + '.s3.' + self.api.region + '.amazonaws.com',
@@ -205,9 +214,7 @@ class AwsHanaProvider:
 
     def _bootstrap(self, identity: box.DeploymentIdentity, start: box.DemandStart) -> dict[str, object]:
         # URLs exist only in private runtime records and EC2 user data.
-        credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
-        signing = s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
-            str(credentials.get('SessionToken', '')))
+        signing = self.signing_key()
         prefix = self._prefix(identity, start)
         def url(method: str, suffix: str) -> str:
             return s3_presign.presign(method, self.bucket + '.s3.' + self.api.region + '.amazonaws.com',

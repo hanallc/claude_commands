@@ -6,71 +6,80 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Generator
-from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass
-import fcntl
-import json
+from contextlib import AbstractContextManager, ExitStack
+from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
 import sys
 import tempfile
-from typing import cast
 
 from scripts.lib import conf, mac_wake, main_publish, main_push_lock, models_registry
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.waiting_rows import git, replace_value, show
+from scripts.lib.waiting_rows import (
+    WaitingChange as WaitingChange, append_model_color, git, journal, journal_path as journal_path,
+    model_color_host, model_color_key, model_color_value, replace_value, show,
+)
 
 
 @dataclass(frozen=True)
-class WaitingChange:
-    """One approved change that is live and that main does not have yet."""
+class ExistingSetting:
+    """The line and current value of an editable setting."""
 
-    stem: str
-    key: str
+    line: int
     value: str
-    message: str
 
 
-def write_live(stem: str, key: str, value: str) -> str:
-    """Write one value into the live file now; return the value it replaced."""
-    source = conf.path(stem)
+@dataclass(frozen=True)
+class NewModelColor:
+    """The model color has no line yet and can be added."""
+
+
+def _new_model_color(stem: str, key: str, value: str, *, accepted: bool) -> bool:
+    if not conf.full_model_color_key(stem, key):
+        return False
+    if not accepted and not model_color_key(stem, key):
+        return False
+    if not model_color_value(value):
+        raise conf.Unusable(f"{stem}: {key}: use a color in #rrggbb format")
+    return True
+
+
+def editable_setting(stem: str, key: str, value: str, *, accepted: bool = False) -> ExistingSetting | NewModelColor:
+    """Validate the change and identify the current setting."""
+    if stem == "statusline" and key.startswith("model."):
+        if host := model_color_host(key):
+            raise conf.Unusable(f"{stem}: {key}: .{host} is a host override, not a model color")
+        settings = conf.settings(conf.path(stem).read_text(encoding="utf-8"))
+        if (key not in settings and conf.host_override(stem, settings, key) is None
+                and _new_model_color(stem, key, value, accepted=accepted)):
+            return NewModelColor()
     index, old = conf.editable_line(stem, key)
     conf.check(stem, key, value)
-    if old != value:
-        write_text_atomic(source, replace_value(source.read_text(encoding="utf-8"), index, value))
-    return old
+    return ExistingSetting(index, old)
 
 
-def journal_path() -> Path:
-    state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
-    return Path(state) / "live-settings" / "waiting.json"
+def write_live(stem: str, key: str, value: str, *, accepted: bool = False) -> str:
+    """Write one value now and return the value it replaced, if any."""
+    source = conf.path(stem)
+    setting = editable_setting(stem, key, value, accepted=accepted)
+    if isinstance(setting, NewModelColor):
+        write_text_atomic(source, append_model_color(source.read_text(encoding="utf-8"), key, value))
+        return ""
+    if setting.value != value:
+        write_text_atomic(source, replace_value(source.read_text(encoding="utf-8"), setting.line, value))
+    return setting.value
 
 
-@contextmanager
-def _journal() -> Generator[list[WaitingChange]]:
-    """Hold the journal lock; the caller changes the list in place."""
-    path = journal_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            rows = cast(list[dict[str, str]], json.loads(path.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            rows = []
-        changes = [WaitingChange(**row) for row in rows]
-        before = list(changes)
-        yield changes
-        if changes != before:
-            write_text_atomic(path, json.dumps([asdict(change) for change in changes], indent=2) + "\n")
+def _journal() -> AbstractContextManager[list[WaitingChange]]:
+    return journal(journal_path())
 
 
-def stage(change: WaitingChange) -> str:
+def stage(change: WaitingChange, *, accepted: bool = False) -> str:
     """Make the change live and record it for main; return the replaced value."""
     with _journal() as changes:
-        old = write_live(change.stem, change.key, change.value)
+        old = write_live(change.stem, change.key, change.value, accepted=accepted)
         changes.append(change)
     return old
 
@@ -78,7 +87,13 @@ def stage(change: WaitingChange) -> str:
 def _commit_row(checkout: Path, relative: str, change: WaitingChange) -> None:
     """Commit only this row onto HEAD; other waiting rows stay live and uncommitted."""
     head = show(checkout, "HEAD", relative)
-    text = replace_value(head, conf.settings(head)[change.key].line, change.value)
+    settings = conf.settings(head)
+    if setting := settings.get(change.key):
+        text = replace_value(head, setting.line, change.value)
+    elif _new_model_color(change.stem, change.key, change.value, accepted=True):
+        text = append_model_color(head, change.key, change.value)
+    else:
+        raise main_publish.Refusal(f"{relative}: {change.key}: exact stored key is missing")
     mode = git(checkout, "ls-tree", "HEAD", "--", relative).split()[0]
     blob = git(checkout, "hash-object", "-w", "--stdin", input_text=text).strip()
     parent = git(checkout, "rev-parse", "HEAD").strip()
@@ -92,43 +107,41 @@ def _commit_row(checkout: Path, relative: str, change: WaitingChange) -> None:
     _ = git(checkout, "update-index", "--cacheinfo", f"{mode},{blob},{relative}")
 
 
-def _publish_rows(checkout: Path, changes: list[WaitingChange], *, wait: bool) -> list[str] | None:
-    """Commit the rows main lacks and push; None means that another process holds main."""
+def _publish_rows(checkout: Path, changes: list[WaitingChange]) -> list[str]:
+    """Commit the valid rows main lacks and push them."""
     lines: list[str] = []
+    for change in changes:
+        source = conf.path(change.stem)
+        relative = str(source.resolve().relative_to(checkout.resolve()))
+        live = conf.settings(source.read_text(encoding="utf-8")).get(change.key)
+        head = conf.settings(show(checkout, "HEAD", relative)).get(change.key)
+        if live is None or live.value != change.value:
+            lines.append(f"main: {change.key}={change.value} has a newer live value; no commit")
+        elif head is None or head.value != change.value:
+            _commit_row(checkout, relative, change)
+    pushed, detail = main_publish.push(checkout, time_limit=main_publish.CommandTimeLimit(_seconds("push_seconds")))
+    if not pushed:
+        raise main_publish.Refusal(f"main: {detail}")
+    lines.append(f"main: {detail}")
+    return lines
+
+
+def publish(checkout: Path, *, wait: bool) -> list[str] | None:
+    """Commit and push waiting changes, then send or queue the Mac pull.
+
+    With wait=False, a busy main returns None at once; the next notes pass tries again.
+    """
     with ExitStack() as locks:
         try:
             locks.enter_context(main_push_lock.main_push_lock(checkout, wait=wait))
         except BlockingIOError:
             return None
         main_publish.ready(checkout, fetch_limit=main_publish.CommandTimeLimit(_seconds("fetch_seconds")))
-        for change in changes:
-            source = conf.path(change.stem)
-            relative = str(source.resolve().relative_to(checkout.resolve()))
-            live = conf.settings(source.read_text(encoding="utf-8")).get(change.key)
-            head = conf.settings(show(checkout, "HEAD", relative)).get(change.key)
-            if live is None or live.value != change.value:
-                lines.append(f"main: {change.key}={change.value} has a newer live value; no commit")
-            elif head is None or head.value != change.value:
-                _commit_row(checkout, relative, change)
-        pushed, detail = main_publish.push(checkout, time_limit=main_publish.CommandTimeLimit(_seconds("push_seconds")))
-        if not pushed:
-            raise main_publish.Refusal(f"main: {detail}")
-        lines.append(f"main: {detail}")
-    return lines
-
-
-def publish(checkout: Path, *, wait: bool) -> list[str] | None:
-    """Commit and push every waiting change, then send or queue the Mac pull.
-
-    With wait=False, a busy main returns None at once; the next notes pass tries again.
-    """
-    with _journal() as journal:
-        changes = list(journal)
-    lines = _publish_rows(checkout, changes, wait=wait)
-    if lines is None:
-        return None
-    with _journal() as journal:
-        journal[:] = [change for change in journal if change not in changes]
+        with _journal() as journal:
+            changes = [change for change in journal if change.publish_on_main]
+        lines = _publish_rows(checkout, changes)
+        with _journal() as journal:
+            journal[:] = [change for change in journal if change not in changes]
     label = " ".join(f"{change.stem}.{change.key}" for change in changes) or "main"
     return [*lines, pull_mac(checkout, label)]
 
@@ -138,7 +151,7 @@ def publish_waiting() -> list[str]:
     lines: list[str] = []
     try:
         with _journal() as journal:
-            first = journal[0] if journal else None
+            first = next((change for change in journal if change.publish_on_main), None)
         if first is not None:
             lines += publish(main_publish.checkout_of(conf.path(first.stem).resolve()), wait=False) or []
     except (OSError, main_publish.Refusal, conf.Unusable) as error:
@@ -165,8 +178,11 @@ def pull_mac(checkout: Path, label: str) -> str:
 
 def write_mac(stem: str, key: str, value: str) -> str:
     """Write the value live on the Mac now; the Mac pull brings the commit later."""
+    arguments = [stem, key, value]
+    if conf.full_model_color_key(stem, key):
+        arguments.insert(0, "--accepted-model-color")
     command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" '
-               + shlex.join([stem, key, value]))
+               + shlex.join(arguments))
     done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh",
                             time_limit=main_publish.CommandTimeLimit(_seconds("mac_write_seconds")))
     if isinstance(done, str):
@@ -196,11 +212,23 @@ def _seconds(key: str) -> int:
 def main(arguments: list[str] | None = None) -> int:
     """Write one value live on this machine: `live_settings.py <stem> <key> <value>`."""
     argv = sys.argv[1:] if arguments is None else arguments
+    accepted = argv[:1] == ["--accepted-model-color"]
+    if accepted:
+        argv = argv[1:]
     if len(argv) != 3:
         print("usage: live_settings.py <stem> <key> <value>", file=sys.stderr)
         return 2
     try:
-        _ = write_live(*argv)
+        stem, key, value = argv
+        with _journal() as changes:
+            old = write_live(stem, key, value, accepted=accepted)
+            if conf.full_model_color_key(stem, key):
+                def same_pending_key(change: WaitingChange) -> bool:
+                    return not change.publish_on_main and (change.stem, change.key) == (stem, key)
+
+                if not old or any(same_pending_key(change) for change in changes):
+                    changes[:] = [change for change in changes if not same_pending_key(change)]
+                    changes.append(WaitingChange(stem, key, value, "", publish_on_main=False))
     except (OSError, UnicodeError, conf.Unusable) as error:
         print(f"live_settings: {error}", file=sys.stderr)
         return 1

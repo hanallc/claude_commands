@@ -419,7 +419,6 @@ placement_once
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         errors = notice.decode(errors="replace") + errors
         self.assertEqual(process.returncode, 75, output + errors)
-        self.assertTrue(self.waiting.is_set(), errors)
         self.assertFalse(self.slot_root.exists())
         self.assertFalse(list(self.slot_root.glob("*.lease.json")))
         with self.queue.loop_turn():

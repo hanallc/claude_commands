@@ -68,8 +68,12 @@ class FirstStepAdmission:
         elif isinstance(grant, wire.LocalPlacementGranted):
             _ = client.finish_step(self.assignment_file, 1, 'slot preparation failed')
         elif isinstance(grant, wire.Assignment):
-            _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, grant.assignment.episode,
-                grant.assignment.owner, 'slot preparation failed'))
+            try:
+                _ = client.cancel_placement(wire.CancelPlacement(uuid4().hex, grant.assignment.episode,
+                    grant.assignment.owner, 'slot preparation failed'))
+            except wire.AdmissionUnavailable as error:
+                if error.reason != wire.PLACEMENT_REQUEST_MISSING_REASON:
+                    raise
         self.grant = HandedOff()
 
 

@@ -10,7 +10,7 @@ from scripts.agents import remote
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import atomic_file, conf_reads, models_registry
+from scripts.lib import atomic_file, conf_reads, git_files, models_registry
 from scripts.lib import unit_runs
 from scripts.usage.agents_log import Assignment
 
@@ -3396,10 +3396,13 @@ with patch.object(fcntl, "flock", admission):
             reads.append(path)
             return read_text(path, encoding=encoding, errors=errors)
 
-        with patch.object(Path, "read_text", read_source), patch.object(
-            subprocess, "run", side_effect=AssertionError("waits must only read files")
+        with (
+            patch.object(Path, "read_text", read_source),
+            patch.object(git_files, "_read_entry", wraps=git_files._read_entry) as read_git,  # pyright: ignore[reportPrivateUsage]
+            patch.object(subprocess, "run", side_effect=AssertionError("waits must only read files")),
         ):
             report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        reads.extend(cast(Path, call.args[0]) for call in read_git.call_args_list)
         phases = cast(list[dict[str, object]], report["phases"])
         self.assertEqual(len(phases), 2)
         for phase in phases:
