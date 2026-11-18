@@ -1662,6 +1662,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(code, 200)
                 self.assertEqual(json.loads(body)["state"], "saved")
                 self.assertEqual(json.loads(body)["waiting_for_answer"], "true")
+                self.assertEqual(json.loads(body)["open_question"], "true")
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(finished.is_set())
                 opened = the_list.load(morty.id, item.id)
@@ -1763,6 +1764,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
+            self.assertEqual(json.loads(response)["open_question"], "true")
             self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
             saved = the_list.load(morty.id, item.id)
             self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
@@ -1770,6 +1772,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(opened.status, 200)
             markup = opened.body.decode().split('<script>', 1)[0]
             self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+            self.assertIn('data-open-question="true"', markup)
             self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
             signed = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', markup))
             finished.clear()
@@ -1784,7 +1787,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn("answer L1 --question Q1", messages[0])
             self.assertEqual(the_list.load(morty.id, item.id), saved)
             waiting = self.request(list_page.PAGE_PATH).body.decode().split('<script>', 1)[0]
-            self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]* hidden>')
+            self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]*">')
             self.assertNotIn('value="resend-Q1"', waiting)
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:

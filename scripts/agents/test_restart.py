@@ -61,6 +61,7 @@ READ_PANES = herdr.Herdr.panes
 
 
 READ_CONFIG = conf.read
+ENUMERATE_RUNNING_SESSIONS = session_records.enumerate_running_sessions
 
 
 def short_resume_check_config(file: str | Path) -> conf.ConfigRead:
@@ -201,7 +202,8 @@ class CodexSnapshotTests(RestartTestCase):
         _ = self.enterContext(patch.object(herdr, "native_process", side_effect=self.native))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         records = registry_confirmation(frozenset(self.claude)).records
-        _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=records))
+        _ = self.enterContext(patch.object(session_records, "enumerate_running_sessions",
+                           return_value=session_records.RunningSessionEnumeration(tuple(records), ())))
 
     def native(self, pid: int, _kind: str) -> herdr.NativeAgentProcess:
         return herdr.NativeAgentProcess(herdr.EnvironmentThread(self.codex[pid]), "1", {})
@@ -231,7 +233,8 @@ class CodexSnapshotTests(RestartTestCase):
               patch.object(herdr, "_process_display_name", return_value="TEST-gate"),
               patch.object(client, "listed", side_effect=listed_rows) as listed,
               patch.object(client, "result", return_value={"process_info": info}) as process,
-              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(session_records, "enumerate_running_sessions",
+                           return_value=session_records.RunningSessionEnumeration((), ())),
               patch.object(herdr, "running_codex_threads", return_value=set()),
               patch.object(restart, "_read_live_members", return_value=restart.CompleteLiveRows([])) as members):
             self.assertEqual(herdr.codex_conversations().unknown, ())
@@ -273,7 +276,8 @@ class CodexSnapshotTests(RestartTestCase):
               patch.object(client, "listed", side_effect=listed_rows),
               patch.object(client, "result", side_effect=read) as process,
               patch.object(herdr, "pane_native_process", side_effect=herdr_types.HerdrFailure("fixture unknown")),
-              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(session_records, "enumerate_running_sessions",
+                           return_value=session_records.RunningSessionEnumeration((), ())),
               patch.object(herdr, "running_codex_threads", return_value=set()),
               patch.object(restart, "_read_live_members", return_value=restart.CompleteLiveRows([])) as members):
             self.assertEqual(restart.live_rows(staff.StaffSnapshot(()), client).rows, [])
@@ -301,7 +305,8 @@ class CodexSnapshotTests(RestartTestCase):
         info = {"shell_pid": 998080, "foreground_process_group_id": 998081,
                 "foreground_processes": [{"pid": 998081, "argv": ["claude"]}]}
         with (patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations({}, ())),
-              patch.object(sessions, "running_sessions", return_value=records),
+              patch.object(session_records, "enumerate_running_sessions",
+                           return_value=session_records.RunningSessionEnumeration(tuple(records), ())),
               patch.object(client, "listed", side_effect=listed_rows) as listed,
               patch.object(client, "result", return_value={"process_info": info}),
               patch.object(client, "pane_tab", side_effect=AssertionError("reuse the pane read")),
@@ -312,6 +317,61 @@ class CodexSnapshotTests(RestartTestCase):
             "TEST-registry-name in /TEST-registry-folder: restart anomaly: unassigned live session",
             "c-bare: restart anomaly: unassigned live session"])
         self.assertEqual(listed.call_args_list.count(call("pane")), 1)
+
+    def test_full_restart_requires_complete_registry_discovery(self) -> None:
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"])
+        path = registry / "unfinished.json"
+        for policy_error in (None, PermissionError("retry policy denied")):
+            with self.subTest(policy_error=policy_error):
+                path.unlink(missing_ok=True)
+                if policy_error is None:
+                    _ = path.write_text("{")
+                    reason = f"session registry unreadable: {path}"
+                else:
+                    reason = f"session registry discovery failed: {policy_error}"
+                with (patch.object(session_records, "enumerate_running_sessions", wraps=ENUMERATE_RUNNING_SESSIONS),
+                      patch.object(session_records, "retry_policy", wraps=session_records.retry_policy,
+                                   side_effect=policy_error),
+                      patch.object(herdr.Herdr, "save_layout") as layout,
+                      patch.object(herdr.Herdr, "remember_row_tab") as remember,
+                      patch.object(restart, "stop_row") as stop,
+                      patch.object(restart, "start_row") as start,
+                      patch.object(shutdown_record, "update") as update,
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(restart.restart(stop_all=True), 1)
+                    self.assertEqual(restart.stop_all(), 1)
+                self.assertIn(f"restart: {reason}", errors.getvalue())
+                layout.assert_not_called()
+                remember.assert_not_called()
+                stop.assert_not_called()
+                start.assert_not_called()
+                update.assert_not_called()
+
+    def test_full_restart_uses_one_registry_read_for_selection(self) -> None:
+        path = self.root / "unreadable.json"
+        complete = session_records.RegistryRead((), ())
+        for later_read in (PermissionError("retry policy denied"), session_records.RegistryRead((), (path,))):
+            for keep_stopped in (True, False):
+                with (self.subTest(later_read=later_read, keep_stopped=keep_stopped),
+                      patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot(self.rows)),
+                      patch.object(session_records, "read_registry", side_effect=[complete, later_read]) as read,
+                      patch.object(session_records, "enumerate_running_sessions", wraps=ENUMERATE_RUNNING_SESSIONS),
+                      patch.object(sessions, "session_liveness", wraps=session_records.session_liveness) as liveness,
+                      patch.object(herdr.Herdr, "save_layout") as layout,
+                      patch.object(restart, "stop_row") as stop,
+                      patch.object(restart, "start_row") as start):
+                    self.assertEqual(restart.stop_all() if keep_stopped else restart.restart(stop_all=True), 0)
+                    read.assert_called_once_with()
+                    layout.assert_called_once_with()
+                    stop.assert_not_called()
+                    start.assert_not_called()
+                    self.assertEqual(liveness.call_args_list, [call(str(row.current_session)) for row in self.rows])
+                    if isinstance(later_read, PermissionError):
+                        with self.assertRaisesRegex(PermissionError, "retry policy denied"):
+                            _ = sessions.session_liveness("missing")
+                    else:
+                        self.assertEqual(sessions.session_liveness("missing"),
+                            sessions.SessionLivenessUnknown(f"session registry unreadable: {path}"))
 
     def test_live_rows_scans_codex_once_for_members_and_unassigned_candidates(self) -> None:
         with (patch.object(herdr, "proc_root", return_value=self.proc) as scans,
@@ -349,7 +409,8 @@ class CodexSnapshotTests(RestartTestCase):
         snapshot = herdr.CodexConversations({}, ("test-account (Codex daemon unknown: unreadable)",))
         with (patch.object(herdr, "codex_conversations", return_value=snapshot) as scan,
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(session_records, "enumerate_running_sessions",
+                           return_value=session_records.RunningSessionEnumeration((), ())),
               patch.dict(os.environ, {"SHUTDOWN_DETAIL": "0"}),
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")).rows, [])
@@ -362,7 +423,8 @@ class CodexSnapshotTests(RestartTestCase):
         snapshot = herdr.CodexConversations({}, ("test-account (Codex daemon unknown: unreadable)",))
         with (patch.object(herdr, "codex_conversations", return_value=snapshot),
               patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
-              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(session_records, "enumerate_running_sessions",
+                           return_value=session_records.RunningSessionEnumeration((), ())),
               patch.dict(os.environ, {"SHUTDOWN_DETAIL": "1"}),
               redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(restart.live_rows(staff.StaffSnapshot(self.rows), herdr.Herdr("agents")).rows, [])
@@ -1179,7 +1241,7 @@ class RestartTests(RestartTestCase):
         self.stops = []
         record = staff.StaffSnapshot(self.rows)
         _ = self.enterContext(patch.object(staff, "initial_snapshot", return_value=record))
-        _ = self.enterContext(patch.object(session_records, "_readable_records", side_effect=self.records))
+        _ = self.enterContext(patch.object(session_records, "read_registry", side_effect=self.registry))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.liveness))
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=self.stop))
         _ = self.enterContext(patch.object(stop_resume, "stop_unit_workers", return_value=[], create=True))
@@ -1228,8 +1290,13 @@ class RestartTests(RestartTestCase):
             record.update(pid=os.getpid(), procStart=sessions.process_start(os.getpid()) or "")
         return records
 
-    def records(self) -> list[sessions.SessionRecord]:
-        return self.records_for(self.running)
+    @staticmethod
+    def registry_for(records: list[sessions.SessionRecord]) -> session_records.RegistryRead:
+        return session_records.RegistryRead(
+            tuple(session_records.RegistryObservation(record, {}) for record in records), ())
+
+    def registry(self, **_kwargs: object) -> session_records.RegistryRead:
+        return self.registry_for(self.records_for(self.running))
 
     @staticmethod
     def session_launch(identity: str, name: str) -> tuple[Literal["claude"], dict[str, str], list[str]]:
@@ -1586,7 +1653,8 @@ class RestartTests(RestartTestCase):
             for dry_run in (False, True):
                 with (self.subTest(kind=kind, dry_run=dry_run),
                       patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-                      patch.object(sessions, "running_sessions", return_value=[]),
+                      patch.object(session_records, "enumerate_running_sessions",
+                           return_value=session_records.RunningSessionEnumeration((), ())),
                       patch.object(herdr, "read_conversation",
                           return_value=herdr.LiveConversation(kind, ())),
                       patch.object(restart, "stop_row") as stop,
@@ -1689,7 +1757,7 @@ class RestartTests(RestartTestCase):
         snapshot = herdr.CodexConversations({}, ())
         with (patch.object(herdr, "read_conversation", side_effect=[
                   herdr.LiveConversation("claude", (123,)), herdr.StoppedConversation()]) as read,
-              patch.object(sessions, "running_sessions") as registry,
+              patch.object(session_records, "enumerate_running_sessions") as registry,
               patch.object(herdr, "running_codex_threads") as codex,
               redirect_stderr(io.StringIO()) as errors):
             selected = restart.live_members(iter((*self.rows[:2], remote_row)), record, resolver=resolver, codex=snapshot)
@@ -3399,7 +3467,7 @@ class RestartTests(RestartTestCase):
                     if self.rows[0].current_session in self.running:
                         identities[str(self.rows[0].current_session)] = (123,)
                     return herdr.CodexConversations(identities, ())
-                with (patch.object(session_records, "_readable_records", return_value=records),
+                with (patch.object(session_records, "read_registry", return_value=self.registry_for(records)),
                       patch.object(herdr, "codex_conversations", side_effect=codex_conversations),
                       patch.object(herdr, "running_codex_threads",
                                    return_value={str(self.rows[0].current_session), "orphan", "codex-orphan"}) as codex,

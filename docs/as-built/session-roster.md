@@ -66,6 +66,9 @@ Its native address still accepts messages.
 The roster reads one staff snapshot and passes it to each entry reader.
 Codex thread titles and herdr labels do not become recipient names.
 The native registry helpers live in `scripts/message/session_records.py`.
+A missing registry folder or an unreadable record leaves unmatched liveness unknown.
+The roster reports each unreadable path and keeps entries that it can read.
+A process count needs a complete registry read.
 `sessions.py` exports those helpers and adds staff recipient lookup.
 Staff imports the native helpers directly, so neither module imports the other.
 
