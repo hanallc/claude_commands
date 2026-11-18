@@ -484,8 +484,20 @@ The root disk keeps its data while the box is stopped. AWS deletes the root disk
 The Spot request is persistent and uses interruption behavior `stop`.
 Setup confirms the instance, request, and stopped state before registering the lifecycle controller.
 Repeat approved setup after a timeout to read the existing stack and confirm its stop.
+Setup skips the Spot price check when it resumes the existing stack.
 An expired reservation cannot authorize another stack request.
 Changed resource inputs require a separate replacement review.
+
+Before it creates or changes the stack, setup checks the Spot price in the configured zone.
+If the price exceeds the ceiling, setup shows the cheapest zone.
+Setup gives a `/tune` command when the effective ceiling key is editable.
+If the configuration rejects the command, setup reports the error and the suggested ceiling.
+
+If setup gives a `/tune` command:
+
+1. Run the displayed `/tune` command.
+2. Run `deploy.py prepare --workload hana`.
+3. Run `deploy.py hana-setup --approve-resources`.
 
 The image must include the independent Hana guard, watchdog, data mount, and root receiver.
 The Natedev owner must install the files from `hana_guest.render_files()` and `hana_receiver.render_files()`.

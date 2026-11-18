@@ -334,16 +334,30 @@ class HanaPlacementTests(CostFixture):
             self.assertEqual(self.eligibility(), placement.TemporaryExclusion('daily_limit'))
             self.assertEqual(len(calls), 3)
 
+    def test_workload_edit_after_routing_keeps_the_probe_budget_and_expires_its_preview(self) -> None:
+        inspect = self.controller.inspect
+
+        def inspect_after_edit() -> box.HanaLifecycleEvidence | box.HanaUnprovisioned | box.HanaLifecycleUnavailable:
+            text_setting(self.workload, 'daily_budget_usd', '0.01')
+            return inspect()
+
+        with self.preview_calls() as calls:
+            with mock.patch.object(self.controller, 'inspect', side_effect=inspect_after_edit):
+                self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
+            self.assertEqual(calls, [self.clock.now] * 2)
+
     def test_preview_does_not_cache_a_budget_recovered_from_git(self) -> None:
         lines = self.workload.read_text().splitlines(keepends=True)
         _ = self.workload.write_text(''.join(line for line in lines if not line.startswith('daily_budget_usd=')))
         recovered = [iter(('daily_budget_usd=0.01\n',)), iter(('daily_budget_usd=6\n',))]
-        with self.preview_calls() as calls, redirect_stderr(StringIO()):
+        with self.preview_calls() as calls, conf.report_key_changes(), redirect_stderr(StringIO()) as warnings:
             with mock.patch.object(conf, '_committed_files', side_effect=recovered) as history:
                 self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
                 self.assertEqual(self.eligibility(), placement.AllowedHost())
         self.assertEqual(history.call_args_list, [mock.call(self.workload)] * 2)
         self.assertEqual(calls, [self.clock.now] * 2)
+        self.assertEqual(warnings.getvalue().count("daily_budget_usd='<missing>'"), 1)
 
     def test_history_and_lifecycle_writes_refresh_the_preview(self) -> None:
         history = ledger.CostLedger(self.state).launch_history_path

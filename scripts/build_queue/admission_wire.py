@@ -462,7 +462,13 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
             from scripts.aws_target import hana_placement
 
             paths.add(target.settings)
-            if isinstance(transport_for(target), hana_placement.HanaControlTransport):
+            if target.platform != "linux":
+                continue
+            try:
+                transport = transport_for(records.ssh_target_settings(target, settings))
+            except conf.Unusable:
+                continue
+            if isinstance(transport, hana_placement.HanaControlTransport):
                 paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
     for path in sorted(paths):
@@ -471,6 +477,10 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
             contents = read_bytes(path)
         except FileNotFoundError:
             contents = b"missing"
+        except OSError as error:
+            # The provider reads and reports its own settings error.
+            digest.update(b"\0unreadable\0")
+            contents = type(error).__name__.encode()
         digest.update(contents)
     return digest.hexdigest()
 
