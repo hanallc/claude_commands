@@ -1262,7 +1262,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** The unit board reads merge and dependency evidence from each unit's own repo through one landed-evidence rule, and labels a failure by its land destination. An incomplete run history shows "merge evidence unavailable". A legacy land result with no production key no longer crashes the board. A batch review report gives each row its own list path. A same-repo board keeps four Git calls. Multi-run cases (F006, F008, F010, F012, F013) moved to one cross-repo board follow-up after five review rounds. On main f6c11ee64 (hash b5ab8a1e3).
 
-### Phase 79 — Review-trial rows keyed by checkpoint  · status: todo
+### Phase 79 — Review-trial rows keyed by checkpoint  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1283,6 +1283,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** A review-trial row records its full checkpoint hash, and `merge_checkpoint.py` passes `--checkpoint`. Two rows name one phase only when unit, plan, phase and checkpoint match; a row with no checkpoint matches by start time. `--checkpoint` stays optional for the landing merge; a follow-up makes it required. The lost postmaster 45bef9a09 and admin-console reviewask 6aff8187c rows are in the natedev ledger. On main b8e30ad51 (hash 767ac1df9).
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
