@@ -254,6 +254,8 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
                 place = herdr.herdr_place_of(pid)
                 if isinstance(place, herdr.HerdrPlace):
                     places.append(place.pane if place.session == client.session else f"{place.session}:{place.pane}")
+                elif isinstance(place, herdr.UnprovedHerdrPlacement):
+                    places.append(f"placement unknown for pid {pid}")
         conflicts.append((identity, ",".join(places) or "outside herdr"))
     locations: dict[str, set[str]] = {}
     unresolved: list[tuple[str, str]] = []
@@ -268,30 +270,18 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
     return sorted(set(unresolved))
 
 
-def producer_pane_kinds(info: dict[str, object]) -> list[Literal["claude", "codex"]]:
-    """Read agent families from a pane's foreground processes."""
-    kinds: list[Literal["claude", "codex"]] = []
-    for value in herdr.json_items(info.get("foreground_processes"), "producer foreground processes"):
-        process = herdr.json_object(value, "producer foreground process")
-        argv = [herdr.json_text(argument, "producer argument")
-                for argument in herdr.json_items(process.get("argv"), "producer arguments")]
-        if herdr.is_claude_process(argv):
-            kinds.append("claude")
-        elif herdr.is_codex_process(argv):
-            kinds.append("codex")
-    return kinds
-
-
 def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> pane_launch.CurrentLaunch:
     """Prove a named native conversation before staff admission."""
     pane = pane.removeprefix(client.session + ":")
     if any(row["pane_id"] == pane for row in client.panes()):
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
                                  "producer adoption process info")
-        kinds = producer_pane_kinds(info)
-        if len(kinds) != 1:
+        owner = herdr.foreground_pane_owner(info)
+        if isinstance(owner, herdr.UnprovedForegroundOwner):
+            raise ValueError(f"producer has no unique native foreground process: {owner.reason}")
+        if isinstance(owner, herdr.NoForegroundAgent):
             raise ValueError("producer has no unique native foreground process")
-        entry = client.producer_admission_launch(pane, kinds[0])
+        entry = client.producer_admission_launch(pane, owner.kind)
         if entry["session_id"] != identity:
             raise ValueError("producer pane runs another conversation")
         return entry
@@ -370,7 +360,7 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
         raise ValueError(f"session {identity}, pane {pane}: producer adoption is unproved: {error}") from error
 
 
-def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str,
+def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str, why: str = "resumed by name", requester: str = "",
                                   client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     """Serialize producer admission and replacement."""
     path = _producer_admission_path(request.name)
@@ -382,12 +372,12 @@ def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str,
         record = staff.initial_snapshot()
         row = next((row for row in record.rows if row.kind == "producer" and row.name == request.name), None)
         if row is None:
-            return _first_producer_resume(request, to=to, client=client, opening=opening)
+            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client, opening=opening)
         with staff.row_operation(str(row.id)):
             if not path.exists() and isinstance(opening, herdr.NoOpeningPrompt) and (not isinstance(request, ProducerFamilyChange)
                                       or row.current_session != request.session):
-                return _resume(str(row.id), to=to, client=client)
-            return _first_producer_resume(request, to=to, client=client, member=row, opening=opening)
+                return _resume(str(row.id), to=to, why=why, requester=requester, client=client)
+            return _first_producer_resume(request, to=to, why=why, requester=requester, client=client, member=row, opening=opening)
 
 
 @final
@@ -480,7 +470,7 @@ def _check_producer_admission_account(pending: PendingProducerAdmission, to: str
             raise ValueError("pending producer admission uses another account; complete its admission before an account move")
 
 
-def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProducerOpening | herdr.NoOpeningPrompt, to: str = "",
+def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProducerOpening | herdr.NoOpeningPrompt, to: str, why: str, requester: str,
                            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW,
                            member: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW) -> ResumeResult:
     """Retain the pane before launch and admit only its proved native identity."""
@@ -496,6 +486,8 @@ def _first_producer_resume(request: ProducerFirstStart, *, opening: PendingProdu
         path = _producer_admission_path(request.name)
         recovering_admission = path.exists()
         if isinstance(request, ProducerFamilyChange) and not recovering_admission:
+            if kind == request.kind:
+                return _resume(request.session, to=to, why=why, requester=requester, client=client)
             _ = member_account.producer_account(kind, to=to)
             _stop_producer_for_family_change(request)
         conflicts = producer_conflicts(request.name, client)
@@ -655,12 +647,18 @@ def _stop_producer_for_family_change(change: ProducerFamilyChange) -> None:
         raise ValueError(f"{change.session}: the old producer pane {pane} did not close")
 
 
-def _producer_current_kind(row: StaffRow, entry: pane_record.PaneLaunch | None) -> Literal["claude", "codex"]:
+@dataclass(frozen=True)
+class ProducerFamilyUnavailable:
+    """The observed session and its saved binding do not supply a family."""
+
+
+def _producer_current_kind(row: StaffRow, entry: pane_record.PaneLaunch | None
+                           ) -> Literal["claude", "codex"] | ProducerFamilyUnavailable:
     try:
         return pane_launch.current_kind(row)
     except ValueError:
         if entry is None or not entry.get("producer_binding", False):
-            raise
+            return ProducerFamilyUnavailable()
         # A Codex launch records its policy even when it has no policy arguments.
         return "codex" if "codex_policy" in entry else "claude"
 
@@ -920,12 +918,9 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
                 member = members[0]
         if member is not None:
             return member.current_session
-        registered = {row["sessionId"] for row in sessions.running_sessions()
-                      if session == row["sessionId"]}
-        if len(registered) > 1:
-            return StopFailed(session, f"{session}: several live sessions match")
-        if registered:
-            return registered.pop()
+        registry = sessions.read_registry()
+        if any(session == row["sessionId"] for row in sessions.running_sessions(registry=registry)):
+            return session
         entries = pane_record.read(herdr.shared_session())
         references = pane_launch.named_references(session, record, entries)
         identities: set[str] = set()
@@ -945,7 +940,11 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
             identities.add(reference.session)
         if len(identities) > 1:
             return StopFailed(session, f"{session}: several tabs match")
-        return identities.pop() if identities else SessionNotFound(session)
+        if identities:
+            return identities.pop()
+        if registry.unreadable:
+            return StopUnproved(session, "session registry unreadable")
+        return SessionNotFound(session)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         return StopFailed(session, str(error))
 
@@ -1239,9 +1238,27 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
         if isinstance(observed, herdr.UnknownConversation):
             herdr.conversation_note(observed)
             client = herdr.Herdr(herdr.shared_session())
-            for pane in client.panes():
-                if pane["session_id"] == identity and not isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-                    return ClaudeUp(identity, pane["pane_id"], "unknown account", start_state=ClaudeStartState.ALREADY_RUNNING)
+            failure = ""
+            try:
+                for pane in client.panes():
+                    if pane["session_id"] != identity and pane["pane_id"] != pane_id:
+                        continue
+                    candidate = pane["pane_id"]
+                    herdr.forget_pane_evidence(client.session, candidate)
+                    try:
+                        info = client.result("pane", "process-info", "--pane", candidate).get("process_info")
+                        owner = herdr.foreground_pane_conversation(info, pane)
+                    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                        failure = str(error)
+                        continue
+                    if isinstance(owner, pane_launch.ProvedPaneConversation) and owner.kind == "codex" and owner.identity == identity:
+                        return _codex_running_on_account(identity, candidate, owner.pid)
+                    if pane["session_id"] == identity:
+                        failure = f"pane {candidate}: cannot prove the reported Codex owner"
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                failure = str(error)
+            if failure or not observed.shared_codex:
+                return ResumeFailed(identity, failure or observed.reason)
             return sessions.SessionNotLive()
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
@@ -1466,8 +1483,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             entry = recovered
         if row is not None and row.kind == "producer":
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            kind = _producer_current_kind(row, entry)
-            if kind != restart.producer_launch(row)[0]:
+            kind = restart.producer_launch(row)[0]
+            current_kind = _producer_current_kind(row, entry)
+            if isinstance(current_kind, str) and current_kind != kind:
                 request = _producer_start_request(row)
                 old_pane: herdr.PaneIdentity | herdr.NoPane = herdr.NoPane(row.name)
                 if isinstance(tab, herdr.TabSession):
@@ -1475,19 +1493,32 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     old_pane = client.pane_row(tab.pane_id)
                 elif isinstance(source_pane, pane_launch.ResumeSourcePane):
                     old_pane = source_client.pane_row(source_pane.pane)
-                change = ProducerFamilyChange(request.name, request.folder, row.current_session, kind, source_client, old_pane)
-                return _locked_first_producer_resume(change, to=to or "", client=client)
-        else:
-            kind = pane_launch.current_kind(row) if entry is None and row is not None else "claude"
-        if entry is not None:
+                change = ProducerFamilyChange(request.name, request.folder, row.current_session, current_kind, source_client, old_pane)
+                return _locked_first_producer_resume(change, to=to or "", why=why, requester=requester, client=client)
+            if entry is not None:
+                entry = names.resume(entry)
+                entry["kind"] = kind
+        elif entry is not None:
             entry = names.resume(entry)
             kind = pane_launch.saved_kind(entry)
+        else:
+            kind = pane_launch.current_kind(row) if row is not None else "claude"
         pane_id = tab.pane_id if isinstance(tab, herdr.TabSession) else ""
         running = running_on_account(identity, pane_id, kind=kind)
         if not isinstance(running, sessions.SessionNotLive):
             if row is not None and isinstance(running, ClaudeUp) and isinstance(running.pid, int) and running.account != "unknown account":
                 member_account.repair_home(row, kind, running.pid)
             return running
+        if row is not None and row.kind == "unit" and (parent := names.tab_record.parent_of(row)) is not None:
+            from scripts.production import unit_lookup
+
+            match unit_lookup.checked_unit(parent.name, row.name, record=names.tab_record):
+                case unit_lookup.UnknownUnit(reason=reason):
+                    return ResumeFailed(identity, reason)
+                case unit_lookup.ProvedLiveUnit():
+                    return ResumeFailed(identity, "a unit owner is still live")
+                case unit_lookup.ProvedAbsentUnit():
+                    pass
         mode = worker_mode() if row is not None else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")

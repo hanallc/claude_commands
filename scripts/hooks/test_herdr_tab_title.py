@@ -7,6 +7,7 @@ import json
 import math
 import tempfile
 import unittest
+from collections.abc import Iterator
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import override
@@ -193,6 +194,22 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.assertEqual(self.retitled, [("w3:p7", "showrunner-fixer")])
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_denied_registry_reports_an_unknown_title_and_leaves_the_pane_unchanged(self) -> None:
+        iterdir = Path.iterdir
+
+        def list_folder(path: Path) -> Iterator[Path]:
+            if path == self.records:
+                raise PermissionError(path)
+            return iterdir(path)
+
+        with (patch.object(Path, "iterdir", new=list_folder), redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(herdr_tab_title.sync({"session_id": "session-a"},
+                {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents"}))
+            with self.assertRaisesRegex(OSError, "session registry unreadable"):
+                _ = herdr_tab_title.current_name("session-a")
+        self.assertEqual(self.retitled, [])
+        self.assertEqual(errors.getvalue(), "herdr title: session registry unreadable for session-a.\n")
 
     def test_delayed_clear_reports_a_missing_row_until_the_native_handoff_finishes(self) -> None:
         unit = self.renamed_unit()
