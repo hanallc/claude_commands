@@ -15,7 +15,7 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger
+from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
@@ -103,8 +103,11 @@ class HanaPlacementTests(CostFixture):
     def evidence(self, request: wire.PlacementRequest) -> placement.HostEvidence:
         key = placement.HostEvidenceKey(self.assignment.destination, request.constraints.session,
             request.constraints.command, 'fixture-config', str(self.root), 'hana', request.profile.step, command_kind='check')
+        workload = conf.read(self.target.settings, load=conf.read_bytes)
+        transport = target_config.read_execution_transport(self.target, configuration=workload)
+        assert isinstance(transport, hana.HanaControlTransport), transport
         with mock.patch('time.time', self.clock), mock.patch('time.monotonic', self.clock):
-            return hana.read_evidence(key, request)
+            return hana.read_evidence(key, request, transport=transport, workload=workload)
 
     def eligibility(self) -> placement.HostEligibility:
         evidence = self.evidence(self.request())
@@ -378,18 +381,32 @@ class HanaPlacementTests(CostFixture):
             self.assertEqual(self.eligibility(), placement.TemporaryExclusion('daily_limit'))
             self.assertEqual(len(calls), 3)
 
+    def test_workload_edit_after_routing_keeps_the_probe_budget_and_expires_its_preview(self) -> None:
+        inspect = self.controller.inspect
+
+        def inspect_after_edit() -> box.HanaLifecycleEvidence | box.HanaUnprovisioned | box.HanaLifecycleUnavailable:
+            text_setting(self.workload, 'daily_budget_usd', '0.01')
+            return inspect()
+
+        with self.preview_calls() as calls:
+            with mock.patch.object(self.controller, 'inspect', side_effect=inspect_after_edit):
+                self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
+            self.assertEqual(calls, [self.clock.now] * 2)
+
     def test_preview_does_not_cache_a_budget_recovered_from_git(self) -> None:
         lines = self.workload.read_text().splitlines(keepends=True)
         _ = self.workload.write_text(''.join(line for line in lines if not line.startswith('daily_budget_usd=')))
         recovered = [iter(('daily_budget_usd=0.01\n',)), iter(('daily_budget_usd=6\n',))]
-        with self.preview_calls() as calls, redirect_stderr(StringIO()):
+        with self.preview_calls() as calls, conf.report_key_changes(), redirect_stderr(StringIO()) as warnings:
             with mock.patch.object(conf, '_committed_files', side_effect=recovered) as history:
                 self.assertEqual(self.eligibility(), placement.TemporaryExclusion('hana_daily_budget_usd'))
                 self.assertEqual(self.eligibility(), placement.AllowedHost())
         self.assertEqual(history.call_args_list, [mock.call(self.workload)] * 2)
         self.assertEqual(calls, [self.clock.now] * 2)
+        self.assertEqual(warnings.getvalue().count("daily_budget_usd='<missing>'"), 1)
 
-    def test_history_and_lifecycle_writes_refresh_the_preview(self) -> None:
+    def test_history_lifecycle_and_setup_writes_refresh_the_preview(self) -> None:
         history = ledger.CostLedger(self.state).launch_history_path
         with self.preview_calls() as calls:
             self.assertEqual(self.eligibility(), placement.AllowedHost())
@@ -397,7 +414,12 @@ class HanaPlacementTests(CostFixture):
             self.assertEqual(self.eligibility(), placement.AllowedHost())
             write_text_atomic(self.controller.path, self.controller.path.read_text())
             self.assertEqual(self.eligibility(), placement.AllowedHost())
-            self.assertEqual(len(calls), 3)
+            setup = self.controller.path.with_name('setup.json')
+            record = remote.read_record(setup)
+            record['instance_type'] = 'c7a.4xlarge'
+            write_text_atomic(setup, json.dumps(record))
+            self.assertEqual(self.eligibility(), placement.AllowedHost())
+            self.assertEqual(len(calls), 4)
 
     def test_bill_creation_and_update_refresh_the_preview(self) -> None:
         end = self.clock.now // 86400 * 86400
