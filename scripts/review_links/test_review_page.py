@@ -36,6 +36,7 @@ from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, review_actions, review_later
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
+from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
 
@@ -1757,6 +1758,15 @@ window.fetch=async(url)=>{
         self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_clears_the_review_save_notice(self) -> None:
+        fixture = self.fixture
+        _ = change_review.append_rows(fixture.review_list, pictured_changes([
+            change_review.Visible(f'Change {number}', 'Read the diff', 'Check the result')
+            for number in range(4, 9)
+        ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
+        self.assertEqual(save_notice_failures(review_page.render(self.root), 'works'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_filters_single_card_refresh_drafts_and_saved_row_removal(self) -> None:
         question_key = self.question()
         question_item = next(item for item in review_items.read(self.root) if item.key == question_key)
@@ -1899,11 +1909,11 @@ window.fetch=async(_url,options={})=>{
   target.querySelector('.list-toggle').click();
   form.requestSubmit(works);
   await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
-  check(visibleStatus('Saved: works'),'F004: the Review result is visible above the table');
-  check(visibleStatus('Not saved: Fixture newer refusal'),'F003: saving one card preserves the other card’s reason');
+  check(!visibleStatus('Saved: works'),'a successful save adds no notice above the table');
+  check(!visibleStatus('Not saved: Fixture newer refusal'),'saving another card clears the failure notice');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
-  check(visibleStatus('Saved: works'),'F004: the result remains visible after the animation');
+  check(!visibleStatus('Saved: works'),'no save notice appears after the animation');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='4','the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
@@ -2137,6 +2147,38 @@ window.fetch=async(_url,options={})=>{
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
                 self.assertEqual(results,[[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = review_page.render(self.root).decode()
+        setup = r"""<script>
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  const row=document.querySelector('[data-type="question"]');
+  row.querySelector('.list-toggle').click();
+  const form=row.querySelector('form');
+  form.querySelector('[data-later-toggle]').click();
+  form.querySelector('[data-later-choose]').click();
+  const previous=form.querySelector('[data-later-month-step="-1"]');
+  const grid=form.querySelector('[data-later-grid]');
+  previous.focus();
+  check(document.activeElement===previous,'Previous month has focus in December');
+  previous.click();
+  const day=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+  check(previous.disabled && day?.dataset.date==='2026-11-30','November has an enabled day');
+  check(document.activeElement===day,'Focus moves from Previous month to the enabled day');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_time_displays_and_saves_24_hour_time(self) -> None:

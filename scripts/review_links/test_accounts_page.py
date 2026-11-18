@@ -846,6 +846,27 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         _ = write_config_fixture(settings, "next_move_percent=2.5\n")
         self.assertIn('data-move-percent="2.5"', accounts_page.board(reading))
 
+    def test_selected_claude_producers_have_an_editable_next_cell(self) -> None:
+        rows = (replace(status_row("claude1"), roles=("producers",), selected_roles=("producers",)),
+                status_row("claude2"),
+                replace(status_row("codex1"), tool="codex", roles=("producers",)))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
+            first_next_moves=accounts.FirstNextMoveTargets({"producers": "claude2"}))
+        markup = accounts_page.board(reading)
+        self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
+        self.assertIn('data-next-target="claude2" aria-label="Choose the next account for producers"', markup)
+        self.assertEqual(markup.count("data-move-group="), 1)
+
+    def test_inherited_claude_producers_have_an_editable_next_cell(self) -> None:
+        row = replace(status_row("claude1"), roles=("showrunners", "producers"),
+                      selected_roles=("showrunners", "producers"), inherited_roles=("producers",))
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT,
+                                         first_next_moves=accounts.FirstNextMoveTargets())
+        markup = accounts_page.board(reading)
+        self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
+        self.assertIn('> (inherited)</span>', markup)
+        self.assertIn('data-next-target="" aria-label="Choose the next account for producers"', markup)
+
     def test_next_cells_show_first_targets_empty_groups_unselected_roles_and_unavailable_reads(self) -> None:
         rows = (replace(status_row("claude1"), roles=("units", "showrunners"), selected_roles=("units", "showrunners")),
                 status_row("claude2"), replace(status_row("claude3"), roles=("spare",)),
@@ -928,7 +949,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
     def test_clear_removes_only_the_first_group_entry_and_refuses_an_empty_group(self) -> None:
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (scratch_account_home(home, {}, clear=True), patch.object(role_map, "is_role_map_host", return_value=True)):
-            for group in ("units", "showrunners"):
+            for group in ("units", "showrunners", "producers"):
                 with self.subTest(group=group):
                     _ = next_moves.add_next_move(group, 1, "claude2")
                     later = next_moves.add_next_move(group, 2, "claude3")
@@ -938,7 +959,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     self.assertEqual(accounts_page.clear_next_move(group), accounts_page.Saved())
                     before = next_moves.next_moves_file().read_bytes()
                     self.assertEqual(accounts_page.clear_next_move(group), accounts_page.Refused("The group has no next move."))
-                    self.assertEqual(accounts_page.clear_next_move("workers"), accounts_page.Refused("Choose units or showrunners."))
+                    self.assertEqual(accounts_page.clear_next_move("workers"), accounts_page.Refused("Choose units, showrunners, or producers."))
                     self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
                     next_moves.remove_next_move("workers", next_moves.FIRST_GROUP_POSITION)
             with patch.object(next_moves, "read_next_moves", side_effect=next_moves.NextMoveError("fixture damaged log")):
@@ -947,7 +968,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
     def test_next_move_save_checks_the_group_and_account_then_sets_the_first_entry_at_the_configured_percent(self) -> None:
         with patch.object(next_moves, "set_first_next_move") as setter:
             self.assertEqual(accounts_page.save_next_move("workers", "claude2"),
-                             accounts_page.Refused("Choose units or showrunners."))
+                             accounts_page.Refused("Choose units, showrunners, or producers."))
             with patch.object(accounts, "claude_account_dir", side_effect=accounts.AccountsError("accounts: claude9 has no note")):
                 self.assertEqual(accounts_page.save_next_move("units", "claude9"),
                                  accounts_page.Refused("accounts: claude9 has no note"))

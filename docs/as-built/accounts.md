@@ -145,12 +145,14 @@ The [trust guide](../accounts.md#trusted-worktrees) describes configured project
 ## Role map and launch selection
 
 Natedev owns the role map for both machines.
-The map contains the Claude groups `units` and `showrunners`, the Codex `workers` account, and an optional timed Claude worker route.
-Both Claude groups may select the same account.
+The map contains the Claude groups `units`, `showrunners`, and `producers`.
+It also contains the Codex `workers` account and an optional timed Claude worker route.
+Claude groups can share an account.
 Codex producers use the workers account.
-Claude producers use the showrunners account.
+Claude producers use the producers account when it has a selection.
+They use the showrunners account until the first producers selection.
 `[producers]` in `config/models.conf` selects each producer's family, model, and effort.
-An absent selection stays unconfigured until an explicit move selects it.
+An explicit move saves a group selection.
 Status, launch, and preview reads never create a selection.
 
 | State | Location |
@@ -251,7 +253,7 @@ These include closed workers without an active dispatch, workers without a curre
 A group move validates the destination before changing the selection or stopping members.
 It selects the account for future launches and moves live members on other accounts.
 A workers swap also selects eligible Codex producers.
-A showrunners group move also selects eligible Claude producers.
+A producers group move selects only eligible Claude producers.
 `eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
 `producer_settings` returns `LaunchSettings` or `InvalidProducerSettings`.
 One `settings_report_scope` limits each producer's invalid-settings warning to one per operation.
@@ -485,7 +487,7 @@ Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
 A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
-A board line of a selected Claude group (`units` or `showrunners`) carries `group`: its account and group.
+A board line of a selected Claude group carries its account and group.
 The Accounts page adds a `next` column after the role color swatch.
 Each next cell belongs to its role row and moves with that row when sorted.
 A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
@@ -529,9 +531,9 @@ An older peer's document holds waiting within busy and starting within idle, wit
 The decoder moves that peer's `starting` count from idle to busy.
 Claude and Codex producers count under `producers` with the same hold and activity rules.
 A live producer counts on the account from its process environment.
-Without a live Claude session, producers count on the selected showrunners account.
+Without a live Claude session, producers count on their launch account.
 Without a live Codex session, producers count on their recorded home or the selected workers account.
-Claude producers retain their showrunners move group.
+Claude producers use the producers move group.
 Codex producers retain their workers move group.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.

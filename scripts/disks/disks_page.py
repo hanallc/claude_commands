@@ -101,7 +101,7 @@ def publish(folder: Path, settings: PageSettings) -> Path:
     tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding="utf-8"))
     source = source.replace("__PAGE_FRAME_STYLE__", console_theme.TOKENS + "__PAGE_FRAME_STYLE__")
     button = ('<button type="button" id="measure-now" aria-label="Measure now" title="Measure now">'
-              + page_frame.icon_svg("refresh-cw") + '</button>')
+              + page_frame.icon_svg("refresh-cw") + 'Measure now</button>')
     title = page_frame.title("Disks", "disks").replace('<span class="page-status-state">',
                                                     '<span class="page-status-state">' + button)
     source = source.replace("__PAGE_TITLE__", title)
