@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
-from scripts.production import merge_gate
+from scripts.production import gate
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
@@ -220,9 +220,9 @@ class GuestTests(unittest.TestCase):
             _ = (repo / 'scripts/aws_target/gate_box.py').write_text('fixture candidate')
             _ = (root / 'stat').write_text('cpu 100 0 100 10000 1000 0 0 0 9999 9999\n')
             _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
-            original_reap = merge_gate.reap_gate_job
+            original_reap = gate.reap_gate_job
             broken_finished = False
-            def reap(job: merge_gate.RunningGateJob, *, block: bool = False) -> None:
+            def reap(job: gate.RunningGateJob, *, block: bool = False) -> None:
                 nonlocal broken_finished
                 original_reap(job, block=block)
                 if job.module == 'test_broken.py' and job.process.returncode is not None:
@@ -231,9 +231,9 @@ class GuestTests(unittest.TestCase):
                         job.process.returncode is None and not job.killed_for):
                     self.assertEqual(ready.recv(5), b'ready')
                     job.started = time.monotonic() - module_limit_s
-            original_run = merge_gate.run_suites
-            def run_suites(repo: Path, *, full: bool, machine: merge_gate.WholeMachine,
-                           module_time_limit_s: float) -> merge_gate.GateRun:
+            original_run = gate.run_suites
+            def run_suites(repo: Path, *, full: bool, machine: gate.WholeMachine,
+                           module_time_limit_s: float) -> gate.GateRun:
                 self.assertEqual(machine.module_seconds, timings)
                 run = original_run(repo, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
@@ -246,17 +246,17 @@ class GuestTests(unittest.TestCase):
                   mock.patch.object(Path, 'home', return_value=root),
                   mock.patch('subprocess.run', side_effect=transport),
                   mock.patch('os.cpu_count', return_value=2),
-                  mock.patch.object(merge_gate, 'reap_gate_job', side_effect=reap),
-                  mock.patch.object(merge_gate, 'run_suites', side_effect=run_suites),
-                  mock.patch.object(merge_gate, 'module_runner', return_value=runner),
-                  mock.patch.object(merge_gate, 'discover_test_modules', return_value=modules) as discover,
-                  mock.patch.object(merge_gate, 'BuildHoldWait', side_effect=AssertionError('hold read')),
-                  mock.patch.object(merge_gate, 'gate_reservation', side_effect=AssertionError('admission')),
-                  mock.patch.object(merge_gate, 'shared_cpu_pool', side_effect=AssertionError('CPU pool')),
-                  mock.patch.object(merge_gate, 'suite_scope_prefix', side_effect=AssertionError('scope')),
-                  mock.patch.object(merge_gate, 'merge_gate_governor_gib', side_effect=AssertionError('governor')),
-                  mock.patch.object(merge_gate, 'gate_state_dir', side_effect=AssertionError('test ledger')),
-                  mock.patch.object(merge_gate, 'typecheck_python', side_effect=AssertionError('type preparation during tests-only trial'))):
+                  mock.patch.object(gate, 'reap_gate_job', side_effect=reap),
+                  mock.patch.object(gate, 'run_suites', side_effect=run_suites),
+                  mock.patch.object(gate, 'module_runner', return_value=runner),
+                  mock.patch.object(gate, 'discover_test_modules', return_value=modules) as discover,
+                  mock.patch.object(gate, 'BuildHoldWait', side_effect=AssertionError('hold read')),
+                  mock.patch.object(gate, 'gate_reservation', side_effect=AssertionError('admission')),
+                  mock.patch.object(gate, 'shared_cpu_pool', side_effect=AssertionError('CPU pool')),
+                  mock.patch.object(gate, 'suite_scope_prefix', side_effect=AssertionError('scope')),
+                  mock.patch.object(gate, 'merge_gate_governor_gib', side_effect=AssertionError('governor')),
+                  mock.patch.object(gate, 'gate_state_dir', side_effect=AssertionError('test ledger')),
+                  mock.patch.object(gate, 'typecheck_python', side_effect=AssertionError('type preparation during tests-only trial'))):
                 previous = Path.cwd()
                 try:
                     exec(compile(code, '<guest>', 'exec'), {})

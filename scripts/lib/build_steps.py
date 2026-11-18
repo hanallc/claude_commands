@@ -122,6 +122,10 @@ GATE_PROGRAMS = {
     "gate": ("gate.py", "merge_gate.py"),
     "test-affected": ("gate.py", "merge_gate.py", "targeted_test.py"),
 }
+_LEGACY_GATE_PROGRAMS = {
+    "merge-gate": ("merge_gate.py",),
+    "targeted-test": ("targeted_test.py",),
+}
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
 RAW_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32})(?![0-9a-f])",
                     re.IGNORECASE)
@@ -243,6 +247,9 @@ def live_process_arguments(process: Path, start_time: str) -> list[str] | Comman
 
 def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> StepJob | OtherCommand | CommandUnreadable:
     """Read the gate job from its process or the copies.py caller."""
+    expected = GATE_PROGRAMS.get(step) or _LEGACY_GATE_PROGRAMS.get(step, ())
+    if not expected:
+        return OTHER_COMMAND
     try:
         argv = live_process_arguments(process, start_time) if start_time else process_arguments(process)
     except OSError as error:
@@ -251,7 +258,6 @@ def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> 
         return argv
     copied = copies_run_command(argv)
     command = copied.arguments if isinstance(copied, CopiesRunCommand) else argv
-    expected = GATE_PROGRAMS.get(step, ())
     return command_job(command) if command_program(command) in expected else OTHER_COMMAND
 
 

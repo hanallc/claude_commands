@@ -355,6 +355,8 @@ class AwsReportTests(MeasurementFixture):
         evidence = run_cost.run_evidence(launches, start, end, 'us-east-2')
         box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('gate',))
         self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
+        box_seconds, _ = evidence.box_seconds('m7a.8xlarge', 'us-east-2', ('merge-gate', 'gate'))
+        self.assertEqual(box_seconds, [Decimal(100), Decimal(600)])
         self.assertEqual(evidence.refusals_per_launch('m7a.8xlarge', 'us-east-2', ('test-affected',))[1:], (0, 1))
         self.assertEqual(evidence.refusals_per_launch('refused.8xlarge', 'us-east-2', ('test-affected',))[1:], (2, 0))
 

@@ -149,7 +149,7 @@ const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NO_REGION = "No region chosen.";
 const NOT_SOLD = "Not sold here";
 const SVG = "http://www.w3.org/2000/svg";
-const VIEWS = [["spot", "Spot price"], ["cost", "Cost per gate"]];
+const VIEWS = [["spot", "Spot price"], ["cost", costViewLabel()]];
 const query = new URLSearchParams(location.search);
 let shown = new Set(data.regions);
 // The price tables show the Spot price or the cost per gate of one run kind; the URL keeps both choices.
@@ -355,8 +355,18 @@ function outlineLegend() {
   return line;
 }
 
+function costViewLabel() {
+  const unit = " (minutes)";
+  const gateCosts = data.runs.find(entry => entry.scope === "gate");
+  const duration = gateCosts?.tables[0]?.headers.find(header => header.endsWith(unit));
+  return "Cost per " + (duration ? duration.slice(0, -unit.length) : "run");
+}
+
 function drawPrices() {
-  for (const button of priceView.children) button.setAttribute("aria-pressed", String(button.dataset.view === view));
+  for (const button of priceView.children) {
+    button.setAttribute("aria-pressed", String(button.dataset.view === view));
+    if (button.dataset.view === "cost") button.textContent = costViewLabel();
+  }
   priceScope.hidden = view !== "cost";
   const priceCards = cards("prices", view === "cost" ? scopeCosts().prices : data.prices);
   for (const card of priceCards) if (card.querySelector("td.end, td.cheapest, td.dearest")) card.appendChild(outlineLegend());
