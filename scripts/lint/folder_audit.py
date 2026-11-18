@@ -289,7 +289,7 @@ def _last_change(path: Path, limits: FolderScanLimits, *,
     for repo in scratch.repos(path, scratch_settings=scratch_settings):
         git = scratch.git_directory(repo)
         if isinstance(git, scratch.GitDirectory):
-            newest = max([newest, *(_mtime(git.path / name) for name in GIT_TIME_FILES)])
+            newest = max([newest, *(_mtime(git.checkout.git_dir / name) for name in GIT_TIME_FILES)])
     return float(newest)
 
 
