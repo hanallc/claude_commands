@@ -453,16 +453,22 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
                                    read_bytes: Callable[[Path], bytes]) -> str:
     """Hash the configuration for placement or an adapter refusal."""
     from scripts.lib import conf
+    from scripts.build_queue import admission_records
+    from scripts.build_targets.execution_transport import HanaControlTransport
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
     if isinstance(settings, placement.ExplicitProviderSettings):
         paths.add(settings.path)
     for target in targets:
         if isinstance(target, target_config.SshTarget) and target.name == target_name:
-            from scripts.build_targets.execution_transport import HanaControlTransport
-
             paths.add(target.settings)
-            if isinstance(transport_for(target), HanaControlTransport):
+            if target.platform != "linux":
+                continue
+            try:
+                transport = transport_for(admission_records.ssh_target_settings(target, settings))
+            except conf.Unusable:
+                continue
+            if isinstance(transport, HanaControlTransport):
                 paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
     for path in sorted(paths):
@@ -471,6 +477,10 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
             contents = read_bytes(path)
         except FileNotFoundError:
             contents = b"missing"
+        except OSError as error:
+            # The provider reads and reports its own settings error.
+            digest.update(b"\0unreadable\0")
+            contents = type(error).__name__.encode()
         digest.update(contents)
     return digest.hexdigest()
 

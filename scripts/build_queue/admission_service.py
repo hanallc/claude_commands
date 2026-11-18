@@ -67,37 +67,41 @@ class ProviderConfiguration:
 
     transports: dict[target_config.SshTarget, ExecutionTransport] = field(default_factory=dict)
     settings: dict[str | Path, conf.ConfigRead] = field(default_factory=dict)
-    files: dict[Path, bytes | OSError] = field(default_factory=dict)
+    files: dict[Path, conf.ConfigurationBytes | OSError] = field(default_factory=dict)
+    targets: dict[str, target_config.Target | records.UnregisteredTarget | conf.Unusable] = field(default_factory=dict)
     generations: dict[tuple[str, placement.ProviderSettings], str] = field(default_factory=dict)
 
-    selected_targets: dict[str, target_config.SshTarget | None] = field(default_factory=dict)
+    def registered_target(self, name: str) -> target_config.Target | records.UnregisteredTarget:
+        if name not in self.targets:
+            try:
+                self.targets[name] = records.effective_target(name, placement.ConfiguredProviderSettings(),
+                    configuration=self.read("build_targets"))
+            except conf.Unusable as error:
+                self.targets[name] = error
+        target = self.targets[name]
+        if isinstance(target, conf.Unusable):
+            raise target
+        return target
 
-    def ssh_target(self, name: str) -> target_config.SshTarget | None:
-        if name not in self.selected_targets:
-            self.selected_targets[name] = next((target for target in target_config.read_targets(target_name=name)
-                if isinstance(target, target_config.SshTarget) and target.name == name), None)
-        return self.selected_targets[name]
+    def target(self, name: str, settings: placement.ProviderSettings
+               ) -> target_config.Target | records.UnregisteredTarget:
+        target = self.registered_target(name)
+        return records.ssh_target_settings(target, settings) if isinstance(target, target_config.SshTarget) else target
 
     def transport(self, target: target_config.SshTarget) -> ExecutionTransport:
         if target not in self.transports:
-            self.transports[target] = target_config.read_execution_transport(target)
+            self.transports[target] = target_config.read_execution_transport(target, configuration=self.read(target.settings))
         return self.transports[target]
 
     def read(self, file: str | Path) -> conf.ConfigRead:
         if file not in self.settings:
-            path = conf.path(file)
-            try:
-                parsed = conf.settings(self.contents(path).decode("utf-8"))
-            except (OSError, UnicodeError) as error:
-                # Keep config recovery and the error from the first read.
-                parsed = conf._UnreadableFile(str(error), isinstance(error, FileNotFoundError))  # pyright: ignore[reportPrivateUsage]
-            self.settings[file] = conf.ConfigRead(file, path, parsed, "CONF_DIR" not in os.environ)
+            self.settings[file] = conf.read(file, load=self.snapshot)
         return self.settings[file]
 
-    def contents(self, path: Path) -> bytes:
+    def snapshot(self, path: Path) -> conf.ConfigurationBytes:
         if path not in self.files:
             try:
-                self.files[path] = path.read_bytes()
+                self.files[path] = conf.read_bytes(path)
             except OSError as error:
                 self.files[path] = error
         contents = self.files[path]
@@ -105,12 +109,20 @@ class ProviderConfiguration:
             raise contents
         return contents
 
+    def contents(self, path: Path) -> bytes:
+        return self.snapshot(path).data
+
     def generation(self, name: str, settings: placement.ProviderSettings) -> str:
         key = name, settings
         if key not in self.generations:
-            target = self.ssh_target(name)
+            try:
+                target = self.registered_target(name)
+            except conf.Unusable:
+                # The probe reports the registry error for this target.
+                target = records.UnregisteredTarget()
+            targets = (target,) if isinstance(target, target_config.SshTarget) else ()
             self.generations[key] = status_wire.placement_configuration_digest(name, settings,
-                targets=() if target is None else (target,), transport_for=self.transport, read_bytes=self.contents)
+                targets=targets, transport_for=self.transport, read_bytes=self.contents)
         return self.generations[key]
 
 
@@ -2580,11 +2592,17 @@ class AdmissionServer:
             self.ledger[ending.request_id] = ReplayEntry(wire.Ok(), self.clock.now())
         self.persist()
 
+    @staticmethod
+    def _placement_settings(request: wire.PlacementRequest,
+                            destination: placement.PlacementDestination) -> placement.ProviderSettings:
+        return next((candidate.settings for candidate in request.constraints.candidates
+                     if candidate.destination == destination), placement.ConfiguredProviderSettings())
+
     def host_evidence_key(self, request: wire.PlacementRequest,
                           destination: placement.PlacementDestination) -> placement.HostEvidenceKey:
-        settings = next((candidate.settings for candidate in request.constraints.candidates
-                         if candidate.destination == destination), placement.ConfiguredProviderSettings())
-        generation = _provider_configuration().generation(destination.target, settings)
+        settings = self._placement_settings(request, destination)
+        with conf.report_key_changes():
+            generation = _provider_configuration().generation(destination.target, settings)
         return placement.HostEvidenceKey(destination, request.constraints.session,
             request.constraints.command, generation, request.constraints.repository,
             request.constraints.package, request.profile.step, settings,
@@ -2594,19 +2612,20 @@ class AdmissionServer:
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
         from scripts.aws_target import hana_placement
 
-        configuration = _provider_configuration()
-        if isinstance(key.settings, placement.ExplicitProviderSettings):
-            target = target_config.SshTarget(key.destination.target, 'linux', key.settings.path)
-        else:
-            target = configuration.ssh_target(key.destination.target)
-        if target is None:
-            return configuration.read("mac_test").number("probe_timeout_s")
-        transport = configuration.transport(target)
-        if isinstance(transport, hana_placement.HanaControlTransport):
-            return float(configuration.read(target.settings).whole('aws_timeout_s'))
-        if isinstance(transport, HanaGpuNextestTransport):
-            return configuration.read(target.settings).number('api_timeout_s')
-        return configuration.read(target.settings).number("probe_timeout_s")
+        with conf.report_key_changes():
+            configuration = _provider_configuration()
+            target = configuration.target(key.destination.target, key.settings)
+            if isinstance(target, target_config.SshTarget):
+                settings = configuration.read(target.settings)
+                if key.destination.provider == "ssh":
+                    transport = configuration.transport(target)
+                    if isinstance(transport, hana_placement.HanaControlTransport):
+                        return settings.value("aws_timeout_s", conf.positive_whole_seconds)
+                    if isinstance(transport, HanaGpuNextestTransport):
+                        return settings.number("api_timeout_s")
+                return settings.number("probe_timeout_s")
+            file = key.settings.path if isinstance(key.settings, placement.ExplicitProviderSettings) else "mac_test"
+            return configuration.read(file).number("probe_timeout_s")
 
     def publish_host_evidence(self, evidence: placement.HostEvidence) -> None:
         self.host_observations[evidence.key] = evidence
@@ -2643,11 +2662,13 @@ class AdmissionServer:
     def _evidence_lifetime(self, key: placement.HostEvidenceKey) -> float:
         """Return how long one probe can take: a waiting pass plus the probe time limit."""
         reader = self.host_readers.get(key)
-        interval = (self.last_usable_configuration.waiting_pass_seconds
-                    if isinstance(self.last_usable_configuration, records.MemoryConfig) else 0.0)
         timeout = (0.0 if key.destination.provider == "local" else
                    reader.timeout if reader is not None else self._host_probe_timeout(key))
-        return interval + timeout
+        return self._waiting_pass_interval() + timeout
+
+    def _waiting_pass_interval(self) -> float:
+        configuration = self.last_usable_configuration
+        return configuration.waiting_pass_seconds if isinstance(configuration, records.MemoryConfig) else 0.0
 
     def _request_host_evidence(self, request: wire.PlacementRequest,
                                destination: placement.PlacementDestination, keys: PlacementEvidenceKeys | None = None
@@ -2656,18 +2677,26 @@ class AdmissionServer:
         if isinstance(key, placement.EvidenceNeeded):
             _ = self.placement_host_keys.pop((request.episode, destination), None)
             return key
+        with conf.report_key_changes():
+            try:
+                return self._request_target_evidence(request, key)
+            except conf.Unusable as error:
+                return placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
+
+    def _request_target_evidence(self, request: wire.PlacementRequest,
+                                 key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        destination = key.destination
         self.placement_host_keys[(request.episode, destination)] = key
         if destination.provider == 'ssh':
             from scripts.aws_target import hana_placement
 
             configuration = _provider_configuration()
-            target = configuration.ssh_target(destination.target)
-            if target is not None:
-                if isinstance(key.settings, placement.ExplicitProviderSettings):
-                    target = replace(target, settings=key.settings.path)
+            target = configuration.target(destination.target, key.settings)
+            if isinstance(target, target_config.SshTarget):
                 transport = configuration.transport(target)
                 if (isinstance(transport, hana_placement.HanaControlTransport)
-                        and request.profile.peak.bytes > configuration.read(transport.settings).whole('step_memory_gib') * 1024 ** 3):
+                        and request.profile.peak.bytes >
+                        configuration.read(transport.settings).value('step_memory_gib', conf.positive_whole) * 1024 ** 3):
                     # Memory belongs to this request, not the shared host evidence.
                     return placement.FreshHostEvidence(key, self.clock.now(), '', placement.TemporaryExclusion('memory'))
         if destination.provider == "local" and not self.background_local_evidence:
@@ -2700,6 +2729,7 @@ class AdmissionServer:
     def _host_evidence_reader(self, key: placement.HostEvidenceKey, interval: float) -> HostEvidenceReader:
         """Keep host and dispatch readings on the same target worker."""
         if key not in self.host_readers:
+            timeout = 0.0 if key.destination.provider == "local" else self._host_probe_timeout(key)
             previous = self.host_observations.get(key)
             target = (key.destination.provider, key.destination.target)
             reader = self.host_targets.get(target)
@@ -2709,8 +2739,7 @@ class AdmissionServer:
                 self.host_targets[target] = reader
             else:
                 reader.request(key)
-            self.host_readers[key] = HostEvidenceReader(key, reader,
-                0.0 if key.destination.provider == "local" else self._host_probe_timeout(key))
+            self.host_readers[key] = HostEvidenceReader(key, reader, timeout)
             if previous is not None:
                 reader.publish(previous)
         return self.host_readers[key]
@@ -2720,6 +2749,14 @@ class AdmissionServer:
         return self._read_host_evidence(key)
 
     def _read_host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        """Limit an unusable setting to the affected target."""
+        with conf.report_key_changes():
+            try:
+                return self._read_target_evidence(key)
+            except conf.Unusable as error:
+                return placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
+
+    def _read_target_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets
         from scripts.mac_test import claim_state, mac_test
@@ -2748,19 +2785,19 @@ class AdmissionServer:
         request = self.host_requests[key]
         if destination.provider not in ("mac", "ssh"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "provider uses its existing admission path")
-        target = next((target for target in target_config.read_targets(target_name=destination.target)
-                       if target.name == destination.target), None)
-        if target is None:
+        target = records.effective_target(destination.target, key.settings)
+        if isinstance(target, records.UnregisteredTarget):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
-        if isinstance(target, target_config.SshTarget) and isinstance(key.settings, placement.ExplicitProviderSettings):
-            target = replace(target, settings=key.settings.path)
+        configuration = conf.read(target.settings if isinstance(target, target_config.SshTarget) else "mac_test",
+                                  load=conf.read_bytes)
         if isinstance(target, target_config.SshTarget):
             from scripts.aws_target import hana_placement
-            transport = target_config.read_execution_transport(target)
+
+            transport = target_config.read_execution_transport(target, configuration=configuration)
             if isinstance(transport, HanaGpuNextestTransport):
                 from scripts.aws_target.hana_placement_adapter import read_gpu_evidence
 
-                return read_gpu_evidence(transport, key, request)
+                return read_gpu_evidence(transport, key, request, configuration=configuration)
             if isinstance(transport, hana_placement.HanaControlTransport):
                 return hana_placement.read_evidence(key, request)
         sent = request.constraints.command_kind
@@ -2776,10 +2813,11 @@ class AdmissionServer:
             if isinstance(target, target_config.SshTarget):
                 answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                    new_step=True, session=key.session)
+                    new_step=True, session=key.session, configuration=configuration)
             else:
                 answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
-                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session)
+                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
+                    configuration=configuration)
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
@@ -2788,7 +2826,7 @@ class AdmissionServer:
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
                 and target.platform == "macos"
                 and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session) == "busy"):
+                                      session=key.session, configuration=configuration) == "busy"):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
@@ -2823,13 +2861,12 @@ class AdmissionServer:
                 placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
-                record["remote_host"], record.get("instance_generation", ""), key.settings)))
+                record["remote_host"], record.get("instance_generation", ""), configuration)))
         return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, host: str, generation: str,
-                                    settings: placement.ProviderSettings
-                                    ) -> placement.ExecutionEvidence:
+                                    config: conf.ConfigRead) -> placement.ExecutionEvidence:
         """Read existing mirror process evidence without invoking provider cleanup."""
         from scripts.mac_test import eligibility, offload, claim_state
 
@@ -2848,25 +2885,21 @@ for placement_pid in $placement_pids; do
     printf '%s\t%s\n' "$placement_pid" "$placement_start"
 done
 '''
+        probe = eligibility.SshProbeSettings(config)
+        options, timeout = offload.ssh_options(probe), probe.probe_timeout_s
         try:
-            target = eligibility.configured_ssh_target(destination.target)
-            config = eligibility.read_config(settings.path if isinstance(settings, placement.ExplicitProviderSettings)
-                                         else target.settings)
-        except (OSError, ValueError):
-            return placement.ExecutionEvidenceUnavailable("provider settings are unavailable", self.clock.now())
-        try:
-            result = subprocess.run(["ssh", *offload.ssh_options(config.connection), host, "sh -c " + shlex.quote(script)],
+            result = subprocess.run(["ssh", *options, host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                check=False, timeout=config.probe_timeout_s)
+                check=False, timeout=timeout)
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     pid, separator, start = line.partition("\t")
                     if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
                         return placement.ObservedExecution(placement.ProcessExecution(host, generation, int(pid), start.strip()))
-            else:
-                offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
+                return placement.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
+            pass
+        offload.write_backoff(time.time() + config.number("unreachable_backoff_s"), destination.target)
         return placement.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
 
     def _prune_ended_placements(self, cutoff: float) -> None:
@@ -2990,8 +3023,15 @@ done
         if saved.assignment.destination.provider == 'ssh':
             try:
                 destination = saved.assignment.destination
-                target = target_config.configured_ssh_target(destination.target)
-                transport = _provider_configuration().transport(target)
+                submitted = self.placement_requests.get(saved.assignment.episode)
+                settings = (placement.ConfiguredProviderSettings() if submitted is None
+                            else self._placement_settings(submitted, destination))
+                with conf.report_key_changes():
+                    configuration = _provider_configuration()
+                    target = configuration.target(destination.target, settings)
+                    if not isinstance(target, target_config.SshTarget):
+                        return True
+                    transport = configuration.transport(target)
                 if isinstance(transport, HanaGpuNextestTransport):
                     from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
 
@@ -3009,7 +3049,6 @@ done
                         return (controller.execution_bound(reference.claim_id)
                                 and claim_dispatch_pending(controller.directory, reference))
 
-                    submitted = self.placement_requests.get(saved.assignment.episode)
                     if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
                         return True
                     key = self.host_evidence_key(submitted, destination)
@@ -3022,7 +3061,11 @@ done
         if not isinstance(provider, placement.ProviderClaimReference):
             return False
         identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
-        return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
+        with conf.report_key_changes():
+            try:
+                return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
+            except conf.Unusable:
+                return True
 
     def _claim_holders(self) -> set[wire.Owner]:
         """The local holders of current provider claims, which the service watches."""
@@ -3164,8 +3207,10 @@ done
         for key in set(self.host_readers) - needed:
             reader = self.host_readers.pop(key)
             reader.worker.remove(key)
-            _ = self.host_requests.pop(key, None)
             _ = self.host_observations.pop(key, None)
+        for key in self.host_requests.keys() - self.host_readers.keys():
+            if key not in needed or not isinstance(self.host_observations.get(key), placement.FreshHostEvidence):
+                _ = self.host_requests.pop(key, None)
 
     def _prepare_placements(self, keys: PlacementEvidenceKeys) -> None:
         """Refresh provider evidence and prepare waiting placement rows on the loop thread."""
@@ -3234,8 +3279,17 @@ done
             if (candidate.destination.provider == 'ssh' and isinstance(candidate.eligibility, placement.TemporaryExclusion)
                     and candidate.eligibility.reason in ('starting', 'blocked', 'recovery')):
                 from scripts.aws_target import hana_placement
-                target = target_config.configured_ssh_target(candidate.destination.target)
-                if isinstance(_provider_configuration().transport(target), hana_placement.HanaControlTransport):
+                with conf.report_key_changes():
+                    try:
+                        settings = self._placement_settings(request, candidate.destination)
+                        configuration = _provider_configuration()
+                        target = configuration.target(candidate.destination.target, settings)
+                        if not isinstance(target, target_config.SshTarget):
+                            continue
+                        transport = configuration.transport(target)
+                    except conf.Unusable:
+                        continue
+                if isinstance(transport, hana_placement.HanaControlTransport):
                     interval = (self.last_usable_configuration.waiting_pass_seconds
                         if isinstance(self.last_usable_configuration, records.MemoryConfig) else 1.0)
                     delayed[target.name] = placement.ProviderRetryNotice(target.name, candidate.eligibility.reason, interval)
@@ -3466,7 +3520,9 @@ done
                         or isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy")):
             return None
         reader = self.host_readers.get(key)
-        latest = reader.latest if reader is not None else self.host_observations.get(key)
+        if reader is None:
+            return None
+        latest = reader.latest
         if (isinstance(latest, placement.FreshHostEvidence) and not isinstance(latest.eligibility, placement.AllowedHost)
                 and not (isinstance(latest.eligibility, placement.TemporaryExclusion) and latest.eligibility.reason == "busy")):
             return None
@@ -3492,14 +3548,15 @@ done
         for hold in held:
             if not same_remote_resource(hold.destination, destination) or hold.observed_at >= observed_at:
                 continue
+            reader = self.host_readers.get(hold.key)
+            if reader is None:
+                continue
             start = holds.get((hold.episode, hold.destination))
             if start is None:
                 start = now
                 holds[(hold.episode, hold.destination)] = start
-                reader = self.host_readers.get(hold.key)
-                if reader is not None:
-                    reader.worker.expedite(hold.key)
-            if now - start <= self._evidence_lifetime(hold.key):
+                reader.worker.expedite(hold.key)
+            if now - start <= self._waiting_pass_interval() + reader.timeout:
                 return True
         return False
 

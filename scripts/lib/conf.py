@@ -18,6 +18,7 @@ import re
 import socket
 import subprocess
 import sys
+from threading import Lock
 from typing import TYPE_CHECKING, TypeVar
 
 from scripts.lib import conf_reads
@@ -27,19 +28,19 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
 
-_warning_sink: ContextVar[Callable[[str], None] | None] = ContextVar("configuration_warning_sink", default=None)
+_warning_sink: ContextVar[Callable[[str, bool], None] | None] = ContextVar("configuration_warning_sink", default=None)
 
 
 def _print_warning(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def _warning(message: str) -> None:
+def _warning(message: str, *, report: bool = True) -> None:
     sink = _warning_sink.get()
-    if sink is None:
+    if sink is not None:
+        sink(message, report)
+    elif report:
         _print_warning(message)
-    else:
-        sink(message)
 
 
 @contextmanager
@@ -47,9 +48,9 @@ def diagnostics(*, report: bool = True) -> Generator[list[str]]:
     """Collect reader warnings for a reply, with optional local output."""
     messages: list[str] = []
 
-    def collect(message: str) -> None:
+    def collect(message: str, new_warning: bool) -> None:
         messages.append(message)
-        if report:
+        if report and new_warning:
             _print_warning(message)
 
     token = _warning_sink.set(collect)
@@ -57,6 +58,50 @@ def diagnostics(*, report: bool = True) -> Generator[list[str]]:
         yield messages
     finally:
         _warning_sink.reset(token)
+
+
+@dataclass(frozen=True)
+class ConfigurationStamp:
+    """Identify the file and its modification when the reader opens it."""
+
+    device: int
+    inode: int
+    modified_ns: int
+    changed_ns: int
+
+    @classmethod
+    def from_stat(cls, info: os.stat_result) -> ConfigurationStamp:
+        return cls(info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+
+
+class UnstampedConfiguration(Enum):
+    UNSTAMPED = "no file stamp"
+
+
+_report_changes: ContextVar[bool] = ContextVar("report_configuration_changes", default=False)
+_reported_bad_edits: set[tuple[Path, str, str, ConfigurationStamp | UnstampedConfiguration]] = set()
+_bad_edits_lock = Lock()
+
+
+@contextmanager
+def report_key_changes() -> Generator[None]:
+    """Report each change to an invalid live key once."""
+    token = _report_changes.set(True)
+    try:
+        yield
+    finally:
+        _report_changes.reset(token)
+
+
+def _key_warning(source: Path, key: str, reason: str, bad: str,
+                 stamp: ConfigurationStamp | UnstampedConfiguration) -> None:
+    report = True
+    if _report_changes.get():
+        identity = (source, key, bad, stamp)
+        with _bad_edits_lock:
+            report = identity not in _reported_bad_edits
+            _reported_bad_edits.add(identity)
+    _warning(f"warning: {reason}", report=report)
 
 
 class Unusable(ValueError):
@@ -118,18 +163,33 @@ class ConfigRead:
     source: Path
     settings: dict[str, Setting] | _UnreadableFile
     repository_allowed: bool
+    stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
 
-    def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool, recover_invalid: bool = True
+    def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
+                 default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
+                 recover_invalid: bool = True
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
+
+        def read_key(settings: dict[str, Setting]) -> Result:
+            nonlocal bad
+            try:
+                setting = _setting(settings, key)
+            except _MissingKey:
+                if isinstance(default, UseConfiguredValue):
+                    raise
+                return default
+            bad = setting.value
+            if allow_blank and not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+                return convert("")
+            return _converted(setting, convert)
+
         repository_allowed = False
         try:
             if isinstance(self.settings, _UnreadableFile):
                 repository_allowed = self.settings.missing
                 raise ValueError(self.settings.reason)
-            setting = _setting(self.settings, key)
-            bad = setting.value
-            return UsableLiveValue(_converted(setting, convert))
+            return UsableLiveValue(read_key(self.settings))
         except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
             repository_allowed = repository_allowed or isinstance(error, _MissingKey)
             reason = f"{self.source}: {key}={bad!r}: {error}"
@@ -139,20 +199,17 @@ class ConfigRead:
             repository = _repository_path(self.file)
             if repository != self.source:
                 try:
-                    setting = _setting(_parse(repository.read_text(encoding="utf-8")), key)
-                    return RecoveredValue(_converted(setting, convert), reason)
+                    return RecoveredValue(read_key(_parse(repository.read_text(encoding="utf-8"))), reason)
                 except (OSError, UnicodeError, ValueError, ArithmeticError):
                     pass
+        if warn:
+            _key_warning(self.source, key, reason, bad, self.stamp)
         for committed in _committed_files(self.source):
             try:
-                value = _converted(_setting(_parse(committed), key), convert)
+                value = read_key(_parse(committed))
             except (ValueError, ArithmeticError):
                 continue
-            if warn:
-                _warning(f"warning: {reason}")
             return RecoveredValue(value, reason)
-        if warn:
-            _warning(f"warning: {reason}")
         return UnavailableValue(reason)
 
     def origin(self, key: str, convert: Callable[[str], Result]
@@ -160,28 +217,32 @@ class ConfigRead:
         """Distinguish live values from recovered values without a warning."""
         return self._resolve(key, convert, warn=False)
 
-    def _value(self, key: str, convert: Callable[[str], Result], *, recover_invalid: bool = True) -> Result:
-        result = self._resolve(key, convert, warn=True, recover_invalid=recover_invalid)
+    def value(self, key: str, convert: Callable[[str], Result], *,
+              default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
+              recover_invalid: bool = True) -> Result:
+        """Read one key with a domain conversion and an optional default."""
+        result = self._resolve(key, convert, warn=True, default=default, allow_blank=allow_blank,
+                               recover_invalid=recover_invalid)
         if isinstance(result, UnavailableValue):
             raise Unusable(f"{result.reason}; no usable committed value" if recover_invalid else result.reason)
         return result.value
 
     def text(self, key: str, *, recover_invalid: bool = True) -> str:
         """Read text and allow defaults for missing values."""
-        return self._value(key, str, recover_invalid=recover_invalid)
+        return self.value(key, str, recover_invalid=recover_invalid)
 
     def effective_key(self, key: str) -> str:
         """Return the host override key when the live file has one."""
         return _effective_key(self.settings, key) if isinstance(self.settings, dict) else key
 
     def number(self, key: str) -> float:
-        return self._value(key, _number)
+        return self.value(key, _number)
 
     def whole(self, key: str) -> int:
-        return self._value(key, _whole)
+        return self.value(key, _whole)
 
     def words(self, key: str) -> tuple[str, ...]:
-        return self._value(key, lambda value: tuple(value.split()))
+        return self.value(key, lambda value: tuple(value.split()))
 
     def values(self, *keys: str, host_only_prefix: str = "") -> dict[str, str]:
         """Return all values when no keys are given. Add base keys for host overrides that match the prefix."""
@@ -223,15 +284,48 @@ class ConfigRead:
         raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
 
 
-def read(file: str | Path) -> ConfigRead:
+@dataclass(frozen=True)
+class ConfigurationBytes:
+    """The file bytes and the stamp of the open file."""
+
+    data: bytes
+    stamp: ConfigurationStamp
+
+
+def _file_stamp(descriptor: int) -> ConfigurationStamp:
+    return ConfigurationStamp.from_stat(os.fstat(descriptor))
+
+
+def read_bytes(source: Path) -> ConfigurationBytes:
+    """Read bytes for a pass that also needs a configuration digest."""
+    with source.open("rb") as stream:
+        # An edit during the read must invalidate the stamp.
+        stamp = _file_stamp(stream.fileno())
+        return ConfigurationBytes(stream.read(), stamp)
+
+
+def read(file: str | Path, *, load: Callable[[Path], ConfigurationBytes] | None = None) -> ConfigRead:
     """Read and parse the live file once; resolve faults when a setting is used."""
     source = path(file)
+    repository_allowed = "CONF_DIR" not in os.environ
+    stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
     try:
-        settings = _parse(source.read_text(encoding="utf-8"))
+        if load is not None:
+            snapshot = load(source)
+            stamp = snapshot.stamp
+            contents = snapshot.data.decode("utf-8")
+        elif _report_changes.get():
+            with source.open(encoding="utf-8") as stream:
+                try:
+                    contents = stream.read()
+                finally:
+                    stamp = _file_stamp(stream.fileno())
+        else:
+            contents = source.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         return ConfigRead(file, source, _UnreadableFile(str(error), isinstance(error, FileNotFoundError)),
-                          "CONF_DIR" not in os.environ)
-    return ConfigRead(file, source, settings, "CONF_DIR" not in os.environ)
+                          repository_allowed, stamp)
+    return ConfigRead(file, source, _parse(contents), repository_allowed, stamp)
 
 
 def read_or_repository(stem: str) -> ConfigRead:
@@ -327,6 +421,12 @@ def decimal(value: str) -> Decimal:
     return result
 
 
+def on_off(value: str) -> bool:
+    if value not in ("on", "off"):
+        raise ValueError("expected on or off")
+    return value == "on"
+
+
 def _number(value: str) -> float:
     return float(decimal(value))
 
@@ -335,6 +435,17 @@ def _whole(value: str) -> int:
     if not re.fullmatch(r"[+-]?[0-9]+", value):
         raise ValueError("expected a whole number")
     return int(value)
+
+
+def positive_whole(value: str) -> int:
+    result = _whole(value)
+    if result <= 0:
+        raise ValueError("expected a positive whole number")
+    return result
+
+
+def positive_whole_seconds(value: str) -> float:
+    return float(positive_whole(value))
 
 
 def _git(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -361,7 +472,8 @@ def _committed_files(source: Path) -> Iterator[str]:
 
 
 def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
-    if convert is _whole and not setting.limit.startswith("# whole:"):
+    whole = convert is _whole or convert is positive_whole or convert is positive_whole_seconds
+    if whole and not setting.limit.startswith("# whole:"):
         raise ValueError("expected a # whole: limit")
     if convert is _number and not setting.limit.startswith("# range:"):
         raise ValueError("expected a # range: limit")
