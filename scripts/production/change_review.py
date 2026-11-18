@@ -93,7 +93,6 @@ _BOUNDARY = re.compile(r"(?<!\\)\|")
 _BREAK_TAG = re.compile(r"<(\\*)br>")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
 _HASH = re.compile(r"\b[0-9a-f]{7,40}\b")
-_REVERT_TARGET = re.compile(r"^This reverts commit ([0-9a-f]{40}|[0-9a-f]{64})(?:\.$|, reversing\b)", re.MULTILINE)
 # The columns an older row keeps its merge hash in, in the order they are read.
 HASH_COLUMNS = ("Merged", "On the Mac build")
 lists_directory = change_routing.lists_directory
@@ -1814,6 +1813,8 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
                         if earlier.words == event.words:
                             return False
                         raise ChangeReviewError(f"{row} is already withdrawn")
+            if isinstance(change_routing.delivery_slots(delivery).verdict, delivery_state.DeliveryIntent):
+                raise ChangeReviewError(f"{row} has a pending verdict message. Withdraw it after delivery.")
             if previous:
                 previous_date = _plain(cells.get("Date", ""))
                 try:
@@ -1838,6 +1839,7 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
 
     root = change_routing.review_root()
     root.mkdir(parents=True, exist_ok=True)
+    delivery = change_routing.delivery_path(root, path, row)
     with review_delivery_lock(root):
         return _edit(path, production, stamp.date(), write, lambda _: f"withdraw {row}")
 
@@ -2393,13 +2395,6 @@ def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
     return frozenset(foreign)
 
 
-def _reverted_on_main(repo: Path) -> set[str]:
-    """Read the commit targets of Git revert messages on origin/main."""
-    messages = _git(repo, "log", "--format=%B", "--fixed-strings", "--grep=This reverts commit ",
-                    "origin/main", "--")
-    return set(_REVERT_TARGET.findall(messages))
-
-
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
@@ -2422,9 +2417,6 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     else:
         merges = _git(repo, "log", "--reverse", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z",
                       "--format=%H%x09%s", f"origin/{merge_branch}", "--").splitlines()
-    if not merges:
-        return []
-    reverted = _reverted_on_main(repo)
     record = staff.snapshot() if record is None else record
     own_list = _line_value(production)
     scoped: set[Path] = set()
@@ -2450,15 +2442,11 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             continue
         if merge in foreign or not on_main(repo, merge):
             continue
-        if merge in reverted:
-            if isinstance(selection, CompletedStep):
-                raise ChangeReviewError(f"{merge} was reverted on origin/main. No row added.")
-            continue
         commits = merge_commits(repo, merge, excluded_refs=_publication_exclusions(repo, merge, outside_refs))
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
         write_commits = [replace(commit, timestamp=max(commit.timestamp, IMAGES_CHECKED_FROM)) for commit in commits]
         for commit, reason in _uncovered_problems(write_commits):
-            if commit.sha not in reverted and entries(commit.message):
+            if entries(commit.message):
                 print(f"{short}: {commit.sha[:SHORT]} {commit.subject}: {reason}", file=sys.stderr)
         if isinstance(selection, CompletedStep):
             matched_step |= any(isinstance(item.readiness, AfterStep) and item.readiness.step == selection.step
@@ -2525,9 +2513,9 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             print(f"{short}: {commit.sha[:SHORT]} {commit.subject}: {reason}", file=sys.stderr)
 
         for (path, owner_doc), changes in routed.items():
-            selected = [change for change in changes if change.checkpoint not in reverted]
+            selected = changes
             if isinstance(selection, CompletedStep):
-                selected = [change for change in selected if isinstance(change.item.readiness, AfterStep)
+                selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
             rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,

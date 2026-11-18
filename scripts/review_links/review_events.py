@@ -71,7 +71,7 @@ def decode(text: str) -> tuple[ReviewLog, ...]:
 
 
 def encode(events: tuple[ReviewLog, ...]) -> str:
-    return json.dumps(rows(events), ensure_ascii=False)
+    return json.dumps(rows(events), ensure_ascii=False).replace("\u2028", r"\u2028").replace("\u2029", r"\u2029")
 
 
 def from_rows(stored: list[StoredReviewLog]) -> tuple[ReviewLog, ...]:
