@@ -432,6 +432,10 @@ class ScratchTests(unittest.TestCase):
                       mock.patch.object(accounts, "set_claude_folder_trust") as trust):
                     checkout = copies.clone(source, task, state)
                     self.assertEqual(checkout.parent, session)
+                    sidecars = [checkout.with_name(checkout.name + suffix) for suffix in (".lease.json", ".lock")]
+                    self.assertTrue(all(path.is_file() for path in sidecars))
+                    other = checkout.with_name(checkout.name + ".lease.json.0123456789abcdef.tmp")
+                    _ = other.write_text("keep this file")
                     if state == "unsaved":
                         _ = (checkout / "work").write_text("keep this work")
                     output, error = io.StringIO(), io.StringIO()
@@ -445,12 +449,14 @@ class ScratchTests(unittest.TestCase):
                     if state in ("clean", "until"):
                         self.assertEqual((code, error.getvalue()), (0, ""))
                         self.assertFalse(checkout.exists())
+                        self.assertFalse(any(path.exists() for path in sidecars))
                         self.assertIn(f"removed {checkout}", output.getvalue())
                         trust.assert_any_call(checkout, trusted=False)
                         self.assertNotIn(str(checkout), scratch.holds())
                     else:
                         self.assertNotEqual(code, 0)
                         self.assertTrue(checkout.is_dir())
+                        self.assertTrue(all(path.is_file() for path in sidecars))
                         self.assertIn(f"kept {checkout}", error.getvalue())
                         self.assertIn("uncommitted changes" if state == "unsaved" else "busy", error.getvalue())
                         self.assertEqual(trust.call_args_list, [mock.call(checkout, trusted=True)])
@@ -458,6 +464,100 @@ class ScratchTests(unittest.TestCase):
                             self.assertEqual((checkout / "work").read_text(), "keep this work")
                             (checkout / "work").unlink()
                         self.assertEqual(scratch.end(task), [checkout])
+                        self.assertFalse(any(path.exists() for path in sidecars))
+                    self.assertEqual(other.read_text(), "keep this file")
+
+    def test_task_end_keeps_the_sidecars_of_a_possible_borrowed_source(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        clone = copies.clone(source, "gate:upstream", "upstream")
+        legacy = self.base / "outside-both-roots"
+        self.git(source, "clone", "--shared", "-q", str(clone), str(legacy))
+        worktree = copy_record.copies_root() / "review-pool" / "review"
+        worktree.parent.mkdir(parents=True)
+        self.git(legacy, "worktree", "add", "--detach", str(worktree))
+
+        result = scratch.end("gate:upstream")
+
+        self.assertEqual(result, [])
+        self.assertEqual(result.kept, [scratch.KeptFolder(
+            clone, f"repair record {worktree / copy_record.RECORD}: cannot rule out borrowed objects")])
+        self.assertTrue(clone.is_dir())
+        self.assertTrue(clone.with_name(clone.name + ".lock").is_file())
+        self.assertTrue(clone.with_name(clone.name + ".lease.json").is_file())
+        self.git(worktree, "cat-file", "-e", "HEAD^{commit}")
+
+    def test_task_end_completes_removal_when_a_sidecar_unlink_fails(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        unlink = os.unlink
+        for suffix in (".lease.json", ".lock"):
+            with self.subTest(suffix=suffix):
+                task = f"gate:sidecar-{suffix[1:]}"
+                clone = copies.clone(source, task)
+                lease = clone.with_name(clone.name + ".lease.json")
+                lock = clone.with_name(clone.name + ".lock")
+                selected = clone.name + suffix
+                mark = scratch.removal_mark(clone)
+
+                def refuse(name: str | bytes | os.PathLike[str] | os.PathLike[bytes], *,
+                           dir_fd: int | None = None) -> None:
+                    if dir_fd is not None and name == selected:
+                        self.assertFalse(clone.exists())
+                        self.assertFalse(mark.exists())
+                        with lock.open("rb") as contender, self.assertRaises(BlockingIOError):
+                            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        raise PermissionError("sidecar unlink denied")
+                    unlink(name, dir_fd=dir_fd)
+
+                with mock.patch.object(os, "unlink", side_effect=refuse):
+                    result = scratch.end(task)
+                self.assertEqual(result, [clone])
+                self.assertEqual(result.kept, [])
+                self.assertFalse(clone.exists())
+                self.assertFalse(mark.exists())
+                self.assertEqual(lease.is_file(), suffix == ".lease.json")
+                self.assertEqual(lock.is_file(), suffix == ".lock")
+
+    def test_task_end_keeps_the_sidecars_and_record_in_a_replacement_parent(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        self.git(source, "commit", "--allow-empty", "-qm", "source")
+        task = "gate:new-parent"
+        clone = copies.clone(source, task)
+        parent = clone.parent
+        self.assertTrue(parent.is_relative_to(self.base))
+        old_parent = self.base / "old-parent"
+        mark = scratch.removal_mark(clone)
+        lease = clone.with_name(clone.name + ".lease.json")
+        lock = clone.with_name(clone.name + ".lock")
+        unlink = os.unlink
+
+        def replace_parent(name: str | bytes | os.PathLike[str] | os.PathLike[bytes], *,
+                           dir_fd: int | None = None) -> None:
+            unlink(name, dir_fd=dir_fd)
+            if name == mark and dir_fd is None:
+                _ = parent.rename(old_parent)
+                parent.mkdir()
+                for path in (mark, lease, lock):
+                    _ = path.write_text("replacement")
+
+        with mock.patch.object(os, "unlink", side_effect=replace_parent):
+            result = scratch.end(task)
+
+        self.assertEqual(result, [clone])
+        self.assertEqual(result.kept, [])
+        self.assertFalse((old_parent / clone.name).exists())
+        self.assertFalse((old_parent / mark.name).exists())
+        for path in (lease, lock):
+            self.assertTrue((old_parent / path.name).is_file())
+        for path in (mark, lease, lock):
+            self.assertEqual(path.read_text(), "replacement")
 
     def test_end_reports_held_work_and_continues_after_a_removal_error(self) -> None:
         failed = scratch.new("gate:report", "failed")

@@ -96,7 +96,10 @@ from typing import Protocol, TypedDict, cast
 from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
-from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, collector_lease, inherited_temporary_parent  # noqa: E402
+from scripts.lib.build_folders import (  # noqa: E402
+    BuildFolderSpec, FolderRemovalLease, HeldFolderRemovalLease, RefusedRemovalLease, build_folder_path, collector_lease,
+    folder_removal_lease, inherited_temporary_parent,
+)
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
@@ -119,6 +122,7 @@ class _HeldRemovalLock:
     path: Path
     process: int
     thread: int
+    lease: FolderRemovalLease
     active: bool = True
 
 
@@ -355,28 +359,34 @@ def directory_record_lock(path: Path, *, wait: bool,
             os.close(descriptor)
 
 
+def _held_removal_lock(path: Path) -> _HeldRemovalLock | None:
+    return next((held for held in _REMOVAL_LOCKS.get()
+                 if held.active and held.path == path.absolute()
+                 and held.process == os.getpid() and held.thread == get_ident()), None)
+
+
 @contextmanager
 def removal_lock(path: Path) -> Generator[bool]:
     """Claim the lease locks and the busy mark, even when absent, and hold them through removal.
     A held lease on the folder or on any folder below it is busy, and the busy mark is then
     not created."""
     key = path.absolute()
-    if any(held.active and held.path == key and held.process == os.getpid() and held.thread == get_ident()
-           for held in _REMOVAL_LOCKS.get()):
+    if _held_removal_lock(key) is not None:
         yield True
         return
-    with (collector_lease(path, children=True, wait=not removal_mark(path).is_file()) as free,
-          busy_locks(path, create=free and not removal_mark(path).is_file()) as idle):
-        if not free or not idle:
-            yield False
-            return
-        held = _HeldRemovalLock(key, os.getpid(), get_ident())
-        token = _REMOVAL_LOCKS.set((*_REMOVAL_LOCKS.get(), held))
-        try:
-            yield True
-        finally:
-            held.active = False
-            _REMOVAL_LOCKS.reset(token)
+    with folder_removal_lease(path, children=True, wait=not removal_mark(path).is_file()) as lease:
+        free = not isinstance(lease, RefusedRemovalLease)
+        with busy_locks(path, create=free and not removal_mark(path).is_file()) as idle:
+            if not free or not idle:
+                yield False
+                return
+            held = _HeldRemovalLock(key, os.getpid(), get_ident(), lease)
+            token = _REMOVAL_LOCKS.set((*_REMOVAL_LOCKS.get(), held))
+            try:
+                yield True
+            finally:
+                held.active = False
+                _REMOVAL_LOCKS.reset(token)
 
 
 @contextmanager
@@ -1492,6 +1502,11 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 else:
                     path.unlink()
                 return RemovedCopy()
+            held = (_held_removal_lock(path) if isinstance(task_request, TaskRemoval)
+                    and isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True else None)
+            lease = (held.lease if held is not None and isinstance(held.lease, HeldFolderRemovalLease)
+                     and held.lease.folder == path else None)
+            sidecars = lease.sidecar_identities() if lease is not None else {}
             saved = save_cargo_outputs(path)
             clean_cargo_outputs(path, saved)
             if isinstance(pending, copy_record.NotRegistered):
@@ -1510,6 +1525,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             else:
                 remove(path)
             finish_removal(path, cargo_cleaned=True)
+            if lease is not None:
+                lease.unlink_sidecars(sidecars)
             return RemovedCopy()
 
 
