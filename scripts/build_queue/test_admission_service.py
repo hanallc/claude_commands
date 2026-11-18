@@ -889,6 +889,51 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     for worker in fixture.server.host_targets.values():
                         worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
+    def test_pass_reads_provider_configuration_once_as_the_queue_grows(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import target_config
+
+        with AdmissionFixture() as fixture:
+            settings = fixture.root / "linux.conf"
+            _ = write_config_fixture(settings, "probe_timeout_s=1\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, provider="ssh", target="linux")
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(replace(candidate, destination=destination),)))
+            fixture.server.placement_requests[request.episode] = request
+
+            with mock.patch.object(io, "open", wraps=io.open) as io_open, \
+                    mock.patch("builtins.open", wraps=open) as builtin_open, \
+                    mock.patch.object(target_config, "read_execution_transport",
+                                      wraps=target_config.read_execution_transport) as read_transport:
+                def settings_opens() -> int:
+                    return sum(cast(tuple[object, ...], call.args)[0] in (settings, str(settings))
+                               for opener in (io_open, builtin_open) for call in opener.call_args_list)
+
+                _ = fixture.run_pass()
+                first = fixture.server.placement_host_keys[(request.episode, destination)]
+                first_counts = settings_opens(), read_transport.call_count
+                self.assertEqual(fixture.server.host_readers[first].timeout, 1)
+                for index in range(12):
+                    extra = replace(request, episode=f"extra-{index}")
+                    fixture.server.placement_requests[extra.episode] = extra
+                _ = write_config_fixture(settings, "probe_timeout_s=4\n", template="mac_test")
+                io_open.reset_mock()
+                builtin_open.reset_mock()
+                read_transport.reset_mock()
+                _ = fixture.run_pass()
+                self.assertEqual((settings_opens(), read_transport.call_count), first_counts)
+                # The transport selector reads the file separately.
+                self.assertEqual(first_counts, (2, 1))
+                current = fixture.server.placement_host_keys[(request.episode, destination)]
+                self.assertNotEqual(current.configuration_generation, first.configuration_generation)
+                self.assertEqual(fixture.server.host_readers[current].timeout, 4)
+                self.assertEqual(len(fixture.server.placement_host_keys), 13)
+                self.assertEqual(set(fixture.server.placement_host_keys.values()), {current})
+
     def test_each_settings_file_controls_its_evidence_age(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request
