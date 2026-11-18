@@ -40,19 +40,17 @@ Stored references keep the staff id and resolve current staff facts when used.
 
 ## Producer rows and commands
 
-Each producer runs its own named job.
-The producer kind supplies shared management.
-Each producer keeps its own role contract.
+Each producer loads the common command and reads its job and current work from its README.
 
 | Staff name | Kind | Command | Job contract |
 |---|---|---|---|
-| `morty` | `producer` | `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
-| `brain` | `producer` | `/producer:brain` | Its command defines management only. |
-| `dwight` | `producer` | `/producer:dwight` | Strategist; its command defines management only. |
+| `morty` | `producer` | `/producer:produce`, then `/producer:morty` | Tracks the user's items and coordinates their showrunners. |
+| `brain` | `producer` | `/producer:produce` | Manages the user's personal notes and task list. |
+| `dwight` | `producer` | `/producer:produce` | Manages its assigned productions. |
 
 The commands live in `commands/producer/`.
 Morty's operations document is `docs/producer/morty-operations.md`.
-The Codex command sync names Morty's skill `producer-morty`.
+The Codex command sync names the common skill `producer-produce` and the List skill `producer-morty`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
@@ -172,6 +170,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/build_queue/build_queue.py` | read | caller_identity |
 | `scripts/build_queue/admission_records.py` | read | caller_identity |
 | `scripts/build_queue/admission_client.py` | read | snapshot, by_id, StaffId; resolve BUILDLOG_OWNER_STAFF_ID only when the caller has no session identity |
+| `scripts/build_queue/admission_service.py` | read | local_snapshot, by_member_reference, unit_by_worktree, by_worktree |
+| `scripts/build_queue/memory_feed.py` | read | supplied_snapshot, StaffId, by_member_reference, by_id, unit_by_worktree, by_worktree |
 | `scripts/direct/assign.py` | read | runtime_id |
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
@@ -212,6 +212,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
+| `scripts/lib/session_move.py` | read | local_snapshot, by_current_session, by_member_reference, StaffSnapshot, StaffAbsent; finds the staff member that owns a moved session |
 | `scripts/lib/session_folder.py` | read | local_snapshot, by_current_session, by_id, StaffRow and StaffSnapshot (types), ReportsTo; member_of names the folder of a staff session |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/memory_admit.py` | read | snapshot; queue priority takes waiter units from recorded staff rows |
@@ -272,6 +273,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/rename_test_support.py` | write | find, native_id, operation, set_worktree, update_current_session |
 | `scripts/production/rename_unit_test_support.py` | read | snapshot |
 | `scripts/agents/shutdown.py` | write | by_id, cli_result, initial_snapshot, operation, operation_fds, rename, restore_unit, row_operation, set_doc, set_worktree, snapshot |
+| `scripts/agents/producer_lifecycle.py` | read | initial_snapshot, slot_operation, validate_name; StaffRow, StaffSnapshot, LiveDoc and PresentWorktree types; add-producer checks the name and the free row before first start |
 | `scripts/production/session_labels.py` | read | snapshot |
 | `scripts/production/session_staff.py` | read | active, snapshot |
 | `scripts/production/showrunner_parent.py` | write | cli_result, move, operation, snapshot |

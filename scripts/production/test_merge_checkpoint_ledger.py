@@ -41,15 +41,15 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.handoff_ledger_row(checkpoint), ("merged", merge))
         self.assertEqual(len(self.events("send.py")), 2)
     def test_home_verify_stub_answers_when_bash_runs_it(self) -> None:
-        """11-16 15:26: the style reader build ran the home verify.sh stub with bash; it waited a day for a click."""
+        """The home verify.sh stub accepts a build command from Bash."""
         verify = self.root / "home/.claude/scripts/direct/verify.sh"
         # Without a display, a stub that bash reads as shell fails at once and does not wait.
         environment = {key: value for key, value in self.env.items() if key not in ("DISPLAY", "WAYLAND_DISPLAY")}
-        result = subprocess.run(["bash", str(verify), "build", "style_reader", "--release", "--attached"],
+        result = subprocess.run(["bash", str(verify), "build", "sample", "--release", "--attached"],
                                 env=environment, capture_output=True, text=True, check=False,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.events("verify.sh")[-1], ["build", "style_reader", "--release", "--attached"])
+        self.assertEqual(self.events("verify.sh")[-1], ["build", "sample", "--release", "--attached"])
 
     def test_duplicate_child_notice_records_a_ledger_write_missed_at_the_merge(self) -> None:
         _ = self.child_production()

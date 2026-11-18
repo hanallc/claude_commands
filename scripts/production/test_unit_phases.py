@@ -30,7 +30,6 @@ from scripts.production import census, display_cells, land_queue, land_runs, liv
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
-from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
 from scripts.production import session_staff, unit_config
@@ -2036,19 +2035,15 @@ class UnitPhasesTests(unittest.TestCase):
         doc = self.root / "status-production.md"
         _ = doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
         owner = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
-        from scripts.production import session_staff
-
         first_session = unit("first", live("first")).session
         assert first_session is not None
+        first_claude = first_session.claude
+        assert isinstance(first_claude, unit_lookup.LiveClaude)
         every = unit_lookup.LabeledProductions({owner.name: {"first": first_session}},
                                               {owner.name: ("first", "second")})
 
         def render() -> str:
-            with (patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())),
-                  patch.object(sessions, "running_sessions", return_value=[sessions.SessionRecord(
-                      sessionId=first.current_session, pid=1, name="first", status="idle",
-                      messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])])):
-                return table_of(live_units.units_in(owner.name, every), {}, self.root)
+            return table_of(live_units.units_in(owner.name, every), {}, self.root)
 
         initial = render()
         self.assertIn("**first** — idle", initial)
@@ -2074,22 +2069,21 @@ class UnitPhasesTests(unittest.TestCase):
                     _ = staff.pause(first.id, "review")
                 elif hold == "exit":
                     _ = staff.exit(first.id, "stop")
-                observed = sessions.SessionRecord(sessionId=first.current_session, pid=1, name="first",
-                    status=activity, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                observed = replace(first_session, claude=first_claude._replace(activity=activity))
+                report = replace(every, units={owner.name: {"first": observed}})
                 snapshot = staff.snapshot()
-                with (patch.object(sessions, "running_sessions", return_value=[observed]),
-                      patch.object(session_state, "running_detached_work", return_value=session_state.RunningDetachedWork(
+                with (patch.object(session_state, "running_detached_work", return_value=session_state.RunningDetachedWork(
                           frozenset({first.id}) if detached else frozenset())),
                       patch.object(staff, "snapshot", wraps=staff.snapshot) as staff_read,
                       patch.object(session_state, "classify", wraps=session_state.classify) as states):
-                    units = live_units.units_in(owner.name, every)
+                    units = live_units.units_in(owner.name, report)
                     self.assertEqual(units[0].status, expected)
                     staff_read.assert_called_once_with()
                     self.assertEqual(states.call_count, len(units))
         _ = staff.resume(first.id)
         self.assertEqual(staff.by_id(first.id), first)
         codex = unit_lookup.LabeledSession("first", unit_lookup.ClaudeUnknown("no Claude registry record"),
-            HerdrPlace("codex", "w1:p1"), process=unit_lookup.ObservedProcess(41, "codex"),
+            HerdrPlace("codex", "w1:p1"), process=session_staff.ProvedCodexPaneProcess(41, "codex"),
             identity=unit_lookup.LiveSession(first.current_session))
         for observed, machine, hold, expected in (
                 (codex, "natedev", "", "idle"),
@@ -2105,8 +2099,7 @@ class UnitPhasesTests(unittest.TestCase):
                 snapshot = staff.StaffSnapshot((owner, member, second))
                 marked: dict[str, unit_lookup.LabeledSession] = {"first": observed} if observed is not None else {}
                 listing = unit_lookup.LabeledProductions({owner.name: marked}, {owner.name: ("first", "second")})
-                with (patch.object(staff, "snapshot", return_value=snapshot) as staff_read,
-                      patch.object(sessions, "running_sessions", return_value=[])):
+                with patch.object(staff, "snapshot", return_value=snapshot) as staff_read:
                     units = live_units.units_in(owner.name, listing)
                     self.assertEqual(units[0].status, expected)
                     self.assertEqual(units[0].machine, machine)
@@ -2150,6 +2143,11 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(keys, ["unit-anomalies:b488aba285f2", "unit-anomalies:b488aba285f2",
                                "unit-anomalies:7d046a634ca9"])
         self.assertEqual(output.getvalue(), "")
+
+    def test_unknown_unit_status_precedes_the_census(self) -> None:
+        marked = live_units.LiveUnit("example", None, status="unknown", owner=unit_lookup.UnknownUnit("pane list denied"))
+        view = unit_phases.CensusView({}, frozenset({remote.local_machine()}), {})
+        self.assertEqual(unit_phases.census_status(view, marked), "unknown")
 
     def test_unreadable_anomaly_repeat_key_reports_one_line_without_a_send(self) -> None:
         sender = Mock()

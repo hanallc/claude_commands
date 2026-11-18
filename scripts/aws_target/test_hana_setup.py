@@ -8,6 +8,7 @@ from decimal import Decimal
 from io import StringIO
 import json
 from pathlib import Path
+import re
 import subprocess
 import time
 from typing import cast, override
@@ -16,63 +17,9 @@ from unittest import mock
 from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config
 from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
-
-
-def write_hana_config() -> Path:
-    """Write fixed setup settings to the test configuration directory."""
-    path = conf.path('hana_aws')
-    _ = path.write_text("""\
-enabled=off
-region=us-east-2
-availability_zone=us-east-2b
-instance_type=m7a.2xlarge
-stack_name=fixture-hana
-ami_id=fixture-image
-ami_owner_id=000000000000
-vpc_id=fixture-vpc
-subnet_id=fixture-subnet
-# range: 0.001..
-spot_max_usd_per_hour=0.25
-# range: 5e-324..
-spot_ceiling_margin=0.25
-# whole: 1..
-root_gib=40
-# whole: 1..
-data_gib=300
-daily_budget_usd=6
-gp3_usd_per_gib_month=0.08
-# whole: 1..60
-guard_grace_seconds=60
-# whole: 1..60
-watchdog_check_seconds=1
-# whole: 1..1800
-permit_max_seconds=1800
-# whole: 1..8
-step_cpu_limit=4
-# whole: 1..24
-step_memory_gib=24
-# whole: 1..60
-mount_timeout_seconds=15
-# whole: 1..
-aws_timeout_s=10
-# whole: 1..
-controller_tick_timeout_s=45
-# whole: 1..604800
-control_url_seconds=3600
-# whole: 1..
-stop_wait_timeout_s=600
-# whole: 1..
-stop_poll_seconds=10
-image_upload_tool=fixture-nixos#coldsnap
-# whole: 60..
-image_upload_timeout_s=3600
-# whole: 1..60
-image_wait_interval_s=10
-""")
-    return path
 
 
 class HanaSetupTests(CostFixture):
@@ -127,40 +74,108 @@ class HanaSetupTests(CostFixture):
                 _ = subject.hana_setup(approve_resources=True)
         self.assertEqual(fake.calls, [])
 
-    def setup_api(self, fake: FakeAws, calls: list[str], spot_price: Callable[[], Decimal], *, stop_state: str | None = None
+    def setup_api(self, fake: FakeAws, calls: list[str], spot_price: Callable[[], Decimal], *, stop_state: str = '',
+                  launch: Callable[[tuple[str, ...]], None] = lambda _arguments: None,
+                  volume_ready: Callable[[], None] = lambda: None
                   ) -> Callable[..., dict[str, object]]:
         workload = conf.read(self.workload)
+        limits = hana_spend.read_settings(workload)
+        zone = workload.text('availability_zone')
+        other_zone = 'us-east-2c'
+        saved_path = self.state / 'hana/setup.json'
+        version = 2
+        attached = False
 
         def api_call(operation: str, *arguments: str, service: str = 'ec2', timeout_s: float | None = None) -> dict[str, object]:
+            nonlocal version, attached
             calls.append(operation)
+            if operation == 'describe-subnets':
+                return {'Subnets': [
+                    {'SubnetId': 'fixture-other-subnet', 'VpcId': 'fixture-vpc', 'AvailabilityZone': other_zone,
+                     'State': 'available', 'DefaultForAz': True},
+                    {'SubnetId': 'fixture-private-subnet', 'VpcId': 'fixture-vpc', 'AvailabilityZone': 'us-east-2a',
+                     'State': 'available', 'DefaultForAz': False},
+                ]}
             if operation == 'describe-spot-price-history':
                 return {'SpotPriceHistory': [{
-                    'InstanceType': workload.text('instance_type'),
-                    'AvailabilityZone': workload.text('availability_zone'),
-                    'SpotPrice': str(spot_price()),
+                    'InstanceType': size, 'AvailabilityZone': priced_zone, 'SpotPrice': str(price),
                     'Timestamp': datetime.fromtimestamp(self.clock.now, UTC).isoformat(),
-                }]}
+                } for size, priced_zone, price in (
+                    (limits.instance_type, zone, spot_price()),
+                    (limits.fallback_instance_types[0], other_zone, '0.10'),
+                    (limits.fallback_instance_types[1], zone, '0.12'),
+                    (limits.fallback_instance_types[2], other_zone, limits.spot_max_usd_per_hour + 1),
+                    (limits.instance_type, 'us-east-2a', '0.01'),
+                )]}
             if operation == 'execute-change-set':
                 evidence = ledger.CostLedger(self.state).read_snapshot()
                 self.assertTrue(any(isinstance(row.state, ledger.HanaExposureOpen) for row in evidence.hana_compute))
                 self.assertTrue(evidence.hana_storage)
                 self.assertEqual(service, 'cloudformation')
                 self.assertIn(workload.text('stack_name'), arguments)
+                version += 1
                 return {}
             if operation == 'describe-change-set':
                 return {'Status': 'CREATE_COMPLETE', 'Changes': []}
-            if operation in ('create-change-set', 'wait') and service == 'cloudformation':
+            if operation == 'create-change-set':
+                rows = cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))
+                self.assertFalse({'InstanceType', 'SubnetId', 'AvailabilityZone', 'DataGiB', 'FallbackInstanceTypes'}
+                                 & {row['ParameterKey'] for row in ledger.rows({'rows': rows}, 'rows')})
+                return {}
+            if operation == 'wait' and service == 'cloudformation':
                 return {}
             if operation == 'describe-stacks':
-                outputs = {'Instance': IDENTITY.instance, 'ControlBucket': 'fixture-bucket', 'DataVolume': 'fixture-volume'}
+                if version == 2:
+                    raise aws_cli.AwsUnavailable('ValidationError: Stack does not exist')
+                outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template',
+                           'LaunchTemplateVersion': str(version), 'SecurityGroup': 'fixture-group'}
                 return {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Outputs': [
                     {'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]}]}
+            if operation == 'describe-stack-resources':
+                return {'StackResources': []}
+            if operation == 'run-instances':
+                saved = remote.read_record(saved_path)
+                self.assertEqual(ledger.mapping(saved['pending_launch'])['token'], arguments[arguments.index('--client-token') + 1])
+                self.assertIn(f'LaunchTemplateId=fixture-template,Version={version}', arguments)
+                launch(arguments)
+                return {'Instances': [{'InstanceId': IDENTITY.instance, 'SpotInstanceRequestId': IDENTITY.spot_request}]}
+            if operation == 'wait' and arguments[0] == 'instance-exists':
+                self.assertEqual(timeout_s, conf.read(self.settings).whole('stack_wait_timeout_s'))
+                saved = remote.read_record(saved_path)
+                self.assertEqual(saved['instance'], IDENTITY.instance)
+                self.assertEqual(saved['spot_request'], IDENTITY.spot_request)
+                return {}
+            if operation == 'create-volume':
+                saved = remote.read_record(saved_path)
+                self.assertEqual(arguments[arguments.index('--availability-zone') + 1], saved['zone'])
+                token = arguments[arguments.index('--client-token') + 1]
+                self.assertEqual(saved['pending_volume'], token)
+                self.assertIn(token, arguments[arguments.index('--tag-specifications') + 1])
+                self.assertEqual(arguments[arguments.index('--size') + 1], str(limits.data_gib))
+                self.assertIn('--encrypted', arguments)
+                self.assertIn('gp3', arguments)
+                return {'VolumeId': 'fixture-volume'}
+            if operation == 'wait' and arguments[0].startswith('volume-'):
+                self.assertEqual(remote.read_record(saved_path)['data_volume'], 'fixture-volume')
+                if arguments[0] == 'volume-available':
+                    volume_ready()
+                return {}
+            if operation == 'describe-volumes':
+                return {'Volumes': [{'VolumeId': 'fixture-volume', 'AvailabilityZone': remote.read_record(saved_path)['zone'],
+                    'Attachments': [{'InstanceId': IDENTITY.instance, 'Device': '/dev/sdf', 'State': 'attached'}] if attached else []}]}
+            if operation == 'attach-volume':
+                self.assertIn(fake.state, ('running', 'stopped'))
+                self.assertEqual(arguments, ('--volume-id', 'fixture-volume', '--instance-id', IDENTITY.instance,
+                                             '--device', '/dev/sdf'))
+                attached = True
+                return {}
+            self.assertNotEqual(operation, 'wait')
             result = fake(['aws', '--profile', 'fixture-admin', '--region', IDENTITY.region,
                 service, operation, *arguments, '--output', 'json'], capture_output=True, text=True,
                 timeout=workload.whole('aws_timeout_s') if timeout_s is None else timeout_s, check=False)
             if result.returncode:
                 raise subprocess.CalledProcessError(result.returncode, 'fake')
-            if operation == 'stop-instances' and stop_state is not None:
+            if operation == 'stop-instances' and stop_state:
                 fake.state = stop_state
             return ledger.mapping(cast(object, json.loads(result.stdout)))
         return api_call
@@ -169,18 +184,31 @@ class HanaSetupTests(CostFixture):
         return [line for line in output.getvalue().splitlines() if line.startswith('waiting for the Hana box to stop:')]
 
     def test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop(self) -> None:
-        fake = FakeAws(self.clock, state='running')
+        fake = FakeAws(self.clock, state='pending')
         subject = self.subject(fake)
         limits = hana_spend.read_settings(conf.read(self.workload))
         calls: list[str] = []
+        attempts: list[tuple[str, ...]] = []
         pauses: list[float] = []
-        api_call = self.setup_api(fake, calls, lambda: limits.spot_max_usd_per_hour, stop_state='stopping')
+        other_zone = 'us-east-2c'
+        saved_path = self.state / 'hana/setup.json'
+
+        def launch(arguments: tuple[str, ...]) -> None:
+            attempts.append(arguments)
+            if len(attempts) == 1:
+                raise aws_cli.AwsUnavailable(
+                    'aws: [ERROR]: An error occurred (InsufficientInstanceCapacity) '
+                    + 'when calling the RunInstances operation: capacity unavailable')
+
+        api_call = self.setup_api(fake, calls, lambda: limits.spot_max_usd_per_hour, stop_state='stopping', launch=launch)
 
         def pause(seconds: float) -> None:
             pauses.append(seconds)
             self.clock.advance(int(seconds))
             self.assertFalse((self.state / 'hana/lifecycle.json').exists())
-            if len(pauses) == 2:
+            if len(pauses) == 1:
+                fake.state = 'running'
+            if len(pauses) == 3:
                 fake.state = 'stopped'
 
         subject.pause = pause
@@ -189,7 +217,6 @@ class HanaSetupTests(CostFixture):
                 mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
                 mock.patch.object(time, 'monotonic', self.clock), mock.patch('sys.stdout', new_callable=StringIO) as output:
             prepared = subject.prepare_hana()
-            saved_path = self.state / 'hana/setup.json'
             saved = remote.read_record(saved_path)
             saved['deployment'] = IDENTITY.deployment
             _ = saved_path.write_text(json.dumps(saved))
@@ -201,7 +228,9 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(record['state'], hana_box.Lifecycle.IDLE_STOPPED)
         self.assertEqual(ledger.mapping(record['identity'])['spot_request'], IDENTITY.spot_request)
         self.assertIn('stop-instances', calls)
-        self.assertEqual(pauses, [10, 10])
+        self.assertEqual(pauses, [10, 10, 10])
+        volume = calls.index('create-volume')
+        self.assertEqual(calls[volume:volume + 5], ['create-volume', 'wait', 'describe-instances', 'describe-instances', 'attach-volume'])
         self.assertEqual(self.stop_progress(output), [
             'waiting for the Hana box to stop: stopping, 0 s of 600 s',
             'waiting for the Hana box to stop: stopping, 10 s of 600 s',
@@ -212,6 +241,24 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(fake.calls[stop + 1:probe], [('ec2', 'describe-instances', 10)] * 3)
         self.assertLess(calls.index('describe-spot-price-history'), calls.index('create-change-set'))
         self.assertLess(calls.index('create-change-set'), calls.index('execute-change-set'))
+        first_launch = calls.index('run-instances')
+        self.assertEqual(calls[first_launch:first_launch + 2], ['run-instances', 'run-instances'])
+        first, second = attempts
+        self.assertIn(limits.instance_type, first)
+        self.assertIn('fixture-subnet', first)
+        self.assertIn(limits.fallback_instance_types[0], second)
+        self.assertIn('fixture-other-subnet', second)
+        self.assertNotEqual(first[first.index('--client-token') + 1], second[second.index('--client-token') + 1])
+        self.assertIn('LaunchTemplateId=fixture-template,Version=3', second)
+        self.assertIn('fixture-group', second)
+        self.assertEqual([line.split(':', 1)[0] for line in output.getvalue().splitlines() if line.startswith('attempt ')],
+                         ['attempt 1 of 3', 'attempt 1 failed', 'attempt 2 of 3'])
+        self.assertIn(f'skip {limits.instance_type} in {other_zone}. AWS lists no Spot price.', output.getvalue())
+        self.assertIn(f'skip {limits.fallback_instance_types[2]} in {other_zone}.', output.getvalue())
+        self.assertIn('USD/h exceeds', output.getvalue())
+        self.assertNotIn('us-east-2a', output.getvalue())
+        compute, = ledger.CostLedger(self.state).read_snapshot().hana_compute
+        self.assertEqual(compute.instance_type, limits.fallback_instance_types[0])
         self.assertNotIn('deploy', calls)
         self.assertNotIn('start-instances', calls)
         self.assertFalse((self.state / 'gate-deployment.json').exists())
@@ -277,9 +324,85 @@ class HanaSetupTests(CostFixture):
             pause.assert_not_called()
         self.assertNotIn('stop-instances', calls)
         self.assertEqual(self.stop_progress(output), ['waiting for the Hana box to stop: stopped, 0 s of 600 s'])
-        spot_check = calls.index('describe-spot-instance-requests')
+        attachment = calls.index('attach-volume')
         probe = calls.index('export-credentials')
-        self.assertEqual(calls[spot_check + 1:probe], ['describe-instances'])
+        self.assertEqual(calls[attachment + 1:probe], ['wait', 'describe-instances', 'describe-instances'])
+
+    def test_setup_attaches_when_the_instance_stops_during_volume_creation(self) -> None:
+        fake = FakeAws(self.clock, state='pending')
+        calls: list[str] = []
+        subject = self.subject(fake)
+        ceiling = hana_spend.read_settings(conf.read(self.workload)).spot_max_usd_per_hour
+
+        def volume_ready() -> None:
+            self.assertEqual(fake.state, 'pending')
+            fake.state = 'stopped'
+
+        api_call = self.setup_api(fake, calls, lambda: ceiling, volume_ready=volume_ready)
+        with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
+                mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'), \
+                mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
+                mock.patch.object(subject, 'pause') as pause, mock.patch('sys.stdout', new_callable=StringIO):
+            _ = subject.prepare_hana()
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+            pause.assert_not_called()
+        self.assertEqual(calls.count('attach-volume'), 1)
+        self.assertNotIn('stop-instances', calls)
+
+    def test_setup_updates_the_launch_template_after_refusals_and_a_ceiling_change(self) -> None:
+        key = 'spot_max_usd_per_hour'
+        ceiling = conf.read(self.workload).text(key)
+        _ = self.workload.write_text(self.workload.read_text().replace(f'{key}={ceiling}\n', f'{key}=0.09\n'))
+        fake = FakeAws(self.clock)
+        subject = self.subject(fake)
+        saved_path = self.state / 'hana/setup.json'
+        attempts: list[tuple[str, ...]] = []
+        calls: list[str] = []
+        price = Decimal('0.08')
+
+        def launch(arguments: tuple[str, ...]) -> None:
+            attempts.append(arguments)
+            saved = remote.read_record(saved_path)
+            if len(attempts) == 1:
+                self.assertEqual(saved['spot_max_price'], '0.09')
+                raise aws_cli.AwsUnavailable('An error occurred (SpotMaxPriceTooLow) when calling the RunInstances operation')
+            self.assertEqual(saved['spot_max_price'], '0.13')
+            self.assertEqual(saved['launch_template'], 'LaunchTemplateId=fixture-template,Version=4')
+            compute = ledger.CostLedger(self.state).read_snapshot().hana_compute
+            self.assertIsInstance(compute[0].state, ledger.HanaExposureClosed)
+            self.assertEqual(compute[1].usd_per_hour, Decimal('0.13'))
+
+        api_call = self.setup_api(fake, calls, lambda: price, launch=launch)
+        with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
+                mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'), \
+                mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call) as aws, \
+                mock.patch('sys.stdout', new_callable=StringIO):
+            _ = subject.prepare_hana()
+            with self.assertRaisesRegex(deploy.DeploymentRefused, 'No Hana Spot candidate launched'):
+                _ = subject.hana_setup(approve_resources=True)
+            saved = remote.read_record(saved_path)
+            self.assertNotIn('instance', saved)
+            self.assertNotIn('pending_launch', saved)
+            price = Decimal('0.11')
+            with self.assertRaisesRegex(deploy.DeploymentRefused, r'/tune hana_aws spot_max_usd_per_hour 0\.13'):
+                _ = subject.hana_setup(approve_resources=True)
+            conf.check(self.workload, key, '0.13')
+            _ = self.workload.write_text(self.workload.read_text().replace(f'{key}=0.09\n', f'{key}=0.13\n'))
+            _ = subject.prepare_hana()
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+            first, second = [cast(tuple[str, ...], call.args) for call in aws.call_args_list
+                             if call.args[0] == 'create-change-set']
+            self.assertEqual(first[first.index('--change-set-type') + 1], 'CREATE')
+            self.assertEqual(second[second.index('--change-set-type') + 1], 'UPDATE')
+            parameters = cast(object, json.loads(second[second.index('--parameters') + 1]))
+            self.assertIn({'ParameterKey': 'SpotMaxPrice', 'ParameterValue': '0.13'},
+                          ledger.rows({'parameters': parameters}, 'parameters'))
+            _ = self.workload.write_text(self.workload.read_text().replace(f'{key}=0.13\n', f'{key}=0.14\n'))
+            _ = subject.prepare_hana()
+            with self.assertRaisesRegex(deploy.DeploymentRefused, 'The approved Hana parameters changed'):
+                _ = subject.hana_setup(approve_resources=True)
+        self.assertEqual(calls.count('create-change-set'), 2)
+        self.assertEqual(len(attempts), 2)
 
     def assert_requested_setup_recovers(self, retry_price: Callable[[], Decimal]) -> None:
         fake = FakeAws(self.clock, state='running', lose_response='describe-instances')
@@ -332,16 +455,29 @@ class HanaSetupTests(CostFixture):
         self.assertIsInstance(spending.check_start(self.clock.now, reservation.exposure.generation), hana_spend.PermitRefused)
         self.assertIsInstance(spending.bind_start(self.clock.now, reservation.exposure.generation, 'fixture-boot'), hana_spend.PermitRefused)
 
-    def test_template_uses_retained_disks_persistent_spot_and_no_guest_credentials(self) -> None:
+    def test_template_provisions_the_launch_resources_and_keeps_scaler_permissions_scoped(self) -> None:
         template = remote.read_record(deploy.HANA_TEMPLATE)
         resources = ledger.mapping(template['Resources'])
         launch = ledger.mapping(ledger.mapping(ledger.mapping(resources['LaunchTemplate'])['Properties'])['LaunchTemplateData'])
         market = ledger.mapping(ledger.mapping(launch['InstanceMarketOptions'])['SpotOptions'])
         self.assertEqual(market['SpotInstanceType'], 'persistent')
         self.assertEqual(market['InstanceInterruptionBehavior'], 'stop')
+        self.assertEqual(market['MaxPrice'], {'Ref': 'SpotMaxPrice'})
         self.assertNotIn('IamInstanceProfile', launch)
         self.assertNotIn('KeyName', launch)
-        self.assertEqual(ledger.mapping(resources['DataVolume'])['DeletionPolicy'], 'Retain')
+        self.assertFalse(resources.keys() & {'Instance', 'DataVolume', 'DataAttachment'})
+        self.assertFalse(ledger.mapping(template['Outputs']).keys() & {'Instance', 'DataVolume'})
+        self.assertFalse(ledger.mapping(template['Parameters']).keys() & {'InstanceType', 'SubnetId', 'AvailabilityZone', 'DataGiB'})
+        policy = ledger.mapping(ledger.mapping(resources['ScalerPolicy'])['Properties'])['PolicyDocument']
+        encoded = json.dumps(policy, separators=(',', ':'))
+        rendered = re.sub(r'\$\{[^}]+\}', 'x' * 64, encoded).replace('{"Ref":"DeploymentId"}', '"' + 'x' * 32 + '"')
+        self.assertLessEqual(len(rendered), 6144)
+        for name in ('Instance', 'DataVolume', 'DataAttachment'):
+            self.assertNotIn(f'{{"Ref":"{name}"}}', encoded)
+        for statement in ledger.rows(ledger.mapping(policy), 'Statement')[:2]:
+            condition = ledger.mapping(ledger.mapping(statement['Condition'])['StringEquals'])
+            self.assertEqual(condition['ec2:ResourceTag/HanaDeployment'], {'Ref': 'DeploymentId'})
+            self.assertEqual(condition['ec2:ResourceTag/Workload'], 'hana')
         self.assertNotIn('AWS::IAM::User', deploy.HANA_TEMPLATE.read_text())
 
     def built_image(self) -> Path:
@@ -430,6 +566,16 @@ class HanaSetupTests(CostFixture):
         fake = FakeAws(self.clock)
         with mock.patch('sys.stdout', new_callable=StringIO):
             self.assertFalse(self.subject(fake).hana_image(self.built_image()))
+        self.assertEqual(fake.calls, [])
+        self.assertIsInstance(hana_image.saved(self.state), hana_image.NoRegisteredImage)
+
+    def test_image_preview_reads_placement_with_invalid_spending_settings(self) -> None:
+        fake = FakeAws(self.clock)
+        text_setting(self.workload, 'enabled', 'on')
+        text_setting(self.workload, 'fallback_instance_types', 'c7a.4xlarge,c7a.4xlarge')
+        with mock.patch('sys.stdout', new_callable=StringIO) as output:
+            self.assertFalse(self.subject(fake).hana_image(self.built_image()))
+        self.assertIn('Hana placement is enabled. This command does not change it.', output.getvalue())
         self.assertEqual(fake.calls, [])
         self.assertIsInstance(hana_image.saved(self.state), hana_image.NoRegisteredImage)
 

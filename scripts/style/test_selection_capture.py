@@ -2,17 +2,19 @@
 
 from contextlib import closing
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
 import shutil
 import subprocess
+import sys
 from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.lib import conf
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
-from scripts.style import refill_measure, selection_capture, style_config, style_ledger
+from scripts.style import refill_measure, selection_capture, style_config, style_ledger, style_reader
 from scripts.style.style_plan_test_support import StylePlanFixture, install_unconfigured_board
 
 
@@ -26,6 +28,20 @@ class SelectionCaptureTests(StylePlanFixture):
         super().setUp()
         executable = install_unconfigured_board(self.root / "board-bin", self.repo)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"PATH": str(executable.parent) + os.pathsep + os.environ["PATH"]})))
+        reader = executable.with_name("cargo-style")
+        _ = reader.write_text("#!/bin/sh\nprintf 'cargo-style 2.3.4 protocol 7\\n'\n")
+        reader.chmod(0o755)
+        configuration = self.root / "capture-config"
+        configuration.mkdir()
+        for path in conf.directory().glob("*.conf"):
+            _ = shutil.copy2(path, configuration / path.name)
+        _ = (configuration / "style_reader.conf").write_text(
+            "# one of: python, rust\nreader=python\n# whole: 1..\nprotocol=7\n"
+            + "# text:\nminimum_version=2.3.4\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "STYLE_READER_BINARY": str(reader)})))
+        style_reader.reset_reader_cache()
+        self.addCleanup(style_reader.reset_reader_cache)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = recorded_showrunner("sample", self.repo / "docs/product-production.md")
         _ = recorded_unit("sample-style", "names", self.unit, self.doc,
@@ -62,6 +78,8 @@ class SelectionCaptureTests(StylePlanFixture):
         before = self.source_rows()
         manifest = selection_capture.capture(self.repo, self.database, "names", folder)
         self.assertEqual(self.source_rows(), before)
+        self.assertEqual(manifest["tools"]["cargo_style"], "cargo-style 2.3.4 protocol 7")
+        self.assertFalse(any(entry["kind"] == "reader_stamp" for entry in manifest["files"]))
 
         copied = {str(entry["copy"]) for entry in manifest["files"]}
         actual = {path.relative_to(folder).as_posix() for path in folder.rglob("*")
@@ -76,16 +94,44 @@ class SelectionCaptureTests(StylePlanFixture):
         sources = {Path(entry["source"]).resolve() for entry in manifest["files"]}
         for source in (self.database, self.plan, self.proposal, self.rule_dir / "capture-name.md"):
             self.assertIn(source.resolve(), sources)
+        with self.subTest(input="installed reader version"):
+            reader = Path(os.environ["STYLE_READER_BINARY"])
+            _ = reader.write_text("#!/bin/sh\nprintf 'cargo-style 2.3.5 protocol 7\\n'\n")
+            changed = selection_capture.replay(folder, style_config.ReaderSource.PYTHON, self.root)
+            self.assertEqual(changed["result_digest"], replayed["result_digest"])
+            self.assertEqual(changed["external_changes"], [{"source": "cargo-style --version",
+                "expected": "cargo-style 2.3.4 protocol 7", "actual": "cargo-style 2.3.5 protocol 7"}])
 
     def test_replays_share_one_digest_and_report_unconfigured_input_changes(self) -> None:
         before = self.source_rows()
         folder = self.root / "capture"
         manifest = selection_capture.capture(self.repo, self.database, "names", folder)
+        self.assertEqual(manifest["format"], 2)
         first = selection_capture.replay(folder, style_config.ReaderSource.PYTHON, self.root)
         second = selection_capture.replay(folder, style_config.ReaderSource.PYTHON, self.root)
         self.assertEqual(first["result_digest"], second["result_digest"])
         self.assertFalse(first["external_changes"])
         self.assertFalse(second["external_changes"])
+        with self.subTest(input="format-1 capture"):
+            manifest_path = folder / "manifest.json"
+            original_manifest = manifest_path.read_text()
+            legacy: dict[str, object] = {**manifest, "format": 1, "tools": {"reader_source": "old-source-tree"}}
+            _ = manifest_path.write_text(json.dumps(legacy))
+            try:
+                for operation in (selection_capture.replay, selection_capture.measure_capture):
+                    with self.assertRaisesRegex(selection_capture.UnsupportedCaptureFormat,
+                                                "capture format 1.*capture again"):
+                        _ = operation(folder, style_config.ReaderSource.PYTHON, self.root)
+                for command in ("replay", "measure"):
+                    result = subprocess.run(
+                        [sys.executable, "-m", "scripts.style.selection_capture", command,
+                         "--folder", str(folder), "--workspace", str(self.root), "--reader", "python"],
+                        capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("capture format 1 is not supported; capture again", result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+            finally:
+                _ = manifest_path.write_text(original_manifest)
         ignore = self.repo / ".git/info/exclude"
         entry, = (entry for entry in manifest["files"] if Path(entry["source"]).resolve() == ignore.resolve())
         _ = ignore.write_text(ignore.read_text() + "\n# Capture replay change.\n")
