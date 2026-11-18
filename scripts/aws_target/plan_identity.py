@@ -79,8 +79,8 @@ class PlanAgentCold(PlanIdentityRefused):
 
 @final
 class PlanAwsRefused(PlanIdentityRefused):
-    def __init__(self, operation: str, code: str = '') -> None:
-        super().__init__(f'AWS did not confirm {operation}.')
+    def __init__(self, message: str, code: str = '') -> None:
+        super().__init__(message)
         self.code = code
 
 
@@ -294,7 +294,7 @@ def _key_for_setup(path: Path) -> PlanCredentials | PlanKeyToCreate:
 
 @final
 class IdentityApi:
-    """Send request fields through standard input and keep AWS replies private."""
+    """Pass JSON request fields as an argument and keep credentials in the environment."""
 
     def __init__(self, region: str, timeout: float, environment: dict[str, str]) -> None:
         self.region = region
@@ -305,13 +305,18 @@ class IdentityApi:
         try:
             result = subprocess.run(
                 ['aws', '--region', self.region, service, operation, '--output', 'json', '--cli-error-format', 'legacy',
-                 '--cli-input-json', 'file:///dev/stdin'],
-                input=json.dumps(parameters).encode(), capture_output=True, timeout=self.timeout,
-                check=False, env=self.environment)
-        except (OSError, subprocess.SubprocessError):
-            raise PlanAwsRefused(operation) from None
+                 '--cli-input-json', json.dumps(parameters)],
+                capture_output=True, timeout=self.timeout, check=False, env=self.environment)
+        except OSError:
+            raise PlanAwsRefused(f'The aws command did not start for {operation}.') from None
+        except subprocess.TimeoutExpired:
+            raise PlanAwsRefused(f'The aws command timed out for {operation}.') from None
+        if result.returncode == 252:
+            raise PlanAwsRefused(f'The aws command refused its arguments for {operation}.')
         if result.returncode:
-            raise PlanAwsRefused(operation, aws_error_code(AwsUnavailable(result.stderr.decode(errors='replace'))))
+            code = aws_error_code(AwsUnavailable(result.stderr.decode(errors='replace')))
+            detail = f' ({code})' if code else ''
+            raise PlanAwsRefused(f'AWS did not confirm {operation}.{detail}', code)
         try:
             return ledger.mapping(cast(object, json.loads(result.stdout))) if result.stdout.strip() else {}
         except ValueError:

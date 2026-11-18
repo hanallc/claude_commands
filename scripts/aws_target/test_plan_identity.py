@@ -54,20 +54,22 @@ class Commands:
         self.fail_key_encryption = False
         self.fail_denial = False
 
-    def execute(self, arguments: Sequence[str], *, input: bytes, capture_output: bool,
+    def execute(self, arguments: Sequence[str], *, input: bytes | None = None, capture_output: bool,
                 timeout: float, check: bool, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
         assert capture_output and timeout > 0 and not check
         self.arguments.append(tuple(arguments))
         if arguments[0] == 'gpg':
+            assert input is not None
             return self.gpg(arguments, input)
-        assert arguments[0] == 'aws' and arguments[-1] == 'file:///dev/stdin'
+        assert arguments[0] == 'aws' and arguments[-2] == '--cli-input-json'
+        assert input is None
         assert env['AWS_CONFIG_FILE'] == env['AWS_SHARED_CREDENTIALS_FILE'] == '/dev/null'
         assert not {'AWS_SESSION_TOKEN', 'AWS_PROFILE', 'AWS_ENDPOINT_URL'} & env.keys()
         operation = arguments[4]
         self.operations.append(operation)
         if operation == 'delete-access-key':
             self.key_deletion_file_states.append(os.path.lexists(self.plan_file))
-        parameters = ledger.mapping(cast(object, json.loads(input)))
+        parameters = ledger.mapping(cast(object, json.loads(arguments[-1])))
         self.payloads[operation] = parameters
         key = env['AWS_ACCESS_KEY_ID']
         assert key in ('fixture-admin', KEY)
@@ -276,6 +278,27 @@ class PlanIdentityTests(unittest.TestCase):
         self.assertEqual(self.run_deploy('plan-identity', '--approve-resources'), 1)
         self.assertIn('A plan stack name is invalid.', self.errors.getvalue())
         self.assertEqual(self.commands.arguments, [])
+
+    def test_identity_api_reports_only_the_aws_cli_failure_cause(self) -> None:
+        api = plan_identity.IdentityApi('us-east-2', 15, {})
+        diagnostic = SECRET.encode()
+        cases = (
+            (FileNotFoundError(SECRET), 'The aws command did not start for get-caller-identity.'),
+            (subprocess.TimeoutExpired('aws', 15, stderr=diagnostic),
+             'The aws command timed out for get-caller-identity.'),
+            (subprocess.CompletedProcess('aws', 252, b'', diagnostic),
+             'The aws command refused its arguments for get-caller-identity.'),
+            (subprocess.CompletedProcess('aws', 1, b'',
+                b'An error occurred (AccessDenied) when calling the GetCallerIdentity operation: ' + diagnostic),
+             'AWS did not confirm get-caller-identity. (AccessDenied)'),
+            (subprocess.CompletedProcess('aws', 1, b'', diagnostic),
+             'AWS did not confirm get-caller-identity.'),
+        )
+        for failure, expected in cases:
+            with self.subTest(expected=expected), mock.patch.object(subprocess, 'run', side_effect=[failure]):
+                with self.assertRaises(plan_identity.PlanAwsRefused) as raised:
+                    _ = api.call('sts', 'get-caller-identity')
+                self.assertEqual(str(raised.exception), expected)
 
     def test_create_encrypts_one_key_and_repeat_keeps_the_matching_key(self) -> None:
         self.assertEqual(self.run_deploy('plan-identity', '--approve-resources'), 0, self.errors.getvalue())
@@ -571,7 +594,10 @@ class PlanIdentityTests(unittest.TestCase):
         self.assert_no_credentials()
 
     def assert_no_credentials(self) -> None:
-        output = self.output.getvalue() + self.errors.getvalue() + repr(self.commands.arguments)
+        command_flags = [args[:-1] if args[-2] == '--cli-input-json' else args for args in self.commands.arguments]
+        output = self.output.getvalue() + self.errors.getvalue() + repr(command_flags)
         for value in (KEY, SECRET, OWNER.account, OWNER.user_arn, 'fixture-admin-secret'):
             self.assertNotIn(value, output)
+        for secret in (SECRET, 'fixture-admin-secret'):
+            self.assertNotIn(secret, repr(self.commands.arguments))
 
