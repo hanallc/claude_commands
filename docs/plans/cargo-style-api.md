@@ -105,7 +105,7 @@ A wrong stored answer is worse than a slow answer. So the key holds every input 
 | Decision digest | The decision files `next` reads (approval and open state). They live in hanadocs and can have open changes, so the key holds a hash of their bytes, not a commit. | the decision writers |
 | State digest | The `--state` file: board reservations and other units' dirty paths | the adapter |
 | Reader version | Fact output. A hash of the fact source files, made at build time. | the build |
-| Program version | Selection code and reply schema. A hash of the whole `cargo-style` source, made at build time; the reader already keys its binary by a source stamp this way. | the build |
+| Program version | Selection code and reply schema. A hash of the whole `cargo-style` source, made at build time. The Python reader client checks the installed crate version and protocol. | the build |
 | Unit | The unit asked about | the request |
 
 Facts are keyed by the reader version only, so a selection change keeps every fact. Derived rows and stored answers use the program version.
