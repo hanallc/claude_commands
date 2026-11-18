@@ -91,13 +91,12 @@ def track_question(delivery: change_page.MessageDelivery, key: str, words: str,
         assert isinstance(question, change_page.OpenQuestion)
         identity = question.question_id
         message = delivery.message.replace(change_page.reply_command(key), change_page.reply_command(key, identity))
-        page = delivery.page
-        if isinstance(page, change_page.UserQuestionPage):
-            page = replace(page, saved={**page.saved, 'message': message})
-        else:
-            assert isinstance(page, change_page.ReviewMessagePage)
-            page = replace(page, saved={**page.saved, 'message': message})
-        status.write_slots(page, delivery.row, replace(slots, question=replace(question, text=words)))
+        original = delivery.page
+        assert isinstance(original, (change_page.UserQuestionPage, change_page.ReviewMessagePage))
+        page = replace(original, saved={**original.saved, 'message': message})
+        updated = replace(slots, question=replace(question, text=words))
+        if page != original or updated != slots:
+            status.write_slots(page, delivery.row, updated)
         return replace(delivery, page=page, message=message)
 
 
@@ -166,11 +165,12 @@ def resume_efficiency(item: review_items.ReviewItem) -> None:
     source = item.source
     assert isinstance(source, review_items.EfficiencySource)
     identity = decision_store.efficiency_identity(item)
-    lines = source.path.read_text().splitlines()
-    index = int(identity[1:])-1
-    head, separator, result = lines[index].partition(' — ')
-    lines[index] = head+separator+re.sub(r'^deferred\b', 'proposed', result, count=1)
-    atomic_file.write_text_atomic(source.path, '\n'.join(lines)+'\n')
+    with efficiency_reviews.ledger_lock(source.path):
+        lines = source.path.read_text().splitlines()
+        index = int(identity[1:])-1
+        head, separator, result = lines[index].partition(' — ')
+        lines[index] = head+separator+re.sub(r'^deferred\b', 'proposed', result, count=1)
+        atomic_file.write_text_atomic(source.path, '\n'.join(lines)+'\n')
 
 
 def later(item: review_items.ReviewItem, value: str, words: str) -> str:
@@ -180,8 +180,8 @@ def later(item: review_items.ReviewItem, value: str, words: str) -> str:
     until = datetime.fromisoformat(value)
     # A menu preset sends UTC; the record and the answer use the user zone.
     until = until.replace(tzinfo=user_zone()) if until.tzinfo is None else until.astimezone(user_zone())
-    record_action(item,'Later until '+until.isoformat()+(': '+words if words else ''))
-    review_later.save(item.key,until)
+    event = 'Later until '+until.isoformat()+(': '+words if words else '')
+    review_later.save(item.key, until, record_log=lambda: record_action(item, event))
     return 'later until '+until.strftime('%Y-%m-%d %H:%M %Z')
 
 
@@ -209,15 +209,16 @@ def save_delivery(page: change_page.ReviewMessagePage | change_page.UserQuestion
         previous_slots = status.slots(page, row)
         attempt = secrets.token_hex()
         intent = change_page.DeliveryIntent(attempt,'verdict',recipients=(owner,))
-        status.write_slots(page,row,change_page.DeliverySlots(change_page.NoDelivery(),intent,question))
+        slots = change_page.DeliverySlots(change_page.NoDelivery(),intent,question)
+        status.write_slots(page,row,slots)
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page,row),'claimed')
         try:
             _ = save()
-            page = replace(page,saved={**page.saved,'saved':True})
-            status.write_slots(page,row,status.slots(page,row))
         except BaseException:
             status.write_slots(previous_page, row, previous_slots)
             raise
+        page = replace(page,saved={**page.saved,'saved':True})
+        status.mark_review_saved(page, row, slots, intent)
     return change_page.MessageDelivery(page,row,(owner,),page.saved['message'],attempt,(owner,))
 
 

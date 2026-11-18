@@ -593,9 +593,9 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
             raise ChangeReviewError(reason)
         return result.stdout.strip()
 
-    if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
-        return
     try:
+        if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+            return
         root = Path(checked("rev-parse", "--show-toplevel"))
         folder = root
         blobs = [(str(path.resolve().relative_to(root)),
@@ -622,7 +622,7 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                 if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
                     raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
-        reason = str(error).splitlines()[0]
+        reason = next(iter(str(error).splitlines()), type(error).__name__)
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
 
 
