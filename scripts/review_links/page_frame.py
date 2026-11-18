@@ -6,6 +6,7 @@ import html
 import json
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from scripts.lib import conf
@@ -169,6 +170,22 @@ def code_block_html(block: re.Match[str]) -> str:
     text = block[1] if block[1] is not None else block[2]
     return ('<div class="code-block"><pre><code>' + html.escape(text)
             + '</code></pre>' + COPY_BUTTON + '</div>')
+
+
+def render_code_blocks(text: str, render_text: Callable[[str], str]) -> str:
+    """Render code blocks and pass the text between them to the caller's renderer."""
+    content: list[str] = []
+    start = 0
+    for block in CODE_BLOCK.finditer(text):
+        before = text[start:block.start()]
+        if before.strip():
+            content.append(render_text(before))
+        content.append(code_block_html(block))
+        start = block.end()
+    after = text[start:]
+    if after.strip() or not content:
+        content.append(render_text(after))
+    return "".join(content)
 
 
 # The title, status and content share one centered column and page background.
