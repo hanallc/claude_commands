@@ -84,7 +84,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
-            + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_exit=75; '
+            + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_nextest_setup=failed; '
             + 'cd "$HOME"/.local/state/mac-test/test-mirror/hana && trim_started=$(date +%s); '
             + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
@@ -120,7 +120,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertNotIn("rm -rf -- target/shots", expected)
 
     def test_nextest_setup_failure_declines_without_fetching(self) -> None:
-        self.configure_fetch(run_status_line="mac_exit=75")
+        self.configure_fetch(run_status_line="mac_nextest_setup=failed")
         result = self.command(runner_options=("--fetch", "target/shots"))
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assert_fetch_wire("not_run", mac="declined", reason="state")
@@ -295,7 +295,8 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertFalse(self.claim_file.exists())
 
     def test_fetch_after_failure_and_no_tests_preserves_the_mac_status(self) -> None:
-        for status, wire_status, reason, exit_code in ((37, "failed", "", 37), (4, "declined", "no_tests", 75)):
+        cases = ((37, "failed", "", 37), (75, "failed", "", 75), (4, "declined", "no_tests", 75))
+        for status, wire_status, reason, exit_code in cases:
             with self.subTest(status=status):
                 self.fixture["run_status_line"] = f"mac_exit={status}"
                 self.sync_fixture()

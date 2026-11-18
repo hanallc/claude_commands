@@ -27,15 +27,17 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 
 class MacCleanupProtocolTests(unittest.TestCase):
     def test_status_marker_followed_by_ordinary_output_is_printed_and_not_a_result(self) -> None:
-        output = io.StringIO()
         controller = offload.ProcessController()
-        text = "mac_exit=0\ntest still running\n"
-        with redirect_stdout(output):
-            answer = controller.stream_mac_run([
-                "/bin/sh", "-c", 'printf "%s" "$1"; exit 255', "protocol", text,
-            ])
-        self.assertIsInstance(answer, offload.MissingMacStatus)
-        self.assertEqual(output.getvalue(), text)
+        for marker in ("mac_exit=0", "mac_nextest_setup=failed"):
+            with self.subTest(marker=marker):
+                text = f"{marker}\ntest still running\n"
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    answer = controller.stream_mac_run([
+                        "/bin/sh", "-c", 'printf "%s" "$1"; exit 255', "protocol", text,
+                    ])
+                self.assertIsInstance(answer, offload.MissingMacStatus)
+                self.assertEqual(output.getvalue(), text)
 
     def test_stream_returns_cleanup_outcome_beside_the_reported_test_status(self) -> None:
         cases = (
@@ -93,18 +95,27 @@ class MacCleanupProtocolTests(unittest.TestCase):
         summary = b"Summary [0.1s] 1 test run: 1 failed, "
         noise = b"x" * (64 * 1024)
         fake_summary = b"Summary [0.2s] 1 test run: 1 passed"
-        output = io.BytesIO()
-        log = io.BytesIO(b"\033[31m" + summary + noise + b"\033[0m\n" + noise + fake_summary + b"\nend\n")
         limits = nextest_log.NextestOutputLimits(tail_bytes=4, summary_bytes=64)
-        with mock.patch.object(log, "readline", wraps=log.readline) as readline:
-            nextest_log.replay_log(log, Path("log"), 42, limits, output)
-        self.assertTrue(readline.called)
-        for call in readline.call_args_list:
-            (size,) = cast(tuple[int], call.args)
-            self.assertTrue(0 < size < len(noise))
-        self.assertEqual(output.getvalue(),
-                         b"mac_test: full nextest log: log\nmac_test: tail fragment: end\n"
-                         + (summary + noise)[:limits.summary_bytes] + b"\n")
+        colored = b"\033[31m" + summary + noise + b"\033[0m"
+        cases = (
+            ("long Summary", colored + b"\n" + noise + fake_summary, (summary + noise)[:limits.summary_bytes]),
+            ("Summary after redraw", noise + b"\r" + colored, (summary + noise)[:limits.summary_bytes]),
+            ("Summary overwritten", colored + b"\rtest output", b""),
+            ("trailing returns", colored + b"\r\033[0m\r", (summary + noise)[:limits.summary_bytes]),
+        )
+        for label, contents, expected in cases:
+            with self.subTest(label=label):
+                output = io.BytesIO()
+                log = io.BytesIO(contents + b"\nend\n")
+                with mock.patch.object(log, "readline", wraps=log.readline) as readline:
+                    nextest_log.replay_log(log, Path("log"), 42, limits, output)
+                self.assertTrue(readline.called)
+                for call in readline.call_args_list:
+                    (size,) = cast(tuple[int], call.args)
+                    self.assertTrue(0 < size < len(noise))
+                self.assertEqual(output.getvalue(),
+                                 b"mac_test: full nextest log: log\nmac_test: tail fragment: end\n"
+                                 + (expected + b"\n" if expected else b""))
 
 
 class MacTargetCleanupShellTests(unittest.TestCase):
@@ -208,21 +219,22 @@ exit "$CLEANUP_TEST_STATUS"
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell):
                 answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
-                self.assertEqual(answer.stdout.splitlines(), ["mac_exit=75", "mac_cleanup=skipped"])
+                self.assertEqual(answer.stdout.splitlines(), ["mac_nextest_setup=failed", "mac_cleanup=skipped"])
                 self.assertIn("cannot start nextest with a log", answer.stderr)
                 self.assertFalse((self.root / "lint-arguments.json").exists())
 
     def test_python_shim_start_failure_declines_but_child_status_is_preserved(self) -> None:
         for shell in (["/bin/sh"], ["zsh", "-f"]):
-            with self.subTest(shell=shell, source="nextest"):
-                answer = self.run_remote(shell, 127, ("--target-dir=other-target",))
-                self.assertEqual(answer.stdout.splitlines()[-2:], ["mac_exit=127", "mac_cleanup=skipped"])
+            for status in (75, 127):
+                with self.subTest(shell=shell, source="nextest", status=status):
+                    answer = self.run_remote(shell, status, ("--target-dir=other-target",))
+                    self.assertEqual(answer.stdout.splitlines()[-2:], [f"mac_exit={status}", "mac_cleanup=skipped"])
         (self.root / "lint-arguments.json").unlink()
         write_shell(self.python, "exit 127\n")
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell, source="shim"):
                 answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
-                self.assertEqual(answer.stdout.splitlines(), ["mac_exit=75", "mac_cleanup=skipped"])
+                self.assertEqual(answer.stdout.splitlines(), ["mac_nextest_setup=failed", "mac_cleanup=skipped"])
                 self.assertFalse((self.root / "lint-arguments.json").exists())
 
     def test_nextest_replays_success_and_retains_bounded_failure_output(self) -> None:

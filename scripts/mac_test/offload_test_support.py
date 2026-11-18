@@ -122,7 +122,7 @@ def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str
 
 def split_mac_run_command(remote: str) -> tuple[list[str], str]:
     """Get the invocation words and the cleanup commands."""
-    for status in (" || echo mac_exit=75", "; echo mac_exit=$?"):
+    for status in (f" || echo {offload.MAC_NEXTTEST_SETUP_FAILURE}", "; echo mac_exit=$?"):
         invocation, separator, cleanup = remote.rpartition(status)
         if separator:
             return shlex.split(invocation), cleanup

@@ -30,7 +30,6 @@ RETENTION_DAYS = "nextest_failure_log_days"
 TAIL_BYTES = "nextest_failure_tail_bytes"
 SUMMARY_BYTES = "nextest_failure_summary_bytes"
 DEFAULT_SETTINGS = Path(__file__).resolve().parents[2] / "config/mac_test.conf"
-SETUP_FAILURE = os.EX_TEMPFAIL
 SUMMARY_SCAN_BYTES = 8192
 
 
@@ -128,13 +127,9 @@ def replay_log(log: BinaryIO, path: Path, status: int, limits: NextestOutputLimi
     if status:
         _ = log.seek(0)
         summary = b""
-        while raw := log.readline(SUMMARY_SCAN_BYTES):
-            line = parse.clean_line(raw.removesuffix(b"\n").decode("utf-8", errors="replace"))
+        for line in parse.bounded_displayed_lines(log, SUMMARY_SCAN_BYTES):
             if parse.SUMMARY.match(line):
                 summary = line.encode()[:limits.summary_bytes]
-            # Discard the rest of this physical line in bounded reads.
-            while len(raw) == SUMMARY_SCAN_BYTES and not raw.endswith(b"\n"):
-                raw = log.readline(SUMMARY_SCAN_BYTES)
         if summary:
             _ = output.write(summary + b"\n")
 
