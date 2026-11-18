@@ -2722,3 +2722,15 @@ The cutover removal commit deletes the script after the run.
 - Checkpoint `989f9049e`.
 
 **Files:** none.
+
+### Phase 144 — A new worktree's Cargo folder starts from a warm sibling  · status: todo
+
+The user approved the pilot from Phase 143: "yes copy from a warm sibling is fine". A new worktree's first build is cold (Hana nextest 634 s against 113 s warm). The first build of a new folder in `/build/cargo` starts from a copy of a warm sibling folder of the same repository.
+
+- Sibling rule: the sibling whose last built revision is nearest to the new worktree's HEAD.
+- Safety: the copy never runs while a build writes the sibling. It holds the sibling's build lock, or it skips that sibling.
+- Cost: `/build` is ext4, so the copy shares no blocks. Copy time and disk per seeded folder are measured and reported.
+- Settings live in `config/build_folders.conf` (new keys). Seeded folders are the worktree's own Cargo folder, so the owner of worktree removal removes them.
+- Proof: Hana first run before and after.
+
+**Files:** to be named by the work order.
