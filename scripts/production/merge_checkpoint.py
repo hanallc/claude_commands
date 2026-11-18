@@ -26,7 +26,6 @@ import tempfile
 import time
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, redirect_stdout
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
@@ -127,7 +126,21 @@ class UnitUnavailable(NamedTuple):
     reason: str
 
 
+class MergeUnderRepoOwner(NamedTuple):
+    pass
+
+
+class MergePolicy(NamedTuple):
+    push: ValidateAndPush | GitPush
+    promotion: production_doc.NoPromotion | production_doc.PromoteTo
+    merge_tests: tuple[tuple[str, ...], ...]
+    flakes: frozenset[str]
+    flaky_tests: frozenset[str]
+
+
 class MergeRequest(NamedTuple):
+    """The destination production and the staff parent that authorizes the merge."""
+
     production: Production
     unit: Unit
     phase: str
@@ -151,6 +164,11 @@ class MergeRequest(NamedTuple):
     excluded: str
     bump: bool = False
     staff_record: staff.StaffSnapshot | None = None
+    staff_parent: Production | MergeUnderRepoOwner = MergeUnderRepoOwner()
+
+    @property
+    def parent_production(self) -> Production:
+        return self.production if isinstance(self.staff_parent, MergeUnderRepoOwner) else self.staff_parent
 
 
 def end_pushed_worktrees(production: ProductionDocument) -> None:
@@ -266,11 +284,59 @@ def user_bump(args: argparse.Namespace) -> bool:
     return bump
 
 
+def merge_destination(unit: Unit, parent: Production, record: staff.StaffSnapshot) -> Production:
+    try:
+        checkout = worktrees.main_checkout(unit.worktree)
+        if checkout == worktrees.main_checkout(parent.checkout):
+            return parent
+    except worktrees.Refused as error:
+        raise Refusal(str(error)) from error
+    owners: list[Production] = []
+    machine = remote.local_machine()
+    for row in staff.active(record, "showrunner"):
+        if not isinstance(row.doc, staff.LiveDoc) or row.doc.machine != machine:
+            continue
+        try:
+            candidate = read_production(row)
+        except Refusal:
+            continue
+        if candidate.checkout == checkout:
+            owners.append(candidate)
+    if not owners:
+        raise Refusal(f"{checkout}: no production owns the merge checkout")
+    if len(owners) > 1:
+        raise Refusal(f"{checkout}: multiple productions own the merge checkout: "
+                      + ", ".join(owner.name for owner in owners))
+    destination = owners[0]
+    try:
+        branch = worktrees.git(checkout, "branch", "--show-current").stdout.strip()
+    except worktrees.Refused as error:
+        raise Refusal(str(error)) from error
+    if branch != destination.merge_branch:
+        raise Refusal(f"{checkout}: merge checkout is on {branch}, expected {destination.merge_branch}")
+    return destination
+
+
+def read_merge_policy(production: ProductionDocument) -> MergePolicy:
+    lines = production.doc.read_text(encoding="utf-8").splitlines()
+    push_field = production_doc.optional_field(lines, "Push")
+    push_raw = cell_value(push_field.text) if isinstance(push_field, production_doc.FieldPresent) else "validate_and_push"
+    if push_raw not in ("git", "validate_and_push"):
+        raise Refusal(f"unknown Push mode: {push_raw}")
+    push = GitPush() if push_raw == "git" else ValidateAndPush()
+    promotion = production_doc.promotion_from_doc(lines)
+    if isinstance(promotion, production_doc.PromoteTo):
+        for checkout in promotion.checkouts:
+            if not checkout.is_dir():
+                raise Refusal(f"Promote checkout {checkout} does not exist; name an existing checkout, or none")
+    return MergePolicy(push, promotion, parse_merge_tests(lines, production.checkout),
+                       listed_names(lines, "Known flakes"), listed_names(lines, "Known flaky tests"))
+
+
 def request_from(args: argparse.Namespace) -> MergeRequest:
     bump = user_bump(args)
     record = staff.snapshot()
     production = read_production(cast(str, args.production), record)
-    lines = production.doc.read_text(encoding="utf-8").splitlines()
     name = cast(str, args.unit)
     resolver = session_staff.RowResolver(record)
     rows = tuple(record.find(kind="unit", parent=production.owner.id))
@@ -286,30 +352,10 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
         raise Refusal(f"unit {name} is not a staff unit of this production")
     if isinstance(unit, UnitUnavailable):
         raise Refusal(f"unit {name}: {unit.reason}")
-    try:
-        checkout = worktrees.main_checkout(unit.worktree)
-        if checkout != worktrees.main_checkout(production.checkout):
-            branch = worktrees.git(checkout, "branch", "--show-current").stdout.strip()
-            if branch != production.merge_branch:
-                raise Refusal(f"{checkout}: merge checkout is on {branch}, expected {production.merge_branch}")
-            production = replace(production, checkout=checkout)
-    except worktrees.Refused as error:
-        raise Refusal(str(error)) from error
-    push_field = production_doc.optional_field(lines, "Push")
-    push_raw = cell_value(push_field.text) if isinstance(push_field, production_doc.FieldPresent) else "validate_and_push"
-    if push_raw not in ("git", "validate_and_push"):
-        raise Refusal(f"unknown Push mode: {push_raw}")
-    push: ValidateAndPush | GitPush = GitPush() if push_raw == "git" else ValidateAndPush()
-    if cast(bool, args.cancel_prior) and isinstance(push, GitPush):
+    destination = merge_destination(unit, production, record)
+    policy = read_merge_policy(destination)
+    if cast(bool, args.cancel_prior) and isinstance(policy.push, GitPush):
         raise Refusal("--cancel-prior applies only to Push: validate_and_push")
-    promotion = production_doc.promotion_from_doc(lines)
-    # Checked at load, so a bad destination stops the checkpoint before anything is pushed.
-    if isinstance(promotion, production_doc.PromoteTo):
-        for checkout in promotion.checkouts:
-            if not checkout.is_dir():
-                raise Refusal(f"Promote checkout {checkout} does not exist; name an existing checkout, or none")
-    flakes = listed_names(lines, "Known flakes")
-    flaky_tests = listed_names(lines, "Known flaky tests")
     if cast(bool, args.shrink) and cast(bool, args.as_built):
         raise Refusal("--shrink and --as-built are separate checkpoints")
     kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit = (
@@ -327,13 +373,14 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
         raise Refusal("--delivers applies only to a code checkpoint")
     scratch = Path(cast(str | None, args.scratch) or os.environ.get("MERGE_CHECKPOINT_SCRATCH")
                    or tempfile.gettempdir()).expanduser()
-    return MergeRequest(production, unit, cast(str, args.phase), cast(str, args.hash),
-                        kind, push, promotion,
-                        parse_merge_tests(lines, production.checkout), flakes, flaky_tests, units, scratch,
+    return MergeRequest(destination, unit, cast(str, args.phase), cast(str, args.hash),
+                        kind, policy.push, policy.promotion,
+                        policy.merge_tests, policy.flakes, policy.flaky_tests, units, scratch,
                         tuple(cast(list[str], args.trailer)), review_trial, delivers or "",
                         cast(bool, args.cancel_prior), cast(str, args.started),
                         cast(str, args.regime), cast(int, args.holds), cast(int, args.merge_defects),
-                        cast(str | None, args.excluded) or "", bump, record)
+                        cast(str | None, args.excluded) or "", bump, record,
+                        production if destination is not production else MergeUnderRepoOwner())
 
 
 class MergedCheckpoint(NamedTuple):
@@ -507,9 +554,10 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
 
 def record_publication_changes(production: ProductionDocument, *, report_unchanged: bool = True,
                                record: staff.StaffSnapshot | None = None,
+                               review_owner: ProductionDocument | None = None,
                                known_producer: change_review.KnownMergeProducer | change_review.UnknownProducer = change_review.UNKNOWN_PRODUCER) -> None:
-    """Scan published merges after every promotion step succeeds."""
-    doc = change_review.list_path(production.doc, record=record)
+    """Scan the destination branch after promotion and route rows by producer."""
+    doc = change_review.list_path((review_owner or production).doc, record=record)
     if doc is None:
         if report_unchanged:
             checkpoint_gate.report("change review", "ok", "the production doc has no Change review line; no rows written")
@@ -712,12 +760,13 @@ def tests(request: MergeRequest, paths: tuple[str, ...], merge_head: str) -> str
     before_merge_tip = good(git(checkout, "rev-parse", f"{merge_head}^1"), "test")
     return checkpoint_tests(request.production, paths, request.commit, request.merge_tests,
                             request.flakes, request.scratch, test_tip, request.flaky_tests,
-                            before_merge_tip=before_merge_tip)
+                            before_merge_tip=before_merge_tip, ledger=request.parent_production)
 
 
 def checkpoint_tests(production: ProductionDocument, paths: tuple[str, ...], checkpoint: str,
                      merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], scratch: Path,
-                     merge_head: str, flaky_tests: frozenset[str], *, before_merge_tip: str = "") -> str:
+                     merge_head: str, flaky_tests: frozenset[str], *, before_merge_tip: str = "",
+                     ledger: ProductionDocument | None = None) -> str:
     scratch.mkdir(parents=True, exist_ok=True)
     log = scratch / f"merge_{checkpoint[:7]}_test.log"
     _ = log.write_text("", encoding="utf-8")
@@ -725,18 +774,20 @@ def checkpoint_tests(production: ProductionDocument, paths: tuple[str, ...], che
     has_base = bool(before_merge_tip) and git(production.checkout, "merge-base", "--is-ancestor",
                                                 checkpoint, before_merge_tip).returncode == 1
     return run_checkpoint_tests(production, paths, merge_tests, flakes, flaky_tests, log, merge_head, before_merge_tip,
-                                base_tip=before_merge_tip if has_base else "")
+                                base_tip=before_merge_tip if has_base else "", ledger=ledger)
 
 
 def run_checkpoint_tests(production: ProductionDocument, paths: tuple[str, ...],
                          merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], flaky_tests: frozenset[str],
-                         log: Path, merge_head: str, before_merge_tip: str, *, base_tip: str) -> str:
+                         log: Path, merge_head: str, before_merge_tip: str, *, base_tip: str,
+                         ledger: ProductionDocument | None = None) -> str:
     """Append test output and undo an unpublished red checkpoint.
 
     With a base tip, a red is checked on that tip with main merged; the unit hears only of its own red.
     """
     try:
-        return checkpoint_gate.run_checkpoint_test_steps(production, paths, merge_tests, flakes, flaky_tests, log)
+        return checkpoint_gate.run_checkpoint_test_steps(production, paths, merge_tests, flakes, flaky_tests, log,
+                                                         ledger=ledger)
     except checkpoint_gate.RedCheckpointTests as error:
         undo_unpushed_merge(production, merge_head, before_merge_tip)
         if not base_tip:
@@ -1104,7 +1155,8 @@ def review_numbers(line: str) -> ReviewTrial:
 
 def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
     recorded = (f"{request.unit.name} phase {request.phase} ({request.commit}) merged as {merge_head}; ")
-    if request.production.log.exists() and recorded in request.production.log.read_text(encoding="utf-8"):
+    parent = request.parent_production
+    if parent.log.exists() and recorded in parent.log.read_text(encoding="utf-8"):
         checkpoint_gate.report("record", "ok", "checkpoint already recorded")
         return
     detail = ("review ledger and production log updated" if isinstance(request.kind, CodeCheckpoint)
@@ -1131,10 +1183,10 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
                        "the showrunner will repair the review record and rerun")
         if result.stdout.startswith("kept "):
             detail = result.stdout.strip() + "; " + detail
-    request.production.log.parent.mkdir(parents=True, exist_ok=True)
-    with request.production.log.open("a", encoding="utf-8") as log:
+    parent.log.parent.mkdir(parents=True, exist_ok=True)
+    with parent.log.open("a", encoding="utf-8") as log:
         suffix = "; promoted" if isinstance(request.promotion, production_doc.PromoteTo) else ""
-        _ = log.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {request.unit.name} phase {request.phase} "
+        _ = log.write(f"- {datetime.now(parent.zone):%H:%M %Z}: {request.unit.name} phase {request.phase} "
                       + f"({request.commit}) merged as {merge_head}; "
                       + ("gate after push" if request.bump else f"{tests_green} green") + f"; pushed{suffix}\n")
     checkpoint_gate.report("record", "ok", detail)
@@ -1245,20 +1297,18 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
     resume_delivery = False
     launch_failure = ""
     log = path.with_name("bump-gate.log")
-    members = request.staff_record if request.staff_record is not None else staff.snapshot()
-    unit = next(row for row in members.find(kind="unit", parent=request.production.owner.id)
-                if row.name == request.unit.name)
+    parent = request.parent_production
     record: checkpoint_gate.BumpGateRecord = {
         "tip": tip, "checkpoint": request.commit,
-        "production_doc": str(request.production.doc), "name": request.production.name,
-        "owner_id": str(request.production.owner.id), "unit_id": str(unit.id),
+        "production_doc": str(parent.doc), "name": parent.name,
+        "owner_id": str(parent.owner.id), "unit_id": str(request.unit.staff_id),
         "merge_branch": request.production.merge_branch, "checkout": str(request.production.checkout),
-        "production_log": os.path.relpath(request.production.log, request.production.checkout),
-        "zone": str(request.production.zone), "unit": request.unit.name,
+        "production_log": os.path.relpath(parent.log, request.production.checkout),
+        "zone": str(parent.zone), "unit": request.unit.name,
         "delivered_to": [],
         "paths": list(paths), "merge_tests": [list(command) for command in request.merge_tests],
         "flakes": sorted(request.flakes), "flaky_tests": sorted(request.flaky_tests),
-        "started": datetime.now(request.production.zone).isoformat(), "pid": 0, "proc_start": "",
+        "started": datetime.now(parent.zone).isoformat(), "pid": 0, "proc_start": "",
         "result": "pending", "detail": "", "log": str(log),
     }
     with checkpoint_gate.record_lock(path):
@@ -1339,10 +1389,11 @@ def merge_checked_checkpoint(request: MergeRequest) -> tuple[list[change_review.
 def check_publication_sources(request: MergeRequest, commits: list[change_review.Commit],
                               test_tip: str, before_merge_tip: str) -> None:
     """Check review ownership before publication and undo an unreadable source."""
-    if change_review.list_path(request.production.doc, record=request.staff_record) is None:
+    parent_doc = request.parent_production.doc
+    if change_review.list_path(parent_doc, record=request.staff_record) is None:
         return
     try:
-        _ = change_review.publication_changes(commits, request.production.doc, record=request.staff_record,
+        _ = change_review.publication_changes(commits, parent_doc, record=request.staff_record,
                                                known_producer=request.unit.staff_id)
     except (change_review.ChangeReviewError, OSError) as error:
         undo_unpushed_merge(request.production, test_tip, before_merge_tip)
@@ -1373,7 +1424,7 @@ def finish_checkpoint(request: MergeRequest, merge_head: str, tests_green: str) 
 def record_land(request: MergeRequest, *, landed: bool, step: str = "", state: str = "", detail: str = "") -> None:
     """Add the land result for the units board; a failed write does not change the land."""
     try:
-        land_runs.record_result(commit=request.commit, production=request.production.name, unit=request.unit.name,
+        land_runs.record_result(commit=request.commit, production=request.parent_production.name, unit=request.unit.name,
                                 phase=request.phase, landed=landed, step=step, state=state, detail=detail)
     except OSError as error:
         print(f"land result: not recorded — {error}", flush=True)
@@ -1425,7 +1476,7 @@ def run(request: MergeRequest) -> int:
                         if isinstance(pushed, PushedTip):
                             tests_green = checkpoint_tests(request.production, paths, request.commit, request.merge_tests,
                                                            request.flakes, request.scratch, test_tip, request.flaky_tests,
-                                                           before_merge_tip=pushed.tip)
+                                                           before_merge_tip=pushed.tip, ledger=request.parent_production)
                         else:
                             tests_green = tests(request, paths, merge_head)
                 else:
@@ -1480,7 +1531,7 @@ def run(request: MergeRequest) -> int:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
                                      issue=str(checkpoint_plan(request)))
                 notify_published_style(request.production, merge_head, tip)
-        record_publication_changes(request.production, record=request.staff_record,
+        record_publication_changes(request.production, record=request.staff_record, review_owner=request.parent_production,
                                    known_producer=change_review.KnownMergeProducer(merge_head, request.unit.staff_id))
         finish_checkpoint(request, merge_head, tests_green)
         return 0
@@ -1566,7 +1617,7 @@ def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem,
                 red_steps = tuple(checkpoint_gate.narrowed(item) for item in red.red
                                   if (tuple(item.step.command), item.step.folder) in commands)
                 try:
-                    _ = checkpoint_gate.run_test_steps(reference.production, red_steps, reference.flakes,
+                    _ = checkpoint_gate.run_test_steps(reference.parent_production, red_steps, reference.flakes,
                                                         reference.flaky_tests, log, raise_start_errors=True)
                 except checkpoint_gate.RedCheckpointTests:
                     probe_result = "red"
@@ -1630,7 +1681,7 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                                                             item.request.unit.name, item.request.commit))
                 tests_green = run_checkpoint_tests(reference.production, tuple(sorted(test_paths)), reference.merge_tests,
                                                    reference.flakes, reference.flaky_tests, log, test_tip, start_tip,
-                                                   base_tip=start_tip)
+                                                   base_tip=start_tip, ledger=reference.parent_production)
         except checkpoint_gate.RedCheckpointTests as error:
             red_commands = {(tuple(red.step.command), red.step.folder) for red in error.red}
             affected = tuple(item for item, steps in selections
@@ -1671,7 +1722,7 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                     record_pushed_merges(item.request.production, item.merge_head, item.request.commit, receipt_tip,
                                          phase_id=item.request.phase, issue=str(checkpoint_plan(item.request)))
                 notify_published_style(shared.production, first.merge_head, tip)
-        record_publication_changes(shared.production, record=shared.staff_record)
+        record_publication_changes(shared.production, record=shared.staff_record, review_owner=shared.parent_production)
         for item in items:
             finish_checkpoint(item.request, item.merge_head,
                               tests_green if isinstance(item.request.kind, CodeCheckpoint) else "no tests")
@@ -1827,27 +1878,16 @@ def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
     if git(child.checkout, "merge-base", "--is-ancestor", checkpoint, child.merge_branch).returncode:
         raise Refusal(f"checkpoint {checkpoint[:7]} is not on {name}'s merge branch {child.merge_branch}")
     already = git(checkout, "merge-base", "--is-ancestor", checkpoint, production.merge_branch).returncode == 0
-    parent_lines = production.doc.read_text().splitlines()
-    mode = production_doc.optional_field(parent_lines, "Push")
-    raw = cell_value(mode.text) if isinstance(mode, production_doc.FieldPresent) else "validate_and_push"
-    if raw not in ("git", "validate_and_push"):
-        raise Refusal(f"unknown Push mode: {raw}")
+    policy = read_merge_policy(production)
     delivery: NotMerged | MergedNotPushed | MergedAndPushed = NotMerged()
     if already:
         merge_head = merge_evidence(production, checkpoint)
         pushed = pushed_state(production, checkpoint)
         delivery = MergedAndPushed(merge_head) if isinstance(pushed, PushedTip) else MergedNotPushed(merge_head)
-    promotion = production_doc.promotion_from_doc(parent_lines)
-    if isinstance(promotion, production_doc.PromoteTo):
-        for destination in promotion.checkouts:
-            if not destination.is_dir():
-                raise Refusal(f"Promote checkout {destination} does not exist; name an existing checkout, or none")
-    flakes = listed_names(parent_lines, "Known flakes")
-    flaky_tests = listed_names(parent_lines, "Known flaky tests")
     scratch = Path(os.environ.get("MERGE_CHECKPOINT_SCRATCH") or tempfile.gettempdir()).expanduser()
-    return ChildHandoffRequest(production, child, checkpoint, GitPush() if raw == "git" else ValidateAndPush(),
-                               parse_merge_tests(parent_lines, production.checkout), cast(str, args.started), delivery, promotion,
-                               root_self, flakes, flaky_tests, scratch)
+    return ChildHandoffRequest(production, child, checkpoint, policy.push, policy.merge_tests,
+                               cast(str, args.started), delivery, policy.promotion,
+                               root_self, policy.flakes, policy.flaky_tests, scratch)
 
 
 def merge_evidence(production: ProductionDocument, checkpoint: str) -> str:

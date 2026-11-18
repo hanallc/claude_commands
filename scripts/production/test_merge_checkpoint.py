@@ -364,31 +364,101 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_staff_parent_authorizes_a_checkpoint_in_the_units_repository(self) -> None:
-        parent = self.root / "parent"
-        parent_origin = self.root / "parent.git"
-        parent.mkdir()
-        _ = self.git("init", "--bare", str(parent_origin), cwd=self.root)
-        _ = self.git("init", "-b", "production", cwd=parent)
-        _ = self.git("commit", "--allow-empty", "-m", "Parent repository", cwd=parent)
-        _ = self.git("remote", "add", "origin", str(parent_origin), cwd=parent)
-        _ = self.git("push", "origin", "production", "production:main", cwd=parent)
-        foreign_commit = self.git("rev-parse", "HEAD", cwd=parent)
-        _ = self.doc.write_text(self.doc.read_text().replace(str(self.checkout), str(parent)))
-        checkpoint = self.checkpoint()
+        for outcome in ("parent commit", "unowned", "branch", "test policy", "push", "promotion", "lock"):
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                parent = self.root / "parent"
+                parent_origin = self.root / "parent.git"
+                parent.mkdir()
+                _ = self.git("init", "--bare", str(parent_origin), cwd=self.root)
+                _ = self.git("init", "-b", "production", cwd=parent)
+                _ = self.git("commit", "--allow-empty", "-m", "Parent repository", cwd=parent)
+                _ = self.git("remote", "add", "origin", str(parent_origin), cwd=parent)
+                _ = self.git("push", "origin", "production", "production:main", cwd=parent)
+                foreign_commit = self.git("rev-parse", "HEAD", cwd=parent)
+                repo_branch = "main" if outcome == "branch" else "production"
+                repo_doc = self.root / "destination-production.md"
+                doc = self.doc.read_text()
+                repo_text = doc.replace("Merge branch:** `production`", f"Merge branch:** `{repo_branch}`")
+                parent_text = doc.replace(str(self.checkout), str(parent))
+                if repo_branch == "main":
+                    _ = self.git("worktree", "remove", str(self.promote))
+                    _ = self.git("checkout", "main")
+                if outcome == "test policy":
+                    parent_text = parent_text.replace("`checkpoint-test`", "`checkpoint-test parent-policy`")
+                    repo_text = repo_text.replace("`checkpoint-test`", "`checkpoint-test repo-policy`")
+                    repo_text += "- **Known flakes:** `proof`\n- **Known flaky tests:** `fixture_flake`\n"
+                    self.executable(self.bin / "checkpoint-test", STUB + '''
+if "-E" not in args:
+    print("    FAIL [  0.1s] (1/1) proof fixture_flake")
+    raise SystemExit(1)
+''')
+                    _ = (self.state / "fail-once-test-proof").touch()
+                    checkpoint = self.checkpoint("crates/proof/Cargo.toml",
+                                                 '[package]\nname = "proof"\nversion = "0.1.0"\n')
+                elif outcome == "promotion":
+                    checkpoint = self.checkpoint(subject="alpha work\n\n"
+                                                 + "Change-Review: Alpha result | Read | Proof | image 012345abcdef")
+                else:
+                    checkpoint = self.checkpoint()
+                if outcome == "push":
+                    parent_text = parent_text.replace("Push:** git", "Push:** validate_and_push")
+                if outcome == "promotion":
+                    parent_install = self.root / "parent-installed"
+                    _ = self.git("clone", "-b", "main", str(parent_origin), str(parent_install), cwd=self.root)
+                    parent_text += f"- **Promote:** {parent_install}\n"
+                    repo_text += f"- **Promote:** {self.promote}\n"
+                    review_dir = Path(self.env["HOME"]) / "rust/hanadocs/change-review"
+                    parent_text += f"- **Change review:** `{review_dir / 'change-review - example.md'}`\n"
+                    repo_text += f"- **Change review:** `{review_dir / 'change-review - destination.md'}`\n"
+                if outcome == "lock":
+                    self.executable(self.bin / "checkpoint-test", STUB + '''
+import fcntl
+with Path(".git/showrunner-merge-destination.lock").open("a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit("the destination merge lock is free")
+''')
+                _ = self.doc.write_text(parent_text)
+                if outcome != "unowned":
+                    _ = repo_doc.write_text(repo_text)
+                    _ = recorded_showrunner("destination", repo_doc)
 
-        with self.subTest(commit="parent repository"):
-            result = self.run_checkpoint(foreign_commit)
-            self.assert_stopped_before_merge(result, "failed", f"commit {foreign_commit} is absent")
-
-        with self.subTest(commit="unit repository"):
-            result = self.run_checkpoint(checkpoint).process
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            landed = self.git("rev-parse", "production", cwd=self.origin)
-            self.assertEqual(self.git("rev-parse", f"{landed}^2", cwd=self.origin), checkpoint)
-            self.assertEqual(self.git("rev-parse", "production", cwd=parent_origin), foreign_commit)
-            self.assertEqual(self.git("rev-parse", "HEAD", cwd=parent), foreign_commit)
-            self.assertIn(landed, (parent / "production.log").read_text())
-            self.assertFalse(self.log.exists())
+                if outcome == "parent commit":
+                    result = self.run_checkpoint(foreign_commit)
+                    self.assert_stopped_before_merge(result, "failed", f"commit {foreign_commit} is absent")
+                    continue
+                result = self.run_checkpoint(checkpoint)
+                if outcome == "unowned":
+                    self.assert_stopped_before_merge(result, "failed", "no production owns the merge checkout")
+                    continue
+                self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+                if outcome == "push":
+                    self.assertEqual(self.events("validate_and_push.sh"), [])
+                landed = self.git("rev-parse", repo_branch, cwd=self.origin)
+                self.assertEqual(self.git("rev-parse", f"{landed}^2", cwd=self.origin), checkpoint)
+                self.assertEqual(self.git("rev-parse", "production", cwd=parent_origin), foreign_commit)
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=parent), foreign_commit)
+                parent_log = (parent / "production.log").read_text()
+                self.assertIn(landed, parent_log)
+                self.assertFalse(self.log.exists())
+                if outcome == "test policy":
+                    self.assertEqual(self.events("checkpoint-test"),
+                                     [["repo-policy"], ["repo-policy", "-E", "test(=fixture_flake)"]])
+                    self.assertIn("known flake proof", parent_log)
+                    self.assertIn("known flaky tests fixture_flake", parent_log)
+                if outcome == "promotion":
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.promote), landed)
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), landed)
+                    self.assertEqual(self.git("rev-parse", "main", cwd=parent_origin), foreign_commit)
+                    review_dir = Path(self.env["HOME"]) / "rust/hanadocs/change-review"
+                    self.assertIn("Alpha result", (review_dir / "change-review - example.md").read_text())
+                    self.assertFalse((review_dir / "change-review - destination.md").exists())
 
     def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
         for failure in ("push", "final-fetch", "rollback-fetch", "rollback-ref"):

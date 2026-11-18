@@ -574,7 +574,8 @@ notice to the unit director before any merge command runs:
    <showrunner name> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
    --delivers "<one line of what the phase delivers>"`.
-   When several checkpoint notices wait, land them in one batch, in arrival order.
+   Group pending notices by the main checkout of each unit's worktree repo.
+   Use one batch file per repo. Keep its notices in arrival order.
    Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
    Run `merge_checkpoint.py --production <showrunner name> --batch <file>` through the same Python launcher.
    Keep each item's flags on its line.
