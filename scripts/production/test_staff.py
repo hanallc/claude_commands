@@ -1,7 +1,7 @@
 """Exercise the staff contract with isolated state and an actual fake SSH process."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker, fixture_runtime_id
 
 import fcntl
 import io
@@ -1925,11 +1925,8 @@ class StaffTests(StaffCommandTestCase):
                 self.assertEqual(self.staff_state(), before)
 
     def test_a_legacy_unit_name_loads_and_survives_an_unrelated_write(self) -> None:
-        runner, unit, worker = self.tree()
-        legacy = replace(unit, name="x-unit")
-        self.write_json(self.staff_file, {"schema": 2, "rows": [
-            runner.to_json(), legacy.to_json(), worker.to_json(),
-        ]})
+        runner, unit, _ = self.tree()
+        legacy = fixture_unit_saved_name(unit, "x-unit")
         self.assertEqual(staff.snapshot().by_path(f"{runner.name}/x-unit"), legacy)
         _ = staff.rename(runner.id, "tools")
         self.assertEqual(staff.snapshot().by_path("tools/x-unit"), legacy)

@@ -989,6 +989,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `staff.validate_unit_name_for_write` holds the rule. Staff row creation, `staff.rename` and `staff.change_director` call it, and `add_unit`, `agents rename` (plan and apply), retired resume, `promote_showrunner`, `demote_showrunner` and `producer_transfer` check it before they change files or sessions. A refusal prints `StaffRefused: unit name '<name>' must not end in -unit` and exits 2. Alias lookups of the `-unit` form and old records that hold such a name still work. Tests use fixture staff files only.
 
+**Gate repair:** the first hash went red at the merge gate. Three test fixtures wrote `-unit` names (`TEST-unit` in test_pane_record, `verify-unit` in test_copies, `renamed-unit` in test_merge_checkpoint_bump). Their names changed; the rule did not.
+
 #### Work Order
 
 **Goal:** the Builds page showed a unit as `organon-unit`, because its staff row kept an old name. The user said "that should be impossible". The showrunner asked whether to refuse such names. The user answered: "yes refuse ending in -unit".

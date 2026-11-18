@@ -2382,7 +2382,7 @@ class WorkerRenameTests(StaffTestCase):
     def test_worker_id_rename_keeps_the_full_pane_label_and_shared_tab(self) -> None:
 
         owner = fixture_member("showrunner", name="TEST-owner")
-        unit = fixture_member("unit", name="TEST-unit", parent=owner.id)
+        unit = fixture_member("unit", name="TEST-member", parent=owner.id)
         for kind in ("claude", "codex"):
             with self.subTest(kind=kind):
                 backend = (staff.ClaudeBackend() if kind == "claude"
@@ -2403,7 +2403,7 @@ class WorkerRenameTests(StaffTestCase):
     def test_unavailable_worker_pane_keeps_the_staff_rename_and_reports_one_anomaly(self) -> None:
 
         owner = fixture_member("showrunner", name="TEST-owner")
-        unit = fixture_member("unit", name="TEST-unit", parent=owner.id)
+        unit = fixture_member("unit", name="TEST-member", parent=owner.id)
         row = fixture_worker("TEST-worker", unit.id)
         arguments = ["rename", str(row.id), "TEST-renamed"]
         with mock.patch.object(herdr.Herdr, "retitle_row", side_effect=herdr_types.HerdrFailure("pane unavailable")):
