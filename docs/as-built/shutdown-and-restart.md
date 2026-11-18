@@ -95,7 +95,7 @@ The shared resume path reads the saved environment, arguments, and folder.
 The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Claude producers use the configured producers account, with the showrunners account as the fallback.
+Claude producers use the configured producers account, or the showrunners account while the producers group has no selection.
 Other Claude sessions use the configured units account.
 A configured producer without a staff row uses the producer first-start account rule.
 When the account does not change, the resume message names no move.
@@ -236,7 +236,7 @@ These model names are aliases that the shared model registry resolves.
 `member_account.producer_account(kind, *, to="")` selects the account before admission.
 Admitted producers use `member_account.resume_account`.
 Both functions select the workers account for Codex.
-Claude uses the producers account, with the showrunners account as the fallback.
+Claude uses the producers account, or the showrunners account while the producers group has no selection.
 An explicit `--to` overrides that selection.
 
 `accounts.eligible_producers(membership, family)` selects active, unpaused, local producers of the configured family.
