@@ -854,8 +854,10 @@ The test server joins its request handlers before fixture cleanup and gives each
 2. The new check fails without the fix.
 3. basedpyright on the changed Python files: 0 errors, 0 warnings. The Disks and page frame suites pass.
 
-### Phase 62 — Image answer buttons use the Review page groups  · status: todo
+### Phase 62 — Image answer buttons use the Review page groups  · status: done
 **Depends on:** none
+
+**Result:** `page_frame.review_action_groups` and one shared style render the labeled button groups on the Review and Images pages. Images: Approved, Not Approved and Send Feedback under Closes the item; Ask question under The item returns to you, after a separator bar. Phones stack the groups with no bar.
 
 #### Work Order
 
