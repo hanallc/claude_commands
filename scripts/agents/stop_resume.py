@@ -55,7 +55,7 @@ from scripts.lib.resume_message import (
 )
 from scripts.agents.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
-    SESSION_WITHOUT_STAFF_ROW,
+    SESSION_WITHOUT_STAFF_ROW, SessionWithoutStaffRow,
     StopUnproved as StopUnproved,
     ClaudeUp as ClaudeUp, ClaudeStartState, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
@@ -87,7 +87,7 @@ class RowStarter(Protocol):
 
 @dataclass(frozen=True)
 class ProducerFirstStart:
-    """A configured producer that needs its first native conversation."""
+    """A configured producer that needs a fresh native conversation."""
 
     name: str
     folder: Path
@@ -101,6 +101,16 @@ class PendingProducerAdmission:
     terminal: str
     kind: Literal["claude", "codex"]
     home: Path
+
+
+@dataclass(frozen=True)
+class ProducerFamilyChange(ProducerFirstStart):
+    """The old conversation and its pane before a fresh producer start."""
+
+    session: StaffId
+    kind: Literal["claude", "codex"]
+    client: herdr.Herdr
+    pane: herdr.PaneIdentity | herdr.NoPane
 
 
 def _producer_admission_path(name: str) -> Path:
@@ -117,6 +127,11 @@ def producer_admission_record(name: str) -> Path:
 def _producer_folder(name: str) -> Path:
     root = conf.read_or_repository("staff").text("PRODUCER_FOLDER_ROOT")
     return Path(root).expanduser() / name
+
+
+def _producer_start_request(row: StaffRow) -> ProducerFirstStart:
+    folder = row.worktree.path if isinstance(row.worktree, staff.PresentWorktree) else _producer_folder(row.name)
+    return ProducerFirstStart(row.name, folder)
 
 
 def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", "codex"], home: Path,
@@ -311,18 +326,23 @@ def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, 
 
 def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str,
                                   client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
-    """Serialize first admission before the producer has a staff row."""
-    _ = _producer_admission_path(request.name)
+    """Serialize producer admission and replacement."""
+    path = _producer_admission_path(request.name)
     with staff.slot_operation("producer-first-" + request.name, request.name):
         record = staff.initial_snapshot()
         row = next((row for row in record.rows if row.kind == "producer" and row.name == request.name), None)
-        if row is not None and not _producer_admission_path(request.name).exists():
-            return _resume(str(row.id), to=to, client=client)
-        return _first_producer_resume(request, to=to, client=client)
+        if row is None:
+            return _first_producer_resume(request, to=to, client=client)
+        with staff.row_operation(str(row.id)):
+            if not path.exists() and (not isinstance(request, ProducerFamilyChange)
+                                      or row.current_session != request.session):
+                return _resume(str(row.id), to=to, client=client)
+            return _first_producer_resume(request, to=to, client=client, member=row)
 
 
 def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
-                           client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
+                           client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW,
+                           member: StaffRow | SessionWithoutStaffRow = SESSION_WITHOUT_STAFF_ROW) -> ResumeResult:
     """Retain the pane before launch and admit only its proved native identity."""
     from scripts.agents import remote
 
@@ -335,6 +355,9 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
         client = herdr.Herdr(herdr.shared_session()) if isinstance(client, herdr.LaunchClientSource) else client
         path = _producer_admission_path(request.name)
         recovering_admission = path.exists()
+        if isinstance(request, ProducerFamilyChange) and not recovering_admission:
+            _ = member_account.producer_account(kind, to=to)
+            _stop_producer_for_family_change(request)
         conflicts = producer_conflicts(request.name, client)
         if len(conflicts) > 1:
             raise ValueError("producer sessions conflict: " + "; ".join(
@@ -357,6 +380,9 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
                     return adopt_named_producer(request, *conflicts[0], client)
         else:
             if conflicts:
+                if isinstance(request, ProducerFamilyChange):
+                    identity, pane = conflicts[0]
+                    raise ValueError(f"another live producer session remains: {identity}, pane {pane}")
                 return adopt_named_producer(request, *conflicts[0], client)
             selected = member_account.producer_account(kind, to=to)
             home = selected.dir if isinstance(selected, accounts.NamedAccount) else selected.home
@@ -424,9 +450,14 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
         entry["name"] = request.name
         pane_record.write(client.session, entry)
         identity = staff.native_id(entry["session_id"])
-        row = staff.ensure("producer", name=request.name, runtime_id=identity,
-            worktree=staff.PresentWorktree(remote.local_machine(), request.folder),
-            doc=staff.LiveDoc(remote.local_machine(), request.folder))
+        folder = staff.PresentWorktree(remote.local_machine(), request.folder)
+        document: staff.LiveDoc | staff.WrappedDoc = staff.LiveDoc(folder.machine, request.folder)
+        if isinstance(member, staff.StaffRow):
+            if isinstance(member.worktree, staff.PresentWorktree):
+                folder = member.worktree
+            if not isinstance(member.doc, staff.DocUnfilled):
+                document = member.doc
+        row = staff.ensure("producer", name=request.name, runtime_id=identity, worktree=folder, doc=document)
         expectation = pane_launch.ProducerLaunchRequest(row.id, identity, kind, request.folder, pending.home)
         with pane_launch.producer_launch_request(expectation):
             row = pane_launch.staff_admitted(row)
@@ -441,6 +472,31 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
                         elapsed_seconds=monotonic() - began, start_state=ClaudeStartState.STARTED)
     except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         return ResumeFailed(request.name, str(error))
+
+
+def _stop_producer_for_family_change(change: ProducerFamilyChange) -> None:
+    result = stop(change.session, change.kind)
+    if isinstance(result, StopFailed):
+        raise ValueError(result.reason)
+    if isinstance(result, SessionNotFound):
+        raise ValueError(f"{change.session}: the old producer session is unavailable")
+    if isinstance(change.pane, herdr.NoPane):
+        return
+    pane = change.pane["pane_id"]
+    pane_record.end(change.client.session, pane, change.session)
+    terminal = herdr.json_text(change.pane.get("terminal_id"), "old producer terminal")
+    if not terminal or not change.client.close_tab_confirmed(pane, terminal=terminal):
+        raise ValueError(f"{change.session}: the old producer pane {pane} did not close")
+
+
+def _producer_current_kind(row: StaffRow, entry: pane_record.PaneLaunch | None) -> Literal["claude", "codex"]:
+    try:
+        return pane_launch.current_kind(row)
+    except ValueError:
+        if entry is None or not entry.get("producer_binding", False):
+            raise
+        # A Codex launch records its policy even when it has no policy arguments.
+        return "codex" if "codex_policy" in entry else "claude"
 
 
 
@@ -1134,9 +1190,7 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
         if machine and machine != remote.local_machine():
             return ResumeFailed(session, f"session is on {machine}")
         if member.kind == "producer" and _producer_admission_path(member.name).exists():
-            folder = (member.worktree.path if isinstance(member.worktree, staff.PresentWorktree)
-                      else _producer_folder(member.name))
-            return _locked_first_producer_resume(ProducerFirstStart(member.name, folder), to=to or "", client=client)
+            return _locked_first_producer_resume(_producer_start_request(member), to=to or "", client=client)
         session = member.current_session
     else:
         if (session and Path(session).name == session and session not in {".", ".."}
@@ -1211,6 +1265,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if saved is not None:
                 original = pane_launch.LaunchPublication(pane_record.record_path(client.session), saved)
         entry = original.entry if original is not None else None
+        source_client = client
         if original is not None:
             source_client = client if original.path == pane_record.record_path(client.session) else herdr.Herdr(original.path.stem)
             locations = [dict(pane) for pane in source_client.panes()]
@@ -1236,16 +1291,24 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                         return running
                 return recovered
             entry = recovered
-        if entry is not None:
-            entry = names.resume(entry)
-        kind = pane_launch.saved_kind(entry) if entry is not None else (
-            pane_launch.current_kind(row) if row is not None and row.kind != "producer" else "claude")
         if row is not None and row.kind == "producer":
             restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-            kind = restart.producer_launch(row)[0]
-            if entry is not None:
-                entry = entry.copy()
-                entry["kind"] = kind
+            kind = _producer_current_kind(row, entry)
+            if kind != restart.producer_launch(row)[0]:
+                request = _producer_start_request(row)
+                old_pane: herdr.PaneIdentity | herdr.NoPane = herdr.NoPane(row.name)
+                if isinstance(tab, herdr.TabSession):
+                    source_client = client
+                    old_pane = client.pane_row(tab.pane_id)
+                elif isinstance(source_pane, pane_launch.ResumeSourcePane):
+                    old_pane = source_client.pane_row(source_pane.pane)
+                change = ProducerFamilyChange(request.name, request.folder, row.current_session, kind, source_client, old_pane)
+                return _locked_first_producer_resume(change, to=to or "", client=client)
+        else:
+            kind = pane_launch.current_kind(row) if entry is None and row is not None else "claude"
+        if entry is not None:
+            entry = names.resume(entry)
+            kind = pane_launch.saved_kind(entry)
         pane_id = tab.pane_id if isinstance(tab, herdr.TabSession) else ""
         running = running_on_account(identity, pane_id, kind=kind)
         if not isinstance(running, sessions.SessionNotLive):
