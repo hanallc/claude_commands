@@ -46,6 +46,7 @@ from scripts.lib import conf
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import staff
+from scripts.review_links import efficiency_reviews, review_events
 
 
 def state_root() -> Path:
@@ -274,30 +275,31 @@ def record(report: Path) -> int:
     caller = staff.snapshot().by_current_session(identity) if identity else None
     by = caller.id if caller is not None and caller.kind == "unit" else ""
     ledger = state_root() / "ledger.md"
-    known = read_lines(ledger)
-    new: list[str] = []
-    for candidate in candidates:
-        candidate = candidate._replace(by=by)
-        # The outcome follows the exact heading and its optional gain and source tags.
-        complete_record = re.compile(re.escape(candidate.head)
-                                     + r"(?: \[gain/week: [^\]]+\])?(?: \[by: [^\]]+\])? — (?:proposed|deferred|accepted|declined|done|relayed)(?:[ ,].*)?")
-        if any(complete_record.fullmatch(line) is not None for line in known):
-            continue
-        # A stopped append can leave just the heading or part of its final state.
-        known = [line for line in known if not candidate.line.startswith(line) or not line]
-        known.append(candidate.line)
-        new.append(candidate.line)
-    if not new:
-        print("nothing new to record")
-    else:
-        print("\n".join(new), flush=True)
-        try:
-            write_text_atomic(ledger, "\n".join(known) + "\n")
-        except OSError as error:
-            print(f"candidates: {error}", file=sys.stderr)
-            return 1
-    open_candidates = ordered(read_lines(ledger))
-    write_note(table(open_candidates) if open_candidates else "no open candidates")
+    try:
+        with efficiency_reviews.ledger_lock(ledger):
+            known = read_lines(ledger)
+            new: list[str] = []
+            for candidate in candidates:
+                candidate = candidate._replace(by=by)
+                # The outcome follows the heading and its optional tags.
+                complete_record = re.compile(re.escape(candidate.head)
+                                             + r"(?: \[gain/week: [^\]]+\])?(?: \[by: [^\]]+\])? — (?:proposed|deferred|accepted|declined|done|relayed)(?:[ ,].*)?")
+                if any(complete_record.fullmatch(line) is not None for line in known):
+                    continue
+                # A stopped append can leave just the heading or part of its final state.
+                known = [line for line in known if not candidate.line.startswith(line) or not line]
+                known.append(candidate.line)
+                new.append(candidate.line)
+            if not new:
+                print("nothing new to record")
+            else:
+                print("\n".join(new), flush=True)
+                write_text_atomic(ledger, "\n".join(known) + "\n")
+            open_candidates = ordered(known)
+            write_note(table(open_candidates) if open_candidates else "no open candidates")
+    except OSError as error:
+        print(f"candidates: {error}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -320,28 +322,31 @@ def record_outcome(identity: str, state: str, applied: str, ledger: Path, *, wai
 
     Returns whether the line changed, and the line.
     """
-    from scripts.review_links import efficiency_reviews, review_events
     reason = review_events.require_waiting_why(waiting_why) if state == "deferred" else ""
     found = EFFICIENCY_ID.match(identity)
     assert found is not None
-    lines = read_lines(ledger)
-    index = int(found["number"]) - 1
-    line = lines[index] if index < len(lines) else ""
-    words = outcome_words(state, applied, now().astimezone(user_zone()).strftime("%Y-%m-%d"))
-    unchanged = line.endswith(" — " + words)
-    if not unchanged and open_candidate(line) is None:
-        raise OutcomeRefused(f"E{index + 1} is not an open candidate in {ledger}")
-    if reason:
-        _ = efficiency_reviews.record(ledger, f"E{found['number']}", "Deferred: " + reason, review_events.KeepMark(),
-                                       who="filer", waiting_why=reason)
-    if unchanged:
-        return False, line
-    lines[index] = OPEN_END.sub(" — " + words, lines[index])
-    write_text_atomic(ledger, "\n".join(lines) + "\n")
-    if ledger == state_root() / "ledger.md":
-        open_candidates = ordered(lines)
-        write_note(table(open_candidates) if open_candidates else "no open candidates")
-    return True, lines[index]
+    with efficiency_reviews.ledger_lock(ledger):
+        lines = read_lines(ledger)
+        index = int(found["number"]) - 1
+        line = lines[index] if index < len(lines) else ""
+        words = outcome_words(state, applied, now().astimezone(user_zone()).strftime("%Y-%m-%d"))
+        unchanged = line.endswith(" — " + words)
+        if not unchanged and open_candidate(line) is None:
+            raise OutcomeRefused(f"E{index + 1} is not an open candidate in {ledger}")
+        if reason:
+            _ = efficiency_reviews.record(ledger, f"E{found['number']}", "Deferred: " + reason, review_events.KeepMark(),
+                                          who="filer", waiting_why=reason)
+        if unchanged:
+            return False, line
+        lines[index] = OPEN_END.sub(" — " + words, lines[index])
+        write_text_atomic(ledger, "\n".join(lines) + "\n")
+        try:
+            if ledger == state_root() / "ledger.md":
+                open_candidates = ordered(lines)
+                write_note(table(open_candidates) if open_candidates else "no open candidates")
+        except (OSError, conf.Unusable) as error:
+            print(f"candidates: outcome saved in {ledger}; cannot update the nightly summary: {error}", file=sys.stderr)
+        return True, lines[index]
 
 
 def outcome(identity: str, state: str, applied: str, ledger: Path, *, waiting_why: str = "") -> int:

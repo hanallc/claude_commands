@@ -12,8 +12,9 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, tzinfo
+from enum import Enum
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
@@ -68,10 +69,14 @@ def records() -> list[ListRecord]:
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
-def waiting_updates(_request: console.NewsRequest) -> frozenset[str]:
+def waiting_updates(request: console.NewsRequest, *,
+                    status: change_page.DeliveryStatus | Literal["standalone"] = "standalone") -> frozenset[str]:
     """Identify each unread update by its record and time."""
+    if status == "standalone":
+        status = change_page.DeliveryStatus(request.root)
     return frozenset(f"{entry.key}/{entry.item.unread_since.isoformat()}" for entry in records()
-                     if isinstance(entry.item.unread_since, datetime))
+                     if isinstance(entry.item.unread_since, datetime)
+                     and isinstance(the_list.question_visibility(entry.keeper, entry.item, status), the_list.QuestionResends))
 
 
 def owner_name(members: staff.StaffSnapshot, owner: the_list.ItemOwner) -> str:
@@ -127,7 +132,8 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
     return html.escape(cast(str, value)) or "Not recorded"
 
 
-def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames) -> str:
+def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
+                   questions: Mapping[str, question_record.Question]) -> str:
     content = change.what
     by = " <small>— " + names.html(change.source, owner_name(names.members, staff.StaffId(change.source))) + "</small>"
     if isinstance(content, the_list.FieldChange):
@@ -141,10 +147,15 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = label + by + change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
         body = "Answered question " + html.escape(content.question_id) + by
+        question = questions.get(content.question_id)
+        if question is not None and question.answer is not None:
+            body += page_question.answered_question_html(question)
     elif isinstance(content, the_list.MarkedRead):
         body = "Marked read" + by
     elif isinstance(content, the_list.Reopened):
         body = "Reopened" + by
+    elif isinstance(content, the_list.Unparked):
+        body = "Unparked" + by
     elif isinstance(content, the_list.ReviewLinksChanged):
         body = content.action + ": " + html.escape(", ".join(content.keys)) + by
     elif isinstance(content, the_list.EvidenceCopyRemoved):
@@ -191,7 +202,8 @@ def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
     return signed_token(secret, keeper, identity, prefix)
 
 
-def feedback_form(entry: ListRecord, secret: str) -> str:
+def feedback_form(entry: ListRecord, secret: str, resends: tuple[the_list.QuestionResend, ...] = (),
+                  *, parking_label: str = "") -> str:
     request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item)).format()
     token = signed_token(secret, entry.keeper, entry.item.id, request)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
@@ -199,16 +211,33 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
                      for name, value in fields.items())
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
-    return ('<form method="post" data-feedback-form>' + hidden + '<div class="list-actions">' + read
-            + '<button name="action" value="remove">Remove</button>'
+    parked = '' if parking_label else ' hidden'
+    unpark = ' hidden' if entry.item.state == the_list.ItemState.CLOSED else parked
+    note = 'Parked until ' + parking_label if parking_label else ''
+    retry = "".join(question_resend(resend) for resend in resends)
+    return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
+            + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
+            + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button>'
             + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
             + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
-            + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div>'
-            + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
+            + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
+            + retry
+            + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
             + '<button name="action" value="question" disabled>Ask question</button>'
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
+
+
+def question_resend(resend: the_list.QuestionResend) -> str:
+    question = resend.question
+    notice = {"failed": "did not reach morty", "ready": "is ready to send",
+              "prepared": "is ready to send"}.get(resend.delivery.state, "may not have reached morty")
+    block = resend.delivery
+    action = (f'<p>{html.escape(block.reason)}</p>' if isinstance(block, change_page.ResendBlocked)
+              else f'<button name="action" value="resend-{question.question_id}">Resend question {question.question_id}</button>')
+    return (f'<section class="page-question"><h3>Question {question.question_id} {notice}</h3>'
+            + f'<p>{html.escape(question.words)}</p>' + action + '</section>')
 
 
 def review_place(keys: tuple[str, ...]) -> str:
@@ -247,9 +276,15 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
     return count_link("review", review_place((review.key,)), label)
 
 
+WAITING_NOTE = "The producer will answer."
+
+
 def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
-            names: staff_names.StaffNames) -> str:
+            names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionResends,
+            *, parking_label: str) -> str:
     item = entry.item
+    if isinstance(visibility, the_list.WaitingForAnswer):
+        return f'<p data-waiting-note>{WAITING_NOTE}</p>'
     sections = ''.join(f'<section><h3>{FIELD_LABELS[field]}</h3>{field_html(field, value, today, names)}</section>'
                        for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
@@ -264,20 +299,20 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     if item.reviews:
         cards = (review_card(identity, reviews) for identity in item.reviews)
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
-    sections += ''.join(page_question.open_question_html(question) if question.answer is None
-                        else page_question.answered_question_html(question) for question in item.questions)
+    questions = {question.question_id: question for question in item.questions}
     # The log appends entries in storage order. Each index stays stable when new entries arrive.
-    log = ''.join(reversed([log_entry_html(change, index, today, names) for index, change in enumerate(item.log)
+    log = ''.join(reversed([log_entry_html(change, index, today, names, questions) for index, change in enumerate(item.log)
                             if not the_list.is_page_request_receipt(change)]))
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
-    return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
+    return (f'<p data-waiting-note hidden>{WAITING_NOTE}</p><div class="list-panel"><div>' + sections
+            + feedback_form(entry, secret, visibility.questions, parking_label=parking_label)
             + '</div><section class="list-log-panel"><h3>Log · newest first</h3>'
             + f'<div class="list-log-scroll" id="{log_id}" tabindex="0" role="region" aria-label="Log · newest first">'
             + '<ol class="list-log">' + log + '</ol></div></section></div>')
 
 
 def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str,
-              reviews: Mapping[str, review_items.ReviewItem],
+              reviews: Mapping[str, review_items.ReviewItem], status: change_page.DeliveryStatus,
               names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT) -> str:
     names = staff_names.for_page(names, members)
     item = entry.item
@@ -285,19 +320,24 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
     producer = owner_name(members, item.producer)
     unread = isinstance(item.unread_since, datetime)
     parked = isinstance(item.parked_until, datetime) and item.parked_until > today
+    visibility = the_list.question_visibility(entry.keeper, item, status)
+    waiting = isinstance(visibility, the_list.WaitingForAnswer)
     eta = item.eta.earliest if isinstance(item.eta, the_list.EtaRange) else item.eta
     eta_sort: tuple[int, float | str] = (0, eta.timestamp()) if isinstance(eta, datetime) else (1, eta_text(eta, today).casefold())
     values = (item.number, owner.casefold(), producer.casefold(), item.title.casefold(), item.state.value.casefold(),
               item.next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
     attributes = {"key": entry.key, "number": str(item.number), "owner": str(item.owner), "producer": item.producer,
                   "keeper-produces": str(item.producer == entry.keeper).lower(), "state": item.state.value,
-                  "unread": str(unread).lower(), "parked": str(parked).lower(), "title": item.title.lower(),
+                  "unread": str(unread).lower(), "parked": str(parked).lower(), "waiting-for-answer": str(waiting).lower(),
+                  "title": item.title.lower(),
                   "owner-name": owner.lower(),
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
     panel = f'list-detail-{index}'
+    toggle_id = "list-toggle-" + html.escape(entry.key.replace("/", "-"), quote=True)
     number = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}" '
-              + f'aria-label="Show item {item.number}"><span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
+              + f'aria-label="Show item {item.number}" id="{toggle_id}">'
+              + f'<span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
     title = '<strong>' + html.escape(item.title) + '</strong>'
     if item.unit:
         title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
@@ -311,8 +351,9 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
             state += '<small>' + label + field_html("next_check", item.next_check, today, names) + '</small>'
         elif isinstance(item.next_check, the_list.CheckCondition):
             state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
-    if parked and isinstance(item.parked_until, datetime):
-        state += '<small data-parked-note>Parked until ' + field_html("parked_until", item.parked_until, today, names) + '</small>'
+    parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
+    if parking_label:
+        state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
     if item.reviews:
         state += '<small>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
@@ -328,9 +369,11 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
              title, state, field_html("next_step", item.next_step, today, names), field_html("eta", item.eta, today, names), update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
-    hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
+    hidden = ' hidden' if waiting or parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
-            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">' + details(entry, today, secret, reviews, names) + '</td></tr></tbody>')
+            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
+            + details(entry, today, secret, reviews, names, visibility, parking_label=parking_label)
+            + '</td></tr></tbody>')
 
 
 @dataclass(frozen=True)
@@ -346,25 +389,53 @@ class ListQuestionDelivery:
     status: change_page.DeliveryStatus
 
 
+class UnparkOutcome(Enum):
+    """The Unpark result to report on the List page."""
+
+    CLEARED = "cleared"
+    CLEARED_NEWER_PARKING_ACTIVE = "cleared_newer_parking_active"
+    EXPIRED = the_list.UnparkNoChangeReason.EXPIRED.value
+    NO_ACTIVE_PARKING = the_list.UnparkNoChangeReason.NO_ACTIVE_PARKING.value
+
+
+@dataclass(frozen=True)
+class ListUnparkSubmission:
+    outcome: UnparkOutcome
+    delivery: ListFeedbackDelivery | change_page.NoMessageDelivery
+
+    def response_outcome(self, current: SavedActionState) -> UnparkOutcome:
+        if self.outcome is UnparkOutcome.CLEARED and current["parked"] == "true":
+            return UnparkOutcome.CLEARED_NEWER_PARKING_ACTIVE
+        return self.outcome
+
+
+ListActionSubmission = ListFeedbackDelivery | ListQuestionDelivery | ListUnparkSubmission | change_page.NoMessageDelivery
+
+
 class SavedActionState(TypedDict):
     unread: str
     unread_sort: float
     item_state: str
     parked: str
     parked_until: str
+    waiting_for_answer: str
 
 
-def saved_action_state(keeper: str, identity: str) -> SavedActionState:
-    item = the_list.load(staff.StaffId(keeper), identity)
+def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None) -> SavedActionState:
+    owner = staff.StaffId(keeper)
+    item = the_list.load(owner, identity)
     zone = user_zone()
     today = the_list.now()
     parked_until = (parked_label(item.parked_until, zone)
                     if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
     unread = item.unread_since
+    reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
+    waiting = isinstance(the_list.question_visibility(owner, item, reading), the_list.WaitingForAnswer)
     return {"unread": str(isinstance(unread, datetime)).lower(),
             "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
             "item_state": item.state.value,
-            "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
+            "parked": str(bool(parked_until)).lower(), "parked_until": parked_until,
+            "waiting_for_answer": str(waiting).lower()}
 
 
 def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
@@ -376,8 +447,7 @@ def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
             pass
 
 
-def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None
-           ) -> ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery:
+def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None) -> ListActionSubmission:
     """Accept signed item actions and save their notices for morty."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
@@ -398,11 +468,14 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
                                page_request=the_list.PageRequest(request, "read", words))
         return change_page.NoMessageDelivery()
     item = the_list.load(morty.id, identity)
-    if action == "question":
+    resend = re.fullmatch(r"resend-(Q[1-9]\d*)", action)
+    if action == "question" or resend is not None:
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status)
+        question = (the_list.resend_question(morty.id, identity, resend[1], request, status) if resend is not None
+                    else the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status))
         if isinstance(question, change_page.MessageDelivery):
-            _mark_seen_update_read(morty.id, item, prefix.seen_update)
+            if resend is None:
+                _mark_seen_update_read(morty.id, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
         return question
     if action == "remove":
@@ -416,6 +489,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         label = parked_label(parked_until, user_zone())
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
         changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
+    elif action == "unpark":
+        notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
+        changed = the_list.unpark(morty.id, identity, source=the_list.PAGE_SOURCE, notice=notice).item
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(morty.id, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
@@ -424,9 +500,13 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     else:
         raise question_record.AnswerRefused("enter words for morty")
     saved_notice = the_list.feedback_requests(changed).get(request)
-    if saved_notice is not None and saved_notice.state == "pending":
-        return ListFeedbackDelivery(morty.id, identity, request)
-    return change_page.NoMessageDelivery()
+    delivery = (ListFeedbackDelivery(morty.id, identity, request)
+                if saved_notice is not None and saved_notice.state == "pending" else change_page.NoMessageDelivery())
+    if action == "unpark":
+        outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
+                   if saved_notice is None else UnparkOutcome.CLEARED)
+        return ListUnparkSubmission(outcome, delivery)
+    return delivery
 
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
@@ -441,8 +521,9 @@ def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> 
     return ()
 
 
-def deliver(delivery: ListFeedbackDelivery | ListQuestionDelivery | change_page.NoMessageDelivery) -> None:
+def deliver(submission: ListActionSubmission) -> None:
     """Send saved List words with the shared retry and alert helpers."""
+    delivery = submission.delivery if isinstance(submission, ListUnparkSubmission) else submission
     if isinstance(delivery, change_page.NoMessageDelivery):
         return
     if isinstance(delivery, ListQuestionDelivery):
@@ -541,11 +622,14 @@ def staff_chips(labels: Mapping[str, str], names: staff_names.StaffNames) -> lis
             for value, label in sorted(labels.items(), key=lambda pair: (pair[1].casefold(), pair[0]))]
 
 
-def render(root: Path, *, include_counts: bool = True) -> bytes:
+def render(root: Path, *, include_counts: bool = True,
+           status: change_page.DeliveryStatus | Literal["standalone"] = "standalone") -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
     items = records()
+    if status == "standalone":
+        status = change_page.DeliveryStatus(root)
     reviews = ({review.key: review for review in review_items.read(root, members=members)}
                if any(entry.item.reviews for entry in items) else {})
     zone = user_zone()
@@ -555,7 +639,7 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
     producers = staff_chips({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items}, names)
     states = [record_table.Chip(state.value, state.value) for state in the_list.ItemState]
     shows = [record_table.Chip(value, label) for value, label in SHOWS if value != 'all']
-    headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
+    headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
@@ -571,30 +655,41 @@ def render(root: Path, *, include_counts: bool = True) -> bytes:
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
                + '<div data-record-filters><div class="list-toolbar">'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
-               + '<div class="list-expansion">' + expansion + '</div></div>'
-               + record_table.chip_row('Show', shows, 'open')
+               + '</div>'
+               + '<div class="list-show-filter">' + record_table.chip_row('Show', shows, 'open')
+               + '<p data-hidden-action-status role="status" hidden></p></div>'
                + record_table.chip_row('State', states, 'all')
                + record_table.chip_row('Owner', owners, 'all')
                + record_table.chip_row('Producer', producers, 'all')
-               + '<span data-list-count role="status" aria-live="polite"></span></div>'
+               + '</div>'
                + '<p data-missing-item role="status" hidden></p>'
-               + '<p data-hidden-action-status role="status" hidden></p>'
-               + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:6%"><col style="width:8%">'
+               + '<div class="list-table-tools"><div class="list-expansion">' + expansion + '</div>'
+               + '<span data-list-count role="status" aria-live="polite"></span></div>'
+               + '<div class="list-table"><table aria-label="The List"><colgroup><col class="list-number-column">'
+               + '<col style="width:8%">'
                + '<col style="width:10%"><col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
                + '<col style="width:8%"></colgroup><thead><tr>' + headers + '</tr></thead>'
-               + ''.join(item_rows(entry, members, today, index, secret, reviews, names) for index, entry in enumerate(items)) + '</table>'
+               + ''.join(item_rows(entry, members, today, index, secret, reviews, status, names)
+                         for index, entry in enumerate(items)) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>' + counts + '</div><script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
-.list-toolbar{display:flex;justify-content:flex-end;align-items:center;gap:6px;margin-bottom:10px}
+.list-toolbar{display:flex;justify-content:flex-end;align-items:center;margin-bottom:10px}
 .list-toolbar .record-filter-words{min-width:0;margin:0}
-.list-expansion{display:flex;gap:6px}
-.list-expansion button{justify-content:center;width:36px;padding:0;cursor:pointer}
-.list-expansion svg{width:18px;height:18px}
+.list-show-filter [data-hidden-action-status]{margin:0 0 8px calc(5rem + 8px)}
+.list-table-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.list-table-tools [data-list-count]{min-width:0;color:var(--ink-2);font-size:13px;text-align:right;overflow-wrap:anywhere}
+.list-number-column{width:6%}
+@media(960px < width <= 1100px){.list-number-column{width:62px}}
+.list-expansion{display:flex;flex:none;gap:6px}
+.list-expansion button{box-sizing:border-box;display:grid;place-items:center;width:26px;height:26px;min-height:0;padding:0;cursor:pointer}
+.list-expansion svg{width:16px;height:16px}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
-.list-actions{position:relative}.list-park>[data-later-menu]{left:0;right:auto}
+.list-actions{position:relative}
+.list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
+.list-row.open [data-parked-note]{display:none}
 .list-table:has(.list-park>[data-later-menu]:not([hidden])),
 .list-table tbody:has(.list-park>[data-later-menu]:not([hidden])){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
@@ -608,6 +703,7 @@ STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 @media(max-width:960px){
+.list-expansion button{width:34px;height:34px}
 .list-table .list-row td[data-label="Producer"]{font-size:inherit}.list-table .list-row td[data-label="Item"]{font-size:17px}
 .list-table .list-row td[data-label="State"]::before{content:none}
 .list-table [data-keeper-produces=true] .list-row td[data-label="Producer"]{display:none}
@@ -620,6 +716,12 @@ SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIM
 let content=document.querySelector('[data-list]');
 let saving=0;
 const drafts=new Map();
+const unparkMessages={
+ cleared:'Unparked',
+ cleared_newer_parking_active:'The original Unpark cleared parking. A newer parking time is active',
+ expired:'Parking time already expired',
+ no_active_parking:'No active parking time to clear',
+};
 /** @type {Map<string, {index: string, offset: number}>} */
 const logPositions=new Map();
 function visibleLogs(){
@@ -666,7 +768,7 @@ function syncUnread(item,form,unread,unreadSort){
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
   if(!read){const button=document.createElement('button');button.name='action';button.value='read';
-   button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);form.querySelector('.list-actions').prepend(button);}
+   button.textContent='Mark read';button.disabled=Boolean(form.dataset.sending);form.querySelector('[value="remove"]').after(button);}
  }else{
   dot?.remove();read?.remove();
   if(!update.querySelector('[aria-label="No unread update"]')){const empty=document.createElement('span');
@@ -678,6 +780,7 @@ const tableView=createRecordTable({content:()=>content,
  filters:['state','producer'],
  beforeApply:rememberLogPositions,
  applied:restoreLogPositions,
+ linkedOnly:data=>data.waitingForAnswer==='true',
  missingItem:key=>{
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
   return number ? 'Item #'+number+' is not on the List' : '';
@@ -697,6 +800,23 @@ const tableView=createRecordTable({content:()=>content,
   items.filter(item=>item.dataset.state==='Waiting for nate' && item.dataset.parked!=='true').length+' need you · '+
   items.filter(item=>item.dataset.unread==='true').length+' unread',
 });
+function listOwnsFocus(){
+ if(parent===window || document.hasFocus()) return true;
+ const frame=window.frameElement;
+ return frame!==null && frame.ownerDocument.activeElement===frame;
+}
+function focusAfterQuestion(item){
+ const rows=[...content.querySelectorAll('[data-list-item]')],index=rows.indexOf(item);
+ const candidates=[...rows.slice(index+1),...rows.slice(0,index).reverse()];
+ for(const row of candidates){
+  const toggle=row.querySelector('.list-toggle');
+  if(toggle?.getClientRects().length){
+   toggle.focus();
+   if(document.activeElement===toggle) return;
+  }
+ }
+ content.querySelector('#list-search').focus();
+}
 function bindListControls(){
  content.querySelectorAll('[data-list-expansion]').forEach(button=>button.addEventListener('click',()=>{
   tableView.setShownExpanded(button.dataset.listExpansion==='expand');
@@ -704,12 +824,14 @@ function bindListControls(){
  content.querySelectorAll('[data-feedback-form]').forEach(form=>{
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
+  const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
   notice.textContent=tableView.actionNotice(item);
   const confirmed={state:item.dataset.state,parked:item.dataset.parked,
    unread:item.dataset.unread==='true',unreadSort:JSON.parse(item.dataset.sortValues)[7]};
   const syncConfirmed=()=>{
    item.dataset.state=confirmed.state;
    item.dataset.parked=confirmed.parked;
+   unpark.hidden=confirmed.parked!=='true' || confirmed.state==='Closed';
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
   };
   const words=form.elements.words,until=form.elements.until;
@@ -737,8 +859,10 @@ function bindListControls(){
    retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
-   const action=event.submitter?.value || 'tell';
+   const submitter=event.submitter,action=submitter?.value || 'tell';
+   const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
+   const asksQuestion=action==='question' || action.startsWith('resend-');
    if(usesWords && !words.value.trim()) return;
    const retry=matching(action);
    let parkingTime=retry?.parkingTime ?? until.value;
@@ -748,8 +872,8 @@ function bindListControls(){
      if(!(at>Date.now())){notice.textContent='Choose a future parking time.';return;}
      parkingTime=new Date(at).toISOString();
     }
-    closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
    }
+   if(action==='park' || action==='unpark') closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',action);
@@ -757,11 +881,16 @@ function bindListControls(){
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
    retainDraft();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
+   const hadFocus=asksQuestion && item.contains(document.activeElement);
+   let focusChoice,waiting=false;
+   const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
+   if(hadFocus) document.addEventListener('focusin',trackFocus);
    let buttons=[...item.querySelectorAll('button')],saved=false,refused=false;
    buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove'){
     item.dataset.state='Closed';
+    unpark.hidden=true;
     syncUnread(item,form,false,0);
    }
    if(action==='park') item.dataset.parked='true';
@@ -770,16 +899,19 @@ function bindListControls(){
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
-    refused=!response.ok && (action!=='question' || response.status<500);
+    refused=!response.ok && (!asksQuestion || response.status<500);
     const result=await response.json();
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
     if(typeof result.item_state==='string') confirmed.state=result.item_state;
     const closed=confirmed.state==='Closed',unread=!closed && result.unread==='true';
-    notice.textContent=action==='remove' ? 'Removed' : action==='park' ? 'Parked' : action==='read' ? 'Marked read' :
-     action==='question' ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
+    const unparked=action==='unpark' && result.unpark_outcome==='cleared';
+    const message=action==='remove' ? 'Removed' : action==='park' ? 'Parked' :
+     action==='unpark' ? (unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable') : action==='read' ? 'Marked read' :
+     asksQuestion ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     if(usesWords && words.value===data.get('words')) words.value='';
+    if(unparked) until.value='';
     if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
     if(closed || ['true','false'].includes(result.unread)){
      confirmed.unread=unread;
@@ -788,15 +920,33 @@ function bindListControls(){
     syncConfirmed();
     const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
     state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
-    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[3]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
+    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
     if(typeof result.parked_until==='string'){
      let note=item.querySelector('[data-parked-note]');
+     parkedDetail.hidden=!result.parked_until;
+     parkedDetail.textContent=result.parked_until ? 'Parked until '+result.parked_until : '';
      if(result.parked_until){
       if(!note){note=document.createElement('small');note.dataset.parkedNote='';state.parentElement.append(note);}
-      note.textContent='Parked until '+result.parked_until;
+      note.textContent=parkedDetail.textContent;
      }else note?.remove();
     }
-    tableView.applyAction();
+    waiting=result.waiting_for_answer==='true';
+    if(waiting){
+     tableView.closeCard(key);
+     item.dataset.waitingForAnswer='true';
+    }
+    if(action==='unpark'){
+     const label='Item #'+item.dataset.number;
+     tableView.showActionResult(item,submission,label,
+      {kind:'success',message,hiddenMessage:unparked ? label+' unparked.' : label+': '+message+'.'});
+    }else{
+     notice.textContent=message;
+     tableView.applyAction();
+    }
+    if(waiting){
+     item.querySelector('.list-panel')?.remove();
+     item.querySelector('[data-waiting-note]').hidden=false;
+    }
    }catch(error){
     const wasHidden=item.hidden;
     if(refused) syncConfirmed();
@@ -810,15 +960,43 @@ function bindListControls(){
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
     buttons=[...item.querySelectorAll('button')];
-    delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);syncTell();
+    delete form.dataset.sending;buttons.forEach(button=>button.disabled=false);syncTell();
     retainDraft();
+    if(focusUnpark && document.hasFocus() &&
+       (document.activeElement===document.body || document.activeElement===unpark)){
+     const target=saved && item.hidden ? content.querySelector('[data-filter-row="show"] [aria-pressed="true"]')
+      : !saved || !unpark.hidden ? unpark : item.querySelector('.list-toggle');
+     if(target?.getClientRects().length){
+      target.focus({preventScroll:true});
+      if(saved && item.hidden){
+       const status=content.querySelector('[data-hidden-action-status]');
+       const top=target.getBoundingClientRect().top;
+       const inset=document.querySelector('[data-page-status]').offsetHeight+12;
+       if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
+        scrollBy({top:Math.floor(top-inset),behavior:'instant'});
+      }
+     }
+    }
     if(refused && action==='park'){
      await tableView.settled();
-     if(document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
+     if(listOwnsFocus() && document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
       parkToggle.focus({preventScroll:true});
      }
     }
-    if(saved) void pageRefresh.refresh(true);
+    if(hadFocus && !waiting && !item.hidden && document.activeElement===document.body)
+     await tableView.rowSettled(item);
+    saving--;
+    if(hadFocus){
+     document.removeEventListener('focusin',trackFocus);
+     if(listOwnsFocus()){
+      if((waiting || item.hidden) && (!focusChoice || item.contains(focusChoice))) focusAfterQuestion(item);
+      else if(!focusChoice && !item.hidden && document.activeElement===document.body){
+       const target=!saved && submitter?.matches(':enabled') ? submitter : item.querySelector('.list-toggle');
+       target.focus({preventScroll:true});
+      }
+     }
+    }
+    if(saved && item.dataset.waitingForAnswer!=='true') void pageRefresh.refresh(true);
    }
   });
  });
@@ -832,8 +1010,10 @@ async function refresh(_supersede=false,current=()=>true){
  if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
  if(saving || dateTimePickerOpen(content) || !current()) return;
- const top=scrollY,focus=document.activeElement?.id;
- const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;
+ const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
+ const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
+ const action=field?.matches('button[name="action"]') ? field.value : '';
+ const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
  rememberLogPositions();
  const surviving=new Set([...fresh.querySelectorAll('[data-list-item]')].map(item=>item.dataset.key));
  for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
@@ -841,6 +1021,11 @@ async function refresh(_supersede=false,current=()=>true){
  bindListControls();tableView.replace();
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
+ if(focusedRow){
+  const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);
+  const button=action && row?.querySelector('[data-detail]:not([hidden]) button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
+  (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
+ }
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 const listReturnParam='list-return',listReturnsKey='console.list.review-returns';

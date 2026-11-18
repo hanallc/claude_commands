@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import atomic_file
 from scripts.production import investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import change_page, question_record, review_items
+from scripts.review_links import change_page, list_page, question_record, review_items
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -765,6 +765,25 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(saved.questions, (replace(closed.questions[0], answer=answer),))
         self.assertEqual(replace(saved, updated=closed.updated, log=closed.log, questions=closed.questions), closed)
 
+    def test_list_command_keeps_an_item_while_its_question_waits(self) -> None:
+        item = self.add("Check the List")
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        shown = list_page.render(status.root, include_counts=False).decode()
+        self.assertRegex(shown, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+        request = the_list.PageRequest("ask", "question", "Which check passed?")
+        _ = the_list.ask_question(MORTY.id, item.id, request, status)
+        waiting = list_page.render(status.root, include_counts=False, status=status).decode()
+        self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]* hidden>')
+        result, output, errors = self.command("list")
+        self.assertEqual((result, errors), (0, ""))
+        self.assertIn(item.title, output)
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "The browser check."),
+                         (0, f"answered {item.id} Q1\n", ""))
+        answered = the_list.load(MORTY.id, item.id)
+        returned = list_page.render(status.root, include_counts=False).decode()
+        self.assertRegex(returned, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
+        self.assertEqual(answered.unread_since, START)
+
     def test_typed_log_refuses_invalid_fields(self) -> None:
         item = self.add()
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
@@ -1013,6 +1032,56 @@ class TheListTests(unittest.TestCase):
             self.assertIn("| 1 |", self.command("list")[1])
         self.assertEqual(self.command("park", "--id", item.id, "--until", "", "--source", "nate"), (0, "", ""))
         self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
+
+    def test_unpark_clears_active_parking_and_saves_one_notice(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        parked = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
+        words = "List page: nate unparked item 1."
+        notice = the_list.PageItemNotice("unpark-1", words, "unpark")
+        with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+            result = the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice)
+        save.assert_called_once()
+        self.assertEqual(result, the_list.SavedEdit(parked, the_list.load(MORTY.id, item.id)))
+        saved = result.item
+        self.assertIs(saved.parked_until, the_list.NoTimestamp.UNSET)
+        self.assertEqual(saved.state, parked.state)
+        self.assertEqual(saved.log[-2].what, the_list.Unparked())
+        self.assertEqual(saved.log[-1].what, the_list.PageFeedback("unpark-1", words, action="unpark"))
+        self.assertEqual(len(saved.log), len(parked.log) + 2)
+        self.assertEqual(the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice),
+                         the_list.UnchangedEdit(saved))
+
+        parked_again = the_list.park(MORTY.id, item.id, START + timedelta(days=2), source="nate")
+        self.assertEqual(the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice),
+                         the_list.UnchangedEdit(parked_again))
+
+    def test_unpark_without_active_parking_changes_nothing(self) -> None:
+        item = self.add()
+        expired = the_list.park(MORTY.id, item.id, START, source="nate")
+        plain = self.add()
+        with patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save:
+            for current in (expired, plain):
+                with self.subTest(item=current.id):
+                    self.assertEqual(the_list.unpark(MORTY.id, current.id, source="nate"), the_list.UnchangedEdit(current))
+                    self.assertEqual(the_list.load(MORTY.id, current.id), current)
+        save.assert_not_called()
+
+    def test_unpark_replays_a_receipt_without_a_saved_reason(self) -> None:
+        item = self.add()
+        _ = the_list.park(MORTY.id, item.id, START, source="nate")
+        notice = the_list.PageItemNotice("unpark-1", "List page: nate unparked item 1.", "unpark")
+        _ = the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice)
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        text = path.read_text()
+        reason = ', "unpark_no_change": "expired"'
+        self.assertIn(reason, text)
+        _ = path.write_text(text.replace(reason, "", 1))
+
+        parked = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
+        replayed = the_list.unpark(MORTY.id, item.id, source=the_list.PAGE_SOURCE, notice=notice)
+        self.assertEqual(replayed, the_list.UnchangedEdit(parked))
+        self.assertEqual(the_list.unpark_no_change_reason(replayed.item, notice.request),
+                         the_list.UnparkNoChangeReason.NO_ACTIVE_PARKING)
 
     def test_default_order_uses_waiting_unread_then_next_check(self) -> None:
         first = self.add("Later check", changes={"next_check": START + timedelta(hours=2)})
