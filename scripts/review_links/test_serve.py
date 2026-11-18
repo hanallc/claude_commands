@@ -205,7 +205,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(cache.get().records, {})
 
     def test_new_item_publishes_native_records_before_success(self) -> None:
-        from scripts.review_links.test_review_submissions import EVIDENCE, PNG
+        from scripts.review_links.test_review_submissions import EVIDENCE, PNG, identify_fixture_image
 
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
@@ -234,6 +234,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(self.server, 'delivery_status', case.status),
               patch.object(handler, 'json_response', see_published),
               patch.object(review_items, 'read', side_effect=AssertionError('Send scanned Review.')),
+              patch.object(review_submissions, '_identify_image', autospec=True, side_effect=identify_fixture_image),
               patch.object(change_page, 'send_to_staff', side_effect=message_sent) as send):
             for kind in new_item_dialog.SubmissionKind:
                 with self.subTest(kind=kind):

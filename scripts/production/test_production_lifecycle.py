@@ -1275,8 +1275,8 @@ class LifecycleTests(LifecycleFixture):
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
         self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, "
-                         + rf"outstanding/{owner_id}\.json, {owner_id}/$")
-        self.assertFalse(any(path.exists() for path in own))
+                         + rf"outstanding/{owner_id}\.lock, outstanding/{owner_id}\.json, {owner_id}/$")
+        self.assertFalse(any(path.exists() for path in (*own, state / "outstanding" / f"{owner_id}.lock")))
         self.assertFalse((state / owner_id).exists())
         self.assertTrue(all(path.exists() for path in other))
 
