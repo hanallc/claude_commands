@@ -909,6 +909,110 @@ The test server joins its request handlers before fixture cleanup and gives each
 1. One dark desktop shot of a question card with a command block and its copy button.
 2. The new check fails without the fix. The Review page, change page and page frame suites pass. basedpyright: 0 errors, 0 warnings.
 
+### Phase 64 — An Ask never replaces a different open question  · status: todo
+**Depends on:** 60, 63
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-17), from the admin-console reviewask reviews: an ordinary Ask can replace a legacy JSON Question that has the same title and asker before migration (`scripts/production/update_registration.py` about line 1573 on main). An open question is lost with no notice.
+
+**Spec:**
+1. Fix it at the source: the Ask write never replaces a different open question.
+2. A legacy record with the same title and asker is migrated first, or the Ask refuses with a named reason. Choose the path that keeps the open question and gives the asker a clear result.
+3. Add a test that fails on main: a legacy JSON Question is open, an ordinary Ask with the same title and asker runs, and the legacy question stays open.
+
+**Files:**
+- `scripts/production/update_registration.py`, its test module
+
+**Workers:** 1 writer (`design`).
+
+**Order:** admin-console reviewask changes the same lines. Build on the reviewask tip that admin-console names.
+
+**Acceptance gate:**
+1. The new check fails on main.
+2. basedpyright: 0 errors, 0 warnings. The update_registration suite passes.
+
+### Phase 65 — A same-tab link shows a just-closed Change  · status: todo
+**Depends on:** 60, 63
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18), from the admin-console reviewscroll reviews: on main, a same-tab link can leave a just-closed Change hidden behind its saved marker (`scripts/review_links/review_page.py`, the fragment handler and the visibility check).
+
+**Spec:**
+1. Find the cause from the admin-console review text and the live code.
+2. A link opened in the same tab always shows the Change it names, and a just-closed Change never stays hidden behind its saved marker.
+3. Add a browser check that fails on main.
+
+**Files:**
+- `scripts/review_links/review_page.py`, `scripts/review_links/test_review_page.py`
+
+**Workers:** 1 writer (`design`).
+
+**Order:** build on the admin-console reviewscroll tip (about 02:00 EST), after phases 60 and 63.
+
+**Acceptance gate:**
+1. The new check fails on main.
+2. The Review page suite passes. basedpyright: 0 errors, 0 warnings.
+
+### Phase 66 — An asked image leaves the page until its answer  · status: done
+**Depends on:** none
+
+**Result:** Ask question removes the image or pair from the Images page and every count. The card returns when the owner answers, with the question, the answer and all four buttons. A direct link to a waiting image shows one line, with no buttons. A question that did not reach the owner (unsaved intent, failed send or unknown result) keeps its card, in the counts, with the resend notice. One rule (`images.ImageReview.visible`) serves the page and the console count. Images 55 tests and Review 57 tests pass; basedpyright is clean.
+
+#### Work Order
+
+**Goal:** the user (2026-11-18, via the sdlc showrunner), on the Images page question from phase 48: "you implemented the image page different - when i ask a question you keep it on the page - stating that the question was asked - i don't want that - i want it to work liek reviews where it goes awy and only comes back when it has been answered".
+
+**Spec (design settled by the showrunner):**
+1. When Ask question saves, the image or pair leaves the Images page and every count at once. No "question asked" card stays.
+2. It returns to the page only when the owner saves an answer. The card then shows the question and the answer, with all answer buttons.
+3. A direct link to a waiting image shows one line that the owner will answer, with no buttons, as the Review page does for an asked row.
+4. The image stays in the store while it waits. `images.py answer` and `images.py delete` are unchanged.
+5. Use the Review page's existing code path for the asked state where one exists; no copy.
+
+**Files:**
+- `scripts/review_links/images.py`, `scripts/review_links/image_store.py`, `scripts/review_links/review_page.py`, `scripts/review_links/change_browser.py`, `scripts/review_links/page_frame.py`, `scripts/review_links/serve.py`
+- `scripts/review_links/test_images.py`, `scripts/review_links/test_review_page.py`
+
+**Workers:** 1 writer (`design`).
+
+**Order:** ahead of phases 60, 64 and 65. It ships alone on origin/main.
+
+**Acceptance gate:**
+1. One dark desktop shot of the Images page with a returned card that shows the question and the answer.
+2. Tests: Ask question removes the card and its counts; an answer brings it back with the question, the answer and all buttons; a direct link to a waiting image shows the one line and no buttons. Each fails on main.
+3. The Images and Review page suites pass. basedpyright: 0 errors, 0 warnings.
+
+### Phase 67 — A unit name that ends in -unit is refused  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the Builds page showed a unit as `organon-unit`, because its staff row kept an old name. The user said "that should be impossible". The showrunner asked whether to refuse such names. The user answered: "yes refuse ending in -unit".
+
+**Spec:**
+1. Every command that writes a unit name refuses a name that ends in `-unit`. It prints the reason in one line and exits non-zero.
+2. The writers include `add_unit`, `agents rename` (rename apply and plan), `promote_unit`, `transfer` and each resume path that can set a name.
+3. The rule lives in one place in staff. Each writer calls it. No copy of the check.
+4. A name given as an alias (the `-unit` form of an existing unit) still resolves to its row, as today. Only a write of such a name is refused.
+5. A read of an old record with such a name does not fail.
+
+**Files:**
+- `scripts/production/staff.py`, `scripts/production/unit_names.py`, `scripts/production/add_unit.py`, `scripts/production/session_staff.py`, `scripts/production/staff_move.py`
+- `scripts/agents/shutdown.py`, `scripts/agents/producer_transfer.py`
+- Tests: `scripts/production/test_staff.py`, `scripts/production/test_unit_names.py`, `scripts/production/test_add_unit_staff_row.py`, `scripts/agents/test_shutdown_cli.py`, `scripts/agents/test_producer_transfer.py`
+
+**Workers:** 1 writer (`review4`).
+
+**Order:** after phase 66, ahead of phases 60, 64 and 65. It ships alone on origin/main.
+
+**Acceptance gate:**
+1. Tests use fixture staff files only, never the live staff record.
+2. Tests: each writer refuses `x-unit` with the one-line reason; an alias lookup of `x-unit` still finds row `x`; a record that already holds `x-unit` still loads. Each refusal test fails on main.
+3. The staff, add_unit, shutdown and transfer suites pass. basedpyright: 0 errors, 0 warnings.
+4. Change-Review: none, unless a visible result exists.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
