@@ -1455,7 +1455,9 @@ class PaneSessionsStarting:
 
 @dataclass(frozen=True)
 class PaneSessionsChanging:
-    """The Claude process starts or exits, so the pane has no current session to read."""
+    """The pane or its agent changed during the scan."""
+
+    reason: str = "starting or exiting"
 
 
 @dataclass(frozen=True)
@@ -1465,7 +1467,14 @@ class PaneSessionsUnknown:
     reason: str
 
 
-PaneSessions = frozenset[str] | PaneSessionsStarting | PaneSessionsChanging | PaneSessionsUnknown
+@dataclass(frozen=True)
+class _PaneProcessNotFound:
+    """The process query did not find the listed pane."""
+
+    reason: str
+
+
+PaneSessions = frozenset[str] | PaneSessionsStarting | PaneSessionsChanging | PaneSessionsUnknown | _PaneProcessNotFound
 
 
 @dataclass
@@ -2098,6 +2107,17 @@ class Herdr:
                 self.save_layout()
             return True
 
+    def _closed_pane_ids(self, missing: set[str]) -> set[str]:
+        if not missing:
+            return set()
+        observed = _pane_observations.get()
+        if observed is not None:
+            _ = observed.replies.pop((self.session, ("pane", "list")), None)
+        try:
+            return missing - {json_text(row.get("pane_id"), "pane id") for row in self.listed("pane")}
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+            return set()
+
     def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
         key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
         with run.lock:
@@ -2113,8 +2133,12 @@ class Herdr:
             except CodexPaneStarting:
                 sessions = PaneSessionsStarting()
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                sessions = (PaneSessionsChanging() if isinstance(error.__cause__, NativeRegistryChanging)
-                            else PaneSessionsUnknown(str(error)))
+                if isinstance(error, HerdrFailure) and error.code == "pane_not_found":
+                    sessions = _PaneProcessNotFound(str(error))
+                elif isinstance(error.__cause__, NativeRegistryChanging):
+                    sessions = PaneSessionsChanging()
+                else:
+                    sessions = PaneSessionsUnknown(str(error))
             run.sessions[key] = sessions
             return sessions
 
@@ -2126,11 +2150,15 @@ class Herdr:
         unknown: list[UnknownPane] = []
         launches: dict[str, pane_launch.PaneLaunch] | None = None
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
-        for pane in panes:
-            sessions = self._row_pane_sessions(pane, run)
+        observations = [(pane, self._row_pane_sessions(pane, run)) for pane in panes]
+        closed = self._closed_pane_ids({str(pane.get("pane_id", "")) for pane, sessions in observations
+                                       if isinstance(sessions, _PaneProcessNotFound)})
+        for pane, sessions in observations:
+            if isinstance(sessions, _PaneProcessNotFound):
+                sessions = (PaneSessionsChanging("pane closed during scan") if str(pane.get("pane_id", "")) in closed
+                            else PaneSessionsUnknown(sessions.reason))
             if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
-                reason = ("starting" if isinstance(sessions, PaneSessionsStarting)
-                          else "starting or exiting" if isinstance(sessions, PaneSessionsChanging) else sessions.reason)
+                reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
                 unknown.append(unread)
                 if isinstance(sessions, PaneSessionsChanging):

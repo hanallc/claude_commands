@@ -36,12 +36,14 @@ from scripts.herdr import herdr
 from scripts.herdr import herdr_types
 from scripts.accounts import accounts, moves
 from scripts.production.staff import STAFF_ROOT
+from scripts.whoami import account as account_reader
 from scripts.whoami import agent_accounts, note_file
-from scripts.lib import conf, models_registry, operation_deadline
+from scripts.lib import agent_program, conf, models_registry, nix_env, operation_deadline
+from scripts.lib.probe_session import PROBE_ENV
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_send
-from scripts.agents import member_account, pane_record, shutdown_record
+from scripts.agents import member_account, pane_record, remote, shutdown_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -121,11 +123,8 @@ def _producer_folder(name: str) -> Path:
 
 def _reserve_producer_pane(request: ProducerFirstStart, kind: Literal["claude", "codex"], home: Path,
                            client: herdr.Herdr) -> PendingProducerAdmission:
-    from scripts.lib import nix_env
-    from scripts.whoami.account import named_account_environment
-
     workspace = conf.read_or_repository("staff").text("PRODUCER_WORKSPACE")
-    environment = named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
+    environment = account_reader.named_account_environment(home) if kind == "claude" else {"CODEX_HOME": str(home)}
     prepared = herdr.prepare_agent_environment(str(request.folder), environment)
     if isinstance(prepared, nix_env.Refused):
         raise OSError(str(prepared))
@@ -279,8 +278,6 @@ def producer_adoption_launch(identity: str, pane: str, client: herdr.Herdr) -> p
 
 def adopt_named_producer(request: ProducerFirstStart, identity: str, pane: str, client: herdr.Herdr) -> ClaudeUp:
     """Admit one proved live conversation without a launch."""
-    from scripts.agents import remote
-
     try:
         entry = producer_adoption_launch(identity, pane, client)
         native = staff.native_id(entry["session_id"])
@@ -324,8 +321,6 @@ def _locked_first_producer_resume(request: ProducerFirstStart, *, to: str,
 def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
                            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     """Retain the pane before launch and admit only its proved native identity."""
-    from scripts.agents import remote
-
     began = monotonic()
     try:
         if not (request.folder / "README.md").is_file():
@@ -395,8 +390,6 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
                     raise ValueError("retained producer conversation is not proved stopped; retain its admission record")
             shell_setup = ":"
             if kind == "claude":
-                from scripts.whoami.account import named_account_environment
-
                 if recovering_admission:
                     if not to:
                         selected = member_account.producer_account(kind)
@@ -405,11 +398,11 @@ def _first_producer_resume(request: ProducerFirstStart, *, to: str = "",
                             pending = replace(pending, home=selected.dir)
                             _write_producer_reservation(request, pending)
                     # A retry can follow an interruption between the write and the shell update.
-                    exports = shlex.join([f"{key}={value}" for key, value in named_account_environment(pending.home).items()])
+                    exports = shlex.join([f"{key}={value}" for key, value in account_reader.named_account_environment(pending.home).items()])
                     shell_setup = f"export {exports}"
                 herdr.trust_claude_launch(request.folder, pending.home)
                 arguments = models_registry.claude_arguments(arguments,
-                    herdr.agent_base_environment(named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
+                    herdr.agent_base_environment(account_reader.named_account_environment(pending.home), herdr.NO_ENVIRONMENT_REMOVALS))
             client.run_in_pane(pending.pane, ["eval", herdr.agent_alias_script(kind) + shell_setup], terminal=pending.terminal)
             outcome = herdr.start_agent(client.session, pending.pane, kind,
                 trust_arguments(kind, str(request.folder), arguments), herdr.NoOpeningPrompt(),
@@ -474,8 +467,6 @@ def detached_moves() -> Generator[None]:
 
 def _tab_of(session: str, *, names: LaunchNames | LaunchNamesNotRead = _UNREAD_NAMES) -> herdr.TabSession | SessionNotFound:
     """Find an existing pane and retain its saved conversation when the herdr id is stale."""
-    from scripts.production import staff
-
     client = herdr.Herdr(herdr.shared_session())
     entries = pane_record.read(client.session)
     membership = (LaunchNames.read() if isinstance(names, LaunchNamesNotRead) else names).tab_record
@@ -573,8 +564,6 @@ def _record_launches(selected: list[str]) -> None:
 
 def release_source(row: StaffRow, backend: ClaudeBackend | CodexBackend | BackendUnavailable) -> SourceRelease:
     """Resolve native stop evidence before creating the destination."""
-    from scripts.production import staff
-
     kind = "claude" if isinstance(backend, staff.ClaudeBackend) else "codex" if isinstance(backend, staff.CodexBackend) else ""
     result = stop(row.id, kind)
     if isinstance(result, SessionNotFound):
@@ -586,8 +575,6 @@ def release_source(row: StaffRow, backend: ClaudeBackend | CodexBackend | Backen
 
 def stop(session: str, kind: str = "", *, deadline: float = math.inf,
          codex: herdr.CodexConversations | None = None) -> StopResult:
-    from scripts.production import staff
-
     try:
         with operation_deadline.within(deadline), staff.row_operation(session):
             shared: StopReadArguments = {"codex": codex} if codex is not None else {}
@@ -601,7 +588,6 @@ def _stop_recorded(session: str, kind: str = "", *,
                    codex: herdr.CodexConversations | None = None) -> StopResult:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     from scripts.herdr import worker_panes
-    from scripts.production import staff
 
     try:
         record = staff.initial_snapshot()
@@ -893,10 +879,6 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
 def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch,
                       account: str, message: str) -> Never:
     """Replace the foreground command with the saved account launch."""
-    from scripts.production import staff
-
-    from scripts.lib.agent_program import resolve_program
-
     kind = pane_launch.saved_kind(entry)
     environment = accounts.launch_shell_environment(Path(entry["cwd"]))
     unset, pane_environment = _pane_environment(tab, entry)
@@ -912,7 +894,7 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
         herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
-    program = resolve_program(kind, environment=environment)
+    program = agent_program.resolve_program(kind, environment=environment)
     arguments = resume_arguments(entry)
     if kind == "claude":
         arguments = models_registry.claude_arguments(arguments, environment)
@@ -998,13 +980,10 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
 
 def _codex_running_on_account(identity: str, pane_id: str, pid: int) -> ClaudeUp | ResumeFailed:
     """Read one process that the conversation reader proves hosts this thread."""
-    from scripts.whoami import account
-    from scripts.accounts import accounts
-
-    setting = account.process_codex_home(pid)
-    if isinstance(setting, account.ProcessEnvironmentUnread):
+    setting = account_reader.process_codex_home(pid)
+    if isinstance(setting, account_reader.ProcessEnvironmentUnread):
         return LiveAccountUnproved(identity, setting.reason)
-    home = setting.home if isinstance(setting, account.ProcessCodexHome) else Path.home() / ".codex"
+    home = setting.home if isinstance(setting, account_reader.ProcessCodexHome) else Path.home() / ".codex"
     return ClaudeUp(identity, pane_id, accounts.codex_home_label(home), start_state=ClaudeStartState.ALREADY_RUNNING, pid=pid)
 
 
@@ -1029,13 +1008,11 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
         return live
     if isinstance(live, sessions.SessionLivenessUnknown):
         return ResumeFailed(identity, live.reason)
-    from scripts.whoami import account
-    from scripts.accounts import accounts
 
     label = "unknown account"
     try:
-        setting = account.process_account_directory(account.process_config_dir(live.pid))
-        if isinstance(setting, account.ConfiguredClaudeFolder):
+        setting = account_reader.process_account_directory(account_reader.process_config_dir(live.pid))
+        if isinstance(setting, account_reader.ConfiguredClaudeFolder):
             label = accounts.claude_config_label(setting.path)
     except (OSError, ValueError) as error:
         print(f"{identity}: account anomaly: {error}", file=sys.stderr)
@@ -1044,8 +1021,6 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
 
 def _member_machine(member: StaffRow) -> str:
     """Return the member's recorded machine, or an empty string when unknown."""
-    from scripts.production import staff
-
     location = member.worktree if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else member.doc
     if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
         return location.machine
@@ -1054,8 +1029,6 @@ def _member_machine(member: StaffRow) -> str:
 
 def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
     """Select close names from local units and showrunners."""
-    from scripts.agents import remote
-
     machine = remote.local_machine()
     return sorted({row.name for row in names.tab_record.rows
                    if row.kind in {"unit", "showrunner"} and _member_machine(row) == machine
@@ -1064,8 +1037,6 @@ def _nearby_resume_names(reference: str, names: LaunchNames) -> list[str]:
 
 def resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
            client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
-    from scripts.production import staff
-
     try:
         settings = conf.read("shutdown")
         for key in ("START_SECONDS", "STAY_SECONDS"):
@@ -1078,8 +1049,6 @@ def resume(session: str, *, why: str = "resumed by name", to: str | None = None,
 
 def _codex_name_ids(name: str) -> list[str]:
     """Accept an explicit native ID without reading Codex display names."""
-    from scripts.production import staff
-
     try:
         _ = staff.native_id(name)
         return [name]
@@ -1127,8 +1096,6 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
     if len(matches) > 1:
         return ResumeFailed(session, f"ambiguous name; candidates: {candidates}")
     if matches:
-        from scripts.agents import remote
-
         member = matches[0]
         machine = _member_machine(member)
         if machine and machine != remote.local_machine():
@@ -1175,7 +1142,6 @@ def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | 
 def heal_account_trust(
     folder: Path, target: Path, source: Path, name: str,
 ) -> herdr.Trusted | herdr.TrustCopied | herdr.Untrusted | herdr.UnreadableTrustFile:
-    from scripts.accounts import accounts
 
     trust = herdr.heal_claude_trust(folder, target / ".claude.json",
         accounts.trust_sources(target, source), dry_run=False)
@@ -1267,7 +1233,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry = entry.copy()
         entry["session_id"] = identity
         entry["environment"] = names.environment(entry)
-        from scripts.whoami.account import named_account_environment
 
         source = pane_launch.config_home(entry, record=names.tab_record)
         source_label = ""
@@ -1282,7 +1247,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             account_environment = {"CODEX_HOME": str(target_dir)}
         else:
             target_dir, label = selected.dir, selected.label
-            account_environment = named_account_environment(target_dir)
+            account_environment = account_reader.named_account_environment(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
         if row is not None and row.kind == "producer":
             expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
@@ -1371,8 +1336,6 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             _exec_in_own_pane(tab, entry, label, message)
         started: herdr.AgentLaunched | sessions.LiveSessionProcess
         if kind == "codex":
-            from scripts.lib import nix_env
-
             prepared = herdr.prepare_session_environment(identity, entry["cwd"], entry["environment"], herdr.NO_ENVIRONMENT_REMOVALS)
             if isinstance(prepared, nix_env.Refused):
                 raise OSError(str(prepared))
@@ -1516,13 +1479,10 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
 def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
                 why: str = "", failure: str = "") -> str:
     """Build one actionable outcome for the showrunner, user push and stay log."""
-    from scripts.production import showrunners, staff, staff_sources
+    from scripts.production import showrunners, staff_sources
     from scripts.accounts import unit_watchdog
     from scripts.notify.push_texts import render
-    from datetime import datetime, timezone
     from scripts.whoami import quota_alert
-    from scripts.lib.probe_session import PROBE_ENV
-    from scripts.agents import remote
 
     try:
         record = staff.snapshot()
@@ -1829,7 +1789,6 @@ def _move_now(selected: list[str], target: str, *, why: str, warn_seconds: int, 
     handoff_failures: dict[str, StopFailed] = {}
     sources: dict[str, str] = dict(source_accounts)
     identities: dict[str, str] = {}
-    from scripts.production import staff
 
     try:
         membership = staff.initial_snapshot()
@@ -1880,7 +1839,6 @@ def _move_now(selected: list[str], target: str, *, why: str, warn_seconds: int, 
                 tab = _tab_of(session)
                 if isinstance(tab, herdr.TabSession) and tab.session_id == caller:
                     handoff_failures[session] = StopFailed(caller, str(error))
-    from scripts.production import staff
 
     with ExitStack() as locks:
         for session in selected:
@@ -1941,7 +1899,45 @@ def move(session: str, target: str, *, why: str) -> MoveResult:
     return move_sessions([session], target, why=why)[0]
 
 
+def _load_batch_modules() -> None:
+    """Load deferred move modules before the batch can wait."""
+    for name in (
+        # Restart imports this module. Worker restore also uses deferred imports.
+        "scripts.agents.restart",
+        "scripts.production.worker",
+        "scripts.agents.inventory",
+        "scripts.astra.design_roles",
+        "scripts.herdr.turn_end",
+        "scripts.direct.assign",
+        "scripts.direct.remove_run_scratch",
+        "scripts.lint.tmp_sweep",
+        "scripts.message.failed_lookup",
+        "scripts.message.send",
+        "scripts.message.roster",
+        # Stops retire prompts. Failed starts can enter the unit watchdog.
+        "scripts.production.unit_lookup",
+        "scripts.production.stall_watch",
+        "scripts.production.staff_sources",
+        "scripts.accounts.unit_watchdog",
+        "scripts.maintenance.settings",
+        "scripts.whoami.quota_alert",
+        "scripts.message.process_table",
+        "scripts.production.unit_names",
+        # Launches can need these modules to check the target environment.
+        "scripts.lib.copy_record",
+        "scripts.lib.slot_root",
+        # Automatic moves use the admission queue and verify process records.
+        "scripts.build_queue.admission_client",
+        "scripts.build_queue.admission_protocol",
+        "scripts.build_hold.owning_session",
+        "scripts.build_hold.override_guard",
+        "scripts.direct.step_record",
+    ):
+        _ = import_module(name)
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     batch = commands.add_parser("batch")
@@ -1952,6 +1948,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = batch.add_argument("--warn-seconds", type=int, default=0)
     _ = batch.add_argument("--source-account", action="append", default=[])
     _ = batch.add_argument("--log", type=Path, default=shutdown_state_root() / "move.log")
+    _ = batch.add_argument("--preload-restarted", action="store_true", help=argparse.SUPPRESS)
     _ = batch.add_argument("sessions", nargs="+")
     stay = commands.add_parser("stay")
     for option in ("session", "pane", "account", "generation"):
@@ -1974,6 +1971,14 @@ def main(argv: list[str] | None = None) -> int:
     token = _batch_process.set(True)
     try:
         with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
+            try:
+                _load_batch_modules()
+            except (ImportError, AttributeError) as error:
+                if cast(bool, args.preload_restarted):
+                    raise
+                print(f"batch startup: module preload failed ({type(error).__name__}); restarting in a new interpreter",
+                      flush=True)
+                os.execv(sys.executable, [sys.executable, __file__, "batch", "--preload-restarted", *argv[1:]])
             results = move_sessions(cast(list[str], args.sessions), cast(str, args.target),
                                     why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
                                     requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),

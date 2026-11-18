@@ -7450,6 +7450,67 @@ class RowTabTests(StaffTestCase):
                 self.assertEqual(any(item.pane == "p1" for item in latest.unknown), not resolved)
                 self.assertEqual(sum("p1 tab t0" in line for line in errors.getvalue().splitlines()), 1)
 
+    def test_layout_scan_refreshes_the_pane_list_after_pane_not_found(self) -> None:
+        for disappeared in (True, False):
+            with self.subTest(disappeared=disappeared):
+                pane = self.client.tabs[0]
+                now = time.time()
+                old = now - herdr.LAYOUT_KEEP_SECONDS - 1
+                saved = herdr.SavedSpace(name="remembered", seen=old, tabs=[
+                    herdr.SavedMemberTab(staff_id=self.rows["unit"].id, seen=old)])
+                path = herdr.layout_path("fixture")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(json.dumps(herdr.SavedLayout(at=old, workspaces=[saved])))
+                process_queries: list[str] = []
+                pane_lists: list[list[str]] = []
+                original = self.client.result
+
+                def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if arguments[:2] == ("pane", "list"):
+                        pane_lists.append([tab["pane_id"] for tab in self.client.tabs])
+                    if arguments[:2] == ("pane", "process-info"):
+                        process_queries.append(arguments[-1])
+                        if arguments[-1] == pane["pane_id"]:
+                            if disappeared:
+                                self.client.tabs.remove(pane)
+                            raise herdr_types.HerdrFailure("pane_not_found: fixture pane is absent", "pane_not_found")
+                    return original(*arguments, deadline=deadline)
+
+                with patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors:
+                    self.client.record_layout()
+                if disappeared:
+                    self.client.tabs.insert(0, pane)
+
+                self.assertEqual(process_queries, ["p0", "p1", "p2"])
+                self.assertEqual(pane_lists, [["p0", "p1", "p2"], ["p1", "p2"] if disappeared else ["p0", "p1", "p2"]])
+                self.assertEqual(herdr.saved_layout("fixture")["workspaces"][0], saved)
+                self.assertEqual(set(self.client.scans[-1].found), {self.rows["split"].id, self.rows["worker"].id})
+                if disappeared:
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertIn("p0 tab t0: pane evidence is unknown: pane_not_found", errors.getvalue())
+
+    def test_layout_scan_refreshes_once_after_several_panes_close(self) -> None:
+        queries: list[tuple[str, ...]] = []
+        original = self.client.result
+
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            if arguments[0] == "pane":
+                queries.append(arguments)
+            if arguments[:3] == ("pane", "process-info", "--pane") and arguments[-1] in {"p0", "p1"}:
+                self.client.tabs = [pane for pane in self.client.tabs if pane["pane_id"] != arguments[-1]]
+                raise herdr_types.HerdrFailure("pane_not_found: fixture pane is absent", "pane_not_found")
+            return original(*arguments, deadline=deadline)
+
+        with patch.object(self.client, "result", side_effect=result), redirect_stderr(io.StringIO()) as errors:
+            self.client.record_layout()
+
+        self.assertEqual(queries, [("pane", "list"), ("pane", "process-info", "--pane", "p0"),
+                                   ("pane", "process-info", "--pane", "p1"), ("pane", "process-info", "--pane", "p2"),
+                                   ("pane", "list")])
+        self.assertEqual(set(self.client.scans[-1].found), {self.rows["worker"].id})
+        self.assertEqual(errors.getvalue(), "")
+
     def test_retitle_uses_proved_rows_and_reports_an_unknown_pane_once(self) -> None:
         self.client.unknown.add("p2")
         self.client.tabs[1]["pane_label"] = "old-worker-label"
