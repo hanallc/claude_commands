@@ -101,13 +101,13 @@ class AttemptDeclined:
     reason: str
 
 
-HANA_COMMAND_ADMISSION_REFUSED = "hana_command_admission_refused"
-
-
 @dataclass(frozen=True)
 class HanaCommandAdmissionRefused:
-    """The Hana guest refused to start the command."""
+    """The Hana command admission check refused the command."""
     reason: str
+
+
+HANA_IMAGE_STALE = "The Hana image is stale. Run deploy.py hana-setup --plan to review replacement."
 
 
 @dataclass(frozen=True)
