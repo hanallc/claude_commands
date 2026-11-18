@@ -102,6 +102,7 @@ export async function startReplies(calls: PostmasterCalls): Promise<Replies> {
       if (e.origin.kind !== "peer") return { kind: "pass" };
       const reply = wrapper(e.text);
       if (reply.kind === "not a reply") return { kind: "pass" };
+      if (/^\s*postmaster:/i.test(reply.body)) return { kind: "pass" };
       const at_ms = calls.now();
       expire(at_ms);
       const socketRoutes = routes.get(reply.socket);
@@ -121,7 +122,7 @@ export async function startReplies(calls: PostmasterCalls): Promise<Replies> {
       await calls.fs.write(path(PATHS.replies, key), JSON.stringify(log));
       const forwarded: string[] = [];
       for (const sessionId of targets) {
-        const text = `Message from ${reply.name} (their answer to ${answerTo}, passed on by postmaster) [${at_ms}-${++forwardCount}]:\n\n${reply.body}`;
+        const text = `${reply.name} (answer to ${answerTo}): ${reply.body}\n\nTag: ${at_ms}-${++forwardCount}`;
         try {
           const answer = await calls.session.send({ to: { sessionId }, text });
           if (answer.isDelivered) forwarded.push(sessionId);

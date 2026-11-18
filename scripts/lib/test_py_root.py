@@ -66,7 +66,7 @@ from scripts.agents import detached_runs
 
 root = Path(os.environ['EXPECTED_CHECKOUT'])
 record_path = root / 'detached.json'
-record = dict(pid=os.getpid(), session_dir=str(root), worker='fixture-test',
+record = dict(status='running', pid=os.getpid(), session_dir=str(root), worker='fixture-test',
               staff_id='fixture-staff', log=str(root / 'detached.log'),
               command=[sys.executable, *sys.argv[1:]])
 # Simulate a supervisor that inherited the root from an older launcher.
