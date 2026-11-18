@@ -209,7 +209,13 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
         }:
             return (bool(run_id) and not isinstance(raw["started_at"], bool)
                     and not isinstance(raw["pid"], bool)
-                    and all(isinstance(arg, str) for arg in cast(list[object], raw["command"])))
+                    and all(isinstance(arg, str) for arg in cast(list[object], raw["command"]))
+                    and all(key not in raw or type(raw[key]) is int
+                            for key in ("command_pid", "command_group", "exit_code"))
+                    and all(key not in raw or isinstance(raw[key], str)
+                            for key in ("supervisor_started", "command_started", "tree_key", "finished_at",
+                                        "delivery", "ended", "stop_reason"))
+                    and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool)))
         case _:
             return False
 
@@ -230,9 +236,9 @@ def stop_with_reason(
         if not _is_run_record(record) or path.name != f"{record['run_id']}.json":
             return False
         stopping = {**record, "stop_reason": reason}
-        write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
         sent = False
         try:
+            write_text_atomic(path, json.dumps(stopping, indent=2, sort_keys=True))
             if still_current():
                 signal_run()
                 sent = True
@@ -277,7 +283,7 @@ def stop_command(path: Path, reason: str) -> bool:
 
     try:
         return stop_with_reason(path, reason, still_current=still_current, signal_run=signal_run)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+    except ProcessLookupError:
         return False
 
 
@@ -340,7 +346,7 @@ def _orphaned(path: Path, raw: Mapping[str, object], now: float) -> bool:
         return False
     pid = _integer(raw.get("pid"))
     if pid > 0:
-        if detached_run_process.supervises(pid, path):
+        if detached_run_process.supervisor_match(pid, path) is not False:
             return False
         command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
         if isinstance(command, (process_start.Started, process_start.Unreadable)):
@@ -422,7 +428,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
         if worker and raw.get("worker") != worker:
             continue
         if raw.get("status") == "finished" and raw.get("completion_pending"):
-            if not detached_run_process.supervises(_integer(raw.get("pid")), path):
+            if detached_run_process.supervisor_match(raw["pid"], path) is False:
                 result.queue_completion(path, _read_record(path))
             continue
         if not _orphaned(path, raw, now):
@@ -660,7 +666,7 @@ def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRun
             errors.append(LiveRunReadError(path, error))
             continue
         if (raw.get("status") == "running" and owns(raw)
-                and detached_run_process.supervises(_integer(raw.get("pid")), path)):
+                and detached_run_process.supervisor_match(_integer(raw.get("pid")), path) is not False):
             found.append(cast(RunRecord, cast(object, raw)))
     return LiveRunEvidence(tuple(found), tuple(errors))
 

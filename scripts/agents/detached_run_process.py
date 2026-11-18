@@ -14,13 +14,21 @@ class ProcessCommandText:
     text: str
 
 
-def process_args(pid: int) -> list[str] | ProcessCommandText:
-    """Read the process arguments or the complete ps command text."""
+@dataclass(frozen=True)
+class ProcessArgumentsUnavailable:
+    """The ps process check timed out."""
+
+
+def process_args(pid: int) -> list[str] | ProcessCommandText | ProcessArgumentsUnavailable:
+    """Read the process arguments or report that ps timed out."""
     if Path("/proc/self").exists():
         return _proc_args(Path(f"/proc/{pid}"))
     timeout = conf.read("detached_runs").whole("PROCESS_CHECK_SECONDS")
-    shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
-                           capture_output=True, text=True, check=False, timeout=timeout)
+    try:
+        shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                               capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ProcessArgumentsUnavailable()
     return ProcessCommandText(shown.stdout.strip())
 
 
@@ -31,11 +39,12 @@ def _proc_args(process: Path) -> list[str]:
         return []
 
 
-def runs_command(pid: int, command: Sequence[str]) -> bool:
-    """Match the program name and its arguments against the current process command."""
+def _command_match(pid: int, command: Sequence[str]) -> bool | ProcessArgumentsUnavailable:
     if pid <= 0 or not command:
         return False
     observed = process_args(pid)
+    if isinstance(observed, ProcessArgumentsUnavailable):
+        return observed
     separator = " " if isinstance(observed, ProcessCommandText) else "\0"
     parts = observed.text.split(" ") if isinstance(observed, ProcessCommandText) else observed
 
@@ -51,6 +60,11 @@ def runs_command(pid: int, command: Sequence[str]) -> bool:
 
     return any(Path(part).name == Path(command[0]).name and matches(index + 1, command[1:])
                for index, part in enumerate(parts) if part)
+
+
+def runs_command(pid: int, command: Sequence[str]) -> bool:
+    """Confirm that the process runs the named program with the given arguments."""
+    return _command_match(pid, command) is True
 
 
 @dataclass(frozen=True)
@@ -74,6 +88,11 @@ def supervisor_records() -> dict[Path, frozenset[int]] | ProcessTableUnavailable
     return {path: frozenset(pids) for path, pids in found.items()}
 
 
+def supervisor_match(pid: int, record_path: Path) -> bool | ProcessArgumentsUnavailable:
+    """Match the supervisor and its record when the process arguments are available."""
+    return _command_match(pid, ["detached_runs.py", "supervise", str(record_path.resolve())])
+
+
 def supervises(pid: int, record_path: Path) -> bool:
-    """Match the supervisor command and its record to exclude reused process IDs."""
-    return runs_command(pid, ["detached_runs.py", "supervise", str(record_path.resolve())])
+    """Confirm the supervisor command and its record before use."""
+    return supervisor_match(pid, record_path) is True
