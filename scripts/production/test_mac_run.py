@@ -16,6 +16,8 @@ from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
@@ -277,9 +279,8 @@ class MacRunTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.home.mkdir()
-        (self.home / ".claude").symlink_to(
-            SCRIPT.parent.parent.parent, target_is_directory=True
-        )
+        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
+                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
