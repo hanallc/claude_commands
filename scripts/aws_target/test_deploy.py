@@ -29,6 +29,7 @@ from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
+from scripts.aws_target.test_hana_setup import write_hana_config
 from scripts.aws_target.test_spot_end import FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
@@ -434,22 +435,13 @@ class HanaSetupFailureTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         self.clock = TestClock()
-        self.workload = self.root / 'hana_aws.conf'
+        self.workload = write_hana_config()
         self.setup_path = self.state / 'hana/setup.json'
         self.book = ledger.CostLedger(self.state)
         self.calls = []
         self.deleted_stacks = {}
-        _ = self.workload.write_bytes((deploy.TEMPLATE.parents[3] / 'config/hana_aws.conf').read_bytes())
-        for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id'):
-            text_setting(self.workload, key, 'fixture-' + key)
         self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
         self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
-        original = conf.read_or_repository
-
-        def configuration(name: str) -> conf.ConfigRead:
-            return conf.read(self.workload) if name == 'hana_aws' else original(name)
-
-        _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
         settings = aws_config.DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gate', 'image',
             'owner', 'fixture-release', 'us-east-2b', 'vpc', 'subnet', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
         _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=settings))

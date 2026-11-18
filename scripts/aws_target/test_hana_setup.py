@@ -17,8 +17,62 @@ from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_spend
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
-from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY, REPOSITORY
+from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
+
+
+def write_hana_config() -> Path:
+    """Write fixed setup settings to the test configuration directory."""
+    path = conf.path('hana_aws')
+    _ = path.write_text("""\
+enabled=off
+region=us-east-2
+availability_zone=us-east-2b
+instance_type=m7a.2xlarge
+stack_name=fixture-hana
+ami_id=fixture-image
+ami_owner_id=000000000000
+vpc_id=fixture-vpc
+subnet_id=fixture-subnet
+# range: 0.001..
+spot_max_usd_per_hour=0.25
+# range: 5e-324..
+spot_ceiling_margin=0.25
+# whole: 1..
+root_gib=40
+# whole: 1..
+data_gib=300
+daily_budget_usd=6
+gp3_usd_per_gib_month=0.08
+# whole: 1..60
+guard_grace_seconds=60
+# whole: 1..60
+watchdog_check_seconds=1
+# whole: 1..1800
+permit_max_seconds=1800
+# whole: 1..8
+step_cpu_limit=4
+# whole: 1..24
+step_memory_gib=24
+# whole: 1..60
+mount_timeout_seconds=15
+# whole: 1..
+aws_timeout_s=10
+# whole: 1..
+controller_tick_timeout_s=45
+# whole: 1..604800
+control_url_seconds=3600
+# whole: 1..
+stop_wait_timeout_s=600
+# whole: 1..
+stop_poll_seconds=10
+image_upload_tool=fixture-nixos#coldsnap
+# whole: 60..
+image_upload_timeout_s=3600
+# whole: 1..60
+image_wait_interval_s=10
+""")
+    return path
 
 
 class HanaSetupTests(CostFixture):
@@ -29,22 +83,10 @@ class HanaSetupTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         self.clock = TestClock()
-        self.workload = self.root / 'hana_aws.conf'
-        _ = self.workload.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        for key, value in {'ami_id': 'fixture-image', 'ami_owner_id': '000000000000',
-                           'vpc_id': 'fixture-vpc', 'subnet_id': 'fixture-subnet'}.items():
-            text_setting(self.workload, key, value)
+        self.workload = write_hana_config()
         book = ledger.CostLedger(self.state)
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private setup inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'private setup account'))
-        original = conf.read_or_repository
-        def configuration(name: str) -> conf.ConfigRead:
-            return conf.read(self.workload) if name == 'hana_aws' else original(name)
-        _ = self.enterContext(mock.patch.object(conf, 'read_or_repository', side_effect=configuration))
-        original_path = conf.path
-        def config_path(name: str) -> Path:
-            return self.workload if name == 'hana_aws' else original_path(name)
-        _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=config_path))
 
     def subject(self, fake: FakeAws) -> deploy.Deployment:
         return deploy.Deployment(self.settings, self.state, self.root / 'output', execute=fake, clock=self.clock, notify=lambda _event: True)
@@ -103,7 +145,7 @@ class HanaSetupTests(CostFixture):
                 self.assertTrue(any(isinstance(row.state, ledger.HanaExposureOpen) for row in evidence.hana_compute))
                 self.assertTrue(evidence.hana_storage)
                 self.assertEqual(service, 'cloudformation')
-                self.assertIn('hana-build', arguments)
+                self.assertIn(workload.text('stack_name'), arguments)
                 return {}
             if operation == 'describe-change-set':
                 return {'Status': 'CREATE_COMPLETE', 'Changes': []}
