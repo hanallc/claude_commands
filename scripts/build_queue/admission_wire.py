@@ -14,6 +14,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
+from scripts.build_targets.execution_transport import HanaControlTransport
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -456,7 +457,6 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
     """Hash the configuration for placement or an adapter refusal."""
     from scripts.lib import conf
     from scripts.build_queue import admission_records
-    from scripts.build_targets.execution_transport import HanaControlTransport
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
     if isinstance(settings, placement.ExplicitProviderSettings):
@@ -552,6 +552,7 @@ class Assignment:
     assignment: placement.PlacementAssignment
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -561,6 +562,7 @@ class LocalPlacementGranted:
     grant: Admitted
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)

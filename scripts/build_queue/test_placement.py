@@ -1557,6 +1557,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
     def idle_hana(self, fixture: PlacementFixture) -> tuple[Path, wire.PlacementRequest]:
         from scripts.aws_target import hana_box
+        from scripts.aws_target.test_hana_box import IDENTITY, record_lifecycle_image
 
         settings, request, _destination = self.target_settings_fixture(fixture)
         settings.unlink()
@@ -1569,7 +1570,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         _ = write_config_fixture(account, template="aws_target")
         controller = hana_box.HanaController(fixture.root / "hana-state", account, settings,
                                              hana_box.ProviderNotInstalled())
-        controller.register(hana_box.DeploymentIdentity("fixture", "box", "spot", "us-east-2"))
+        controller.register(IDENTITY)
+        _ = record_lifecycle_image(controller.directory, settings)
         from scripts.aws_target import hana_placement_adapter
         from scripts.mac_test import eligibility
 
@@ -1579,7 +1581,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
         return settings, request
 
     def test_idle_hana_preview_uses_the_recovered_permit(self) -> None:
-        from scripts.aws_target import hana_spend
+        from scripts.aws_target import hana_box, hana_spend
 
         with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
@@ -1593,7 +1595,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(expires - now, spending.settings.permit_max_seconds)
                 return hana_spend.StartAffordable(expires)
 
-            with (redirect_stderr(warnings), mock.patch.object(hana_spend.HanaSpending, "preview_start",
+            with (redirect_stderr(warnings),
+                  mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True),
+                  mock.patch.object(hana_spend.HanaSpending, "preview_start",
                                                                autospec=True, side_effect=preview) as start):
                 evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
@@ -1745,7 +1749,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
     def test_hana_preview_recovers_budget_and_ignores_guest_guard(self) -> None:
         from decimal import Decimal
-        from scripts.aws_target import hana_spend
+        from scripts.aws_target import hana_box, hana_spend
 
         with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
@@ -1762,7 +1766,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     ("guard_grace_seconds", good.replace("guard_grace_seconds=60", "guard_grace_seconds=broken"), 0),
                 )
                 for key, contents, count in edits:
-                    with self.subTest(key=key), redirect_stderr(io.StringIO()) as warnings:
+                    image_check = (mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True)
+                                   if key == "guard_grace_seconds" else nullcontext())
+                    with self.subTest(key=key), redirect_stderr(io.StringIO()) as warnings, image_check:
                         _ = settings.write_text(contents)
                         evidence = self.read_target(fixture, request)
                         assert isinstance(evidence, placement.FreshHostEvidence), evidence
