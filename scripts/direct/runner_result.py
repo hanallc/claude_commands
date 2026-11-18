@@ -8,7 +8,7 @@ import sys
 from typing import Literal, cast
 
 
-ResultWord = Literal["passed", "failed", "lost", "declined"]
+ResultWord = Literal["passed", "failed", "lost", "declined", "hana_command_admission_refused"]
 
 
 @dataclass(frozen=True)
@@ -48,10 +48,12 @@ def read_result(path: Path, status: int, selected_is_mac: bool) -> UsableRunnerR
             words.append(value)
         elif name in {"reason", "seconds", "holder", "fetch", "fix", "build_target_directory"}:
             fields[name] = value
-    if len(words) != 1 or words[0] not in {"passed", "failed", "lost", "declined"}:
+    if len(words) != 1 or words[0] not in {"passed", "failed", "lost", "declined", "hana_command_admission_refused"}:
         return UnusableRunnerResult()
     word = cast(ResultWord, words[0])
     if word == "passed" and status != 0 or word == "failed" and status == 0:
+        return UnusableRunnerResult()
+    if word == "hana_command_admission_refused" and (selected_is_mac or status != 75 or not fields.get("reason")):
         return UnusableRunnerResult()
     return UsableRunnerResult(word, fields.get("reason", ""), fields.get("seconds", ""),
                               fields.get("holder", ""), fields.get("fetch", "failed"),

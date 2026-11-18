@@ -119,6 +119,7 @@ __PAGE_TITLE__
 </div>
 <p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span></p>
 <div id="prices"></div>
+<section class="card" id="placement-scores"></section>
 <h2 class="section-title">Quotas</h2>
 <details class="card" id="quota-help">
   <summary>How to open the quota cases in AWS</summary>
@@ -365,6 +366,9 @@ function drawPrices() {
 }
 
 function drawFixed() {
+  const placement = fill(document.getElementById("placement-scores"), data.placement_scores,
+    "Latest score / 72 h median / samples. A score is stale after two hours or when a newer request has no score.");
+  placement.appendChild(element("p", "AWS scores a request with fewer than three instance types lower. Compare the 32-vCPU column with recorded launch results.", "note"));
   cards("quotas", data.quotas);
   fill(document.getElementById("hours"), data.hours, data.hours_note);
 }
