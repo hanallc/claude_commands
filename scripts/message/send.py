@@ -141,6 +141,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
+from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TextIO, TypedDict, cast, get_args
 
@@ -389,8 +390,20 @@ class PublishingPostmaster(PostmasterOwner):
     stage: Literal["publishing"]
 
 
-class RelayingPostmaster(PostmasterOwner):
+class DirectRelayInProgress(PostmasterOwner):
+    stage: Literal["direct-relay"]
+
+
+class RelayRetryBlocked(PostmasterOwner):
+    """The postmaster allowed fallback. Older direct relays also used this stage."""
+
     stage: Literal["relaying"]
+
+
+class RelayAcceptanceUnconfirmed(PostmasterOwner):
+    """The relay returned without proof of acceptance or non-delivery."""
+
+    stage: Literal["relay-unconfirmed"]
 
 
 class ResolvedPostmaster(PostmasterOwner):
@@ -398,7 +411,10 @@ class ResolvedPostmaster(PostmasterOwner):
     outcome: Literal["delivered", "queued", "failed", "expired", "withdrawn"]
 
 
-PostmasterReservation = ReservedPostmaster | PublishingPostmaster | RelayingPostmaster | ResolvedPostmaster
+PostmasterReservation = (
+    ReservedPostmaster | PublishingPostmaster | DirectRelayInProgress | RelayRetryBlocked
+    | RelayAcceptanceUnconfirmed | ResolvedPostmaster
+)
 
 
 class PendingDelivery(TypedDict):
@@ -1157,14 +1173,16 @@ QueueRow = ReadableQueueRow | QueueRowNeedsInspection
 
 def _read_queue_rows(path: Path) -> list[QueueRow]:
     try:
-        with path.open("rb") as queue:
-            rows: list[QueueRow] = []
-            for raw in queue:
-                entry = _queued_message(loads(raw.decode("utf-8")))
-                rows.append(QueueRowNeedsInspection(raw) if entry is None else ReadableQueueRow(entry, raw))
-            return rows
+        text = path.read_text(encoding="utf-8", newline="")
     except FileNotFoundError:
         return []
+    rows: list[QueueRow] = []
+    with StringIO(text, newline="\n") as queue:
+        for line in queue:
+            raw = line.encode("utf-8")
+            entry = _queued_message(loads(line))
+            rows.append(QueueRowNeedsInspection(raw) if entry is None else ReadableQueueRow(entry, raw))
+    return rows
 
 
 def read_queue(path: Path) -> list[QueuedMessage]:
@@ -1708,14 +1726,19 @@ def postmaster_claim(states: KeyStates, key: str, recipient: str) -> ClaimGrante
     if "postmaster" not in pending:
         return ClaimGranted()
     reservation = pending["postmaster"]
-    if reservation["stage"] == "reserved":
+    if reservation["stage"] == "reserved" or reservation["stage"] == "direct-relay":
         if _owner_released(reservation):
             release_postmaster_claim(state, recipient, pending)
             return ClaimGranted()
         return RepeatPending(POSTMASTER_UNCONFIRMED)
-    if reservation["stage"] == "relaying":
-        return (RepeatUnconfirmed(POSTMASTER_UNCONFIRMED) if _owner_released(reservation)
-                else RepeatPending(POSTMASTER_UNCONFIRMED))
+    if reservation["stage"] == "relaying" or reservation["stage"] == "relay-unconfirmed":
+        if not _owner_released(reservation):
+            return RepeatPending(POSTMASTER_UNCONFIRMED)
+        target = pending.get("recipient")
+        if reservation["stage"] == "relaying" and target is not None and target["kind"] == "relay-process":
+            release_postmaster_claim(state, recipient, pending)
+            return ClaimGranted()
+        return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED)
     if reservation["stage"] == "publishing":
         receipt = postmaster.receipt(STATE, reservation["entry_id"])
         if isinstance(receipt, postmaster.ResultPending):
@@ -1780,8 +1803,8 @@ def _reserve_claude_delivery(message: Message, at: datetime, limit: float, entry
                 state["last"][message.to] = at.isoformat()
             else:
                 _ = state["last"].setdefault(message.to, at.isoformat())
-            reservation = (RelayingPostmaster(stage="relaying", entry_id=entry_id,
-                                              owner_pid=os.getpid(), owner_start=owner.start)
+            reservation = (DirectRelayInProgress(stage="direct-relay", entry_id=entry_id,
+                                                 owner_pid=os.getpid(), owner_start=owner.start)
                            if direct_relay else
                            ReservedPostmaster(stage="reserved", entry_id=entry_id,
                                               owner_pid=os.getpid(), owner_start=owner.start))
@@ -1827,7 +1850,7 @@ def publish_postmaster_entry(message: Message, entry_id: str, source: Path, targ
 
 
 def cancel_unpublished_postmaster_claim(message: Message, entry_id: str) -> None:
-    """Only the reserved stage permits cancellation as unpublished."""
+    """Cancel a reservation when its setup fails before transport starts."""
     if message.key is None:
         return
     with key_states() as states:
@@ -1835,7 +1858,7 @@ def cancel_unpublished_postmaster_claim(message: Message, entry_id: str) -> None
         marker = pending_deliveries(state).get(message.to)
         if marker is not None and "postmaster" in marker:
             reservation = marker["postmaster"]
-            if (reservation["entry_id"] == entry_id and reservation["stage"] == "reserved"
+            if (reservation["entry_id"] == entry_id and reservation["stage"] in ("reserved", "direct-relay")
                     and _owns_attempt(reservation)):
                 release_postmaster_claim(state, message.to, marker)
 
@@ -1851,7 +1874,7 @@ def record_postmaster_result(message: Message, entry_id: str,
             return
         reservation = marker["postmaster"]
         if (reservation["entry_id"] != entry_id or not _owns_attempt(reservation)
-                or reservation["stage"] in ("resolved", "relaying")):
+                or reservation["stage"] not in ("reserved", "publishing")):
             return
         if isinstance(delivery, postmaster.Delivered):
             _ = resolve_postmaster_claim(states, message.key, message.to, reservation, "delivered")
@@ -1882,15 +1905,15 @@ def finish_postmaster_claim(message: Message, entry_id: str,
             return True
         if reservation["stage"] == "publishing":
             return False
-        marker["postmaster"] = RelayingPostmaster(stage="relaying", entry_id=entry_id,
+        marker["postmaster"] = RelayRetryBlocked(stage="relaying", entry_id=entry_id,
             owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
         return True
 
 
 def complete_postmaster_fallback(message: Message, recipient: StableRecipient, entry_id: str,
                                  at: datetime, result: Result) -> bool:
-    """Resolve a definite relay result before releasing its durable ownership."""
-    if message.key is None or isinstance(result, UncertainRelayDelivery):
+    """Record the relay result before releasing ownership."""
+    if message.key is None:
         return True
     with key_states() as states:
         state = states.get(message.key, {"last": {}})
@@ -1898,24 +1921,25 @@ def complete_postmaster_fallback(message: Message, recipient: StableRecipient, e
         if marker is None or "postmaster" not in marker:
             return False
         reservation = marker["postmaster"]
-        if (reservation["stage"] != "relaying" or reservation["entry_id"] != entry_id
-                or not _owns_attempt(reservation) or result.outcome not in ("sent", "queued", "failed")):
+        if (reservation["stage"] not in ("direct-relay", "relaying") or reservation["entry_id"] != entry_id
+                or not _owns_attempt(reservation)):
             return False
-        outcome: Literal["delivered", "queued", "failed"] = (
-            "delivered" if result.outcome == "sent" else "queued" if result.outcome == "queued" else "failed")
-        _ = resolve_postmaster_claim(states, message.key, message.to, reservation, outcome)
-        later = state["last"].get(recipient.value)
-        if result.outcome in ("sent", "queued"):
-            state["last"][message.to] = marker["started"]
-            newer = later is not None and datetime.fromisoformat(later) > at
-            if not newer:
-                state["last"][recipient.value] = marker["started"]
-            write_key_states(states)
-            _ = state.get("pending", {}).pop(message.to, None)
-            return not newer
-        else:
+        if isinstance(result, UncertainRelayDelivery):
+            marker["postmaster"] = RelayAcceptanceUnconfirmed(stage="relay-unconfirmed", entry_id=entry_id,
+                owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
+            return True
+        if result.outcome == "failed":
             release_postmaster_claim(state, message.to, marker)
-        return True
+            return True
+        if result.outcome not in ("sent", "queued"):
+            return False
+        later = state["last"].get(recipient.value)
+        newer = later is not None and datetime.fromisoformat(later) > at
+        state["last"][message.to] = marker["started"]
+        if not newer:
+            state["last"][recipient.value] = marker["started"]
+        _ = state.get("pending", {}).pop(message.to, None)
+        return not newer
 
 
 def _owner_released(record: Mapping[str, object]) -> bool:
@@ -2196,7 +2220,7 @@ def _socket_delivery_plan(message: Message, registry: sessions.RegistryRead,
             mailbox = target
         elif conversation_recipient(mailbox) != target:
             return ClaudeRoutingFailed(unit_lookup.ClaudeOwnerMismatch("the requested socket names a different Claude conversation"))
-        plan = _claude_delivery_plan(message, mailbox, registry, records, membership)
+        plan = _claude_delivery_plan(message, mailbox, registry, records)
         if isinstance(plan, RelayAttempt) and plan.message.to != message.to:
             return ClaudeRoutingFailed(unit_lookup.ClaudeOwnerMismatch("the requested socket differs from the proved Claude owner's socket"))
         return plan
@@ -2213,7 +2237,7 @@ def _socket_delivery_plan(message: Message, registry: sessions.RegistryRead,
         if isinstance(fallback, RecipientLookupFailed):
             return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(fallback.reason))
         if isinstance(fallback, ConversationRecipient):
-            plan = _claude_delivery_plan(message, fallback, registry, records, membership)
+            plan = _claude_delivery_plan(message, fallback, registry, records)
             if not isinstance(plan, SessionIdWithoutLiveRecipient):
                 return plan
         return ClaudeRoutingFailed(unit_lookup.ClaudeSocketAbsent(f"{error}; {dead_socket_reason(message.to)}"))
@@ -2276,7 +2300,7 @@ def _fixed_staff_relay_plan(message: Message, selection: FixedStaffLookup) -> Re
     if isinstance(member, RecipientLookupFailed):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(member.reason))
     mailbox = StaffClaudeRecipient(member.id, ConversationRecipient(machine(), str(member.current_session)))
-    plan = _claude_delivery_plan(message, mailbox, registry, records, membership)
+    plan = _claude_delivery_plan(message, mailbox, registry, records)
     if isinstance(plan, SessionIdWithoutLiveRecipient):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(
             f"no live Claude session answers to staff ID {selection.to}"))
@@ -2316,13 +2340,12 @@ def relay_socket(message: Message, timeout: float, *,
     if isinstance(mailbox, NoRelayReplyMailbox):
         return message, Result("failed", f"{result.detail}; {dead_socket_reason(message.to)}")
     registry = sessions.read_registry()
-    membership = staff.snapshot()
     if isinstance(mailbox, StaffClaudeRecipient):
-        member = membership.by_id(mailbox.staff_id)
+        member = staff.snapshot().by_id(mailbox.staff_id)
         if member is None or isinstance(member.retirement, staff.RetiredProducer):
             return message, Result("failed", "the staff recipient is unavailable")
         mailbox = StaffClaudeRecipient(member.id, ConversationRecipient(machine(), str(member.current_session)))
-    plan = _claude_delivery_plan(message, mailbox, registry, sessions.running_records(registry), membership)
+    plan = _claude_delivery_plan(message, mailbox, registry, sessions.running_records(registry))
     if isinstance(plan, ClaudeRoutingFailed):
         return message, Result("failed", plan.failure.reason)
     address = conversation_recipient(mailbox).address
@@ -2539,7 +2562,7 @@ def recover_socket_queues(registry: sessions.RegistryRead, at: datetime) -> tupl
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
                               entry.get("shown_sender", entry["from"]),
                               stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")))
-            plan = _claude_delivery_plan(message, mailbox, registry, records, membership)
+            plan = _claude_delivery_plan(message, mailbox, registry, records)
             if not isinstance(plan, RelayAttempt):
                 reason = plan.failure.reason if isinstance(plan, ClaudeRoutingFailed) else "no live receiver"
                 lines.append(f"unresolved socket queue {path}: {reason}; left in place")
@@ -3267,7 +3290,7 @@ class CheckedRelayAcceptance:
 
 @dataclass(frozen=True)
 class RelayRequestNotForwarded:
-    """The proxy sent no request bytes."""
+    """The proxy did not start the recipient write."""
 
 
 @dataclass(frozen=True)
@@ -3292,10 +3315,21 @@ class RefusedRelayRequest(Result):
 RelayForward = RelayRequestNotForwarded | RelayRequestInterrupted | RelayRequestForwarded | RefusedRelayRequest
 
 
+@dataclass
+class RelayRecipientWrite:
+    """Track the recipient write across the proxy thread and its caller."""
+
+    state: RelayRequestNotForwarded | RelayRequestInterrupted | RelayRequestForwarded = field(
+        default_factory=RelayRequestNotForwarded)
+
+
 def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAcceptance | Result:
     """Check the approved call, its result, and the proxy forward together."""
-    if isinstance(observed.forward, RefusedRelayRequest):
-        return observed.forward
+    forward = observed.forward
+    if isinstance(forward, RefusedRelayRequest):
+        return forward
+    if isinstance(forward, RelayRequestInterrupted):
+        return _unaccepted_relay(forward, forward.reason)
     events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     mode = next((as_str(event.get("permissionMode")) for event in events
                  if event.get("type") == "system" and event.get("subtype") == "init"), "unknown")
@@ -3305,33 +3339,33 @@ def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAccep
     if len(sends) != 1:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
         reason = f"{len(sends)} SendMessage calls" if sends else f"the relay made no SendMessage call: {one_line(said) or 'no output'}"
-        return _unaccepted_relay(observed.forward, reason, queue_if_unsent=not sends)
+        return _unaccepted_relay(forward, reason, queue_if_unsent=not sends)
     call = sends[0]
     inputs = as_dict(call.get("input"))
     if inputs.get("to") != observed.target or inputs.get("message") != text:
-        return _unaccepted_relay(observed.forward, "SendMessage used a different target or payload")
+        return _unaccepted_relay(forward, "SendMessage used a different target or payload")
     tool_id = as_str(call.get("id"))
     results = [part for event in events if event.get("type") == "user"
                for value in as_list(as_dict(event.get("message")).get("content"))
                if (part := as_dict(value)).get("type") == "tool_result" and part.get("tool_use_id") == tool_id]
     if not tool_id or len(results) != 1:
-        return _unaccepted_relay(observed.forward, "SendMessage did not return one matching result")
+        return _unaccepted_relay(forward, "SendMessage did not return one matching result")
     result = results[0]
     answer = result_text(result.get("content"))
     if result.get("is_error") is True or as_dict(loads(answer)).get("success") is not True:
         rejected = result.get("is_error") is True or as_dict(loads(answer)).get("success") is False
-        return _unaccepted_relay(observed.forward, describe(answer) or "SendMessage did not confirm success",
+        return _unaccepted_relay(forward, describe(answer) or "SendMessage did not confirm success",
                                  queue_if_unsent=rejected)
-    if observed.forward != RelayRequestForwarded(tool_id, text):
-        return _unaccepted_relay(observed.forward, "SendMessage has no matching completed proxy forward")
+    if forward != RelayRequestForwarded(tool_id, text):
+        return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
     return CheckedRelayAcceptance(tool_id, f"mode {mode}; verbatim; {describe(answer)}")
 
 
 def _unaccepted_relay(forward: RelayForward, reason: str, *, queue_if_unsent: bool = False) -> Result:
+    if isinstance(forward, RefusedRelayRequest):
+        return forward
     if isinstance(forward, RelayRequestNotForwarded):
         return Result("queued" if queue_if_unsent else "failed", reason)
-    if isinstance(forward, RelayRequestInterrupted):
-        reason = forward.reason
     return UncertainRelayDelivery("failed", f"{reason}; delivery unconfirmed")
 
 
@@ -3753,71 +3787,63 @@ def _matched_relay_payload(wire: bytearray, expected: str) -> str | RefusedRelay
 
 def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: socket.socket,
                           attempt: ClaudeDeliveryAttempt, approved: Path,
-                          expected: str) -> RelayForward | unit_lookup.SocketUnavailable:
+                          expected: str, write: RelayRecipientWrite) -> RelayForward | unit_lookup.SocketUnavailable:
     """Forward the approved request on the connection that passed the owner check."""
-    request: RelayForward = RelayRequestNotForwarded()
     request_bytes = bytearray()
     with selectors.DefaultSelector() as reader:
         _ = reader.register(listener, selectors.EVENT_READ)
         _ = reader.register(stop, selectors.EVENT_READ)
         if all(key.fileobj is stop for key, _ in reader.select()):
-            return request
-        connection = listener.accept()[0]
-        _ = reader.unregister(listener)
-        with connection:
+            return write.state
+        with listener.accept()[0] as connection:
+            _ = reader.unregister(listener)
             connection.settimeout(peer.gettimeout())
             readers = {connection: peer, peer: connection}
             for incoming in readers:
                 _ = reader.register(incoming, selectors.EVENT_READ)
             stopping = False
-            try:
-                while readers:
-                    ready = reader.select(0 if stopping else None)
-                    if not ready and stopping:
-                        break
-                    for key, _ in ready:
-                        if key.fileobj is stop:
-                            _ = reader.unregister(stop)
-                            stopping = True
-                            continue
-                        incoming = cast(socket.socket, key.fileobj)
-                        outgoing = readers[incoming]
-                        data = incoming.recv(65536)
-                        if data and incoming is connection:
-                            request = RelayRequestInterrupted("the proxy did not complete the request")
-                            request_bytes.extend(data)
-                            if len(request_bytes) > CLAUDE_RELAY_MAX_BYTES:
-                                return RefusedRelayRequest("failed", "the relay request exceeds the Claude socket limit")
-                            continue
-                        if data:
-                            outgoing.sendall(data)
-                            continue
-                        if incoming is connection:
-                            if not request_bytes.endswith(b"\n"):
-                                return request
-                            payload = _matched_relay_payload(request_bytes, expected)
-                            if isinstance(payload, RefusedRelayRequest):
-                                return payload
-                            tool_id = approved.read_text(encoding="utf-8").strip()
-                            if not tool_id:
-                                return RefusedRelayRequest("failed", "the relay tool call has no approval")
-                            check = unit_lookup.validate_claude_connection(peer, attempt.pid, attempt.started)
-                            if isinstance(check, unit_lookup.SocketUnavailable):
-                                return check
-                            owner = _validate_attempt_recipient(attempt)
-                            if isinstance(owner, unit_lookup.SocketUnavailable):
-                                return owner
-                            peer.sendall(request_bytes)
-                            request = RelayRequestForwarded(tool_id, payload)
-                        outgoing.shutdown(socket.SHUT_WR)
-                        _ = reader.unregister(incoming)
-                        del readers[incoming]
-            except (OSError, ValueError) as error:
-                reason = f"cannot forward through the checked socket: {error}"
-                if isinstance(request, RelayRequestNotForwarded):
-                    return unit_lookup.SocketUnavailable(reason)
-                return RelayRequestInterrupted(reason)
-    return request
+            while readers:
+                ready = reader.select(0 if stopping else None)
+                if not ready and stopping:
+                    break
+                for key, _ in ready:
+                    if key.fileobj is stop:
+                        _ = reader.unregister(stop)
+                        stopping = True
+                        continue
+                    incoming = cast(socket.socket, key.fileobj)
+                    outgoing = readers[incoming]
+                    data = incoming.recv(65536)
+                    if data and incoming is connection:
+                        request_bytes.extend(data)
+                        if len(request_bytes) > CLAUDE_RELAY_MAX_BYTES:
+                            return RefusedRelayRequest("failed", "the relay request exceeds the Claude socket limit")
+                        continue
+                    if data:
+                        outgoing.sendall(data)
+                        continue
+                    if incoming is connection:
+                        if not request_bytes.endswith(b"\n"):
+                            return write.state
+                        payload = _matched_relay_payload(request_bytes, expected)
+                        if isinstance(payload, RefusedRelayRequest):
+                            return payload
+                        tool_id = approved.read_text(encoding="utf-8").strip()
+                        if not tool_id:
+                            return RefusedRelayRequest("failed", "the relay tool call has no approval")
+                        check = unit_lookup.validate_claude_connection(peer, attempt.pid, attempt.started)
+                        if isinstance(check, unit_lookup.SocketUnavailable):
+                            return check
+                        owner = _validate_attempt_recipient(attempt)
+                        if isinstance(owner, unit_lookup.SocketUnavailable):
+                            return owner
+                        write.state = RelayRequestInterrupted("the proxy did not complete the request")
+                        peer.sendall(request_bytes)
+                        write.state = RelayRequestForwarded(tool_id, payload)
+                    outgoing.shutdown(socket.SHUT_WR)
+                    _ = reader.unregister(incoming)
+                    del readers[incoming]
+    return write.state
 
 
 @contextmanager
@@ -3863,41 +3889,49 @@ def _validate_attempt_recipient(attempt: ClaudeDeliveryAttempt) -> SocketAttempt
 
 def _bound_relay(message: Message, timeout: float, command: list[str], env: dict[str, str],
                  attempt: ClaudeDeliveryAttempt
-                 ) -> RelayTransportResponse | unit_lookup.SocketUnavailable:
-    check = _validate_attempt_recipient(attempt)
-    if isinstance(check, unit_lookup.SocketUnavailable):
-        return check
-    peer = unit_lookup.connect_claude_socket(attempt.socket, attempt.pid, attempt.started, timeout=min(timeout, 1.0))
-    if isinstance(peer, unit_lookup.SocketUnavailable):
-        return peer
-    check = _validate_attempt_recipient(attempt)
-    if isinstance(check, unit_lookup.SocketUnavailable):
-        peer.close()
-        return check
-    with (peer, _relay_proxy_directory() as directory,
-          socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener):
-        private = Path(directory)
-        proxy = str(private / "delivery.sock")
-        target = replace(message, to=f"uds:{proxy}")
-        approved = private / "approved"
-        payload = agent_text(target, via_relay=True)
-        settings = _relay_settings(private, target, payload, approved)
-        listener.bind(proxy)
-        listener.listen(1)
-        cancel, stop = socket.socketpair()
-        with cancel, stop, ThreadPoolExecutor(max_workers=1) as executor:
-            forwarding = executor.submit(_forward_relay_socket, listener, peer, stop, attempt, approved, payload)
-            try:
-                result = run([*command, "--settings", settings], relay_prompt(target), timeout, env, Path.home())
-            finally:
-                cancel.shutdown(socket.SHUT_WR)
-            try:
-                forwarded = forwarding.result()
-            except (OSError, ValueError) as error:
-                forwarded = RelayRequestInterrupted(f"cannot forward through the checked socket: {error}")
-            if isinstance(forwarded, unit_lookup.SocketUnavailable):
-                return forwarded
-    return RelayTransportResponse(*result, target.to, forwarded)
+                 ) -> RelayTransportResponse | unit_lookup.SocketUnavailable | Result:
+    write = RelayRecipientWrite()
+    try:
+        check = _validate_attempt_recipient(attempt)
+        if isinstance(check, unit_lookup.SocketUnavailable):
+            return check
+        peer = unit_lookup.connect_claude_socket(attempt.socket, attempt.pid, attempt.started, timeout=min(timeout, 1.0))
+        if isinstance(peer, unit_lookup.SocketUnavailable):
+            return peer
+        with peer:
+            check = _validate_attempt_recipient(attempt)
+            if isinstance(check, unit_lookup.SocketUnavailable):
+                return check
+            with (_relay_proxy_directory() as directory,
+                  socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener):
+                private = Path(directory)
+                proxy = str(private / "delivery.sock")
+                target = replace(message, to=f"uds:{proxy}")
+                approved = private / "approved"
+                payload = agent_text(target, via_relay=True)
+                settings = _relay_settings(private, target, payload, approved)
+                listener.bind(proxy)
+                listener.listen(1)
+                cancel, stop = socket.socketpair()
+                with cancel, stop, ThreadPoolExecutor(max_workers=1) as executor:
+                    try:
+                        forwarding = executor.submit(_forward_relay_socket, listener, peer, stop, attempt,
+                                                     approved, payload, write)
+                    except RuntimeError as error:
+                        return _unaccepted_relay(write.state, f"cannot start the relay proxy thread: {error}")
+                    try:
+                        result = run([*command, "--settings", settings], relay_prompt(target), timeout, env, Path.home())
+                    finally:
+                        cancel.close()
+                    try:
+                        forwarded = forwarding.result()
+                    except (OSError, ValueError) as error:
+                        return _unaccepted_relay(write.state, f"cannot forward through the checked socket: {error}")
+        if isinstance(forwarded, unit_lookup.SocketUnavailable):
+            return forwarded
+        return RelayTransportResponse(*result, target.to, forwarded)
+    except (OSError, ValueError) as error:
+        return _unaccepted_relay(write.state, f"cannot relay through the checked socket: {error}")
 
 
 def relay(message: Message, timeout: float) -> Result:
@@ -3930,28 +3964,33 @@ def relay(message: Message, timeout: float) -> Result:
     # A Mac keeps Claude's login in its keychain, which ssh cannot open; the user's
     # `claude setup-token` token, encrypted behind gpg-agent, stands in for it.
     token_file = Path.home() / ".config" / "claude" / "oauth-token.gpg"
-    if token_file.exists():
-        token = subprocess.run(["gpg", "--pinentry-mode", "error", "--quiet", "--decrypt", str(token_file)],
-                               capture_output=True, text=True, timeout=10, check=False)
-        if token.returncode != 0:
-            return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
-    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
-    relay_env = models_registry.agent_environment(env)
     try:
-        observed = _bound_relay(message, timeout, command, relay_env, attempt)
-    except OSError as error:
-        return Result("failed", f"cannot relay through the checked socket: {error}")
+        if token_file.exists():
+            token = subprocess.run(["gpg", "--pinentry-mode", "error", "--quiet", "--decrypt", str(token_file)],
+                                   capture_output=True, text=True, timeout=10, check=False)
+            if token.returncode != 0:
+                return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
+        relay_env = models_registry.agent_environment(env)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return Result("failed", f"cannot prepare the relay: {error}")
+    command = [str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
+    observed = _bound_relay(message, timeout, command, relay_env, attempt)
     if isinstance(observed, unit_lookup.ClaudeSocketAbsent):
         return ConfirmedSocketMiss("queued", observed.reason)
     if isinstance(observed, unit_lookup.SocketUnavailable):
         return Result("failed", observed.reason)
+    if isinstance(observed, Result):
+        return observed
     code, out, err = observed.code, observed.stdout, observed.stderr
-    raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
-    raw.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(raw, out + err)
-    if code is None and not isinstance(observed.forward, RefusedRelayRequest):
-        return UncertainRelayDelivery("failed", f"relay timed out after {timeout:g} s; delivery unconfirmed")
+    try:
+        raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(raw, out + err)
+    except OSError as error:
+        print(f"message relay log: {error}", file=sys.stderr)
+    if code is None:
+        return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
     result = read_relay(observed, agent_text(message, via_relay=True))
     if isinstance(result, CheckedRelayAcceptance):
         return Result("sent", result.detail)
@@ -3961,9 +4000,9 @@ def relay(message: Message, timeout: float) -> Result:
 
 
 def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: sessions.RegistryRead,
-                          records: list[sessions.SessionRecord], membership: staff.StaffSnapshot) -> RelayPlan:
+                          records: list[sessions.SessionRecord]) -> RelayPlan:
     conversation = conversation_recipient(mailbox).conversation
-    checked = unit_lookup.checked_conversation(conversation, record=membership, registry=registry, probe_address=False)
+    checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
     if isinstance(checked, unit_lookup.UnknownUnit):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
     candidates = [record for record in records if record["sessionId"] == conversation]
@@ -3997,7 +4036,7 @@ def relay_plan(message: Message, registry: sessions.RegistryRead, records: list[
         return _socket_delivery_plan(message, registry, records, membership, mailbox)
     if isinstance(mailbox, NoRelayReplyMailbox):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable("no Claude conversation was selected at routing"))
-    return _claude_delivery_plan(message, mailbox, registry, records, membership)
+    return _claude_delivery_plan(message, mailbox, registry, records)
 
 
 def _postmaster_recipient(attempt: RelayAttempt, records: list[sessions.SessionRecord],
@@ -4924,7 +4963,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     claude_route = isinstance(route, (ClaudeRecipient, QueuedStaffRecipient))
     if claude_route and fixed:
         assert isinstance(mailbox, StaffClaudeRecipient)
-        plan = _claude_delivery_plan(message, mailbox, registry, running, membership)
+        plan = _claude_delivery_plan(message, mailbox, registry, running)
         if isinstance(plan, SessionIdWithoutLiveRecipient):
             plan = ClaudeRoutingFailed(unit_lookup.SocketUnavailable(
                 f"no live Claude session answers to staff ID {mailbox.staff_id}"))

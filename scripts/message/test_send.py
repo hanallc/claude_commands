@@ -9,6 +9,7 @@ from scripts.lib.checkout_test_support import python_tool_source
 
 import io
 import builtins
+import errno
 import fcntl
 import hashlib
 import json
@@ -27,7 +28,8 @@ import tempfile
 import time
 import unittest
 from collections.abc import Generator
-from contextlib import AbstractContextManager, closing, contextmanager, redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -202,8 +204,10 @@ send._bound_relay(message, 2, [], {}, attempt)
         message = send.Message(address, "fixture", "Preview", "body", None, claude_attempt=attempt)
         with (mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())),
               mock.patch.object(unit_lookup, "checked_conversation", return_value=unit_lookup.ProvedAbsentUnit()),
+              mock.patch.object(staff, "snapshot", side_effect=staff.StaffAbsent("staff record is absent")) as membership,
               mock.patch.object(send, "relay", return_value=send.ConfirmedSocketMiss("queued", "ENOENT")) as relay):
             _, result = send.relay_socket(message, 2)
+        membership.assert_not_called()
         self.assertEqual(result.outcome, "queued", result.detail)
         self.assertEqual(result.receiver, "session:recipient")
         relay.assert_called_once_with(message, 2)
@@ -341,8 +345,8 @@ send._bound_relay(message, 2, [], {}, attempt)
 
             with mock.patch.object(send, "run", side_effect=launch):
                 result = send.relay(message, 2)
-        self.assertIsInstance(result, send.UncertainRelayDelivery)
-        self.assertEqual(result.detail, "the proxy did not complete the request; delivery unconfirmed")
+        self.assertNotIsInstance(result, send.UncertainRelayDelivery)
+        self.assertEqual(result, send.Result("failed", "SendMessage has no matching completed proxy forward"))
 
     def test_proxy_accepts_only_the_approved_claude_message_body(self) -> None:
         with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
@@ -447,9 +451,8 @@ send._bound_relay(message, 2, [], {}, attempt)
             text = send.agent_text(message, via_relay=True)
             with mock.patch.object(send, "run", return_value=(0, stream(INIT, call(text), answer(OK)), "")):
                 result = send.relay(message, 2)
-        self.assertIsInstance(result, send.UncertainRelayDelivery)
-        self.assertEqual(result.detail,
-                         "cannot forward through the checked socket: fixture broken pipe; delivery unconfirmed")
+        self.assertNotIsInstance(result, send.UncertainRelayDelivery)
+        self.assertEqual(result, send.Result("failed", "cannot forward through the checked socket: fixture broken pipe"))
 
     def test_relay_imports_only_its_temporary_checkout(self) -> None:
         repository = Path(send.__file__).resolve().parents[2]
@@ -3096,6 +3099,141 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         relay.assert_called_once_with(send.Message(address, "test", "body", "body", None), 30.0)
         self.assertEqual(self.log()[-1]["postmaster"], "unresolved")
 
+    def test_keyed_relay_retry_depends_on_the_recipient_write(self) -> None:
+        for fault, detail in (
+            ("setup", "fixture proxy setup error"),
+            ("connect", "fixture recipient connect error"),
+            ("submit", "cannot start new thread"),
+            ("accept", "fixture proxy accept error"),
+            ("empty-timeout", "relay timed out after 3 s"),
+            ("buffered-timeout", "relay timed out after 3 s"),
+            ("exit", "relay exit 1: the relay made no SendMessage call: no output"),
+            ("proxy", "fixture proxy error"),
+            ("command", "fixture relay command error"),
+            ("write", "fixture recipient write error"),
+        ):
+            with self.subTest(fault=fault), socket.socket(socket.AF_UNIX) as listener:
+                self.check_keyed_relay_retry(fault, detail, listener)
+
+    def check_keyed_relay_retry(self, fault: str, detail: str, listener: socket.socket) -> None:
+        recipient = f"recipient-{fault}"
+        self.session(recipient, recipient)
+        path = self.root / f"{recipient}.sock"
+        path.unlink()
+        listener.bind(str(path))
+        listener.listen()
+        listener.settimeout(3)
+        address = f"session:{recipient}"
+        options = local_options(["--to", address, "--key", fault, "--repeat-minutes", "30", "--timeout", "3",
+                                 "--from", "fixture", "--summary", "Notice", "--text", f"Notice for {fault}"])
+        accepted: list[bytes] = []
+        accept, sendall = socket.socket.accept, socket.socket.sendall
+
+        def fail_proxy_accept(connection: socket.socket) -> tuple[socket.socket, object]:
+            if connection is listener:
+                return accept(connection)
+            raise OSError(errno.EMFILE, "fixture proxy accept error")
+
+        def interrupt_recipient_write(connection: socket.socket, data: bytes | bytearray, flags: int = 0) -> None:
+            if isinstance(data, bytearray):
+                sendall(connection, data[:1], flags)
+                raise BrokenPipeError("fixture recipient write error")
+            sendall(connection, data, flags)
+
+        def launch(command: list[str], prompt: str, _timeout: float, _env: dict[str, str] | None,
+                   _cwd: Path | None, *, fault: str = "") -> tuple[int | None, str, str]:
+            target = cast(str, json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith("- to: "))))
+            text = prompt.split("----- BEGIN MESSAGE -----\n", 1)[1].rsplit("\n----- END MESSAGE -----", 1)[0]
+            wire = relay_wire(text)
+            with socket.socket(socket.AF_UNIX) as client, listener.accept()[0] as peer:
+                if fault != "empty-timeout":
+                    client.settimeout(3)
+                    client.connect(target[4:])
+                if fault not in ("empty-timeout", "accept"):
+                    self.assertEqual(approve_relay_call(command, target, text, "Notice"), 0)
+                    client.sendall(wire[:-3] if fault in ("buffered-timeout", "exit", "command") else wire)
+                    client.shutdown(socket.SHUT_WR)
+                if not fault:
+                    peer.settimeout(3)
+                    with peer.makefile("rb") as request:
+                        accepted.append(request.read())
+                    self.assertEqual(accepted, [wire])
+                    peer.sendall(b"k")
+                    self.assertEqual(client.recv(1), b"k")
+                    return 0, stream(INIT, call(text, target=target), answer(OK)), ""
+                if fault not in ("empty-timeout", "accept"):
+                    self.assertEqual(client.recv(1), b"")
+                if fault == "write":
+                    peer.settimeout(3)
+                    self.assertEqual(peer.recv(1), wire[:1])
+                else:
+                    peer.setblocking(False)
+                    with self.assertRaises(BlockingIOError):
+                        _ = peer.recv(1)
+                if fault == "command":
+                    raise OSError("fixture relay command error")
+                return (None if fault.endswith("timeout") else 1), "", ""
+
+        queue = send.queue_for(address)
+        with (mock.patch.object(send, "relay", new=REAL_RELAY),
+              mock.patch.object(send, "claude_binary", return_value="/fixture/claude"),
+              mock.patch.object(accounts, "account_for_unscoped_launch", return_value=accounts.LegacyHomeLaunch()),
+              mock.patch.object(models_registry, "claude_model", return_value="fixture")):
+            with ExitStack() as faults:
+                _ = faults.enter_context(mock.patch.object(send, "run", side_effect=partial(launch, fault=fault)))
+                if fault == "setup":
+                    _ = faults.enter_context(mock.patch.object(send, "_relay_proxy_directory",
+                                                              side_effect=OSError("fixture proxy setup error")))
+                if fault == "connect":
+                    _ = faults.enter_context(mock.patch.object(socket.socket, "connect",
+                                                              side_effect=OSError(errno.EACCES, detail)))
+                if fault == "submit":
+                    _ = faults.enter_context(mock.patch.object(ThreadPoolExecutor, "submit",
+                                                              side_effect=RuntimeError(detail)))
+                if fault == "accept":
+                    _ = faults.enter_context(mock.patch.object(socket.socket, "accept", new=fail_proxy_accept))
+                if fault == "proxy":
+                    _ = faults.enter_context(mock.patch.object(send, "_matched_relay_payload",
+                                                              side_effect=OSError("fixture proxy error")))
+                if fault == "write":
+                    _ = faults.enter_context(mock.patch.object(socket.socket, "sendall", new=interrupt_recipient_write))
+                first = send.send(options)
+            self.assertIn(detail, first.detail)
+            self.assertEqual(accepted, [])
+            if fault == "write":
+                self.assertIsInstance(first, send.UncertainRelayDelivery)
+                self.assertEqual(first.outcome, "failed")
+                self.assertEqual(send.read_queue(queue), [])
+                states = cast(send.KeyStates, json.loads((self.root / "keys.json").read_text()))
+                pending, = send.pending_deliveries(states[fault]).values()
+                assert "postmaster" in pending
+                self.assertEqual(pending["postmaster"]["stage"], "relay-unconfirmed")
+                with mock.patch.object(send, "run") as blocked:
+                    self.assertEqual(send.send(options).outcome, "pending")
+                blocked.assert_not_called()
+                return
+            self.assertNotIsInstance(first, send.UncertainRelayDelivery)
+            if fault in ("setup", "submit"):
+                with listener.accept()[0] as closed:
+                    closed.settimeout(3)
+                    self.assertEqual(closed.recv(1), b"")
+            retry_at = send.now()
+            if fault == "exit":
+                self.assertEqual(first.outcome, "queued")
+                entry, = send.read_queue(queue)
+                self.assertEqual(entry.get("key"), fault)
+                retry_at += timedelta(minutes=31)
+            else:
+                self.assertEqual(first.outcome, "failed")
+                self.assertEqual(self.claims(fault), {})
+            with (mock.patch.object(send, "run", side_effect=launch) as launched,
+                  mock.patch.object(send, "now", return_value=retry_at)):
+                self.assertEqual(send.send(options).outcome, "sent")
+                self.assertEqual(send.send(options).outcome, "skipped")
+            launched.assert_called_once()
+            self.assertEqual(len(accepted), 1)
+            self.assertEqual(send.read_queue(queue), [])
+
     def test_postmaster_success_retires_queued_copy_for_key(self) -> None:
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
@@ -3174,6 +3312,28 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def claims(self, key: str) -> dict[str, str]:
         states = cast(send.KeyStates, json.loads((self.root / "keys.json").read_text()))
         return states.get(key, {"last": {}})["last"]
+
+    def test_relay_acceptance_survives_a_stop_and_a_replacement_conversation(self) -> None:
+        self.session("before", "Recipient")
+        self.session("after", "Replacement")
+        options = local_options(["--to", "session:before", "--key", "notice", "--repeat-minutes", "30",
+                                 "--recipient-key", "logical-recipient", "--from", "fixture", "--text", "Notice"])
+        keys = self.root / "keys.json"
+
+        def stop_after_first_acceptance_write(path: Path, text: str) -> None:
+            write_text_atomic(path, text)
+            if path == keys and self.relayed:
+                raise KeyboardInterrupt
+
+        with (mock.patch.object(send, "write_atomic", side_effect=stop_after_first_acceptance_write),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = send.send(options)
+        accepted = self.claims("notice")
+        replacement = options._replace(selection=send.RosterLookup("session:after"))
+        self.assertEqual(send.send(replacement).outcome, "skipped")
+        self.assertEqual(accepted, {"session:before": accepted["session:before"],
+                                    "logical-recipient": accepted["session:before"]})
+        self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'before.sock'}"])
 
     def test_keyed_staff_recipient_restart_preserves_repeat_window(self) -> None:
         self.session("before", "resources")
@@ -4383,6 +4543,27 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             with socket.socket(socket.AF_UNIX) as listener:
                 listener.bind(str(path))
         return f"uds:{path}"
+
+    def test_legacy_direct_relay_reclaims_a_stopped_sender(self) -> None:
+        pid = os.getppid()
+        started = sessions.process_start(pid)
+        assert started is not None
+        address = self.relay_record(pid, "fixture", stale=True)
+        host = send.machine()
+        recipient = f"relay-process:{host}:{pid}:{started}"
+        at = send.now().isoformat()
+        marker = send.PendingDelivery(started=at, limit_seconds=30,
+            postmaster=send.RelayRetryBlocked(stage="relaying", entry_id="legacy", owner_pid=os.getpid(),
+                                             owner_start="stopped-sender"),
+            recipient=send.SavedRelayProcess(kind="relay-process", machine=host,
+                generation=send.QueuedProcessGeneration(pid=pid, started=started, socket=address[4:])))
+        states: send.KeyStates = {"notice": {"last": {recipient: at}, "pending": {recipient: marker}}}
+        send.write_key_states(states)
+        options = local_options(["--to", address, "--key", "notice", "--repeat-minutes", "30",
+                                 "--from", "fixture", "--text", "Notice"])
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual([message.to for message in self.relayed], [address])
 
     def socket_queue(self, address: str, *entries: tuple[datetime, str], name: str = "",
                      conversation: str = "") -> Path:
