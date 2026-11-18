@@ -10,7 +10,6 @@ try:
 except FileNotFoundError:
     pass
 
-import json
 import time
 from pathlib import Path
 from typing import cast
@@ -66,15 +65,11 @@ def running_work(session_dir: Path) -> str | None:
     if any(_text(path) == "reviewing" for path in statuses):
         return "a review pass"
     try:
-        state = cast("dict[str, object]", json.loads(_text(session_dir / "progress_history_state.json")))
-    except json.JSONDecodeError:
+        phases = recorder_state.read_open_phases(session_dir)
+    except ValueError:
         return None
-    recorder_state.migrate_phases(state)
-    phases = [*recorder_state.open_phases(state), state.get("phase")]
     for phase in phases:
-        if not isinstance(phase, dict):
-            continue
-        activity = cast("dict[str, object]", phase).get("activity")
+        activity = phase.get("activity")
         if isinstance(activity, dict):
             entry = cast("dict[str, object]", activity)
             if entry.get("status") == "active":

@@ -192,8 +192,7 @@ class TmpSweepCase(unittest.TestCase):
         fake_process(self.proc, phase_pid, fds=(str(phase_used / "file"),))
         state_path = run / unit_runs.STATE_FILE
         state = cast(dict[str, object], json.loads(state_path.read_text())) if state_path.exists() else {}
-        _ = state_path.write_text(json.dumps({**state, "phase": {"id": "open", "status": "active"},
-                                              "open_phases": [{"id": "older-open"}, {"id": "ad hoc"}]}))
+        _ = state_path.write_text(json.dumps({**state, "open_phases": [{"id": "older-open"}, {"id": "ad hoc"}, {"id": "open"}]}))
         eligible = reason in (tmp_sweep.RunKeepReason.DIRECTOR, tmp_sweep.RunKeepReason.SESSION_WORKTREE)
         if eligible:
             with mock.patch.object(recorder_state, "read_open_phase_ids", side_effect=ValueError("fixture unreadable state")):
@@ -515,7 +514,7 @@ class CopyTests(TmpSweepCase):
 
     def test_open_phase_and_unknown_records_survive_at_any_age(self) -> None:
         run = self.tmp.parent / "run"
-        progress = write(run / "progress_history_state.json", json.dumps({"phase": {"id": "21", "status": "active"}}))
+        progress = write(run / "progress_history_state.json", json.dumps({"open_phases": [{"id": "21", "status": "active"}]}))
         live = self.copy("phase", task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
         unknown = self.copy("unknown")
         _ = (unknown / copy_record.RECORD).write_text("bad json")

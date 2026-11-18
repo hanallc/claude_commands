@@ -24,7 +24,7 @@ from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-from scripts.direct import plan_history
+from scripts.direct import plan_history, recorder_state
 from scripts.lib import unit_runs
 from scripts.lib.user_zone import user_zone
 from scripts.production import session_staff, staff, unit_config, unit_names
@@ -481,9 +481,9 @@ def _phase_instances(
 
 
 def _open_instances(
-    runs: list[list[dict[str, object]]],
+    runs: list[list[dict[str, object]]], open_instance_ids: set[str],
 ) -> list[OpenPhaseInstance]:
-    """Read every unfinished phase instance in the newest run."""
+    """Read the events for open phase instances."""
     if not runs:
         return []
     events = runs[-1]
@@ -492,7 +492,7 @@ def _open_instances(
     for event in events:
         event_type = _text(event.get("event_type"))
         instance_id = _text(event.get("phase_instance_id"))
-        if not instance_id:
+        if instance_id not in open_instance_ids:
             continue
         if event_type == "phase_finished":
             closed.add(instance_id)
@@ -952,15 +952,18 @@ def with_run_promises(record: PhaseRecord, events: list[dict[str, object]]) -> P
     return record._replace(current=current, phases=rows, plan_finish=_plan_finish(rows))
 
 
-def _current_run_events(runs: list[list[dict[str, object]]], record: staff.StaffSnapshot) -> list[list[dict[str, object]]]:
+def _current_run_events(
+    runs: list[list[dict[str, object]]], record: staff.StaffSnapshot,
+) -> tuple[list[list[dict[str, object]]], set[str]]:
     """Select the run that its owner's staff pointer names."""
     opened = {row.run.path.name: row.run.path for row in record.rows if isinstance(row.run, staff.OpenRun)}
     for events in runs:
         start = next((event for event in events if event.get("event_type") == "run_started"), dict[str, object]())
         folder = opened.get(_text(start.get("run_id")))
-        if folder is not None and unit_runs.run_is_open(folder):
-            return [events]
-    return []
+        if folder is not None and unit_runs.run_is_open(folder, record=record):
+            phases = recorder_state.read_open_phases(folder)
+            return [events], recorder_state.open_instance_ids(phases)
+    return [], set()
 
 
 def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = None) -> PhaseRecord:
@@ -983,14 +986,15 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     run_events = [plan_history.read_run_events(path)
                   for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
-    current_run = _current_run_events(run_events, resolver.record)
+    current_run, open_instance_ids = _current_run_events(run_events, resolver.record)
     return _build_phase_record(
         plan_path, phases, run_events, _instances_by_phase(phases, instances),
-        _open_instances(current_run),
+        _open_instances(current_run, open_instance_ids),
     )
 
 
-def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
+def build_run(plan_path: Path, events: list[dict[str, object]], *,
+              open_instance_ids: set[str] | None = None) -> PhaseRecord:
     """Build a phase record from one run after its plan headings are gone.
 
     Each recorded instance keeps its own row, including unfinished phases in
@@ -1022,7 +1026,8 @@ def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
             start=instance.start if instance else at - timedelta(seconds=seconds),
             finish=InstanceFinished(at=at, status=_text(event.get("status")), seconds=seconds, written_at=index),
         ))
-    opened = [instance for instance in instances if instance.instance_id not in finished_ids]
+    opened = [instance for instance in instances if instance.instance_id not in finished_ids
+              and (open_instance_ids is None or instance.instance_id in open_instance_ids)]
     ordered = finished + opened
     phases: list[plan_history.PlanPhase] = [
         {"id": instance.phase, "title": instance.title,

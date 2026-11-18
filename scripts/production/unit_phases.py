@@ -39,41 +39,12 @@ from scripts.lib.process_failure import failure_detail
 
 from scripts.style import style_config
 from scripts.direct import phase_table, phase_waits
-from scripts.direct import plan_history
+from scripts.direct import plan_history, recorder_state
 
 from scripts.production import display_cells, land_queue, land_runs
 from scripts.production import unit_queue, waits_on
 from scripts.lib import unit_runs
 from scripts.whoami import quota_state
-
-RunEventsReader = Callable[[Path], list[dict[str, object]]]
-
-
-WORK_EVENT = re.compile(r'"event_type"\s*:\s*"([^"\\]+)"')
-WORK_EVENTS = frozenset(("run_started", "reopened", "phase_started", "phase_finished", "phase_dropped", "run_finished", "pass_started", "pass_finished",
-                         "activity_started", "activity_finished", "eta_stated", "wait_started", "wait_finished",
-                         "wait_unclosed", "wait_holder_seen", "checkpoint"))
-
-
-def read_work_events(path: Path) -> list[dict[str, object]]:
-    """Read phase, step, ETA, and wait events."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return []
-    events: list[dict[str, object]] = []
-    for line in lines:
-        kind = WORK_EVENT.search(line)
-        if kind is None or kind.group(1) not in WORK_EVENTS:
-            continue
-        try:
-            value = cast(object, json.loads(line))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            events.append(cast(dict[str, object], value))
-    return events
-
 
 def single_spaced(text: str) -> str:
     """Join the words of text with one space each."""
@@ -596,38 +567,12 @@ def completed_unit_phases(events: Sequence[dict[str, object]]) -> dict[str, Phas
     return {phase: phase_sent_work(history) for phase, history in phases.items() if phase in completed}
 
 
-class OpenRunPhase(NamedTuple):
-    """The id and current step of a phase that has not finished."""
-
-    phase_id: str
-    step: display_cells.OpenStep | display_cells.NoOpenStep
-
-
-class OpenUnitRun(NamedTuple):
-    """A unit's run with at least one phase still open."""
-
-    started: float
-    path: Path
-    phases: tuple[OpenRunPhase, ...]
-
-
 class NewestUnitRun(NamedTuple):
     """The newest run found for one unit."""
 
     started: float
     path: Path
     start: dict[str, object]
-
-
-class NoOpenUnitRun(NamedTuple):
-    """The unit's newest run has no open phase."""
-
-
-class OpenPhaseHistory(NamedTuple):
-    """Keep the events for one phase until it closes."""
-
-    phase_id: str
-    events: list[dict[str, object]]
 
 
 def newest_unit_runs(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, NewestUnitRun]:
@@ -658,48 +603,6 @@ def run_is_finished(events: list[dict[str, object]]) -> bool:
         if kind in ("run_finished", "reopened"):
             return kind == "run_finished"
     return False
-
-
-def open_unit_runs(snapshot: staff.StaffSnapshot, *,
-                   read_run: RunEventsReader = read_work_events,
-                   newest: dict[staff.StaffId, NewestUnitRun] | None = None) -> dict[staff.StaffId, OpenUnitRun]:
-    """Read each unit's staff pointer and retain its open phases."""
-    result: dict[staff.StaffId, OpenUnitRun] = {}
-    for owner in snapshot.find(kind="unit"):
-        if newest is not None:
-            latest = newest.get(owner.id)
-            if latest is None:
-                continue
-            path = latest.path
-        else:
-            if not isinstance(owner.run, staff.OpenRun) or not unit_runs.run_is_open(owner.run.path):
-                continue
-            path = plan_history.run_events_path(owner.run.path)
-        events = read_run(path)
-        if run_is_finished(events):
-            continue
-        start = next((event for event in events if event.get("event_type") == "run_started"), dict[str, object]())
-        started = next((float(value) for value in (start.get("run_started_at"), start.get("timestamp_epoch"))
-                        if isinstance(value, int | float) and not isinstance(value, bool)), 0.0)
-        phases: dict[str, OpenPhaseHistory] = {}
-        current = ""
-        for event in events:
-            kind = event.get("event_type")
-            key = str(event.get("phase_instance_id") or event.get("phase_id") or current)
-            if kind == "phase_started":
-                current = key
-                phases[key] = OpenPhaseHistory(str(event.get("phase_id", "")), [event])
-            elif kind == "phase_finished":
-                _ = phases.pop(key, None)
-            elif key in phases:
-                phases[key].events.append(event)
-        previous = newest.get(owner.id) if newest is not None else None
-        if previous is not None and previous.path == path:
-            started = previous.started
-        if phases:
-            result[owner.id] = OpenUnitRun(started, path, tuple(
-                OpenRunPhase(phase.phase_id, display_cells.open_step(phase.events)) for phase in phases.values()))
-    return result
 
 
 def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
@@ -798,7 +701,7 @@ def local_worktree_exists(tree: staff.PresentWorktree) -> bool:
         return False
 
 
-def fallback_plan(member: staff.StaffRow, run: NewestUnitRun, opened: OpenUnitRun | NoOpenUnitRun,
+def fallback_plan(member: staff.StaffRow, run: NewestUnitRun, open_ids: set[str],
                   record: object, *, read_plan: Callable[[Path], list[plan_history.PlanPhase]]) -> BoardPlanRecord:
     """Read unfinished plan headings against the newest run's open phases."""
     if not isinstance(member.worktree, staff.PresentWorktree):
@@ -812,10 +715,9 @@ def fallback_plan(member: staff.StaffRow, run: NewestUnitRun, opened: OpenUnitRu
     path = plan_history.resolve_plan_path(member.worktree.path, value)
     if isinstance(record, phase_table.PhaseRecord) and record.plan == path:
         return record_fields(record)
-    running = {phase.phase_id for phase in opened.phases} if isinstance(opened, OpenUnitRun) else set[str]()
     return {"plan": str(path), "phases": [
         {"phase": phase["id"], "title": phase["title"],
-         "status": "done" if phase["done"] else "running" if phase["id"] in running else "todo"}
+         "status": "done" if phase["done"] else "running" if phase["id"] in open_ids else "todo"}
         for phase in read_plan(path)]}
 
 
@@ -1478,7 +1380,6 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
 
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
     newest = newest_unit_runs(unit_snapshot)
-    runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
     machines = display_cells.machine_column([unit.machine for unit in units])
     no_workers = quota_state.no_worker_mode()
     states: list[UnitBoardState] = []
@@ -1499,12 +1400,19 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             queue = read_queue(member.id)
             hold = hold_text(member, now=now, zone=zone)
             run = newest.get(member.id)
-            opened = runs.get(member.id, NoOpenUnitRun())
             if run is not None:
                 run_events = read_run(run.path)
+                open_phases: list[dict[str, object]] = []
+                if (isinstance(member.run, staff.OpenRun) and member.run.path.name == run.path.stem
+                        and not run_is_finished(run_events)):
+                    try:
+                        open_phases = recorder_state.read_open_phases(member.run.path)
+                    except ValueError as error:
+                        session_staff.report_anomaly(str(error))
                 planless = not plan_phase_rows(record_fields(record))
                 if planless:
-                    record = fallback_plan(member, run, opened, record, read_plan=read_plan)
+                    open_ids = {value for phase in open_phases if isinstance(value := phase.get("id"), str)}
+                    record = fallback_plan(member, run, open_ids, record, read_plan=read_plan)
                 plan_path = record_fields(record).get("plan", "")
                 if Path(plan_path) in plan_failures:
                     error = plan_failures[Path(plan_path)]
@@ -1513,9 +1421,11 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                         record = {"plan": plan_path}
                     else:
                         record = {**record_fields(record), "unavailable": str(error)}
-                if isinstance(opened, OpenUnitRun):
+                if open_phases:
                     plan_path = record_fields(record).get("plan", "")
-                    built = phase_table.build_run(Path(plan_path), run_events)
+                    built = phase_table.build_run(
+                        Path(plan_path), run_events, open_instance_ids=recorder_state.open_instance_ids(open_phases),
+                    )
                     positions: dict[str, int] = {row.get("phase", ""): position
                                                  for position, row in enumerate(plan_phase_rows(record_fields(record)))}
                     phases = tuple(sorted((phase for phase in built.phases if isinstance(phase, phase_table.OpenPhase)),

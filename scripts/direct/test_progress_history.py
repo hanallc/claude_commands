@@ -148,7 +148,7 @@ class ProgressHistoryTests(unittest.TestCase):
         path = run / "progress_history_state.json"
         command = ["bash", "assign.sh", "a path with spaces"]
         fields = {"owner_staff_id": parent.id,
-                  "phase": {"id": "1", "instance_id": "phase-1", "status": "active"},
+                  "open_phases": [{"id": "1", "instance_id": "phase-1", "status": "active"}],
                   "pass": {"impl": {"status": "active", "instance_id": "same-pass", "worker_id": worker.id,
                                     "team_slot": "impl", "phase": {"id": "1", "instance_id": "phase-1"},
                                     "launcher_command": command}}}
@@ -7405,6 +7405,20 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(self.eta_report_line(eastern),
                          "ETA Sat 17 Oct 12:10 (on its first ETA, 1 fix round + 1 running)")
 
+    def test_eta_fallback_uses_the_open_instance_when_phase_ids_match(self) -> None:
+        session_dir = self.short_report_fixture("eta-set-aside", promises=("16:10",), running_fix=False)
+        history = self.history_dir / "runs/eta-set-aside.jsonl"
+        with history.open("a", encoding="utf-8") as stream:
+            for event in self.read_events(session_dir.name):
+                if event.get("event_type") in ("phase_started", "eta_stated"):
+                    copy = {**event, "phase_instance_id": "set-aside"}
+                    if event.get("event_type") == "eta_stated":
+                        copy["eta_at"] = self.report_time(19)
+                    _ = stream.write(json.dumps(copy) + "\n")
+        with patch.object(phase_table, "build", side_effect=phase_table.NoPlan("fixture")):
+            report = self.short_progress(session_dir, self.report_time(16))
+        self.assertTrue(self.eta_report_line(report).startswith("ETA 16:10"), report)
+
     def test_short_eta_line_formats_promises_in_the_user_zone(self) -> None:
         session_dir = self.short_report_fixture("short-user-zone")
 
@@ -8459,38 +8473,6 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual([(event["phase_id"], event["phase_elapsed_seconds"]) for event in ended],
                          [(phase_id, base + 200 + offset * 10 - expected[phase_id][0])
                           for offset, phase_id in enumerate(order)])
-
-    def test_legacy_phase_records_move_their_scoped_fields_to_the_open_list(self) -> None:
-        base = 40_000
-        session = self.start_run("legacy-phase-records", base)
-        self.start_numbered_phase(session, "5", base + 10)
-        self.start_numbered_phase(session, "6", base + 20)
-        path = session / plan_history.STATE_FILENAME
-        state = self.read_state(session)
-        older, current = recorder_state.open_phases(state)
-        older["parked"] = {"phase_last_percent": 20, "pending_calibration": {"candidate_percent": 20}}
-        state["open_phases"] = [older]
-        state["phase"] = current
-        state["phase_last_percent"] = 40
-        state["activity"] = {"instance_id": "legacy-activity", "status": "active", "started_at": base + 25}
-        atomic_file.write_text_atomic(path, json.dumps(state))
-        self.assertEqual(recorder_state.read_open_phase_ids(session), ["5", "6"])
-
-        self.finish_numbered_phase(session, base + 30, "--phase-id", "5")
-        normalized = self.read_state(session)
-        remaining, = recorder_state.open_phases(normalized)
-        self.assertEqual((remaining["id"], remaining["phase_last_percent"]), ("6", 40))
-        self.assertIn("activity", remaining)
-        self.assertNotIn("phase_last_percent", normalized)
-        self.assertNotIn("activity", normalized)
-        closed = cast(dict[str, object], normalized["phase"])
-        self.assertEqual((closed["id"], closed["phase_last_percent"]), ("5", 20))
-        self.assertEqual(closed["pending_calibration"], {"candidate_percent": 20})
-        self.assertNotIn("parked", closed)
-        self.assertEqual(self.phase_events(session.name, "activity_finished"), [])
-        self.finish_numbered_phase(session, base + 40)
-        activity, = self.phase_events(session.name, "activity_finished")
-        self.assertEqual((activity["phase_id"], activity["activity_elapsed_seconds"]), ("6", 15))
 
     def test_finishing_an_older_open_phase_leaves_the_current_one_and_its_workers(self) -> None:
         started_at = 41_000

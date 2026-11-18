@@ -1124,19 +1124,17 @@ def record_lifetime(path: Path, now: float, ending_task: str = "", *,
             state = cast(dict[str, object], raw)
             current = state.get("phase")
             opened = state.get("open_phases", [])
-            if not isinstance(current, dict) or not isinstance(opened, list):
+            if (current is not None and not isinstance(current, dict)) or not isinstance(opened, list):
                 raise ValueError("invalid phase state")
-            phases: list[object] = [*cast(list[object], opened), cast(object, current)]
-            for item in phases:
+            for item in cast(list[object], opened):
                 if not isinstance(item, dict):
                     raise ValueError("invalid phase record")
-                fields = cast(dict[str, object], item)
-                if str(fields.get("id")) == phase:
-                    status = fields.get("status")
-                    if status == "active" or item in opened:
-                        return Live(f"open phase: {phase} in {run}")
-                    # finish-phase's --status choices in progress_history.py; no shared constant exists.
-                    if status not in ("completed", "stopped", "error", "finished", "complete", "ended"):
+                if cast(dict[str, object], item).get("id") == phase:
+                    return Live(f"open phase: {phase} in {run}")
+            if isinstance(current, dict):
+                fields = cast(dict[str, object], current)
+                if fields.get("id") == phase:
+                    if fields.get("status") not in ("completed", "stopped", "error", "finished", "complete", "ended"):
                         raise ValueError("unreadable phase status")
                     return Ended(f"phase {phase} ended in {progress}") if isinstance(protection, Ended) else protection
             if record.task == ending_task or task_has_end_evidence(record):

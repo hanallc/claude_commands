@@ -224,11 +224,20 @@ class UnitPhasesTests(unittest.TestCase):
         header: dict[str, object] = {"event_type": "run_started", "run_id": name,
             "owner_staff_id": member.id, "owner_session": member.current_session,
             "working_dir": str(self.root), "plan_doc": plan, "run_started_at": started}
-        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(header))
         events = [header, *({"event_type": "phase_started", "phase_id": phase,
             "phase_title": title, "phase_instance_id": phase + "-instance",
             "phase_started_at": started + index + 1, "timestamp_epoch": started + index + 1}
             for index, (phase, title) in enumerate(phases)), *tail]
+        opened: dict[str, dict[str, object]] = {}
+        for event in events:
+            instance = event.get("phase_instance_id")
+            if not isinstance(instance, str):
+                continue
+            if event.get("event_type") == "phase_started":
+                opened[instance] = {"id": event.get("phase_id"), "instance_id": instance, "status": "active"}
+            elif event.get("event_type") == "phase_finished":
+                _ = opened.pop(instance, None)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({**header, "open_phases": list(opened.values())}))
         path = history / (name + ".jsonl")
         _ = path.write_text("".join(json.dumps(row) + "\n" for row in events))
         _ = staff.set_run(member.id, staff.OpenRun(folder))
@@ -692,6 +701,22 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertNotIn(holder.current_session, rendered)
         self.assertEqual(rendered.splitlines()[0],
             "working 1 · waiting to merge 0 · waiting on other work 0 · idle 0 · 1 units")
+
+    def test_board_uses_only_open_instances_from_the_recorder(self) -> None:
+        member = self.member("parallel")
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        _ = self.write_run(member, "parallel", [("old", "Set aside"), ("one", "First"), ("two", "Second")],
+                           started=now - 123)
+        state_path = self.root / "runs/parallel" / unit_runs.STATE_FILE
+        state = cast(dict[str, object], json.loads(state_path.read_text()))
+        state["open_phases"] = cast(list[dict[str, object]], state["open_phases"])[1:]
+        _ = state_path.write_text(json.dumps(state))
+
+        rendered = self.blocks([member], {})
+        self.assertNotIn("old ·", rendered)
+        self.assertNotIn("Set aside (old)", rendered)
+        self.assertIn("one · 2m elapsed", rendered)
+        self.assertIn("two · 2m elapsed", rendered)
 
     def test_status_comes_from_the_census_session_or_the_scanned_machines(self) -> None:
         owner = fixture_member("showrunner", name="status-owner")
@@ -1857,15 +1882,13 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertNotIn(str(self.root / "failed.log"), rendered)
 
         tail[0]["reason"] = "The user stopped this attempt"
+        tail.extend((
+            {"event_type": "phase_started", "phase_id": "gate-time-limit", "phase_instance_id": "gate-new",
+             "phase_title": stopped[3][1], "phase_started_at": finished + 300},
+            {"event_type": "pass_started", "phase_id": "gate-time-limit", "phase_instance_id": "gate-new",
+             "pass_instance_id": "gate-writer", "pass_kind": "impl", "worker_id": "writer-id"},
+        ))
         _ = self.write_run(member, "admin-console", [*stopped, answer], tail, plan="missing-plan.md")
-        with path.open("a") as stream:
-            for event in (
-                {"event_type": "phase_started", "phase_id": "gate-time-limit", "phase_instance_id": "gate-new",
-                 "phase_title": stopped[3][1], "phase_started_at": finished + 300},
-                {"event_type": "pass_started", "phase_id": "gate-time-limit", "phase_instance_id": "gate-new",
-                 "pass_instance_id": "gate-writer", "pass_kind": "impl", "worker_id": "writer-id"},
-            ):
-                _ = stream.write(json.dumps(event) + "\n")
         with patch.object(land_queue, "land_view", return_value=merge):
             rendered = self.blocks([member], {}, workers=[census_worker("writer", member.id)])
         rows = detail_rows(rendered, member.name)
@@ -2335,7 +2358,9 @@ class UnitPhasesTests(unittest.TestCase):
                 "# Plan\n### Phase 1 — First work · status: todo\n### Phase 2 — Later work · status: todo\n")
             folder = self.root / "runs" / name
             folder.mkdir(parents=True)
-            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({
+                "owner_staff_id": member.id, "open_phases": [{"id": "1", "instance_id": name, "status": "active"}],
+            }))
             _ = staff.set_run(member.id, staff.OpenRun(folder))
             path = history / f"{name}.jsonl"
             events: list[dict[str, object]] = [

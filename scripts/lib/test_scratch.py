@@ -1864,17 +1864,15 @@ print(scratch.target('gate:proof', 'tree', False))
         scratch.hand_over(path, "next-unit", "gate:next-unit")
         self.assertIsInstance(scratch.task_of(path), copy_record.Registered)
 
-    def test_phase_lifetime_reads_current_and_parked_phases_and_fails_closed(self) -> None:
+    def test_phase_lifetime_reads_the_open_phase_list_and_fails_closed(self) -> None:
         run = self.base / "run"
         run.mkdir()
         progress = run / "progress_history_state.json"
         path = self.copy(task="phase:maker/21", run_dir=str(run), phase_id="21")
-        for state in ({"phase": {"id": "21", "status": "active"}},
-                      {"phase": {"id": "22", "status": "active"},
-                       "open_phases": [{"id": "21", "status": "active"}]}):
-            _ = progress.write_text(json.dumps(state))
-            self.assertIsInstance(scratch.lifetime(path), scratch.Live)
-            self.assertEqual(scratch.end("phase:maker/21"), [])
+        state = {"open_phases": [{"id": "21", "status": "active"}, {"id": "22", "status": "active"}]}
+        _ = progress.write_text(json.dumps(state))
+        self.assertIsInstance(scratch.lifetime(path), scratch.Live)
+        self.assertEqual(scratch.end("phase:maker/21"), [])
         _ = progress.write_text("bad")
         unknown = scratch.lifetime(path)
         self.assertIsInstance(unknown, scratch.Unknown)
@@ -2038,7 +2036,7 @@ print(scratch.target('gate:proof', 'tree', False))
         with mock.patch.object(scratch, "remove", side_effect=OSError("injected removal stop")):
             result = scratch.end("phase:maker/21")
         self.assertEqual(result.kept, [scratch.KeptFolder(path, "injected removal stop")])
-        _ = progress.write_text(json.dumps({"phase": {"id": "22", "status": "active"}, "open_phases": []}))
+        _ = progress.write_text(json.dumps({"open_phases": [{"id": "22", "status": "active"}]}))
         self.assertEqual(scratch.end("phase:maker/21"), [path])
 
     def test_hand_over_keeps_parent_path_and_child_alternates_then_child_goes_first(self) -> None:
@@ -2317,7 +2315,7 @@ print(scratch.target('gate:proof', 'tree', False))
         busy = self.copy("busy")
         run = self.base / "run"
         run.mkdir()
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"phase": {"id": "21", "status": "active"}}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"open_phases": [{"id": "21", "status": "active"}]}))
         phase = self.copy("phase", task="phase:maker/21", run_dir=str(run), phase_id="21")
         parent = self.copy("parent", task="until:2000-01-01T0000Z")
         child = self.copy("child")
@@ -2675,8 +2673,9 @@ print(scratch.target('gate:proof', 'tree', False))
         old_run.mkdir()
         new_run.mkdir()
         for run, phase, status in ((old_run, "21", "completed"), (new_run, "22", "active")):
-            _ = (run / "progress_history_state.json").write_text(json.dumps(
-                {"phase": {"id": phase, "status": status}}))
+            record = {"id": phase, "status": status}
+            state: dict[str, object] = {"open_phases": [record]} if status == "active" else {"phase": record}
+            _ = (run / "progress_history_state.json").write_text(json.dumps(state))
         path = self.copy(task="phase:maker/21", run_dir=str(old_run), phase_id="21", land_target="origin/old")
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
         scratch.hand_over(path, "next-unit", "phase:next-unit/22")

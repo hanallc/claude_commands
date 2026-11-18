@@ -289,11 +289,9 @@ def _phase_identity(
     if len(phases) > 1:
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases)
         raise SystemExit(f"{len(phases)} phases are open ({open_ids}); name one with --phase")
-    phase = phases[0] if phases else _object_dict(progress.get("phase"))
-    if not phase:
+    if not phases:
         return "", ""
-    if not closed_phase_ok and _string(phase.get("status")) not in ("", "active"):
-        raise SystemExit(f"Phase {_string(phase.get('id'))} is not open (open phases: none)")
+    phase = phases[0]
     return _string(phase.get("instance_id")), _string(phase.get("id"))
 
 

@@ -460,12 +460,6 @@ def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None,
         raise SystemExit(f"Unable to read progress state {path}: {error}") from error
     if state is None:
         raise SystemExit(f"Invalid progress state: {path}")
-    legacy = _object_dict(state.get("phase"))
-    recorder_state.migrate_phases(state)
-    if legacy is not None and legacy.get("status") == "active":
-        for passed in _open_passes(state).values():
-            if "phase" not in passed:
-                passed["phase"] = _phase_stamp(legacy)
     if not resolve_staff:
         return state
     return plan_history.staff_directory(state, staff.initial_snapshot() if record is None else record,
@@ -1229,8 +1223,9 @@ def _open_phase_named(state: dict[str, object], phase_id: str) -> dict[str, obje
 
 
 def _last_finished_phase(state: dict[str, object]) -> dict[str, object] | None:
-    # The closed record remains available to commands that report after a phase ends.
-    return _object_dict(state.get("phase")) or None
+    """Read the last finished phase."""
+    phase = _object_dict(state.get("phase"))
+    return phase if phase is not None and phase.get("status") in ("completed", "stopped", "error") else None
 
 
 def _selected_phase(state: dict[str, object], args: argparse.Namespace, *, closed: bool = False) -> dict[str, object] | None:
@@ -5037,21 +5032,26 @@ def _project_chain_eta(
 
 def _phase_eta_line(session_dir: Path, phase_number: str) -> str:
     """Read the phase ETA from the plan or its run events."""
+    def run_record(state: dict[str, object]) -> phase_table.PhaseRecord:
+        instance_ids = recorder_state.open_instance_ids(recorder_state.open_phases(state))
+        return phase_table.build_run(session_dir, _run_events(state), open_instance_ids=instance_ids)
+
     try:
         record = phase_table.build(session_dir)
     except (phase_table.NoPlan, phase_table.NoState):
-        state = _read_state(session_dir, resolve_staff=False)
-        record = phase_table.build_run(session_dir, _run_events(state))
+        record = run_record(_read_state(session_dir, resolve_staff=False))
     candidates = [*record.phases]
     if isinstance(record.current, phase_table.OpenPhase):
         candidates = [record.current, *candidates]
-    if not any(isinstance(row, phase_table.OpenPhase) and row.phase == phase_number for row in candidates):
+    row = next((item for item in candidates if isinstance(item, phase_table.OpenPhase)
+                and item.phase == phase_number), None)
+    if row is None:
         state = _read_state(session_dir, resolve_staff=False)
         if _open_phase_named(state, phase_number) is not None:
-            candidates = [row for row in phase_table.build_run(session_dir, _run_events(state)).phases
-                          if isinstance(row, phase_table.OpenPhase)]
-    row = next((item for item in candidates if item.phase == phase_number), None)
-    return _phase_eta_text(row, plan_history.now_epoch())
+            row = next((item for item in run_record(state).phases if isinstance(item, phase_table.OpenPhase)
+                        and item.phase == phase_number), None)
+    return _phase_eta_text(row or next((item for item in candidates if item.phase == phase_number), None),
+                           plan_history.now_epoch())
 
 
 def _phase_eta_text(row: phase_table.OpenPhase | phase_table.DonePhase | phase_table.TodoPhase | None,
@@ -5538,7 +5538,7 @@ def _print_open_phase_progress(session_dir: Path) -> None:
     now = plan_history.now_epoch()
     events = _run_events(state)
     counts = _state_plan_phase_counts(state)
-    table = phase_table.build_run(session_dir, events)
+    table = phase_table.build_run(session_dir, events, open_instance_ids=recorder_state.open_instance_ids(phases))
     rows = {row.instance_id: row for row in table.phases if isinstance(row, phase_table.OpenPhase)}
     print(_scope_line(state))
     for phase in phases:
