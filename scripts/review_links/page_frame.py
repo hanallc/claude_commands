@@ -197,7 +197,27 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 [data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
 @keyframes page-status-turn{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){[data-status-icon=Reading] svg{animation:none}}
+.review-actions{display:flex;align-items:flex-end;gap:26px;flex-wrap:wrap}
+.review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
+.review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}
+.review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
+@media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
+@media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''')
+
+def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "") -> str:
+    """Render the Review action groups that have controls."""
+    groups = (
+        ("Closes the item", closing_buttons, "", ""),
+        ("The item returns to you", returning_buttons, "", ""),
+        ("Hides it until", later_controls, " review-later", ' class="later-menu"'),
+    )
+    return '<div class="review-actions">' + "".join(
+        f'<div class="review-action-group{group_class}"><span>{label}</span>'
+        + f'<div{controls_class}>{controls}</div></div>'
+        for label, controls, group_class, controls_class in groups if controls
+    ) + '</div>'
+
 
 COPY_BUTTON = '''<button type="button" data-copy-code aria-label="Copy code" title="Copy">
 <svg data-copy-icon width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
