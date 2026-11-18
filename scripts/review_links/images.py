@@ -202,8 +202,9 @@ def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
 
 
 def question_html(question: question_record.Question, open_questions: Mapping[str, ImageQuestionDelivery]) -> str:
-    if question.answer is not None:
-        return page_question.answered_question_html(question)
+    answer = question.answer
+    if answer is not None:
+        return page_question.answered_question_html(question, answer)
     content = page_question.open_question_html(question)
     delivery = open_questions.get(question.question_id, QuestionDelivery.ACCEPTED)
     if delivery is QuestionDelivery.ACCEPTED:
