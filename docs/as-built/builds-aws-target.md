@@ -102,7 +102,7 @@ deploy.py down --workload plan-identity --approve-destroy
 
 1. Sign in to the AWS console for the management account.
 2. Switch to `OrganizationAccountAccessRole` in the test account.
-3. Create an IAM user with the `AdministratorAccess` policy in the test account.
+3. Create the IAM user `aws-build-test` with the path `/aws-build/` and the `AdministratorAccess` policy in the test account.
 4. Create an access key for that user.
 5. Run `deploy.py test-identity` in a terminal on natedev.
 

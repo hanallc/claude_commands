@@ -16,7 +16,7 @@ from scripts.lib.atomic_file import create_text_atomic, prepared_replacement, sy
 
 CONSOLE_SETUP = (
     'Switch to OrganizationAccountAccessRole in the test account from the management account. '
-    'Create an IAM user with AdministratorAccess and create an access key for that user. '
+    'Create the IAM user aws-build-test (path /aws-build/) with AdministratorAccess and create an access key for it. '
     'Run test-identity again with a key from the recorded test account to replace the saved key.'
 )
 ACCOUNT_RECORD = 'test-identity.json'
