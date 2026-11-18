@@ -2657,6 +2657,27 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             _ = self.git("branch", "-f", "style/main", style_tip)
         return ledger, style_tip
 
+    def test_last_issued_ticket_kind_ignores_queued_rows_and_a_late_predecessor_merge(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        unit = ticket_owner_id("read")
+        other = ticket_owner_id("modules")
+        read = ledger.ticket_get("1001")["rules"][0]
+        self.assertIsInstance(ledger.last_issued_ticket_kind(other), style_ledger.NoIssuedTicket)
+        self.assertEqual(ledger.last_issued_ticket_kind(unit), "read")
+
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        path = self.sources[2]
+        ledger.ticket_add("1002", unit, "structure", "modules", "crates/beta", [path], [structure],
+                          cells=((structure, path),))
+        ledger.ticket_assign("1002", "main")
+        _ = ledger.ticket_merge("1001")
+        ledger.ticket_add("1003", unit, "read", "names", "crates/alpha", [self.sources[0]], [read])
+        ledger.ticket_add("1004", other, "read", "names", "crates/beta", [self.sources[3]], [read])
+        ledger.ticket_assign("1004", "main")
+
+        self.assertEqual(ledger.last_issued_ticket_kind(unit), "structure")
+        self.assertEqual(ledger.last_issued_ticket_kind(other), "read")
+
     def test_successor_gate_ignores_docs_imported_by_a_style_fast_forward(self) -> None:
         ledger, _ = self.successor_after_style_fast_forward()
         self.write(self.sources[2], "pub fn successor_work() {}\n")

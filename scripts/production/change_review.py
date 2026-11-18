@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -446,6 +446,18 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else BODY
 
 
+def review_list_source(path: Path) -> Path:
+    """Resolve a review list path and reject existing paths that are not files."""
+    source = path.resolve()
+    try:
+        mode = source.stat().st_mode
+    except FileNotFoundError:
+        return source
+    if not stat.S_ISREG(mode):
+        raise ChangeReviewError(f"{source}: the review list must be a regular file")
+    return source
+
+
 def list_file(showrunner: str, *, sources: list[Path] | None = None) -> Path:
     """The list of the top-level showrunner called `showrunner`."""
     folder = lists_directory() if sources is None else lists_directory(sources=sources)
@@ -772,6 +784,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                   else str(producer) if isinstance(producer, str) else row_production(owner, record)
                   for change, owner, producer in zip(changes, row_owners, row_producers)]
     unregistered: set[str] = set()
+    pending_rows: list[str] = []
 
     def write(lines: list[str]) -> list[str]:
         existing = _changes("".join(lines)) if any(isinstance(change, PublicationChange) for change in changes) else []
@@ -821,6 +834,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                                      IMAGE: row_images[index]})
                 for offset, index in enumerate(selected)]
         _insert(lines, end, rows)
+        pending_rows.extend(rows)
         unregistered.update(change.unit_name for index in selected
                             if isinstance(change := changes[index], PublicationChange)
                             and isinstance(change.producer, UnknownProducer) and change.unit_name)
@@ -835,7 +849,14 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             return f"add {named}"
         return f"{'row' if len(ids) == 1 else 'rows'} {named} from {merged}"
 
-    rows = _edit(path, production, day, write, what)
+    def publish(path: Path, text: str) -> None:
+        try:
+            write_text_atomic(path, text)
+        except AtomicDurabilityUnconfirmed as error:
+            visible = [WrittenReviewRow(path, row) for row in pending_rows]
+            raise ReviewListDurabilityUnconfirmed(path, visible, error) from error
+
+    rows = _edit(path, production, day, write, what, publish=publish)
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
@@ -1984,7 +2005,7 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         result = scratch.end(f"row:{_owner(path)}-{row}")
         return ([f"removed {folder}" for folder in result]
                 + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
-    except (scratch.ScratchError, OSError) as error:
+    except (conf.Unusable, scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 
 
@@ -2043,6 +2064,7 @@ class PendingVerdictCleanup:
     feature_review: str = ''
     superseded_wait: str = ''
     wait_log: WaitSupersessionDestination | NoSavedWaitLogDestination = NO_SAVED_WAIT_LOG_DESTINATION
+    require_git_commit: bool = True
 
     @classmethod
     def for_row(cls, root: Path, path: Path, row: str) -> PendingVerdictCleanup:
@@ -2050,16 +2072,23 @@ class PendingVerdictCleanup:
         return cls(path, row, root / name.replace('.review-link-delivery-', VERDICT_CLEANUP_PREFIX, 1))
 
     @classmethod
-    def load(cls, intent: Path, lists: Path) -> PendingVerdictCleanup:
-        """Read the exact list, row and verdict for restart cleanup."""
-        fields = cast(dict[str, object], json.loads(intent.read_text(encoding='utf-8')))
+    def load(cls, intent: Path, expected_directory: Path | None = None) -> PendingVerdictCleanup:
+        """Read the exact list, row and verdict from a private cleanup record."""
+        with os.fdopen(os.open(intent, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding='utf-8') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise ChangeReviewError(f"{intent}: scratch cleanup record must be private")
+            fields = cast(dict[str, object], json.load(source))
         path = Path(cast(str, fields['list']))
         row = _row_id('row', cast(str, fields['row']))
+        if path != review_list_source(path) or (expected_directory is not None and path.parent != expected_directory):
+            raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         cleanup = replace(cls.for_row(intent.parent, path, row),
                           verdict=_words('verdict', cast(str, fields['verdict'])),
                           feature_review=cast(str, fields.get('feature_review', '')),
-                          superseded_wait=cast(str, fields.get('superseded_wait', '')))
-        if path.parent != lists or path.is_symlink() or not path.match(PREFIX+'*.md') or cleanup.intent != intent:
+                          superseded_wait=cast(str, fields.get('superseded_wait', '')),
+                          require_git_commit=fields.get('require_git_commit') is not False)
+        if cleanup.intent != intent:
             raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         if 'wait_log' in fields:
             cleanup = replace(cleanup, wait_log=WaitSupersessionDestination.from_fields(
@@ -2088,12 +2117,15 @@ class PendingVerdictCleanup:
     def confirm_durability(self) -> None:
         """Confirm the visible verdict before recovery performs its closeout."""
         self.sync()
-        _commit([self.path], f'{_owner(self.path)} verdict {self.row}', report_warning=self.commit_failed)
+        _commit([self.path], f'{_owner(self.path)} verdict {self.row}',
+                report_warning=self.commit_failed if self.require_git_commit else _print_warning)
 
     def save(self) -> None:
         fields: dict[str, object] = {
             'list':str(self.path.resolve()), 'row':self.row, 'verdict':self.verdict,
             'feature_review':self.feature_review, 'superseded_wait':self.superseded_wait}
+        if not self.require_git_commit:
+            fields['require_git_commit'] = False
         if isinstance(self.wait_log, WaitSupersessionDestination):
             fields['wait_log'] = self.wait_log.fields()
         write_text_atomic(self.intent, json.dumps(fields)+'\n', new_file_mode=0o600)
@@ -2232,7 +2264,8 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
         else:
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append,
-                                    publish=publish, superseded=superseded, commit_warning=cleanup.commit_failed)
+                                    publish=publish, superseded=superseded,
+                                    commit_warning=cleanup.commit_failed if cleanup.require_git_commit else warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings, cleanup=cleanup)
 
 
@@ -2399,10 +2432,38 @@ def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
     return frozenset(foreign)
 
 
+@dataclass(frozen=True)
+class WrittenReviewRow:
+    list_path: Path
+    markdown: str
+
+
+class ReviewListWriteFailed(ChangeReviewError):
+    """A list write failed after zero or more rows were saved."""
+
+    def __init__(self, list_path: Path, rows: list[WrittenReviewRow], error: Exception) -> None:
+        super().__init__(str(error))
+        self.list_path: Path = list_path
+        self.written_rows: tuple[WrittenReviewRow, ...] = tuple(rows)
+
+
+class ReviewListDurabilityUnconfirmed(ReviewListWriteFailed):
+    """The new rows are visible after the write, but the directory sync failed."""
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
                known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
+    """Return the Markdown for the rows written to the review lists."""
+    return [row.markdown for row in list_ready_rows(repo, production, merge_branch, review_list=review_list,
+                                                   record=record, selection=selection, known_producer=known_producer)]
+
+
+def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
+                    review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
+                    selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+                    known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
     try:
@@ -2437,7 +2498,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside = _reviewed_merge_refs_by_doc(repo, lambda: outside_docs, record=record)
     outside_refs = set(outside.values())
     foreign = _foreign_merges(repo, outside, production, merge_branch, record)
-    rows: list[str] = []
+    rows: list[WrittenReviewRow] = []
     matched_step = False
     recorded = checkpoint_producers(record)
     for entry in merges:
@@ -2522,9 +2583,15 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
-            rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
-                                    on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem))
+            try:
+                written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
+                                      on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+            except ReviewListDurabilityUnconfirmed as error:
+                raise ReviewListDurabilityUnconfirmed(path, [*rows, *error.written_rows], error) from error
+            except (ChangeReviewError, OSError, UnicodeError) as error:
+                raise ReviewListWriteFailed(path, rows, error) from error
+            rows.extend(WrittenReviewRow(path, row) for row in written)
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows

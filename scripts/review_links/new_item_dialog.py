@@ -570,7 +570,7 @@ SCRIPT = r'''(() => {
  const fields = [...form.querySelectorAll('fieldset'), words, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, evidence, token, recipients, images = [], sending = false;
- let draftRevision = 0, sentRevision = -1, requestId;
+ let draftRevision = 0, sentRevision = -1, requestId, keepDraft = false;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -718,18 +718,39 @@ SCRIPT = r'''(() => {
 
  async function responseData(response, fallback) {
   const data = await response.json().catch(() => null);
-  if (!response.ok || !data) throw new Error(data?.reason || fallback);
+  if (!response.ok || !data) {
+   const failure = new Error(data?.error || data?.reason || fallback);
+   failure.staleToken = response.status === 403 && data?.code === 'stale_token';
+   throw failure;
+  }
   return data;
+ }
+
+ async function loadOptions(signal) {
+  const response = await fetch(endpoint, {cache: 'no-store', signal});
+  const data = await responseData(response, 'Could not load recipients.');
+  if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || !data.token) {
+   throw new Error('Could not load recipients.');
+  }
+  return data;
+ }
+
+ async function post(payload) {
+  const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                          body: JSON.stringify(payload)});
+  return responseData(response, 'Could not send this item.');
  }
 
  function close() {
   if (!dialog.open || sending) return;
   opening.abort();
   dialog.close();
-  for (const image of images) URL.revokeObjectURL(image.url);
-  images = [];
-  previews.replaceChildren();
-  previews.hidden = true;
+  if (!keepDraft) {
+   for (const image of images) URL.revokeObjectURL(image.url);
+   images = [];
+   previews.replaceChildren();
+   previews.hidden = true;
+  }
   if (launcher?.isConnected) launcher.focus({preventScroll: true});
   launcher = null;
  }
@@ -745,32 +766,30 @@ SCRIPT = r'''(() => {
  async function open({trigger, kind = 'question', evidence: capture = {kind: 'none'}} = {}) {
   if (dialog.open || sending) return;
   launcher = trigger || document.activeElement;
-  evidence = structuredClone(capture);
   token = '';
-  recipients = null;
-  sentRevision = -1;
-  form.reset();
-  setError('');
-  recipientChips.replaceChildren();
+  if (!keepDraft) {
+   evidence = structuredClone(capture);
+   recipients = null;
+   sentRevision = -1;
+   form.reset();
+   setError('');
+   recipientChips.replaceChildren();
+   const kinds = [...form.querySelectorAll('input[name="kind"]')];
+   (kinds.find(input => input.value === kind) || kinds[0]).checked = true;
+   showEvidence();
+  }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
-  const kinds = [...form.querySelectorAll('input[name="kind"]')];
-  const selected = kinds.find(input => input.value === kind) || kinds[0];
-  selected.checked = true;
-  showEvidence();
   updateSend();
   const controller = new AbortController();
   opening = controller;
   dialog.showModal();
-  selected.focus({preventScroll: true});
+  const focus = keepDraft ? words : form.querySelector('input[name="kind"]:checked');
+  focus.focus({preventScroll: true});
   body.scrollTop = 0;
   try {
-   const response = await fetch(endpoint, {cache: 'no-store', signal: controller.signal});
-   const data = await responseData(response, 'Could not load recipients.');
+   const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || !data.token) {
-    throw new Error('Could not load recipients.');
-   }
    token = data.token;
    recipients = data.recipients;
    showRecipients();
@@ -802,15 +821,23 @@ SCRIPT = r'''(() => {
   let saved;
   try {
    payload.images = await Promise.all(images.map(image => pastedData(image.file)));
-   const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                           body: JSON.stringify(payload)});
-   const result = await responseData(response, 'Could not send this item.');
+   let result;
+   try {
+    result = await post(payload);
+   } catch (failure) {
+    if (!failure.staleToken) throw failure;
+    const fresh = await loadOptions(opening.signal);
+    token = fresh.token;
+    result = await post({...payload, token});
+   }
    const prefix = {question:'Q', proposal:'P', investigation:'I', bug:'I'}[kind];
    if (typeof result.id !== 'string' || !new RegExp('^' + prefix + '[1-9][0-9]*$').test(result.id)) {
     throw new Error('The server did not return a saved item ID.');
    }
    saved = result;
+   keepDraft = false;
   } catch (failure) {
+   keepDraft = true;
    setError(failure.message);
   } finally {
    setSending(false);

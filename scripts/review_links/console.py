@@ -22,6 +22,12 @@ PAGE_NAME = "console.html"
 NEWS_NAME = "news"
 # The console script's placeKey uses the same prefix for the place it keeps for each page.
 PLACE_PREFIX = "at."
+REVIEW_PLACE_SCRIPT = review_legacy.SCRIPT + r"""function legacyReviewPlace(params, legacy=''){
+ if((params.get('legacy') || legacy)==='investigation' && params.get('type')==='investigation')
+  params.set('type','investigations');
+ reviewPlace(params,legacy);
+}
+"""
 ICON_NAMES = frozenset(("list-checks", "inbox", "hammer", "cloud", "hard-drive", "image", "message-circle-question", "panel-left-close",
                         "panel-left-open", "menu", "refresh-cw", "sparkle", "users", "search"))
 REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
@@ -276,7 +282,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
-    content = content.replace('<script>', '<script>'+review_legacy.SCRIPT, 1)
+    content = content.replace('<script>', '<script>'+REVIEW_PLACE_SCRIPT, 1)
     return content.encode("utf-8")
 
 
@@ -655,7 +661,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       const previous=new URL(url.searchParams.get('at.'+identity) || '/console/changes.html',location.origin);
       const filters=new URLSearchParams(previous.search);
       for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
-      reviewPlace(filters,kind);filters.set('type',kind);
+      filters.set('type',kind);legacyReviewPlace(filters,kind);
       url.searchParams.set('at.review','/console/review.html#'+filters);
       history.replaceState(null,'',url);identity='review';
     }

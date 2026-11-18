@@ -129,7 +129,7 @@ class DispatchPrompt:
 
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
-                       stop_at_done: bool = False) -> TranscriptReceipt:
+                       stop_at_done: bool = False, accept_late_done: bool = False) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
     submitted = False
     responding = False
@@ -170,7 +170,8 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                     reply = DispatchAwaitingReply(
                         reply.last_reply if isinstance(reply, DispatchAwaitingReply) else reply.reply,
                         tuple(sorted(results.union(reply.runs if isinstance(reply, DispatchAwaitingReply) else ()))))
-            elif (responding or isinstance(line, DispatchPrompt)) and entry.startswith("assistant:\n"):
+            elif (responding or isinstance(line, DispatchPrompt) or accept_late_done and submitted
+                  ) and entry.startswith("assistant:\n"):
                 text = entry.removeprefix("assistant:\n")
                 if isinstance(completion, FinalReply):
                     complete = bool(text.strip())
@@ -179,6 +180,8 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                     if isinstance(line, DispatchPrompt) and line.include_stage_two:
                         complete = complete or worker_admission.reply_ends_dispatch(
                             text, worker_panes.stage_two_completion_id(completion.dispatch_id))
+                if accept_late_done and not responding and not complete:
+                    continue
                 if complete and stop_at_done and isinstance(completion, DoneReply):
                     return TranscriptReceipt(DispatchComplete(text), frozenset(received))
                 if complete and isinstance(line, DispatchPrompt):
@@ -255,6 +258,15 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         return replace(reply, anomalies=tuple(
             f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(pending)))
     return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
+
+
+def stopped_pass_reply(row: staff.StaffRow, receipt: progress_history.StoppedPassReceipt) -> DispatchReceipt:
+    """Verify a stopped pass reply in the transcript after its prompt."""
+    backend = staff.backend(row)
+    if isinstance(backend, staff.BackendUnavailable):
+        return DispatchEvidenceUnknown("worker transcript backend is unavailable")
+    return transcript_receipt(_receipt_records(row, backend, require_transcript=True), receipt.line,
+                              DoneReply(receipt.completion_id), stop_at_done=True, accept_late_done=True).receipt
 
 
 def completion_close_evidence(row: staff.StaffRow, line: str, completion_id: str, *,
