@@ -94,7 +94,7 @@ def setUpModule() -> None:
         "REVIEW_LINKS_ROOT": str(Path(folder.name) / "links"), "CHANGE_REVIEW_DIR": folder.name,
         "SHOWRUNNER_STATE_DIR": f"{folder.name}/showrunner-state",
         "UNIT_HISTORY_DIR": f"{folder.name}/history", copy_record.ROOT_ENV: f"{folder.name}/scratch",
-        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
+        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro", scratch.HOLDS_ENV: f"{folder.name}/holds.json"}))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
                        doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
@@ -275,6 +275,25 @@ class NativeVerdictTests(unittest.TestCase):
                      '--row', delivery.row, '--reason', 'The change was reverted')
         self.assertEqual(run(*arguments), (1, '', 'C1 has a pending verdict message. Withdraw it after delivery.\n'))
         self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == record:
+                raise PermissionError('fixture record is unreadable')
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with mock.patch.object(Path, 'read_text', new=read):
+            code, output, error = run(*arguments)
+        self.assertEqual((code, output), (1, ''))
+        self.assertIn('fixture record is unreadable', error)
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+
+        _ = record.write_text('{', encoding='utf-8')
+        code, output, error = run(*arguments)
+        self.assertEqual((code, output), (1, ''))
+        self.assertIn('cannot read its verdict delivery record', error)
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), (before[0], b'{'))
+        _ = record.write_bytes(before[1])
         self.assertEqual(case.fixture.messages, [])
 
         change_page.recover_pending(change_page.DeliveryStatus(case.root))
@@ -3024,13 +3043,26 @@ class ActionTest(unittest.TestCase):
         self.assertIn("| --- | --- | --- | --- | --- |\n| C76 | Panels keep shields | Works, thanks | 2026-10-15 | 2026-10-14 |\n| C70 |", text)
 
     def test_withdraw_an_open_row_and_keep_the_users_words_and_time(self) -> None:
-        words = "The panels are back | Keep the café sign.\u2028Keep the panels.\u2029Keep the shields."
+        words = "The panels are back | Keep the café sign.\u2028Keep the panels.\u2029Keep the shields.\u0085Keep the fonts."
         arguments = ("withdraw", "--production", DOC, "--list", str(self.path), "--row", "C76", "--reason", words)
         self.enterContext(mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.path.parent / "review-links")}))
+        folder = scratch.new(f"row:{self.path.stem}-C76", "withdraw")
+        _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
+        held = os.path.realpath(folder)
+        self.assertIn(held, scratch.holds())
         with mock.patch.object(change_review, "now", return_value=ADD_TIME):
-            for _ in range(2):
-                code, _, error = run(*arguments)
-                self.assertEqual(code, 0, error)
+            with mock.patch.object(scratch, "end", side_effect=scratch.ScratchError("fixture cleanup failed")):
+                code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("scratch not removed: fixture cleanup failed", output)
+            self.assertIn(held, scratch.holds())
+            before = self.path.read_bytes()
+            code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+        self.assertIn(f"removed {folder}\n", output)
+        self.assertFalse(folder.exists())
+        self.assertNotIn(held, scratch.holds())
+        self.assertEqual(self.path.read_bytes(), before)
         snapshot = change_review.review_snapshot(self.path)
         self.assertEqual([row["#"] for row in snapshot.pending], ["C77"])
         row = next(row for row in snapshot.reviewed if row["#"] == "C76")

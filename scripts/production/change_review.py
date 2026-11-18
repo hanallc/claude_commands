@@ -1813,7 +1813,11 @@ def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: 
                         if earlier.words == event.words:
                             return False
                         raise ChangeReviewError(f"{row} is already withdrawn")
-            if isinstance(change_routing.delivery_slots(delivery).verdict, delivery_state.DeliveryIntent):
+            try:
+                slots = change_routing.delivery_slots(delivery, strict=True)
+            except (OSError, ValueError) as error:
+                raise ChangeReviewError(f"{row}: cannot read its verdict delivery record: {error}") from error
+            if isinstance(slots.verdict, delivery_state.DeliveryIntent):
                 raise ChangeReviewError(f"{row} has a pending verdict message. Withdraw it after delivery.")
             if previous:
                 previous_date = _plain(cells.get("Date", ""))
@@ -2944,6 +2948,8 @@ def _run(options: CommandLine) -> int:
             shown = row_display_id(target.path, target.row)
             written = withdraw_row(target.path, target.row, options.reason, now(), production_doc(options.production))
             print(f"{shown} withdrawn" if written else f"{shown} already withdrawn")
+            for line in end_row_scratch(target.path, target.row):
+                print(line)
         case "list-path":
             print(production_list(options.production))
         case "showrunner":
