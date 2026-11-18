@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, placement
 from scripts.build_queue.test_queue_view import with_converted_executions
 
 import json
@@ -2679,6 +2679,7 @@ def write_browser_fixture(folder: Path) -> None:
         for name, reason in (
             ("pressure", admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory")),
             ("spacing", admission_records.StartSpacingWait(110)),
+            ("cargo_folder", placement.CargoFolderWait()),
             ("head", admission_records.BehindHead("first", 1, "head-session")),
         ):
             readings[name] = with_wait_reason(base, reason)
