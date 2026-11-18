@@ -56,7 +56,9 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.build_queue.admission_test_support import (
+    AdmissionFixture, FIXTURE_CLOUD_GATE_SLOTS, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted,
+)
 
 
 def setUpModule() -> None:
@@ -3478,22 +3480,24 @@ class CloudAdmissionTests(unittest.TestCase):
     def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            requests = [self.cloud_request(fixture) for _ in range(11)]
-            grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:9]]
-            for request in requests[9:]:
+            slots = FIXTURE_CLOUD_GATE_SLOTS
+            requests = [self.cloud_request(fixture) for _ in range(slots + 2)]
+            grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:slots]]
+            first_waiting, second_waiting = requests[slots:]
+            for request in (first_waiting, second_waiting):
                 reply, = fixture.server.handle_request(request)
                 assert isinstance(reply, wire.Wait)
                 self.assertIn("cloud slot", reply.text)
-                self.assertIn("9 of 9", reply.text)
-            self.assertEqual(len(fixture.server.reservations), 9)
+                self.assertIn(f"{slots} of {slots}", reply.text)
+            self.assertEqual(len(fixture.server.reservations), slots)
             fixture.release(grants[0])
             _ = fixture.run_pass()
-            self.assertIn(requests[9].episode, fixture.server.reservations)
-            self.assertNotIn(requests[10].episode, fixture.server.reservations)
-            self.assertEqual(len(fixture.server.reservations), 9)
+            self.assertIn(first_waiting.episode, fixture.server.reservations)
+            self.assertNotIn(second_waiting.episode, fixture.server.reservations)
+            self.assertEqual(len(fixture.server.reservations), slots)
             fixture.release(grants[1])
             _ = fixture.run_pass()
-            self.assertIn(requests[10].episode, fixture.server.reservations)
+            self.assertIn(second_waiting.episode, fixture.server.reservations)
 
     def test_cloud_slot_limit_reads_configuration_at_use(self) -> None:
         with AdmissionFixture() as fixture:
