@@ -101,7 +101,7 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-empty],[data-missing-keys]{padding:16px;margin:0;color:var(--ink-2)}
-[data-missing-keys],[data-hidden-action-status]{white-space:pre-line}
+[data-missing-keys]{white-space:pre-line}
 [data-missing-item]{color:var(--ink-2);scroll-margin-top:16px}
 .list-table .record-motion-source{display:none!important}
 .list-table td.record-motion-cell{padding:0;border:0;text-align:left}
@@ -171,7 +171,8 @@ let linkedItem='';
 let placeHash=location.hash;
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
-const rowMotion=new Map(),actionResults=new Map();
+const rowMotion=new Map(),actionNotices=new Map();
+let latestSubmission=0,latestActionFailure=null;
 const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
@@ -276,17 +277,20 @@ function animateRow(table,item,showRow){
 function showHiddenActionResults(items){
  const status=content.querySelector('[data-hidden-action-status]');
  if(!status) return;
- const messages=[];
- for(const [key,{label,message}] of actionResults){
+ let text='';
+ if(latestActionFailure){
+  const {key,label,message}=latestActionFailure;
   const item=items.find(item=>item.dataset.key===key);
-  if(!item || item.hidden || item.querySelector('[data-detail]').hidden) messages.push(label+': '+message);
+  if(!item || item.hidden || item.querySelector('[data-detail]').hidden) text=label+': '+message;
  }
- const text=messages.join('\n');
  if(status.textContent!==text) status.textContent=text;
  status.hidden=!text;
 }
-function showActionResult(item,label,message){
- actionResults.set(item.dataset.key,{label,message});
+/** @param {{kind:'success' | 'failure', message:string}} result */
+function showActionResult(item,submission,label,{kind,message}){
+ const key=item.dataset.key;
+ actionNotices.set(key,message);
+ if(kind==='failure' && submission===latestSubmission) latestActionFailure={key,label,message};
  item.querySelector('[data-send-status]').textContent=message;
  apply(false,{animate:true});
 }
@@ -475,11 +479,14 @@ function bind(){
 }
 return {place,apply,bind,opened,restorePlace,
  startAction(item){
-  actionResults.delete(item.dataset.key);
+  const submission=++latestSubmission;
+  latestActionFailure=null;
+  actionNotices.delete(item.dataset.key);
   apply(false,{animate:true});
+  return submission;
  },
  showActionResult,
- actionNotice(item){return actionResults.get(item.dataset.key)?.message ?? '';},
+ actionNotice(item){return actionNotices.get(item.dataset.key) ?? '';},
  applyAction(){apply(false,{animate:true});},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(){

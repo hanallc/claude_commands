@@ -635,7 +635,7 @@ function bind(){
    if(action==='remove') item.dataset.state='Closed';
    if(action==='park') item.dataset.parked='true';
    if(clearsUnread) item.dataset.unread='false';
-   tableView.startAction(item);
+   const submission=tableView.startAction(item);
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
@@ -670,7 +670,7 @@ function bind(){
     if(refused) Object.assign(item.dataset,confirmed);
     if(refused || hidUnread) tableView.opened.add(key);
     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-    tableView.showActionResult(item,'Item '+item.dataset.number,message);
+    tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
