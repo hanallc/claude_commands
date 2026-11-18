@@ -222,20 +222,32 @@ Each producer uses its own tab in the `producers` workspace of the shared herdr 
 It takes the family, model, and effort from the current producer settings.
 `pane_launch` reads `--effort` as an option with a value.
 
+Before resuming a producer, `stop_resume` compares the configured family with the current conversation's family.
+It reads the saved launch or the current session's native process or transcript.
+On a family change, resume stops the old conversation and prints its `catch_up.py` command.
+It starts a new conversation on the current group account or the account given with `--to`.
+It reuses the producer's idle pane or opens a new pane.
+`producer_transfer.bind` updates the staff row after resume proves the live process.
+It publishes the pane binding after the row names the live conversation.
+On retry, resume checks the producer pane for a live conversation of the configured family.
+Resume can bind that conversation without another launch.
+If the row already names the live conversation, resume can finish its pane publication.
+
 `models_registry.launch_settings("producers", name)` validates each `family:model:effort` value in `config/models.conf`.
 The configured lines are:
 
 ```ini
 [producers]
 morty=codex:astra:high
-brain=codex:astra:medium
+brain=claude:fable:high
 dwight=claude:fable:high
 ```
 
 These model names are aliases that the shared model registry resolves.
 `member_account.producer_account(kind, *, to="")` selects the account before admission.
 Admitted producers use `member_account.resume_account`.
-Both functions select the workers account for Codex and the showrunners account for Claude.
+Both functions select the workers account for Codex.
+Claude uses the producers account, with the showrunners account as the fallback.
 An explicit `--to` overrides that selection.
 
 `accounts.eligible_producers(membership, family)` selects active, unpaused, local producers of the configured family.
@@ -243,7 +255,7 @@ An explicit `--to` overrides that selection.
 Invalid settings exclude that producer.
 `settings_report_scope` limits its warning to one per operation.
 A workers swap includes eligible Codex producers.
-A showrunners group move includes eligible Claude producers.
+A producers group move includes eligible Claude producers.
 Units and showrunners retain their existing group selection.
 
 A repeated move selects a stopped producer even when its recorded home already names the target.
@@ -320,18 +332,21 @@ The process arguments need no session ID.
 
 1. Refuse a caller that another staff row records. Refuse a producer on another machine.
 2. Prove the caller through `stop_resume.producer_adoption_launch`: native id, family, account home, folder, and pane.
-3. Refuse a Claude caller outside the showrunners account; the refusal names the `agents move` command.
+3. Refuse a Claude caller outside the selected producer account. Print the `agents move` command.
 4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
-5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
-6. Publish `[producers].NAME` through `models_registry.store_producer`.
-7. Write the row through `staff.transfer_producer`, then publish the pane record as the producer binding.
-8. Give the tab the producer name through `retitle_row`; the saved layout supplies the position of the old tab.
+5. Stop the old conversation and any live replacement in the producer pane.
+6. Call `producer_transfer.bind` to publish the caller.
 
+`producer_transfer.stop_previous` stops the old conversation through `restart.stop_row` and closes its panes.
+Transfer saves optional model settings before it calls `bind`.
+`bind` writes the row through `staff.transfer_producer`.
+It publishes the pane binding and uses `retitle_row` to give the tab the producer name.
+The saved layout supplies the position of the old tab.
 `restart.restart(stop_all=True, only=(row id,))` then restarts the caller outside the row lock.
 The restart runs in a detached process and sends no opening prompt.
 The row id, the document, and the `staff:<row id>` message queue do not change.
-Each step is safe to run again; a caller that already holds the row skips step 5.
-A failure between steps 6 and 7 leaves the new settings on the old session until the next run.
+A caller that already holds the row skips the stop.
+A failure after the model update can leave the new settings on the old session until the next run.
 
 `agents remove-stray NAME SESSION` removes a local stray producer conversation.
 The command uses this order:

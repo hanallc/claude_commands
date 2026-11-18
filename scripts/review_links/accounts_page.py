@@ -66,8 +66,8 @@ def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
 
 def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
     """Make the target the group's first next move at the configured percent."""
-    if group != "units" and group != "showrunners":
-        return Refused("Choose units or showrunners.")
+    if group not in ("units", "showrunners", "producers"):
+        return Refused("Choose units, showrunners, or producers.")
     try:
         _ = accounts.claude_account_dir(target)
     except accounts.AccountsError as error:
@@ -81,8 +81,8 @@ def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
 
 def clear_next_move(group: str) -> Saved | Refused | SaveFailed:
     """Remove the group's first entry and retain later entries."""
-    if group != "units" and group != "showrunners":
-        return Refused("Choose units or showrunners.")
+    if group not in ("units", "showrunners", "producers"):
+        return Refused("Choose units, showrunners, or producers.")
     try:
         if not any(entry.group == group for entry in next_moves.read_next_moves()):
             return Refused("The group has no next move.")

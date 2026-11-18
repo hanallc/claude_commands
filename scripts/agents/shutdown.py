@@ -543,12 +543,24 @@ def _worktree_is_remote(row: staff.StaffRow) -> bool:
 
 
 def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
+    if not isinstance(row.paused, staff.Paused):
+        return False
     remote = (_worktree_is_remote(row) if not isinstance(row.worktree, staff.WorktreeUnfilled) else
               isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and not unit_machine_is_local(row.doc.machine))
-    return isinstance(row.paused, staff.Paused) and (remote or isinstance(
+    if not remote and row.kind == "producer":
+        try:
+            publication = pane_record.publication_for_session(row.current_session)
+            if publication is None or not publication.entry.get("producer_binding", False):
+                return False
+            plan = stop_resume.producer_resume_plan(row, publication.entry)
+        except (OSError, ValueError):
+            return False
+        if isinstance(plan, stop_resume.StartReplacementProducer):
+            return False
+    return remote or isinstance(
         stop_resume.running_on_account(str(row.current_session), "",
             kind="codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"),
-        stop_resume.ClaudeUp))
+        stop_resume.ClaudeUp)
 
 
 def _lifecycle(options: CommandLine) -> int:

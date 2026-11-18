@@ -82,6 +82,29 @@ class AgentsUsageTests(unittest.TestCase):
             self.assertEqual((row.name, row.kind, row.current_session), ("dwight", "producer", world.identity))
             self.assertEqual(len(world.arguments), 1)
 
+    def test_resume_of_a_paused_producer_changes_family_before_sending_a_continuation(self) -> None:
+        from scripts.agents.test_stop_resume import producer_first_fixture
+        from scripts.lib.test_models_registry import write_registry
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        with producer_first_fixture("codex") as world:
+            code, output, errors = self.invoke(["resume", "dwight"])
+            self.assertEqual(code, 0, errors + output)
+            row = staff.initial_snapshot().rows[0]
+            _ = staff.pause(row.id, "fixture pause")
+            _ = write_registry(world.case.root / "configuration/models.conf",
+                {"producers": {"dwight": "claude:opus:high"}}, update=True)
+            new = fixture_runtime_id("replacement-claude")
+            with (mock.patch.object(stop_resume, "running_on_account",
+                                    return_value=stop_resume.ClaudeUp(row.current_session, world.pane, "codex3")),
+                  mock.patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp(new, "new-pane", "claude3")) as resume,
+                  mock.patch.object(shutdown, "_message") as message):
+                code, output, errors = self.invoke(["resume", "dwight"])
+            self.assertEqual(code, 0, errors + output)
+            self.assertIn(new, output)
+            resume.assert_called_once_with(row.id, why="resumed by name", to=None)
+            message.assert_not_called()
+
     def test_status_excludes_a_retired_unit_whose_process_still_runs(self) -> None:
         from scripts.agents.test_inventory import InventoryTests, TARGET_LOGIN, UNIT_ID, DESKTOP_ID
         from scripts.whoami.account import Account

@@ -58,8 +58,11 @@ A stop dry run prints the selected session and workers without stopping them.
 An exited director starts through the shared resume path.
 Stop does not save or restore composer drafts.
 Resume restores the saved folder and environment.
-Codex uses the configured `workers` account; Claude units and showrunners use their configured role accounts.
+Codex uses the `workers` account. Claude units, showrunners, and producers use their group accounts.
 Other Claude sessions use the units account; `--to ACCOUNT` overrides the account.
+If a producer's configured family changes, resume stops the old conversation and starts a new one.
+The new conversation takes the producer row. Resume prints the `catch_up.py` command for the old ID.
+Use `agents transfer` to give the row to an existing conversation.
 The default reason is `resumed by name`.
 Retired units do not appear in active status or the board.
 Resume without `--retired` refuses a retired unit.
@@ -98,10 +101,11 @@ Repeat an interrupted rename to complete its saved move.
 Show each anomaly and the final output.
 See `docs/as-built/production-rename.md` and `docs/as-built/unit-rename.md`.
 
-Move selects a session id, an exact session name, `units`, or `showrunners`.
+Move selects a session ID, an exact session name, or a group: `units`, `showrunners`, or `producers`.
 It stops each selected session and resumes the same conversation in its local herdr pane on ACCOUNT.
 One resume message explains the move and the retained Codex workers. Workers keep their threads.
 A group move selects the group's account and moves every live member on another account.
+The `producers` move also resumes eligible stopped Claude producers.
 `--dry-run` previews the move. `--why` supplies the resume reason.
 Each member prints one result line. Show the output unchanged.
 Run the command on the machine that holds the session.
@@ -112,7 +116,7 @@ Transfer runs in a session that has no staff row, on the producer's machine.
 It stops the old conversation and closes its tab. It keeps the row id, the document, and the message queue.
 It sets the row's session, account home, and launch folder, then restarts the caller as the producer.
 `--model` and `--effort` replace `[producers].NAME`; the caller supplies the family.
-A Claude caller must run on the showrunners account; the refusal names the `agents move` command.
+A Claude caller must use the producers account. The refusal gives the `agents move` command.
 After a failure, run the same command again.
 
 Before a power-off, run `agents stop --all`.

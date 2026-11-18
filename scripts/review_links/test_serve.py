@@ -19,6 +19,7 @@ import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.client import HTTPConnection
 from io import StringIO
 from pathlib import Path
@@ -567,6 +568,23 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 _ = self.post(images.PAGE_PATH, 'fixture-question')
             self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
+
+    def test_accounts_post_saves_and_clears_a_producers_next_move(self) -> None:
+        from scripts.accounts import accounts, next_moves
+
+        entry = next_moves.ClaudeGroupMove("fixture", "producers", 1, 0, "claude2", datetime.now(timezone.utc))
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "claude_account_dir", return_value=self.root / "claude2"),
+              patch.object(next_moves, "console_next_move_percent", return_value=1.0),
+              patch.object(next_moves, "set_first_next_move", return_value=entry) as save,
+              patch.object(next_moves, "read_next_moves", return_value=(entry,)),
+              patch.object(next_moves, "remove_next_move") as clear):
+            status, content = self.post(accounts_page.PAGE_PATH, "group=producers&to=claude2")
+            self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
+            save.assert_called_once_with("producers", 1.0, "claude2")
+            status, content = self.post(accounts_page.PAGE_PATH, "group=producers&clear=first")
+            self.assertEqual((status, json.loads(content)), (200, {"state": "saved"}))
+            clear.assert_called_once_with("producers", next_moves.FIRST_GROUP_POSITION)
 
     def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
         with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("staff file absent")),

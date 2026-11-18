@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import io
+import math
 import os
+import signal
 import unittest
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout
@@ -12,7 +14,7 @@ from typing import Literal, cast
 from unittest.mock import Mock, patch
 
 from scripts.accounts import accounts
-from scripts.agents import pane_record, producer_transfer, remote, restart
+from scripts.agents import pane_record, producer_transfer, remote, restart, stop_resume
 from scripts.agents.test_stop_resume import ProducerAdmissionWorld, producer_first_fixture
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import models_registry
@@ -119,6 +121,108 @@ def transfer_fixture(kind: Literal["claude", "codex"], settings: str) -> Generat
 
 
 class ProducerTransferTests(unittest.TestCase):
+    def test_resume_repairs_a_transfer_interrupted_after_the_staff_write(self) -> None:
+        with transfer_fixture("claude", "claude:opus:high") as fixture:
+            world = fixture.world
+            row = fixture.producer()
+            with (patch.object(pane_record, "write", side_effect=OSError("fixture interruption")),
+                  self.assertRaisesRegex(OSError, "fixture interruption")):
+                _ = fixture.transfer()
+            moved = staff.by_id(row.id)
+            assert moved is not None
+            self.assertEqual(moved.current_session, world.identity)
+            self.assertNotIn(world.pane, pane_record.read("agents"))
+            world.case.launched.add(world.identity)
+            with patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", world.pane)):
+                result = stop_resume.resume(row.name)
+            self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+            assert isinstance(result, stop_resume.ClaudeUp)
+            self.assertEqual((result.session_id, result.pane_id), (world.identity, world.pane))
+            binding = pane_record.read("agents")[world.pane]
+            self.assertEqual((binding.get("staff_id"), binding.get("producer_binding")), (row.id, True))
+            self.assertEqual(world.arguments, [])
+
+    def test_transfer_to_a_third_conversation_stops_a_live_unbound_codex_replacement(self) -> None:
+        with transfer_fixture("claude", "claude:opus:high") as fixture:
+            world = fixture.world
+            row = fixture.producer()
+            client = world.case.client
+            replacement = fixture_runtime_id("unbound-codex-replacement")
+            pane, terminal = "w2:p4", "replacement-terminal"
+            client.rows.append({"pane_id": pane, "terminal_id": terminal, "tab_id": "producer-tab",
+                                "workspace_id": "producer-workspace", "label": row.name})
+            client.native_ids[pane] = replacement
+            live = {replacement, world.identity}
+            entry = pane_launch.launch(pane, replacement, str(world.folder),
+                                       {"CODEX_HOME": str(world.case.root / ".codex3")}, ["codex"], kind="codex")
+            response, activity, proof = client.result, client.pane_activity, client.producer_admission_launch
+            conversation, native = herdr.read_conversation, herdr.native_process
+
+            def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                if arguments == ("pane", "process-info", "--pane", pane):
+                    return {"process_info": {"foreground_processes": [{"argv": ["codex"]}]}}
+                return response(*arguments, deadline=deadline)
+
+            def observe(selected: str) -> herdr.PaneRunning | herdr.PaneAtShell:
+                return herdr.PaneRunning(("codex",)) if selected == pane and replacement in live else activity(selected)
+
+            def prove(selected: str, kind: Literal["claude", "codex"]) -> pane_launch.CurrentLaunch:
+                if selected == pane:
+                    self.assertEqual(kind, "codex")
+                    self.assertIn(replacement, live)
+                    return entry
+                return proof(selected, kind)
+
+            def read(identity: str, kind: str = "", *, codex: herdr.CodexConversations | None = None
+                     ) -> herdr.LiveConversation | herdr.StoppedConversation | herdr.UnknownConversation:
+                if identity == replacement:
+                    self.assertEqual(kind, "codex")
+                    return herdr.LiveConversation("codex", (457,)) if replacement in live else herdr.StoppedConversation()
+                return conversation(identity, kind, codex=codex)
+
+            def native_process(pid: int, kind: str, reported: str | herdr.PaneNotRead = herdr.PANE_NOT_READ
+                               ) -> herdr.NativeAgentProcess:
+                if pid == 457:
+                    self.assertEqual(kind, "codex")
+                    return herdr.NativeAgentProcess(herdr.EnvironmentThread(replacement), "generation-2", {})
+                return native(pid, kind, reported)
+
+            def signal_process(pid: int, number: int) -> None:
+                self.assertEqual((pid, number), (457, signal.SIGTERM))
+                self.assertIn(f"stop {OLD_SESSION}", fixture.steps)
+                live.remove(replacement)
+                fixture.steps.append(f"stop {replacement}")
+
+            def same_process(pid: int, started: str) -> bool:
+                self.assertEqual((pid, started), (457, "generation-2"))
+                return replacement in live
+
+            def close(selected: str, *, terminal: str = "") -> bool:
+                if selected == pane:
+                    self.assertEqual(terminal, "replacement-terminal")
+                    self.assertNotIn(replacement, live)
+                    _ = client.native_ids.pop(pane)
+                    client.rows[:] = [item for item in client.rows if item["pane_id"] != pane]
+                    return True
+                return fixture.close(selected, terminal=terminal)
+
+            with (patch.object(client, "result", side_effect=result),
+                  patch.object(client, "pane_activity", side_effect=observe),
+                  patch.object(client, "producer_admission_launch", side_effect=prove),
+                  patch.object(client, "close_retained_pane", side_effect=close),
+                  patch.object(herdr, "read_conversation", side_effect=read),
+                  patch.object(herdr, "native_process", side_effect=native_process),
+                  patch.object(herdr, "check_native_target", return_value=True),
+                  patch.object(stop_resume, "_same_process", side_effect=same_process),
+                  patch.object(stop_resume, "_signal_process", side_effect=signal_process)):
+                _ = fixture.transfer()
+            self.assertEqual(live, {world.identity})
+            self.assertEqual(client.native_ids, {world.pane: world.identity})
+            self.assertEqual(staff.by_id(row.id), replace(row, current_session=staff.native_id(world.identity),
+                home=staff.SessionHome(world.home), worktree=staff.PresentWorktree(remote.local_machine(), world.folder)))
+            binding = pane_record.read("agents")[world.pane]
+            self.assertEqual((binding.get("staff_id"), binding.get("producer_binding")), (row.id, True))
+
     def test_a_codex_producer_moves_to_a_claude_session_and_back(self) -> None:
         cases: tuple[tuple[Literal["claude", "codex"], str, str, str], ...] = (
             ("claude", "codex:gpt-test:high", "opus", "high"), ("codex", "claude:opus:high", "gpt-test", "medium"))
