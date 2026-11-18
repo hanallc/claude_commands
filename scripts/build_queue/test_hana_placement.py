@@ -20,6 +20,7 @@ from scripts.build_queue.admission_test_support import only_admitted
 from scripts.aws_target import hana_box, hana_execution, hana_placement
 from scripts.aws_target.controller_lock import control_lock
 from scripts.build_targets import target_config
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -402,7 +403,9 @@ class HanaQueueTests(unittest.TestCase):
             with (mock.patch.object(target_config, 'read_targets', return_value=(target,)),
                     mock.patch.object(hana_placement, 'read_evidence', return_value=answer) as read):
                 self.assertEqual(fixture.server.read_provider_evidence(key), answer)
-                read.assert_called_once_with(key, request)
+                read.assert_called_once_with(key, request,
+                    transport=hana_placement.HanaControlTransport(settings, 'fixture-hana'),
+                    workload=conf.read(settings, load=conf.read_bytes))
 
     def test_worker_evidence_marks_the_snapshot_stale_on_the_loop_thread(self) -> None:
         with PlacementFixture() as fixture:

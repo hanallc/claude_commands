@@ -72,7 +72,7 @@ def read_settings(configuration: conf.ConfigRead) -> SafetySettings:
     values: dict[str, object] = {'enabled': permit.enabled, 'permit_max_seconds': permit.permit_max_seconds}
     for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'step_cpu_limit',
                 'step_memory_gib', 'mount_timeout_seconds'):
-        values[key] = configuration.whole(key)
+        values[key] = configuration.value(key, conf.positive_whole)
     return decode_settings(values)
 
 
