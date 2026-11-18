@@ -64,6 +64,12 @@ Task cleanup removes the clone and clears the removal marks before it tries to r
 Cleanup holds the lock and checks the identities of those two files before it removes either file.
 Recovery leaves the files if the clone is already absent when recovery starts.
 
+The borrow check keeps sources with recorded borrowers or unreadable copy records.
+It checks the copy folders in the registry and the adopted copies in the holds file.
+It skips an unregistered folder if the folder's parent is directly under the copies root and contains `.git`.
+This exception applies only if the folder contains none of `.git`, `HEAD`, `objects`, or `commondir`.
+The check inspects these entries without following symbolic links.
+
 `copies.py list` reads slot leases and remote mirror rows.
 `copies.py remove` removes owned editable and remote copies; it never removes a shared slot.
 The nightly slot sweep removes old free slots.
