@@ -169,6 +169,8 @@ class StoredReviewMessage(TypedDict):
     # A record saved before efficiencies has no row; its row is the source's stem.
     row: NotRequired[str]
     image_question_dispatch: NotRequired[ImageQuestionDispatch]
+    submission_request: NotRequired[str]
+    submission_delivered: NotRequired[bool]
 
 
 class SentCloseoutAlerts(TypedDict):
@@ -542,6 +544,12 @@ class DeliveryStatus:
                     return
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
+                    if isinstance(page, ReviewMessagePage) and page.saved.get('submission_request'):
+                        if isinstance(result, NoFailedDelivery):
+                            completed = replace(page, saved={**page.saved, 'submission_delivered': True})
+                            self.write_slots(completed, row, slots.updated('verdict', NoDelivery()))
+                        self.record_result_locked(delivery, result)
+                        return
                     self.record_result_locked(delivery, result)
                     if current.kind == "validation":
                         updated = replace(slots, validation=ValidationRequested(current.attempt, current.feedback))
@@ -1614,6 +1622,8 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 fields = cast(StoredDeliverySlots,json.loads(path.read_text()))
                 saved = fields.get('review_message')
                 if saved is None:
+                    continue
+                if saved.get('submission_delivered'):
                     continue
                 source = Path(saved['source'])
                 row = saved.get('row',source.stem)

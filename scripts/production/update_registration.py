@@ -1069,7 +1069,7 @@ def question_records_for_document(doc: Path | staff.StaffRow, identities: Questi
     return selected_question_records(sorted(paths), statuses, owner_ids, sources, owner, strict=strict)
 
 
-def _review_question_path(folder: QuestionFolder, request_id: str) -> Path:
+def review_question_path(folder: QuestionFolder, request_id: str) -> Path:
     digest = hashlib.sha256(request_id.encode()).hexdigest()
     return folder.path / f"question-{folder.owner}-review-{digest}.md"
 
@@ -1133,9 +1133,9 @@ def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owne
 
 
 def question_records_for_owner(owner: staff.StaffId, *, statuses: tuple[str, ...] = (),
-                               owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
-    paths = sorted(_known_question_paths(owner))
-    return selected_question_records(paths, statuses, owner_ids, owner=owner, strict=False)
+                               owner_ids: set[staff.StaffId] | None = None, strict: bool = False) -> list[QuestionRecord]:
+    paths = sorted(_known_question_paths(owner, strict=strict))
+    return selected_question_records(paths, statuses, owner_ids, owner=owner, strict=strict)
 
 
 def unowned_question_records(identities: QuestionStaff, *, statuses: tuple[str, ...] = (),
@@ -1175,12 +1175,27 @@ def _question_records(issues: list[Issue], *, legacy_owner: str = "") -> list[Qu
     return records
 
 
+def pending_review_reply(record: QuestionRecord) -> bool:
+    """Return whether a sent Question still accepts a scoped reply."""
+    return record.status == "open" and "review_submission" in record.item and "followup" in record.item
+
+
+@contextmanager
+def wrap_question_locks(*owners: staff.StaffId) -> Generator[None]:
+    """Lock Question stores in staff ID order."""
+    with ExitStack() as locks:
+        for owner in sorted(set(owners)):
+            _ = locks.enter_context(outstanding_lock(outstanding_path_for_owner(owner)))
+            _ = locks.enter_context(_question_number_lock(owner))
+        yield
+
+
 def close_questions(document: Path, identities: QuestionStaff) -> None:
     """Close the production's questions and retain their records for history."""
     owner = identities.owner(document).id
     with outstanding_lock(outstanding_file(owner, identities=identities)), _question_number_lock(owner), ExitStack() as rollback:
         closing = [replace(record, status="closed") for record in question_records_for_document(document, identities, strict=True)
-                   if record.status == "open"]
+                   if record.status == "open" and not pending_review_reply(record)]
         texts = [_question_text(record) for record in closing]
         with question_numbers() as numbers:
             for record, text in zip(closing, texts, strict=True):
@@ -1824,7 +1839,7 @@ def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
                            followup=PendingFollowup(text=outgoing.words, sent=sent),
                            waiting_why=outgoing.waiting_why,
                            review_submission=new_item_dialog.stored_submission(outgoing.details))
-    path = _review_question_path(folder, outgoing.details.request_id)
+    path = review_question_path(folder, outgoing.details.request_id)
     record = QuestionRecord(path, folder.owner, folder.owner, item, "open")
     with outstanding_lock(outstanding_path(production)):
         return _file_question(record, outgoing.before_write)
