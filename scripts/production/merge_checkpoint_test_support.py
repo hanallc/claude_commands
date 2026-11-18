@@ -59,7 +59,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,
             cwd: Path | str | None = None, stdin: int | None = None, stdout: int | None = None,
-            stderr: int | None = None, input: str | None = None,
+            stderr: int | None = None, input: str | None = None, errors: str | None = None,
             pass_fds: Sequence[int] = ()) -> subprocess.CompletedProcess[str]:
         child_env = dict(os.environ) if env is None else env
         child_cwd = Path.cwd() if cwd is None else Path(cwd)
@@ -81,7 +81,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
             return invoke_recorder(args, child_env, child_cwd)
         return real_run(command, capture_output=capture_output, text=text, check=check,
                         timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, input=input,
-                        pass_fds=pass_fds)
+                        errors=errors, pass_fds=pass_fds)
 
     with mock.patch.object(subprocess, "run", run), mock.patch.object(
         change_review, "lists_directory", return_value=Path(environment["HOME"]) / "rust/hanadocs/change-review",
