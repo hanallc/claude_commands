@@ -996,7 +996,9 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> LabeledSessionFo
     pending = _pending_launch(request)
     if isinstance(pending, LivePendingOpening):
         native = pending.session_id
-        place = herdr.herdr_place_of(pending.process.pid)
+        place = herdr.process_placement(pending.process.pid)
+        if isinstance(place, herdr.UnprovedHerdrPlacement):
+            raise Refusal(place.reason)
         if isinstance(place, herdr.NotInHerdr):
             raise Refusal(f"pending session {native} runs outside herdr")
         observed = herdr.Herdr(place.session).native_session(place.pane, "claude", request.timeout)
@@ -1004,8 +1006,11 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> LabeledSessionFo
             raise Refusal(f"pending session {native} differs from pane identity {observed}")
         return LabeledSessionFound(unit_lookup.LabeledSession(name,
             unit_lookup.LiveClaude(name, native, "", pending.process.pid), place, identity=unit_lookup.LiveSession(native)))
-    unit = unit_lookup.labeled_session(request.production.name, name)
-    return NoLabeledSession() if unit is None else LabeledSessionFound(unit)
+    try:
+        pane = unit_lookup.labeled_session(request.production.name, name)
+    except OSError as error:
+        raise Refusal(f"cannot tell whether Claude runs for {name}: {error}") from error
+    return NoLabeledSession() if pane is None else LabeledSessionFound(pane)
 
 
 def registry_remote_control(claude: unit_lookup.Claude) -> bool:

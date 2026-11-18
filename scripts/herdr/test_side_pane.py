@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from scripts.herdr import herdr, pane_launch, side_pane, worker_panes
 from scripts.herdr import herdr_types
-from scripts.herdr.test_herdr import codex_foreground_cases
+from scripts.herdr.test_herdr import ClaudeForegroundSocket, codex_foreground_cases
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -166,12 +166,14 @@ class SidePaneTests(StaffTestCase):
                                                agent=agent, reported_unknown=reported_unknown)
                     pid = case.world.foreground[result.pane][0]
                     identity = case.world.processes[pid].current_identity
+                    proof = ClaudeForegroundSocket(name, result.pane, pid)
                     with (patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_SESSION": name,
                               "HERDR_PANE_ID": result.pane}),
                           patch.object(sys, "stdin", io.StringIO(json.dumps({
                               "source": "startup", "session_id": identity, "cwd": str(prepared.directory)}))),
+                          patch.object(herdr, "session_socket_request", side_effect=proof.request),
                           patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()),
-                          patch.object(pane_record, "claude_arguments", return_value=["claude", *arguments]),
+                          patch.object(pane_record, "process_arguments", return_value=["claude", *arguments]),
                           patch.object(os, "getppid", return_value=pid),
                           patch.object(staff, "runtime_id", return_value=identity)):
                         record_start()

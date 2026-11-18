@@ -325,7 +325,7 @@ class StopResumeTests(unittest.TestCase):
                 case.client.native_ids[world.pane] = world.identity
                 if location in ("registry", "two-live"):
                     directory = case.root / "sessions"
-                    directory.mkdir()
+                    directory.mkdir(exist_ok=True)
                     _ = (directory / "456.json").write_text(json.dumps({
                         "pid": 456, "sessionId": world.identity, "name": "dwight", "cwd": str(world.folder),
                         "messagingSocketPath": "", "updatedAt": 1, "procStart": "generation-1"}))
@@ -416,7 +416,7 @@ class StopResumeTests(unittest.TestCase):
                 member = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "renamed-producer", staff.StaffRoot(),
                                         current_session=staff.native_id(world.identity))
                 directory = world.case.root / "sessions"
-                directory.mkdir()
+                directory.mkdir(exist_ok=True)
                 _ = (directory / "456.json").write_text(json.dumps({
                     "pid": 456, "sessionId": world.identity, "name": "old-producer", "cwd": str(world.folder),
                     "messagingSocketPath": "", "updatedAt": 1, "procStart": "generation-1"}))
@@ -424,6 +424,7 @@ class StopResumeTests(unittest.TestCase):
                 _ = (world.home / "session_index.jsonl").write_text(json.dumps({
                     "id": world.identity, "thread_name": "old-producer"}) + "\n")
                 with patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((member,))), \
+                     patch.object(herdr, "process_environment", return_value={}), \
                      patch.object(herdr, "codex_conversations", return_value=herdr.CodexConversations(
                          {world.identity: (456,)} if kind == "codex" else {}, ())):
                     self.assertEqual(stop_resume.producer_conflicts(member.name, world.case.client),
@@ -452,7 +453,7 @@ class StopResumeTests(unittest.TestCase):
                 self.assertEqual(len(staff.initial_snapshot().rows), 1 if stage == "publication" else 0)
                 if stage == "named-before-retry":
                     registry = world.case.root / "sessions"
-                    registry.mkdir()
+                    registry.mkdir(exist_ok=True)
                     _ = (registry / "123.json").write_text(json.dumps({
                         "pid": 123, "sessionId": fixture_runtime_id("manual-dwight"), "name": "dwight",
                         "messagingSocketPath": "", "updatedAt": 1, "procStart": "generation-1"}))
@@ -1150,16 +1151,39 @@ class StopResumeTests(unittest.TestCase):
                       patch.object(herdr, "launch_prepared_agent") as launch,
                       redirect_stderr(io.StringIO()) as errors):
                     result = stop_resume.resume(identity, to="codex1")
-                self.assertIsInstance(result, stop_resume.ClaudeUp)
-                assert isinstance(result, stop_resume.ClaudeUp)
-                self.assertEqual(result.start_state, ClaudeStartState.ALREADY_RUNNING)
-                self.assertEqual((result.session_id, result.pane_id), (identity, "w1:p2"))
-                activity.assert_called_once_with("w1:p2")
+                assert isinstance(result, stop_resume.ResumeFailed)
+                self.assertEqual((result.session_id, result.reason), (identity,
+                    "pane w1:p2: cannot prove the reported Codex owner"))
+                activity.assert_not_called()
                 opened.assert_not_called()
                 launch.assert_not_called()
                 self.detach.assert_not_called()
                 self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
                 self.assertIn("other-session (Codex thread unknown)", errors.getvalue())
+
+    def test_unknown_codex_resume_requires_the_proved_pane_conversation(self) -> None:
+        identity = self.saved_codex_name()
+        pane: herdr.PaneIdentity = {"pane_id": "w1:p2", "workspace_id": "w1", "session_id": identity}
+        unknown = herdr.UnknownConversation("fixture conversation is unknown")
+        with (codex_foreground_cases(self.root) as cases,
+              patch.object(herdr, "read_conversation", return_value=unknown),
+              patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("codex",))),
+              patch.object(self.client, "panes", return_value=[pane]),
+              patch.object(self.client, "result") as report,
+              patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(identity), "1", {})),
+              patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.root / ".codex2")),
+              patch.object(accounts, "codex_home_label", return_value="codex2"),
+              redirect_stderr(io.StringIO())):
+            for case in cases:
+                with self.subTest(case=case.name):
+                    report.return_value = {"process_info": case.info}
+                    result = stop_resume.running_on_account(identity, "w1:p2", kind="codex")
+                    if case.owner_proved:
+                        assert isinstance(result, stop_resume.ClaudeUp)
+                        self.assertEqual((result.session_id, result.pid, result.account), (identity, 456, "codex2"))
+                    else:
+                        self.assertIsInstance(result, stop_resume.ResumeFailed)
 
     def test_resume_of_a_running_codex_id_keeps_its_current_account(self) -> None:
         identity = self.saved_codex_name()
@@ -2232,6 +2256,7 @@ class StopResumeTests(unittest.TestCase):
             "CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
         self.assertTrue(moves.store_file().is_relative_to(self.root))
+        sessions.sessions_dir().mkdir(parents=True, exist_ok=True)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
@@ -2613,6 +2638,15 @@ class StopResumeTests(unittest.TestCase):
                     else:
                         retitle.assert_not_called()
 
+    def test_stopped_unit_resume_refuses_an_unreadable_owner_report(self) -> None:
+        parent = fixture_member("showrunner", name="unit-owner")
+        row = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=self.entry["session_id"],
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        with patch.object(unit_lookup, "checked_unit", return_value=unit_lookup.UnknownUnit("pane list denied")):
+            result = stop_resume.resume(str(row.id))
+        self.assertEqual(result, stop_resume.ResumeFailed(row.current_session, "pane list denied"))
+        self.start.assert_not_called()
+
     def test_recovery_fixture_rejects_an_unrecorded_resume_identity(self) -> None:
         with self.assertRaises(AssertionError):
             _ = self.pane_run("pane", "run", "w2:p3", "exec claude --resume unrecorded-session")
@@ -2625,6 +2659,7 @@ class StopResumeTests(unittest.TestCase):
         with (isolated_staff_file(path, {}),
               patch.dict(os.environ, source_environment(self.root / "sources")),
               isolated_source_readers()):
+            sessions.sessions_dir().mkdir(parents=True, exist_ok=True)
             parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
             owner = staff.ensure("unit", name="alpha", parent=staff.ReportsTo(parent.id), runtime_id=self.entry["session_id"])
             owner = staff.set_home(owner.id, staff.SessionHome(self.root / ".claude3"))

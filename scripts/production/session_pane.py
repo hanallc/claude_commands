@@ -13,7 +13,9 @@ from scripts.herdr import herdr  # noqa: E402
 from scripts.herdr.herdr import AgentBlocked, Herdr  # noqa: E402
 from scripts.herdr.herdr_types import HerdrFailure as HerdrFailure  # noqa: E402
 from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from scripts.production.unit_lookup import LiveSession, LiveClaude, Place, labeled_session, sessions_dir  # noqa: E402
+from scripts.production.unit_lookup import (  # noqa: E402
+    LabeledSession, LiveSession, Place, ProvedAbsentUnit, ProvedLiveUnit, UnknownUnit, checked_unit, sessions_dir,
+)
 from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
 USAGE = ("usage: session_pane.py <read|type|keys|where> <unit <production_name> <unit>|session <id>> "
@@ -69,9 +71,22 @@ def session_place(session_id: str) -> Place:
 
 def record_place(record: SessionRecord) -> Place:
     """Resolve the pane owned by this specific registry process."""
-    place = herdr.herdr_place_of(record["pid"])
+    place = herdr.process_placement(record["pid"])
+    if isinstance(place, herdr.UnprovedHerdrPlacement):
+        raise HerdrFailure(place.reason)
     if isinstance(place, herdr.NotInHerdr):
         raise NoSuchTarget(record["sessionId"])
+    client = Herdr(place.session)
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
+                             "session pane process info")
+    owner = herdr.foreground_pane_owner(info)
+    if isinstance(owner, herdr.UnprovedForegroundOwner):
+        raise HerdrFailure(owner.reason)
+    if not isinstance(owner, herdr.ProvedClaudeForeground) or owner.pid != record["pid"]:
+        raise HerdrFailure("the session process is not the foreground Claude owner")
+    native = herdr.read_foreground_pane_owner(owner, {})
+    if native.current_identity != record["sessionId"]:
+        raise HerdrFailure("the foreground Claude owner has a different session")
     return place
 
 
@@ -108,11 +123,15 @@ def main(arguments: list[str]) -> int:
               or verb == "where" and rest):
             raise ValueError(USAGE)
         if kind == "unit":
-            unit = labeled_session(production_name, name)
-            if unit is None:
-                raise NoSuchTarget(target)
-            place = unit.place
-            session_id = unit.claude.session_id if isinstance(unit.claude, LiveClaude) else unit.identity.id if isinstance(unit.identity, LiveSession) else ""
+            match checked_unit(production_name, name):
+                case ProvedLiveUnit(owner=LabeledSession(identity=LiveSession(id=identity), place=pane)):
+                    place, session_id = pane, identity
+                case ProvedAbsentUnit():
+                    raise NoSuchTarget(target)
+                case UnknownUnit(reason=reason):
+                    raise HerdrFailure(reason)
+                case ProvedLiveUnit():
+                    raise HerdrFailure("no proved pane owner")
         else:
             place = session_place(name)
             session_id = name

@@ -696,7 +696,17 @@ class WaitTimedOut:
 
 @dataclass(frozen=True)
 class NotInHerdr:
-    """The process has no identifiable herdr pane and listening server."""
+    """The process has no herdr placement."""
+
+
+@dataclass(frozen=True)
+class UnprovedHerdrPlacement:
+    """The available evidence does not establish the process placement."""
+
+    reason: str
+
+
+type ProcessPlacement = HerdrPlace | NotInHerdr | UnprovedHerdrPlacement
 
 
 @dataclass(frozen=True)
@@ -1412,10 +1422,16 @@ class PaneObservations:
     """Share read-only pane evidence until the report scope closes."""
     replies: dict[tuple[str, tuple[str, ...]], dict[str, object]] = field(default_factory=dict)
     process_batches: set[str] = field(default_factory=set)
+    linux_process_states: dict[int, ForegroundProcessState | UnreadableLinuxProcessState] = field(default_factory=dict)
 
-    @cached_property
-    def process_places(self) -> dict[int, HerdrPlace]:
-        return herdr_places()
+    bulk_placement: HerdrProcessPlacements | None = None
+    pid_placements: dict[int, ProcessPlacement] = field(default_factory=dict)
+
+    @property
+    def process_places(self) -> HerdrProcessPlacements:
+        if self.bulk_placement is None:
+            self.bulk_placement = herdr_places()
+        return self.bulk_placement
 
 
 _pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
@@ -1448,6 +1464,9 @@ def forget_pane_evidence(session: str, pane: str) -> None:
     if observed is not None:
         _ = observed.replies.pop((session, ("pane", "list")), None)
         _ = observed.replies.pop((session, ("pane", "process-info", "--pane", pane)), None)
+        observed.linux_process_states.clear()
+        observed.bulk_placement = None
+        observed.pid_placements.clear()
 
 
 class CodexArgumentsSource(Enum):
@@ -1540,16 +1559,7 @@ class Herdr:
 
     def socket_request(self, method: str, **params: object) -> dict[str, object]:
         """Send one request to this session's socket."""
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
-            stream.settimeout(PROGRAM_TIMEOUT_SECONDS)
-            stream.connect(str(_session_socket(self.session)))
-            stream.sendall((json.dumps({"id": "herdr-tabs", "method": method, "params": params}) + "\n").encode())
-            with stream.makefile("r", encoding="utf-8") as reply:
-                response = decode_object(reply.readline(), f"herdr {method}")
-        if "error" in response:
-            error = json_object(response["error"], f"herdr {method} error")
-            raise HerdrFailure(json_text(error.get("message"), "socket error"))
-        return json_object(response.get("result"), f"herdr {method} result")
+        return session_socket_request(self.session, method, **params)
 
     def listed(self, kind: str, *arguments: str, deadline: float = math.inf) -> list[dict[str, object]]:
         return [json_object(item, f"herdr {kind}").copy() for item in json_items(
@@ -1587,7 +1597,7 @@ class Herdr:
                 for pane in panes]
 
     def pane_activity(self, pane: str) -> PaneAtShell | PaneRunning:
-        """Describe whether the pane is at its shell or running foreground work."""
+        """Check whether the pane is at its shell. Include program names for diagnostics."""
         forget_pane_evidence(self.session, pane)
         context = f"herdr session {self.session} pane {pane} process info"
         info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"), context)
@@ -2414,7 +2424,9 @@ class Herdr:
         argv = owner.arguments
         if isinstance(arguments, CodexArgumentsSource):
             arguments = argv[2:] if Path(argv[0]).name in {"node", "nodejs"} else argv[1:]
-        observed = native_process(owner.pid, "codex")
+        row = self.pane_row(pane)
+        report = "" if isinstance(row, NoPane) else pane_session(row)
+        observed = native_process(owner.pid, "codex", report)
         session_id, started, environment = observed.identity.id, observed.started, observed.environment
         cwd = json_text(owner.cwd, "Codex launch cwd")
         if not Path(cwd).is_absolute():
@@ -3084,6 +3096,11 @@ class ForegroundProcessState:
 
 
 @dataclass(frozen=True)
+class UnreadableLinuxProcessState:
+    error: OSError | ValueError | IndexError
+
+
+@dataclass(frozen=True)
 class CodexForegroundDescendant:
     pid: int
     program: str
@@ -3122,6 +3139,31 @@ class NoForegroundAgent:
     pass
 
 
+@dataclass(frozen=True)
+class ProvedMatch[Owner]:
+    owner: Owner
+
+
+@dataclass(frozen=True)
+class ProvedOtherOwner:
+    owner: ForegroundPaneAgent
+
+
+@dataclass(frozen=True)
+class ObservedEmpty:
+    place: HerdrPlace
+    shell_pid: int
+
+
+@dataclass(frozen=True)
+class UnknownPaneOwner:
+    place: HerdrPlace
+    reason: str
+
+
+type CheckedPane[Owner] = ProvedMatch[Owner] | ProvedOtherOwner | ObservedEmpty | UnknownPaneOwner
+
+
 def _foreground_processes(info: dict[str, object]) -> list[dict[str, object]]:
     return [json_object(value, "native foreground process")
             for value in json_items(info.get("foreground_processes"), "native foreground processes")]
@@ -3135,7 +3177,7 @@ def _foreground_pid(process: dict[str, object]) -> int:
 
 
 def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, object],
-                      arguments: list[str]) -> ProvedCodexForeground:
+                      arguments: list[str], *, for_input: bool) -> ProvedCodexForeground:
     pid = _foreground_pid(process)
     darwin = _platform() == "darwin"
     proved = {pid}
@@ -3157,8 +3199,7 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
                     info = _darwin_process_bsd_info(current, include_zombies=True)
                     state = ForegroundProcessState(info.pbi_ppid, info.pbi_status == _DARWIN_SZOMB)
                 else:
-                    fields = _linux_process_stat(current)
-                    state = ForegroundProcessState(int(fields[1]), fields[0] == "Z")
+                    state = _linux_process_state(current, fresh=for_input)
                 states[current] = state
                 current = state.parent
         except (HerdrFailure, OSError, ValueError, IndexError, AttributeError) as error:
@@ -3168,7 +3209,10 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
         if current not in proved:
             raise HerdrFailure("foreground process is outside the Codex process tree")
         proved.update(path)
-        descendants.append(CodexForegroundDescendant(child_pid, program, states[child_pid].exited))
+        exited = states[child_pid].exited
+        if not exited and program in ("node", "nodejs") and not _foreground_arguments(child):
+            raise HerdrFailure("a foreground Node process has no arguments")
+        descendants.append(CodexForegroundDescendant(child_pid, program, exited))
     return ProvedCodexForeground(pid, arguments, process.get("cwd"), tuple(descendants))
 
 
@@ -3187,14 +3231,14 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
             claude.append((process, arguments))
         elif not arguments:
             missing_argv.add(_foreground_program(process))
-    if codex or "codex" in missing_argv:
+    if codex or missing_argv.intersection({"codex", "node", "nodejs"}):
         try:
             if not codex:
                 raise HerdrFailure("agent argv is unavailable")
             if len(codex) != 1:
                 raise HerdrFailure(f"expected one foreground codex process, found {len(codex)}")
             process, arguments = codex[0]
-            owner = _codex_foreground(foreground, process, arguments)
+            owner = _codex_foreground(foreground, process, arguments, for_input=for_input)
         except HerdrFailure as error:
             programs = ", ".join(_foreground_program(process) for process in foreground)
             return UnprovedForegroundOwner("codex", f"{error}. Foreground programs are {programs}")
@@ -3218,6 +3262,25 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
     if "claude" in missing_argv:
         return UnprovedForegroundOwner("claude", "agent argv is unavailable")
     return NoForegroundAgent()
+
+
+def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPaneAgent | ObservedEmpty | UnknownPaneOwner:
+    """Read the foreground evidence before comparing it with a requested owner."""
+    try:
+        owner = foreground_pane_owner(info)
+        if isinstance(owner, UnprovedForegroundOwner):
+            return UnknownPaneOwner(place, owner.reason)
+        if not isinstance(owner, NoForegroundAgent):
+            return owner
+        shell, group = _pane_process_ids(info, "empty pane")
+        foreground = _foreground_processes(info)
+        if (group == shell and len(foreground) == 1 and _foreground_pid(foreground[0]) == shell
+                and _foreground_program(foreground[0]).lstrip("-") in
+                {"sh", "bash", "zsh", "dash", "fish", "ksh", "ash", "csh", "tcsh", "nu", "xonsh", "elvish"}):
+            return ObservedEmpty(place, shell)
+        return UnknownPaneOwner(place, "no foreground agent")
+    except HerdrFailure as error:
+        return UnknownPaneOwner(place, str(error))
 
 
 def _require_foreground_kind(owner: ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner,
@@ -4195,10 +4258,10 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
             if option in value_options:
                 if not option_value or option_value.startswith("-"):
                     fresh = False
-                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: option {option} has a missing or dash value")
+                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: missing or invalid option value")
                 if option in {"-c", "--config"} and "=" not in option_value:
                     fresh = False
-                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: option {option} has no =")
+                    unknown = CodexLaunchIdentityUnknown(f"{unavailable}: invalid configuration value")
             elif option == "--":
                 return StartingCodexPane(pid) if fresh else unknown
             elif not option.startswith("-"):
@@ -4210,7 +4273,7 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
                 if option in {"exec", "e", "review", "fork", "login", "logout", "mcp", "mcp-server",
                               "app-server", "app", "completion", "sandbox", "debug", "apply", "a",
                               "cloud", "features", "help"}:
-                    return CodexLaunchIdentityUnknown(f"{unavailable}: subcommand {option}")
+                    return CodexLaunchIdentityUnknown(f"{unavailable}: unsupported subcommand")
                 return StartingCodexPane(pid) if fresh else unknown
             elif option in {"--no-daemon", "--no-alt-screen", "--full-auto", "--search", "--oss",
                             "--dangerously-bypass-approvals-and-sandbox"}:
@@ -4254,13 +4317,26 @@ def codex_pane_process(pid: int, place: HerdrPlace) -> NativeAgentProcess:
     return native_process(pid, "codex", "")
 
 
+def _observed_process_placement(pid: int) -> ProcessPlacement:
+    observed = _pane_observations.get()
+    if observed is None:
+        return herdr_place_of(pid)
+    place = observed.process_places.get(pid)
+    if place is not None:
+        return place
+    if pid not in observed.pid_placements:
+        observed.pid_placements[pid] = herdr_place_of(pid)
+    return observed.pid_placements[pid]
+
+
 def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
     """Bind the current identity and account to one unchanged process."""
     if kind == "codex" and isinstance(reported, PaneNotRead):
-        observed = _pane_observations.get()
-        place = observed.process_places.get(pid, NotInHerdr()) if observed is not None else herdr_place_of(pid)
+        place = _observed_process_placement(pid)
         if isinstance(place, HerdrPlace):
             return codex_pane_process(pid, place)
+        if isinstance(place, UnprovedHerdrPlacement):
+            raise ValueError(place.reason)
         reported = ""
     started = _process_birth(pid)
     environment = process_environment(pid)
@@ -4320,7 +4396,7 @@ def check_native_target(pid: int, kind: str, expected: NativeAgentProcess) -> bo
 def _process_display_name(pid: int) -> str:
     """Use the tab or registry name when available; otherwise use the pid."""
     try:
-        place = herdr_place_of(pid)
+        place = _observed_process_placement(pid)
         if isinstance(place, HerdrPlace):
             tab = Herdr(place.session).pane_tab(place.pane)[2]
             record = _tab_staff()
@@ -4583,7 +4659,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
         except (HerdrFailure, OSError, ValueError) as error:
             observations = _pane_observations.get()
             if (isinstance(error, CodexPaneStarting) and observations is not None
-                    and pid in observations.process_places):
+                    and isinstance(observations.process_places.get(pid), HerdrPlace)):
                 print(f"herdr pid {pid}: pane is starting", file=sys.stderr)
                 continue
             if environment is not None:
@@ -4994,6 +5070,20 @@ def _session_socket(name: str) -> Path:
     return session_directory / "herdr.sock"
 
 
+def session_socket_request(session: str, method: str, **params: object) -> dict[str, object]:
+    """Send a request to the session socket without the herdr binary."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(PROGRAM_TIMEOUT_SECONDS)
+        stream.connect(str(_session_socket(session)))
+        stream.sendall((json.dumps({"id": "herdr-tabs", "method": method, "params": params}) + "\n").encode())
+        with stream.makefile("r", encoding="utf-8") as reply:
+            response = decode_object(reply.readline(), f"herdr {method}")
+    if "error" in response:
+        error = json_object(response["error"], f"herdr {method} error")
+        raise HerdrFailure(json_text(error.get("message"), "socket error"))
+    return json_object(response.get("result"), f"herdr {method} result")
+
+
 class DarwinProcessIdentity(NamedTuple):
     """Registry-compatible birth time and controlling-terminal presence (0 or 1)."""
 
@@ -5158,6 +5248,7 @@ class _LivePanePlaces:
             self.pane_list_status = _PaneListStatus.READABLE
         self.shell_places: dict[int, HerdrPlace] = {}
         self.shells_read: bool = False
+        self.shells_complete: bool = True
 
     def shells(self) -> dict[int, HerdrPlace]:
         if self.pane_list_status is _PaneListStatus.UNREADABLE:
@@ -5169,18 +5260,28 @@ class _LivePanePlaces:
                     info = json_object(Herdr(self.session).result("pane", "process-info", "--pane", pane)
                                        .get("process_info"), "herdr pane process info")
                 except HerdrFailure:
+                    self.shells_complete = False
                     continue
                 shell = info.get("shell_pid")
                 if isinstance(shell, int) and not isinstance(shell, bool) and shell > 0:
                     self.shell_places[shell] = HerdrPlace(self.session, pane)
+                else:
+                    self.shells_complete = False
         return self.shell_places
 
     def place(self, pid: int, environment: dict[str, str], parent: Callable[[int], int]) -> HerdrPlace | NotInHerdr:
         launch_pane = environment.get("HERDR_PANE_ID", "")
         if not launch_pane or environment.get("TMUX_PANE"):
             return NotInHerdr()
+        placement = self.placement(pid, launch_pane, parent)
+        if isinstance(placement, UnprovedHerdrPlacement):
+            return (HerdrPlace(self.session, launch_pane) if self.pane_list_status is _PaneListStatus.UNREADABLE
+                    else NotInHerdr())
+        return placement
+
+    def placement(self, pid: int, launch_pane: str, parent: Callable[[int], int]) -> ProcessPlacement:
         if self.pane_list_status is _PaneListStatus.UNREADABLE:
-            return HerdrPlace(self.session, launch_pane)
+            return UnprovedHerdrPlacement(f"cannot read panes for herdr session {self.session}")
         if launch_pane in self.panes:
             return HerdrPlace(self.session, self.panes[launch_pane]["pane_id"])
         shells = self.shells()
@@ -5191,8 +5292,10 @@ class _LivePanePlaces:
             seen.add(pid)
             try:
                 pid = parent(pid)
-            except (OSError, ValueError, IndexError):
-                break
+            except (OSError, ValueError, LookupError):
+                return UnprovedHerdrPlacement(f"cannot read ancestry of process {pid}")
+        if pid in seen or not self.shells_complete:
+            return UnprovedHerdrPlacement(f"cannot establish pane ancestry in herdr session {self.session}")
         return NotInHerdr()
 
 
@@ -5213,7 +5316,23 @@ def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
 
 def linux_process_parent(pid: int) -> int:
     """Read the parent pid from the Linux process root."""
-    return int(_linux_process_stat(pid)[1])
+    return _linux_process_state(pid).parent
+
+
+def _linux_process_state(pid: int, *, fresh: bool = False) -> ForegroundProcessState:
+    observed = None if fresh or _process_action.get() else _pane_observations.get()
+    state = observed.linux_process_states.get(pid) if observed is not None else None
+    if state is None:
+        try:
+            fields = _linux_process_stat(pid)
+            state = ForegroundProcessState(int(fields[1]), fields[0] == "Z")
+        except (OSError, ValueError, IndexError) as error:
+            state = UnreadableLinuxProcessState(error)
+        if observed is not None:
+            observed.linux_process_states[pid] = state
+    if isinstance(state, UnreadableLinuxProcessState):
+        raise state.error.with_traceback(None)
+    return state
 
 
 def _linux_process_stat(pid: int) -> list[str]:
@@ -5221,52 +5340,98 @@ def _linux_process_stat(pid: int) -> list[str]:
     return fields[fields.rindex(")") + 1:].split()
 
 
-@pane_snapshot()
-def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
-    if _platform() == "darwin":
-        return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
-    try:
-        environment = _process_environment(proc_root() / str(pid))
-        if environment.get("TMUX_PANE"):
-            return NotInHerdr()
-        pane = environment.get("HERDR_PANE_ID", "")
-        if not pane:
-            return NotInHerdr()
-        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
-    except OSError:
-        return NotInHerdr()
-    session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid, "")
-    return (_live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
-            if session else NotInHerdr())
+def herdr_place_of(pid: int) -> ProcessPlacement:
+    """Read the placement of a process without dropping an unreadable result."""
+    return process_placement(pid)
 
 
 @pane_snapshot()
-def herdr_places() -> dict[int, HerdrPlace]:
-    """Every herdr process's place from one scan, by pid: herdr_place_of for many pids at once."""
-    if _platform() == "darwin":
-        return {process.pid: process.place for process in herdr_processes()}
+def process_placement(pid: int, *, environment: Mapping[str, str] | None = None) -> ProcessPlacement:
+    """Distinguish verified placement, a non-pane process, and unreadable placement."""
     try:
-        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
-    except OSError:
-        return {}
-    places: dict[int, HerdrPlace] = {}
-    for pid, session in _process_sessions(candidates, _live_server_processes(candidates)).items():
-        try:
-            environment = _process_environment(proc_root() / str(pid))
-        except OSError:
+        if environment is None:
+            environment = process_environment(pid)
+        if (not environment.get("HERDR_PANE_ID")) or environment.get("TMUX_PANE"):
+            return _placement_in_session(pid, environment, "", linux_process_parent)
+        if _platform() == "darwin":
+            processes = {process.pid: process for process in _darwin_processes()}
+            session = _darwin_process_sessions(processes, _darwin_bound_sockets()).get(pid)
+            if session is not None:
+                return _placement_in_session(pid, environment, session, lambda item: processes[item].parent)
+        else:
+            candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
+            session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid)
+            if session is not None:
+                return _placement_in_session(pid, environment, session, linux_process_parent)
+    except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+        return UnprovedHerdrPlacement(f"cannot read the placement of process {pid}")
+    return UnprovedHerdrPlacement(f"cannot establish the herdr session of process {pid}")
+
+
+@dataclass(frozen=True)
+class HerdrProcessPlacements:
+    """Placement evidence for processes associated with a Herdr server."""
+
+    placements: dict[int, ProcessPlacement]
+    scan_failures: tuple[str, ...] = ()
+
+    def get(self, pid: int) -> ProcessPlacement | None:
+        """Return cached evidence. A missing entry requires a PID read."""
+        return self.placements.get(pid)
+
+
+@pane_snapshot()
+def herdr_places() -> HerdrProcessPlacements:
+    """Read one process scan and preserve each unreadable placement."""
+    failures: list[str] = []
+    servers: dict[int, str] = {}
+    try:
+        if _platform() == "darwin":
+            processes = {process.pid: process for process in _darwin_processes()}
+            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets())
+
+            def parent(pid: int) -> int:
+                return processes[pid].parent
+        else:
+            candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
+            servers = _live_server_processes(candidates, failures=failures)
+            sessions = _process_sessions(candidates, servers, failures=failures)
+            parent = linux_process_parent
+    except (OSError, HerdrFailure, ValueError, subprocess.SubprocessError) as error:
+        return HerdrProcessPlacements({}, (str(error),))
+    placements: dict[int, ProcessPlacement] = {}
+    for pid, session in sessions.items():
+        if pid in servers:
             continue
-        place = _live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
-        if isinstance(place, HerdrPlace):
-            places[pid] = place
-    return places
+        try:
+            environment = process_environment(pid)
+        except (OSError, HerdrFailure, ValueError, subprocess.SubprocessError):
+            placements[pid] = UnprovedHerdrPlacement(f"cannot read the placement of process {pid}")
+            continue
+        placements[pid] = _placement_in_session(pid, environment, session, parent)
+    return HerdrProcessPlacements(placements, tuple(failures))
 
 
-def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
+def _placement_in_session(pid: int, environment: Mapping[str, str], session: str,
+                          parent: Callable[[int], int]) -> ProcessPlacement:
+    if environment.get("TMUX_PANE"):
+        return NotInHerdr()
+    pane = environment.get("HERDR_PANE_ID", "")
+    if pane:
+        return _live_pane_reader.get()(session).placement(pid, pane, parent)
+    if any(environment.get(key) for key in ("HERDR_ENV", "HERDR_SESSION", "HERDR_SOCKET_PATH")):
+        return UnprovedHerdrPlacement(f"process {pid} has herdr markers but no pane id")
+    return NotInHerdr()
+
+
+def _live_server_processes(candidates: list[Path], *, failures: list[str] | None = None) -> dict[int, str]:
     """Identify servers by listening socket ownership, independent of argv."""
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr"
     try:
         lines = proc_root().joinpath("net", "unix").read_text().splitlines()
-    except OSError:
+    except OSError as error:
+        if failures is not None:
+            failures.append(f"cannot read herdr sockets: {error}")
         return {}
     listeners: dict[str, str] = {}
     for line in lines:
@@ -5296,6 +5461,9 @@ def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
                         holders.setdefault(inode, set()).add(int(process.name))
         except OSError:
             continue
+    if failures is not None:
+        failures.extend(f"cannot establish a socket owner for herdr session {session}"
+                        for inode, session in listeners.items() if len(holders.get(inode, ())) != 1)
     return {next(iter(pids)): listeners[inode] for inode, pids in holders.items() if len(pids) == 1}
 
 
@@ -5337,7 +5505,8 @@ def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[i
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
-def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[int, str]:
+def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
+                      failures: list[str] | None = None) -> dict[int, str]:
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
@@ -5360,7 +5529,11 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
         try:
             parent = linux_process_parent(int(process.name))
             children.setdefault(parent, []).append(process)
-        except (OSError, ValueError, IndexError):
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, IndexError) as error:
+            if failures is not None:
+                failures.append(f"cannot read the parent of process {process.name}: {error}")
             continue
     descendants = [(process, session) for pid, session in servers.items() for process in children.get(pid, [])]
     sessions = dict(servers)
@@ -5575,17 +5748,11 @@ def _darwin_process_cwds(pids: Sequence[int]) -> dict[int, str | UnreadableCwd]:
     return working_directories
 
 
-def _darwin_herdr_processes() -> list[HerdrProcess]:
-    try:
-        candidates = _darwin_processes()
-        listeners = _darwin_bound_sockets()
-    except (HerdrFailure, subprocess.TimeoutExpired):
-        return []
+def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket]) -> dict[int, str]:
     config = _session_socket("default").parent
     holders: dict[str, set[int]] = {}
-    owned = {process.pid for process in candidates}
     for listener in listeners:
-        if listener.pid not in owned:
+        if listener.pid not in by_pid:
             continue
         if listener.path == config / "herdr.sock":
             session = "default"
@@ -5596,8 +5763,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
         holders.setdefault(session, set()).add(listener.pid)
     servers = {next(iter(pids)): session for session, pids in holders.items() if len(pids) == 1}
     children: dict[int, list[int]] = {}
-    by_pid = {process.pid: process for process in candidates}
-    for process in candidates:
+    for process in by_pid.values():
         children.setdefault(process.parent, []).append(process.pid)
     sessions: dict[int, str] = {}
     for server, session in servers.items():
@@ -5609,6 +5775,16 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
                 continue
             sessions[pid] = session
             pending.extend(children.get(pid, []))
+    return sessions
+
+
+def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrProcess]:
+    try:
+        by_pid = {process.pid: process for process in _darwin_processes()}
+        listeners = _darwin_bound_sockets()
+    except (HerdrFailure, subprocess.TimeoutExpired):
+        return []
+    sessions = _darwin_process_sessions(by_pid, listeners)
     processes: list[HerdrProcess] = []
     working_directories = _darwin_process_cwds(sorted(sessions))
     for pid, session in sessions.items():
@@ -5621,7 +5797,8 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
                 pid, environment, lambda ident: by_pid[ident].parent if ident in by_pid else 0)
             if isinstance(place, NotInHerdr):
                 continue
-            marks = _process_marks(pid, environment, list(arguments.argv), place)
+            marks = (_inherited_process_marks(environment) if inherited_marks_only
+                     else _process_marks(pid, environment, list(arguments.argv), place))
             processes.append(HerdrProcess(pid, place, marks,
                                           Path(by_pid[pid].executable).name, working_directories[pid]))
         except (HerdrFailure, subprocess.TimeoutExpired):
@@ -5629,9 +5806,13 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
     return processes
 
 
+def _inherited_process_marks(environment: Mapping[str, str]) -> dict[str, str]:
+    return {key: environment[key] for key in NATIVE_ID_MARKS if key in environment}
+
+
 def _process_marks(pid: int, environment: dict[str, str], arguments: list[str], place: HerdrPlace) -> dict[str, str]:
     """Project proved agent identities for reports; retain membership when proof is unavailable."""
-    marks = {key: environment[key] for key in NATIVE_ID_MARKS if key in environment}
+    marks = _inherited_process_marks(environment)
     kind = "codex" if is_codex_process(arguments) else "claude" if is_claude_process(arguments) else ""
     if kind:
         try:
@@ -5677,9 +5858,9 @@ class UnitTabClassifier:
 
 @observation_snapshot()
 @pane_snapshot()
-def _scan_herdr_processes() -> list[HerdrProcess]:
+def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrProcess]:
     if _platform() == "darwin":
-        return _darwin_herdr_processes()
+        return _darwin_herdr_processes(inherited_marks_only=True) if inherited_marks_only else _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:
         candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
@@ -5705,35 +5886,40 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
                 cwd = str(process.joinpath("cwd").resolve(strict=True))
             except (OSError, ValueError, RuntimeError) as error:
                 cwd = UnreadableCwd(str(error))
-            marks = _process_marks(pid, environment, arguments, place)
+            marks = (_inherited_process_marks(environment) if inherited_marks_only
+                     else _process_marks(pid, environment, arguments, place))
             processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue
     return processes
 
 
+def _read_current_processes(inherited_marks_only: bool) -> list[HerdrProcess]:
+    return _scan_herdr_processes(inherited_marks_only=True) if inherited_marks_only else _scan_herdr_processes()
+
+
 @dataclass
 class _ProcessSnapshot:
     """A report-only reader whose lifetime ends for all copied contexts at once."""
-    parent: Callable[[], list[HerdrProcess]]
+    parent: Callable[[bool], list[HerdrProcess]]
     active: bool = True
-    saved: Callable[[], list[HerdrProcess]] = field(init=False)
+    saved: Callable[[bool], list[HerdrProcess]] = field(init=False)
 
     def __post_init__(self) -> None:
         self.saved = cache(self.parent)
 
-    def __call__(self) -> list[HerdrProcess]:
-        reader: Callable[[], list[HerdrProcess]] = self
+    def __call__(self, inherited_marks_only: bool) -> list[HerdrProcess]:
+        reader: Callable[[bool], list[HerdrProcess]] = self
         while isinstance(reader, _ProcessSnapshot):
             if not reader.active:
-                return _scan_herdr_processes()
+                return _read_current_processes(inherited_marks_only)
             reader = reader.parent
-        return self.saved()
+        return self.saved(inherited_marks_only)
 
 
 # Only report reads may share a snapshot. Action decisions always scan afresh.
-_process_reader: ContextVar[Callable[[], list[HerdrProcess]]] = ContextVar(
-    "herdr_process_reader", default=lambda: _scan_herdr_processes())
+_process_reader: ContextVar[Callable[[bool], list[HerdrProcess]]] = ContextVar(
+    "herdr_process_reader", default=_read_current_processes)
 _process_action: ContextVar[bool] = ContextVar("herdr_process_action", default=False)
 
 
@@ -5767,21 +5953,31 @@ def process_action() -> Generator[None]:
     while isinstance(reader, _ProcessSnapshot):
         reader.active = False
         reader = reader.parent
-    token = _process_reader.set(lambda: _scan_herdr_processes())
+    token = _process_reader.set(_read_current_processes)
     action = _process_action.set(True)
+    observations = _pane_observations.set(None)
+    panes = _live_pane_reader.set(_LivePanePlaces)
+    evidence = _pane_evidence_run.set(_SCAN_AT_USE)
     try:
         yield
     finally:
+        _pane_evidence_run.reset(evidence)
+        _live_pane_reader.reset(panes)
+        _pane_observations.reset(observations)
         _process_action.reset(action)
         _process_reader.reset(token)
 
 
-def herdr_processes(*, membership: StaffLabels | StaffLabelsRead = StaffLabelsRead.PENDING) -> list[HerdrProcess]:
-    """Read current processes, or the snapshot held by an explicit scope."""
+def herdr_processes(*, membership: StaffLabels | StaffLabelsRead = StaffLabelsRead.PENDING,
+                    inherited_marks_only: bool = False) -> list[HerdrProcess]:
+    """Read process placement. Inherited marks can only identify possible members."""
+    processes = _process_reader.get()(inherited_marks_only)
+    if inherited_marks_only:
+        return processes
     labels = RecordedLabels(membership)
     return [HerdrProcess(row.pid, row.place, labels.resolve(row.pid, row.marks),
                          row.command, row.working_directory)
-            for row in _process_reader.get()()]
+            for row in processes]
 
 
 def _check_agent_arguments(kind: str, agent_arguments: list[str]) -> None:

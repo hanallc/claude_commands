@@ -189,6 +189,8 @@ def producer_conflicts(name: str, client: herdr.Herdr) -> list[tuple[str, str]]:
                 place = herdr.herdr_place_of(pid)
                 if isinstance(place, herdr.HerdrPlace):
                     places.append(place.pane if place.session == client.session else f"{place.session}:{place.pane}")
+                elif isinstance(place, herdr.UnprovedHerdrPlacement):
+                    places.append(f"placement unknown for pid {pid}")
         conflicts.append((identity, ",".join(places) or "outside herdr"))
     locations: dict[str, set[str]] = {}
     unresolved: list[tuple[str, str]] = []
@@ -990,9 +992,27 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude") -> 
         if isinstance(observed, herdr.UnknownConversation):
             herdr.conversation_note(observed)
             client = herdr.Herdr(herdr.shared_session())
-            for pane in client.panes():
-                if pane["session_id"] == identity and not isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
-                    return ClaudeUp(identity, pane["pane_id"], "unknown account", start_state=ClaudeStartState.ALREADY_RUNNING)
+            failure = ""
+            try:
+                for pane in client.panes():
+                    if pane["session_id"] != identity and pane["pane_id"] != pane_id:
+                        continue
+                    candidate = pane["pane_id"]
+                    herdr.forget_pane_evidence(client.session, candidate)
+                    try:
+                        info = client.result("pane", "process-info", "--pane", candidate).get("process_info")
+                        owner = herdr.foreground_pane_conversation(info, pane)
+                    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                        failure = str(error)
+                        continue
+                    if isinstance(owner, pane_launch.ProvedPaneConversation) and owner.kind == "codex" and owner.identity == identity:
+                        return _codex_running_on_account(identity, candidate, owner.pid)
+                    if pane["session_id"] == identity:
+                        failure = f"pane {candidate}: cannot prove the reported Codex owner"
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                failure = str(error)
+            if failure or not observed.shared_codex:
+                return ResumeFailed(identity, failure or observed.reason)
             return sessions.SessionNotLive()
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
@@ -1225,6 +1245,16 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if row is not None and isinstance(running, ClaudeUp) and isinstance(running.pid, int) and running.account != "unknown account":
                 member_account.repair_home(row, kind, running.pid)
             return running
+        if row is not None and row.kind == "unit" and (parent := names.tab_record.parent_of(row)) is not None:
+            from scripts.production import unit_lookup
+
+            match unit_lookup.checked_unit(parent.name, row.name, record=names.tab_record):
+                case unit_lookup.UnknownUnit(reason=reason):
+                    return ResumeFailed(identity, reason)
+                case unit_lookup.ProvedLiveUnit():
+                    return ResumeFailed(identity, "a unit owner is still live")
+                case unit_lookup.ProvedAbsentUnit():
+                    pass
         mode = worker_mode() if row is not None else NO_WORKERS
         if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
             return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")

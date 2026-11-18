@@ -864,9 +864,11 @@ class AccountsTests(unittest.TestCase):
                         self.assertIn({"session": member.current_session, "state": "busy"}, account_row["sessions"])
                     if kind == "unit":
                         assert parent is not None
-                        listing = unit_lookup.LabeledProductions({}, {parent.name: (member.name,)})
+                        checked = unit_lookup.ProvedLiveUnit(unit_lookup.LiveClaude(
+                            member.name, member.current_session, "", 900, activity))
+                        listing = unit_lookup.LabeledProductions({}, {parent.name: (member.name,)},
+                            registry_owners={parent.name: {member.name: checked}} if activity else {})
                         with (patch.object(staff, "snapshot", return_value=snapshot),
-                              patch.object(sessions, "running_sessions", return_value=observed),
                               patch.object(detached_run_process, "process_args", return_value=process_args),
                               patch.object(detached_run_process, "supervisor_records", return_value={run_path.resolve(): frozenset({90001})}
                                   if supervisor == "live" else {}),

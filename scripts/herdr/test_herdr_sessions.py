@@ -379,6 +379,18 @@ class HerdrSessionsTests(unittest.TestCase):
                             else "unit\tunknown\t\nsolo\tunknown\t\n")
                     self.assertEqual(self.call("list"), (0, rows + "runner\tshowrunner\trunner\n", ""))
 
+    def test_list_reports_an_unreadable_node_wrapper_as_unknown(self) -> None:
+        self.respond(["agents"], tabs=("wrapped",))
+        replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
+        replies["--session agents pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "label": "wrapped", "session_id": fixture_runtime_id("node-wrapper")}
+        ]}})}
+        _ = self.responses.write_text(json.dumps(replies))
+        for program in ("node", "nodejs"):
+            with self.subTest(program=program):
+                self.observe("w1:p1", {"foreground_processes": [{"pid": 456, "name": program, "argv": []}]})
+                self.assertEqual(self.call("list"), (0, "wrapped\tunknown\t\n", ""))
+
     def test_unit_role_takes_precedence_over_showrunner(self) -> None:
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")

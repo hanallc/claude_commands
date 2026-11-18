@@ -7,10 +7,12 @@ import json
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, final, override
@@ -20,10 +22,11 @@ from unittest import mock
 from scripts.agents import pane_record
 from scripts.lib.models_registry import LaunchSettings
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file
 from scripts.herdr import herdr, pane_launch
-from scripts.herdr.test_herdr import codex_foreground_cases, native_process_commands
+from scripts.herdr.test_herdr import ClaudeForegroundSocket, codex_foreground_cases, native_process_commands
 from scripts.message import sessions
 from scripts.message import sessions as runtime_sessions
 from scripts.agents.test_pane_restore import FakeClient
@@ -130,8 +133,38 @@ class PaneRecordTests(unittest.TestCase):
         command = [BASH, "-c", 'exec -a claude "$0" "$@"', sys.executable, str(self.root / "runner.py"),
                    sys.executable, str(HOOK), *flags]
         payload = json.dumps({"session_id": session_id, "cwd": "/work/alpha", "source": source})
-        return subprocess.run(command, input=payload, env={**self.env, "HERDR_PANE_ID": pane},
-                              capture_output=True, text=True, check=False, timeout=60)
+        environment = {**self.env, "HERDR_PANE_ID": pane}
+        if environment.get("HERDR_ENV") != "1":
+            return subprocess.run(command, input=payload, env=environment,
+                                  capture_output=True, text=True, check=False, timeout=60)
+
+        with (short_socket_directory("h-") as config, socket.socket(socket.AF_UNIX) as listener,
+              ThreadPoolExecutor(max_workers=1) as executor):
+            environment["XDG_CONFIG_HOME"] = config
+            session = environment["HERDR_SESSION"]
+            path = Path(config) / "herdr/sessions" / session / "herdr.sock"
+            path.parent.mkdir(parents=True)
+            listener.bind(str(path))
+            listener.listen(1)
+            listener.settimeout(herdr.PROGRAM_TIMEOUT_SECONDS)
+
+            def serve(proof: ClaudeForegroundSocket) -> None:
+                connection = listener.accept()[0]
+                with connection, connection.makefile("r", encoding="utf-8") as source:
+                    connection.settimeout(herdr.PROGRAM_TIMEOUT_SECONDS)
+                    request = herdr.decode_object(source.readline(), "fixture socket request")
+                    method = herdr.json_text(request.get("method"), "fixture socket method")
+                    params = herdr.json_object(request.get("params"), "fixture socket parameters")
+                    pane_id = herdr.json_text(params.get("pane_id"), "fixture socket pane")
+                    result = proof.request(session, method, pane_id=pane_id)
+                    connection.sendall((json.dumps({"id": request.get("id"), "result": result}) + "\n").encode())
+
+            with subprocess.Popen(command, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as child:
+                served = executor.submit(serve, ClaudeForegroundSocket(session, pane, child.pid))
+                stdout, stderr = child.communicate(input=payload, timeout=60)
+                served.result()
+            return subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
 
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
