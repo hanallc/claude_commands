@@ -22,6 +22,7 @@ from scripts.production.staff_test_support import StaffTestCase, production_memb
 from scripts.production import showrunner_tree
 from scripts.production.proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 from scripts.lib import conf, unit_runs
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 # Importable once proposals_table has put scripts/direct on the path.
 from scripts.direct import phase_table
@@ -33,7 +34,9 @@ class ProposalsTableTests(StaffTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")}))
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        self.enterContext(mock.patch.dict(os.environ, environment))
         # No live update timer names a production below the test's own.
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
         _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", return_value=[]))
@@ -262,6 +265,7 @@ class ProposalsTableTests(StaffTestCase):
         self.assertEqual(sorted(row.proposal for row in rows), ["Former-folder add-on", "New-folder add-on"])
 
     def test_the_table_keeps_one_line_per_row_and_cuts_a_long_title(self) -> None:
+        _ = write_config_fixture(self.root / "config/proposals_table.conf", "title_width=60\nstate_width=80\n")
         long_title = "word " * 40
         text = proposals_table.table([Row("unit | one", "first\nsecond", "2026-10-12", REVIEW_STATE),
                                       Row("unit", long_title, "2026-10-12", long_title)])
@@ -292,6 +296,7 @@ class ProposalsTableTests(StaffTestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
+        _ = write_config_fixture(self.root / "config/proposals_table.conf", "title_width=60\nstate_width=80\n")
         doc = self.write("trunk/docs/plans/report-settings.md", "# Production\n\n- **Proposals:** `issues`\n"
                          + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n")
         _ = recorded_showrunner("footers", doc)

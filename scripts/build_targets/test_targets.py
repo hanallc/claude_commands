@@ -92,6 +92,10 @@ class IsolatedTargetTest(unittest.TestCase):
         self.holders.mkdir()
         self.mac_state.mkdir()
         (self.root / "sessions").mkdir()
+        _ = config_environment(self.root)
+        _ = write_config_fixture(self.root / "build_targets.conf",
+                                 "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                                 + "kind.natedev=local\nplatform.natedev=linux\n")
         _ = write_config_fixture(self.settings, "host=test-mac\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
@@ -173,9 +177,9 @@ class ConfigurationTests(IsolatedTargetTest):
                     _ = targets.read_targets(registry)
 
 
-    def test_shipped_config_reads_mac_then_natedev(self) -> None:
-        self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
-            targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),
+    def test_fixture_config_reads_mac_then_natedev(self) -> None:
+        self.assertEqual(targets.read_targets(self.root / "build_targets.conf"), (
+            targets.SshTarget("mac", "macos", self.settings),
             targets.LocalTarget("natedev", "linux"),
         ))
 

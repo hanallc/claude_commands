@@ -16,6 +16,7 @@ from unittest.mock import Mock, call, patch
 
 from scripts.lib import conf, nix_env
 from scripts.lib.nix_env_test_support import NixFixture
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.nix_env import heal
 from scripts.agents import stop_resume
 from scripts.notify import push_texts
@@ -39,18 +40,16 @@ class HealTests(NixFixture):
 
     def test_a_sweep_keeps_its_state_log_and_lock_in_the_selected_folder(self) -> None:
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
-        original = settings.read_text()
         first, second = self.root / "first", self.root / "second"
         second.mkdir()
-        configured = original.replace("heal_state_directory=~/.local/state/nix-heal", f"heal_state_directory={first}")
-        _ = settings.write_text(configured)
+        _ = write_config_fixture(settings, f"heal_state_directory={first}\n")
         real_lock = fcntl.flock
         locked_paths: list[Path] = []
 
         def lock(stream: TextIO, operation: int) -> None:
             real_lock(stream, operation)
             locked_paths.append(Path(cast(str, stream.name)))
-            _ = settings.write_text(configured.replace(str(first), str(second)))
+            _ = write_config_fixture(settings, f"heal_state_directory={second}\n")
 
         def configured_directory() -> Path:
             return Path(conf.read("nix_env").text("heal_state_directory"))
@@ -80,12 +79,13 @@ class HealTests(NixFixture):
             proc_start=self.session.proc_start, stop_request_sent=True)
         heal.save_history(directory, {self.session.session_id: history})
         settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
-        original = settings.read_text()
+        _ = write_config_fixture(settings,
+            "command_timeout_seconds=550\nrelaunch_launch_seconds=25\nrelaunch_confirmation_seconds=15\n")
         with (patch.object(heal, "list_sessions", return_value=[]),
               patch.object(time, "time", return_value=1100.0), patch.object(heal, "alert") as alert):
             self.assertEqual(heal.sweep(), 0)
             alert.assert_not_called()
-            _ = settings.write_text(original.replace("command_timeout_seconds=600", "command_timeout_seconds=1"))
+            _ = write_config_fixture(settings, "command_timeout_seconds=1\n")
             self.assertEqual(heal.sweep(), 0)
             alert.assert_called_once()
             self.assertIn("waiting for a live replacement", cast(str, alert.call_args.args[-1]))
@@ -123,6 +123,8 @@ class HealTests(NixFixture):
         self.assertEqual(self.direnv_calls(), [])
 
     def test_registry_reads_all_config_dirs_and_ignores_corrupt_or_reused_entries(self) -> None:
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "nix_env.conf",
+                                 "session_directory_glob=.claude*/sessions\n")
         for number, name in enumerate((".claude", ".claude3"), 1):
             directory = self.home / name / "sessions"
             directory.mkdir(parents=True)
@@ -366,6 +368,7 @@ class HealTests(NixFixture):
                 self.assertEqual(self.records()[-1]["reason"], output or f"exit {code}")
 
     def test_broken_replacement_hits_hour_guard_and_pushes_once(self) -> None:
+        _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "nix_env.conf", "restart_interval_seconds=3600\n")
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = ""
         # The command returns but never publishes a healthy replacement.

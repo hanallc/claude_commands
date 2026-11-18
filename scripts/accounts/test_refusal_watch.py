@@ -32,6 +32,7 @@ from unittest.mock import ANY, Mock, call, patch
 from scripts.lib import conf, transcripts
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.agents import stop_resume
@@ -2162,8 +2163,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
 
     def test_deferred_build_move_keeps_its_destination_until_a_later_check(self) -> None:
-        _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
-                         Path(os.environ["CONF_DIR"]) / "shutdown.conf")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "MOVE_BUILD_WAIT_MINUTES=30\n")
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         _ = accounts.set_group_account("units", "claude3", why="auto: build", now=NOW, origin=accounts.AutoOrigin())

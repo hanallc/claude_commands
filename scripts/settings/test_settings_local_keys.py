@@ -1,4 +1,5 @@
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import json
 import os
@@ -97,9 +98,9 @@ class SettingsFilterTests(unittest.TestCase):
             _ = shutil.copy2(source, self.root / "scripts/settings" / source.name)
         for name in ("conf.sh", "conf_record.sh", "conf.py", "conf_reads.py", "atomic_file.py", "py"):
             _ = shutil.copy2(KEYS.parents[1] / "lib" / name, self.root / "scripts/lib" / name)
-        for name in ("settings", "send", "postmaster", "codex_daemon"):
-            source = KEYS.parents[2] / "config" / f"{name}.conf"
-            _ = shutil.copy2(source, self.root / "config" / source.name)
+        for name in ("send", "postmaster", "codex_daemon"):
+            _ = write_config_fixture(self.root / "config" / f"{name}.conf")
+        _ = write_config_fixture(self.root / "config/settings.conf", "local_key_notice_to=fixture-owner\n")
         _ = shutil.copy2(KEYS.with_name("local_key_notices.py"), self.root / "scripts/settings/local_key_notices.py")
         for name in ("send_result.py", "send_budget.py", "session_send.py"):
             _ = shutil.copy2(KEYS.parents[1] / "message" / name, self.root / "scripts/message" / name)
@@ -325,7 +326,7 @@ else:
         _ = self.refresh()
         _ = self.refresh()
         self.assertEqual(len(self.sends()), 1)
-        self.assertEqual(self.sends()[0][1], "natedev")
+        self.assertEqual(self.sends()[0][1], "fixture-owner")
         _ = (self.root / "config/settings.conf").write_text("local_key_notice_to=fixture-destination\n")
         self.write_settings({"shared": 1, "theme": "dark"})
         _ = self.refresh()

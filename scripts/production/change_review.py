@@ -264,13 +264,19 @@ def common_git_directory(repo: Path) -> Path:
 def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]], *,
                         record: staff.StaffSnapshot | None = None) -> list[str]:
     """Origin branches whose readable productions in this repository already write review rows."""
+    return list(dict.fromkeys(_reviewed_merge_refs_by_doc(repo, productions, record=record).values()))
+
+
+def _reviewed_merge_refs_by_doc(repo: Path, productions: Callable[[], Iterable[Path]], *,
+                                record: staff.StaffSnapshot | None = None) -> dict[Path, str]:
+    """Keep each production document with its origin merge ref."""
     try:
         common = common_git_directory(repo)
         available = set(_git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/").splitlines())
         docs = tuple(productions())
     except (OSError, UnicodeError, ValueError, Refusal, ChangeReviewError):
-        return []
-    refs: list[str] = []
+        return {}
+    refs: dict[Path, str] = {}
     for doc in docs:
         try:
             lines = doc.read_text(encoding="utf-8").splitlines()
@@ -281,10 +287,10 @@ def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]], *
                 continue
             branch = production_field(lines, "Merge branch")
             if f"refs/remotes/origin/{branch}" in available:
-                refs.append(f"origin/{branch}")
+                refs[doc] = f"origin/{branch}"
         except (OSError, UnicodeError, ValueError, Refusal, ChangeReviewError):
             continue
-    return list(dict.fromkeys(refs))
+    return refs
 
 
 def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
@@ -309,17 +315,20 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
     return commits
 
 
-def missing(commits: list[Commit]) -> list[str]:
-    """Each invalid commit that no passing commit names in a Change-Review-Covers line.
-
-    A pushed commit cannot be amended, so a later checkpoint carries the lines for one that missed them.
-    """
+def _uncovered_problems(commits: list[Commit]) -> Iterable[tuple[Commit, str]]:
+    """Find invalid commits that no passing commit covers."""
     covered = [found.group("sha") for commit in commits if entries(commit.message)
                and not problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp)
                for found in _COVERS.finditer(commit.message)]
-    return [f"{commit.sha[:SHORT]} {commit.subject}: {reason}" for commit in commits
-            if (reason := problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp))
-            and not any(commit.sha.startswith(sha) for sha in covered)]
+    for commit in commits:
+        reason = problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp)
+        if reason and not any(commit.sha.startswith(sha) for sha in covered):
+            yield commit, reason
+
+
+def missing(commits: list[Commit]) -> list[str]:
+    """Name each invalid commit that no passing commit covers."""
+    return [f"{commit.sha[:SHORT]} {commit.subject}: {reason}" for commit, reason in _uncovered_problems(commits)]
 
 
 def review_commits(commits: list[Commit]) -> list[Commit]:
@@ -554,15 +563,15 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with _list_lock(path):
-        text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
-        lines = text.splitlines(keepends=True)
-        result = write(lines)
-        if lines == text.splitlines(keepends=True):
-            _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
-            return result
-        _sort(path, lines)
-        _stamp(path, lines, production, day)
-        write_text_atomic(path, "".join(lines))
+        # Writers always take the list lock before the image reference lock.
+        with _image_reference_lock():
+            text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
+            lines = text.splitlines(keepends=True)
+            result = write(lines)
+            if lines != text.splitlines(keepends=True):
+                _sort(path, lines)
+                _stamp(path, lines, production, day)
+                write_text_atomic(path, "".join(lines))
         _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
         return result
 
@@ -723,12 +732,18 @@ def _sort(path: Path, lines: list[str]) -> None:
     lines[first:end] = [rows[row["#"]] for row in ordered(named, path)]
 
 
+def _refuse_image_problem(change: PublicationChange, reason: str) -> None:
+    """Refuse an image failure when the caller has no scan diagnostic handler."""
+    raise ChangeReviewError(f"{change.checkpoint[:SHORT]}: {reason}")
+
+
 def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day: date, merged: str, production: Path,
                 rank: str = "", owners: Sequence[Path] = (),
                 producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
                 record: staff.StaffSnapshot, repo: Path = _CURRENT_REPO,
                 on_hold: Callable[[PublicationChange], None] | None = None,
-                merge_changes: Sequence[PublicationChange] = (), added_at: datetime | None = None) -> list[str]:
+                merge_changes: Sequence[PublicationChange] = (), added_at: datetime | None = None,
+                on_image_problem: Callable[[PublicationChange, str], None] = _refuse_image_problem) -> list[str]:
     """Add changes to To review with fixed staff IDs from record.
 
     owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
@@ -738,6 +753,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     if not changes:
         return []
     items = [change.item if isinstance(change, PublicationChange) else change for change in changes]
+    for index, item in enumerate(items):
+        _require_row_image(item.image, f"change {index + 1} ({item.change})")
     row_owners = [change.source.production if isinstance(change, PublicationChange) and isinstance(change.source, UnitSource)
                   else owners[index] if owners else production for index, change in enumerate(changes)]
     row_producers = [change.producer if isinstance(change, PublicationChange)
@@ -765,8 +782,18 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
         if not selected:
             return []
         number = next_number("".join(lines))
-        row_images = {index: _row_image(items[index].image, f"C{number + offset}")
-                      for offset, index in enumerate(selected)}
+        row_images: dict[int, str] = {}
+        for index in selected:
+            try:
+                row_images[index] = _row_image(items[index].image, f"C{number + len(row_images)}")
+            except ChangeReviewError as error:
+                change = changes[index]
+                if not isinstance(change, PublicationChange):
+                    raise
+                on_image_problem(change, str(error))
+        selected = list(row_images)
+        if not selected:
+            return []
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
         _add_column(path, lines, SECTION, PRODUCTION)
@@ -814,12 +841,20 @@ def image_path(identity: str) -> str:
     return image_store.change_image(change_routing.review_root(), identity)
 
 
+def _require_row_image(identity: str, row: str) -> None:
+    """Refuse a visible row without an image."""
+    if not identity:
+        raise ChangeReviewError(f"{row}: a visible row requires an image; run change_review.py image --image <png> "
+                                + "(or --output <text file>), then pass the id with --image")
+
+
 def _row_image(identity: str, row: str) -> str:
-    if not identity or image_path(identity):
+    """Resolve a stored image before a row write."""
+    if identity and image_path(identity):
         return identity
-    if copied := image_store.copy_page_image(identity):
+    if identity and (copied := image_store.copy_page_image(identity)):
         return copied
-    print(f"change review: no image {identity}; row {row} has no image")
+    _require_row_image("", f"{row} (image {identity} is unavailable)" if identity else row)
     return ""
 
 
@@ -1479,6 +1514,15 @@ def _list_lock(path: Path) -> Generator[None]:
         os.close(descriptor)
 
 
+@contextmanager
+def _image_reference_lock() -> Generator[None]:
+    """Protect image checks, row writes, and image cleanup across all lists."""
+    root = change_routing.review_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(root / ".change-image-references.lock"):
+        yield
+
+
 def describe(row: dict[str, str], *, record: staff.StaffSnapshot | None = None) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
     record = staff.initial_snapshot() if record is None else record
@@ -1522,37 +1566,56 @@ class RowWrite[Result]:
     after: Callable[[], None]
 
 
+def _remove_unused_image(path: Path, identity: str) -> None:
+    """Remove an image only after all known review lists release it."""
+    with _image_reference_lock():
+        try:
+            paths = {path, *path.parent.glob(PREFIX + "*.md"), *lists_directory().glob(PREFIX + "*.md")}
+            for member in staff.initial_snapshot().find(kind="showrunner"):
+                if isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc)) and member.doc.path.is_file():
+                    named = _line_value(member.doc.path)
+                    if named:
+                        paths.add(Path(named).expanduser())
+            if any(row.get(IMAGE) == identity for source in paths for row in review_rows(source)):
+                return
+        except (ChangeReviewError, OSError, UnicodeError) as error:
+            _print_warning(f"image {identity} kept because a review list could not be checked: {error}")
+            return
+        image_store.remove_change(change_routing.review_root(), identity)
+
+
 def _edit_write(path: Path, row: str, item: Visible | KeepRowText, image: str) -> RowWrite[str]:
     """Edit the selected text and image cells without changing the row's identity or position."""
     removed_image = ""
 
     def write(lines: list[str]) -> str:
         nonlocal removed_image
-        _ = _to_review(path, lines, row)
-        if image:
-            _add_column(path, lines, SECTION, IMAGE)
+        columns, index = _to_review(path, lines, row)
+        cells = dict(zip(columns, _cells(lines[index])))
+        current_image = _plain(cells.get(IMAGE, ""))
+        _require_row_image(image or current_image, row)
+        resolved_image = _row_image(image or current_image, row)
+        _add_column(path, lines, SECTION, IMAGE)
         columns, index = _to_review(path, lines, row)
         cells = dict(zip(columns, _cells(lines[index])))
         if isinstance(item, Visible):
             cells.update({"Change": _cell(item.change), CHECK: _cell(item.how())})
-        if image:
-            previous = _plain(cells.get(IMAGE, ""))
-            removed_image = previous if previous != image else ""
-            cells[IMAGE] = _cell(image)
+        removed_image = current_image if current_image != resolved_image else ""
+        cells[IMAGE] = _cell(resolved_image)
         written = _row(path, columns, cells)
         lines[index] = written + "\n"
         return written
 
     def after() -> None:
         if removed_image:
-            image_store.remove_change(change_routing.review_root(), removed_image)
+            _remove_unused_image(path, removed_image)
 
     return RowWrite(write, after)
 
 
 def edit_row(path: Path, row: str, item: Visible | KeepRowText, day: date, production: Path,
              *, image: str = "") -> str:
-    """Edit a row and remove its previous image after the write."""
+    """Edit a row and remove its previous image when no review row uses it."""
     change = _edit_write(path, row, item, image)
     written = _edit(path, production, day, change.write, lambda _: f"edit {row}")
     change.after()
@@ -1659,7 +1722,7 @@ def _verdict_write(
 
     def after() -> None:
         if removed_image:
-            image_store.remove_change(change_routing.review_root(), removed_image)
+            _remove_unused_image(path, removed_image)
 
     return RowWrite(write, after)
 
@@ -1668,7 +1731,7 @@ def record_verdict(
     path: Path, row: str, verdict: str, day: date, production: Path, *,
     report_warning: Callable[[str], None] = _print_warning,
 ) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
-    """Record a verdict once and remove its image after the write."""
+    """Record a verdict once and remove its image when no review row uses it."""
     change = _verdict_write(path, row, verdict, day)
     result = _edit(path, production, day, change.write, lambda _: f"verdict {row}", report_warning=report_warning)
     change.after()
@@ -1996,6 +2059,34 @@ def _publication_exclusions(repo: Path, merge: str, refs: Iterable[str]) -> list
     return sorted(excluded)
 
 
+def _staff_descendant(row: staff.StaffRow, ancestor: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
+    """Test descent through the held staff parents."""
+    seen: set[staff.StaffId] = set()
+    parent = record.parent_of(row)
+    while parent is not None and parent.id not in seen:
+        if parent.id == ancestor.id:
+            return True
+        seen.add(parent.id)
+        parent = record.parent_of(parent)
+    return False
+
+
+def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
+                    merge_branch: str, record: staff.StaffSnapshot) -> frozenset[str]:
+    """Exclude descendant merges only when the scanning branch does not share them."""
+    owner = unit_lookup.doc_owner(production, record)
+    own_merges = set(_git(repo, "rev-list", "--first-parent", "--merges",
+                          f"origin/{merge_branch}", "--").split())
+    foreign: set[str] = set()
+    for doc, ref in refs.items():
+        merges = set(_git(repo, "rev-list", "--first-parent", "--merges",
+                          f"--since={READY_FROM}T00:00:00Z", ref, "--").split())
+        if _staff_descendant(unit_lookup.doc_owner(doc, record), owner, record):
+            merges.difference_update(own_merges)
+        foreign.update(merges)
+    return frozenset(foreign)
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
@@ -2019,10 +2110,21 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
         merges = _git(repo, "log", "--reverse", "--first-parent", "--merges", f"--since={READY_FROM}T00:00:00Z",
                       "--format=%H%x09%s", f"origin/{merge_branch}", "--").splitlines()
     record = staff.snapshot() if record is None else record
-    scoped = set(_publication_docs(production, record))
+    own_list = _line_value(production)
+    scoped: set[Path] = set()
+    for doc in _publication_docs(production, record):
+        try:
+            named = _line_value(doc)
+        except (OSError, UnicodeError):
+            scoped.add(doc)
+            continue
+        if not named or named == own_list:
+            scoped.add(doc)
     outside_docs = [row.doc.path for row in record.find(kind="showrunner")
                     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.path not in scoped]
-    outside_refs = set(reviewed_merge_refs(repo, lambda: outside_docs, record=record))
+    outside = _reviewed_merge_refs_by_doc(repo, lambda: outside_docs, record=record)
+    outside_refs = set(outside.values())
+    foreign = _foreign_merges(repo, outside, production, merge_branch, record)
     rows: list[str] = []
     matched_step = False
     recorded = checkpoint_producers(record)
@@ -2030,10 +2132,20 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
         merge, subject = entry.split("\t", 1)
         if any(subject.endswith(f" into {ref.removeprefix('origin/')}") for ref in outside_refs):
             continue
-        if not on_main(repo, merge):
+        if merge in foreign or not on_main(repo, merge):
             continue
         commits = merge_commits(repo, merge, excluded_refs=_publication_exclusions(repo, merge, outside_refs))
         short = _git(repo, "rev-parse", f"--short={SHORT}", merge).strip()
+        write_commits = [replace(commit, timestamp=max(commit.timestamp, IMAGES_CHECKED_FROM)) for commit in commits]
+        for commit, reason in _uncovered_problems(write_commits):
+            if entries(commit.message):
+                print(f"{short}: {commit.sha[:SHORT]} {commit.subject}: {reason}", file=sys.stderr)
+        if isinstance(selection, CompletedStep):
+            matched_step |= any(isinstance(item.readiness, AfterStep) and item.readiness.step == selection.step
+                                for _, item in _checkpoint_entries(commits))
+        valid_commits = [commit for commit in review_commits(write_commits)
+                         if not problem(commit.subject, commit.message, commit.files, timestamp=commit.timestamp)]
+        commits_by_sha = {commit.sha: commit for commit in commits}
         routed: dict[tuple[Path, Path], list[PublicationChange]] = {}
         merge_changes: dict[Path, list[PublicationChange]] = {}
         noted: set[str] = set()
@@ -2075,7 +2187,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                     producers[checkpoint] = checkpoint_owner
                 parents = ancestry[checkpoint]
                 checkpoint = parents[0] if parents else ""
-        for change in publication_changes(commits, production, record=record, known_producer=producer,
+        for change in publication_changes(valid_commits, production, record=record, known_producer=producer,
                                           recorded_producers=producers):
             readiness = change.item.readiness
             if isinstance(selection, CompletedStep) and isinstance(readiness, AfterStep) and readiness.step == selection.step:
@@ -2088,6 +2200,10 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                 continue
             routed.setdefault((path, owner_doc), []).append(change)
             merge_changes.setdefault(path, []).append(change)
+        def image_problem(change: PublicationChange, reason: str) -> None:
+            commit = commits_by_sha[change.checkpoint]
+            print(f"{short}: {commit.sha[:SHORT]} {commit.subject}: {reason}", file=sys.stderr)
+
         for (path, owner_doc), changes in routed.items():
             selected = changes
             if isinstance(selection, CompletedStep):
@@ -2096,7 +2212,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             stamp = now()
             rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
                                     on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path], added_at=stamp))
+                                    merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem))
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
@@ -2167,6 +2283,8 @@ def _register_image(image: str, output: str) -> str:
     if bool(image) == bool(output):
         raise ChangeReviewError("image needs one of --image or --output")
     try:
+        if image_store.IDENTITY.fullmatch(image):
+            return _row_image(image, "image")
         return (image_store.register_change(Path(image).expanduser()) if image
                 else image_store.register_output(Path(output).expanduser()))
     except (ValueError, subprocess.SubprocessError) as error:
@@ -2264,6 +2382,7 @@ class BatchWrite:
     row: str
     production: Path
     write: Callable[[list[str]], Callable[[], list[str]]]
+    prepare: Callable[[], None]
 
 
 def _batch_item(value: object, index: int, day: date, review_root: Path) -> BatchWrite:
@@ -2289,10 +2408,19 @@ def _batch_item(value: object, index: int, day: date, review_root: Path) -> Batc
         options.image, options.output = text("image"), text("output")
         item = (KeepRowText() if (options.image or options.output) and not any((options.change, options.check, options.see))
                 else _visible(options))
-        image = _register_image(options.image, options.output) if options.image or options.output else ""
-        change = _edit_write(path, target.row, item, image)
+        existing = next((row for row in review_rows(path) if row["#"] == target.row), None)
+        if existing is None:
+            raise RowNotListed(f"{target.row} is not on the list to review")
+        _require_row_image(options.image or options.output or existing.get(IMAGE, ""), target.row)
+
+        image = ""
+
+        def prepare_image() -> None:
+            nonlocal image
+            image = _register_image(options.image, options.output) if options.image or options.output else ""
 
         def edit(lines: list[str]) -> Callable[[], list[str]]:
+            change = _edit_write(path, target.row, item, image)
             written = change.write(lines)
             columns, _, _ = _table(path, lines, SECTION)
             cells = dict(zip(columns, _cells(written)))
@@ -2304,7 +2432,7 @@ def _batch_item(value: object, index: int, day: date, review_root: Path) -> Batc
 
             return after
 
-        return BatchWrite(index, path, target.row, doc, edit)
+        return BatchWrite(index, path, target.row, doc, edit, prepare_image)
     if operation == "verdict":
         if text("image") or text("output"):
             raise ChangeReviewError("verdict does not accept image or output")
@@ -2326,7 +2454,7 @@ def _batch_item(value: object, index: int, day: date, review_root: Path) -> Batc
 
             return after
 
-        return BatchWrite(index, path, target.row, doc, record)
+        return BatchWrite(index, path, target.row, doc, record, lambda: None)
     raise ChangeReviewError("op must be edit or verdict")
 
 
@@ -2342,6 +2470,7 @@ def batch(file: Path) -> list[str]:
     root = change_routing.review_root()
     items: list[BatchWrite] = []
     rows: dict[tuple[Path, str], int] = {}
+    errors: list[str] = []
     for index, value in enumerate(cast(list[object], values)):
         try:
             item = _batch_item(value, index, day, root)
@@ -2351,33 +2480,41 @@ def batch(file: Path) -> list[str]:
             rows[key] = index
             items.append(item)
         except (ChangeReviewError, OSError, ValueError) as error:
-            raise ChangeReviewError(f"batch item {index}: {error}") from error
+            errors.append(f"batch item {index}: {error}")
+    if errors:
+        raise ChangeReviewError("\n".join(errors))
     if not items:
         return []
     if len({item.path.parent for item in items}) != 1:
         raise ChangeReviewError("batch: all lists must be in one folder")
+    for item in items:
+        try:
+            item.prepare()
+        except (ChangeReviewError, OSError) as error:
+            raise ChangeReviewError(f"batch item {item.index}: {error}") from error
     items[0].path.parent.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     after: list[Callable[[], list[str]]] = []
-    with file_lock.exclusive(root / '.review-link-delivery.lock'), _list_lock(items[0].path):
-        original: dict[Path, str] = {}
-        lines_by_path: dict[Path, list[str]] = {}
-        for item in items:
-            try:
-                if item.path not in original:
-                    original[item.path] = read(item.path)
-                    lines_by_path[item.path] = original[item.path].splitlines(keepends=True)
-                after.append(item.write(lines_by_path[item.path]))
-            except (ChangeReviewError, OSError) as error:
-                raise ChangeReviewError(f"batch item {item.index}: {error}") from error
-        changed = {path: lines for path, lines in lines_by_path.items()
-                   if lines != original[path].splitlines(keepends=True)}
-        for path, lines in changed.items():
-            _sort(path, lines)
-            for production in dict.fromkeys(item.production for item in items if item.path == path):
-                _stamp(path, lines, production, day)
-        for path, lines in changed.items():
-            write_text_atomic(path, "".join(lines))
+    with file_lock.exclusive(root / ".review-link-delivery.lock"), _list_lock(items[0].path):
+        with _image_reference_lock():
+            original: dict[Path, str] = {}
+            lines_by_path: dict[Path, list[str]] = {}
+            for item in items:
+                try:
+                    if item.path not in original:
+                        original[item.path] = read(item.path)
+                        lines_by_path[item.path] = original[item.path].splitlines(keepends=True)
+                    after.append(item.write(lines_by_path[item.path]))
+                except (ChangeReviewError, OSError) as error:
+                    raise ChangeReviewError(f"batch item {item.index}: {error}") from error
+            changed = {path: lines for path, lines in lines_by_path.items()
+                       if lines != original[path].splitlines(keepends=True)}
+            for path, lines in changed.items():
+                _sort(path, lines)
+                for production in dict.fromkeys(item.production for item in items if item.path == path):
+                    _stamp(path, lines, production, day)
+            for path, lines in changed.items():
+                write_text_atomic(path, "".join(lines))
         owners: dict[str, int] = {}
         for item in items:
             owner = _owner(item.path)

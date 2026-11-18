@@ -134,12 +134,16 @@ class VaultPullTests(unittest.TestCase):
             _ = self.git(repository, "remote", "set-url", "origin", str(self.github))
         settings = self.folder / "config"
         settings.mkdir()
-        production = Path(__file__).resolve().parents[2] / "config/build_targets.conf"
-        _ = (settings / "build_targets.conf").write_text(
+        build_targets = settings / "build_targets.conf"
+        _ = build_targets.write_text(
             "# whole: 0..10\nvault.lock_retries=2\n# range: 0..5\nvault.lock_retry_delay_s=0\n"
+            + "vault.question_production=natedev\n"
             + "# range: 1..86400\nvault.lock_question_age_s=3600\n"
-            + production.read_text())
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(settings)}))
+            + "sync.connect_timeout_s=10\n"
+        )
+        self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(settings), "BUILD_TARGETS_CONFIG": str(build_targets),
+        }))
         point_root_at(self, self.root)
         script = self.folder / "update_registration.py"
         _ = script.write_text(QUESTION_STAND_IN)

@@ -38,6 +38,7 @@ from scripts.production import staff
 from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.agents import pane_record, remote
+from scripts.lint.memory_test_support import write_config_fixture
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
@@ -392,6 +393,10 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
+        if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
+            configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
+            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
@@ -403,7 +408,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             "SESSION_TEMP_ROOT": environment["SESSION_TEMP_ROOT"],
             "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
-            "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
+            "STAFF_CONFIG": environment["STAFF_CONFIG"],
         })))
         for name in ("showrunners", "scripts.production.showrunners"):
             module = sys.modules.get(name)
