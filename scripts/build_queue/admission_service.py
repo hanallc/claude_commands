@@ -9,12 +9,14 @@ from collections import deque
 from collections.abc import Generator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
+from contextvars import ContextVar
 import errno
 import hashlib
 import heapq
 import json
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
+from functools import cached_property
 import os
 from pathlib import Path
 import select
@@ -42,6 +44,8 @@ from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot, slot_wait
+from scripts.build_targets import target_config
+from scripts.build_targets.execution_transport import ExecutionTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
@@ -56,6 +60,82 @@ from scripts.build_queue.scope_activity import (
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
+
+
+@dataclass
+class ProviderConfiguration:
+    """Reuse provider settings during one admission pass."""
+
+    transports: dict[target_config.SshTarget, ExecutionTransport] = field(default_factory=dict)
+    settings: dict[str | Path, conf.ConfigRead] = field(default_factory=dict)
+    files: dict[Path, bytes | OSError] = field(default_factory=dict)
+    generations: dict[tuple[str, placement.ProviderSettings], str] = field(default_factory=dict)
+
+    @cached_property
+    def ssh_targets(self) -> dict[str, target_config.SshTarget]:
+        return {target.name: target for target in target_config.read_targets()
+                if isinstance(target, target_config.SshTarget)}
+
+    def transport(self, target: target_config.SshTarget) -> ExecutionTransport:
+        if target not in self.transports:
+            self.transports[target] = target_config.read_execution_transport(target)
+        return self.transports[target]
+
+    def read(self, file: str | Path) -> conf.ConfigRead:
+        if file not in self.settings:
+            path = conf.path(file)
+            try:
+                contents = self.contents(path)
+                if isinstance(contents, OSError):
+                    raise contents
+                parsed = conf.settings(contents.decode("utf-8"))
+            except (OSError, UnicodeError) as error:
+                # Keep config recovery and the error from the first read.
+                parsed = conf._UnreadableFile(str(error), isinstance(error, FileNotFoundError))  # pyright: ignore[reportPrivateUsage]
+            self.settings[file] = conf.ConfigRead(file, path, parsed, "CONF_DIR" not in os.environ)
+        return self.settings[file]
+
+    def contents(self, path: Path) -> bytes | OSError:
+        if path not in self.files:
+            try:
+                self.files[path] = path.read_bytes()
+            except OSError as error:
+                self.files[path] = error
+        return self.files[path]
+
+    def generation(self, name: str, settings: placement.ProviderSettings) -> str:
+        key = name, settings
+        if key in self.generations:
+            return self.generations[key]
+        from scripts.aws_target import hana_placement
+
+        paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
+        if isinstance(settings, placement.ExplicitProviderSettings):
+            paths.add(settings.path)
+        target = self.ssh_targets.get(name)
+        if target is not None:
+            paths.add(target.settings)
+            if isinstance(self.transport(target), hana_placement.HanaControlTransport):
+                paths.add(conf.path("aws_target"))
+        digest = hashlib.sha256()
+        for path in sorted(paths):
+            contents = self.contents(path)
+            if isinstance(contents, FileNotFoundError):
+                contents = b"missing"
+            if isinstance(contents, OSError):
+                raise contents
+            digest.update(str(path).encode())
+            digest.update(contents)
+        self.generations[key] = digest.hexdigest()
+        return self.generations[key]
+
+
+_PASS_PROVIDER_CONFIGURATION: ContextVar[ProviderConfiguration] = ContextVar("pass_provider_configuration")
+
+
+def _provider_configuration() -> ProviderConfiguration:
+    current = _PASS_PROVIDER_CONFIGURATION.get(None)
+    return ProviderConfiguration() if current is None else current
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -1959,13 +2039,14 @@ class AdmissionServer:
 
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
-        from scripts.build_targets import target_config
-
-        # One pass reads the target list once; each placement check in the pass uses that read.
-        with target_config.command_configuration():
-            result = self._pass(configuration)
-        self._answer_parked_placements()
-        return result
+        token = _PASS_PROVIDER_CONFIGURATION.set(ProviderConfiguration())
+        try:
+            with target_config.command_configuration():
+                result = self._pass(configuration)
+                self._answer_parked_placements()
+                return result
+        finally:
+            _PASS_PROVIDER_CONFIGURATION.reset(token)
 
     def _answer_parked_placements(self) -> None:
         parked, self.parked_placements = self.parked_placements, []
@@ -2436,47 +2517,28 @@ class AdmissionServer:
 
     def host_evidence_key(self, request: wire.PlacementRequest,
                           destination: placement.PlacementDestination) -> placement.HostEvidenceKey:
-        from scripts.build_targets import target_config
-
-        paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
         settings = next((candidate.settings for candidate in request.constraints.candidates
                          if candidate.destination == destination), placement.ConfiguredProviderSettings())
-        if isinstance(settings, placement.ExplicitProviderSettings):
-            paths.add(settings.path)
-        for target in target_config.read_targets():
-            if isinstance(target, target_config.SshTarget) and target.name == destination.target:
-                paths.add(target.settings)
-                from scripts.aws_target import hana_placement
-                if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
-                    paths.add(conf.path('aws_target'))
-        digest = hashlib.sha256()
-        for path in sorted(paths):
-            digest.update(str(path).encode())
-            try:
-                digest.update(path.read_bytes())
-            except FileNotFoundError:
-                digest.update(b"missing")
+        generation = _provider_configuration().generation(destination.target, settings)
         return placement.HostEvidenceKey(destination, request.constraints.session,
-            request.constraints.command, digest.hexdigest(), request.constraints.repository,
+            request.constraints.command, generation, request.constraints.repository,
             request.constraints.package, request.profile.step, settings,
             request.owner if destination.provider == "local" else placement.NoLocalHoldOwner(),
             request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
-        from scripts.build_targets import target_config
         from scripts.aws_target import hana_placement
 
+        configuration = _provider_configuration()
         if isinstance(key.settings, placement.ExplicitProviderSettings):
             target = target_config.SshTarget(key.destination.target, 'linux', key.settings.path)
-            if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
-                return float(conf.read(target.settings).whole('aws_timeout_s'))
-            return conf.read(key.settings.path).number("probe_timeout_s")
-        for target in target_config.read_targets():
-            if isinstance(target, target_config.SshTarget) and target.name == key.destination.target:
-                if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
-                    return float(conf.read(target.settings).whole('aws_timeout_s'))
-                return conf.read(target.settings).number("probe_timeout_s")
-        return conf.read("mac_test").number("probe_timeout_s")
+        else:
+            target = configuration.ssh_targets.get(key.destination.target)
+        if target is None:
+            return configuration.read("mac_test").number("probe_timeout_s")
+        if isinstance(configuration.transport(target), hana_placement.HanaControlTransport):
+            return float(configuration.read(target.settings).whole('aws_timeout_s'))
+        return configuration.read(target.settings).number("probe_timeout_s")
 
     def publish_host_evidence(self, evidence: placement.HostEvidence) -> None:
         self.host_observations[evidence.key] = evidence
@@ -2520,19 +2582,17 @@ class AdmissionServer:
         self.placement_host_keys[(request.episode, destination)] = key
         if destination.provider == 'ssh':
             from scripts.aws_target import hana_placement
-            from scripts.build_targets import target_config
 
-            for target in target_config.read_targets():
-                if not isinstance(target, target_config.SshTarget) or target.name != destination.target:
-                    continue
+            configuration = _provider_configuration()
+            target = configuration.ssh_targets.get(destination.target)
+            if target is not None:
                 if isinstance(key.settings, placement.ExplicitProviderSettings):
                     target = replace(target, settings=key.settings.path)
-                transport = target_config.read_execution_transport(target)
+                transport = configuration.transport(target)
                 if (isinstance(transport, hana_placement.HanaControlTransport)
-                        and request.profile.peak.bytes > conf.read(transport.settings).whole('step_memory_gib') * 1024 ** 3):
+                        and request.profile.peak.bytes > configuration.read(transport.settings).whole('step_memory_gib') * 1024 ** 3):
                     # Memory belongs to this request, not the shared host evidence.
                     return placement.FreshHostEvidence(key, self.clock.now(), '', placement.TemporaryExclusion('memory'))
-                break
         if destination.provider == "local" and not self.background_local_evidence:
             try:
                 return self.host_probe(key)
@@ -2570,7 +2630,7 @@ class AdmissionServer:
 
     def _read_host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
-        from scripts.build_targets import build_targets, target_config
+        from scripts.build_targets import build_targets
         from scripts.mac_test import claim_state, mac_test
         from scripts.mac_test.eligibility import recorded_step_kind
         from scripts.build_hold import build_hold
@@ -2830,12 +2890,11 @@ done
 
         provider = saved.provider
         from scripts.aws_target import hana_placement
-        from scripts.build_targets import target_config
         if saved.assignment.destination.provider == 'ssh':
             try:
                 destination = saved.assignment.destination
                 target = target_config.configured_ssh_target(destination.target)
-                transport = target_config.read_execution_transport(target)
+                transport = _provider_configuration().transport(target)
                 if isinstance(transport, hana_placement.HanaControlTransport):
                     from scripts.aws_target.hana_execution import claim_dispatch_pending
                     reference = placement.ProviderClaimReference('ssh', destination.target, destination.scope,
@@ -3049,9 +3108,8 @@ done
             if (candidate.destination.provider == 'ssh' and isinstance(candidate.eligibility, placement.TemporaryExclusion)
                     and candidate.eligibility.reason in ('starting', 'blocked', 'recovery')):
                 from scripts.aws_target import hana_placement
-                from scripts.build_targets import target_config
                 target = target_config.configured_ssh_target(candidate.destination.target)
-                if isinstance(target_config.read_execution_transport(target), hana_placement.HanaControlTransport):
+                if isinstance(_provider_configuration().transport(target), hana_placement.HanaControlTransport):
                     interval = (self.last_usable_configuration.waiting_pass_seconds
                         if isinstance(self.last_usable_configuration, records.MemoryConfig) else 1.0)
                     delayed[target.name] = placement.ProviderRetryNotice(target.name, candidate.eligibility.reason, interval)

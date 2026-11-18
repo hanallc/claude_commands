@@ -369,6 +369,7 @@ class AcquisitionRetry:
     last_outage_line: float = float("-inf")
     leave_interval: float = float("inf")
     unreachable_deadline: float = float("inf")
+    estimate_refresh_pending: bool = False
 
     def start_leave_schedule(self, interval: float) -> None:
         self.leave_interval = interval
@@ -489,6 +490,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     CLOCK.monotonic() + limit if launch and limit > 0 else float("inf"))
         retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
+    was_refreshing = retry.estimate_refresh_pending
     try:
         if isinstance(configuration, ReadConfigurationAtUse):
             from scripts.build_queue import admission_records as records
@@ -511,6 +513,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     except conf.Unusable as error:
         return _refused(str(error), checker=True)
     finally:
+        retry.estimate_refresh_pending = was_refreshing
         _ACQUISITION_RETRY.reset(token)
 
 
@@ -519,6 +522,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              *, attempt: Callable[[], None], channel: EstimateConnection | None, retry: AcquisitionRetry,
              configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming
              ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
+    from scripts.build_queue import admission_records as records
+
     first = request
     placement_control = _waits_for_live_service(first)
     leave_interval = (configuration.running_pass_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming))
@@ -531,8 +536,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     launch = isinstance(first, wire.LaunchRequest)
     failure_limit = _whole_seconds("BUILDLOG_MEM_CHECK_RETRY_S", 60)
     had_wait = False
-    refresh_pending = False
-    answered_expiry = -math.inf
+    retry_estimator = False
     failed_since: float | None = None  # An external transport/checker boundary, not stored domain state.
     restarted = False
     last_valid = CLOCK.monotonic()
@@ -576,6 +580,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 if active_channel is not None or send_timeout < timeout:
                     connection.settimeout(send_timeout)
                 connection.sendall(wire.encode_request(request).encode())
+                answered_expiry = -math.inf
                 pending = active_channel.pending if active_channel is not None else bytearray()
                 while True:
                     deadline = max(last_valid, last_silence_notice) + configuration.silence_seconds
@@ -607,8 +612,18 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         raise CheckerFailure(str(error)) from error
                     if CLOCK.monotonic() > retry.deadline:
                         return deadline_reply()
-                    retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
-                        if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
+                    cause = reply.reason if isinstance(reply, wire.Wait) else None
+                    if isinstance(cause, records.HeadAdmissionStatus):
+                        cause = cause.cause
+                    if not generation_query:
+                        if isinstance(cause, records.EstimateExpired):
+                            retry.estimate_refresh_pending = True
+                        elif (isinstance(reply, (wire.Admitted, wire.LaunchAdmitted, wire.Refused))
+                                or isinstance(reply, wire.Wait) and not isinstance(cause, records.ReadingUnavailable)):
+                            retry.estimate_refresh_pending = False
+                    if not retry.estimate_refresh_pending:
+                        retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
+                            if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
                         if generation_query or placement_control:
                             return reply
@@ -669,8 +684,6 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         return reply
                     if not isinstance(reply, wire.Wait):
                         raise CheckerFailure("invalid admission answer")
-                    from scripts.build_queue import admission_records as records
-                    cause = reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus) else reply.reason
                     if isinstance(cause, records.EstimateExpired) and cause.estimated_at <= answered_expiry:
                         # A pass can reach this connection before the service reads the refreshed request.
                         continue
@@ -688,24 +701,24 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if CLOCK.monotonic() >= retry.deadline:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
                     if isinstance(cause, records.EstimateExpired):
-                        answered_expiry = cause.estimated_at
                         if isinstance(first, wire.ServiceEstimateRequest):
-                            request = first
+                            refreshed = first
                         else:
                             if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
                                 raise CheckerFailure("estimate cannot be refreshed")
                             estimate: Callable[[], wire.AdmitRequest | wire.LaunchRequest] = refresh
-                            refresh_pending = True
                             try:
-                                request = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
-                                                  code_version=LOADED_ADMISSION_CODE_VERSION)
-                                refresh_pending = False
+                                refreshed = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
+                                                    code_version=LOADED_ADMISSION_CODE_VERSION)
                             except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
                                 raise
                             except Exception as error:
+                                retry_estimator = True
                                 raise CheckerFailure(str(error)) from error
                         # A new connection would end this waiter's place, and a pass could start a later step in the gap.
-                        connection.sendall(wire.encode_request(request).encode())
+                        connection.sendall(wire.encode_request(refreshed).encode())
+                        request = refreshed
+                        answered_expiry = cause.estimated_at
                         continue
         except CheckerFailure as error:
             if generation_query:
@@ -726,12 +739,13 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     return LeftQueue()
                 if CLOCK.monotonic() >= retry.deadline:
                     return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+                check_unreachable()
                 print(f"memory admission check failed ({reason}); trying again, the step keeps its place", file=sys.stderr)
-                if not refresh_pending or refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
+                if not retry_estimator or refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
                     break
                 try:
                     request = replace(_refreshed(first, refresh), code_version=LOADED_ADMISSION_CODE_VERSION)
-                    refresh_pending = False
+                    retry_estimator = False
                     break
                 except (_QueueLeft, _QueueUnreachable):
                     raise
@@ -756,8 +770,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 if not restarted:
                     print("admission service restarted; waiting again", file=sys.stderr)
                     restarted = True
-                continue
-            if CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming)) else configuration.silence_seconds):
+                if not retry.estimate_refresh_pending:
+                    continue
+            elif CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming)) else configuration.silence_seconds):
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused" if isinstance(error, ConnectionRefusedError) else str(error)
                 print(f"admission service unavailable: {reason}; waiting again", file=sys.stderr)
                 retry.last_outage_line = CLOCK.monotonic()
