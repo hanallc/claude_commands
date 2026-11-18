@@ -5,7 +5,8 @@ The Python token reader in style_footprint uses str.isspace, the re classes \\d 
 str.splitlines. Rust has no exact match for them: char::is_whitespace leaves out U+001C to U+001F.
 This script reads each class from this Python and writes it as code-point ranges.
 
-Usage: style_reader_tables.py [--check]
+Usage: style_reader_tables.py --tables PATH [--check]
+Use the path to crates/cargo-style/src/unicode_tables.rs in the cargo-liner checkout.
 --check exits 1 when the Rust file differs from what this Python writes.
 """
 
@@ -17,8 +18,8 @@ import sys
 import unicodedata
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
-TABLES_PATH = Path(__file__).resolve().parents[2] / "rust/style_reader/src/unicode_tables.rs"
 SURROGATES = range(0xD800, 0xE000)
 DECIMAL = re.compile(r"\d")
 WORD = re.compile(r"\w")
@@ -67,20 +68,22 @@ def rust_source() -> str:
     return "\n".join(lines) + "\n"
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    _ = parser.add_argument("--tables", type=Path, required=True, help="path to the Rust Unicode tables")
     _ = parser.add_argument("--check", action="store_true", help="exit 1 when the Rust file is not current")
-    check = bool(parser.parse_args().check)  # pyright: ignore[reportAny]
+    arguments = parser.parse_args(argv)
+    tables = cast(Path, arguments.tables)
     source = rust_source()
-    if check:
-        current = TABLES_PATH.read_text() if TABLES_PATH.exists() else ""
+    if cast(bool, arguments.check):
+        current = tables.read_text() if tables.exists() else ""
         if current != source:
-            print(f"{TABLES_PATH} is not current; run {Path(__file__).name}", file=sys.stderr)
+            print(f"{tables} is not current. Run {Path(__file__).name} with --tables and omit --check.", file=sys.stderr)
             return 1
         return 0
-    _ = TABLES_PATH.write_text(source)
+    _ = tables.write_text(source)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

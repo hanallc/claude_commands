@@ -32,7 +32,7 @@ from uuid import uuid4
 from scripts.aws_target import cloud_gate, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import AwsExecutor, aws_error_code, execute_command
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus, spot_quota
-from scripts.aws_target.config import gate_deployment, read_settings
+from scripts.aws_target.config import SpendingSettings, gate_deployment, read_settings
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
 from scripts.production import merge_gate
@@ -70,6 +70,10 @@ PREPARED_NAMES = frozenset(('hana-tests.tar.zst', 'closure.export', 'source.tar'
     'runtime.env', 'gpu-trial.nix', 'closure.json', 'request.json', 'manifest.json', 'inventory.json',
     'gpu_trial_wrapper.py', 'machines', 'prepare.log'))
 RUN_INPUT_NAMES = ('hana-tests.tar.zst', 'closure.export', 'source.tar', 'payload.tar', 'cargo-home')
+GPU_TRIAL_ARTIFACT_PREFIX = 'artifacts/gpu-size-trial/'
+GPU_TRIAL_REQUEST_PREFIX = 'requests/gpu-size-trial/'
+GPU_SPOT_FILTERS = ('Name=instance-lifecycle,Values=spot', 'Name=instance-state-name,Values=pending,running',
+                    'Name=instance-type,Values=g*.*,vt*.*')
 
 
 @dataclass(frozen=True)
@@ -1189,6 +1193,53 @@ def gpu_aws_executor(execute: AwsExecutor) -> AwsExecutor:
 
 
 @dataclass(frozen=True)
+class GpuSpotLaunch:
+    deployment_id: str
+    trial_id: str
+    attempt: str
+    instance_type: str
+    max_price: Decimal
+    expires_at: int
+    root_gib: int
+    user_data: str
+
+    def arguments(self, regional: Mapping[str, object], subnet: Mapping[str, object],
+                  root_device: str, policy: SpendingSettings) -> dict[str, object]:
+        """Build the Spot request for the trial and its setup probe."""
+        tags = [{'Key': 'GateDeployment', 'Value': self.deployment_id},
+                {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': self.attempt},
+                {'Key': 'ExpiresAt', 'Value': str(self.expires_at)}, {'Key': 'GpuSizeTrial', 'Value': self.trial_id},
+                {'Key': policy.cost_explorer_tag_key, 'Value': policy.cost_explorer_tag_value}]
+        return {
+            'LaunchTemplate': {'LaunchTemplateId': regional['template'], 'Version': regional['version']},
+            'ImageId': regional['image'], 'MinCount': 1, 'MaxCount': 1, 'ClientToken': self.attempt,
+            'InstanceType': self.instance_type,
+            'InstanceMarketOptions': {'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time',
+                'InstanceInterruptionBehavior': 'terminate', 'MaxPrice': str(self.max_price)}},
+            'BlockDeviceMappings': [{'DeviceName': root_device,
+                'Ebs': {'VolumeSize': self.root_gib, 'VolumeType': 'gp3', 'Encrypted': True, 'DeleteOnTermination': True}}],
+            'NetworkInterfaces': [{'DeviceIndex': 0, 'SubnetId': subnet['id'], 'Groups': [regional['security_group']],
+                                   'AssociatePublicIpAddress': True}],
+            'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
+            'UserData': self.user_data,
+        }
+
+
+def gpu_object_exists(api: AwsCli, bucket: str, key: str) -> bool:
+    """List the exact object key."""
+    # The exact key comes first in a general-purpose bucket's sorted response.
+    reply = api.call('list-objects-v2', '--bucket', bucket, '--prefix', key,
+                     '--max-keys', '1', '--no-paginate', service='s3api')
+    return any(row.get('Key') == key for row in ledger.rows({'Contents': reply.get('Contents', [])}, 'Contents'))
+
+
+def gpu_signing_key(api: AwsCli) -> s3_presign.SigningKey:
+    reply = api.call('export-credentials', '--format', 'process', service='configure')
+    return s3_presign.SigningKey(ledger.text(reply, 'AccessKeyId'), ledger.text(reply, 'SecretAccessKey'),
+                                str(reply.get('SessionToken', '')))
+
+
+@dataclass(frozen=True)
 class PricedSubnet:
     price: Decimal
     subnet: dict[str, object]
@@ -1271,9 +1322,7 @@ class GpuTrialWorker:
         if quota < needed:
             return Decimal(0)
         # A one-time RunInstances request launches or fails immediately and leaves no open request.
-        instances = api.call('describe-instances', '--filters', 'Name=instance-lifecycle,Values=spot',
-                             'Name=instance-state-name,Values=pending,running',
-                             'Name=instance-type,Values=g*.*,vt*.*')
+        instances = api.call('describe-instances', '--filters', *GPU_SPOT_FILTERS)
         if instances.get('NextToken'):
             raise ValueError('The regional GPU Spot usage is incomplete')
 
@@ -1388,7 +1437,7 @@ class GpuTrialWorker:
             with tarfile.open(payload, 'w') as archive:
                 for name in payload_names:
                     archive.add(folder / name, arcname=name)
-            prefix = 'requests/gpu-size-trial/' + str(online['trial'])
+            prefix = GPU_TRIAL_REQUEST_PREFIX + str(online['trial'])
             for name in upload_names:
                 self.upload(str(online['bucket']), prefix + '/' + name, folder / name,
                             ledger.instant(online, 'lifetime_minutes') * 60)
@@ -1400,15 +1449,14 @@ class GpuTrialWorker:
             remove_path(payload)
 
     def signed_links(self, folder: Path, online: dict[str, object], request: dict[str, object]) -> dict[str, str]:
-        reply = self.gates.api.call('export-credentials', '--format', 'process', service='configure')
-        signing = s3_presign.SigningKey(str(reply['AccessKeyId']), str(reply['SecretAccessKey']), str(reply.get('SessionToken', '')))
+        signing = gpu_signing_key(self.gates.api)
         now = int(self.gates.clock())
         home = self.gates.api.region
-        prefix = 'requests/gpu-size-trial/' + str(online['trial'])
+        prefix = GPU_TRIAL_REQUEST_PREFIX + str(online['trial'])
         def url(method: str, key: str) -> str:
             return s3_presign.presign(method, str(online['bucket']) + '.s3.' + home + '.amazonaws.com', key,
                                     home, signing, datetime.fromtimestamp(now, UTC), max(1, int(str(request['expires'])) - now))
-        result_prefix = 'artifacts/gpu-size-trial/' + str(request['attempt'])
+        result_prefix = GPU_TRIAL_ARTIFACT_PREFIX + str(request['attempt'])
         manifest = read_json(folder / 'manifest.json')
         hashes = mapping(manifest['sha256'])
         links = {'payload': url('GET', prefix + '/payload.tar'), 'closure': url('GET', prefix + '/closure.export'),
@@ -1440,11 +1488,7 @@ class GpuTrialWorker:
         return cloud_gate.cleanup_attempts(attempts, self.gates)
 
     def download_result(self, bucket: str, key: str, path: Path) -> bool:
-        # The exact key comes first in a general-purpose bucket's sorted response.
-        reply = self.gates.api.call('list-objects-v2', '--bucket', bucket, '--prefix', key,
-                                    '--max-keys', '1', '--no-paginate', service='s3api')
-        return (any(row.get('Key') == key for row in ledger.rows({'Contents': reply.get('Contents', [])}, 'Contents'))
-                and self.gates.download(bucket, key, path))
+        return gpu_object_exists(self.gates.api, bucket, key) and self.gates.download(bucket, key, path)
 
     def collect(self, folder: Path, box: Path, request: dict[str, object], online: dict[str, object],
                 poll_seconds: int) -> None:
@@ -1681,22 +1725,9 @@ class GpuTrialWorker:
             try:
                 links = self.signed_links(folder, online, request)
                 policy = read_settings(self.gates.settings_path)
-                tags = [{'Key': 'GateDeployment', 'Value': str(online['deployment_id'])},
-                        {'Key': 'Workload', 'Value': 'cloud-claude-gate'}, {'Key': 'GateAttempt', 'Value': attempt},
-                        {'Key': 'ExpiresAt', 'Value': str(tag_expires)}, {'Key': 'GpuSizeTrial', 'Value': str(online['trial'])},
-                        {'Key': policy.cost_explorer_tag_key, 'Value': policy.cost_explorer_tag_value}]
-                arguments: dict[str, object] = {
-                    'LaunchTemplate': {'LaunchTemplateId': regional['template'], 'Version': regional['version']},
-                    'ImageId': regional['image'], 'MinCount': 1, 'MaxCount': 1, 'ClientToken': attempt,
-                    'InstanceType': size,
-                    'InstanceMarketOptions': {'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time',
-                        'InstanceInterruptionBehavior': 'terminate', 'MaxPrice': str(maximum)}},
-                    'BlockDeviceMappings': [{'DeviceName': account.text('root_device_name'),
-                        'Ebs': {'VolumeSize': online['root_gib'], 'VolumeType': 'gp3', 'Encrypted': True, 'DeleteOnTermination': True}}],
-                    'NetworkInterfaces': [{'DeviceIndex': 0, 'SubnetId': subnet['id'], 'Groups': [regional['security_group']],
-                                           'AssociatePublicIpAddress': True}],
-                    'TagSpecifications': [{'ResourceType': kind, 'Tags': tags} for kind in ('instance', 'volume')],
-                    'UserData': gpu_user_data(links, str(manifest['system']), str(manifest['toolchain']), tag_expires, stop_at)}
+                launch = GpuSpotLaunch(str(online['deployment_id']), trial_id, attempt, size, maximum, tag_expires,
+                    root_gib, gpu_user_data(links, str(manifest['system']), str(manifest['toolchain']), tag_expires, stop_at))
+                arguments = launch.arguments(regional, subnet, account.text('root_device_name'), policy)
                 vcpus = largest_gate_vcpus((size,))
                 if isinstance(mode, HanaGpuNextestRequest):
                     if self.available_gpu_vcpus(region, vcpus) < vcpus:
