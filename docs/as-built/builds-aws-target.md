@@ -39,6 +39,82 @@ Deployment uses encrypted administrator credentials for resource changes.
 Gate services use the private scaler profile.
 Boxes receive signed URLs and no scaler credential file.
 
+## AWS plan identity
+
+Run this command in a terminal on natedev.
+
+```sh
+deploy.py plan-identity --approve-resources
+```
+
+For a new key, the command checks encryption to the GPG key that protects the GitHub token.
+Run `github-warmup` in a terminal on natedev if the GPG agent is cold.
+Enter the administrator passphrase when the command asks for it.
+The command creates the `aws-build-plan` IAM user and one managed policy.
+It checks the user with STS, reads EC2 availability zones, and simulates seven denied actions.
+After these checks pass, it saves one access key in `~/.config/aws-build/plan.gpg` with mode `0600`.
+The rename that publishes `plan.gpg` commits setup.
+If setup fails before the rename, it revokes any new key it finds.
+During setup, `plan.gpg` must be absent before the command revokes a key.
+If directory sync or cleanup fails after the rename, the command warns and reports that the identity is ready.
+Setup keeps the verified file and IAM key after the rename.
+If IAM lists no key after a failed creation, a key can appear later.
+Run the same approved command again to revoke the late key and create a new key.
+If `plan.gpg` is absent, the command revokes all keys that IAM lists for the plan user before it creates one key.
+The command keeps the local key when it matches the sole key that IAM lists.
+Setup refuses if the local key differs from the sole key that IAM lists.
+Setup also refuses if it cannot read or decrypt `plan.gpg`.
+This refusal preserves the local file and the IAM keys.
+Setup uses GPG without a passphrase prompt for these checks.
+If `plan.gpg` is damaged, delete the file and run the command again.
+The command compares the default policy with the current configuration and sets a new default version when they differ.
+Omit `--approve-resources` to print the plan without contacting AWS.
+
+The policy allows setup reads, IAM simulation for users in the account, and S3 object listings in account buckets.
+The policy allows reads of applied service quotas and quota request history.
+The command prints the configured names and regions of the home, regional gate, and Hana stacks.
+The policy limits CloudFormation stack details and templates to those stacks.
+It allows creation and deletion of change sets named `aws-build-plan-*` on those stacks.
+The policy blocks the `TemplateURL` request parameter.
+CloudFormation accepts an inline template body or `UsePreviousTemplate` when the stack has a template.
+A `CREATE` change set for an absent stack leaves an empty stack in `REVIEW_IN_PROGRESS`.
+The policy denies deletion of every stack.
+It denies change set execution, role passing, EC2, IAM and S3 writes, and S3 object reads.
+It denies EC2 instance attribute and Spot request reads because those calls can return user data.
+
+Sessions use `plan_credentials()` to decrypt the key without a prompt.
+If the agent is cold, run `github-warmup` in a terminal on natedev.
+The approved removal command can revoke the key while `plan.gpg` exists.
+Run this command in the same terminal to remove the key, user, and policy.
+
+```sh
+deploy.py down --workload plan-identity --approve-destroy
+```
+
+## Run a setup plan
+
+Run this command in a terminal on natedev.
+
+```sh
+deploy.py hana-setup --plan
+```
+
+The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
+It refuses first-time setup, pending instance or volume work, direct-owned boxes, and merge gate setup.
+
+The plan checks the local credential file and reads the scaler identity with STS.
+It uses the same stack, instance, disk, and parameter checks as approved setup.
+It previews one modification to `ScalerPolicy` without resource replacement.
+The plan deletes the change set and confirms its removal with CloudFormation.
+If removal stays unconfirmed, the plan prints the change set name and refuses.
+
+The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
+The plan simulates the EC2 probes without reading user data or starting the box.
+The S3 simulation uses the control bucket policy from the stack template.
+If the template has no policy or the plan cannot resolve it, the plan prints a note.
+The plan then simulates S3 without a bucket policy.
+Bucket policies added outside the stack are out of scope.
+
 ## Hana guest safety files
 
 `scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
