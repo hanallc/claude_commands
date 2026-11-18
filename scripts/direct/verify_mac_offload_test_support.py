@@ -1092,6 +1092,26 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         admission.server.host_probe = provider
         _ = caller_provider_controls(self, admission)
+        handle_request = admission.server.handle_request
+
+        def refresh_after_release(request: wire.Request,
+                                  connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                                  ) -> list[wire.Reply]:
+            replies = handle_request(request, connection)
+            if (isinstance(request, wire.ExecutionReport)
+                    and request.assignment.destination.provider == "mac"
+                    and isinstance(request.path, placement.DispatchPathSettled)
+                    and isinstance(request.outcome, (placement.PrelaunchRefused, placement.AttemptDeclined))):
+                assignment = request.assignment
+                key = admission.server.placement_host_keys.get((assignment.episode, assignment.destination))
+                reader = admission.server.host_readers.get(key) if key is not None else None
+                if reader is not None:
+                    # The runner released its claim. Discard readings from the old subscription.
+                    reader.worker.remove(reader.key)
+                    reader.worker.request(reader.key)
+            return replies
+
+        admission.server.handle_request = refresh_after_release
 
     def ssh_probe_reaches(self, host: str) -> bool:
         ssh = self.bin_directory / "ssh"
@@ -1754,13 +1774,13 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                     *, repeat_decline: bool = True) -> None:
         clock = self.control_routing_clock()
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        admission = caller_admission(self, self.root, self.environment)
         if wait_kind == "routing":
             _ = self.routing_fixture()
         elif wait_kind == "first_hold":
             _ = self.routing_fixture()
             record = self.root / "hold-after-routing.json"
             _ = (Path(self.environment["BUILD_HOLD_DIR"]) / "hana").replace(record)
-            admission = caller_admission(self, self.root, self.environment)
             previous = admission.server.handle_request
             published = False
 
@@ -1776,10 +1796,20 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 
         else:
             meminfo = self.hold_memory()
+        notice = self.runner_state / "mac-retry-notice"
+        reply_filter = admission.server.reply_filter
+
+        def observe_retry(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait) and any(item.target == "mac" for item in reply.retry_notices):
+                notice.touch()
+            return reply_filter(reply)
+
+        admission.server.reply_filter = observe_retry
         self.set_mac_answer(mode, reason, 75)
         self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_verify("test", "sample", "--no-cache")
         self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(notice, (process,))
         self.wait_for_retry_probe(100, process)
         self.assertEqual(len(self.runner_events()), 1)
 
@@ -1792,7 +1822,6 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                     build_hold.HolderIdentity("hana", "hana"), "render checks",
                     build_hold.NoReleaseEta(), datetime.now().astimezone())
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
-        admission = caller_admission(self, self.root, self.environment)
         episode = self.runner_episode()
         if wait_kind in ("hold", "first_hold"):
             self.wait_until(lambda: any(candidate.destination.provider == "local"
