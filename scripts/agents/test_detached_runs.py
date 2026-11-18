@@ -2613,6 +2613,59 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(agent.notices), 2)
         self.assertIn("phase 40: done", agent.notices[1])
 
+    def test_supervisor_recovers_a_pane_stop_staged_by_an_interrupted_stopper(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        record = self.record(row)
+        record.update(pid=DEAD_PID, command_group=DEAD_PID, command_started="private-start",
+                      pane_dispatch_id=dispatch)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        reason = "Interrupted pane stop."
+        write_text_atomic(path.with_suffix(".stop-staged"),
+                          json.dumps({**record, "stop_pass_requested": True, "stop_reason": reason}))
+        path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).touch()
+
+        with (patch.object(detached_runs, "_run", return_value=143) as run,
+              patch.object(detached_runs, "scope_prefix", return_value=["fixture-scope"]),
+              patch.object(detached_runs, "_group_is_live", return_value=False)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(run.call_count, 1)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("stop_reason"), reason)
+        self.assertIs(saved.get("stop_pass_requested"), True)
+        self.assertFalse(path.with_suffix(".stop-staged").exists())
+        self.assertFalse(path.with_suffix(detached_runs.PENDING_STOP_SUFFIX).exists())
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("phase 40: stopped", self.notices[0][1])
+
+    def test_a_failed_record_rename_preserves_the_latest_confirmed_pane_stop(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        path = Path(self.record(row)["log"]).with_suffix(".json")
+        replace = os.replace
+
+        def fail_record_rename(source: Path, target: Path) -> None:
+            if target == path:
+                raise OSError("fixture record rename failure")
+            replace(source, target)
+
+        def verify_group() -> detached_runs.CommandGroup:
+            return detached_runs.CommandGroup(DEAD_PID, "private-start")
+
+        with (patch.object(os, "replace", side_effect=fail_record_rename),
+              patch.object(process_group, "send_process_group") as send_group,
+              contextlib.redirect_stderr(io.StringIO())):
+            self.assertTrue(detached_runs.stop_with_reason(
+                path, "Build hold.", verify_group=verify_group, signal_group=process_group.send_process_group))
+            self.assertTrue(detached_runs.stop_with_reason(
+                path, "Pane stop.", verify_group=verify_group, signal_group=process_group.send_process_group,
+                stop_pass=True))
+        self.assertEqual(send_group.call_count, 2)
+        confirmed = worker_lifecycle.read_json_object(path.with_suffix(".stop-confirmed"))
+        self.assertEqual(confirmed.get("stop_reason"), "Pane stop.")
+        self.assertIs(confirmed.get("stop_pass_requested"), True)
+
     def test_confirmed_stop_keeps_the_pane_request_after_a_failed_record_rename(self) -> None:
         row = self.fixture.worker("impl", family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")

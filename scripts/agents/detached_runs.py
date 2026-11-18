@@ -79,6 +79,7 @@ COMMAND_GATE = ('read -r ready || exit 125; watcher_python=$1 watcher_script=$2;
                 + '"$UNIT_DETACHED_RECORD") <&0 & exec 0</dev/null; exec "$@"')
 SUPERVISOR_GONE_REASON = "the supervisor ended before the command, so its watcher stopped the command"
 CONFIRMED_STOP_SUFFIX = ".stop-confirmed"
+STAGED_STOP_SUFFIX = ".stop-staged"
 
 
 class PaneDispatchUnavailable(TypedDict):
@@ -247,17 +248,16 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
             return False
 
 
-def _confirmed_stop_fields(path: Path, run_id: object) -> StopFields:
-    confirmed_path = path.with_suffix(CONFIRMED_STOP_SUFFIX)
-    confirmed = worker_lifecycle.read_json_object(confirmed_path)
-    if not confirmed:
+def _read_stop_fields(path: Path, run_id: object) -> StopFields:
+    saved = worker_lifecycle.read_json_object(path)
+    if not saved:
         return {}
-    reason = confirmed.get("stop_reason")
-    if (not isinstance(run_id, str) or confirmed.get("run_id") != run_id or not isinstance(reason, str)
-            or ("stop_pass_requested" in confirmed and confirmed["stop_pass_requested"] is not True)):
-        raise worker_lifecycle.WorkerStateUnreadable(confirmed_path, "invalid confirmed stop fields")
+    reason = saved.get("stop_reason")
+    if (not isinstance(run_id, str) or saved.get("run_id") != run_id or not isinstance(reason, str)
+            or ("stop_pass_requested" in saved and saved["stop_pass_requested"] is not True)):
+        raise worker_lifecycle.WorkerStateUnreadable(path, "invalid stop fields")
     fields: StopFields = {"stop_reason": reason}
-    if confirmed.get("stop_pass_requested") is True:
+    if saved.get("stop_pass_requested") is True:
         fields["stop_pass_requested"] = True
     return fields
 
@@ -268,8 +268,21 @@ def _read_record(path: Path) -> RunRecord:
         raise SystemExit(f"detached_runs: {path} is not a run record")
     if path.name != f"{raw['run_id']}.json":
         raise SystemExit(f"detached_runs: {path} does not match run ID {raw['run_id']}")
-    confirmed = _confirmed_stop_fields(path, raw["run_id"])
+    confirmed = _read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), raw["run_id"])
     return {**raw, **confirmed} if confirmed else raw
+
+
+def _recover_staged_pane_stop(path: Path, record: RunRecord) -> RunRecord:
+    """Recover the pane request under the record lock after the command exits."""
+    if record.get("stop_pass_requested") or not path.with_suffix(PENDING_STOP_SUFFIX).exists():
+        return record
+    staged = path.with_suffix(STAGED_STOP_SUFFIX)
+    fields = _read_stop_fields(staged, record["run_id"])
+    if not fields.get("stop_pass_requested"):
+        return record
+    _ = staged.replace(path.with_suffix(CONFIRMED_STOP_SUFFIX))
+    atomic_file.sync_folder(path.parent)
+    return {**record, **fields}
 
 
 def stop_with_reason(
@@ -286,7 +299,7 @@ def stop_with_reason(
             return False
         if isinstance(verify_group(), CommandGroupUnverified):
             return False
-        pending = path.with_suffix(".stop-staged")
+        staged = path.with_suffix(STAGED_STOP_SUFFIX)
         confirmed = path.with_suffix(CONFIRMED_STOP_SUFFIX)
         stopping = {**record, "stop_reason": reason}
         pending_stop = path.with_suffix(PENDING_STOP_SUFFIX)
@@ -297,7 +310,7 @@ def stop_with_reason(
         signaled = False
         try:
             try:
-                write_text_atomic(pending, json.dumps(stopping, indent=2, sort_keys=True),
+                write_text_atomic(staged, json.dumps(stopping, indent=2, sort_keys=True),
                                   new_file_mode=path.stat().st_mode & 0o777)
                 command = verify_group()
                 if isinstance(command, CommandGroupUnverified):
@@ -305,11 +318,10 @@ def stop_with_reason(
                 signal_group(command.group, signal.SIGTERM)
                 signaled = True
                 try:
-                    _ = pending.replace(path)
+                    _ = staged.replace(path)
                 except OSError:
                     # Publish the staged content only after the signal succeeds.
-                    with contextlib.suppress(FileExistsError):
-                        os.link(pending, confirmed)
+                    _ = staged.replace(confirmed)
                     atomic_file.sync_folder(path.parent)
                     raise
                 confirmed.unlink(missing_ok=True)
@@ -317,7 +329,7 @@ def stop_with_reason(
             finally:
                 if stop_pass and not signaled:
                     pending_stop.unlink(missing_ok=True)
-                pending.unlink(missing_ok=True)
+                staged.unlink(missing_ok=True)
         except OSError as error:
             if not signaled:
                 raise
@@ -545,8 +557,9 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
         try:
             with record_lock(path):
                 record = _read_record(path)
-            if record["status"] != "running":
-                continue
+                if record["status"] != "running":
+                    continue
+                record = _recover_staged_pane_stop(path, record)
             newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
                         and other.get("staff_id") == record["staff_id"]
                         and _number(other.get("started_at"), 0.0) > record["started_at"]
@@ -813,7 +826,7 @@ def live_runs_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]]) -> li
 
 def _recover_indexed_stop(path: Path, raw: dict[str, object]) -> None:
     if raw.get("stop_pass_requested") is not True and path.with_suffix(PENDING_STOP_SUFFIX).exists():
-        raw.update(_confirmed_stop_fields(path, raw.get("run_id")))
+        raw.update(_read_stop_fields(path.with_suffix(CONFIRMED_STOP_SUFFIX), raw.get("run_id")))
 
 
 def _run_is_pending(path: Path, raw: dict[str, object], supervisor_owns: Callable[[int], bool]) -> bool:
@@ -1228,11 +1241,12 @@ def command_supervise(args: argparse.Namespace) -> int:
     prefix = scope_prefix(marker, environment)
     exit_code = _run(prefix + record["command"], environment, log)
     with record_lock(record_path):
-        record = _read_record(record_path)
+        record = _recover_staged_pane_stop(record_path, _read_record(record_path))
         retry_without_scope = bool(prefix) and not marker.exists() and not record.get("stop_reason")
     if retry_without_scope:
         exit_code = _run(record["command"], environment, log)
-        record = _read_record(record_path)
+        with record_lock(record_path):
+            record = _recover_staged_pane_stop(record_path, _read_record(record_path))
     marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
