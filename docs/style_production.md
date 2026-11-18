@@ -686,9 +686,9 @@ Run `reconcile` afterward: a root's unsent row stays pending until ancestry
 marks it merged.
 This also clears hand-offs a departing parent had not merged.
 
-On `From <unit>: ticket <id> closed with no code change; <n> held.`, merge
-nothing and send neither a hand-off nor a refill message: the unit refills
-itself; its `ticket merge` already woke units waiting for sync.
+When you receive `ticket <id> closed with no code change; <n> held.`, skip the merge.
+Omit the hand-off and refill messages.
+The unit refills itself, and its `ticket merge` already notified units that wait for sync.
 When `<n>` is positive, run `style_proposals.py file`.
 
 ## Yielding
