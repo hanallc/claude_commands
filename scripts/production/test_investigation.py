@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 import tempfile
@@ -64,6 +65,7 @@ class InvestigationTests(unittest.TestCase):
                          (question, answer, investigation.InvestigationState.ANSWER_READY))
         self.assertEqual(ready.filed, item.filed)
         self.assertTrue(ready.answered)
+        self.assert_review_checks_under_the_owner_lock(ready)
         self.assertEqual(self.command("read", "--id", "I1"), (0, "", ""))
         read = investigation.load(OWNER.id, "I1")
         self.assertTrue(read.read)
@@ -138,6 +140,22 @@ class InvestigationTests(unittest.TestCase):
         _ = investigation.mark_read(OWNER.id, item.id)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, timestamp))
         self.assertEqual(self.command("answer", "--id", item.id, "--text", "The cause is known.")[0], 1)
+
+    def assert_review_checks_under_the_owner_lock(self, item: investigation.Investigation) -> None:
+        """Use the answered record to check refusal under the owner lock."""
+        folder = investigation.folder(OWNER.id)
+        path = folder / f"{item.id}.md"
+        before = path.read_bytes()
+
+        def refuse() -> None:
+            lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+            with lock.open("r") as other, self.assertRaises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            raise investigation.InvestigationError("The record changed.")
+
+        with self.assertRaisesRegex(investigation.InvestigationError, "The record changed"):
+            _ = investigation.mark_read(OWNER.id, item.id, check=refuse)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_native_answer_refuses_a_superseded_review_exchange(self) -> None:
         for wait in ('native', 'question'):
