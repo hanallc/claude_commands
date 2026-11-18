@@ -6,7 +6,7 @@ from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
 
 
 class VerifyTokenBuildTests(VerifyTokenWaitFixture):
-    def test_build_makes_the_packages_binaries_under_the_token_and_prints_their_paths(self) -> None:
+    def test_build_makes_the_packages_binaries_and_prints_their_paths(self) -> None:
         # A smoke or live-shot helper ran raw `cargo build` before it launched
         # the app, and the user approved it by hand (2026-10-23).
         environment = self.build_stub([{"name": "sample", "kind": ["lib"]},
@@ -17,7 +17,7 @@ class VerifyTokenBuildTests(VerifyTokenWaitFixture):
         self.assertIn(f"binary: {self.root / 'target' / 'debug' / 'sample-app'}\n", result.stdout)
         self.assertNotIn("demo", result.stdout)
         self.assertEqual((self.root / "cargo-calls").read_text(), "build --workspace --bin sample-app\n")
-        self.assertIn("claim: token cargo acquired", (self.root / "board" / "board.log").read_text())
+        self.assertFalse((self.root / "board" / "board.log").exists())
         self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
 
     def test_build_of_an_example_turns_on_its_required_features(self) -> None:

@@ -3,7 +3,7 @@
 ## What it is
 
 Each build target has its own platform, capacity, hold, and admission rules.
-natedev uses the local memory gate, Cargo token, and build-folder limits.
+The queue checks natedev memory and the Cargo build folder before it grants local placement.
 SSH targets use their configured runner and claims.
 The Mac admits one job per repository, so different repositories can run together.
 `verify.sh` selects targets through `step_routing_rule` and the configured target order.
@@ -154,7 +154,7 @@ The default order is Mac, then natedev.
 `--mac "<reason>"` pins movable steps to the Mac.
 `--local "<reason>"` pins all steps to natedev.
 A pin keeps admission, spending, and version checks.
-Remote steps take no natedev grant or cargo token.
+Remote steps use the assigned target slot.
 A remote refusal never sends a pinned movable step to natedev.
 Lint repairs run on natedev, including under `lint --mac`. The one exception is the Mac fix pass after a held Mac `mend-check` finding.
 
@@ -175,14 +175,14 @@ An unpinned final keeps the local clean-tree and compiler checks and can save a 
 A pinned final runs both steps on its target and keeps the clean-tree check.
 It saves no pass because a saved pass describes this machine.
 
-- `route_test` runs after the per-call wait files and cleanup trap exist, and before the per-call `wait-local` and the cargo token. It reads the `eligible` table and records an excluded Mac at once (`BUILDLOG_MAC=declined`, and its reason in `BUILDLOG_MAC_REASON` and `BUILDLOG_LOCAL_REASON` unless `--local` was given), also when `offload.py` is never called. It then visits the eligible targets in config order:
+- `route_test` runs after the per-call wait files and cleanup trap exist, and before the per-call `wait-local`. It reads the `eligible` table and records an excluded Mac at once (`BUILDLOG_MAC=declined`, and its reason in `BUILDLOG_MAC_REASON` and `BUILDLOG_LOCAL_REASON` unless `--local` was given), also when `offload.py` is never called. It then visits the eligible targets in config order:
   - natedev: `check_routing_hold` (`register-local`). Exit 0 sends the test to natedev. Exit 10 or 12 goes on to the next target, so a filtered test can still pass on the Mac when natedev's hold state cannot be read.
   - an `ssh` target: `try_mac_test <settings>` runs `offload.py run --settings <path>`. A pass or failure ends the call with the Mac's status. A pass prints `verify.sh: PASS on the Mac (macOS), so nothing ran on natedev.` and records `passed_full` or `passed_filter` with `host=mac`. A temporary decline or a lost run keeps the target on the retry list. Permanent exclusions (`no_tests`, `off`, `repo`, `linux_only`, `local_flag`) stop retries for that target.
 - With a retry list and a held natedev, the call waits for either machine. Each pass checks the hold with `check_routing_hold` (`register-local`), waits through `local_release_wait.py` for up to `BUILD_TARGETS_POLL_S` (15 s), then checks each Mac retry. A hold release wakes the wait early. A free Mac is tried before the next hold check. Only `busy` and `blocked` are passed as `--last-decline`.
 - `remember_mac_retry` and `mac_retry_hook` apply one rule to routing and local waits. After `busy` or `blocked`, the next normal poll may try a free Mac. After any other temporary result, including `lost` or `runner`, the call waits 180 s from that attempt's end before another try. The deadline uses a monotonic clock and resets after each such result. One stderr line explains this delay per call. The deadline never delays a local step that can start.
 - Leaving for the Mac (`run_local_test`): `MAC_LEAVE_SETTINGS` keeps an eligible Mac after every temporary result. `LINT_QUEUE_LEAVE_HOOK` checks the retry deadline, then `mac_test.py free-now --settings <path>`. `build_hold_wait_local` passes the same command to `wait-local`. A hold that starts during the memory wait can still send the call to a free Mac. Status 75 means that the local step left its wait before starting, with no memory reservation. The call tries the Mac again. A pass or failure ends the call; another temporary result keeps the hook; a permanent exclusion removes it. `try_mac_test` restores the caller's signal traps.
 - The hold and routing messages repeat only when their text or decline reason changes. `verify.sh: running on natedev` marks local execution.
-- After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
+- The local runner checks the hold after placement. A new hold returns the memory grant and requests placement again. Remote steps use their target's hold rules.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
 - `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
 - Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`; at the default ten minutes it sends one phone push per outage. Blocks use an emergency push cleared by `/build:mac unblock` or the saved outage ending; idle claims and free Macs ask for a decision. The idle interval and its send keys reset after an active job. No waiting steps means no idle line or push.
@@ -464,7 +464,7 @@ the log does not record that connection. Journal retention also limits the evide
 - A remote pass or failure ends its step. CI checks platform differences.
 - The routing rule permits remote read-only steps. Tree-writing steps always remain on natedev.
 - Unpinned `build` can run on any eligible target. The configured order selects the target. Unpinned `final` remains on natedev.
-- natedev's own limits are unchanged: the memory gate, the cargo token, build-folder turns.
+- The queue checks memory and Cargo build folder use before local placement.
 - A job never runs on a held target and never falls back to one. When every eligible target is held or full it waits and says what it is waiting on.
 - Code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free, and every reader of `TargetState` handles all five cases.
 - A release removes the last holder file at once. Every waiting call can then enter the memory gate, which orders builds and checks memory. Old release records still read.
@@ -670,8 +670,8 @@ A changed nonempty key writes `FIRED`, records the changed path, and sends USR2 
 An unreadable snapshot cannot prove a change and does not fire.
 A missing parent ends the watcher with status 3.
 
-`cancel_tree_run` stops the watcher and remote runner, releases the Cargo token, and stops the local step group.
-It removes this call's token waiter files, including `.again`, and its recorded memory resources.
+`cancel_tree_run` stops the watcher, remote runner, and local step group.
+Cleanup releases the local memory grant.
 It records `cancelled`, prints the resubmit message, and exits `TREE_CHANGED_STATUS=77`.
 It writes no verdict cache and starts no retry.
 The final `cache_record` tree check still prevents a stale pass.
@@ -698,41 +698,12 @@ It does not prove that every stopped descendant has exited before verify release
 [Pending verify work](../plans/natedev-verify-next.md) records that remaining limit.
 Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offload](mac-test-offload.md).
 
-## Cargo token ownership and wait holders
+## Local placement and wait holders
 
-`config/direct.conf` supplies `VERIFY_TOKEN_HOLD_SECONDS` and `VERIFY_TOKEN_RENEW_SECONDS`.
-The shipped values are 3600 and 60 seconds.
-The renewal interval cannot exceed one third of the lease.
-`start_token_renewer` and `stop_token_renewer` maintain one renewer while a step command runs.
-No placement, memory, remote claim or hold wait holds the token, so no wait renews it.
-`renew_token` passes `--pid $$` to `board.sh renew`.
-An inconclusive busy guard returns 2 and does not end renewal.
-A different recorded holder PID refuses renewal.
-
-The renewer records only its own sleep PID.
-Its launch flag and prior-job value recover `$!` before the PID assignment when a signal arrives during launch.
-Its trap stops and waits only for that sleep.
-A bare `wait` or `kill $(jobs -p)` can reach inherited jobs that the subshell did not start.
-
-`board.sh` retains an expired token when the live holder and recorded process group still match.
-`scripts/lib/process_start.py` supplies `Started`, `Zombie`, `Gone`, and `Unreadable` process-start results.
-Linux reads field 22 from the process stat file; Darwin uses `ps -o lstart=` under `LC_ALL=C TZ=UTC`.
-Different result kinds never compare equal.
-Unreadable start evidence retains ownership; a gone owner or a different start permits reclamation.
-All token, claim, and watcher readers must use the same host-specific start form.
-
-`STEP_OWNER_PY` checks ownership before a step starts.
-Lost ownership writes `VERIFY_TOKEN_LOST_FILE` and returns 125 without running the command.
-`buildlog_retry_unstarted_step` releases memory, reacquires the token, and repeats admission without recording an attempt result.
-`run()` wraps `run_step` and `finish_step_token`.
-It releases a token that the step acquired on success, failure, or an early return.
-It preserves a token that the caller already owned.
-The detached sweep calls `run_once` without board acquisition, so a verify call cannot wait on its sweep's token.
-
-`release_token` keeps `.given_back` across repeated releases from pipeline shells.
-`sync_token_state` checks that mark before either acquisition path.
-Only `token_acquired` removes it after successful acquisition.
-A local formatter uses `acquire_token local`, so a preceding remote step cannot send formatting to another target.
+Verify resolves the build folder on the caller host using the step's Cargo metadata.
+The placement request uses this folder for the local candidate.
+Verify starts local Cargo after placement and the last hold check.
+Formatting uses the local invocation path and requests no memory.
 
 ### Recorded wait holders
 
@@ -740,13 +711,6 @@ A local formatter uses `acquire_token local`, so a preceding remote step cannot 
 An absent identity records `HolderNotNamed`.
 `wait-holder` records a changed holder or its disappearance.
 No separate holder watcher runs beside a wait.
-
-Token lookup checks the roster key, implementation-worker slot or file stem, roster slot, then the herdr pass record.
-The herdr match uses the dispatch key or one matching `worker_name`.
-One staff identity resolves through the staff row's `current_session`.
-Missing or ambiguous matches give no session.
-The fallback unit comes from `unit_runs.run_owner`; `director` uses `unit_runs.director`.
-The lookup cache uses `slot:holder_pid` and retries unresolved identities on the next observation.
 
 Hold waits read `hold_waited_on`.
 Remote waits read overlapping claims owned by live runs of another session.
@@ -757,7 +721,7 @@ A failed memory close writes `phase-close.<pid>.memory.<id>` for a later close a
 A pinned target waits only while another live session holds its target claim.
 This includes a Linux reserve that loses a claim race and returns 1.
 Other refused answers retain their refusal.
-The pinned interval closes before execution starts, and a remote reservation closes the Cargo-token interval.
+The pinned interval closes before execution starts.
 Pinned routing skips the ordinary remote retry delay.
 Token wait timestamps read `scripts/lib/user_zone.py` directly and need no `USER_ZONE_SCRIPT` variable.
 

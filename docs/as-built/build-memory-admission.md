@@ -197,12 +197,10 @@ The adapter uses that grant without a second admission request.
 Restart requires fresh token confirmation for requests that need a token.
 A placement waiter holds no cargo token.
 `_placement_row` marks every `TokenRequired` row token-waiting, so `memory_admit.py` does not admit it.
-`verify.sh` sends `--token after-grant`: it takes the token after a local grant.
-Its first pass sends `TokenRequired(TokenReadinessUnchecked)`.
-That pass starts nothing on natedev, so a free remote target can take the step.
-The client shows no memory wait for that pass, and `verify.sh` sends the next pass at once.
-Later passes send `TokenNotRequired`, because the service needs no token before that grant.
-These are existing wire values, so a new `verify.sh` works with a service that started before this change.
+Verify sends `TokenNotRequired`. A local grant starts the step without a unit board token.
+The placement request includes the resolved Cargo build folder for the local candidate.
+The queue checks that folder together with memory before a local grant.
+Remote candidates use their target slots.
 An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 
 Remote rows carry execution evidence and the assigned host.
@@ -1030,7 +1028,7 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 
 `run()` wraps `run_once`. A failed step is a memory kill when its output shows `SIGKILL|SIGTERM|signal: (9|15)` and the journal shows, inside the step's window, earlyoom's `sending SIG(TERM|KILL) to process` (`journalctl -u earlyoom`) or the kernel's `Memory cgroup out of memory` / `Out of memory: Killed` (`journalctl -k`). The query lives in `memory_kill_in_journal` so tests can stub `journalctl`. A memory kill is never the tree's failure: the step re-runs once (`killed for memory: <step>; retrying once`), and a second kill exits 137 with `killed for memory twice: <step>`. Each kill appends a byte to `MEM_KILL_FILE`; the second creates `<file>.stopped`. `note_event` passes `BUILDLOG_MEM_KILLS` and `BUILDLOG_MEM_KILL_STOPPED` to `record.py call`.
 
-`verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `UNIT_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
+Verify records zero seconds of board token wait on new calls. Historical call records retain their saved value.
 
 `/build:bump` resolves the waiting step's recorded unit before it checks roster labels.
 The no-unit display placeholder supplies no unit.
@@ -1039,39 +1037,15 @@ The Builds page shows the saved priority order and reasons.
 
 Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` holds `PriorityUnit` or `NormalOrder` only in the resolved queue. Priority transitions decode to `SettledPriority` or `PendingPriorityTransition`; a pending transition keeps its id and saved month-log offset through retries. One cleanup guard isolates both a failed token-wait intent and failed dead-owner reservation finalization. Each failure logs its record path and keeps the record for the next poll; other cleanup and admission continue.
 
-### Cargo token reclaim (`scripts/direct/board.sh`)
+### Local execution after placement
 
-A local compiling attempt waits for placement and memory without the board's `cargo` token.
-A token from an earlier step of the same call is released before the next placement.
-After a local grant, `verify.sh` takes the token, then runs cargo. The grant keeps its reservation during that token wait.
-So a memory wait no longer holds the cargo token. The token wait after a grant lasts only while a peer of the same unit runs cargo.
-A step placed on the Mac or an SSH target never takes the natedev token.
-`acquire_token()` waits in the existing FIFO queue and reuses a token that this call already holds.
-When the token wait after a grant ends without the token, the call cancels its placement or releases its reservation.
-A natedev hold that starts during that wait ends it: the call releases its reservation and places the step again.
-The execution guard still checks the token owner before cargo starts.
-`unreachable_limit_seconds` limits missing-socket and refused-connection retries to 60 seconds by default.
-The client reports the retry interval once when a connection fails.
-A successful connection resets that interval.
-At the limit, the client exits with status 2, and verify starts no cargo.
+A compiling step waits for placement. The queue checks memory and the Cargo build folder for a local start.
+Verify checks for a local hold again before it starts Cargo.
+If a hold starts after the grant, verify returns the grant and requests placement again.
+Formatting runs locally without a memory request or a board token.
 
-Cancellation, a hold, and departure for the Mac release the token.
-A later local attempt takes the token again after its next grant.
-Each `run()` path releases tokens that it acquired, as required by verify Phase 36.
-Noncompiling local steps retain their existing token path and request no memory.
-The wait log names the holder and its PID, including holder files without a final newline.
-It says `this call holds it` when the recorded PID equals the call's PID.
-
-Old shells can still send `admit`, `token-wait`, and a second `admit` with `BUILDLOG_MEM_TOKEN_BACK_AT`.
-The service keeps this compatibility path and records its token gap.
-New shells generate neither the second request nor a token gap.
-
-A hold releases the token until the hold ends.
-A call that waits again keeps its original FIFO position through its `.again` waiter file.
-The hold wait and token wait retain separate history records.
-`TOKEN_WAIT_FILE` carries a step's token wait to the call record.
-`TOKEN_WAIT_FILE.given_back` records a subshell release for its parent.
- An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `detached_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release use an exclusive flock on `locks/<res>.guard`. One perl call locks descriptor 9 because the Mac has no `flock(1)`. The shell retains the lock after perl exits. The kernel releases the lock when the holder dies. A reclaimer reads the lock again while it holds the guard. Thus, two waiters cannot both reclaim the lock. A release cannot remove a lock that a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
+The admission service still accepts the legacy `token-wait` command and records the gap for those clients.
+The board still manages tokens for its own callers.
 
 ### Build log: records and schema
 
@@ -1658,7 +1632,7 @@ A named example supplies its required features.
 `take_build_args` refuses a missing target or a package without a binary with exit 2.
 The Cargo build keeps `--workspace` and the workspace's feature set.
 A named package owns feature names without a slash; without a package, feature names pass unchanged.
-The build uses the build hold, cargo token, memory admission, and a call record with verb `build`.
+The build uses the build hold, local placement checks, and a call record with verb `build`.
 `print_built_binaries` prints `binary: <target_directory>/<debug|release>/[examples/]<name>` for each target.
 The build saves no pass record and does not use Mac offload.
 Use this command for smoke and shot helpers.

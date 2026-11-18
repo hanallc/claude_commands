@@ -282,10 +282,10 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         _ = source.write_text(source.read_text() + "// caller edited during cargo\n")
 
     def assert_resources_held(self) -> None:
-        self.assertTrue((self.board / "locks/cargo.d").is_dir(), "test did not take the cargo token")
+        self.assertFalse((self.board / "locks/cargo.d").exists())
         self.assertTrue(self.admission.server.reservations,
                         "test did not take memory admission")
-        # The token owner starts a separate session. Register it for test cleanup.
+        # Register the step group for test cleanup.
         descendant = int((self.control / "descendant.pid").read_text())
         self.started_groups.add(os.getpgid(descendant))
 

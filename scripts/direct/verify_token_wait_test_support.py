@@ -17,7 +17,6 @@ import shlex
 import shutil
 import select
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -30,7 +29,6 @@ from scripts.direct.recorder_fixture import invoke_recorder, record_wait_workers
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -490,55 +488,12 @@ esac
         self.wait_for_running(self.root / "hold-waiting", process)
         return process
 
-    def start_owned_step(self, environment: dict[str, str]) -> subprocess.Popen[str]:
-        """Run the real command guard and renewer with a real board lease."""
-        source = VERIFY.read_text()
-        start = source.index("STEP_OWNER_PY='\n")
-        end = source.index("\nrelease_token() {", start)
-        script = self.root / "owned-step.sh"
-        _ = script.write_text('set -eo pipefail\nsource "$1"\n'
-            + source[start:end] + shell_functions(VERIFY, "release_token") + '''
-BOARD_HELPER=$TEST_BOARD_HELPER BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=$UNIT_TEAM_ROLE
-STEP_RECORD_SCRIPT=$TEST_STEP_RECORD_SCRIPT
-PY=$TEST_REAL_PYTHON
-source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
-TOKEN_HOLD_S=$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)
-TOKEN_RENEW_S=$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)
-TOKEN_HELD=0 TOKEN_WAIT_FILE=""
-HOLD_WAIT_DIR=$TEST_HOLD_DIRECTORY
-mkdir -p "$HOLD_WAIT_DIR"
-trap 'status=$?; release_token || true; exit "$status"' EXIT
-bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold "$TOKEN_HOLD_S"
-TOKEN_HELD=1
-status=0
-buildlog_exec cargo check > "$HOLD_WAIT_DIR/command-output" 2>&1 || status=$?
-cat -- "$HOLD_WAIT_DIR/command-output"
-exit "$status"
-''')
-        process = subprocess.Popen(["bash", str(script), str(VERIFY.parent.parent / "lint/invoke.sh")],
-            cwd=self.root, env={**environment, "TEST_BOARD_HELPER": str(BOARD),
-                "TEST_STEP_RECORD_SCRIPT": str(VERIFY.with_name("step_record.py")),
-                "TEST_REAL_PYTHON": sys.executable, "TEST_HOLD_DIRECTORY": str(self.root / "owned-step-hold")},
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.started_groups.add(process.pid)
-        return process
-
     def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
         process = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
         self.started_groups.add(process.pid)
         return process
-
-    def wait_for_waiter(self, board: Path, process: subprocess.Popen[str]) -> None:
-        """Waits until the call's own file is in the board's token waiter list."""
-        waiters = board / "token_waiters"
-        waiters.mkdir(parents=True, exist_ok=True)
-
-        def listed() -> bool:
-            return any(path.name.endswith(f".{process.pid}") for path in waiters.iterdir())
-        wait_until(lambda: listed() or process.poll() is not None, waiters, processes=(process,))
-        self.assertTrue(listed(), "verify never waited for the token")
 
     def assert_interrupted_holder_stops_step_before_release(self, interruption: signal.Signals) -> None:
         board = self.root / "board"
@@ -554,17 +509,14 @@ exit "$status"
         try:
             self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists())
-            lock = board / "locks" / "cargo.d"
-            step_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
-            step_group = cast(int, step_record["group"])
+            step_group = os.getpgid(int((self.root / "cargo-pid").read_text()))
             self.started_groups.add(step_group)
 
             send_process_group(first.pid, interruption)
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(first.returncode, 0)
-            self.assertFalse(lock.exists(), "interrupted verify kept its token")
             self.assertEqual(self.live_group_processes(step_group), [],
-                             "token became free while its step still ran")
+                             "the step group survived interruption")
             second = self.verify(second_environment)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         finally:

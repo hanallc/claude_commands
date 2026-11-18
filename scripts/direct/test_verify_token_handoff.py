@@ -9,7 +9,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 
 
 class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
-    def test_a_hold_waiter_holds_no_token_and_takes_it_after_the_hold(self) -> None:
+    def test_a_hold_waiter_starts_after_the_hold(self) -> None:
         board = self.root / "board"
         lock = board / "locks" / "cargo.d"
         environment = self.hold_environment(board, 0)
@@ -29,10 +29,10 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
                                     start_new_session=True)
             self.started_groups.add(peer.pid)
             self.wait_for_running(self.root / "running", peer)
-            self.assertEqual((lock / "holder_pid").read_text(), str(peer.pid))
+            self.assertFalse(lock.exists())
 
-            (self.root / "hold-release").touch()
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+            (self.root / "hold-release").touch()
             _ = (self.root / "release").touch()
             self.assertEqual(peer.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             self.assertEqual(held.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
@@ -64,15 +64,13 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
         self.assertFalse((board / "locks" / "cargo.d").exists())
         self.assertFalse((self.root / "cargo-calls").exists(), "the step ran on natedev")
 
-    def test_no_hold_gives_nothing_back(self) -> None:
+    def test_no_hold_starts_without_a_board_token(self) -> None:
         board = self.root / "board"
         (self.root / "build-hold").mkdir()
         result = self.verify({**self.environment, "UNIT_RUN_DIR": str(board),
                               "UNIT_TEAM_ROLE": "impl"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        log = (board / "board.log").read_text()
-        # The memory wait keeps the initial token.
-        self.assertEqual((log.count("token cargo acquired"), log.count("token cargo released")), (1, 1), log)
+        self.assertFalse((board / "board.log").exists())
 
 
 

@@ -1310,15 +1310,14 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         functions = shell_functions(VERIFY,
             "collect_child", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
-            "release_token", "stop_token_renewer",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
             "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
-            "placement_once", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
-            "route_compiling_step", "sync_token_state",
-            "pinned_target_refuse", "record_token_wait", "renew_token", "start_token_renewer",
+            "placement_once", "local_cargo_build_folder", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
+            "route_compiling_step", "take_local_placement",
+            "pinned_target_refuse",
             "try_reserved_target", "mac_only_refuse",
             "route_test", "check_routing_hold")
         functions += shell_functions(VERIFY.parent.parent / "lint/invoke.sh", "buildlog_now")
@@ -1329,6 +1328,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         setup = r'''
 set -euo pipefail
 PY=$TEST_REAL_DIRECT/../lib/py
+VERIFY_START_DIR=$TEST_REAL_DIRECT
 CMD=test PKG=sample ARGS=(sample) NEXTEST_ARGS=(-p sample --no-tests=warn)
 FILTER_RUN=${TEST_DIRECT_FILTER:-0}
 if [[ "$FILTER_RUN" == 1 ]]; then ARGS+=(--filter alpha); NEXTEST_ARGS+=(--filter-expr 'test(alpha)'); fi
@@ -1370,9 +1370,8 @@ BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_S=""
 BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
 DOC_REPO_TOP=$PACKAGE_ROOT
 BOARD_HELPER=$TEST_REAL_DIRECT/board.sh BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=direct
-TOKEN_USED=0 TOKEN_HELD=0 TOKEN_RENEWER_PID="" TOKEN_WAITED=0
 VERIFY_MONOTONIC_OFFSET_US=0
-trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
+trap 'finish_tree_watch; finish_hold_wait' EXIT
 '''
         invoke = 'source "$TEST_REAL_DIRECT/../lint/invoke.sh"\n'
         _ = script.write_text(invoke + functions + setup + '\neval "$1"\n', encoding="utf-8")

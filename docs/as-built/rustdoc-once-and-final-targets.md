@@ -46,7 +46,7 @@ The example scan refuses tests inside examples before a build starts.
    Source files and the source index stay unchanged.
 3. If `lint.conf` has `doc=off`, it prints one line that says it ignores the switch.
 4. It runs `LINT_CONFIG_FORCE=1 invoke_doc --workspace` against the staged snapshot.
-   Local execution uses the Cargo token and memory gate.
+   Local execution uses queue placement and the final hold check.
    Remote execution sends the snapshot through `--source-root` with the original repository identity.
    A named package owns feature names without a slash.
    Without a package, feature names pass unchanged.

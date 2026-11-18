@@ -64,7 +64,7 @@ class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
                         self.assertNotIn("package(sample)", " ".join(nextest_arguments))
                 self.assertNotIn("--no-cache", runner_arguments)
                 self.assertFalse(runners[0]["token_held"])
-                self.assertTrue(local[0]["token_held"], json.dumps(local[0]) + result.stdout + result.stderr)
+                self.assertFalse(local[0]["token_held"], json.dumps(local[0]) + result.stdout + result.stderr)
                 record = self.last_call()
                 self.assertEqual(record["mac"], "declined")
                 self.assertEqual(record["mac_reason"], "busy")

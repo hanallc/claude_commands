@@ -131,9 +131,9 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
     ) -> subprocess.CompletedProcess[str]:
         functions = shell_functions(
             VERIFY, "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
-            "run", "run_step", "finish_step_token", "route_compiling_step",
+            "run", "run_step", "route_compiling_step",
             "take_local_placement", "apply_placement_outcome",
-            "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
+            "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
             "read_metadata", "load_metadata", "workspace_taplo",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
@@ -149,7 +149,6 @@ ARGS=()
 if [[ -n "$TEST_STATE_PACKAGE" ]]; then ARGS=("$TEST_STATE_PACKAGE"); fi
 PINNED_TARGET=$TEST_STATE_PINNED
 STEP_RECORD_PATH="" STEP_STATE_PATH="" STEP_RECORD_TEXT=""
-TOKEN_USED=0 TOKEN_WAITED=0
 HOLD_LINT=0 CHECK_LINT=0 METADATA_READY=0
 FEATURE_FLAGS=()
 VERIFY_METADATA_SCRIPT=$TEST_REAL_DIRECT/verify_metadata.py

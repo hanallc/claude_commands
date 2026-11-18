@@ -32,33 +32,22 @@ buildlog_exec /bin/sh -c 'printf "%s\n" "$BUILDLOG_RESERVED_STEP"'
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, f"4242-start-1\t4242\t{work}/admission\n")
 
-    def test_nested_step_refuses_before_memory_or_cargo_token_wait(self) -> None:
-        scripts = Path(__file__).resolve().parents[1]
-        token = shell_functions(scripts / "direct/verify.sh", "acquire_token")
-        shell = r'''
-source "$1"
-sync_token_state() { :; }
-token_wait_clock() { touch "$TEST_TOKEN_ATTEMPT"; exit 99; }
-TOKEN_USED=1 TOKEN_HELD=0
-'''
-        shell += token + '\n"$TEST_NESTED_ACTION"\n'
+    def test_nested_step_refuses_before_a_memory_wait(self) -> None:
+        gate = Path(__file__).with_name("memory_gate.sh")
         with AdmissionFixture() as fixture:
             outer = fixture.request()
             with fixture.loop_turn():
                 grant, = fixture.server.handle_request(outer)
             assert isinstance(grant, wire.Admitted)
             marker = f"{grant.reservation}\t{outer.owner.pid}\t{fixture.state_dir.resolve()}"
-            attempted = fixture.root / "token-attempt"
-            for action in ("acquire_token", "buildlog_wait_for_memory"):
-                with self.subTest(action=action):
-                    environment = {**os.environ, "BUILDLOG_RESERVED_STEP": marker,
-                                   "TEST_TOKEN_ATTEMPT": str(attempted), "TEST_NESTED_ACTION": action}
-                    result = subprocess.run(["bash", "-c", shell, "test", str(scripts / "lint/memory_gate.sh")],
-                                            env=environment, capture_output=True, text=True, timeout=5)
-                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                    self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
-                    self.assertIn(f"{grant.reservation} (pid {outer.owner.pid})", result.stderr)
-                    self.assertFalse(attempted.exists())
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1"; buildlog_wait_for_memory', "test", str(gate)],
+                env={**os.environ, "BUILDLOG_RESERVED_STEP": marker},
+                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+            self.assertIn(f"{grant.reservation} (pid {outer.owner.pid})", result.stderr)
 
     def test_relative_source_keeps_the_launcher_after_a_directory_change(self) -> None:
         with tempfile.TemporaryDirectory() as work:

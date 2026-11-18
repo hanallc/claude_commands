@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import cast, override
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_step_routes as routes
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record, VERIFY
+from scripts.direct.verify_token_wait_test_support import BOARD, VerifyTokenWaitFixture, Record
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -20,7 +21,13 @@ class VerifyTokenWaitTests(VerifyTokenWaitFixture):
         super().setUp()
         _ = caller_admission(self, self.root, self.environment)
 
-    def test_placement_waits_without_the_token_and_cargo_runs_with_memory_and_token(self) -> None:
+    def test_granted_local_step_starts_cargo_without_a_token_call(self) -> None:
+        session = Path(self.environment["UNIT_SESSION_DIR"])
+        take = subprocess.run(["bash", str(BOARD), "acquire", str(session), "peer", "cargo",
+                               "--pid", str(os.getpid())], env=self.environment,
+                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(take.returncode, 0, take.stdout + take.stderr)
+        original_board = (session / "board.log").read_text()
         observer = self.root / "observe-token.py"
         observations = self.root / "token-observations.json"
         _ = observer.write_text('import sys\n' + f"with open({str(Path(__file__).resolve().parents[2] / 'scripts/lib/package_root.py')!r}) as package_root: exec(package_root.read(), {{'__file__': package_root.name}})\n" + '''import json
@@ -35,23 +42,21 @@ reservations = list(state.reservations.values())
 lock = Path(os.environ["UNIT_SESSION_DIR"]) / "locks/cargo.d"
 capture = Path(os.environ["TEST_TOKEN_OBSERVATIONS"])
 rows = json.loads(capture.read_text()) if capture.exists() else {}
+assert (lock / "holder").read_text().strip() == "peer"
 if phase == "admission":
-    # The placement wait holds neither the token nor a reservation.
     assert phase not in rows, rows
-    assert not lock.exists(), phase
     assert not reservations, reservations
-    rows[phase] = {"holder": ""}
+    rows[phase] = {"reservations": len(reservations)}
 else:
-    assert lock.is_dir(), phase
     assert len(reservations) == 1, reservations
-    rows[phase] = {"holder": (lock / "holder_pid").read_text()}
+    rows[phase] = {"reservations": len(reservations)}
 capture.write_text(json.dumps(rows))
 ''')
         shell = self.root / "observe.sh"
         _ = shell.write_text('''set -T
 observe_admission() {
     if [[ "${FUNCNAME[1]:-}" == placement_once && "$BASH_COMMAND" == 'PLACEMENT_CLIENT_ACTIVE=1' \
-          && "${TOKEN_HELD:-0}" == 0 && ! -e "$TEST_TOKEN_OBSERVATIONS" ]]; then
+          && ! -e "$TEST_TOKEN_OBSERVATIONS" ]]; then
         python3 "$TEST_TOKEN_OBSERVER" admission || exit 95
     fi
 }
@@ -62,8 +67,10 @@ trap observe_admission DEBUG
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         captured = cast(dict[str, Record], json.loads(observations.read_text()))
         self.assertEqual(set(captured), {"admission", "run"})
-        self.assertEqual(captured["admission"]["holder"], "")
-        self.assertRegex(str(captured["run"]["holder"]), r"^[0-9]+\n?$")
+        self.assertEqual(captured["admission"]["reservations"], 0)
+        self.assertEqual(captured["run"]["reservations"], 1)
+        self.assertEqual((session / "board.log").read_text(), original_board)
+        self.assertEqual(self.records()[0]["token_wait_s"], 0)
         directory = self.root / "buildlog/admission"
         times = directory / "queue_times.jsonl"
         rows = [cast(Record, json.loads(line)) for line in times.read_text().splitlines()] if times.exists() else []
@@ -71,26 +78,6 @@ trap observe_admission DEBUG
         self.assertEqual(list(directory.glob("*.reservation")), [])
         self.assertEqual(len(self.records()), 1)
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
-
-    def test_token_wait_names_a_holder_without_a_final_newline(self) -> None:
-        board = self.root / "board"
-        environment = {**self.environment, "UNIT_RUN_DIR": str(board)}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
-            env={**environment, "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        self.started_groups.add(first.pid)
-        self.wait_for_running(self.root / "running", first)
-        output = self.root / "token-note.err"
-        with output.open("wb") as stream:
-            second = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
-                env={**environment, "UNIT_TEAM_ROLE": "second"}, stdout=stream,
-                stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(second.pid)
-        self.wait_for_output(output, "waiting for the cargo token since", second)
-        self.assertIn(f"first (pid {first.pid}) holds it", output.read_text())
-        _ = (self.root / "release").touch()
-        self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0)
-        self.assertEqual(second.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
 
     def test_mac_routing_under_hold_skips_initial_token_acquisition(self) -> None:
         holders = Path(self.environment["BUILD_HOLD_DIR"])
@@ -121,53 +108,14 @@ trap observe_admission DEBUG
         self.assertEqual(self.records()[-1]["token_wait_s"], 0)
 
     def test_no_token_records_zero(self) -> None:
-        # A session dir alone makes this a director's run, which takes the token.
         environment = {name: value for name, value in self.environment.items()
                        if name != "UNIT_SESSION_DIR"}
         result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.records()[0]["token_wait_s"], 0)
-        self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata"])
+        self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata", "metadata"])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
-
-    def test_director_run_takes_the_token_as_slot_director(self) -> None:
-        clock = self.root / "director-clock"
-        _ = clock.write_text("100\n")
-        session = Path(self.environment["UNIT_SESSION_DIR"])
-        result = self.verify({**self.environment, "UNIT_TOKEN_CLOCK_FILE": str(clock)})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.records()[0]["token_wait_s"], 0)
-        self.assertIn("[director] claim: token cargo acquired", (session / "board.log").read_text())
-        self.assertFalse((session / "locks" / "cargo.d").exists(), "the director's token was not released")
-
-    def test_token_wait_uses_elapsed_seconds_when_no_clock_override_is_present(self) -> None:
-        # Advance Bash's elapsed clock at the two reads, without the file
-        # override. A real second passing is irrelevant to the subtraction.
-        clock_reads = self.root / "elapsed-clock-reads"
-        shell = self.root / "elapsed-clock.sh"
-        _ = shell.write_text('''set -T
-advance_elapsed_clock() {
-    if [[ "$BASH_COMMAND" == 'TOKEN_CLOCK_NOW=$SECONDS' ]]; then
-        if [[ -e "$TEST_CLOCK_READS" ]]; then SECONDS=120; else SECONDS=100; fi
-        : > "$TEST_CLOCK_READS"
-    fi
-}
-trap advance_elapsed_clock DEBUG
-''')
-        environment = {**self.environment, "BASH_ENV": str(shell),
-                       "TEST_CLOCK_READS": str(clock_reads),
-                       "UNIT_RUN_DIR": str(self.root / "clock-board"),
-                       "UNIT_TEAM_ROLE": "clock"}
-        for key in ("UNIT_WORKER_POLL_SECS",
-                    "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
-            _ = environment.pop(key, None)
-        result = self.verify(environment)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(self.records()), 1)
-        self.assertEqual(self.records()[0]["token_wait_s"], 20)
-
-
 
 if __name__ == "__main__":
     _ = unittest.main()

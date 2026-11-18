@@ -28,7 +28,7 @@ else:
 
 
 class VerifyAdmissionSignalsTests(VerifyDocFixture):
-    def test_nested_verify_refuses_before_a_token_or_admission_wait(self) -> None:
+    def test_nested_verify_refuses_before_an_admission_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         grant = admission.occupy_host()
         with admission.loop_turn():

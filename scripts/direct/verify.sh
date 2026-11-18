@@ -215,7 +215,6 @@
 # Call records include time, repository, worktree, branch, commit and call id.
 # Steps use the same call id. /verify_saved reports the saved time.
 # Status 77 means edits changed the tree during judgment.
-# Status 76 means a newer call replaced this call in the token queue.
 # Exit 2 means a usage error, missing tooling or a Mac-only refusal.
 # Exit 3 means a sandbox failure. Other statuses come from the tool.
 
@@ -803,22 +802,9 @@ step_writes_tree() {
     return 1
 }
 
-finish_step_token() {
-    local held_before=$1 status=$2
-    if [[ "${TOKEN_USED:-0}" == 1 ]]; then
-        sync_token_state
-        if [[ "$held_before" == 0 ]] && ! release_token; then
-            (( status != 0 )) || status=1
-        fi
-    fi
-    return "$status"
-}
-
 run() {
-    if [[ "${TOKEN_USED:-0}" == 1 ]]; then sync_token_state; fi
-    local held_before=${TOKEN_HELD:-0} status=0
+    local status=0
     run_step "$@" || status=$?
-    finish_step_token "$held_before" "$status" || status=$?
     if [[ "${STEP_RECORD_ACTIVE:-0}" == 1 ]] && step_writes_tree "$@"; then
         step_state local_noncompiling
     fi
@@ -882,8 +868,6 @@ run_step() {
         if buildlog_step_compiles "$@"; then
             step_state on_natedev
         else
-            acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
-            record_token_wait
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
@@ -894,12 +878,9 @@ run_step() {
         (
             set +m
             if (
-                step_token_before=${TOKEN_HELD:-0}
                 if (( LINT_REPAIR_REUSED_GRANT )) || [[ "${LINT_MEND_WAIT:-0}" == 1 ]]; then
                     BUILDLOG_PRELAUNCH_OUTCOME=abandon
                 fi
-                # The pipeline shell owns tokens taken during memory admission.
-                trap 'status=$?; finish_step_token "$step_token_before" "$status"; exit $?' EXIT
                 run_once "$@"
             ) 2>&1 | tee "$step_log" ${CLIPPY_LOG:+"$CLIPPY_LOG"} ${MEND_LOG:+"$MEND_LOG"}; then
                 exit 0
@@ -1531,12 +1512,10 @@ ROUTING_WAIT_STARTED=""
 # step subshells to the parent cleanup, which also ends interrupted waits.
 PHASE_WAIT_SESSION="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
 PHASE_WAIT_RECORDER="$(cd "${BASH_SOURCE[0]%/*}" && pwd)/progress_history.py"
-PHASE_TOKEN_OBSERVATION=""
-PHASE_TOKEN_HOLDER=""
 phase_wait_holder_flags() {
     local record_script="${STEP_RECORD_SCRIPT:-$PHASE_WAIT_RECORDER}"
     VERIFY_PY_HELPER=PHASE_WAIT_HOLDER verify_helper "${record_script%/*}/phase_wait_holder.py" "$1" "${2:-}" \
-        "${BOARD_DIR:-$PHASE_WAIT_SESSION}" "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" "${DOC_REPO_TOP:-$PWD}"
+        "$PHASE_WAIT_SESSION" "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" "${DOC_REPO_TOP:-$PWD}"
 }
 phase_wait_target_busy() {
     local holder
@@ -1559,28 +1538,8 @@ phase_wait_start() {
             rm -f "$pending"
         done
     fi
-    local holder_kind=$key payload="${3:-}" observation="" slot="" holder_pid=""
-    if [[ "$key" == token ]]; then
-        if [[ -f "$BOARD_DIR/locks/cargo.d/holder" ]]; then
-            IFS= read -r slot < "$BOARD_DIR/locks/cargo.d/holder" || true
-        fi
-        if [[ -f "$BOARD_DIR/locks/cargo.d/holder_pid" ]]; then
-            IFS= read -r holder_pid < "$BOARD_DIR/locks/cargo.d/holder_pid" || true
-        fi
-        observation="$slot:$holder_pid"
-        if [[ -z "$slot" || "$slot" == unknown ]]; then
-            PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""
-        elif [[ "${PHASE_TOKEN_OBSERVATION:-}" == "$observation" && -n "${PHASE_TOKEN_HOLDER:-}" ]]; then
-            holder="${PHASE_TOKEN_HOLDER:-}"
-        else
-            if ! holder="$(phase_wait_holder_flags token "$slot")"; then
-                printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
-                return 0
-            fi
-            PHASE_TOKEN_OBSERVATION=$observation
-            PHASE_TOKEN_HOLDER=$holder
-        fi
-    elif [[ "${4:-}" == supplied ]]; then
+    local holder_kind=$key payload="${3:-}"
+    if [[ "${4:-}" == supplied ]]; then
         holder=$payload
     elif [[ "$key" != memory || -n "$payload" ]]; then
         if [[ "$reason" == "Mac busy" ]]; then holder_kind=mac; fi
@@ -1627,7 +1586,6 @@ phase_wait_start() {
     fi
 }
 phase_wait_finish() {
-    if [[ "$1" == token ]]; then PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""; fi
     local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
     if [[ ! -s "$file" ]]; then
         rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
@@ -1779,7 +1737,6 @@ interrupt_hold_wait() {
 finish_hold_wait() {
     phase_wait_finish_all
     collect_hold_wait
-    if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
         verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
@@ -1811,8 +1768,6 @@ CLIPPY_FIX_LIMIT_REACHED=0
 PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
-TOKEN_WAIT_S=0
-TOKEN_WAIT_FILE=""
 LOOKUP_KEY=""
 LOOKUP_STATUS=0
 EXIT_STATUS=0
@@ -1928,17 +1883,10 @@ cancel_tree_run() {
         collect_child "$runner_pid" TERM
         MAC_RUNNER_PID=""
     fi
-    # Board release also stops a step's separately owned process group.
-    if declare -F release_token >/dev/null; then release_token || true; fi
     if [[ -n "${RUN_STEP_PID:-}" ]]; then
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" KILL 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
-    fi
-    # Reacquisition creates .again in the step's subshell. Both names belong
-    # to this call, even when the parent never saw TOKEN_WAIT_ENTRY change.
-    if [[ -n "${TOKEN_WAITER_FILE:-}" ]]; then
-        rm -f "$TOKEN_WAITER_FILE" "${TOKEN_WAITER_FILE}.again"
     fi
     exec 9>&-
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
@@ -2072,17 +2020,11 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "$MEM_KILL_FILE" ]]; then
         mem_kills=$(wc -c < "$MEM_KILL_FILE")
     fi
-    local token_wait_s=${TOKEN_WAIT_S:-0} step_wait
-    if [[ -n "${TOKEN_WAIT_FILE:-}" && -f "$TOKEN_WAIT_FILE" ]]; then
-        while IFS= read -r step_wait; do
-            token_wait_s=$(( token_wait_s + step_wait ))
-        done < "$TOKEN_WAIT_FILE"
-    fi
     local mem_kill_stopped=0
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="$token_wait_s" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S=0 BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
         BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" BUILDLOG_PACKAGE="${VERIFY_PACKAGE:-}" \
         verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
@@ -2189,7 +2131,6 @@ try_mac_test() {
         runner_args+=(--claim-owner-pid $$ --claim-id "$claim_id" --episode "$episode" --attempt "$attempt"
             --claim-session "$claim_session")
     fi
-    if declare -F release_token >/dev/null; then release_token || return $?; fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
     local remote_kind
     remote_kind=$(remote_step_kind)
@@ -2487,28 +2428,27 @@ initialize_step_record() {
 # Reuse the call's decision. A hold check supplies the only local allow.
 route_compiling_step() {
     local command=$1
+    if [[ -n "${BUILDLOG_RESERVED_STEP:-}" ]]; then buildlog_check_nested_step || return $?; fi
     STEP_RAN_ON_MAC=0 MAC_PASSED=0
     if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
-        local token_status=0 reason
-        take_local_placement || token_status=$?
+        local reason
+        take_local_placement
         LINT_REPAIR_PENDING_GRANT=0
-        if (( token_status == 0 )); then
-            if reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
-                    "$PLACEMENT_ASSIGNMENT_FILE" "$PLACEMENT_GRANT_FILE" "$PLACEMENT_EPISODE" "$$" "${LINT_COPY_TREE:-}" "$@"); then
-                # Keep the sidecar that the grant uses to find its build scope.
-                local grant_peak=$BUILDLOG_PEAK
-                buildlog_begin "$@" || true
-                BUILDLOG_PEAK=$grant_peak
-                BUILDLOG_PLACEMENT_PREPARED=1
-                LINT_REPAIR_REUSED_GRANT=1
-                return 0
-            fi
-            echo "verify.sh: cannot reuse the judgment grant: ${reason:-grant check failed}. Requesting placement again." >&2
-            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid "$PLACEMENT_OWNER_PID" --reason "the judgment grant cannot cover the lint repair" >/dev/null || return $?
-        elif (( token_status != 10 )); then
-            return "$token_status"
+        if [[ "$(local_cargo_build_folder "$@")" != "${PLACEMENT_CARGO_FOLDER:-}" ]]; then
+            reason="the repair uses a different Cargo build folder"
+        elif reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
+                "$PLACEMENT_ASSIGNMENT_FILE" "$PLACEMENT_GRANT_FILE" "$PLACEMENT_EPISODE" "$$" "${LINT_COPY_TREE:-}" "$@"); then
+            # Keep the sidecar that the grant uses to find its build scope.
+            local grant_peak=$BUILDLOG_PEAK
+            buildlog_begin "$@" || true
+            BUILDLOG_PEAK=$grant_peak
+            BUILDLOG_PLACEMENT_PREPARED=1
+            LINT_REPAIR_REUSED_GRANT=1
+            return 0
         fi
+        echo "verify.sh: cannot reuse the judgment grant: ${reason:-grant check failed}. Requesting placement again." >&2
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+            --pid "$PLACEMENT_OWNER_PID" --reason "the judgment grant cannot cover the lint repair" >/dev/null || return $?
         unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
     fi
     if [[ "${PLACEMENT_OUTCOME:-}" != retry ]]; then PLACEMENT_EPISODE=""; fi
@@ -2554,7 +2494,6 @@ route_compiling_step() {
     fi
     MAC_FINISH_CALL=0
     if [[ "$CMD" == test ]]; then MAC_FINISH_CALL=1; fi
-    # Placement and memory waits hold no cargo token; a local grant takes it in route_test.
     route_test || return $?
     if [[ "$MAC_PASSED" == 1 ]]; then
         STEP_RAN_ON_MAC=1
@@ -2697,8 +2636,13 @@ placement_failed() {
     PLACEMENT_FAILED=1
 }
 
+local_cargo_build_folder() {
+    [[ "${1:-}" == cargo ]] || return 0
+    verify_helper "$VERIFY_START_DIR/verify_cargo_folder.py" "$@"
+}
+
 placement_once() {
-    local token=none reply line route="" status=0 monitor=0
+    local reply line route="" status=0 monitor=0 prerequisite=none
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
@@ -2708,6 +2652,11 @@ placement_once() {
         PLACEMENT_SOURCE_KEY=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "${MAC_SOURCE_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}") || return $?
         PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
         PLACEMENT_GRANT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.sh"
+        PLACEMENT_CARGO_FOLDER=""
+        if [[ "${MAC_ONLY:-0}" == 0 && "${STEP_FORCE_MAC:-0}" == 0 \
+                && "${PINNED_TARGET:-natedev}" == natedev ]]; then
+            PLACEMENT_CARGO_FOLDER="$(local_cargo_build_folder "${PLACEMENT_COMMAND[@]}")" || return $?
+        fi
         if [[ -n "${LINT_MEMORY_WAIT_FILE:-}" ]]; then
             mv "$LINT_MEMORY_WAIT_FILE" "$PLACEMENT_ASSIGNMENT_FILE.wait" || return $?
             LINT_MEMORY_WAIT_FILE=""
@@ -2715,14 +2664,23 @@ placement_once() {
         export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
     fi
     PLACEMENT_OUTCOME=""
-    # route_test released any token before placement; a local grant takes it.
-    if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
+    # Use the queue's first pass to give routed work a remote placement probe.
+    # The next pass permits local admission. Neither pass takes a board token.
+    PLACEMENT_REMOTE_PROBE=0
+    if [[ "$STEP_RUNS_ON" == any_target && "${LOCAL_ONLY:-0}" == 0 \
+            && -z "${PINNED_TARGET:-}" && "${MAC_ONLY:-0}" == 0 \
+            && "${STEP_FORCE_MAC:-0}" == 0 && -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        prerequisite=after-grant
+        PLACEMENT_REMOTE_PROBE=1
+    fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
         --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
-        --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
+        --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$prerequisite"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
+    # This folder constrains the local candidate only. Remote candidates use their slots.
+    [[ -z "${PLACEMENT_CARGO_FOLDER:-}" ]] || placement_args+=(--cargo-folder "$PLACEMENT_CARGO_FOLDER")
     [[ -z "${BUILDLOG_RUN:-}" ]] || placement_args+=(--run "$BUILDLOG_RUN")
     if [[ -n "${PINNED_TARGET:-}" ]]; then
         placement_args+=(--target "$PINNED_TARGET")
@@ -2734,7 +2692,7 @@ placement_once() {
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
     if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" \
-            --token none --request-file "$BUILDLOG_FIRST_STEP_REQUEST" -- "${PLACEMENT_COMMAND[@]}"
+            --request-file "$BUILDLOG_FIRST_STEP_REQUEST" -- "${PLACEMENT_COMMAND[@]}"
         return $?
     fi
     if [[ -n "${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" ]]; then
@@ -2845,37 +2803,6 @@ wait_for_claim_recovery() {
 }
 
 take_local_placement() {
-    # The grant keeps its reservation while the call takes its unit's cargo token.
-    local token_status=0
-    TOKEN_WAIT_HOLD_CHECK=build_hold_check_local
-    acquire_token local || token_status=$?
-    TOKEN_WAIT_HOLD_CHECK=""
-    if (( token_status == 10 )); then
-        # A natedev hold started before the token came: give back the grant and place again.
-        record_token_wait
-        export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
-        export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
-        BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
-        if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
-            buildlog_release_memory 10 abandon
-        else
-            source "$PLACEMENT_GRANT_FILE" || return $?
-            buildlog_release_memory 10
-        fi
-        apply_placement_outcome
-        if [[ "$PLACEMENT_OUTCOME" == unresolved ]]; then
-            build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
-            return 2
-        fi
-        echo 'verify.sh: natedev hold started during the cargo token wait; choosing its target again.' >&2
-        return 10
-    fi
-    if (( token_status != 0 )); then
-        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-            --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the cargo token wait ended" >/dev/null || true
-        return "$token_status"
-    fi
-    record_token_wait
     if [[ "$CMD" == test ]]; then echo 'verify.sh: running on natedev'; fi
     export BUILDLOG_SELECTED_LOCAL_GRANT="$PLACEMENT_GRANT_FILE"
     export BUILDLOG_PLACEMENT_FILE="$PLACEMENT_ASSIGNMENT_FILE"
@@ -2892,8 +2819,6 @@ route_test() {
             fi
         fi
     done <<< "$STEP_TARGET_TABLE"
-    # A placement wait holds no cargo token, also after an earlier step; a local grant takes it again.
-    release_token || return $?
     while :; do
         local placement_status=0 admission=0
         check_routing_hold || admission=$?
@@ -2916,10 +2841,8 @@ route_test() {
                 step_state waiting_ssh "$PINNED_TARGET"
             fi
             if [[ "${PLACEMENT_WAIT_MEMORY:-0}" == 0 ]]; then start_routing_wait; fi
-            # The first pass of an episode starts nothing on natedev, so a free remote target
-            # can take the step. The next pass can grant natedev at once.
-            if [[ "${TOKEN_USED:-0}" == 1 && "${PLACEMENT_TOKEN_CHECK_EPISODE:-}" != "$PLACEMENT_EPISODE" ]]; then
-                PLACEMENT_TOKEN_CHECK_EPISODE=$PLACEMENT_EPISODE
+            if [[ "${PLACEMENT_REMOTE_PROBE:-0}" == 1 && "${PLACEMENT_PROBE_EPISODE:-}" != "$PLACEMENT_EPISODE" ]]; then
+                PLACEMENT_PROBE_EPISODE=$PLACEMENT_EPISODE
                 continue
             fi
             wait_for_placement
@@ -2943,14 +2866,8 @@ route_test() {
                 LINT_REPAIR_PENDING_GRANT=1
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
-            local token_status=0
-            take_local_placement || token_status=$?
-            if (( token_status == 10 )); then continue; fi
-            return "$token_status"
-        fi
-        if [[ "${TOKEN_USED:-0}" == 1 ]]; then
-            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" report-prerequisite --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
-                --token after-grant >/dev/null || return $?
+            take_local_placement
+            return
         fi
         local claim_status=0
         # reserve and recover-reservation take the same words.
@@ -3175,7 +3092,7 @@ build_seconds() {
 }
 
 # Records a pass, or a lint failure, under the tree its verdict was judged on
-# (VERDICT_KEY; lint's rewrites are part of it), before the token is released
+# (VERDICT_KEY includes lint repairs).
 # so a peer queued on the same call finds it. A record replaces the other kind
 # on the same tree. A third word `mac` marks a pass the Mac ran (`host=mac`),
 # which a --local call does not reuse. Fails when there is nothing to record,
@@ -3187,7 +3104,7 @@ user_clock() {
 
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
-    # A lost token gives no verdict about the tree.
+    # An unstarted command gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
     if [[ "$CMD" == lint ]]; then
         [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
@@ -3340,523 +3257,7 @@ trap - INT TERM HUP
 PROGRESS_HISTORY="${HOME}/.claude/scripts/direct/progress_history.py"
 ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
 
-# A phase runs two workers against one target/ directory and one Cargo lock,
-# so every cargo run below has to be serialized against its peers. Taking the
-# token here rather than asking each worker's prompt to take it is deliberate:
-# a rule that lives only in a prompt is a rule an agent can drop, and dropping
-# this one blocks the whole team behind a lock nobody announced.
-#
-# UNIT_RUN_DIR is deliberately not UNIT_SESSION_DIR: that
-# variable also opens a progress activity window, and concurrent windows
-# would collide in a recorder that keeps one.
-BOARD_HELPER="${HOME}/.claude/scripts/direct/board.sh"
-BOARD_DIR="${UNIT_RUN_DIR:-}"
-BOARD_SLOT="${UNIT_TEAM_ROLE:-}"
-# The unit director's own run (a session dir, no board, no team role) takes the
-# token too, as slot `director` on the session's board, so it queues with the
-# workers' detached runs instead of building beside them.
-if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${UNIT_SESSION_DIR:-}" ]]; then
-    BOARD_DIR="${UNIT_SESSION_DIR}"
-    BOARD_SLOT=director
-fi
-# TOKEN_USED: this run takes the token. TOKEN_HELD: it holds the token now. The
-# token is released during holds and remote work.
-TOKEN_USED=0
-TOKEN_HELD=0
-# A step routed to the Mac skips its first token acquisition.
-TOKEN_WAITED=0
-TOKEN_WAITER_PID=""
-# A local grant sets this to its hold check: a hold that starts during the token wait ends it.
-TOKEN_WAIT_HOLD_CHECK=""
-# shellcheck source=/dev/null
-source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
-TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)" || exit 2
-TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)" || exit 2
-TOKEN_RENEW_S=$(awk -v interval="$TOKEN_RENEW_S" -v hold="$TOKEN_HOLD_S" \
-    'BEGIN { if (interval > hold / 3) interval = hold / 3; print interval }')
-token_wait_clock() {
-    # Tests can advance a disposable clock while acquisition still blocks on
-    # the real board. Normal calls retain Bash's elapsed-seconds clock.
-    if [[ -n "${UNIT_TOKEN_CLOCK_FILE:-}" ]]; then
-        read -r TOKEN_CLOCK_NOW < "$UNIT_TOKEN_CLOCK_FILE"
-    else
-        TOKEN_CLOCK_NOW=$SECONDS
-    fi
-}
-# A run ended during its token wait stops the waiting acquire, gives back a
-# token that acquire took in the last instant, then ends by its caller's trap,
-# or by the signal itself when the caller has none.
-# A hold check ended the wait before the token came; this call holds no token.
-token_wait_left() {
-    phase_wait_finish token
-    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
-    TOKEN_WAIT_ENTRY=""
-    trap - INT TERM HUP
-    eval "$TOKEN_CALLER_TRAPS"
-}
-
-token_wait_interrupted() {
-    local signal_name=$1
-    trap - INT TERM HUP
-    if [[ -n "$TOKEN_WAITER_PID" ]]; then
-        collect_child "$TOKEN_WAITER_PID" TERM
-    fi
-    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
-    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
-    TOKEN_WAIT_INTERRUPTED=1
-    eval "$TOKEN_CALLER_TRAPS"
-    kill -s "$signal_name" "${BASHPID:-$$}"
-}
-# A newer call from the same worker, with the same verb and arguments in the
-# same worktree, ends this one while it still waits for its first token: the
-# newer call checks a newer tree, so this verdict is no longer wanted (one
-# worker queued 27 such calls on 2026-10-21, and peers waited 20 h behind
-# them). A lint key leaves out its package, since every lint covers the
-# workspace. A waiting call keeps a file named <slot>.<key>.<start>.<pid> in
-# the board's token_waiters folder; a newer call sends SIGUSR1 to each older one that still
-# runs verify.sh. A call that holds the token runs to the end, and a signal
-# that lands after the wait does nothing.
-#
-# The same files make one queue: a call tries for the token only while no
-# older call that still runs verify.sh waits. Before, any poller took a freed
-# token, and with about 25 calls on one board two calls waited 3 and 3.5 h
-# behind newer ones (2026-10-22). A call that releases the token during a
-# hold waits again under its first start, in a file with an `.again`
-# suffix: it keeps its place, and a newer call does not supersede it, since it
-# already took the token once.
-VERIFY_SUPERSEDED_STATUS=76
-TOKEN_WAITERS_DIR=""
-TOKEN_WAITER_PREFIX=""
-TOKEN_WAITER_FILE=""
-TOKEN_WAITER_OWN_STAMP=0
-TOKEN_WAIT_ENTRY=""
-TOKEN_FIRST_WAIT_DONE=0
-TOKEN_WAITERS_AHEAD=0
-TOKEN_SUPERSEDED=0
-# Minutes between the "still waiting for the cargo token" lines.
-TOKEN_WAIT_NOTE_MIN=5
-trap ':' USR1
-token_waiters_key() {
-    local key_args=(${ARGS[@]+"${ARGS[@]}"})
-    if [[ "$CMD" == lint && ${#key_args[@]} -gt 0 && "${key_args[0]}" != --* ]]; then
-        key_args=("${key_args[@]:1}")
-    fi
-    local hash
-    hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | hash_stream)"
-    printf '%s\n' "${hash:0:16}"
-}
-supersede_older_waiters() {
-    local file name pid stamp own=${TOKEN_WAITER_FILE%.*}
-    own=${own##*.}
-    for file in "$TOKEN_WAITERS_DIR/$TOKEN_WAITER_PREFIX".*.*; do
-        [[ -f "$file" ]] || continue
-        name=${file##*/}
-        pid=${name##*.}
-        stamp=${name%.*}
-        stamp=${stamp##*.}
-        [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
-        if ! kill -0 "$pid" 2>/dev/null; then
-            rm -f "$file"
-        elif (( 10#$stamp < 10#$own )) \
-            && ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'; then
-            kill -USR1 "$pid" 2>/dev/null || true
-        fi
-    done
-}
-token_waiter_runs_verify() {
-    local pid=$1 args=()
-    kill -0 "$pid" 2>/dev/null || return 1
-    if [[ -r "/proc/$pid/cmdline" ]]; then
-        mapfile -d '' args < "/proc/$pid/cmdline" 2>/dev/null || return 1
-        [[ "${args[*]}" == *verify.sh* ]]
-    else
-        ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'
-    fi
-}
-# Sets TOKEN_WAITERS_AHEAD to the waiting calls that started before this one,
-# and removes the files of calls that no longer run.
-count_token_waiters_ahead() {
-    local file name pid stamp
-    TOKEN_WAITERS_AHEAD=0
-    [[ -n "$TOKEN_WAITERS_DIR" ]] || return 0
-    for file in "$TOKEN_WAITERS_DIR"/*; do
-        [[ -f "$file" ]] || continue
-        name=${file##*/}
-        name=${name%.again}
-        pid=${name##*.}
-        stamp=${name%.*}
-        stamp=${stamp##*.}
-        [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
-        if ! token_waiter_runs_verify "$pid"; then
-            rm -f "$file"
-        elif (( 10#$stamp < 10#$TOKEN_WAITER_OWN_STAMP )); then
-            TOKEN_WAITERS_AHEAD=$(( TOKEN_WAITERS_AHEAD + 1 ))
-        fi
-    done
-}
-# Prints the token wait to the log: a line when it starts, one every
-# TOKEN_WAIT_NOTE_MIN minutes, and one when the token is taken.
-token_wait_note() {
-    local kind=$1 waited_min=$2 holder="" holder_pid="" who
-    if [[ -r "${BOARD_DIR}/locks/cargo.d/holder" ]]; then
-        holder=$(< "${BOARD_DIR}/locks/cargo.d/holder")
-    fi
-    if [[ -r "${BOARD_DIR}/locks/cargo.d/holder_pid" ]]; then
-        holder_pid=$(< "${BOARD_DIR}/locks/cargo.d/holder_pid")
-    fi
-    if [[ "$holder_pid" == "$$" ]]; then
-        who="this call holds it (pid $holder_pid)"
-    elif [[ -n "$holder" ]]; then
-        who="$holder (pid ${holder_pid:-unknown}) holds it"
-    elif (( TOKEN_WAITERS_AHEAD > 0 )); then
-        who="it is free and goes to an earlier call"
-    else
-        who="it came free just now"
-    fi
-    case "$kind" in
-        first) printf 'waiting for the cargo token since %s: %s; calls ahead of this one: %d\n' \
-            "$(TZ="$("$PY" -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%H:%M %Z')" \
-            "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
-        still) printf 'still waiting for the cargo token (%d min): %s; calls ahead of this one: %d\n' \
-            "$waited_min" "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
-        taken) printf 'took the cargo token after %d min\n' "$waited_min" >&2 ;;
-    esac
-}
-# Ends a call that a newer one replaced. Its caller reads this as no verdict,
-# never as a failure to repair: the newer call's result answers instead.
-# A step whose call is gone has no one to give a result to, and the token
-# never comes: board.sh answers a dead --pid with "gone" (exit 4). On
-# 2026-10-20 a step a test left behind tried again here for 45 h.
-token_wait_orphaned() {
-    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
-    trap - INT TERM HUP
-    echo "verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token." >&2
-    exit 1
-}
-token_wait_superseded() {
-    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
-    rm -f "$TOKEN_WAIT_ENTRY"
-    trap - INT TERM HUP
-    TOKEN_WAIT_S=$TOKEN_WAITED
-    printf 'verify.sh: superseded by a newer %s call; this call ran nothing. Read the newer call'"'"'s result: nothing failed and nothing needs a repair.\n' "$CMD"
-    note_event superseded "$SECONDS" 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
-    exit "$VERIFY_SUPERSEDED_STATUS"
-}
-# A release stays visible to every shell until an acquisition succeeds.
-sync_token_state() {
-    if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
-        TOKEN_HELD=0
-    fi
-}
-
-token_acquired() {
-    TOKEN_HELD=1
-    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
-}
-
-# Dead holders release the token. The queue removes waiters whose verify.sh ended.
-# TOKEN_WAITED records the elapsed wait in seconds.
-# The local argument disables remote routing for a local formatter.
-record_token_wait() {
-    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
-    fi
-}
-
-acquire_token() {
-    buildlog_check_nested_step || return $?
-    sync_token_state
-    TOKEN_WAITED=0
-    [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
-    local started noted=-1 waited pause
-    # A step's subshell has no traps of its own, though trap -p there prints
-    # the parent's: restoring those would run the parent's cleanup in the step.
-    TOKEN_CALLER_TRAPS=""
-    if [[ "${BASHPID:-$$}" == "$$" ]]; then
-        TOKEN_CALLER_TRAPS="$(trap -p INT TERM HUP)"
-    fi
-    trap 'token_wait_interrupted INT' INT
-    trap 'token_wait_interrupted TERM' TERM
-    trap 'token_wait_interrupted HUP' HUP
-    token_wait_clock
-    started=$TOKEN_CLOCK_NOW
-    TOKEN_WAIT_ENTRY=""
-    if [[ -n "$TOKEN_WAITER_FILE" ]]; then
-        TOKEN_WAIT_ENTRY=$TOKEN_WAITER_FILE
-        (( TOKEN_FIRST_WAIT_DONE == 0 )) || TOKEN_WAIT_ENTRY="${TOKEN_WAITER_FILE}.again"
-        : > "$TOKEN_WAIT_ENTRY"
-    fi
-    local status
-    while :; do
-        if (( TOKEN_SUPERSEDED )); then
-            token_wait_clock
-            TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
-            token_wait_superseded
-        fi
-        kill -0 "$$" 2>/dev/null || token_wait_orphaned
-        if [[ -n "$TOKEN_WAIT_HOLD_CHECK" ]]; then
-            local hold_status=0
-            "$TOKEN_WAIT_HOLD_CHECK" || hold_status=$?
-            if (( hold_status != 0 )); then
-                token_wait_clock
-                TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
-                token_wait_left
-                return "$hold_status"
-            fi
-        fi
-        count_token_waiters_ahead
-        if (( noted >= 0 )); then phase_wait_start token "cargo token"; fi
-        # The line goes out before the first try when the token is not free.
-        if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
-            phase_wait_start token "cargo token"
-            token_wait_note first 0
-            noted=0
-        fi
-        status=1
-        pause=3
-        if (( TOKEN_WAITERS_AHEAD == 0 )); then
-            # Two tries 3 s apart, then the queue is read again.
-            pause=1
-            bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-                --pid $$ --hold "$TOKEN_HOLD_S" --wait 3 >/dev/null 2>&1 &
-            TOKEN_WAITER_PID=$!
-            status=0
-            wait "$TOKEN_WAITER_PID" || status=$?
-            # SIGUSR1 ends the wait builtin early; the acquire may have won first.
-            if (( status != 0 && TOKEN_SUPERSEDED )); then
-                kill "$TOKEN_WAITER_PID" 2>/dev/null || true
-                status=0
-                wait "$TOKEN_WAITER_PID" 2>/dev/null || status=$?
-            fi
-            if (( status == 0 )); then
-                TOKEN_SUPERSEDED=0
-                break
-            fi
-            TOKEN_WAITER_PID=""
-            (( status != 4 )) || token_wait_orphaned
-        fi
-        token_wait_clock
-        waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
-        if (( noted < 0 )); then
-            phase_wait_start token "cargo token"
-            token_wait_note first 0
-            noted=0
-        elif (( waited >= noted + TOKEN_WAIT_NOTE_MIN )); then
-            token_wait_note still "$waited"
-            noted=$waited
-        fi
-        (( TOKEN_SUPERSEDED )) || sleep "$pause"
-    done
-    phase_wait_finish token
-    TOKEN_WAITER_PID=""
-    token_acquired
-    TOKEN_FIRST_WAIT_DONE=1
-    trap ':' USR1
-    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
-    TOKEN_WAIT_ENTRY=""
-    trap - INT TERM HUP
-    eval "$TOKEN_CALLER_TRAPS"
-    token_wait_clock
-    TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
-    (( noted < 0 )) || token_wait_note taken $(( TOKEN_WAITED / 60 ))
-}
-if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
-    TOKEN_USED=1
-    TOKEN_WAITERS_DIR="${BOARD_DIR}/token_waiters"
-    TOKEN_WAITER_PREFIX="${BOARD_SLOT}.$(token_waiters_key)"
-    mkdir -p "$TOKEN_WAITERS_DIR"
-    TOKEN_WAITER_STAMP=${EPOCHREALTIME:-$(date +%s).000000}
-    TOKEN_WAITER_OWN_STAMP=${TOKEN_WAITER_STAMP/[.,]/}
-    TOKEN_WAITER_FILE="${TOKEN_WAITERS_DIR}/${TOKEN_WAITER_PREFIX}.${TOKEN_WAITER_OWN_STAMP}.$$"
-    trap 'TOKEN_SUPERSEDED=1' USR1
-    supersede_older_waiters
-fi
-
-# Fork before starting each step. The child creates its own session, records
-# its group leader under the token guard, and only then starts the command.
-# This also covers the first instant of a step, when a killed verify cannot
-# leave a command that a periodic process scan has not found yet.
-STEP_OWNER_PY='
-import fcntl
-import json
-import os
-from pathlib import Path
-import signal
-import subprocess
-import sys
-
-lock = Path(sys.argv[1])
-holder = sys.argv[2]
-command = sys.argv[3:]
-
-def shell_status(status: int) -> int:
-    return status if status >= 0 else 128 - status
-
-with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.lib.process_start import Started, process_start, process_start_format
-
-def identity(pid):
-    result = process_start(pid)
-    if not isinstance(result, Started):
-        raise RuntimeError("cannot read the step owner start")
-    return result.start
-
-child = os.fork()
-if child:
-    def forward(signum, _frame):
-        try:
-            if (sent := subprocess.run([str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "py"), str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "process_group.py"), str(child), str(signum)], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
-        except ProcessLookupError:
-            # The child has not created its new group yet, or has exited.
-            try:
-                os.kill(child, signum)
-            except ProcessLookupError:
-                pass
-
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(signum, forward)
-    _, status = os.waitpid(child, 0)
-    sys.exit(shell_status(os.waitstatus_to_exitcode(status)))
-
-os.setsid()
-with (lock.parent / "cargo.guard").open("a+") as guard:
-    fcntl.flock(guard, fcntl.LOCK_EX)
-    # A token released or reclaimed after the grant leaves no holder_pid,
-    # or a holder that recorded none: either way this run no longer holds it.
-    try:
-        recorded = (lock / "holder_pid").read_text()
-    except OSError:
-        recorded = ""
-    if recorded != holder:
-        lost_file = os.environ.get("VERIFY_TOKEN_LOST_FILE")
-        if lost_file:
-            Path(lost_file).write_text("lost")
-        print("verify.sh: lost the cargo token before its step started", file=sys.stderr)
-        sys.exit(125)
-    record = lock / f"owned.{os.getpid()}.tmp"
-    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
-    os.replace(record, lock / "owned")
-    fcntl.flock(guard, fcntl.LOCK_UN)
-
-sys.exit(shell_status(subprocess.call(command)))
-'
-
-# Preserve the shared invocation policy (including systemd scopes and its
-# fallback), changing only the command it launches while this token is held.
-eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
-renew_token() {
-    local status=0
-    bash "${BOARD_HELPER}" renew "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-        --pid $$ --hold "$TOKEN_HOLD_S" >/dev/null 2>&1 || status=$?
-    # Status 2 means the guard cannot confirm ownership. Continue renewal.
-    (( status == 0 || status == 2 ))
-}
-
-# Each step command owns one renewer. Release stops the renewer before ownership changes.
-start_token_renewer() {
-    [[ "${TOKEN_HELD:-0}" -eq 1 ]] || return 0
-    renew_token || return 1
-    local renew_parent=${BASHPID:-$$}
-    (
-        local renew_sleep_pid="" renew_previous_pid="" renew_sleep_starting=0
-        # Bash can retain pipeline jobs that this subshell cannot wait for.
-        # Stop and collect only the sleep that this renewer started.
-        trap '
-            trap "" INT TERM HUP
-            # Bash sets $! before it can run this trap after the sleep starts.
-            if (( renew_sleep_starting )) && [[ "${!:-}" != "$renew_previous_pid" ]]; then
-                renew_sleep_pid=$!
-            fi
-            if [[ -n "$renew_sleep_pid" ]]; then
-                collect_child "$renew_sleep_pid" TERM
-            fi
-            exit 0
-        ' INT TERM HUP
-        while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
-            renew_previous_pid=${!:-}
-            renew_sleep_starting=1
-            sleep "$TOKEN_RENEW_S" &
-            renew_sleep_pid=$!
-            renew_sleep_starting=0
-            wait "$renew_sleep_pid" || break
-            renew_sleep_pid=""
-            renew_token || break
-        done
-    ) &
-    TOKEN_RENEWER_PID=$!
-}
-
-stop_token_renewer() {
-    [[ -n "${TOKEN_RENEWER_PID:-}" ]] || return 0
-    collect_child "$TOKEN_RENEWER_PID" TERM
-    TOKEN_RENEWER_PID=""
-}
-
-buildlog_exec() {
-    if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        local TOKEN_RENEWER_PID="" step_status=0
-        if ! start_token_renewer; then
-            printf lost > "${HOLD_WAIT_DIR:?}/token-lost"
-            printf 'verify.sh: lost the cargo token before its step started\n' >&2
-            return 125
-        fi
-        VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
-            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
-                "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
-        stop_token_renewer
-        return "$step_status"
-    else
-        buildlog_exec_unowned "$@"
-    fi
-}
-
-# Retry only when the ownership guard started no command.
-# run_once releases the reservation and sampler before this call.
-buildlog_retry_unstarted_step() {
-    BUILDLOG_RETRY_STEP=0
-    [[ -s "$HOLD_WAIT_DIR/token-lost" ]] || return 0
-    rm -f "$HOLD_WAIT_DIR/token-lost"
-    # shellcheck disable=SC2034 # invoke.sh reads this callback result.
-    BUILDLOG_RETRY_STEP=1
-    TOKEN_HELD=0
-    if [[ -n "${BUILDLOG_PLACEMENT_EPISODE:-}" ]]; then
-        if [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-            : > "${TOKEN_WAIT_FILE}.given_back"
-        fi
-        BUILDLOG_RETRY_STEP=0
-        return "$LINT_LEFT_QUEUE_STATUS"
-    fi
-    if ! buildlog_step_compiles "$@"; then
-        acquire_token local || return $?
-        record_token_wait
-    fi
-}
-
-release_token() {
-    stop_token_renewer
-    # A subshell records its release for the parent shell.
-    # A killed acquisition can still hold the token, so release that token too.
-    if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
-        if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-            bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
-        fi
-        TOKEN_HELD=0
-    fi
-    [[ "${TOKEN_HELD}" -eq 1 ]] || return 0
-    local release_status=0
-    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null \
-        || release_status=$?
-    # An ownership identity change permits reclaim. Preserve the original step result.
-    (( release_status == 0 || release_status == 3 )) || return "$release_status"
-    TOKEN_HELD=0
-    if [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        : > "${TOKEN_WAIT_FILE}.given_back"
-    fi
-}
-
-# A local attempt waits for memory without its cargo token, so the unit's other
-# calls keep building. After the grant it takes the token; the grant keeps its
-# reservation during that wait. A grant from placement already holds the token.
+# Record a direct local memory wait when there is no placement grant.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
 buildlog_wait_for_memory() {
     if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
@@ -3866,26 +3267,13 @@ buildlog_wait_for_memory() {
     local status=0
     BUILDLOG_MEM_WAIT_S=0
     step_state waiting_hold
-    sync_token_state
-    release_token || return $?
     buildlog_wait_for_memory_only "$@" || status=$?
-    if (( status != 0 )) || [[ "$BUILDLOG_MEM_OUTCOME" != Granted ]]; then
-        return "$status"
+    if (( status == 0 )) && [[ "$BUILDLOG_MEM_OUTCOME" == Granted ]]; then
+        step_state on_natedev
     fi
-    acquire_token local || status=$?
-    if (( status != 0 )); then
-        buildlog_release_memory "$status"
-        return "$status"
-    fi
-    record_token_wait
-    step_state on_natedev
+    return "$status"
 }
 
-# A build hold stops every natedev build, so a step gives the token back while
-# it waits out a hold too, and takes it again after the release; a step that
-# leaves the hold wait for the Mac (status LINT_LEFT_QUEUE_STATUS) does not. The
-# hold time stays in the hold wait record; only the time to take the token
-# again counts as token wait. With no hold present, nothing is given back.
 refresh_test_build_inputs() {
     # Admission and the recorder must see the inputs after a hold, just as
     # buildlog_begin takes its source key after that wait.
@@ -3913,20 +3301,9 @@ build_hold_wait_local() {
     fi
     step_state waiting_hold
     phase_wait_start hold "build hold"
-    # A step without the token (before the first take, or after a Mac trip) only waits.
-    if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
-        build_hold_wait_local_only "$@" || status=$?
-        phase_wait_finish hold
-        if [[ "${status:-0}" -ne 0 ]]; then return "$status"; fi
-        if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
-        return 0
-    fi
-    release_token || return $?
     build_hold_wait_local_only "$@" || status=$?
     phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
-    acquire_token || return $?
-    record_token_wait
     if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
     return "$status"
 }
@@ -3934,14 +3311,10 @@ build_hold_wait_local() {
 # Again before the first step: a peer running this same call on this tree may
 # have recorded its result since the first lookup.
 if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
-    if ! release_token && (( LOOKUP_STATUS == 0 )); then
-        LOOKUP_STATUS=1
-    fi
     exit "${LOOKUP_STATUS}"
 fi
 RUN_STARTED=${SECONDS}
 MEM_KILL_FILE="$(mktemp)"
-TOKEN_WAIT_FILE="$(mktemp)"
 if [[ "$CMD" == test ]]; then
     # The common path calculates once; a later hold refreshes after its wait.
     refresh_test_build_inputs
@@ -3972,8 +3345,6 @@ stop_interrupted_run_log() {
 }
 
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
-    # Taken now, after the token and hold waits: an edit made while this call
-    # waited is part of the tree it runs on.
     if [[ "$CMD" != test ]]; then set_verdict_keys; fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
@@ -4010,9 +3381,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     fi
 fi
 
-# One exit path for both the progress window and the token, so a run that fails
-# or is interrupted still hands the token back instead of leaving its peers to
-# wait out the hold.
+# Close progress records and release the placement when verify ends.
 verify_cleanup() {
     local status=$1 outcome=ran code="${EXIT_STATUS}"
     if [[ "$EXIT_STATUS" == "$TREE_CHANGED_STATUS" ]]; then status=cancelled; fi
@@ -4041,10 +3410,6 @@ verify_cleanup() {
     if [[ "${ACTIVITY_ACTIVE}" -eq 1 ]]; then
         finish_activity "${status}"
     fi
-    if ! release_token && (( EXIT_STATUS == 0 )); then
-        EXIT_STATUS=1
-    fi
-    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "$TOKEN_WAIT_FILE" "${TOKEN_WAIT_FILE}.given_back"
     release_wait_claim
     if [[ -n "${PLACEMENT_EPISODE:-}" && "$PLACEMENT_OUTCOME" != unresolved ]]; then
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" --pid "${PLACEMENT_OWNER_PID:-$$}" \
@@ -4086,17 +3451,12 @@ verify_interrupted() {
     interrupt_hold_wait
     if [[ -n "$RUN_STEP_PID" ]]; then
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
-        release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
     verify_cleanup interrupted
     finish_verify_run "$EXIT_STATUS"
     stop_interrupted_run_log
-    if [[ "${TOKEN_WAIT_INTERRUPTED:-0}" == 1 ]]; then
-        trap - INT TERM HUP
-        kill -s "$1" "${BASHPID:-$$}"
-    fi
     exit "$EXIT_STATUS"
 }
 trap 'verify_interrupted 2' INT

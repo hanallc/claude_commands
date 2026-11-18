@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -126,31 +124,6 @@ class VerifyMetadataTests(unittest.TestCase):
 
 
 class VerifyShellHelperTests(unittest.TestCase):
-    def test_waiter_hash_preserves_scope_without_python(self) -> None:
-        for tool in ("sha256sum", "shasum"):
-            executable = shutil.which(tool)
-            if executable is None:
-                continue
-            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as directory:
-                folder = Path(directory)
-                (folder / tool).symlink_to(executable)
-                script = "\n".join((
-                    "set -euo pipefail", 'PATH="$1"', 'PY=false',
-                    shell_functions(DIRECT / "verify.sh", "hash_stream", "token_waiters_key"),
-                    "CMD=lint; ARGS=(alpha --check); token_waiters_key",
-                    "CMD=lint; ARGS=(beta --check); token_waiters_key",
-                    "CMD=test; ARGS=(alpha --filter 'case_one'); token_waiters_key",
-                ))
-                result = subprocess.run(["bash", "-c", script, "hash-test", str(folder)],
-                                        cwd=folder, text=True, capture_output=True,
-                                        timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                scopes = (("lint", "--check"), ("lint", "--check"),
-                          ("test", "alpha", "--filter", "case_one"))
-                expected = [hashlib.sha256("\0".join((str(folder.resolve()), *words)).encode()).hexdigest()[:16]
-                            for words in scopes]
-                self.assertEqual(result.stdout.splitlines(), expected)
-
     def test_routing_wait_records_shell_elapsed_time_without_python(self) -> None:
         source = (DIRECT / "verify.sh").read_text()
         with tempfile.TemporaryDirectory() as directory:

@@ -11,7 +11,7 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -163,40 +163,6 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
             if hidden.exists():
                 _ = hidden.rename(admission.socket_path)
 
-    def test_a_token_lost_after_the_grant_refuses_execution_and_the_retry_takes_it_again(self) -> None:
-        admission = caller_admission(self, self.root, self.environment)
-        board = self.root / "board"
-        errors = self.root / "lost-token.err"
-        attempts = self.root / "attempt-statuses"
-        released = self.root / "token-released"
-        shell = self.root / "observe-attempts.sh"
-        _ = shell.write_text('''set -T
-observe_attempt_status() {
-    if [[ "${FUNCNAME[1]:-}" == buildlog_exec && ! -e "$TEST_TOKEN_RELEASED" ]]; then
-        : > "$TEST_TOKEN_RELEASED"
-        bash "$TEST_BOARD" release "$UNIT_RUN_DIR" impl cargo --pid $$ >/dev/null 2>&1
-    fi
-    if [[ "${FUNCNAME[1]:-}" == run_step_attempt && "$BASH_COMMAND" == 'buildlog_retry_unstarted_step "$@"' ]]; then
-        printf '%s\\n' "$status" >> "$TEST_ATTEMPT_STATUSES"
-    fi
-}
-trap observe_attempt_status DEBUG
-''')
-        with errors.open("wb") as stream:
-            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
-                env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
-                     "BASH_ENV": str(shell), "TEST_ATTEMPT_STATUSES": str(attempts),
-                     "TEST_TOKEN_RELEASED": str(released), "TEST_BOARD": str(BOARD)},
-                stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(process.pid)
-        self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
-        self.assertTrue(released.exists())
-        self.assertEqual(attempts.read_text().splitlines()[0], "125")
-        self.assertIn("lost the cargo token before its step started", errors.read_text())
-        self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
-        self.assertFalse((board / "locks/cargo.d").exists())
-        wait_until(admission.callers_released, admission.state_dir)
-
     def test_two_boards_share_memory_without_a_resource_cycle(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         admission.free(20 * 1024 ** 3)
@@ -212,7 +178,7 @@ trap observe_attempt_status DEBUG
         second_errors = self.root / "second.err"
         second = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(second_board),
             "UNIT_TEAM_ROLE": "impl"}, second_errors)
-        self.assertEqual((first_board / "locks/cargo.d/holder_pid").read_text(), str(first.pid))
+        self.assertFalse((first_board / "locks/cargo.d").exists())
         self.assertFalse((second_board / "locks/cargo.d").exists(), "a memory waiter holds no cargo token")
         _ = (self.root / "release").touch()
         self.assertEqual(first.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())

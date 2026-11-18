@@ -1,4 +1,4 @@
-"""Check lease renewal, admission retry, and loaded lint input identity."""
+"""Check board renewal and loaded lint input identity."""
 from __future__ import annotations
 
 import fcntl
@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -17,269 +16,14 @@ from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, BOARD, VERIFY
-from scripts.direct.wait_for_test_state import wait_until
 
 SCRIPTS = VERIFY.parent.parent
 
 
-def token_renewal_functions() -> str:
-    return shell_functions(VERIFY, "collect_child", "start_token_renewer", "stop_token_renewer")
-
-
-def token_admission_functions() -> str:
-    return shell_functions(VERIFY, "record_token_wait", "buildlog_wait_for_memory")
-
-
-
-class LongStepOwnershipTests(VerifyTokenWaitFixture):
+class BoardRenewTests(VerifyTokenWaitFixture):
     def board(self, board: Path, *words: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(BOARD), words[0], str(board), *words[1:]],
                               env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-
-    def test_running_step_renews_past_its_original_hold_and_stops_on_release(self) -> None:
-        _ = write_config_fixture(self.root / "direct.conf", "VERIFY_TOKEN_HOLD_SECONDS=2\nVERIFY_TOKEN_RENEW_SECONDS=1")
-        board = self.root / "board"
-        process = self.start_owned_step({**self.environment, "UNIT_RUN_DIR": str(board),
-                                    "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
-                                    })
-        lock = board / "locks" / "cargo.d"
-        try:
-            self.wait_for_running(self.root / "running", process)
-            original_expiry = int((lock / "expires").read_text())
-            # Observe renewal after the original lease expires.
-            wait_until(lambda: int((lock / "expires").read_text() or "0") > original_expiry + 2,
-                       lock, processes=(process,))
-            rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
-            self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
-            self.assertEqual((lock / "holder").read_text().strip(), "first")
-        finally:
-            (self.root / "release").touch()
-            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertFalse(lock.exists())
-        # There must be no heartbeat left in the call's session after release.
-        self.assertEqual(self.live_group_processes(process.pid), [])
-
-    def test_expired_matching_live_step_keeps_ownership_but_dead_holder_is_freed(self) -> None:
-        board = self.root / "board"
-        process = self.start_owned_step({**self.environment, "UNIT_RUN_DIR": str(board),
-                                    "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
-                                    })
-        lock = board / "locks" / "cargo.d"
-        try:
-            self.wait_for_running(self.root / "running", process)
-            _ = (lock / "expires").write_text("0")
-            rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
-            self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
-            self.assertIsNone(process.poll())
-            self.end_group(process.pid)
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
-            self.assertEqual(rival.returncode, 0, rival.stdout + rival.stderr)
-        finally:
-            (self.root / "release").touch()
-            self.end_group(process.pid)
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            _ = self.board(board, "release", "second", "cargo", "--pid", str(os.getpid()))
-
-    def test_every_step_renews_before_launching_its_command(self) -> None:
-        harness = self.root / "two-steps.sh"
-        _ = harness.write_text("set -eu\n" + shell_functions(VERIFY, "renew_token")
-                               + token_renewal_functions()
-                               + shell_functions(VERIFY, "buildlog_exec") + r'''
-BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=holder STEP_RECORD_SCRIPT="$TEST_STEP_SCRIPT"
-source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
-TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)"
-TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)"
-TOKEN_HELD=1 PY=$3 STEP_OWNER_PY=""
-HOLD_WAIT_DIR="$TEST_HOLD_DIR"
-bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold 30
-buildlog_exec_unowned() {
-    test "$(cat "$BOARD_DIR/locks/cargo.d/expires")" -gt 0 || return 99
-    printf 'command started after renewal\n'
-}
-for step in first second; do
-    printf 0 > "$BOARD_DIR/locks/cargo.d/expires"
-    buildlog_exec true
-done
-test -z "${TOKEN_RENEWER_PID:-}"
-bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
-''')
-        result = subprocess.run(["bash", str(harness), str(BOARD), str(self.root / "board"), sys.executable],
-                                env={**self.environment, "TEST_STEP_SCRIPT": str(VERIFY.with_name("step_record.py")), "TEST_HOLD_DIR": str(self.root)}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.count("command started after renewal"), 2)
-
-    def memory_wait_process(self, *, lose_at_launch: bool = False, scoped_attempt: bool = False,
-                            board_helper: Path = BOARD, noncompiling: bool = False) -> subprocess.Popen[str]:
-        # Use the real board and ownership guard with controlled admission replies.
-        _ = write_config_fixture(self.root / "direct.conf", "VERIFY_TOKEN_HOLD_SECONDS=2\nVERIFY_TOKEN_RENEW_SECONDS=1")
-        source = VERIFY.read_text()
-        owner_start = source.index("STEP_OWNER_PY='\n")
-        owner_end = source.index("\nrelease_token() {", owner_start)
-        harness = self.root / "held-memory.sh"
-        _ = harness.write_text('set -eu\nsource "$4"\n'
-                               + source[owner_start:owner_end]
-                               + shell_functions(VERIFY, "release_token")
-                               + token_admission_functions() + r'''
-BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=first
-source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
-TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)"
-TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)"
-TOKEN_USED=1 TOKEN_HELD=0 TOKEN_WAIT_FILE="$TEST_ROOT/token-waits" TOKEN_WAITED=0 PY=$3
-BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_WAIT_FROM=0 BUILDLOG_MEM_OUTCOME=Granted passes=0
-HOLD_WAIT_DIR="$TEST_ROOT/hold"
-mkdir -p "$HOLD_WAIT_DIR"
-eval "$(declare -f buildlog_exec_unowned | sed '1s/buildlog_exec_unowned/buildlog_exec_actual/')"
-buildlog_exec_unowned() {
-    if [[ "$TEST_LOSE_AT_LAUNCH" == 1 && ! -f "$TEST_ROOT/lost-at-launch" ]]; then
-        : > "$TEST_ROOT/lost-at-launch"
-        bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
-    fi
-    buildlog_exec_actual "$@"
-}
-step_state() { :; }
-sync_token_state() { :; }
-buildlog_token_wait() { buildlog_release_memory 0; }
-token_acquired() { TOKEN_HELD=1; }
-build_hold_wait_local() { :; }
-build_hold_check_local() { :; }
-buildlog_begin() {
-    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_MEM_MAX_PATH="" BUILDLOG_MEM_SAMPLING_CONTEXT=""
-    if [[ "$TEST_SCOPED_ATTEMPT" == 1 ]]; then
-        BUILDLOG_PEAK="$TEST_ROOT/attempt.$RANDOM.peak"
-    fi
-}
-buildlog_end() {
-    printf '%s\n' "$1" >> "$TEST_ROOT/recorded-statuses"
-    [[ -z "$BUILDLOG_PEAK" ]] || rm -f "$BUILDLOG_PEAK"
-}
-# Run the real scope shell without requiring a user systemd manager.
-systemd-run() {
-    while [[ "$1" != -- ]]; do shift; done
-    shift
-    printf '%s\n' "$BUILDLOG_PEAK" >> "$TEST_ROOT/scoped-attempts"
-    "$@"
-}
-sweep_after_step() { :; }
-buildlog_release_memory() {
-    rm -f "$TEST_ROOT/reservation"
-    BUILDLOG_MEM_RESERVATION=""
-}
-# Use the real board for token ownership.
-acquire_token() {
-    TOKEN_WAITED=0
-    [[ "$TOKEN_HELD" == 0 ]] || return 0
-    : > "$TEST_ROOT/token-wait"
-    bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold "$TOKEN_HOLD_S" --wait 30
-    TOKEN_HELD=1
-    if [[ -f "$TEST_ROOT/acquisitions" ]]; then TOKEN_WAITED=7; fi
-    printf 'acquired\n' >> "$TEST_ROOT/acquisitions"
-    rm -f "$TEST_ROOT/token-wait"
-}
-buildlog_wait_for_memory_only() {
-    passes=$(( passes + 1 ))
-    if (( passes == 1 )); then
-        : > "$TEST_ROOT/memory-wait"
-        "$PY" "$TEST_WAIT_HELPER" "$TEST_RELEASE"
-    fi
-    BUILDLOG_MEM_RESERVATION="$TEST_ROOT/reservation"
-    : > "$BUILDLOG_MEM_RESERVATION"
-    printf '%s\n' "$TOKEN_HELD" >> "$TEST_ROOT/admission-holders"
-}
-trap 'stop_token_renewer; release_token; buildlog_release_memory; rm -rf "$HOLD_WAIT_DIR"' EXIT
-if [[ "$TEST_NONCOMPILING" == 1 ]]; then
-    buildlog_step_compiles() { return 1; }
-    acquire_token
-fi
-run_once cargo check
-release_token
-''')
-        # The fake cargo command uses the real launcher and ownership guard.
-        environment = {**self.environment, "TEST_ROOT": str(self.root), "STEP_RECORD_SCRIPT": str(VERIFY.with_name("step_record.py")),
-                       "TEST_LOSE_AT_LAUNCH": "1" if lose_at_launch else "0",
-                       "TEST_SCOPED_ATTEMPT": "1" if scoped_attempt else "0",
-                       "TEST_REAL_BOARD": str(BOARD), "TEST_NONCOMPILING": "1" if noncompiling else "0",
-                       "TEST_BLOCK": "1", "TEST_RUNNING": str(self.root / "command-ran")}
-        process = subprocess.Popen(["bash", str(harness), str(board_helper), str(self.root / "board"), sys.executable,
-                                    str(SCRIPTS / "lint" / "invoke.sh")],
-                                   cwd=self.root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   start_new_session=True)
-        self.started_groups.add(process.pid)
-        self.addCleanup(self.finish_memory_wait, process)
-        return process
-
-    def finish_memory_wait(self, process: subprocess.Popen[str]) -> None:
-        (self.root / "release").touch()
-        if process.poll() is None:
-            self.end_group(process.pid)
-        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-
-    def test_a_memory_wait_holds_no_token_and_the_step_takes_it_after_the_grant(self) -> None:
-        process = self.memory_wait_process()
-        lock = self.root / "board" / "locks" / "cargo.d"
-        self.wait_for_running(self.root / "memory-wait", process)
-        self.assertFalse(lock.exists(), "the memory wait holds the token")
-        (self.root / "release").touch()
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertTrue((self.root / "command-ran").exists())
-        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0"])
-        self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired"])
-        self.assertFalse(lock.exists())
-        self.assertEqual(self.live_group_processes(process.pid), [])
-
-    def test_a_grant_keeps_its_reservation_while_a_peer_holds_the_token(self) -> None:
-        process = self.memory_wait_process()
-        board = self.root / "board"
-        self.wait_for_running(self.root / "memory-wait", process)
-        rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
-        self.assertEqual(rival.returncode, 0, rival.stdout + rival.stderr)
-        try:
-            (self.root / "release").touch()
-            self.wait_for_running(self.root / "token-wait", process)
-            self.assertTrue((self.root / "reservation").exists(), "the token wait gave up its grant")
-            self.assertFalse((self.root / "command-ran").exists())
-        finally:
-            _ = self.board(board, "release", "second", "cargo", "--pid", str(os.getpid()))
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertTrue((self.root / "command-ran").exists())
-        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0"])
-        self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
-        self.assertFalse((self.root / "reservation").exists())
-        self.assertFalse((self.root / "hold").exists())
-        self.assertEqual(self.live_group_processes(process.pid), [])
-
-    def test_ownership_guard_refusal_readmits_before_running_and_records_only_the_step(self) -> None:
-        process = self.memory_wait_process(lose_at_launch=True, scoped_attempt=True)
-        self.wait_for_running(self.root / "memory-wait", process)
-        (self.root / "release").touch()
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertTrue((self.root / "command-ran").exists())
-        self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired", "acquired"])
-        # Each memory wait runs without the token.
-        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0", "0"])
-        self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
-        # The first take waits for no peer, so only the retry records a token wait.
-        self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
-        self.assertFalse((self.root / "reservation").exists())
-        self.assertFalse((self.root / "hold").exists())
-        self.assertEqual(len((self.root / "scoped-attempts").read_text().splitlines()), 2)
-        self.assertEqual(list(self.root.glob("attempt.*.peak")), [], "discarded scope kept its peak file")
-        self.assertEqual(list(self.root.glob("attempt.*.peak.cgroup")), [])
-        self.assertEqual(self.live_group_processes(process.pid), [])
-
-    def test_unstarted_noncompiling_step_reacquires_before_its_command(self) -> None:
-        process = self.memory_wait_process(lose_at_launch=True, noncompiling=True)
-        self.wait_for_running(self.root / "command-ran", process)
-        (self.root / "release").touch()
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired", "acquired"])
-        self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
-        self.assertFalse((self.root / "board/locks/cargo.d").exists())
 
     def test_renew_requires_the_matching_holder_pid(self) -> None:
         board = self.root / "board"
@@ -370,7 +114,7 @@ if arguments[:1] == ["clippy"]:''')
             self.assertEqual(self.calls("clippy"), [])
 
 
-    def test_lost_token_status_is_not_cached_as_a_tree_lint_failure(self) -> None:
+    def test_unstarted_status_is_not_cached_as_a_tree_lint_failure(self) -> None:
         cache = self.enable_cache()
         self.environment["TEST_CLIPPY_STATUS"] = "125"
         result = self.invoke_verify("lint", "sample", cwd=self.root)

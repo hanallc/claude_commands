@@ -164,10 +164,10 @@ class VerifyBuildKeyTests(support.VerifyLintScopeFixture):
         source = support.VERIFY.read_text(encoding="utf-8")
         # Use the actual hold wrapper and pre-run key setup, including their
         # ordering relative to invoke.sh's run_once and buildlog_begin.
-        hold_wrapper = "# A build hold stops every natedev build," + source.split(
-            "# A build hold stops every natedev build,", 1)[1].split(
+        hold_wrapper = "refresh_test_build_inputs() {" + source.split(
+            "refresh_test_build_inputs() {", 1)[1].split(
                 "# Again before the first step:", 1)[0]
-        key_setup = source.split('TOKEN_WAIT_FILE="$(mktemp)"\n', 1)[1].split(
+        key_setup = source.split('MEM_KILL_FILE="$(mktemp)"\n', 1)[1].split(
             'if [[ -n "${CACHE_DIR}" ]]', 1)[0]
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         packages = cast(list[dict[str, object]], metadata["packages"])

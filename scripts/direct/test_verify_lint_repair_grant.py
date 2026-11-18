@@ -21,8 +21,6 @@ from scripts.lint.memory_test_support import write_pressure_reading
 class PlacementStop(Enum):
     NONE = ""
     REPAIR_HOLD = "repair-hold"
-    REPAIR_TOKEN_LOSS = "repair-token-loss"
-    TOKEN_WAIT_HOLD = "token-wait-hold"
 
 
 PLACEMENT_STOP = r"""
@@ -35,34 +33,6 @@ case "$TEST_PLACEMENT_STOP" in
                 return 10
             fi
             fixture_hold_check
-        }
-        ;;
-    repair-token-loss)
-        eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/fixture_exec/')"
-        buildlog_exec() {
-            if [[ "${LINT_REPAIR_REUSED_GRANT:-}" == 1 && ! -e "$TEST_STOP_APPLIED" ]]; then
-                : > "$TEST_STOP_APPLIED"
-                printf lost > "$HOLD_WAIT_DIR/token-lost"
-                return 125
-            fi
-            fixture_exec "$@"
-        }
-        ;;
-    token-wait-hold)
-        eval "$(declare -f acquire_token | sed '1s/acquire_token/fixture_acquire_token/')"
-        eval "$(declare -f buildlog_release_memory | sed '1s/buildlog_release_memory/fixture_release_memory/')"
-        acquire_token() {
-            if [[ -n "${TOKEN_WAIT_HOLD_CHECK:-}" && ! -e "$TEST_STOP_APPLIED" ]]; then
-                : > "$TEST_STOP_APPLIED"
-                return 10
-            fi
-            fixture_acquire_token "$@"
-        }
-        buildlog_release_memory() {
-            fixture_release_memory "$@"
-            if [[ "$1" == 10 && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then
-                cp "$PLACEMENT_GRANT_FILE.outcome" "$TEST_STOP_APPLIED.outcome"
-            fi
         }
         ;;
 esac
@@ -182,7 +152,7 @@ wanted=rev-parse
                 releases.append(request)
             repair_followup_request = False
             if isinstance(request, wire.PlacementRequest):
-                if (stop in (PlacementStop.REPAIR_HOLD, PlacementStop.REPAIR_TOKEN_LOSS)
+                if (stop is PlacementStop.REPAIR_HOLD
                         and grants and request.episode not in requested_episodes and not repair_followup):
                     first = grants[0].assignment
                     saved = admission.server.assignments[placement.attempt_key(first.episode, first.attempt)]
@@ -401,19 +371,6 @@ buildlog_release_memory 0
 
     def test_hold_after_reuse_abandons_judgment_before_placing_again(self) -> None:
         self.assert_stopped_repair_abandons_judgment(PlacementStop.REPAIR_HOLD)
-
-    def test_token_loss_after_reuse_abandons_judgment_before_placing_again(self) -> None:
-        self.assert_stopped_repair_abandons_judgment(PlacementStop.REPAIR_TOKEN_LOSS)
-
-    def test_cancel_in_token_wait_records_abandon_and_requests_a_new_episode(self) -> None:
-        run = self.repair(ordinary=True, fail_finish=True, stop=PlacementStop.TOKEN_WAIT_HOLD)
-        self.assertEqual(run.result.returncode, 0, run.result.stdout + run.result.stderr)
-        episode = run.grants[0].assignment.episode
-        self.assertEqual([cancel.episode for cancel in run.cancels], [episode])
-        self.assertNotEqual(run.grants[1].assignment.episode, episode)
-        report = self.fixture.root / "placement-stopped.outcome"
-        self.assertTrue(report.exists(), "the token wait release did not publish an outcome")
-        self.assertEqual(report.read_text().strip(), f"{episode}\tabandon")
 
     def test_unresolved_cleanup_preserves_cargo_status_and_blocks_the_next_request(self) -> None:
         run = self.repair(ordinary=True, fail_finish=True, fail_cancel=True)

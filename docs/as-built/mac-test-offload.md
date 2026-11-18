@@ -29,7 +29,7 @@ Standalone fixed local callers retain their existing local admission path.
 Doc prepares one staged snapshot before routing. Both routes judge that snapshot and write the same doc pass record after success, only if the staged tree still matches. The Mac runner gets the original repository identity and `--source-root` for the snapshot; it copies no unstaged or untracked sources.
 
 Lint judgments, check, and doc use the same availability checks and target reservations as tests.
-A free eligible target permits immediate routing, including during a natedev Cargo token wait.
+A free eligible target permits immediate routing.
 An idle alert marker does not control admission.
 Blocks, live repository claims, and retry delays still apply.
 Tree repair steps remain local.
@@ -648,7 +648,7 @@ Converted callers request placement before they claim a provider scope.
 `place-step --once` writes an `Assignment` or `LocalPlacementGranted` file.
 A wait retains the episode, original queue time, run place, and priority.
 Token readiness reports remain separate from fixed placement constraints.
-No placement wait holds the cargo token; a local grant takes it.
+A local grant permits the step to start after the final hold check.
 A remote selection releases the unused continuation claim.
 
 The adapter claims only the assignment's target, scope, and slot under the existing provider lock.
