@@ -678,41 +678,32 @@ The snapshot does not change `controller.json`.
 `spot_table.spot_tables` reads only the local snapshot, cost ledger and configuration.
 It is the one source of the price tables of the AWS page; no terminal output remains.
 The user, 2026-11-15, removed the `/aws_prices` command and its `deploy.py spot-table` output because the page shows the prices.
-It gives two price tables: the standard types, then the GPU types.
-Each has candidate regions as rows and machine types as columns.
-The user asked for this layout on 2026-11-15 through builds, because the regions outnumber the types.
-Each cell shows the lowest zone price in USD/h.
-A type that a region does not sell shows `—` (`spot_table.NOT_SOLD`), in `Table.not_sold`.
-Another empty cell says `no snapshot` or `read failed`.
-Cached prices and quotas remain visible after a read failure.
-Their price cells include `read failed`, and the regional detail gives the last good age.
-Old prices include `old <minutes> min` in their cells.
-Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
-Each region without evidence says `no snapshot was ever taken`.
-The table never uses a bare `-` for an unavailable value.
-Each region shows its snapshot age and a stale mark after `price_max_age_seconds`, under the prices.
-Below the prices, two quota tables show the Standard quota and the G and VT quota in vCPUs.
-Each also shows the number of boxes of its types that fit: standard types in the first, GPU types in the second.
-One region read writes the prices and both quotas together, so the quota cells show no age.
-The box counts divide the quota by the existing type-size vCPU calculation and round downward.
-An absent snapshot explains missing quotas and box counts without creating files.
-The standard rows are `instance_types`, then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
-The hourly snapshot reads prices for all three lists, so the page can compare types the gates do not use yet.
-Below the quotas, the page shows one run table for each standard type, with one line for each candidate region.
-The user asked for this layout on 2026-11-14 through builds. Each line shows:
-1. The lowest zone Spot price in USD/h.
-2. The median merge gate box time in minutes with one decimal, such as `7.5`, from launch to finish, boot included.
+It supplies Spot prices and quotas for Standard and GPU. It calculates gate estimates only for Standard.
+Each data table has one row per candidate region.
+Spot prices use the lowest zone price in USD/h.
+The snapshot retains prices and quotas from the last successful read.
+The snapshot lines give the age and result of each region's last read.
+A failure line gives the time, failed read, error class, and AWS error message.
+A region without a snapshot says that it has no snapshot.
+The standard types come from `instance_types` and `price_compare_instance_types`.
+The GPU types come from `gpu_instance_types`.
+The hourly snapshot reads all three lists.
+Below the Prices and quotas card, the page shows one run table per standard type.
+Each run table has one line per candidate region.
+The user asked for this layout on 2026-11-14 through builds. Each line has these columns.
+
+1. The median box time for the selected runs in minutes, from launch through finish, with one decimal such as `7.5`.
    Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
-3. Runs: the run count of that time.
+2. Runs gives the number of runs used to calculate the median.
    A region without its own runs uses the type's runs in other regions, and the cell says `elsewhere`.
    A type without runs uses the runs of the types with its vCPU count, and the cell says `same vCPUs`.
-4. The estimate: Spot price times that box time, plus the refusal wait cost.
-5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
-6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
+3. Paid USD/h divides the bill's `SpotUsage:<type>` cost for the type and region by its billed hours.
+4. Paid USD/run gives the selected runs' share of the bill, which splits between runs of both kinds by box time.
    The cell also counts the runs whose day has no bill yet, such as `0.0314 (17 bill due)`.
    A bill comes up to about a day late.
    A region whose runs all wait for a bill shows `17 bill due`; a region with no own runs of the type shows `no runs`.
-7. Paid runs: the count of runs that paid USD/run covers.
+5. Paid runs gives the number of runs that Paid USD/run covers.
+
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
@@ -732,35 +723,37 @@ A Spend card at the top shows today, yesterday and the month to date, with the m
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again
 when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
-The Prices and Quotas sections follow the Spend card.
-The user asked for these page changes on 2026-11-14 through builds:
-1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
-   `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
-   The cost cells are the estimate in USD for one run (`RunCosts.prices`), the estimate that gate placement uses.
-   A type and region with no estimate shows a dash. GPU types have no runs, so their cost cells are dashes.
-   The run kind switch also sets the run tables below. The URL keeps both choices, as `?prices=cost&runs=merge-gate`.
-2. Each column has a three-color scale: green at the minimum, white at the median and red at the maximum.
-   In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
-   A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
-   The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
-   A column with only two values has no box, because the colors already show which is which.
-   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text and a 2 px white outline (`--mark-edge`).
-   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and the same white outline.
-   Both are the same in both themes, and they replace the scale color and the box of that cell.
-   The user asked for them on 2026-11-15 through builds, because bold alone did not make the cheapest cell stand out.
-   The user asked for the white outline on the gold cell too, so both table marks match.
-   A legend line above the cards explains the colors.
-   A legend line under each price card that has a mark names the box, the gold cell and the black cell.
-   Builds removed the vCPU group mark on 2026-11-15.
-3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
-   The content fills the window width, less a 16 px gutter on each side; the user asked for it on 2026-11-15 through builds.
-   The region chips have 6 px padding and a 4 px gap, so the 21 chips fit one row in a 1920 px window.
-   The user asked for the side by side cards on 2026-11-15 through builds.
-4. A header of the form `name (unit)` shows the unit on a smaller second line.
-5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
-   The page run tables have no Spot or estimate column, because the cost view shows those numbers.
-6. A `Table.not_sold` cell shows the lucide `ban` icon, with the title `Not sold here` on hover, and no legend.
-   The user asked for it on 2026-11-15 through builds.
+The Prices and quotas card follows the Spend card.
+The user approved the combined table on 2026-11-18.
+1. The sticky filter area shows Geography, Regions, Show, Types, and Runs in that order.
+   Show starts with Spot price, Cost per gate, and Quota on.
+   Each Show chip toggles its columns.
+   Types selects Standard or GPU, with Standard on the first view.
+2. The first two columns show the region and its quota in vCPUs.
+   The quota is Standard quota or G and VT quota for the selected types.
+   The quota has a blue-gray tint and stays visible when all Show chips are off.
+3. Each type header includes its vCPU count.
+   When multiple values show, each type groups the Spot (USD/h), Gate (USD), or Fit (boxes) columns.
+   Fit divides the region quota by the type's vCPU count and rounds down.
+   GPU types omit Gate and show `GPU types have no gate runs.` when only Cost per gate is on.
+   Gate estimates use the Spot price times the median box time, plus the refusal wait cost.
+   A region with a cached Spot price shows `read failed` or `old` next to its name.
+   A ban icon with the title `Not sold here` identifies a type that the region does not sell.
+   Unavailable values show a dash with the reason where known.
+4. The Runs chips show when Cost per gate is on.
+   Merge gates, Targeted runs, and Both select the Gate estimates and the run tables.
+   The choice also selects the refused and launched tables.
+   The billed hours table does not depend on the run choice.
+   The run tables omit Spot price and estimate because the Prices and quotas card shows them.
+5. The Spot and Gate columns use separate color scales and marks.
+   The scale uses green for the minimum and red for the maximum.
+   A median between those limits uses the theme's middle color.
+   A white box with a dark edge marks column extremes when the column has more than two values and the extremes differ.
+   Gold marks the cheapest value of each measure, and black marks the most expensive value.
+   These marks replace the scale and white box for those cells.
+   Quota and Fit cells have no scale or marks.
+6. One legend, the snapshot lines, and the quota case instructions follow the table.
+   A page refresh keeps the horizontal scroll position.
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it. `All` shows every region again.
@@ -770,10 +763,10 @@ A region filter at the top of the page shows all regions by default; the user as
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
 3. The colors, the box and the table marks use only the chosen regions. `Table.values` holds the number of each cell.
-   One region shows no color and no box.
+   One region has no column scale or column box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
-6. The page keeps the region choice in browser storage. The URL keeps the price view and the run kind.
+6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=merge-gate`.
 
 ### Billed hours check
 
