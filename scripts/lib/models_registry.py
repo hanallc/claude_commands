@@ -150,6 +150,37 @@ def claude_arguments(arguments: Sequence[str], environment: Mapping[str, str]) -
     return resolved
 
 
+class ProducerProfile(NamedTuple):
+    family: Literal["claude", "codex"]
+    model: str
+    effort: str
+
+    def value(self) -> str:
+        return f"{self.family}:{self.model}:{self.effort}"
+
+
+def parse_producer_profile(value: str) -> ProducerProfile:
+    match value.split(":"):
+        case ["claude" | "codex" as family, model, effort] if model and effort:
+            return ProducerProfile(family, model, effort)
+        case _:
+            raise ValueError("expected <family>:<model>:<effort>")
+
+
+def producer_defaults() -> ProducerProfile:
+    """Read and validate the default profile for a new producer."""
+    path = registry_path()
+    key = "producer_defaults.model"
+    try:
+        text = registry_text(path)
+        profile = parse_producer_profile(parse_registry(text).get("producer_defaults", {}).get("model", ""))
+        configuration = LaunchModelConfiguration(path, text, tuple(registry_rows.records(text)))
+        _ = launch_settings("producer_defaults", "model", configuration=configuration)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{path}: {key}: {' '.join(str(error).splitlines())}") from error
+    return profile
+
+
 def launch_settings(section: str, key: str, family: Literal["claude", "codex", "assigned"] = "assigned", *,
                     configuration: LaunchModelConfiguration | None = None) -> LaunchSettings:
     """Read launch settings through the existing shell resolver.
@@ -160,14 +191,14 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
         configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
     resolver = 'agents_resolve "$2.$3"' if family == "assigned" else '_agents_resolve_in_family "$2.$3" "$4"'
     resolver_arguments: list[str] = [] if family == "assigned" else [family]
-    if section == "producers":
+    if section in ("producers", "producer_defaults"):
         value = next((row.value for row in reversed(configuration.rows)
                       if row.section == section and row.key == key), "")
-        match value.split(":"):
-            case ["claude" | "codex" as producer_family, model, effort] if model and effort:
-                resolver_arguments = [producer_family, f"{model}:{effort}"]
-            case _:
-                raise ValueError(f"invalid producer settings for {key}; expected <family>:<model>:<effort>")
+        try:
+            profile = parse_producer_profile(value)
+        except ValueError as error:
+            raise ValueError(f"invalid producer settings for {key}; {error}") from error
+        resolver_arguments = [profile.family, f"{profile.model}:{profile.effort}"]
         resolver = ('AGENT_FAMILY="$4"; _agents_validate_pair "$2.$3" "$4" "$5" && '
                     '_agents_resolve_service_tier "$2.$3" "$4"')
     result = subprocess.run(
@@ -512,6 +543,29 @@ def store_producer(name: str, family: str, model: str, effort: str) -> LaunchSet
     path, before, after, settings = _producer_candidate(name, family, model, effort)
     _ = store_registry(path, before, after, f"{name} producer uses {family}:{model}:{effort}")
     return settings
+
+
+def rename_producer(old: str, new: str, profile: ProducerProfile, *, keep_old: bool = False) -> None:
+    """Publish the new producer key and remove the old key when permitted."""
+    path = registry_path()
+    before = registry_text(path)
+    rows = parse_registry(before).get("producers", {})
+    if (not keep_old and old in rows and rows[old] != profile.value()) or (new in rows and rows[new] != profile.value()):
+        raise ValueError(f"{path}: producer settings changed during rename")
+    edits = [] if keep_old else [registry_rows.RowChange("producers", old, "")]
+    edits.append(registry_rows.RowChange("producers", new, f"{new}={profile.value()}"))
+    _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"rename producer {old} to {new}")
+
+
+def remove_producer(name: str, profile: ProducerProfile) -> None:
+    """Remove the key after the lifecycle operation saves its value."""
+    path = registry_path()
+    before = registry_text(path)
+    rows = parse_registry(before).get("producers", {})
+    if name in rows and rows[name] != profile.value():
+        raise ValueError(f"{path}: producer settings changed during retirement")
+    edits = [registry_rows.RowChange("producers", name, "")]
+    _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"retire producer {name}")
 
 
 @final

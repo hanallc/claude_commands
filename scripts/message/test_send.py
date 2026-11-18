@@ -943,18 +943,27 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'new-session.sock'}")
         self.assertEqual(set(self.claims("fixed-id")), {"staff:fixed", "session:new-session"})
 
-    def test_duplicate_staff_paths_refuse_without_delivery_or_queue(self) -> None:
+    def test_refused_staff_targets_do_not_deliver_or_queue(self) -> None:
         parent = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("runner"))
         rows = [parent, *(staff.StaffRow(staff.StaffId(identity), "unit", "resources", staff.ReportsTo(parent.id),
                                         current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct")) for identity in ("one", "two"))]
-        self.staff_rows = {row.id: row for row in rows}
-        for target in ("resources", "builds/resources"):
-            errors = io.StringIO()
-            with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
-                _ = send.send(local_options(["--to", target, "--text", "hello"]))
-            self.assertEqual(stopped.exception.code, 2)
-            self.assertIn(f"ambiguous staff row for {target!r}", errors.getvalue())
+        retired = staff.StaffRow(staff.StaffId("producer-fixed"), "producer", "planner", staff.StaffRoot(),
+                                 current_session=staff.StaffId("producer-current"),
+                                 retirement=staff.RetiredProducer("claude:sonnet:high"))
+        self.staff_rows = {row.id: row for row in (*rows, retired)}
+        cases = (
+            (("resources", "builds/resources"), "ambiguous staff row for {target!r}"),
+            ((retired.id, f"session:{retired.id}"), "{target}: planner is a retired producer"),
+        )
+        for targets, reason in cases:
+            for target in targets:
+                with self.subTest(target=target):
+                    errors = io.StringIO()
+                    with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+                        _ = send.send(local_options(["--to", target, "--text", "hello"]))
+                    self.assertEqual(stopped.exception.code, 2)
+                    self.assertIn(reason.format(target=target), errors.getvalue())
         self.assertEqual(self.relayed, [])
         self.assertFalse((self.root / "queue").exists())
 

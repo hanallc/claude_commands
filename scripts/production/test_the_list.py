@@ -110,6 +110,22 @@ class TheListTests(unittest.TestCase):
         self.assertIn("| 1 | show | dwight | Plan the year |", table)
         self.assertIn("| 2 | show | morty | Ship it |", table)
 
+    def test_move_open_producer_preserves_closed_items_and_retries_without_a_log_entry(self) -> None:
+        current = self.add("Move this", changes={"producer": OTHER.id})
+        closed = self.add("Keep this", changes={"producer": OTHER.id})
+        closed = the_list.close(MORTY.id, closed.id, "Closed for this test", source="fixture")
+        for _ in range(2):
+            moved = the_list.move_open_producer(MORTY.id, current.id, OTHER.id, MORTY.id, source="agents retire")
+            self.assertEqual(moved.producer, MORTY.id)
+            self.assertEqual(len(moved.log), len(current.log) + 1)
+            self.assertEqual(moved.log[-1].source, "agents retire")
+            self.assertEqual(the_list.move_open_producer(MORTY.id, closed.id, OTHER.id, MORTY.id,
+                                                        source="agents retire"), closed)
+        notes = the_list.folder(MORTY.id) / "L-notes.md"
+        _ = notes.write_text("# Notes\n")
+        with the_list.require_no_open_producer_items(MORTY.id, OTHER.id):
+            self.assertEqual(notes.read_text(), "# Notes\n")
+
     def test_close_reopen_and_repeats_keep_the_record_and_number(self) -> None:
         item = self.add(number=70)
         path = the_list.folder(MORTY.id) / "L70.md"

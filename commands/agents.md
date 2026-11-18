@@ -13,7 +13,7 @@ Use the `agents` program.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
-- `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]`: rename a unit, showrunner, or worker.
+- Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
 - `agents resume NAME --retired`: restore a retired unit and its retained workers.
@@ -23,6 +23,28 @@ Use the `agents` program.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
+
+## Producer lifecycle
+
+Use `agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]` to create a producer.
+The command uses `producer_defaults.model` in `config/models.conf`.
+It creates the README if needed and prints the staff id, account and tab.
+Repeat the command with the same options after an interruption.
+
+Use `agents rename OLD NEW` to rename a producer.
+The command keeps the staff id and document folder.
+It reports the path of the document folder.
+
+Use `agents retire NAME [--to PRODUCER]` to retire a producer.
+The command requires the producer to close its open questions.
+If the producer has no `handoff.md`, the command requests the file.
+Repeat the command after the file exists.
+The command stops the conversation and closes its tab before it moves open List items.
+Open List items move to the selected producer, or to morty by default.
+Use `--to` only with a producer whose conversation is live.
+The command retains the conversation and document folder.
+Use `agents resume NAME --retired` to restore the profile and conversation.
+You cannot rename or retire morty.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
 It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.

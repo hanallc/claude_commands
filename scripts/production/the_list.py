@@ -13,7 +13,8 @@ import json
 import re
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -1053,6 +1054,30 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
     return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source)
+
+
+def move_open_producer(keeper: staff.StaffId, identity: str, previous: staff.StaffId,
+                       producer: staff.StaffId, *, source: str) -> ListItem:
+    """Move an open item only while it belongs to the previous producer."""
+    def edit(item: ListItem, _: datetime) -> ListItem:
+        if item.state == ItemState.CLOSED or item.producer != previous:
+            return item
+        return replace(item, producer=producer)
+
+    return _change(keeper, identity, edit, FieldChange("Updated", {"producer": producer}), source)
+
+
+@contextmanager
+def require_no_open_producer_items(keeper: staff.StaffId, producer: staff.StaffId) -> Generator[None]:
+    """Hold the List lock after confirming the producer has no open items."""
+    store = _store(keeper)
+    with store.locked():
+        for path in store.folder().iterdir():
+            if path.suffix == ".md" and store.valid_id(path.stem):
+                item = load(keeper, path.stem)
+                if item.state != ItemState.CLOSED and item.producer == producer:
+                    raise ListError("new open items belong to the producer. Run agents retire again.")
+        yield
 
 
 def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:

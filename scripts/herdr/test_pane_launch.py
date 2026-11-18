@@ -47,7 +47,14 @@ class LaunchEnvironmentTests(unittest.TestCase):
                   patch.object(herdr, "pane_native_process", side_effect=error) as decoded):
                 self.assertEqual(pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
                     record, client, {"w1:p1": entry}, evidence=evidence), [])
-                decoded.assert_called_once()
+                with self.assertRaisesRegex(pane_launch.PaneProcessUnreadable, "w1:p1:"):
+                    _ = pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
+                        record, client, {"w1:p1": entry}, evidence=evidence, strict_retained_reads=True)
+                self.assertEqual(decoded.call_count, 2)
+        with (patch.object(client, "result", return_value={"process_info": {}}),
+              self.assertRaisesRegex(pane_launch.PaneProcessUnreadable, "expected a shell pid")):
+            _ = pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
+                record, client, {"w1:p1": entry}, evidence=evidence, strict_retained_reads=True)
 
     def test_launch_does_not_retain_staff_environment(self) -> None:
         policy = ["--sandbox", "read-only", "-c", 'model_reasoning_effort="high"',
