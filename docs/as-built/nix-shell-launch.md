@@ -139,9 +139,12 @@ Helpers retain these values until the agent starts.
 
 ## Existing sessions
 
-`scripts/nix_env/heal.py` reads each `~/.claude*/sessions` registry through
-`message/sessions.py`'s typed reader. It ignores headless print runs and records
-without a confirmed process start. `HealSession` carries the session id, pid,
+`scripts/nix_env/heal.py` uses the shared reader for the configured registry and each discovered `~/.claude*/sessions` registry.
+An incomplete read returns `Unavailable` if the exact lookup finds no live match.
+The healer reports discovery errors and keeps a pending restart when its replacement lookup is incomplete.
+The health check reports unreadable paths and exits with status 1.
+The healer skips headless print runs and records without a confirmed process start.
+`HealSession` carries the session id, pid,
 process start, name, cwd, status and config directory. `inspect` distinguishes
 `Healthy`, `Broken`, `Unavailable(reason)` and `Gone`; `broken(session)` is true
 only for `Broken`. No `.envrc` means no restart is needed. With `.envrc`, Linux

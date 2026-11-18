@@ -6284,6 +6284,12 @@ class PostmasterReplyRecord:
     body: str
     targets: tuple[str, ...]
 
+    def matches_forward(self, text: str) -> bool:
+        answer_to = ", ".join(self.senders)
+        if len(self.senders) > 1:
+            answer_to = f"one of {answer_to}"
+        return text == f"{self.name} (answer to {answer_to}): {self.body}"
+
     @classmethod
     def from_fields(cls, fields: dict[str, object]) -> PostmasterReplyRecord:
         """Validate the postmaster schema at the JSON boundary."""
@@ -6345,11 +6351,10 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
         body = body.removeprefix("\r\n").removesuffix("\r\n")
     elif body.startswith("\n"):
         body = body.removeprefix("\n").removesuffix("\n")
-    forward = re.fullmatch(
-        r'Message from [^\r\n]+ \(their answer to [^\r\n]+, passed on by postmaster\) '
-        + r'\[([0-9]+)-[0-9]+\]:\n\n(.*)', body, re.DOTALL)
-    if forward is None:
+    tag = re.search(r'\n\nTag: ([0-9]+)-[0-9]+\Z', body)
+    if tag is None:
         return UnverifiedSupplierMessage(SupplierMessageRejection.INVALID_FORWARD)
+    timestamp, forwarded_text = tag[1], body[:tag.start()]
 
     # Resolve the outer sender before reading reply records. A name in the
     # message, or a reply record alone, cannot establish the forward's origin.
@@ -6363,21 +6368,21 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     records: list[PostmasterReplyRecord] = []
     if root.is_absolute():
         # replyCount names files; forwardCount names deliveries. They need not agree.
-        for path in (root / "message/postmaster/replies").glob(f"{forward[1]}-*.json"):
+        for path in (root / "message/postmaster/replies").glob(f"{timestamp}-*.json"):
             if path.is_symlink() or re.fullmatch(r'[0-9]+-[0-9]+\.json', path.name) is None:
                 continue
             try:
                 record = _read_postmaster_reply_record(path)
             except (OSError, ValueError):
                 continue
-            if str(record.at_ms) == forward[1]:
+            if str(record.at_ms) == timestamp:
                 records.append(record)
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.NO_RECORD)
     records = [record for record in records if record.socket == address.address]
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.SOCKET_MISMATCH)
-    records = [record for record in records if record.body == forward[2]]
+    records = [record for record in records if record.matches_forward(forwarded_text)]
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.BODY_MISMATCH)
     records = [record for record in records if owner_session in record.targets]
@@ -6386,7 +6391,7 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     if len(records) != 1:
         return UnverifiedSupplierMessage(SupplierMessageRejection.SEVERAL_RECORDS)
     # The write-once reply record's targets establish the intended recipients.
-    return VerifiedSupplierMessage(forward[2], SupplierMessageRoute.POSTMASTER_REPLY)
+    return VerifiedSupplierMessage(records[0].body, SupplierMessageRoute.POSTMASTER_REPLY)
 
 
 def _turn_waits_for_marker(marker: dict[str, object], waits: dict[str, dict[str, object]]) -> list[dict[str, object]]:
@@ -6484,7 +6489,9 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         from_supplier = isinstance(message, VerifiedSupplierMessage)
         user_wait = wait.get("wait_kind") == "WaitingForUser"
         body = message.body if isinstance(message, VerifiedSupplierMessage) else ""
-        body = re.sub(r'^Message from [^\n]+ via postmaster: [^\n]* \[[a-fA-F0-9]{8}\]\r?\n\r?\n', "", body, count=1)
+        body = re.sub(r'^[^\r\n]*: [^\r\n]*\r?\nSender native id: [^\r\n]+\r?\n'
+                      + r'(?:Shown sender: [^\r\n]+\r?\n)?Tag: [a-fA-F0-9]{8}\r?\n\r?\n',
+                      "", body, count=1)
         relay = from_supplier and body.lstrip().startswith("From the user (via the showrunner):")
         if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
             return

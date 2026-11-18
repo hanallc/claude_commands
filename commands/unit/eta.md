@@ -33,7 +33,7 @@ not pause the phase's work.
 Send the showrunner one message, first line self-contained, with every time
 in the user's zone, as the recorder prints it (user, 2026-10-04):
 
-`From <unit>: Phase <N> ETA: <HH:MM zone>, <P>% done (range <HH:MM>–<HH:MM>), from <basis>.`
+`Phase <N> ETA: <HH:MM zone>, <P>% done (range <HH:MM>–<HH:MM>), from <basis>.`
 
 P is the phase row's `%` in the recorder's summary.
 

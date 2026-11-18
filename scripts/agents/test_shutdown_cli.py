@@ -1,6 +1,7 @@
 """Test the agents CLI with private staff rows and temporary repositories."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import math
@@ -1319,6 +1320,30 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
         self.assertEqual(self.unit_worktree(), staff.RemovedWorktree(remote.local_machine(), self.worktree, staff.ParkedBranch("alpha-branch")))
+
+    def test_retirement_releases_the_pair_when_the_lock_is_free(self) -> None:
+        for held in (False, True):
+            with self.subTest(held=held):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    lease = case.worktree.with_name(case.worktree.name + ".lease.json")
+                    lock = case.worktree.with_name(case.worktree.name + ".lock")
+                    _ = lease.write_text("{}\n")
+                    lock.touch()
+                    with lock.open("r+") as descriptor:
+                        if held:
+                            fcntl.flock(descriptor, fcntl.LOCK_EX)
+                        code, output = case.retire()
+
+                    self.assertEqual(code, 0, output)
+                    self.assertFalse(case.worktree.exists())
+                    self.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
+                    self.assertEqual(lease.exists(), held)
+                    self.assertEqual(lock.exists(), held)
+                    self.assertEqual(output.count("Worktree pair kept"), int(held))
+                finally:
+                    case.doCleanups()
 
     def test_retirement_removes_the_gate_copy_owned_by_the_unit_worktree(self) -> None:
         owner = copies.source_owner(self.worktree)

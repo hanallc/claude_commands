@@ -54,6 +54,8 @@ def record_field_names(schema: type) -> tuple[str, ...]:
 
 def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> dict[str, object]:
     """Keep existing wire fields compatible with the pinned client."""
+    if writing and "job" in record and record["job"] == {"kind": "GateJobNotRecorded"}:
+        del record["job"]
     if (schema.__module__ == "scripts.build_queue.placement"
             and schema.__name__ in ("PlacementAssignment", "PlacementConstraints")):
         source = record.get("source_identity", record.get("source_key"))
