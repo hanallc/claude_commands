@@ -205,7 +205,7 @@
 # Test keys also include the result environment selected in direct.conf.
 # Fixed terminal values replace caller values locally and on remote targets.
 # New result inputs and --env values do not change the build key.
-# Lint keys include mend, nightly rustfmt, Clippy and Taplo versions.
+# Lint keys include tool versions and the cargo-mend content hash.
 # Filter keys sort names and remove duplicate names.
 # Do not cache usage errors, sandbox failures or killed runs.
 # Do not cache lint failures if the last repair and format pass changed files.
@@ -1818,6 +1818,7 @@ VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
 LINT_FIX_INCOMPLETE=0
+LINT_USED_REMOTE_MEND=0
 PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
@@ -2360,6 +2361,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
 
     LAST_TARGET_OUTCOME="$result_word" LAST_TARGET_REASON="$result_reason"
+    if [[ "$CMD" == lint && "$MAC_VERB" == mend-* && ( "$result_word" == passed || "$result_word" == failed ) ]]; then
+        LINT_USED_REMOTE_MEND=1
+    fi
     BUILDLOG_MAC="$result_word"
     BUILDLOG_MAC_REASON="$result_reason"
     BUILDLOG_MAC_S="$result_seconds"
@@ -3192,6 +3196,10 @@ run_local_test() {
 # with. Sets LOOKUP_KEY either way, --no-cache included.
 cache_lookup() {
     [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 1
+    # The lint key identifies the local cargo-mend binary.
+    if [[ "$CMD" == lint && ( "$MAC_ONLY" == 1 || "${PINNED_TARGET:-natedev}" != natedev ) ]]; then
+        return 1
+    fi
     local record outcome="" word
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
@@ -3256,6 +3264,8 @@ cache_record() {
     # A lost token gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
     if [[ "$CMD" == lint ]]; then
+        # A remote mend result has no binary identity in the local key.
+        [[ "${LINT_USED_REMOTE_MEND:-0}" == 0 ]] || return 1
         [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
     fi
     key="$(tree_key)"

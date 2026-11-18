@@ -12,7 +12,7 @@ from unittest import mock
 from scripts.direct import tree_watch
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
-from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, VERIFY
+from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, VERIFY, write_fixture_cargo_mend
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -109,6 +109,24 @@ exit "$EXIT_STATUS"
         self.environment["TEST_CODE_KEY_READ_LOG"] = str(reads)
         self.check_version_change("MEND")
         self.assertIn(self.config.stem, reads.read_text().splitlines())
+
+    def test_mend_replacement_rechecks_a_failure_with_the_same_version(self) -> None:
+        _ = self.dirty_cache()
+        self.environment.update({"TEST_VERSION_MEND": "mend 0.23.0-dev", "TEST_CLIPPY_STATUS": "43"})
+        first = self.invoke_cache_functions()
+        self.assertEqual(first.returncode, 43, first.stdout + first.stderr)
+        self.assertTrue(self.clippy_ran())
+        repeated = self.invoke_cache_functions()
+        self.assertEqual(repeated.returncode, 43, repeated.stdout + repeated.stderr)
+        self.assertIn("FAIL (recorded)", repeated.stdout)
+        self.assertFalse(self.clippy_ran())
+
+        write_fixture_cargo_mend(self.root / "bin/cargo-mend", "replacement revision")
+        self.environment["TEST_CLIPPY_STATUS"] = "0"
+        changed = self.invoke_cache_functions()
+        self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
+        self.assertNotIn("(recorded)", changed.stdout)
+        self.assertTrue(self.clippy_ran())
 
     def test_rustfmt_version_invalidates_passes_and_failures(self) -> None:
         self.check_version_change("RUSTFMT")

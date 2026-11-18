@@ -9,7 +9,7 @@ from typing import override
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
-from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
+from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB, write_fixture_cargo_mend
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -19,6 +19,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
     def setUp(self) -> None:
         super().setUp()
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
+        write_fixture_cargo_mend(self.bin_directory / "cargo-mend")
         self.write_executable(self.bin_directory / "taplo", TAPLO_STUB)
         config = self.root / "lint.conf"
         _ = write_config_fixture(config, "mend=on\nfmt=on\nclippy=on\n")
@@ -79,6 +80,20 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.assertTrue(any("fmt" in arguments and "--all" in arguments for arguments in local), local)
         self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
         self.assertEqual(list(Path(self.environment["TMPDIR"]).glob("tmp.*")), [])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.pass")), [])
+
+    def test_mac_clippy_failure_after_remote_mend_is_not_cached(self) -> None:
+        self.set_verb_answer("clippy", "failed", 1)
+        process = self.queued_lint()
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 1, output + errors)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "clippy"])
+        self.assertEqual(self.local_mend(), [])
+        cache = self.board / "verify_cache"
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(list(cache.glob("*.fail")), [])
 
     def test_mac_finding_returns_to_memory_and_repairs_on_natedev(self) -> None:
         self.environment.update({"TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "101"})

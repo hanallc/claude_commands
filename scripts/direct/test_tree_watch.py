@@ -1,8 +1,10 @@
 """Exercise the watcher's scope with actual Git trees and Cargo workspace inputs."""
 from __future__ import annotations
 
-import os
+from collections.abc import Sequence
+import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,6 +22,7 @@ from scripts.direct.tree_watch_test_support import (
     WATCH_DEADLINE,
     write_workspace as write_workspace,
 )
+from scripts.direct.verify_lint_scope_test_support import write_fixture_cargo_mend
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -66,12 +69,19 @@ class TreeWatchTests(TreeWatchFixture):
     def test_lint_versions_reuse_the_call_reading_and_keep_failed_reads_disabled(self) -> None:
         saved = self.root / "lint-versions"
         formatter = self.root / "rustfmt-version"
-        with mock.patch.dict(os.environ, {"VERIFY_LINT_VERSIONS_FILE": str(saved),
+        cargo_home = self.root / "cargo-home"
+        tools = cargo_home / "bin"
+        tools.mkdir(parents=True)
+        write_fixture_cargo_mend(tools / "cargo-mend")
+        with mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home),
+                                         "VERIFY_LINT_VERSIONS_FILE": str(saved),
                                          "VERIFY_LINT_RUSTFMT_VERSION_FILE": str(formatter)}):
-            with mock.patch.object(subprocess, "check_output", return_value=b"tool version\n") as probe:
+            with (mock.patch.object(subprocess, "check_output", return_value=b"tool version\n") as probe,
+                  mock.patch.object(hashlib, "file_digest", wraps=hashlib.file_digest) as digest):
                 first = tree_watch.lint_tool_versions()
                 self.assertEqual(tree_watch.lint_tool_versions(), first)
                 self.assertEqual(probe.call_count, 4)
+                digest.assert_called_once()
                 self.assertEqual(formatter.read_bytes(), b"tool version")
             saved.unlink()
             with mock.patch.object(subprocess, "check_output", side_effect=OSError("tool missing")) as probe:
@@ -80,6 +90,70 @@ class TreeWatchTests(TreeWatchFixture):
                 with self.assertRaises(ValueError):
                     _ = tree_watch.lint_tool_versions()
                 probe.assert_called_once()
+
+    def test_mend_binary_changes_lint_key_with_the_same_version(self) -> None:
+        session = self.root / "session"
+        cargo_home = session / "cargo-home"
+        tools = session / "tools"
+        home_bin = cargo_home / "bin"
+        tools.mkdir(parents=True, exist_ok=True)
+        home_bin.mkdir(parents=True)
+        home_mend, path_mend = home_bin / "cargo-mend", tools / "cargo-mend"
+        check_output = subprocess.check_output
+        metadata = json.dumps(self.metadata)
+        for in_path, selected, other in ((False, home_mend, path_mend), (True, path_mend, home_mend)):
+            with self.subTest(cargo_home_bin_in_path=in_path):
+                entries = (tools, home_bin) if in_path else (tools,)
+                path_prefix = os.pathsep.join(map(str, entries))
+
+                def tool_output(args: Sequence[str | bytes], *, stderr: int, timeout: float | None = None) -> bytes:
+                    if tuple(args) == ("cargo", "mend", "--version"):
+                        return check_output([str(selected), "mend", "--version"], stderr=stderr, timeout=timeout)
+                    if args[0] in ("cargo", "taplo"):
+                        return b"tool fixture version"
+                    return check_output(args, stderr=stderr, timeout=timeout)
+
+                def key() -> str:
+                    return tree_watch.TreeInputs(["--", "lint"], metadata).keys(watch=False)[0]
+
+                with (mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home),
+                          "PATH": path_prefix + os.pathsep + os.environ["PATH"],
+                          "VERIFY_LINT_VERSIONS_FILE": "", "VERIFY_LINT_RUSTFMT_VERSION_FILE": ""}),
+                      mock.patch.object(subprocess, "check_output", side_effect=tool_output) as probe):
+                    write_fixture_cargo_mend(selected, "first revision")
+                    write_fixture_cargo_mend(other, "unselected revision")
+                    first = key()
+                    self.assertRegex(first, r"^[0-9a-f]{64}$")
+                    write_fixture_cargo_mend(other, "different unselected revision")
+                    self.assertEqual(key(), first)
+                    write_fixture_cargo_mend(selected, "second revision")
+                    second = key()
+                    self.assertRegex(second, r"^[0-9a-f]{64}$")
+                    self.assertNotEqual(second, first)
+                    self.assertEqual(check_output([str(selected), "mend", "--version"]), b"mend 0.23.0-dev\n")
+                    self.assertIn(mock.call(("cargo", "mend", "--version"), stderr=subprocess.DEVNULL, timeout=10),
+                                  probe.call_args_list)
+
+    def test_missing_or_unreadable_mend_disables_the_tool_key_for_the_call(self) -> None:
+        saved = self.root / "lint-versions"
+        cargo_home = self.root / "cargo-home"
+        tools = cargo_home / "bin"
+        tools.mkdir(parents=True)
+        with (mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home), "PATH": str(tools),
+                                           "VERIFY_LINT_VERSIONS_FILE": str(saved),
+                                           "VERIFY_LINT_RUSTFMT_VERSION_FILE": ""}),
+              mock.patch.object(subprocess, "check_output", return_value=b"tool fixture version"),
+              mock.patch.object(hashlib, "file_digest", side_effect=PermissionError("cannot read binary")) as digest):
+            for failure in (FileNotFoundError, PermissionError):
+                with self.subTest(failure=failure.__name__):
+                    with self.assertRaises(failure):
+                        _ = tree_watch.lint_tool_versions()
+                    self.assertEqual(saved.read_bytes(), b"")
+                    with self.assertRaises(ValueError):
+                        _ = tree_watch.lint_tool_versions()
+                    saved.unlink()
+                    write_fixture_cargo_mend(tools / "cargo-mend")
+            digest.assert_called_once()
 
     def test_lint_keys_without_result_caching_do_not_probe_versions(self) -> None:
         import json

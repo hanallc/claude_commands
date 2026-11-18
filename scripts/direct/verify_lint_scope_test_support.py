@@ -61,6 +61,11 @@ class CargoWorkspaceMetadata(TypedDict):
     packages: list[CargoPackageMetadata]
 
 
+def write_fixture_cargo_mend(path: Path, revision: str = "") -> None:
+    """Install a fixture binary with a stable version string."""
+    write_stdlib_tool(path, f'print("mend 0.23.0-dev")\n# {revision}\n')
+
+
 CARGO_STUB = r'''
 import json
 import os
@@ -231,6 +236,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.config = self.root / "lint.conf"
         self.write_config(clippy="on")
         write_stdlib_tool(bin_directory / "cargo", CARGO_STUB)
+        write_fixture_cargo_mend(bin_directory / "cargo-mend")
         write_stdlib_tool(bin_directory / "taplo", TAPLO_STUB)
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')

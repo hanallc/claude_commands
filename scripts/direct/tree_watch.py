@@ -20,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -51,8 +52,30 @@ def run(*args: str | bytes) -> bytes:
     return subprocess.check_output(list(args), stderr=subprocess.DEVNULL)
 
 
+def cargo_mend_binary() -> Path:
+    """Find Cargo's external mend command on Linux or macOS."""
+    cargo_home = os.environ.get("CARGO_HOME")
+    try:
+        home_bin = (Path(cargo_home).absolute() if cargo_home else Path.home() / ".cargo") / "bin"
+    except RuntimeError as error:
+        raise FileNotFoundError("Cargo home is unavailable") from error
+    directories = [Path(entry) for entry in os.environ["PATH"].split(os.pathsep)] if "PATH" in os.environ else []
+    # Cargo puts its bin directory first unless PATH already sets its position.
+    if home_bin not in directories:
+        directories.insert(0, home_bin)
+    for directory in directories:
+        binary = directory / "cargo-mend"
+        try:
+            mode = binary.stat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISREG(mode) and mode & 0o111:
+            return binary
+    raise FileNotFoundError("cargo-mend is unavailable")
+
+
 def lint_tool_versions() -> bytes:
-    """Identify each lint tool through the command that runs it."""
+    """Read tool versions and the cargo-mend content hash once per call."""
     saved = os.environ.get("VERIFY_LINT_VERSIONS_FILE", "")
     if saved and Path(saved).exists():
         versions = Path(saved).read_bytes()
@@ -78,6 +101,9 @@ def lint_tool_versions() -> bytes:
             if not version:
                 raise ValueError("lint tool returned no version: " + " ".join(command))
             versions.extend("\0".join(command).encode() + b"\0" + version + b"\0")
+        with cargo_mend_binary().open("rb") as binary:
+            digest = hashlib.file_digest(binary, "sha256").hexdigest().encode("ascii")
+        versions.extend(b"cargo-mend-sha256\0" + digest + b"\0")
     except (OSError, ValueError, subprocess.SubprocessError):
         if saved:
             _ = Path(saved).write_bytes(b"")
@@ -227,7 +253,7 @@ class TreeInputs:
             try:
                 versions = lint_tool_versions()
             except (OSError, ValueError, subprocess.SubprocessError):
-                # Unknown tool versions prevent cache reuse and publication.
+                # Unknown tool identity prevents cache reuse and publication.
                 return "", watch_key
             key.update(versions)
         tree_content = key.copy()
