@@ -489,6 +489,29 @@ def store_producer(name: str, family: str, model: str, effort: str) -> LaunchSet
     return settings
 
 
+def rename_producer(old: str, new: str, profile: ProducerProfile, *, keep_old: bool = False) -> None:
+    """Publish the new producer key and remove the old key when permitted."""
+    path = registry_path()
+    before = registry_text(path)
+    rows = parse_registry(before).get("producers", {})
+    if (not keep_old and old in rows and rows[old] != profile.value()) or (new in rows and rows[new] != profile.value()):
+        raise ValueError(f"{path}: producer settings changed during rename")
+    edits = [] if keep_old else [registry_rows.RowChange("producers", old, "")]
+    edits.append(registry_rows.RowChange("producers", new, f"{new}={profile.value()}"))
+    _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"rename producer {old} to {new}")
+
+
+def remove_producer(name: str, profile: ProducerProfile) -> None:
+    """Remove the key after the lifecycle operation saves its value."""
+    path = registry_path()
+    before = registry_text(path)
+    rows = parse_registry(before).get("producers", {})
+    if name in rows and rows[name] != profile.value():
+        raise ValueError(f"{path}: producer settings changed during retirement")
+    edits = [registry_rows.RowChange("producers", name, "")]
+    _ = store_registry(path, before, registry_rows.replay(before, edits, False), f"retire producer {name}")
+
+
 @final
 class Arguments(argparse.Namespace):
     command: str = ""
