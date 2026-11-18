@@ -847,8 +847,10 @@ sys.exit(1)
         del legacy_record["director_dir"]
         legacy_record["run_id"] = legacy.stem
         write_text_atomic(legacy, json.dumps(legacy_record))
-        with contextlib.redirect_stderr(io.StringIO()) as errors:
+        with (patch.object(turn_end, "run_finished") as complete,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
             popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
+        complete.assert_called_once_with(THREAD_ONE)
         lines = errors.getvalue().splitlines()
         self.assertEqual(len(lines), 1, lines)
         self.assertIn(str(legacy), lines[0])
@@ -1121,7 +1123,7 @@ sys.exit(status)
         for name, fields in cases:
             # The supervisor check passes, so each refusal comes from the command group record.
             with (self.subTest(case=name), patch.object(process_group, "send_process_group") as send,
-                  patch.object(detached_run_process, "supervises", return_value=True)):
+                  patch.object(detached_run_process, "supervisor_match", return_value=True)):
                 self.update_record(path, pid=os.getpid(), **fields)
                 with contextlib.redirect_stderr(io.StringIO()) as error:
                     self.assertEqual(detached_runs.main(["stop", "--reason", "fixture stop", str(path)]), 1)
@@ -1174,7 +1176,7 @@ sys.exit(status)
             assert isinstance(started, process_start.Started)
             self.update_record(path, run_id="other-run", command_group=os.getpid(), command_started=started.start)
             original = path.read_text()
-            with (patch.object(detached_run_process, "supervises", return_value=True),
+            with (patch.object(detached_run_process, "supervisor_match", return_value=True),
                   patch.object(detached_runs, "write_text_atomic", wraps=write_text_atomic) as write,
                   patch.object(process_group, "send_process_group") as send):
                 self.assertFalse(detached_runs.stop_command(path, "fixture stop"))
@@ -1367,7 +1369,7 @@ exit 143
         with self.subTest(case="ps times out for both running and finished records"):
             finished = self.finished_run("awaiting-completion", pid=DEAD_PID, completion_pending=True)
             running = self.record(["pending supervisor"]).replace(path.with_name("pending-supervisor.json"))
-            self.update_record(running, run_id=running.stem, pid=DEAD_PID)
+            self.update_record(running, run_id=running.stem, pid=DEAD_PID, tree_key="key-1")
             ready = self.record(["ready to reap"]).replace(path.with_name("ready-to-reap.json"))
             self.update_record(ready, run_id=ready.stem, pid=0, started_at=0)
             saved = (running.read_bytes(), finished.read_bytes())
@@ -1379,6 +1381,7 @@ exit 143
             with (patch.object(Path, "exists", exists_without_proc),
                   patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5))):
                 self.assertEqual(detached_runs.reap_orphans(str(self.session)), [ready.stem])
+                self.assertIsNotNone(detached_runs.live_twin(running.parent, WORKER, ["pending supervisor"], "key-1"))
                 popen, _ = self.start(["new command"])
                 popen.assert_called_once()
             self.assertEqual((running.read_bytes(), finished.read_bytes()), saved)

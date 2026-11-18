@@ -62,9 +62,13 @@ def _command_match(pid: int, command: Sequence[str]) -> bool | ProcessArgumentsU
                for index, part in enumerate(parts) if part)
 
 
+def _possibly_live(match: bool | ProcessArgumentsUnavailable) -> bool:
+    return match is not False
+
+
 def runs_command(pid: int, command: Sequence[str]) -> bool:
-    """Confirm that the process runs the named program with the given arguments."""
-    return _command_match(pid, command) is True
+    """Keep the command live when its arguments are unavailable."""
+    return _possibly_live(_command_match(pid, command))
 
 
 @dataclass(frozen=True)
@@ -94,5 +98,5 @@ def supervisor_match(pid: int, record_path: Path) -> bool | ProcessArgumentsUnav
 
 
 def supervises(pid: int, record_path: Path) -> bool:
-    """Confirm the supervisor command and its record before use."""
-    return supervisor_match(pid, record_path) is True
+    """Keep the supervisor live when its arguments are unavailable."""
+    return _possibly_live(supervisor_match(pid, record_path))

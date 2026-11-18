@@ -272,7 +272,7 @@ def stop_command(path: Path, reason: str) -> bool:
 
     def still_current() -> bool:
         command = command_group(path)
-        return (command is not None and detached_run_process.supervises(supervisor, path)
+        return (command is not None and detached_run_process.supervisor_match(supervisor, path) is True
                 and process_start.process_start(command.group) == process_start.Started(command.started))
 
     def signal_run() -> None:
@@ -666,7 +666,7 @@ def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRun
             errors.append(LiveRunReadError(path, error))
             continue
         if (raw.get("status") == "running" and owns(raw)
-                and detached_run_process.supervisor_match(_integer(raw.get("pid")), path) is not False):
+                and detached_run_process.supervises(_integer(raw.get("pid")), path)):
             found.append(cast(RunRecord, cast(object, raw)))
     return LiveRunEvidence(tuple(found), tuple(errors))
 
