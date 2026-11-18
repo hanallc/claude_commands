@@ -120,6 +120,15 @@ def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str
     return [*argv[:-1], words[boundary + 3]]
 
 
+def split_mac_run_command(remote: str) -> tuple[list[str], str]:
+    """Get the invocation words and the cleanup commands."""
+    for status in (" || echo mac_exit=75", "; echo mac_exit=$?"):
+        invocation, separator, cleanup = remote.rpartition(status)
+        if separator:
+            return shlex.split(invocation), cleanup
+    raise AssertionError(f"Missing Mac status command in {remote!r}")
+
+
 class SelectorEvent(TypedDict):
     command: str
     args: list[str]
@@ -918,7 +927,8 @@ raise SystemExit(offload.main())
         self.assertEqual(len(self.events_for("rsync")), 1)
         remote = self.events_for("ssh")[-1]["args"][-1]
         self.assertIn("lint nextest", remote)
-        return shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+        words, _ = split_mac_run_command(remote)
+        return words
 
     def assert_stable_copy_sends_key(self) -> None:
         # A later stable copy must send its key after the earlier copy omitted it.

@@ -1997,9 +1997,12 @@ def remote_test_command(
         if isinstance(request.placement, AssignedOffloadRequest) else ""
     )
     capture = ""
+    report_status = "; echo mac_exit=$?"
     if request.verb == "nextest":
-        limits = nextest_log.output_limits(config.settings, config.values)
+        limits = nextest_log.output_limits(config.settings)
         capture = nextest_log.capture_function(limits) + " && "
+        # The writer reports the child status. A failed launch takes the setup path.
+        report_status = f" || echo mac_exit={nextest_log.SETUP_FAILURE}"
     runner = "run_nextest_logged " if capture else ""
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
@@ -2016,7 +2019,7 @@ def remote_test_command(
         f"{forced_config}"
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"{runner}~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
+        f"{runner}~/.claude/scripts/lint/lint {invocation}{report_status}; {cleanup_command}"
     )
 
 

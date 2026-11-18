@@ -12,6 +12,7 @@ import json
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -693,7 +694,8 @@ class NextestLogRetentionTests(TmpSweepCase):
         old = self.now - 3 * DAY
         for path in (expired, opened, unrelated, linked, folder):
             os.utime(path, (old, old), follow_symlinks=False)
-        _ = write_config_fixture(conf.path("mac_test"), f"{nextest_log.RETENTION_DAYS}=2\n")
+        host = socket.gethostname().partition(".")[0]
+        _ = conf.path("mac_test").write_text(f"# whole: 1..\n{nextest_log.RETENTION_DAYS}.{host}=2\n")
         scan = ("printf", "%s", f"p41\nf4\naw\nn{opened}\n")
         with (mock.patch.dict(os.environ, {"HOME": str(home)}),
               mock.patch.object(sys, "platform", "darwin"),

@@ -1578,7 +1578,7 @@ def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: S
     try:
         if os.fstat(folder).st_uid != os.getuid():
             return
-        days = conf.read("mac_test").whole(nextest_log.RETENTION_DAYS)
+        days = nextest_log.retention_days()
         cutoff = now - days * 24 * HOUR_SECONDS
         expired: dict[str, os.stat_result] = {}
         with os.scandir(folder) as entries:

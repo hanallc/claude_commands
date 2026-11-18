@@ -89,6 +89,24 @@ class MacCleanupProtocolTests(unittest.TestCase):
                                  + text + " under the 100 GiB floor\n")
 
 
+    def test_nextest_summary_scan_bounds_long_lines(self) -> None:
+        summary = b"Summary [0.1s] 1 test run: 1 failed, "
+        noise = b"x" * (64 * 1024)
+        fake_summary = b"Summary [0.2s] 1 test run: 1 passed"
+        output = io.BytesIO()
+        log = io.BytesIO(b"\033[31m" + summary + noise + b"\033[0m\n" + noise + fake_summary + b"\nend\n")
+        limits = nextest_log.NextestOutputLimits(tail_bytes=4, summary_bytes=64)
+        with mock.patch.object(log, "readline", wraps=log.readline) as readline:
+            nextest_log.replay_log(log, Path("log"), 42, limits, output)
+        self.assertTrue(readline.called)
+        for call in readline.call_args_list:
+            (size,) = cast(tuple[int], call.args)
+            self.assertTrue(0 < size < len(noise))
+        self.assertEqual(output.getvalue(),
+                         b"mac_test: full nextest log: log\nmac_test: tail fragment: end\n"
+                         + (summary + noise)[:limits.summary_bytes] + b"\n")
+
+
 class MacTargetCleanupShellTests(unittest.TestCase):
     root: Path = Path()
     home_directory: Path = Path()
@@ -192,6 +210,19 @@ exit "$CLEANUP_TEST_STATUS"
                 answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
                 self.assertEqual(answer.stdout.splitlines(), ["mac_exit=75", "mac_cleanup=skipped"])
                 self.assertIn("cannot start nextest with a log", answer.stderr)
+                self.assertFalse((self.root / "lint-arguments.json").exists())
+
+    def test_python_shim_start_failure_declines_but_child_status_is_preserved(self) -> None:
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell, source="nextest"):
+                answer = self.run_remote(shell, 127, ("--target-dir=other-target",))
+                self.assertEqual(answer.stdout.splitlines()[-2:], ["mac_exit=127", "mac_cleanup=skipped"])
+        (self.root / "lint-arguments.json").unlink()
+        write_shell(self.python, "exit 127\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell, source="shim"):
+                answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
+                self.assertEqual(answer.stdout.splitlines(), ["mac_exit=75", "mac_cleanup=skipped"])
                 self.assertFalse((self.root / "lint-arguments.json").exists())
 
     def test_nextest_replays_success_and_retains_bounded_failure_output(self) -> None:

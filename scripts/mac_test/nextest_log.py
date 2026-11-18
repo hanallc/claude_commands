@@ -10,9 +10,9 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Collection, Generator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import BinaryIO
@@ -31,6 +31,7 @@ TAIL_BYTES = "nextest_failure_tail_bytes"
 SUMMARY_BYTES = "nextest_failure_summary_bytes"
 DEFAULT_SETTINGS = Path(__file__).resolve().parents[2] / "config/mac_test.conf"
 SETUP_FAILURE = os.EX_TEMPFAIL
+SUMMARY_SCAN_BYTES = 8192
 
 
 @dataclass(frozen=True)
@@ -39,12 +40,27 @@ class NextestOutputLimits:
     summary_bytes: int
 
 
-def output_limits(settings: conf.ConfigRead | conf.UseConfiguredValue, keys: Collection[str]) -> NextestOutputLimits:
+def settings_with_defaults(settings: conf.ConfigRead | conf.UseConfiguredValue, defaults: conf.ConfigRead) -> conf.ConfigRead:
+    """Supply missing keys before the typed reader applies host overrides."""
+    if isinstance(settings, conf.UseConfiguredValue):
+        return defaults
+    if isinstance(settings.settings, dict) and isinstance(defaults.settings, dict):
+        return replace(settings, settings={**defaults.settings, **settings.settings})
+    return settings
+
+
+def retention_days() -> int:
+    """Read the log retention period for this host."""
+    return settings_with_defaults(conf.read("mac_test"), conf.read(DEFAULT_SETTINGS)).whole(RETENTION_DAYS)
+
+
+def output_limits(settings: conf.ConfigRead | conf.UseConfiguredValue) -> NextestOutputLimits:
     """Use the typed reader and keep the shipped Summary ceiling."""
     defaults = conf.read(DEFAULT_SETTINGS)
     ceiling = defaults.whole(SUMMARY_BYTES)
-    tail = settings.whole(TAIL_BYTES) if isinstance(settings, conf.ConfigRead) and TAIL_BYTES in keys else defaults.whole(TAIL_BYTES)
-    summary = settings.whole(SUMMARY_BYTES) if isinstance(settings, conf.ConfigRead) and SUMMARY_BYTES in keys else ceiling
+    effective = settings_with_defaults(settings, defaults)
+    tail = effective.whole(TAIL_BYTES)
+    summary = effective.whole(SUMMARY_BYTES)
     if tail < 1 or not 1 <= summary <= ceiling:
         raise conf.Unusable(f"Mac nextest output limits must be positive and the Summary limit must be at most {ceiling}")
     return NextestOutputLimits(tail, summary)
@@ -54,12 +70,8 @@ def capture_function(limits: NextestOutputLimits) -> str:
     """Define the remote shell function that executes the log writer."""
     return (
         'run_nextest_logged() { '
-        'nextest_python="$HOME/.claude/scripts/lib/py"; '
-        'nextest_writer="$HOME/.claude/scripts/mac_test/nextest_log.py"; '
-        'if [ ! -x "$nextest_python" ] || [ ! -f "$nextest_writer" ]; then '
-        "printf 'mac_test: the nextest log writer is unavailable\\n' >&2; "
-        f'return {SETUP_FAILURE}; fi; '
-        f'"$nextest_python" -B "$nextest_writer" run {limits.tail_bytes} {limits.summary_bytes} "$@"; }}'
+        '"$HOME/.claude/scripts/lib/py" -B "$HOME/.claude/scripts/mac_test/nextest_log.py" '
+        f'run {limits.tail_bytes} {limits.summary_bytes} "$@"; }}'
     )
 
 
@@ -116,15 +128,18 @@ def replay_log(log: BinaryIO, path: Path, status: int, limits: NextestOutputLimi
     if status:
         _ = log.seek(0)
         summary = b""
-        for raw in log:
-            line = parse.clean_line(raw.decode("utf-8", errors="replace").removesuffix("\n"))
+        while raw := log.readline(SUMMARY_SCAN_BYTES):
+            line = parse.clean_line(raw.removesuffix(b"\n").decode("utf-8", errors="replace"))
             if parse.SUMMARY.match(line):
                 summary = line.encode()[:limits.summary_bytes]
+            # Discard the rest of this physical line in bounded reads.
+            while len(raw) == SUMMARY_SCAN_BYTES and not raw.endswith(b"\n"):
+                raw = log.readline(SUMMARY_SCAN_BYTES)
         if summary:
             _ = output.write(summary + b"\n")
 
 
-def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: BinaryIO) -> int:
+def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: BinaryIO) -> int | None:
     """Hold the log lock through dispatch and replay."""
     from scripts.copies import copies
 
@@ -147,7 +162,7 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
                 raise
         except (OSError, ValueError) as error:
             print(f"mac_test: cannot start nextest with a log: {error}", file=sys.stderr)
-            return SETUP_FAILURE
+            return None
         try:
             if status:
                 os.utime(log.fileno(), None)
@@ -161,7 +176,12 @@ def run_logged(command: Sequence[str], limits: NextestOutputLimits, output: Bina
 
 def main(arguments: list[str]) -> int:
     if arguments[:1] == ["run"] and len(arguments) >= 4:
-        return run_logged(arguments[3:], NextestOutputLimits(int(arguments[1]), int(arguments[2])), sys.stdout.buffer)
+        limits = NextestOutputLimits(int(arguments[1]), int(arguments[2]))
+        status = run_logged(arguments[3:], limits, sys.stdout.buffer)
+        if status is None:
+            return 1
+        print(f"mac_exit={status}", flush=True)
+        return 0
     if arguments[:1] == ["read"] and len(arguments) == 2:
         try:
             read_log(Path(arguments[1]), sys.stdout.buffer)

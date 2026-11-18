@@ -7,8 +7,10 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -41,7 +43,9 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test.offload_test_commands import install_nextest_log_writer
-from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
+from scripts.mac_test.offload_test_support import (
+    OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
+)
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -511,6 +515,18 @@ class OffloadSettingsTests(unittest.TestCase):
                       self.assertRaisesRegex(conf.Unusable, nextest_log.SUMMARY_BYTES + "|Summary limit")):
                     _ = offload.remote_test_command(config, request, HANA)
 
+    def test_explicit_mac_settings_use_host_only_nextest_limits(self) -> None:
+        host = socket.gethostname().partition(".")[0]
+        source = self.settings.read_text()
+        for key, value in ((nextest_log.TAIL_BYTES, 36), (nextest_log.SUMMARY_BYTES, 52)):
+            source = re.sub(rf"^{key}=\d+$", f"{key}.{host}={value}", source, flags=re.MULTILINE)
+        _ = self.settings.write_text(source)
+        config = eligibility.read_config(self.settings)
+        request = offload.OffloadRequest(self.root, "hana", "log-limit", offload.NO_RESULT_FILE, (),
+                                        owner="verify", holder_session="fixture-session")
+        with mock.patch.object(subprocess, "run", RUN_SUBPROCESS), mock.patch.object(subprocess, "Popen", START_SUBPROCESS):
+            self.assertIn(" run 36 52 ", offload.remote_test_command(config, request, HANA))
+
     def test_sender_normalizes_multiline_tool_versions_before_parity(self) -> None:
         versions = {"rustc": " rustc fixture \n", "nextest":
             " cargo-nextest 0.9.143  \n release: 0.9.143\n commit: abc\n date: today\n host: linux \n",
@@ -966,7 +982,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
                     self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
                     self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
-                    remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                    remote_words, _ = split_mac_run_command(ssh[1]["args"][-1])
                     lint_index = remote_words.index("~/.claude/scripts/lint/lint")
                     self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
                     self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
@@ -996,7 +1012,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                                                   offload.ssh_options(config.connection))
                 self.assertEqual(prefix[-1], "alternate-mac")
                 self.assertIn("LINT_SWEEP_BUDGET_GIB=8", remote)
-                remote_words = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+                remote_words, _ = split_mac_run_command(remote)
                 lint_index = remote_words.index("~/.claude/scripts/lint/lint")
                 self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
                 self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
@@ -1265,7 +1281,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                         remote = offload.remote_test_command(config, request, HANA)
                         claim = offload.claim_arguments(request, config)
                     self.assertEqual(claim[claim.index("--what") + 1], f"{verb} hana")
-                sent = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+                sent, _ = split_mac_run_command(remote)
                 position = sent.index("~/.claude/scripts/lint/lint")
                 self.assertEqual(sent[position + 1:], [verb, *words])
                 if verb == "doc":
@@ -1455,7 +1471,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assert_wire("passed", "")
         remote = self.events_for("ssh")[-1]["args"][-1]
-        remote_words = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+        remote_words, _ = split_mac_run_command(remote)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
@@ -1580,10 +1596,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)
         remote = run[-1]
-        run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
-        self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertIn("mac_cleanup=", status_command)
-        remote_words = shlex.split(run_command)
+        remote_words, cleanup = split_mac_run_command(remote)
+        self.assertIn("mac_cleanup=", cleanup)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertEqual(
             remote_words[lint_index :],
@@ -1669,10 +1683,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         result = self.command("-E", FILTER, filter_run=True)
         self.assertEqual(result.returncode, 0, result.stdout)
         remote = self.events_for("ssh")[-1]["args"][-1]
-        run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
-        self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertIn("mac_cleanup=", status_command)
-        remote_words = shlex.split(run_command)
+        remote_words, cleanup = split_mac_run_command(remote)
+        self.assertIn("mac_cleanup=", cleanup)
         self.assertIn(f"({FILTER}) & not (test(slow) | test(gpu))", remote_words)
         self.assertNotIn(FILTER, remote_words)
 
