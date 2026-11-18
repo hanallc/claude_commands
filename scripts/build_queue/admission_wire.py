@@ -1,7 +1,9 @@
 """Admission socket shapes and encoding without queue records at startup."""
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ from scripts.build_targets import target_config
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
     from scripts.build_queue import placement
+    from scripts.build_targets.execution_transport import ExecutionTransport
 else:
     class _DeferredAdmissionRecords:
         """Load domain types when an annotation or a default needs them."""
@@ -444,6 +447,34 @@ class CancelPlacement(CallerCode):
     reason: str
 
 
+def placement_configuration_digest(target_name: str, settings: placement.ProviderSettings, *,
+                                   targets: Iterable[target_config.Target],
+                                   transport_for: Callable[[target_config.SshTarget], ExecutionTransport],
+                                   read_bytes: Callable[[Path], bytes]) -> str:
+    """Hash the configuration for placement or an adapter refusal."""
+    from scripts.lib import conf
+
+    paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
+    if isinstance(settings, placement.ExplicitProviderSettings):
+        paths.add(settings.path)
+    for target in targets:
+        if isinstance(target, target_config.SshTarget) and target.name == target_name:
+            from scripts.aws_target import hana_placement
+
+            paths.add(target.settings)
+            if isinstance(transport_for(target), hana_placement.HanaControlTransport):
+                paths.add(conf.path("aws_target"))
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path).encode())
+        try:
+            contents = read_bytes(path)
+        except FileNotFoundError:
+            contents = b"missing"
+        digest.update(contents)
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True)
 class ClaimFailure(CallerCode):
     """The report holds an assignment, failed provider claim, and reason."""
@@ -452,6 +483,8 @@ class ClaimFailure(CallerCode):
     reason: str
     claim: placement.ProviderClaimReference | placement.NoProviderClaim = field(
         default_factory=lambda: placement.NoProviderClaim())
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = field(
+        default_factory=lambda: records.NoRefusalSettings())
 
 
 @dataclass(frozen=True)

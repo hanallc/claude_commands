@@ -79,6 +79,7 @@ def _take(name: str, caller: str, pane: str, client: herdr.Herdr, model: str, ef
 
 def transfer(name: str, *, model: str = "", effort: str = "") -> int:
     """Move the producer row to the caller, then restart the caller as the producer."""
+    staff.validate_unit_name_for_write(name)
     if bool(model) != bool(effort):
         raise ValueError("give --model and --effort together")
     caller, pane = staff.runtime_id(), os.environ.get("HERDR_PANE_ID", "")

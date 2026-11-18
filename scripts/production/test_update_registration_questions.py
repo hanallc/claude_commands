@@ -178,7 +178,8 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual({frontmatter(path)["asked_by"][0] for path in questions}, {owner_id, unit_id})
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in [proposal, *questions]}
         _ = staff.rename(owner_id, "renamed-owner")
-        _ = staff.rename(unit_id, "renamed-unit")
+        new_unit_name = "renamed"
+        _ = staff.rename(unit_id, new_unit_name)
         for transferred in (False, True):
             with self.subTest(transferred=transferred):
                 if transferred:
@@ -187,10 +188,10 @@ class RegistrationTests(RegistrationFixture):
                                  [] if transferred else [proposal])
                 self.assertEqual([issue.path for issue in proposals_folder.open_proposals(destination_doc)],
                                  [proposal] if transferred else [])
-                self.assertEqual(proposal_issue.proposal_unit(Issue(proposal, frontmatter(proposal))), "renamed-unit")
+                self.assertEqual(proposal_issue.proposal_unit(Issue(proposal, frontmatter(proposal))), new_unit_name)
                 listed = self.run_command("questions-table")
                 self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
-                for text in ("Choose the layout", "Choose the colors", "renamed-unit", "renamed-owner"):
+                for text in ("Choose the layout", "Choose the colors", new_unit_name, "renamed-owner"):
                     self.assertIn(text, listed.stdout)
                 self.assertNotIn("A separate proposal", listed.stdout)
                 other = invoke_cli(registration, registration.main,

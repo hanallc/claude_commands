@@ -160,7 +160,7 @@ class StandingTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         self.enterContext(isolated_staff_file(self.base / "staff.json", {}))
         parent = fixture_member("showrunner", name="builds")
-        owner = fixture_member("unit", name="verify-unit", parent=parent.id)
+        owner = fixture_member("unit", name="copy-owner", parent=parent.id)
         self.owner_id = str(owner.id)
         os.environ["CODEX_THREAD_ID"] = ""
         os.environ["CLAUDE_CODE_SESSION_ID"] = owner.current_session
@@ -252,7 +252,7 @@ class StandingTests(unittest.TestCase):
 
     def test_same_named_units_have_separate_folders_and_removal(self) -> None:
         parent = fixture_member("showrunner", name="another-production")
-        other = fixture_member("unit", name="verify-unit", parent=parent.id)
+        other = fixture_member("unit", name="copy-owner", parent=parent.id)
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:
             with copies.standing(str(other.id), self.source, copies.CommittedSource(self.head)) as second:
                 self.assertNotEqual(first, second)
@@ -2032,7 +2032,7 @@ with patch.object(subprocess, 'run', pause_clone):
                     result = self.cli('list')
                     self.assertEqual(result.returncode, 0, result.stderr)
                     line = next(line for line in result.stdout.splitlines() if str(tree) in line)
-                    for value in ('verify-unit', 'origin', self.head[:7], 'busy', str(os.getpid())):
+                    for value in ('copy-owner', 'origin', self.head[:7], 'busy', str(os.getpid())):
                         self.assertIn(value, line)
                     self.assertIn(f'\t{host_name()}\t', line)
                 result = self.cli('list')
@@ -2049,7 +2049,7 @@ with patch.object(subprocess, 'run', pause_clone):
                 if layout == 'mixed':
                     remote = next(row for row in rows if row['path'] == mirror.path)
                     self.assertEqual((remote['owner'], remote['repository'], remote['host']),
-                                     ('verify-unit', self.source.name, 'remote-host'))
+                                     ('copy-owner', self.source.name, 'remote-host'))
                     self.assertEqual((remote['state'], remote['session'], remote['holder_pid']),
                                      expected_remote_lease_columns('idle', '-', '-'))
 

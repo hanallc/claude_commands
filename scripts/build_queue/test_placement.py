@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 import io
 import json
 import os
+from pathlib import Path
 import select
 import signal
 import subprocess
@@ -18,11 +19,12 @@ import unittest
 from unittest import mock
 from typing import TextIO, cast, override
 
+from scripts.aws_target import hana_placement as hana
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
-from scripts.mac_test import claim_state, mac_test, offload
+from scripts.mac_test import claim_state, eligibility, mac_test, offload
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -34,6 +36,7 @@ from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLE
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
 ALLOWED_HOST = placement.AllowedHost()
+HANA_REPOSITORY = "https://github.com/natepiano/hana"
 
 
 class PlacementFixture(AdmissionFixture):
@@ -106,6 +109,38 @@ def assignment_for(fixture: AdmissionFixture, request: wire.PlacementRequest) ->
     if not isinstance(reply, wire.Assignment):
         raise AssertionError(f"placement did not assign the eligible destination: {reply!r}")
     return reply.assignment
+
+
+def hana_policy_request(fixture: PlacementFixture) -> tuple[wire.PlacementRequest, hana.HanaControlTransport]:
+    repository = fixture.root / "hana"
+    repository.mkdir()
+    settings = fixture.root / "hana_aws.conf"
+    _ = write_config_fixture(settings, f"enabled=on\nrepository_identity={HANA_REPOSITORY}\n")
+    _ = (fixture.root / "build_targets.conf").write_text(
+        "targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\nsettings.hana-aws=hana_aws.conf\n")
+    scope = RepositoryScope("hana", HANA_REPOSITORY, 1)
+    destination = placement.PlacementDestination("ssh", "hana-aws", "aws-hana", scope, 1)
+    request = placement_request(fixture)
+    assert isinstance(request.profile, records.StepProfile)
+    request = replace(request, profile=replace(request.profile, step="check"), constraints=replace(
+        request.constraints, command=("cargo", "check"), command_kind="check", repository=str(repository),
+        candidates=(placement.PlacementCandidate(destination),)))
+    return request, hana.HanaControlTransport(settings, destination.host)
+
+
+def report_hana_refusal(fixture: PlacementFixture, transport: hana.HanaControlTransport,
+                        assignment: placement.PlacementAssignment, *, before_report: Callable[[], object]) -> None:
+    controller = offload.ProcessController()
+    request = offload.OffloadRequest(fixture.root / "hana", "hana", "call", offload.NO_RESULT_FILE, (),
+        owner="fixture-adapter", holder_session=claim_state.session_id(assignment.session), verb="check",
+        kind="check", target=assignment.destination.target, placement=offload.AssignedOffloadRequest(assignment))
+    with mock.patch.object(eligibility, "repository_identity",
+                           return_value=eligibility.KnownRepository("hana", HANA_REPOSITORY)):
+        refused = offload.run_hana_offload(controller, transport, request, time.monotonic())
+    assert isinstance(refused, offload.DeclinedMacRun) and (refused.reason, refused.detail) == ("off", "off"), refused
+    _ = before_report()
+    with fixture.serving():
+        offload.report_placement_result(controller, request, refused)
 
 
 def adopt_assignment(fixture: PlacementFixture, request: wire.PlacementRequest,
@@ -492,6 +527,217 @@ class PlacementTests(unittest.TestCase):
                 replacement_claim = adopt_assignment(fixture, request, replacement)
                 self.assertIsInstance(fixture.connect(consume_permission(
                     "replacement-launch", replacement, replacement_claim)).replies()[-1], wire.FirstAuthorization)
+
+    def test_settings_refusals_retry_after_the_provider_settings_change(self) -> None:
+        for reason in ("off", "repo", "command"):
+            with self.subTest(reason=reason), PlacementFixture() as fixture:
+                settings = fixture.root / "provider.conf"
+                _ = write_config_fixture(settings, template="mac_test")
+                request = placement_request(fixture)
+                candidate = replace(request.constraints.candidates[0],
+                    settings=placement.ExplicitProviderSettings(settings))
+                request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+                original_evidence = publish_candidate(fixture, request)
+                assigned = assignment_for(fixture, request)
+                if reason == "repo":
+                    claim = adopt_assignment(fixture, request, assigned)
+                    _ = fixture.server.handle_request(wire.ExecutionReport("settings-refused", assigned,
+                        claim, placement.ExecutionNotStarted(), placement.PrelaunchRefused(reason),
+                        placement.DispatchPathSettled()))
+                else:
+                    _ = fixture.server.handle_request(wire.ClaimFailure("settings-refused", assigned, reason))
+                fixture.restart()
+                _ = publish_candidate(fixture, request)
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.DispatchStatus)
+                self.assertEqual(reply.retry, placement.DoNotRetry(reason))
+
+                _ = write_config_fixture(settings, "probe_timeout_s=16\n", template="mac_test")
+                fixture.clock.advance(1)
+                current_evidence = publish_candidate(fixture, request)
+                self.assertNotEqual(original_evidence.key.configuration_generation,
+                                    current_evidence.key.configuration_generation)
+                with mock.patch.object(fixture.server, "host_evidence_key",
+                                       wraps=fixture.server.host_evidence_key) as read_key:
+                    _ = fixture.run_pass()
+                read_key.assert_called_once_with(request, assigned.destination)
+                if reason == "command":
+                    self.assertNotIn(assigned.episode, fixture.server.current_assignments)
+                    self.assertEqual(fixture.server.placement_eligibility[assigned.episode],
+                        (placement.CandidateEligibility(assigned.destination, placement.FixedExclusion(reason)),))
+                else:
+                    key = fixture.server.current_assignments.get(assigned.episode)
+                    self.assertIsNotNone(key, "the next pass must assign the target")
+                    assert key is not None
+                    renewed = fixture.server.assignments[key].assignment
+                    self.assertNotEqual(renewed.attempt, assigned.attempt)
+                    self.assertEqual((renewed.destination, renewed.since), (assigned.destination, assigned.since))
+
+    def test_an_older_settings_refusal_without_a_generation_can_retry(self) -> None:
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+            _ = fixture.server.handle_request(wire.ClaimFailure("old-off-refusal", assigned, "off"))
+            key = placement.attempt_key(assigned.episode, assigned.attempt)
+            path = fixture.state_dir / "state.json"
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            assignments = cast(dict[str, dict[str, object]], state["assignments"])
+            _ = assignments[key].pop("assigned_settings_generation")
+            _ = assignments[key].pop("refusal_settings")
+            assignments[key]["settings_refusal_generation"] = {"kind": "SettingsRefusalGeneration", "digest": "old"}
+            _ = path.write_text(json.dumps(state))
+            fixture.restart()
+            self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("off"))
+            _ = publish_candidate(fixture, request)
+            _ = fixture.run_pass()
+            self.assertIn(assigned.episode, fixture.server.current_assignments)
+            self.assertNotEqual(fixture.server.current_assignments[assigned.episode], key)
+
+    def test_enabling_the_route_before_the_refusal_report_permits_a_retry(self) -> None:
+        with PlacementFixture() as fixture:
+            settings = fixture.root / "provider.conf"
+            _ = write_config_fixture(settings, "offload=off\n", template="mac_test")
+            request = placement_request(fixture)
+            candidate = replace(request.constraints.candidates[0], settings=placement.ExplicitProviderSettings(settings))
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            original = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+            fixture.restart()
+            _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
+            self.assertIsInstance(fixture.server.handle_request(
+                wire.ClaimFailure("delayed-off-refusal", assigned, "off"))[0], wire.DispatchStatus)
+            enabled = publish_candidate(fixture, request)
+            self.assertNotEqual(original.key.configuration_generation, enabled.key.configuration_generation)
+            _ = fixture.run_pass()
+            key = fixture.server.current_assignments.get(assigned.episode)
+            self.assertIsNotNone(key, "the first pass with the enabled settings must assign the target")
+            assert key is not None
+            renewed = fixture.server.assignments[key].assignment
+            self.assertNotEqual(renewed.attempt, assigned.attempt)
+            self.assertEqual((renewed.destination, renewed.since), (assigned.destination, assigned.since))
+
+    def test_hana_retries_when_settings_are_restored_before_the_dispatch_refusal(self) -> None:
+        with PlacementFixture() as fixture:
+            request, transport = hana_policy_request(fixture)
+            settings = transport.settings
+            enabled_settings = settings.read_bytes()
+            original = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+
+            _ = write_config_fixture(settings, "enabled=off\n")
+            disabled_key = fixture.server.host_evidence_key(request, assigned.destination)
+            self.assertNotEqual(disabled_key.configuration_generation, original.key.configuration_generation)
+
+            # The fixture executes the actual prelaunch check. No provider dispatch was started.
+            with mock.patch.object(service.HostEvidenceWorker, "dispatch_pending", return_value=False):
+                report_hana_refusal(fixture, transport, assigned, before_report=lambda: settings.write_bytes(enabled_settings))
+                restored = publish_candidate(fixture, request)
+                self.assertEqual(restored.key.configuration_generation, original.key.configuration_generation)
+                _ = fixture.run_pass()
+                key = placement.attempt_key(assigned.episode, assigned.attempt)
+                self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("off"))
+                replacement = assignment_for(fixture, request)
+                self.assertNotEqual(replacement.attempt, assigned.attempt)
+                self.assertEqual((replacement.destination, replacement.since), (assigned.destination, assigned.since))
+                fixture.restart()
+                self.assertEqual(fixture.server.assignments[key].refusal_settings,
+                    records.RefusalSettings(disabled_key.configuration_generation))
+                _ = publish_candidate(fixture, request)
+                self.assertEqual(assignment_for(fixture, request), replacement)
+
+    def test_hana_settings_edit_between_digest_and_policy_permits_one_retry(self) -> None:
+        with PlacementFixture() as fixture:
+            request, transport = hana_policy_request(fixture)
+            enabled = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+            policy = hana.fixed_policy
+
+            def disable_hana(settings: hana.HanaControlTransport, repository: str, kind: str
+                             ) -> hana.HanaStepRefused | hana.EnabledHanaRoute:
+                _ = write_config_fixture(settings.settings, "enabled=off\n")
+                return policy(settings, repository, kind)
+
+            with mock.patch.object(service.HostEvidenceWorker, "dispatch_pending", return_value=False):
+                with mock.patch.object(hana, "fixed_policy", side_effect=disable_hana):
+                    report_hana_refusal(fixture, transport, assigned, before_report=lambda: None)
+                # The provider evidence permits a retry so the fixture can check the second report.
+                disabled = publish_candidate(fixture, request)
+                self.assertNotEqual(disabled.key.configuration_generation, enabled.key.configuration_generation)
+                replacement = assignment_for(fixture, request)
+                self.assertNotEqual(replacement.attempt, assigned.attempt)
+                report_hana_refusal(fixture, transport, replacement, before_report=lambda: None)
+                _ = publish_candidate(fixture, request)
+                _ = fixture.run_pass()
+
+            self.assertNotIn(assigned.episode, fixture.server.current_assignments)
+            self.assertEqual(fixture.server.placement_eligibility[assigned.episode],
+                (placement.CandidateEligibility(assigned.destination, placement.FixedExclusion("off")),))
+            self.assertEqual(len(fixture.server.assignments), 2)
+            for attempt, evidence in ((assigned, enabled), (replacement, disabled)):
+                saved = fixture.server.assignments[placement.attempt_key(attempt.episode, attempt.attempt)]
+                self.assertEqual(saved.refusal_settings, records.RefusalSettings(evidence.key.configuration_generation))
+
+    def test_settled_repo_decline_waits_for_a_settings_change(self) -> None:
+        with PlacementFixture() as fixture:
+            settings = fixture.root / "provider.conf"
+            _ = write_config_fixture(settings, template="mac_test")
+            request = placement_request(fixture)
+            candidate = replace(request.constraints.candidates[0], settings=placement.ExplicitProviderSettings(settings))
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            _ = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assigned)
+            self.assertEqual(fixture.server.handle_request(consume_permission("repo-consume", assigned, claim)),
+                [wire.FirstAuthorization(assigned, claim)])
+            _ = fixture.connect(wire.ExecutionReport("repo-decline", assigned, claim, placement.ExecutionNotStarted(),
+                placement.AttemptDeclined("repo"), placement.DispatchPathSettled())).replies()
+            key = placement.attempt_key(assigned.episode, assigned.attempt)
+            for pass_number in range(3):
+                with self.subTest(pass_number=pass_number):
+                    fixture.clock.advance(1)
+                    _ = publish_candidate(fixture, request)
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("repo"))
+                    self.assertEqual(fixture.server.assignments[key].retry, placement.DoNotRetry("repo"))
+                    self.assertNotIn(assigned.episode, fixture.server.current_assignments)
+                if pass_number == 0:
+                    fixture.restart()
+            _ = write_config_fixture(settings, "linux_only.hana=\n", template="mac_test")
+            _ = publish_candidate(fixture, request)
+            _ = fixture.run_pass()
+            replacement = assignment_for(fixture, request)
+            self.assertNotEqual(replacement.attempt, assigned.attempt)
+            self.assertEqual((replacement.destination, replacement.since), (assigned.destination, assigned.since))
+
+    def test_a_settings_read_error_does_not_interrupt_a_refusal_report(self) -> None:
+        with PlacementFixture() as fixture:
+            settings = fixture.root / "provider.conf"
+            _ = write_config_fixture(settings, template="mac_test")
+            request = placement_request(fixture)
+            candidate = replace(request.constraints.candidates[0], settings=placement.ExplicitProviderSettings(settings))
+            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            _ = publish_candidate(fixture, request)
+            assigned = assignment_for(fixture, request)
+            read_bytes = Path.read_bytes
+
+            def read(path: Path) -> bytes:
+                if path == settings:
+                    raise PermissionError("private provider settings are unreadable")
+                return read_bytes(path)
+
+            with mock.patch.object(Path, "read_bytes", new=read):
+                reply, = fixture.connect(wire.ClaimFailure("unreadable-provider", assigned, "off")).replies()
+                self.assertIsInstance(reply, wire.DispatchStatus)
+                self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
+                denied, = fixture.server.handle_request(request)
+                self.assertIsInstance(denied, wire.PlacementWait)
+            key = placement.attempt_key(assigned.episode, assigned.attempt)
+            saved = service.read_state(fixture.state_dir).assignments[key]
+            self.assertEqual(saved.state, placement.ClosedAssignment("off"))
+            self.assertIsInstance(saved.terminal_report, placement.TerminalAttemptReport)
+            assert isinstance(saved.terminal_report, placement.TerminalAttemptReport)
+            self.assertEqual(saved.terminal_report.outcome, placement.PrelaunchRefused("off"))
 
     def test_final_command_results_never_retry_on_another_available_host(self) -> None:
         for status in (0, 17):
