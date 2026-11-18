@@ -43,9 +43,11 @@ from scripts.build_hold import override_guard
 
 from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
+from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_send
+from scripts.production import staff
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
@@ -372,6 +374,129 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertIsInstance(replay, wire.PlacementWait)
                 self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
                 self.assertEqual(fixture.server.assignments[key].terminal_report, report)
+
+    def test_hana_claim_failure_uses_the_exact_dispatch_journal(self) -> None:
+        from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_result, hana_source
+        from scripts.aws_target.test_hana_execution import FakeExecutionObjects
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, coordinator_holder, hana_policy_request, local_candidate,
+            publish_candidate,
+        )
+        from scripts.mac_test import claim_state
+
+        cases = (("settled command path", "The Hana attempt already has a settled command path"),
+                 ("failed start", "The Hana start deadline expired"),
+                 ("fenced start refusal", "The Hana start deadline expired"),
+                 ("command published", ""),
+                 ("restored startup refusal", "The Hana start deadline expired"),
+                 ("restored claim failure", "The Hana attempt already has a settled command path"))
+        for case, reason in cases:
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                target_state = fixture.root / "targets"
+                with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(target_state)}):
+                    request, transport = hana_policy_request(fixture)
+                    local = local_candidate(fixture)
+                    request = replace(request, constraints=replace(request.constraints,
+                        candidates=(*request.constraints.candidates, local)))
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    destination = assignment.destination
+                    self.assertEqual(destination, request.constraints.candidates[0].destination)
+                    key = placement.attempt_key(assignment.episode, assignment.attempt)
+                    claim = placement.ProviderClaimReference("ssh", destination.target, destination.scope,
+                        placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                        assignment.episode, assignment.attempt)
+                    controller = hana_placement.controller_for(transport, read_only=True)
+                    controller.bind_execution(claim.claim_id)
+                    if case == "command published":
+                        generation = hana_placement.HanaHostGeneration("deployment", "start", "boot")
+                        identity = hana_result.HanaAttemptKey(claim.episode, claim.attempt, claim.claim_id, generation)
+                        manifest = hana_source.SourceManifest(1, "hana-source", "a" * 40, "b" * 64,
+                            "https://bucket.s3.us-east-2.amazonaws.com/source", (), ("cargo", "check"), (), (), "c" * 64)
+                        source_key = assignment.source_key
+                        assert isinstance(source_key, placement.SourceKeyKnown)
+                        dispatch = hana_execution.HanaExecutionRequest(identity, manifest, 1, source_key,
+                            manifest.argv, hana_result.LogicalStepLink("call", claim.episode))
+                        holder = coordinator_holder(assignment)
+                        adopted_claim = placement.AdoptedProviderClaim(claim, holder, assignment.session,
+                            destination.host, "host-generation-a")
+                        _ = publish_candidate(fixture, request, claims=(adopted_claim,))
+                        adopted = hana_placement.HanaClaimAdopted(placement.ReservedHost(assignment, adopted_claim), generation)
+                        objects = FakeExecutionObjects(dispatch)
+
+                        def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
+                            authorized, = fixture.server.handle_request(message)
+                            assert isinstance(authorized, wire.FirstAuthorization), authorized
+                            return authorized
+
+                        state = hana_execution.dispatch_execution(controller.directory, dispatch, adopted,
+                            objects, consume=consume, current_permission=lambda: hana_box.CommandPermission(
+                                claim.claim_id, hana_box.VerifiedBoot("boot", "start"), 1, int(fixture.clock.now()) + 60),
+                            current_source_key=lambda: assignment.source_key)
+                        self.assertIsInstance(state, hana_execution.DispatchSent)
+                        self.assertEqual(len(objects.envelopes), 1)
+                        self.assertIsInstance(objects.envelopes[0], hana_execution.HanaCommandEnvelope)
+                        self.assertIsInstance(hana_execution.observe_execution(controller.directory, dispatch, objects),
+                            placement.ObservedExecution)
+                        self.assertTrue(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                        refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
+                        assert isinstance(refusal, wire.DispatchStatus)
+                        self.assertEqual(refusal.state, placement.CurrentAssignment())
+                        self.assertIsInstance(refusal.permission, placement.PermissionConsumed)
+                        waiting, = fixture.server.handle_request(request)
+                        self.assertIsInstance(waiting, wire.PlacementWait)
+                        self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                        continue
+                    if case == "fenced start refusal":
+                        def release() -> bool:
+                            return hana_placement.release_assigned(assignment, coordinator_holder(assignment), controller)
+
+                        fenced = hana_execution.settle_unpublished_claim(controller.directory, claim,
+                            release_claim=release, reason=reason)
+                        self.assertIsInstance(fenced, hana_execution.HanaSettlementPending)
+                        self.assertTrue(hana_execution.execution_command_settled(controller.directory, claim.claim_id))
+                        self.assertTrue(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                        self.assertEqual(claim_state.read_claims(claim_state.state_paths(destination.target)), ())
+                        refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
+                        assert isinstance(refusal, wire.DispatchStatus)
+                        self.assertEqual(refusal.state, placement.CurrentAssignment())
+                        controller.register(hana_box.DeploymentIdentity("deployment", "instance", "spot", "us-east-2"))
+                        retry, = fixture.server.handle_request(request)
+                        self.assertEqual(retry, wire.Assignment(assignment))
+                        settlement = hana_execution.settle_unpublished_claim(controller.directory, claim,
+                            release_claim=release, reason=reason)
+                    else:
+                        settlement = hana_execution.settle_unpublished_claim(controller.directory, claim,
+                            release_claim=lambda: True, reason=reason)
+                    self.assertIsInstance(settlement, hana_execution.HanaSettled)
+                    self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, claim))
+                    if case == "fenced start refusal":
+                        _ = fixture.run_pass()
+                        self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("state"))
+                    elif case.startswith("restored"):
+                        startup = case == "restored startup refusal"
+                        refused_reason = reason if startup else "state"
+                        report = placement.TerminalAttemptReport(placement.PrelaunchRefused(refused_reason),
+                            placement.DispatchPathPending("The Hana claim remains retained" if startup
+                                else "provider settlement remains pending"), fixture.clock.now())
+                        fixture.server.assignments[key] = replace(fixture.server.assignments[key], terminal_report=report,
+                            provider=claim if startup else placement.NoProviderClaim(), retry=placement.RetryAt(report.received_at))
+                        fixture.server.persist()
+                        fixture.restart()
+                        local_key = fixture.server.current_assignments[assignment.episode]
+                        self.assertEqual(fixture.server.assignments[local_key].assignment.destination, local.destination)
+                        self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment(refused_reason))
+                    else:
+                        # The adapter reports the reason code and prints the detailed provider reason.
+                        refusal, = fixture.server.handle_request(wire.ClaimFailure("refusal", assignment, "state"))
+                        assert isinstance(refusal, wire.DispatchStatus)
+                        self.assertEqual(refusal.state, placement.ClosedAssignment("state"))
+                    reply, = fixture.server.handle_request(request)
+                    self.assertIsInstance(reply, wire.LocalPlacementGranted)
+                    assert isinstance(reply, wire.LocalPlacementGranted)
+                    self.assertEqual(reply.assignment.destination, local.destination)
+                    self.assertEqual((reply.assignment.episode, reply.assignment.since), (assignment.episode, assignment.since))
+                    self.assertNotEqual(reply.assignment.attempt, assignment.attempt)
 
     def test_a_settled_decline_waits_for_evidence_at_or_after_its_report(self) -> None:
         from scripts.build_queue.test_placement import (
@@ -888,6 +1013,51 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     release.set()
                     for worker in fixture.server.host_targets.values():
                         worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def test_pass_reads_provider_configuration_once_as_the_queue_grows(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import target_config
+
+        with AdmissionFixture() as fixture:
+            settings = fixture.root / "linux.conf"
+            _ = write_config_fixture(settings, "probe_timeout_s=1\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
+            request = placement_request(fixture)
+            candidate, = request.constraints.candidates
+            destination = replace(candidate.destination, provider="ssh", target="linux")
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(replace(candidate, destination=destination),)))
+            fixture.server.placement_requests[request.episode] = request
+
+            with mock.patch.object(io, "open", wraps=io.open) as io_open, \
+                    mock.patch("builtins.open", wraps=open) as builtin_open, \
+                    mock.patch.object(target_config, "read_execution_transport",
+                                      wraps=target_config.read_execution_transport) as read_transport:
+                def settings_opens() -> int:
+                    return sum(cast(tuple[object, ...], call.args)[0] in (settings, str(settings))
+                               for opener in (io_open, builtin_open) for call in opener.call_args_list)
+
+                _ = fixture.run_pass()
+                first = fixture.server.placement_host_keys[(request.episode, destination)]
+                first_counts = settings_opens(), read_transport.call_count
+                self.assertEqual(fixture.server.host_readers[first].timeout, 1)
+                for index in range(12):
+                    extra = replace(request, episode=f"extra-{index}")
+                    fixture.server.placement_requests[extra.episode] = extra
+                _ = write_config_fixture(settings, "probe_timeout_s=4\n", template="mac_test")
+                io_open.reset_mock()
+                builtin_open.reset_mock()
+                read_transport.reset_mock()
+                _ = fixture.run_pass()
+                self.assertEqual((settings_opens(), read_transport.call_count), first_counts)
+                # The transport selector reads the file separately.
+                self.assertEqual(first_counts, (2, 1))
+                current = fixture.server.placement_host_keys[(request.episode, destination)]
+                self.assertNotEqual(current.configuration_generation, first.configuration_generation)
+                self.assertEqual(fixture.server.host_readers[current].timeout, 4)
+                self.assertEqual(len(fixture.server.placement_host_keys), 13)
+                self.assertEqual(set(fixture.server.placement_host_keys.values()), {current})
 
     def test_each_settings_file_controls_its_evidence_age(self) -> None:
         from scripts.build_queue import placement
@@ -2396,6 +2566,43 @@ class WaitHolderServiceTests(unittest.TestCase):
                 self.assertTrue(waits)
                 self.assertEqual(waits[-1].snapshot.holder, records.SessionHolder("gap-session", "gap-worker"))
 
+    def test_gate_hold_keeps_the_admitted_job_after_restart_and_command_loss(self) -> None:
+        job = StepJob("test-all")
+        for source, expected in (("request", "test-all"), ("process", "test-all"), ("old record", "merge-gate")):
+            with self.subTest(source=source), AdmissionFixture() as fixture:
+                run = fixture.run_owner()
+                request = fixture.request(step="merge-gate", run=run)
+                cmdline = fixture.proc.path / str(request.owner.pid) / "cmdline"
+                argv = ("python3", "copies.py", "run", "--repo", str(fixture.root), "--",
+                        "python3", "merge_gate.py", "--tests-only", "--full")
+                if source == "request":
+                    request = replace(request, identity=replace(request.identity, job=job))
+                else:
+                    _ = cmdline.write_bytes(b"\0".join(map(os.fsencode, argv)) + b"\0")
+                with fixture.loop_turn():
+                    granted = only_admitted(fixture.server.handle_request(request))
+                cmdline.unlink(missing_ok=True)
+                if source == "old record":
+                    path = fixture.state_dir / "state.json"
+                    state = cast(dict[str, object], json.loads(path.read_text()))
+                    reservations = cast(dict[str, dict[str, object]], state["reservations"])
+                    del reservations[request.episode]["gate_job"]
+                    _ = path.write_text(json.dumps(state))
+                fixture.restart()
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                running, = [step for step in reply.reading.view.running if step.pid == request.owner.pid]
+                expected_job = GateJobNotRecorded() if source == "old record" else job
+                self.assertEqual(running.job, expected_job)
+                fixture.release(granted)
+                hold, = fixture.server.slots.values()
+                assert isinstance(hold, records.BetweenStepsSlot)
+                assert isinstance(hold.identity, records.EndedStepFacts)
+                self.assertEqual(hold.identity.step, expected)
+                self.assertEqual(hold.identity.job, expected_job)
+                self.assertEqual(wire.parse_record(wire.encode_record(hold), records.BetweenStepsSlot), hold)
+
     def test_a_released_unit_steps_held_slot_keeps_its_unit_without_a_session(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
@@ -3309,6 +3516,7 @@ class CloudAdmissionTests(unittest.TestCase):
     def test_tenth_cloud_gate_waits_and_starts_after_a_release(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
+            fixture.configure(cloud_gate_slots=9)
             requests = [self.cloud_request(fixture) for _ in range(11)]
             grants = [only_admitted(fixture.server.handle_request(request)) for request in requests[:9]]
             for request in requests[9:]:
@@ -3428,6 +3636,55 @@ class RoomAndSlotTests(unittest.TestCase):
                     self.assertIsInstance(replies[0], wire.Wait)
                     self.assertFalse(fixture.server.reservations)
 
+    def test_an_oversized_head_with_only_its_own_claim_starts_alone(self) -> None:
+        for bypass in (False, True):
+            with self.subTest(bypass=bypass), AdmissionFixture() as fixture:
+                run = fixture.run_owner()
+                first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+                fixture.release(first)
+                fixture.free(11 * GIB)
+                head = fixture.request(run=run, need=16 * GIB)
+
+                with mock.patch.object(gate, "CONTINUATION_MAY_PASS", bypass):
+                    replies = fixture.server.handle_request(head)
+
+                result = fixture.server.last_result
+                assert isinstance(result, gate.PassResult)
+                decision = result.rows[0].decision
+                self.assertEqual(decision.room.room, 2 * GIB)
+                self.assertEqual(decision.room.need, 10 * GIB)
+                self.assertEqual(decision.room.basis, records.StartsAlone())
+                grant = only_admitted(replies)
+                self.assertEqual(grant.need, 16 * GIB)
+                self.assertEqual(set(fixture.server.reservations), {head.episode})
+                self.assertFalse(fixture.server.slots)
+                room = fixture.run_pass().policy.room
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.used + room.kept, 16 * GIB)
+
+    def test_an_oversized_head_waits_for_another_runs_slot_to_expire(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+            fixture.allow_next_start()
+            other = only_admitted(fixture.server.handle_request(fixture.request(run=fixture.run_owner(), need=GIB)))
+            fixture.release(first)
+            fixture.release(other)
+            other_slot = gate.between_steps(fixture.server.slots[other.reservation])
+            fixture.free(11 * GIB)
+            head = fixture.request(run=run, need=16 * GIB)
+
+            reply, = fixture.server.handle_request(head)
+            self.assertIsInstance(reply, wire.Wait)
+            self.assertFalse(fixture.server.reservations)
+            self.assertIsInstance(fixture.server.slots[first.reservation], records.ContinuationSlot)
+
+            fixture.clock.advance(other_slot.expires_at - fixture.clock.now())
+            alone = fixture.run_pass()
+            self.assertEqual(alone.rows[0].decision.room.basis, records.StartsAlone())
+            self.assertEqual(fixture.server.reservations[head.episode].need, 16 * GIB)
+            self.assertFalse(fixture.server.slots)
+
     def test_existing_host_reading_gets_calm_pressure_without_erasing_deliberate_pressure(self) -> None:
         for blocked in (False, True):
             with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as directory:
@@ -3496,6 +3753,9 @@ class RoomAndSlotTests(unittest.TestCase):
             run = fixture.run_owner()
             first = fixture.request(run=run, need=6 * GIB)
             grant = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            # A live reservation prevents the continuation from starting alone.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.release(grant)
             fixture.allow_next_start()
             fixture.free(10 * GIB)
@@ -3513,7 +3773,7 @@ class RoomAndSlotTests(unittest.TestCase):
             self.assertIsInstance(held.reason, records.BehindHead)
             protected = next(row for row in result.rows if row.owner ==
                 f"{head.owner.pid}-{head.owner.start_time}")
-            self.assertEqual(protected.decision.room.room, -GIB)
+            self.assertEqual(protected.decision.room.room, GIB)
             claim = fixture.server.waiters[successor.episode].last_reply
             assert isinstance(claim, wire.Wait)
             assert isinstance(claim.reason, records.HeadAdmissionStatus)
@@ -3592,6 +3852,50 @@ class RoomAndSlotTests(unittest.TestCase):
                 else:
                     self.assertIsInstance(reply.reason.cause, records.MemoryPressure)
 
+    def test_release_keeps_the_hold_and_its_charge_for_all_recorded_step_text(self) -> None:
+        cases = (("", "hana"), (" ", "hana"), ("556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", "hana"),
+                 ("umask", "hana"), ("$UNIT", "hana"), ("unrecognized", "hana"), ("test", "hana"),
+                 ("unrecognized", "local repo"), ("mend", "local repo"))
+        for step, repository in cases:
+            with self.subTest(step=step, repository=repository), AdmissionFixture() as fixture:
+                folder = str(fixture.root / repository)
+                request = fixture.request(run=fixture.run_owner(), step=step, need=GIB)
+                assert isinstance(request.profile, records.StepProfile)
+                request = replace(request, profile=replace(request.profile, repo=repository, worktree=folder),
+                                  identity=replace(request.identity, folder=folder))
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.release(grant)
+                self.assertEqual(len(fixture.server.slots), 1)
+                _ = fixture.run_pass()
+                inputs = fixture.server.last_inputs
+                policy = fixture.server.last_policy
+                assert isinstance(inputs, records.QueueInputs) and isinstance(policy, records.AdmissionPolicy)
+                room = gate.inputs_room(inputs, policy)
+                assert isinstance(room, records.MemoryRoom)
+                self.assertEqual(room.kept, GIB)
+
+    def test_release_records_ended_step_identity(self) -> None:
+        with AdmissionFixture() as fixture:
+            member = staff.StaffRow(staff.StaffId("fixed-director"), "unit", "startup", staff.StaffRoot(),
+                                    current_session=staff.StaffId("old-session"))
+            first = fixture.request(run=fixture.run_owner(), step="nextest")
+            first = replace(first, argv=("cargo", "nextest", "run", "-E", "package(hana)"),
+                            identity=replace(first.identity, session_id=member.current_session))
+            with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((member,))):
+                grant = only_admitted(fixture.server.handle_request(first))
+            fixture.restart()
+            fixture.release(grant)
+            slot, = fixture.server.slots.values()
+            self.assertEqual(cast(dict[str, object], codec.snapshot_value(slot)).get("identity"),
+                             {"kind": "EndedStepFacts", "step": "nextest", "package": "hana",
+                              "project": "fixture", "folder": str(fixture.root), "staff_id": "fixed-director"})
+            _ = fixture.run_pass()
+            saved = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(saved, queue_snapshot.QueueSnapshot)
+            self.assertEqual(saved.inputs.slots, (slot,))
+            fixture.restart()
+            self.assertEqual(fixture.server.slots, {})
+
     def test_view_release_and_admit_pass_capture_the_same_continuation_slot(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
@@ -3622,7 +3926,40 @@ class RoomAndSlotTests(unittest.TestCase):
             self.assertEqual(continuation.decision.room.need, 2 * GIB)
 
 
-    def test_slot_reuse_starts_under_pressure_without_order_or_spacing(self) -> None:
+    def test_a_continuation_held_behind_an_earlier_row_gives_its_claim_back(self) -> None:
+        for head_gib in (8, 16):
+            with self.subTest(head_gib=head_gib), AdmissionFixture() as fixture:
+                run = fixture.run_owner()
+                first = only_admitted(fixture.server.handle_request(fixture.request(run=run, need=6 * GIB)))
+                fixture.allow_next_start()
+                running = only_admitted(fixture.server.handle_request(fixture.request(need=GIB)))
+                fixture.release(first)
+                fixture.allow_next_start()
+                fixture.free(11 * GIB)
+                head = fixture.request(need=head_gib * GIB, since=fixture.clock.now() - 120)
+                initial, = fixture.server.handle_request(head)
+                assert isinstance(initial, wire.Wait)
+                self.assertEqual(initial.snapshot.decision.room.room, 2 * GIB)
+
+                successor = fixture.request(run=run, need=6 * GIB)
+                _ = fixture.server.handle_request(successor)
+                self.assertFalse(fixture.server.slots, "the earlier row needs the claim's memory")
+                result = fixture.server.last_result
+                assert isinstance(result, gate.PassResult)
+                self.assertEqual(result.rows[0].decision.room.room, 8 * GIB)
+                self.assertFalse(result.rows[1].decision.reused_slot)
+                self.assertEqual(result.rows[1].decision.room.need, 6 * GIB)
+                self.assertIn(successor.episode, fixture.server.waiters)
+                if head_gib == 8:
+                    self.assertIn(head.episode, fixture.server.reservations)
+                else:
+                    self.assertNotIn(head.episode, fixture.server.reservations)
+                    fixture.release(running)
+                    alone = fixture.run_pass()
+                    self.assertEqual(alone.rows[0].decision.room.basis, records.StartsAlone())
+                    self.assertIn(head.episode, fixture.server.reservations)
+
+    def test_slot_reuse_can_pass_under_pressure_when_the_switch_is_on(self) -> None:
         for need in (4 * GIB, 6 * GIB):
             for unreadable in (False, True):
                 with self.subTest(need=need, unreadable=unreadable), AdmissionFixture() as fixture:
@@ -3634,7 +3971,8 @@ class RoomAndSlotTests(unittest.TestCase):
                     head = fixture.request(need=GIB)
                     self.assertIsInstance(fixture.server.handle_request(head)[0], wire.Wait)
                     successor = fixture.request(run=run, need=need)
-                    next_grant = only_admitted(fixture.server.handle_request(successor))
+                    with mock.patch.object(gate, "CONTINUATION_MAY_PASS", True):
+                        next_grant = only_admitted(fixture.server.handle_request(successor))
                     result = fixture.server.last_result
                     assert isinstance(result, gate.PassResult)
                     reused = next(row for row in result.rows if row.owner ==
@@ -3678,6 +4016,9 @@ class RoomAndSlotTests(unittest.TestCase):
             run = fixture.run_owner()
             first = fixture.request(run=run, need=6 * GIB)
             grant = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            # A live reservation prevents the continuation from starting alone.
+            _ = only_admitted(fixture.server.handle_request(fixture.request(need=0)))
             fixture.release(grant)
             fixture.clock.advance(5)
             fixture.free(10 * GIB)
@@ -4861,11 +5202,11 @@ class ServiceTests(unittest.TestCase):
                     label = "hana · nextest" if owner_name == "folder" else f"{head.owner.pid} · nextest"
                 if owner_name == "continuation":
                     head = replace(request, identity=replace(request.identity, name="continuation"))
-                    label = "continuation · nextest"
+                    label = "ordinary · nextest"
                     ordinary = fixture.request(need=8 * GIB, since=fixture.clock.now() - 1)
                     ordinary = replace(ordinary, identity=replace(ordinary.identity, name="ordinary"))
                     ordinary_peer = fixture.connect(ordinary)
-                    peers = [fixture.connect(head), ordinary_peer]
+                    peers = [ordinary_peer, fixture.connect(head)]
                 else:
                     peers = [fixture.connect(head), fixture.connect(fixture.request(need=8 * GIB))]
                 for position, peer in enumerate(peers, 1):
@@ -4883,16 +5224,19 @@ class ServiceTests(unittest.TestCase):
                         if position == 1:
                             self.assertIn("this build is the queue head", output.getvalue())
                         else:
-                            self.assertEqual(waits[-1].snapshot.head_need, 12 * GIB)
-                            self.assertIn("head continuation · nextest needs 12.0 GiB", output.getvalue())
+                            self.assertEqual(waits[-1].snapshot.head_need, 8 * GIB)
+                            self.assertIn("head ordinary · nextest needs 8.0 GiB", output.getvalue())
                             self.assertNotIn("this build is the queue head", output.getvalue())
-                fixture.free(60 * GIB)
+                fixture.free((20 if owner_name == "continuation" else 60) * GIB)
+                if owner_name == "continuation":
+                    fixture.allow_next_start()
                 result = fixture.server.run_pass()
                 assert isinstance(result, gate.PassResult)
                 expected = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                                   key=lambda row: row.admission.rank if isinstance(row.admission, gate.ProposedAdmission) else -1)
                 first = only_admitted(peers[0].replies())
                 self.assertTrue(any(isinstance(reply, wire.Wait) for reply in peers[1].replies()))
+                fixture.free(60 * GIB)
                 fixture.allow_next_start()
                 next_result = fixture.server.run_pass()
                 assert isinstance(next_result, gate.PassResult)
@@ -5911,6 +6255,10 @@ class CutoverServiceTests(unittest.TestCase):
             grant = only_admitted(fixture.server.handle_request(owner_request))
             peak = int(15.76 * GIB)
             fixture.scoped_peak(grant, peak)
+            fixture.allow_next_start()
+            blocker = fixture.request(need=GIB // 8, step="check",
+                owner=fixture.proc.spawn(used=GIB // 8))
+            blocker_grant = only_admitted(fixture.server.handle_request(blocker))
             fixture.free(0)
             fixture.hold_starts()
             waiter = replace(fixture.request(need=12 * GIB, step="build",
@@ -5935,11 +6283,6 @@ class CutoverServiceTests(unittest.TestCase):
             self.assertNotIn(waiter.episode, fixture.server.reservations)
             fixture.clock.advance(1)
             fixture.free(60 * GIB)
-            blocker = fixture.request(need=GIB // 8, step="check",
-                owner=fixture.proc.spawn(used=GIB // 8))
-            if blocker.episode not in fixture.server.reservations:
-                fixture.allow_next_start()
-            blocker_grant = only_admitted(fixture.server.handle_request(blocker))
             fixture.free(18 * GIB)
             with test_hang_guard.LauncherHangGuard(self.id()).protect(), fixture.serving(), \
                     mock.patch.object(client, "CLOCK", fixture.clock), \

@@ -34,6 +34,7 @@ from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
@@ -190,6 +191,15 @@ class UncertainGateLaunch:
     expires: int
 
 
+@final
+class AwsServiceFailure(AwsUnavailable):
+    """The AWS CLI reports a service error code for the operation."""
+    def __init__(self, operation: str, code: str, *, first_attempt: bool) -> None:
+        super().__init__(f'{operation}: {code}')
+        self.code = code
+        self.first_attempt = first_attempt
+
+
 def cleanup_folder(folder: Path, worker: GateWorker) -> bool:
     """Clean one gate folder or all module folders in a trial."""
     paths = [folder / 'request.json'] if (folder / 'request.json').exists() else sorted(folder.glob('*/request.json'))
@@ -279,19 +289,21 @@ class CloudReservation:
 
 
 @contextmanager
-def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Generator[CloudReservation]:
+def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob) -> Generator[CloudReservation]:
     """Keep the route's cloud slot until its result or fallback returns."""
     pid = os.getpid()
     start = admission_records.process_start_time(pid)
     if start is None:
         raise GateRefused('The cloud route has no live process identity')
     owner, episode, since = wire.Owner(pid, start), uuid4().hex, time.time()
-    profile = admission_records.ProgramProfile(mode.value, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
+    step = work.step if isinstance(work, StepJob) else work.value
+    job = work if isinstance(work, StepJob) else GATE_JOB_NOT_RECORDED
+    profile = admission_records.ProgramProfile(step, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
         admission_records.HistoryPeakSizing(0, admission_records.FirstProgramPeak(0), 0.0))
     def refresh() -> wire.AdmitRequest:
-        request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
+        request = admission_client.step_request([step], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
-        return replace(request, place=wire.CloudPlace('aws'))
+        return replace(request, place=wire.CloudPlace('aws'), identity=replace(request.identity, job=job))
     with ExitStack() as held_slot:
         try:
             held = held_slot.enter_context(queue_place.held_reservation(queue_place.RefreshedRequest(refresh)))
@@ -358,6 +370,10 @@ class GateWorker:
         try:
             _ = self.api.call('get-object', '--bucket', bucket, '--key', key, str(path), service='s3api')
             return True
+        except AwsServiceFailure as error:
+            if error.code in ('404', 'NoSuchKey'):
+                return False
+            raise
         except AwsUnavailable as error:
             if any(code in str(error) for code in ('NoSuchKey', '(404)', 'Not Found')):
                 return False

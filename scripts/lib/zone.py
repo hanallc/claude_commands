@@ -144,8 +144,8 @@ def broadcast_on_mac(text: str) -> tuple[bool, str]:
 def notice(zone: str, before: str) -> str:
     now = datetime.now(ZoneInfo(zone))
     label = now.tzname() or zone
-    return (f"From /zone ({now:%H:%M} {label}): the user's time zone is now {zone} ({label}, {_offset(now)}); "
-            + f"it was {before}. config/user_zone.conf says so on both machines. Write every time you give the user "
+    return (f"The user's time zone is now {zone} ({label}, {_offset(now)}) as of {now:%H:%M} {label}; it was {before}. "
+            + "config/user_zone.conf says so on both machines. Write every time you give the user "
             + f"in {label}, with its label. Read the clock with TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) "
             + "date '+%H:%M %Z', never with bare date, because each machine's clock keeps its own zone. "
             + "Scripts that read user_zone.py change by themselves. Change any note of yours that names the old zone.")

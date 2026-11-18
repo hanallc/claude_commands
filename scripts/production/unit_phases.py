@@ -329,6 +329,8 @@ def _unit_session(unit: live_units.LiveUnit) -> str | None:
 
 def census_status(view: CensusView | census.CensusFailed, unit: live_units.LiveUnit) -> str:
     """Return the tile's status word, `exited` for an unlisted unit on a scanned machine, or `—`."""
+    if isinstance(unit.owner, unit_lookup.UnknownUnit):
+        return "unknown"
     if isinstance(view, census.CensusFailed):
         return display_cells.NONE
     session_id = _unit_session(unit)
@@ -1179,7 +1181,7 @@ def shell_waits(view: CensusView | census.CensusFailed, unit: live_units.LiveUni
                 zone: ZoneInfo, snapshot: staff.StaffSnapshot, events: list[dict[str, object]],
                 phases: tuple[phase_table.OpenPhase, ...]) -> tuple[TaskLine, ...]:
     """Describe the director's commands with their recorded resource waits."""
-    if isinstance(view, census.CensusFailed):
+    if isinstance(view, census.CensusFailed) or isinstance(unit.owner, unit_lookup.UnknownUnit):
         return ()
     session_id = _unit_session(unit)
     session = view.sessions.get(session_id) if session_id is not None else None

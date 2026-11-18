@@ -50,7 +50,7 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
         for key, value in (
             ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', standard[0]),
             ('price_compare_instance_types', standard[1]), ('gpu_instance_types', gpu),
-            ('gate_wait_usd_per_minute', '0'),
+            ('hana_gpu_instance_types', gpu), ('gate_wait_usd_per_minute', '0'),
         ):
             ledger_test_support.text_setting(config, key, value)
         prices = [

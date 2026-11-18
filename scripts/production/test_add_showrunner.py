@@ -360,7 +360,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             return True
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(12345)),
-              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w1:p1")),
               patch.object(add_showrunner, "showrunner_appeared", side_effect=register)):
             recovered = self.run_command("kid")
         self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
@@ -389,7 +389,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(first.returncode, add_showrunner.SESSION_NOT_READY, first.stderr)
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(12345)),
-              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w1:p1")),
               patch.object(herdr.Herdr, "_wait_for_submit", return_value=None),
               patch.object(herdr.Herdr, "_prompt") as typed,
               patch.object(herdr.Herdr, "_send_keys") as keys):
@@ -451,7 +451,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             return submit(client, pane, opening, launched_at, timeout_ms)
 
         with (patch.object(herdr.Herdr, "submit_opening_prompt", new=published_before_work),
-              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1"))):
+              patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w1:p1"))):
             recovered = self.run_command("kid")
         self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
         self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
@@ -485,7 +485,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         other_native = fixture_runtime_id("another-showrunner-backend")
         with (patch.object(completion_receipt, "read_launch_receipt",
                            wraps=completion_receipt.read_launch_receipt) as read,
-              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w1:p1")),
               patch.object(herdr.Herdr, "native_session", return_value=other_native)):
             retry = self.run_command("kid")
         self.assertEqual(retry.returncode, 2, retry.stdout + retry.stderr)
@@ -510,7 +510,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         other_native = fixture_runtime_id("another-showrunner-backend")
         with (patch.object(completion_receipt, "read_launch_receipt",
                            wraps=completion_receipt.read_launch_receipt) as read,
-              patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")),
+              patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w1:p1")),
               patch.object(herdr.Herdr, "native_session", side_effect=[native, other_native])):
             with patch.object(add_showrunner, "running", return_value=False):
                 retry = self.run_command("kid")
@@ -541,7 +541,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(child.parent, staff.ReportsTo(parent.id))
         data, edge = self.staff.staff_file.read_bytes(), self.parent_of("kid")
         calls = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
-        with patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w1:p1")):
+        with patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w1:p1")):
             again = self.run_command("kid")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("already started", again.stdout)
@@ -574,6 +574,16 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
         self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]], [[
             "--session", "agents", "agent", "prompt", "w1:p1", f"/showrunner:produce {self.doc('kid')}"]])
+
+    def test_resume_refuses_an_unreadable_registry(self) -> None:
+        _ = self.doc("kid")
+        identity = fixture_runtime_id("unreadable-showrunner")
+        before = self.herdr_calls()
+        with patch.object(sessions, "session_liveness", return_value=sessions.SessionLivenessUnknown("registry denied")):
+            result = self.run_command("kid", "--resume", identity, "--cwd", str(self.root))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("registry denied", result.stderr)
+        self.assertFalse(any(call[2:4] == ["agent", "start"] for call in self.herdr_calls()[len(before):]))
 
     def test_resume_starts_in_the_given_directory_with_the_resume_prompt(self) -> None:
         self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
@@ -853,11 +863,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_recorded_herdr_resume_without_an_account_passes_check_using_configured_group(self) -> None:
         self.resume_record()
-        for pid, parent, argv, environment in (
-            (991000, 0, ["herdr", "--session", "kid", "server"], {}),
-            (991001, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1"}),
-        ):
-            write_process(self.env, pid, parent, argv, environment)
+        write_process(self.env, 991000, 0, ["herdr", "--session", "kid", "server"], {})
         result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check: ok", result.stdout)

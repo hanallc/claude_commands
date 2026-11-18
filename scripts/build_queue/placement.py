@@ -133,6 +133,20 @@ RetryDecision = RetryAt | DoNotRetry
 
 
 @dataclass(frozen=True)
+class AssignedSettingsGeneration:
+    """The digest identifies the provider settings that qualified the assignment."""
+    digest: str
+
+
+@dataclass(frozen=True)
+class UnknownAssignedSettingsGeneration:
+    """An older assignment has no saved settings digest."""
+
+
+SETTINGS_REFUSAL_REASONS = frozenset({"off", "repo"})
+
+
+@dataclass(frozen=True)
 class DispatchPathSettled:
     """The dispatch path has settled."""
 
@@ -269,6 +283,34 @@ class CommandKindNotSent:
 
 
 @dataclass(frozen=True)
+class NoCargoFolder:
+    """The step does not require exclusive use of a Cargo build folder."""
+
+
+@dataclass(frozen=True, order=True)
+class CargoFolder:
+    """The path identifies a Cargo build folder on the local host."""
+    path: Path
+
+    def __post_init__(self) -> None:
+        if self.path.anchor != "/" or ".." in self.path.parts or "\0" in str(self.path):
+            raise ValueError("the Cargo folder must be an absolute, resolved path")
+
+
+CARGO_FOLDER_WAIT_REASON = "waits for the build in the same Cargo folder"
+
+
+@dataclass(frozen=True)
+class CargoFolderWait:
+    """Another step holds the Cargo build folder."""
+
+
+@dataclass(frozen=True)
+class CargoFolderFree:
+    """The Cargo build folder does not prevent admission."""
+
+
+@dataclass(frozen=True)
 class PlacementConstraints:
     """The constraints hold source identity, command, caller, candidates, and selection rules."""
     source_key: SourceIdentity
@@ -279,6 +321,7 @@ class PlacementConstraints:
     candidates: tuple[PlacementCandidate, ...]
     selection: HostSelection = ConfiguredOrder()
     command_kind: CommandKind | CommandKindNotSent = CommandKindNotSent()
+    cargo_folder: CargoFolder | NoCargoFolder = NoCargoFolder()
 
 
 @dataclass(frozen=True)
@@ -530,9 +573,16 @@ def assigned_claim_id(episode: str, attempt: str) -> str:
     return uuid.uuid5(uuid.NAMESPACE_URL, attempt_key(episode, attempt)).hex
 
 
+def assigned_claim_reference(assignment: PlacementAssignment) -> ProviderClaimReference:
+    """Identify the provider claim whose key derives from the assignment."""
+    destination = assignment.destination
+    return ProviderClaimReference(destination.provider, destination.target, destination.scope,
+        assigned_claim_id(assignment.episode, assignment.attempt), assignment.episode, assignment.attempt)
+
+
 def retry_decision(destination: PlacementDestination, reason: str, now: float) -> RetryDecision:
     """Keep the existing remote decline delays separate from evidence age."""
-    if reason in ("no_tests", "off", "repo", "linux_only", "local_flag", "command"):
+    if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
     delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0
     return RetryAt(now + delay)

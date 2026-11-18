@@ -1,4 +1,4 @@
-"""Test Waiting reasons in all five canonical stores."""
+"""Test Waiting reasons and the Change state."""
 from __future__ import annotations
 
 import io
@@ -52,9 +52,7 @@ class WaitingWhyTests(unittest.TestCase):
         _ = doc.write_text(doc.read_text() + f'- **Efficiency ledger:** {self.ledger}\n')
 
     def enter_waiting(self, kind: review_items.ReviewType, reason: str) -> review_items.ReviewItem:
-        if kind == review_items.ReviewType.CHANGE:
-            _ = change_page.DeliveryStatus(self.root).begin(self.fixture.page, 'C1', 'validation', waiting_why=reason)
-        elif kind == review_items.ReviewType.QUESTION:
+        if kind == review_items.ReviewType.QUESTION:
             identities = update_registration.QuestionStaff.read()
             source = next(item.source for item in review_items.read(self.root, assign_ids=False) if item.key == self.question)
             assert isinstance(source, review_items.QuestionSource)
@@ -78,10 +76,7 @@ class WaitingWhyTests(unittest.TestCase):
 
     def remove_reason(self, item: review_items.ReviewItem) -> None:
         source = item.source
-        if isinstance(source, review_items.ChangeSource):
-            page = change_page.ReviewPage(source.path, self.fixture.production, (source.row['#'],), '')
-            path = change_page.DeliveryStatus(self.root).path(page, source.row['#'])
-        elif isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+        if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
             _ = source.record.item.pop('waiting_why', None)
             _ = source.record.item.pop('review_id', None)
             lines = source.record.path.read_text().splitlines()
@@ -108,9 +103,7 @@ class WaitingWhyTests(unittest.TestCase):
                 _ = update_registration.followup(scope, source.record.item['text'], ' ', identities=identities)
             return
         with self.assertRaisesRegex(ValueError, 'Waiting items need'):
-            if kind == review_items.ReviewType.CHANGE:
-                _ = change_page.DeliveryStatus(self.root).begin(self.fixture.page, 'C1', 'validation')
-            elif kind == review_items.ReviewType.INVESTIGATION:
+            if kind == review_items.ReviewType.INVESTIGATION:
                 _ = investigation.file(self.fixture.unit.id, 'Find the cause', 'What caused this?')
             elif kind == review_items.ReviewType.PROPOSAL:
                 _ = proposal_issue.record_review(self.proposal, 'Question: Which change?', review_events.ReviewMark.WAITING,
@@ -146,6 +139,21 @@ class WaitingWhyTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn('not Waiting', error)
+
+    def test_validating_change_is_outside_waiting_reasons(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        page = self.fixture.page
+        path = status.path(page, 'C1')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text('{"feedback":"Check this change."}\n')
+        key = 'page-owner/C1'
+        items = review_items.read(self.root, show=review_items.ReviewState.VALIDATING)
+        self.assertEqual([(item.key, item.state) for item in items], [(key, review_items.ReviewState.VALIDATING)])
+        self.assertEqual(self.command('list'), (0, '', ''))
+        before = path.read_bytes()
+        self.assertEqual(self.command('set', '--item', key, '--text', WHY),
+                         (1, '', 'waiting_why: The item is not Waiting.\n'))
+        self.assertEqual(path.read_bytes(), before)
 
     def test_validate_uses_automatic_reason_for_spaces(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -230,7 +238,8 @@ def case(kind: review_items.ReviewType, check: Callable[[WaitingWhyTests, review
     return run
 
 
-for kind in review_items.REVIEW_TYPES:
+for kind in (review_items.ReviewType.QUESTION, review_items.ReviewType.INVESTIGATION,
+             review_items.ReviewType.PROPOSAL, review_items.ReviewType.EFFICIENCY):
     for name, check in (('refusal', WaitingWhyTests.check_refusal), ('store', WaitingWhyTests.check_store),
                         ('list', WaitingWhyTests.check_list), ('set', WaitingWhyTests.check_set)):
         setattr(WaitingWhyTests, f'test_{kind.value}_{name}', case(kind, check))

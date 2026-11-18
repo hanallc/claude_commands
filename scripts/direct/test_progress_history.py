@@ -8,7 +8,7 @@ from scripts.agents import remote
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib import atomic_file, conf_reads, models_registry
+from scripts.lib import atomic_file, conf_reads, git_files, models_registry
 from scripts.lib import unit_runs
 from scripts.usage.agents_log import Assignment
 
@@ -2112,9 +2112,9 @@ print('two homes isolated; recorder lock retained; caller restored')
             "session_id": "supplier-session", "senders": ["another-director", "director"],
             "body": body, "targets": ["another-director", "director"],
         }))
+        forward = f"renamed-supplier (answer to one of another-director, director): {body}\n\nTag: 1030000-9"
         prompt = ('<cross-session-message from="uds:/fixture/postmaster/socket" from-name="postmaster">'
-                  + "Message from renamed-supplier (their answer to one of another-director, director, "
-                  + "passed on by postmaster) [1030000-9]:\n\n" + body + "</cross-session-message>")
+                  + forward + "</cross-session-message>")
         os.environ["UNIT_NOW_EPOCH"] = "1030"
         return session, record, prompt
 
@@ -2152,7 +2152,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def test_pending_forward_preserves_body_whitespace_and_ignores_the_record_counter(self) -> None:
         name = "pending-exact-body"
-        session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\n")
+        session, _, prompt = self.forwarded_supplier_wait(name, "\nThe checkpoint is merged.\n\nTag: 1029000-1\n\n")
         self.assertFalse((self.root / "state/message/postmaster/forwards").exists())
         progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
         progress_history.finish_turn_wait(session, "director", source="PEER", prompt=prompt)
@@ -3392,10 +3392,13 @@ with patch.object(fcntl, "flock", admission):
             reads.append(path)
             return read_text(path, encoding=encoding, errors=errors)
 
-        with patch.object(Path, "read_text", read_source), patch.object(
-            subprocess, "run", side_effect=AssertionError("waits must only read files")
+        with (
+            patch.object(Path, "read_text", read_source),
+            patch.object(git_files, "_read_entry", wraps=git_files._read_entry) as read_git,  # pyright: ignore[reportPrivateUsage]
+            patch.object(subprocess, "run", side_effect=AssertionError("waits must only read files")),
         ):
             report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1040)))
+        reads.extend(cast(Path, call.args[0]) for call in read_git.call_args_list)
         phases = cast(list[dict[str, object]], report["phases"])
         self.assertEqual(len(phases), 2)
         for phase in phases:
@@ -4108,7 +4111,7 @@ with patch.object(fcntl, "flock", admission):
                              [["bash", "assign.sh", role, "prompt with spaces", "--literal=$HOME"] for role in roles])
 
     def test_launcher_recovery_keeps_the_active_pass_and_saved_command(self) -> None:
-        for status, finished_at, minutes in (("active", 41_040, 0), ("error", 41_140, 2)):
+        for status, finished_at, minutes in (("active", 41_040, 0), ("error", 41_140, 1)):
             with self.subTest(status=status):
                 name = "launcher-recovery-" + status
                 session = self.start_run(name, 41_000)
@@ -4128,9 +4131,8 @@ with patch.object(fcntl, "flock", admission):
                     self.finish_slot_pass(session, "review", "error", 41_080)
                     with patch.object(plan_history, "now_epoch", return_value=finished_at):
                         progress_history.complete_dispatch(session, "review", str(active["instance_id"]))
-                    failed, finished = self.pass_events(name, "pass_finished")
-                    self.assertEqual(failed["status"], "error")
-                    self.assertEqual(finished["status"], "completed")
+                    finished, = self.pass_events(name, "pass_finished")
+                    self.assertEqual(finished["status"], "error")
                 else:
                     self.finish_slot_pass(session, "review", "completed", finished_at)
                     finished, = self.pass_events(name, "pass_finished")
@@ -4291,6 +4293,73 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(record["launcher_command"], command)
         self.assertEqual(len(self.pass_events("dispatch-api", "pass_started")), 1)
         self.assertEqual(len(self.pass_events("dispatch-api", "pass_finished")), 1)
+
+    def test_a_completion_attempt_preserves_error_for_the_next_assignment(self) -> None:
+        session = self.start_run("dispatch-replacement", 41_000)
+        self.start_phase(session, 41_010)
+        parent = fixture_member("showrunner", name="dispatch-parent")
+        member = fixture_worker("impl", parent.id, runtime_id=fixture_runtime_id("dispatch-replacement"))
+        prompt = self.root / "replacement-prompt.txt"
+        _ = prompt.write_text("Read the requested files.\n")
+
+        def begin() -> str:
+            return progress_history.begin_dispatch(session, slot="impl", phase="3", role="impl",
+                worker_name=member.name, worker_id=member.id, launcher_command=["assign.sh"],
+                prompt=prompt, kind="impl", lens="")
+
+        with patch.dict(os.environ, {"HOME": str(self.root), "CONF_DIR": str(self.root),
+                                     "MODELS_CONFIG_FILE": str(self.models_config_file), "UNIT_NOW_EPOCH": "41020"}):
+            predecessor = begin()
+            progress_history.complete_dispatch(session, "impl", predecessor, status="error")
+            failed_pass = self.pass_slots(session)["impl"]
+            progress_history.complete_dispatch(session, "impl", predecessor)
+            self.assertEqual(self.pass_slots(session)["impl"], failed_pass)
+            self.assertEqual(failed_pass["status"], "error")
+            successor = begin()
+            self.assertNotEqual(successor, predecessor)
+            progress_history.complete_dispatch(session, "impl", successor)
+            self.assertEqual(begin(), successor)
+        self.assertEqual(len(self.pass_events("dispatch-replacement", "pass_started")), 2)
+        self.assertEqual([event["status"] for event in self.pass_events("dispatch-replacement", "pass_finished")],
+                         ["error", "completed"])
+
+    def test_reply_completed_checks_the_current_completion_file_and_done_id(self) -> None:
+        run = self.start_run("saved-reply", 41_000)
+        self.start_phase(run, 41_010)
+        prompt = self.root / "review-prompt.txt"
+        _ = prompt.write_text("Review the requested files.\n")
+        parent = fixture_member("showrunner", name="reply-parent")
+        member = fixture_worker("reviewer", parent.id, runtime_id=fixture_runtime_id("saved-reply"))
+
+        def begin() -> str:
+            return progress_history.begin_dispatch(run, slot="review", phase="3", role="review",
+                worker_name=member.name, worker_id=member.id, launcher_command=["assign.sh"],
+                prompt=prompt, kind="broad", lens="contract")
+
+        instance = begin()
+        completion_id = f"{instance}-2"
+        reply = run / "review.md"
+        late_reply = run / f"review_late_{instance}.md"
+        progress_history.save_dispatch_delivery(run, instance,
+            progress_history.DispatchDelivery(f"Review the diff. DONE {completion_id}", completion_id, str(reply)))
+        progress_history.complete_dispatch(run, "review", instance, status="error")
+        _ = late_reply.write_text(f"Verdict: clear.\nDONE {completion_id}.\n")
+        self.assertFalse(progress_history.reply_completed(run, late_reply))
+        progress_history.save_hook_completion(run, instance,
+            progress_history.HookCompletion("error", str(late_reply), ("A completion action failed.",)))
+        _ = reply.write_text(late_reply.read_text())
+        self.assertFalse(progress_history.reply_completed(run, reply))
+        self.assertTrue(progress_history.reply_completed(run, late_reply))
+        for tail in ("The text changed.", f"DONE {instance}", f"DONE {completion_id}\nThe text changed."):
+            with self.subTest(tail=tail):
+                _ = late_reply.write_text(f"Verdict: clear.\n{tail}\n")
+                self.assertFalse(progress_history.reply_completed(run, late_reply))
+        late_reply.unlink()
+        self.assertFalse(progress_history.reply_completed(run, late_reply))
+
+        _ = late_reply.write_text(f"Verdict: clear.\nDONE {completion_id}\n")
+        self.assertNotEqual(begin(), instance)
+        self.assertFalse(progress_history.reply_completed(run, late_reply))
 
     def test_hook_completion_keeps_the_delivery_and_closes_only_its_pass(self) -> None:
         run = self.start_run("hook-completion", 41_000)

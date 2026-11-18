@@ -50,6 +50,7 @@ from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production import fake_unit_host
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message import sessions
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -299,6 +300,7 @@ class WaitingTests(unittest.TestCase):
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
+            held.listen(128)
             self.addCleanup(held.close)
         if pane not in self.host_pids:
             self.host_pids[pane] = fake_unit_host.live_pid(self)
@@ -306,9 +308,12 @@ class WaitingTests(unittest.TestCase):
         process = Path(os.environ["HERDR_PROC"]) / str(pid) / "environ"
         if not process.exists():
             fake_unit_host.place_process(os.environ, pid, pane, exec_shell=True)
-        self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
-            "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
-            "updatedAt": 1, "tmux": ""}))
+        unit = (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]
+        self.write(self.root / "sessions" / f"{pid}.json", json.dumps({
+            "pid": pid, "procStart": sessions.process_start(pid),
+            "sessionId": unit_membership("showrunner-example", unit).id,
+            "name": name, "messagingSocketPath": str(path), "updatedAt": 1, "tmux": "",
+        }))
 
     def write_production_doc(self) -> None:
         self.write(self.doc, "\n".join((
