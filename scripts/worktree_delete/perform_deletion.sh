@@ -77,6 +77,10 @@ cleanup_residual_directory() {
     fi
 }
 
+if [[ "$WORKTREE_PATH" != /* ]]; then
+    WORKTREE_PATH="$PWD/$WORKTREE_PATH"
+fi
+
 # Every git call below runs against the ambient cwd. When the caller's cwd is
 # inside the worktree being removed, that directory stops existing partway
 # through and git aborts with "Unable to read current working directory". Move
@@ -138,6 +142,7 @@ if [[ -e "$WORKTREE_PATH" ]]; then
     exit 1
 fi
 
+"$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" release-pair -- "$WORKTREE_PATH" || true
 "$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../lib/scratch.py" cargo-clean "$WORKTREE_PATH"
 
 echo ""

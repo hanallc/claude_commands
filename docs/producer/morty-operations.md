@@ -1,7 +1,10 @@
 # Local operations
 
 State root: `~/rust/hanadocs/morty`.
-The List records hold items; write them only through `the_list.py`.
+Write List items through `the_list.py`.
+The assigned producer writes the latest status, next step, and ETA.
+Morty keeps add, close, park, and reassign for all items.
+Read status for items assigned to another producer from The List.
 `checkins.json` holds the current schedule, outstanding inquiries, and the active timer. Keep only its latest state.
 
 ## Records
@@ -54,7 +57,7 @@ Send at most one pending inquiry per item. Save the expected reply time before s
 Use `send_later.py` to wake morty, not to send an automatic demand to a showrunner.
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to morty --from morty --text 'Read ~/.claude/commands/producer/morty.md. Read The List records and checkins.json. Handle due items from fresh evidence first. Group missing status requests by showrunner. Schedule the next wake.'
+~/.claude/scripts/lib/py ~/.claude/scripts/message/send_later.py --at 'YYYY-MM-DD HH:MM' -- --to morty --from morty --text 'Load /producer:produce, then /producer:morty. Read The List records and checkins.json. Handle due items from fresh evidence first. Group missing status requests by showrunner. Schedule the next wake.'
 ```
 
 Read back the timer with `systemctl --user show <timer> -p NextElapseUSecRealtime`.

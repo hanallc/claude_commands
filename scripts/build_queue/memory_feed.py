@@ -49,8 +49,11 @@ from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_owner_name, step_text
 from scripts.build_queue.queue_view import reason_phrase
-from scripts.lib.build_steps import (OTHER_COMMAND, RECORDED_STEP_NAMES, OtherCommand, StepJob,
-                                     StepNames, command_job, command_program, command_script, read_step_names)
+from scripts.build_queue.admission_jobs import StepJob
+from scripts.lib.build_steps import (GATE_PROGRAMS, GATE_SCRIPTS, OTHER_COMMAND, RECORDED_STEP_NAMES, CopiesRunCommand,
+                                     OtherCommand, StepNames, command_script, copies_run_command,
+                                     gate_job_from_process, live_process_arguments, process_arguments, read_step_names)
+from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
 from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
 from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs, command_slot_name,
                                            public_queue_text, recorded_step)
@@ -564,7 +567,7 @@ def queue_row_labels(step: QueueRowName, name: QueueRowName, *, unit: UnitCell =
     """Give the page a name and the parts of its tooltip title."""
     if ci_label:
         return {"name": name, "title": {"unit": "", "step": CIJobTitle(ci_label)}}
-    if isinstance(unit, StaffUnitName):
+    if isinstance(unit, StaffUnitName) and step != unit:
         return {"name": name, "title": {"unit": unit, "step": step}}
     return {"name": name, "title": {"unit": "", "step": name}}
 
@@ -599,8 +602,12 @@ def build_row_step(step: str, package: str | admission_records.PackageNotRecorde
     return program_name if isinstance(program_name, QueueRowName) else QueueRowName.recorded_step_text(step)
 
 
-def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames) -> QueueRowName | NoNamedStep:
-    return build_row_step(facts.step if isinstance(facts.step, str) else "", facts.package,
+def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames,
+                    owner: unit_labels.UnitLabels) -> QueueRowName | NoNamedStep:
+    step = facts.step if isinstance(facts.step, str) else ""
+    if step in GATE_STEPS:
+        return QueueRowName.owner_only(public_queue_text(owner.unit) or owner.owner_text)
+    return build_row_step(step, facts.package,
         facts.project if isinstance(facts.project, str) else "", facts.folder if isinstance(facts.folder, str) else "", names)
 
 
@@ -633,8 +640,7 @@ class RunRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     need_part: NotRequired[bool]
 
 
-# Queue steps whose job shows only in the command's arguments.
-GATE_STEPS = frozenset({"gate", "test-affected"})
+GATE_STEPS = frozenset(GATE_PROGRAMS)
 
 
 @dataclass(frozen=True)
@@ -642,30 +648,21 @@ class NotGateStep:
     """The step is not a merge gate or a targeted test, so its name already says its job."""
 
 
-@dataclass(frozen=True)
-class CommandUnreadable:
-    """The process ended or hid its command line before the feed read it."""
-    error: str
-
-
 StepJobReading = StepJob | NotGateStep | admission_records.PidNotRecorded | CommandUnreadable | OtherCommand
 
 
-def step_job(step: str, pid: int | admission_records.PidNotRecorded, proc: Path = PROC) -> StepJobReading:
+def step_job(step: str, pid: int | admission_records.PidNotRecorded, proc: Path = PROC, *,
+             start_time: str = "") -> StepJobReading:
     """The job of a natedev merge gate or targeted test, read from its process arguments."""
     if step not in GATE_STEPS:
         return NotGateStep()
     if not isinstance(pid, int):
         return pid
-    try:
-        arguments = (proc / str(pid) / "cmdline").read_bytes().split(b"\0")
-    except OSError as error:
-        return CommandUnreadable(str(error))
-    return command_job([part.decode(errors="replace") for part in arguments if part])
+    return gate_job_from_process(step, proc / str(pid), start_time=start_time)
 
 
 def job_step(job: StepJobReading, step: str) -> str:
-    """The step key a row shows: the job when the command named one, else the queue's step."""
+    """Use the job key when the command identifies the job."""
     return job.step if isinstance(job, StepJob) else step
 
 
@@ -673,13 +670,12 @@ def job_notes(job: StepJobReading, unit: str, names: StepNames) -> RowQueueNotes
     """The description and changes rows of a gate job; empty for any other step."""
     if not isinstance(job, StepJob):
         return {}
-    about = names.about(job, unit)
-    if not about:
+    template, owner = names.about_template(job, unit)
+    if not template:
         return {}
-    owner = job.unit or (unit if unit != "—" else "")
-    parts = staff_names.template_parts(names.settings.get(f"about.{job.step}", ""),
+    parts = staff_names.template_parts(template,
         {"unit": staff_names.StaffReference(owner), "branch": job.branch, "modules": job.modules})
-    return {"about": about, "about_parts": parts, "changes": names.changes(job)}
+    return {"about": staff_names.parts_text(parts), "about_parts": parts, "changes": names.changes(job)}
 
 
 def current_step_parts(step: admission_records.RunningStep | admission_records.WaitingStep,
@@ -800,10 +796,6 @@ class FeedStaff:
         return self.worktrees[key]
 
 
-def process_arguments(process: Path) -> list[str]:
-    return [os.fsdecode(word) for word in (process / "cmdline").read_bytes().split(b"\0") if word]
-
-
 def leftover_program(pid: int | admission_records.PidNotRecorded, recorded: str) -> ProcessName:
     """Use the script from matching process arguments, or the recorded program."""
     if isinstance(pid, int):
@@ -818,53 +810,30 @@ def leftover_program(pid: int | admission_records.PidNotRecorded, recorded: str)
     return ProcessName(Path(recorded).name)
 
 
-@dataclass(frozen=True)
-class CopiesSlotCommand:
-    source: str
-    arguments: tuple[str, ...]
-
-
-def copies_slot_command(owner: wire.Owner) -> CopiesSlotCommand | OtherCommand:
+def copies_slot_command(owner: wire.Owner) -> CopiesRunCommand | OtherCommand:
     """Read the command after copies.py run for this process lifetime."""
-    process = PROC / str(owner.pid)
-    try:
-        argv = process_arguments(process)
-        stat = (process / "stat").read_text().rsplit(") ", 1)[1].split()
-        if stat[19] != owner.start_time or stat[0] in ("Z", "X"):
-            return OTHER_COMMAND
-        if command_program(argv) != "copies.py":
-            return OTHER_COMMAND
-        start = next(index for index, word in enumerate(argv) if Path(word).name == "copies.py") + 1
-        if argv[start:start + 1] != ["run"]:
-            return OTHER_COMMAND
-        separator = argv.index("--", start + 1)
-        for index, word in enumerate(argv[start + 1:separator], start=start + 1):
-            if word == "--repo" and index + 1 < separator:
-                return CopiesSlotCommand(argv[index + 1], tuple(argv[separator + 1:]))
-            if word.startswith("--repo="):
-                return CopiesSlotCommand(word.partition("=")[2], tuple(argv[separator + 1:]))
-    except (OSError, ValueError, IndexError, StopIteration):
-        pass
-    return OTHER_COMMAND
+    argv = live_process_arguments(PROC / str(owner.pid), owner.start_time)
+    return OTHER_COMMAND if isinstance(argv, CommandUnreadable) else copies_run_command(argv)
 
 
 def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members: FeedStaff) -> WaitRow | NoNamedStep:
     identity = slot.identity
     folder = Path(identity.folder)
-    legacy = copies_slot_command(slot.owner) if not folder.is_absolute() else OTHER_COMMAND
-    source = Path(legacy.source) if isinstance(legacy, CopiesSlotCommand) else folder
-    step = recorded_step(identity.step, names)
-    if isinstance(step, NoNamedStep) and isinstance(legacy, CopiesSlotCommand):
+    legacy_gate = identity.step in GATE_STEPS or Path(identity.step).name in GATE_SCRIPTS
+    legacy = copies_slot_command(slot.owner) if legacy_gate or not folder.is_absolute() else OTHER_COMMAND
+    source = Path(legacy.source) if isinstance(legacy, CopiesRunCommand) else folder
+    step = NoNamedStep.FOUND if legacy_gate else recorded_step(identity.step, names)
+    if isinstance(step, NoNamedStep) and isinstance(legacy, CopiesRunCommand):
         step = command_slot_name(legacy.arguments, names)
-    if isinstance(step, NoNamedStep):
-        step = QueueRowName.repository(slot.wait.repository, str(source))
-    if isinstance(step, NoNamedStep):
-        return step
     current = (members.fixed_owner_labels(staff.StaffId(identity.session_id)) if folder.is_absolute()
                else members.labels_for(identity.session_id, slot.machine, source))
     label = current or unit_labels.UnitLabels("")
     unit = staff_unit(label)
     showrunner = public_owner_name(label.showrunner) or public_owner_name(identity.name, identity.session_id)
+    if isinstance(step, NoNamedStep):
+        step = QueueRowName.owner_only(unit or showrunner) if legacy_gate else QueueRowName.repository(slot.wait.repository, str(source))
+    if isinstance(step, NoNamedStep):
+        return step
     return {"kind": "repository-slot", **queue_row_labels(step, step, unit=unit),
             **page_owner_labels(replace(label, showrunner=showrunner), unit=unit),
             "pid": slot.owner.pid, "detail": slot.wait.repository, "need": 0.0, "since": slot.since,
@@ -1243,6 +1212,33 @@ class StepPageOwner:
         if self.caller:
             fields["caller"] = self.caller
         return fields
+
+    def neutral_name(self) -> QueueRowName:
+        return QueueRowName.owner_only(public_queue_text(self.unit) or public_queue_text(self.labels.owner_text) or self.caller)
+
+
+@dataclass(frozen=True)
+class LocalStepName:
+    """The visible name, tooltip title, and styled parts of a local row."""
+
+    title: QueueRowName
+    name: QueueRowName
+    parts: list[staff_names.NamePart]
+
+
+def local_step_name(step: admission_records.RunningStep | admission_records.WaitingStep, owner: StepPageOwner,
+                    names: StepNames, labels: Mapping[str, unit_labels.UnitLabels], ci_label: str, job: StepJobReading
+                    ) -> LocalStepName | NoNamedStep:
+    if step.step in GATE_STEPS and not isinstance(job, StepJob):
+        neutral = QueueRowName.owner_only(ci_label) if ci_label else owner.neutral_name()
+        return LocalStepName(neutral, neutral, staff_names.text_parts(neutral))
+    title = (build_row_step(step.step, step.package, step.project, step.folder, names, kind=QueueKind.CI)
+             if ci_label else build_row_step(step.step, step.package, step.project, step.folder, names))
+    if isinstance(title, NoNamedStep):
+        return title
+    name = title.for_owner(names, step.step, owner.labels.unit, owner.labels.role,
+        prefix=step_owner_name(step, labels), ci=bool(ci_label))
+    return LocalStepName(title, name, step_name_parts(step, names, owner.labels, labels, ci=bool(ci_label)))
 
 
 def has_controlling_terminal(pid: int, start: str) -> bool:
@@ -2283,6 +2279,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     def page_owner(step: admission_records.RunningStep | admission_records.WaitingStep) -> StepPageOwner:
         return step_page_owner(step, labels, ci_runners, members, machine, process_starts)
 
+    def local_job(step: admission_records.RunningStep | admission_records.WaitingStep) -> StepJobReading:
+        if isinstance(step.job, StepJob):
+            return step.job
+        start = process_starts.get(step.pid, "") if isinstance(step.pid, int) else ""
+        return step_job(step.step, step.pid, PROC, start_time=start)
+
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
         identity = labels.get(activity.session_id)
@@ -2318,30 +2320,28 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for hold in captured.runs:
         step = by_owner.get(hold.memory.owner)
         ci_label = step.session_name if step is not None and step.unit in ci_runners else ""
-        job: StepJobReading = step_job(step.step, step.pid) if step is not None and not ci_label else NotGateStep()
+        job = local_job(step) if step is not None and not ci_label else NotGateStep()
         if step is None:
             slot = held_slots.get(hold.memory.owner)
             if slot is None or isinstance(slot.identity, admission_records.HoldPredatesStepFacts):
                 # Older holds contribute to the RAM totals without a separate row.
                 continue
-            title_step = ended_step_name(slot.identity, names)
+            if isinstance(slot.identity.job, StepJob):
+                job = slot.identity.job
+            labels_for_slot = members.ended_step_labels(slot.identity)
+            title_step = ended_step_name(slot.identity, names, labels_for_slot)
             if isinstance(title_step, NoNamedStep):
                 continue
-            labels_for_slot = members.ended_step_labels(slot.identity)
             owner = StepPageOwner(labels_for_slot, unit=staff_unit(labels_for_slot))
             display_name = title_step
             parts: list[staff_names.NamePart] = []
         else:
             owner = page_owner(step)
-            identity = owner.labels
-            shown = replace(step, step=job_step(job, step.step), unit=identity.unit)
-            title_step = (build_row_step(shown.step, shown.package, shown.project, shown.folder, names, kind=QueueKind.CI)
-                          if ci_label else build_row_step(shown.step, shown.package, shown.project, shown.folder, names))
-            if isinstance(title_step, NoNamedStep):
+            shown = replace(step, step=job_step(job, step.step), unit=owner.labels.unit)
+            named = local_step_name(shown, owner, names, labels, ci_label, job)
+            if isinstance(named, NoNamedStep):
                 continue
-            display_name = title_step.for_owner(names, shown.step, identity.unit, identity.role,
-                prefix=step_owner_name(shown, labels), ci=bool(ci_label))
-            parts = step_name_parts(shown, names, identity, labels, ci=bool(ci_label))
+            title_step, display_name, parts = named.title, named.name, named.parts
         detail = owner.labels.unit if step is not None else SWAP_NAMES["between"]
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
@@ -2377,13 +2377,16 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             key = admission_records.execution_group(step, entry.owner)
             if key in remote_groups:
                 continue
-            title_step = build_row_step(step.step, step.package, step.project, step.folder, names)
+            verb = step.step
+            unknown_gate = verb in GATE_STEPS
+            title_step = (owner.neutral_name() if unknown_gate else
+                          build_row_step(verb, step.package, step.project, step.folder, names))
             if isinstance(title_step, NoNamedStep):
                 continue
             remote_groups.add(key)
             display_name = (title_step.with_prefix(step_owner_name(shown_step, labels))
-                if isinstance(recorded_step(step.step, names), QueueRowName) else title_step)
-            parts = current_step_parts(shown_step, names, identity, labels)
+                if not unknown_gate and isinstance(recorded_step(verb, names), QueueRowName) else title_step)
+            parts = [] if unknown_gate else current_step_parts(shown_step, names, identity, labels)
             remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **owner.fields(),
@@ -2492,18 +2495,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         else:
             reason = reason_phrase(waiter.reason, waiting)
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
-        job = NotGateStep() if ci_label else step_job(waiter.step, waiter.pid)
+        job = NotGateStep() if ci_label else local_job(waiter)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
-        title_step = (build_row_step(shown_waiter.step, shown_waiter.package, shown_waiter.project, shown_waiter.folder,
-                                     names, kind=QueueKind.CI) if ci_label else
-                      build_row_step(shown_waiter.step, shown_waiter.package, shown_waiter.project, shown_waiter.folder, names))
-        if isinstance(title_step, NoNamedStep):
+        named = local_step_name(shown_waiter, owner, names, labels, ci_label, job)
+        if isinstance(named, NoNamedStep):
             continue
-        display_name = title_step.for_owner(names, shown_waiter.step, identity.unit, identity.role,
-            prefix=step_owner_name(shown_waiter, labels), ci=bool(ci_label))
-        parts = step_name_parts(shown_waiter, names, identity, labels, ci=bool(ci_label))
-        waiters[place] = {**queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label),
-                        "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
+        waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label),
+                        "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
                         "need": gib(need), "since": waiter.since,
@@ -2553,11 +2551,18 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
             current = members.labels_for(cloud.identity.session_id, machine, Path(cloud.identity.folder))
             identity = current or queue_view.cloud_step_labels(cloud, model)
-            raw_step = cloud.identity.step
+            job = cloud.identity.job if isinstance(cloud.identity.job, StepJob) else step_job(
+                cloud.identity.step, cloud.owner.pid, PROC, start_time=cloud.owner.start_time)
+            step = job_step(job, cloud.identity.step)
             unit = staff_unit(identity, missing="—") if current is not None or cloud.identity.session_id in cloud_labels else ""
-            title_step = build_row_step(raw_step, "", "", "", names, kind=QueueKind.AWS)
-            display_name = title_step.for_owner(names, raw_step, unit, identity.role)
-            parts = queue_owner_parts(names, raw_step, unit, identity.role)
+            if step in GATE_STEPS and not isinstance(job, StepJob):
+                title_step = display_name = QueueRowName.owner_only(public_queue_text(unit)
+                    or public_queue_text(identity.owner_text) or public_owner_name(cloud.identity.name, cloud.identity.session_id))
+                parts = staff_names.text_parts(display_name)
+            else:
+                title_step = build_row_step(step, "", "", "", names, kind=QueueKind.AWS)
+                display_name = title_step.for_owner(names, step, unit, identity.role)
+                parts = queue_owner_parts(names, step, unit, identity.role)
             values: CloudWorkRow = {"kind": "cloud", **queue_row_labels(title_step, display_name, unit=unit),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **page_owner_labels(identity, unit=unit), "pid": cloud.owner.pid,
@@ -2572,7 +2577,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                          and not isinstance(cloud.wait, wire.CloudSlotWait),
                 "late_age": queue_view.cloud_update_age(information.update.seconds)
                     if isinstance(information.update, queue_view.CloudUpdateLate)
-                    and not isinstance(cloud.wait, wire.CloudSlotWait) else ""}
+                    and not isinstance(cloud.wait, wire.CloudSlotWait) else "",
+                **job_notes(job, unit, names)}
             if isinstance(cloud.wait, wire.CloudSlotWait):
                 cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
                     "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}

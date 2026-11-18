@@ -1308,16 +1308,25 @@ def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
 NO_COMPLETION_ACTIONS = pass_recorder.CompletionActions()
 
 
-def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object) -> None:
+def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object, *,
+                     stopped_notice: bool = False) -> None:
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = pass_recorder.read_state(session_dir)
+        changed = False
+        if stopped_notice:
+            notice = pass_recorder.object_dict((pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}).get(instance_id))
+            if notice is not None and notice.get("delivered") is not True:
+                notice["delivered"] = True
+                changed = True
         for passed in pass_recorder.pass_slots(state).values():
             if passed.get("instance_id") == instance_id:
                 if passed.get(key) != value:
                     passed[key] = value
-                    pass_recorder.write_state(session_dir, state)
-                return
+                    changed = True
+                break
+        if changed:
+            pass_recorder.write_state(session_dir, state)
 
 
 def worker_artifact(path: Path, slot: str, worker: str) -> Path:
@@ -1364,14 +1373,109 @@ def save_hook_completion(run: Path, instance_id: str, completion: HookCompletion
     _update_dispatch(run, instance_id, "hook_completion", asdict(completion))
 
 
+@dataclass(frozen=True)
+class StoppedPassNotice:
+    instance_id: str
+    run_id: str
+    worker_id: staff.StaffId
+    worker_name: str
+    director_id: staff.StaffId
+    phase_id: str
+    reason: str
+    delivered: bool = False
+
+
+class NoStoppedPassNotice(Enum):
+    UNRECORDED = "no stopped pass notice was recorded"
+
+
+@dataclass(frozen=True)
+class StoppedPassReceipt:
+    instance_id: str
+    line: str
+    completion_id: str
+    reply_file: str
+
+
+def stopped_pass_receipts(run: Path, worker_id: staff.StaffId) -> Generator[StoppedPassReceipt]:
+    """Read the archived receipts for this worker's stopped passes."""
+    try:
+        state = worker_lifecycle.read_json_object(pass_recorder.state_path(run))
+    except worker_lifecycle.WorkerStateUnreadable as error:
+        unit_runs.report_anomaly(" ".join(f"anomaly: stopped pass receipts: {error}".splitlines()))
+        return
+    notices = pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}
+    for instance_id, value in notices.items():
+        fields = pass_recorder.object_dict(value) or {}
+        receipt = pass_recorder.object_dict(fields.get("receipt")) or {}
+        completion_id = pass_recorder.string(receipt.get("completion_id"))
+        if fields.get("worker_id") == worker_id and completion_id:
+            yield StoppedPassReceipt(instance_id, pass_recorder.string(receipt.get("line")), completion_id,
+                                     pass_recorder.string(receipt.get("reply_file")))
+
+
+def stopped_run_notice(run: Path, run_id: str) -> StoppedPassNotice | NoStoppedPassNotice:
+    """Read the notice even if another pass now occupies the slot."""
+    if not pass_recorder.state_path(run).is_file():
+        return NoStoppedPassNotice.UNRECORDED
+    state = pass_recorder.read_state(run, resolve_staff=False)
+    notices = pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}
+    for value in notices.values():
+        fields = pass_recorder.object_dict(value)
+        if fields is not None and fields.get("run_id") == run_id:
+            return StoppedPassNotice(
+                pass_recorder.string(fields.get("instance_id")), run_id, staff.StaffId(pass_recorder.string(fields.get("worker_id"))),
+                pass_recorder.string(fields.get("worker_name")), staff.StaffId(pass_recorder.string(fields.get("director_id"))),
+                pass_recorder.string(fields.get("phase_id")), pass_recorder.string(fields.get("reason")), fields.get("delivered") is True,
+            )
+    return NoStoppedPassNotice.UNRECORDED
+
+
+def stopped_notice_delivered(run: Path, instance_id: str) -> bool:
+    state = pass_recorder.read_state(run, resolve_staff=False)
+    notices = pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}
+    fields = pass_recorder.object_dict(notices.get(instance_id)) or {}
+    return fields.get("delivered") is True
+
+
+class StopDispatchRefused(Enum):
+    CHANGED = "the recorder no longer has the exact open pane pass"
+
+
+def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow,
+                  director: staff.StaffId, *, run_id: str, reason: str) -> StoppedPassNotice | StopDispatchRefused:
+    """Commit the stopped outcome, pass status, and notice in one state write."""
+    with (run / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = pass_recorder.read_state(run)
+        passed = pass_recorder.open_passes(state).get(slot)
+        if (passed is None or passed.get("instance_id") != instance_id or passed.get("worker_id") != worker.id
+                or state.get(unit_runs.OWNER_FIELD) != director
+                or isinstance(hook_completion(passed), HookCompletion)):
+            return StopDispatchRefused.CHANGED
+        passed["hook_completion"] = asdict(HookCompletion("stopped", "", (reason,)))
+        phase = pass_recorder.object_dict(passed.get("phase")) or {}
+        notice = StoppedPassNotice(instance_id, run_id, worker.id, worker.name, director,
+                                   pass_recorder.string(phase.get("id")), reason)
+        delivery = pass_recorder.dispatch_delivery(passed)
+        notices = pass_recorder.object_dict(state.get("stopped_pass_notices")) or {}
+        notices[instance_id] = {**asdict(notice), "receipt": {
+            "line": delivery.line, "completion_id": delivery.completion_id or instance_id,
+            "reply_file": delivery.reply_file,
+        }}
+        state["stopped_pass_notices"] = notices
+        _ = pass_recorder.close_slot_pass(run, state, slot, "canceled", pass_recorder.now_epoch())
+        return notice
+
+
 def dispatch_completed(run: Path, slot: str, instance_id: str) -> bool:
     passed = pass_recorder.pass_slots(pass_recorder.read_state(run)).get(slot, {})
     return passed.get("instance_id") == instance_id and passed.get("status") == "completed"
 
 
-def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> None:
+def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str, *, stopped_pass: bool = False) -> None:
     """Record a notice only after its message succeeds."""
-    _update_dispatch(session_dir, instance_id, "hook_notice", notice)
+    _update_dispatch(session_dir, instance_id, "hook_notice", notice, stopped_notice=stopped_pass)
 
 
 def record_quota_refusal(session_dir: Path, instance_id: str, refusal_id: str) -> None:
@@ -5278,6 +5382,12 @@ class PostmasterReplyRecord:
     body: str
     targets: tuple[str, ...]
 
+    def matches_forward(self, text: str) -> bool:
+        answer_to = ", ".join(self.senders)
+        if len(self.senders) > 1:
+            answer_to = f"one of {answer_to}"
+        return text == f"{self.name} (answer to {answer_to}): {self.body}"
+
     @classmethod
     def from_fields(cls, fields: dict[str, object]) -> PostmasterReplyRecord:
         """Validate the postmaster schema at the JSON boundary."""
@@ -5339,11 +5449,10 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
         body = body.removeprefix("\r\n").removesuffix("\r\n")
     elif body.startswith("\n"):
         body = body.removeprefix("\n").removesuffix("\n")
-    forward = re.fullmatch(
-        r'Message from [^\r\n]+ \(their answer to [^\r\n]+, passed on by postmaster\) '
-        + r'\[([0-9]+)-[0-9]+\]:\n\n(.*)', body, re.DOTALL)
-    if forward is None:
+    tag = re.search(r'\n\nTag: ([0-9]+)-[0-9]+\Z', body)
+    if tag is None:
         return UnverifiedSupplierMessage(SupplierMessageRejection.INVALID_FORWARD)
+    timestamp, forwarded_text = tag[1], body[:tag.start()]
 
     # Resolve the outer sender before reading reply records. A name in the
     # message, or a reply record alone, cannot establish the forward's origin.
@@ -5357,21 +5466,21 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     records: list[PostmasterReplyRecord] = []
     if root.is_absolute():
         # replyCount names files; forwardCount names deliveries. They need not agree.
-        for path in (root / "message/postmaster/replies").glob(f"{forward[1]}-*.json"):
+        for path in (root / "message/postmaster/replies").glob(f"{timestamp}-*.json"):
             if path.is_symlink() or re.fullmatch(r'[0-9]+-[0-9]+\.json', path.name) is None:
                 continue
             try:
                 record = _read_postmaster_reply_record(path)
             except (OSError, ValueError):
                 continue
-            if str(record.at_ms) == forward[1]:
+            if str(record.at_ms) == timestamp:
                 records.append(record)
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.NO_RECORD)
     records = [record for record in records if record.socket == address.address]
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.SOCKET_MISMATCH)
-    records = [record for record in records if record.body == forward[2]]
+    records = [record for record in records if record.matches_forward(forwarded_text)]
     if not records:
         return UnverifiedSupplierMessage(SupplierMessageRejection.BODY_MISMATCH)
     records = [record for record in records if owner_session in record.targets]
@@ -5380,7 +5489,7 @@ def _supplier_message(identity: str, prompt: str, owner_session: str) -> Verifie
     if len(records) != 1:
         return UnverifiedSupplierMessage(SupplierMessageRejection.SEVERAL_RECORDS)
     # The write-once reply record's targets establish the intended recipients.
-    return VerifiedSupplierMessage(forward[2], SupplierMessageRoute.POSTMASTER_REPLY)
+    return VerifiedSupplierMessage(records[0].body, SupplierMessageRoute.POSTMASTER_REPLY)
 
 
 def _turn_waits_for_marker(marker: dict[str, object], waits: dict[str, dict[str, object]]) -> list[dict[str, object]]:
@@ -5477,7 +5586,9 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         from_supplier = isinstance(message, VerifiedSupplierMessage)
         user_wait = wait.get("wait_kind") == "WaitingForUser"
         body = message.body if isinstance(message, VerifiedSupplierMessage) else ""
-        body = re.sub(r'^Message from [^\n]+ via postmaster: [^\n]* \[[a-fA-F0-9]{8}\]\r?\n\r?\n', "", body, count=1)
+        body = re.sub(r'^[^\r\n]*: [^\r\n]*\r?\nSender native id: [^\r\n]+\r?\n'
+                      + r'(?:Shown sender: [^\r\n]+\r?\n)?Tag: [a-fA-F0-9]{8}\r?\n\r?\n',
+                      "", body, count=1)
         relay = from_supplier and body.lstrip().startswith("From the user (via the showrunner):")
         if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
             return

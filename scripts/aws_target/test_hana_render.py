@@ -1,6 +1,9 @@
 """Test isolated Hana rendering with only the listed repository files."""
 from __future__ import annotations
 
+import ast
+from collections.abc import Iterator
+from importlib.util import resolve_name
 from pathlib import Path
 import shutil
 import stat
@@ -45,6 +48,47 @@ loopback.shell_timeout_s=13
 loopback.command_timeout_s=43
 """
 
+# The guest does not ship these imports for host operations, tests, and type annotations.
+UNSHIPPED_IMPORTS = {
+    'aws_target/hana_execution.py': {'aws_target/hana_box.py', 'buildlog/sync.py',
+        'aws_target/remote.py', 'aws_target/controller_lock.py', 'aws_target/ledger.py'},
+    'aws_target/hana_placement.py': {'aws_target/hana_box.py'},
+    'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
+        'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
+    'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
+    'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
+    'buildlog/record.py': {'aws_target/config.py', 'direct/step_record.py'},
+    'buildlog/step_context.py': {'lib/cargo_target_config.py'},
+    'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
+    'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
+    'lib/build_folders.py': {'lib/descendants.py'},
+    'lib/python_startup/sitecustomize.py': {'lib/testing_folders.py'},
+    'lib/scratch.py': {'direct/phase_table.py', 'production/proposals_table.py', 'production/unit_lookup.py',
+        'production/production_doc.py', 'direct/plan_history.py', 'accounts/__init__.py', 'accounts/accounts.py'},
+    'lib/unit_runs.py': {'direct/worker_state.py'},
+    'lint/memory_admit.py': {'message/unit_labels.py'},
+    'production/staff.py': {'agents/worker_lifecycle.py', 'agents/remote.py', 'lib/operation_environment.py'},
+}
+
+
+def imported_source_paths(source: Path) -> Iterator[Path]:
+    """Find repository modules in imports at all levels of a Python file."""
+    package = '.'.join(source.parent.parts)
+    for node in ast.walk(ast.parse((ROOT / source).read_bytes(), filename=str(source))):
+        if isinstance(node, ast.Import):
+            names = [item.name for item in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            module = resolve_name('.' * node.level + (node.module or ''), package)
+            names = [module, *(f'{module}.{item.name}' for item in node.names)]
+        else:
+            continue
+        for name in names:
+            if name.startswith('scripts.'):
+                path = Path(*name.split('.'))
+                for candidate in (path.with_suffix('.py'), path / '__init__.py'):
+                    if (ROOT / candidate).is_file():
+                        yield candidate
+
 
 class HanaRenderTests(unittest.TestCase):
     def test_listed_files_render_all_guest_names_modes_and_bytes(self) -> None:
@@ -64,6 +108,16 @@ class HanaRenderTests(unittest.TestCase):
                     _ = destination.write_text(BUILD_TARGETS_SETTINGS, encoding='utf-8')
                 else:
                     _ = shutil.copyfile(ROOT / relative, destination)
+            listed = {Path(entry) for entry in entries}
+            missing = {
+                f'{source} imports {dependency}'
+                for source in listed if source.suffix == '.py'
+                for dependency in imported_source_paths(source)
+                if dependency not in listed
+                and str(dependency.relative_to('scripts')) not in UNSHIPPED_IMPORTS.get(
+                    str(source.relative_to('scripts')), ())
+            }
+            self.assertEqual(sorted(missing), [], 'The guest manifest lacks imported modules')
             result = subprocess.run([sys.executable, '-E', '-m', 'scripts.aws_target.hana_render',
                                      '--device', '/dev/sdf', 'rendered'], cwd=checkout,
                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)

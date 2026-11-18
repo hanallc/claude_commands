@@ -8,18 +8,23 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 import json
-import re
 from statistics import median
 from typing import cast
 
 from scripts.aws_target import ledger
+from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
 
 KINDS = (('gate', 'merge gates'), ('test-affected', 'targeted tests'))
 EVERY_KIND = tuple(mode for mode, _label in KINDS)
+_MODE_ALIASES = {'gate': 'merge-gate', 'test-affected': 'targeted-test'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
+
+
+def _run_kind(mode: str) -> str:
+    return _MODE_ALIASES.get(mode, mode)
 
 
 @dataclass(frozen=True)
@@ -76,13 +81,16 @@ def runs_from_rows(rows: Sequence[dict[str, object]], start: datetime, end: date
         at = datetime.fromtimestamp(float(str(row['time'])), UTC)
         if not start <= at < end:
             continue
+        mode = row.get('mode')
+        if isinstance(mode, str):
+            mode = _run_kind(mode)
         if row.get('result') == 'fallback':
-            fallbacks.append((at, row))
+            fallbacks.append((at, {**row, 'mode': mode} if isinstance(mode, str) else row))
         if 'mode' not in row:
             omitted += 1
         elif row.get('result') == 'finished':
             launch = launched.get(str(row.get('attempt', '')))
-            size, mode = row.get('instance_type'), row.get('mode')
+            size = row.get('instance_type')
             # Placement reads this too, so a row it cannot use is counted, not raised.
             if launch is None or not isinstance(size, str) or not size or not isinstance(mode, str):
                 omitted += 1
@@ -93,6 +101,7 @@ def runs_from_rows(rows: Sequence[dict[str, object]], start: datetime, end: date
     return GateRuns(runs, omitted, fallbacks)
 
 
+DayKey = tuple[str, str, str]
 BilledKey = tuple[str, str, str, str]
 
 
@@ -130,15 +139,19 @@ def paid_per_hour(bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]]) ->
 
 def billed_allocations(bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]],
                        runs: list[FinishedGateRun]) -> dict[BilledKey, Decimal]:
-    """Split each billed day's Spot cost of a type in a region between its run kinds by box time."""
+    """Split each daily Spot bill for a type and region by box time across all modes."""
     groups: dict[BilledKey, Decimal] = defaultdict(Decimal)
     for run in runs:
         groups[run.instance_type, run.region, run.day, run.mode] += run.box_s
+    totals: dict[DayKey, Decimal] = defaultdict(Decimal)
+    for (size, region, at, _mode), seconds in groups.items():
+        totals[size, region, at] += seconds
     allocations: dict[BilledKey, Decimal] = {}
     for (size, region, at, mode), seconds in groups.items():
-        if (size, region, at) in bills:
-            total = sum((groups.get((size, region, at, kind), Decimal(0)) for kind, _label in KINDS), Decimal(0))
-            allocations[size, region, at, mode] = bills[size, region, at][0] * seconds / total
+        day_key = (size, region, at)
+        total = totals[day_key]
+        if total != 0 and day_key in bills:
+            allocations[size, region, at, mode] = bills[day_key][0] * seconds / total
     return allocations
 
 
@@ -149,9 +162,6 @@ def billed_runs(runs: list[FinishedGateRun], allocations: dict[BilledKey, Decima
 def billed_cost_per_run(runs: list[FinishedGateRun], allocations: dict[BilledKey, Decimal]) -> Decimal:
     groups = {(run.instance_type, run.region, run.day, run.mode) for run in runs}
     return sum((allocations[key] for key in groups), Decimal(0)) / len(runs)
-
-
-DayKey = tuple[str, str, str]
 
 
 @dataclass(frozen=True)
@@ -241,14 +251,6 @@ def median_run_time(seconds: list[Decimal]) -> str:
     return f'{minutes}m {remainder}s'
 
 
-def gate_vcpus(instance_type: str) -> int:
-    """Return the vCPU count that the type's size names, or zero for an unknown size."""
-    size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', instance_type)
-    if not size:
-        return 0
-    return 2 if size[1] == 'large' else 4 * int(size[2] or '1')
-
-
 class BoxTimeSource(Enum):
     """Where the box times of a type and region come from."""
     OWN = ''
@@ -270,23 +272,25 @@ class RunEvidence:
 
     def box_seconds(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[list[Decimal], BoxTimeSource]:
         """Own region box times, else the type's times in all regions, else times of types with its vCPU count."""
-        own = [time for mode in modes for time in self.by_region.get((size, region, mode), [])]
+        kinds = dict.fromkeys(map(_run_kind, modes))
+        own = [time for kind in kinds for time in self.by_region.get((size, region, kind), [])]
         if own:
             return own, BoxTimeSource.OWN
-        typed = [time for mode in modes for time in self.by_type.get((size, mode), [])]
+        typed = [time for kind in kinds for time in self.by_type.get((size, kind), [])]
         if typed:
             return typed, BoxTimeSource.OTHER_REGIONS
         # A type without runs is priced by the runs of a type with the same vCPU count, not by the median of all types.
         vcpus = gate_vcpus(size)
         return [time for (other, mode), times in self.by_type.items()
-                if vcpus and mode in modes and gate_vcpus(other) == vcpus for time in times], BoxTimeSource.SAME_VCPUS
+                if vcpus and mode in kinds and gate_vcpus(other) == vcpus for time in times], BoxTimeSource.SAME_VCPUS
 
     def refusals_per_launch(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[Decimal | None, int, int]:
         """Refused requests for each launched box, with the counts it comes from.
 
         Requests without a mode count only when the modes cover every kind.
         """
-        counted = (*modes, NO_MODE) if set(EVERY_KIND) <= set(modes) else modes
+        kinds = tuple(dict.fromkeys(map(_run_kind, modes)))
+        counted = (*kinds, NO_MODE) if set(EVERY_KIND) <= set(kinds) else kinds
         refused = sum(self.refused.get((size, region, mode), 0) for mode in counted)
         launched = sum(self.launched.get((size, region, mode), 0) for mode in counted)
         if not refused + launched:
@@ -299,7 +303,7 @@ class RunEvidence:
 
         A region without its own runs borrows the other regions' box time and adds unmeasured_extra_s for its transfers."""
         seconds, source = self.box_seconds(size, region, modes)
-        seconds = seconds or [time for mode in modes for time in self.by_mode.get(mode, [])]
+        seconds = seconds or [time for kind in dict.fromkeys(map(_run_kind, modes)) for time in self.by_mode.get(kind, [])]
         box = ((Decimal(median(seconds)) if seconds else default_seconds)
                + (Decimal(0) if source is BoxTimeSource.OWN else unmeasured_extra_s))
         # Capacity refusals do not depend on the run kind, so every request counts.
@@ -334,7 +338,7 @@ def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: dateti
             continue
         result = row.get('result')
         attempts[str(row.get('attempt', ''))].append((at, str(result)))
-        key = str(row.get('instance_type', '')), str(row.get('region') or home), str(row.get('mode', NO_MODE))
+        key = str(row.get('instance_type', '')), str(row.get('region') or home), _run_kind(str(row.get('mode', NO_MODE)))
         if result == 'launched':
             launched[key] += 1
         elif result == 'refused' and row.get('error_code') in ZONE_REFUSALS | QUOTA_REFUSALS:

@@ -222,9 +222,10 @@ def stop_cancelled_test(name: str, result: subprocess.CompletedProcess[str], log
 
 def run_checkpoint_test_steps(production: ProductionDocument, paths: tuple[str, ...],
                               merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str],
-                              flaky_tests: frozenset[str], log: Path) -> str:
+                              flaky_tests: frozenset[str], log: Path, *,
+                              ledger: ProductionDocument | None = None) -> str:
     """Select checkpoint commands and run them with the flake rules."""
-    return run_test_steps(production, test_steps(production, paths, merge_tests), flakes, flaky_tests, log)
+    return run_test_steps(ledger or production, test_steps(production, paths, merge_tests), flakes, flaky_tests, log)
 
 
 def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTestStep], flakes: frozenset[str],

@@ -45,15 +45,17 @@ def load_tests(loader, tests, pattern):
 COPY_TARGETED_RUN = COPY_IMPORT_AUDIT + '''
 import runpy
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import gate
 root = Path(os.environ['EXPECTED_CHECKOUT'])
+os.environ['GATE_STATE_DIR'] = str(root / 'gate-state')
+os.environ['GATE_PASSED_DIR'] = str(root / 'gate-passes')
 def selected_suite(repo, *args, **kwargs):
-    assert kwargs['mode'] is merge_gate.SuiteMode.TARGETED_TEST
-    return merge_gate.run_suites(repo, machine=merge_gate.WholeMachine(),
-        selected=merge_gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
+    assert kwargs['mode'] is gate.SuiteMode.TARGETED
+    return gate.run_suites(repo, machine=gate.WholeMachine(),
+        selected=gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
         mode=kwargs['mode'])
 sys.argv = [str(root / 'scripts/production/targeted_test.py'), '--repo', str(root)]
-with mock.patch.object(merge_gate, 'run_gate_suites', side_effect=selected_suite):
+with mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite):
     try:
         runpy.run_path(sys.argv[0], run_name='__main__')
     finally:
@@ -66,7 +68,7 @@ from scripts.agents import detached_runs
 
 root = Path(os.environ['EXPECTED_CHECKOUT'])
 record_path = root / 'detached.json'
-record = dict(pid=os.getpid(), session_dir=str(root), worker='fixture-test',
+record = dict(status='running', pid=os.getpid(), session_dir=str(root), worker='fixture-test',
               staff_id='fixture-staff', log=str(root / 'detached.log'),
               command=[sys.executable, *sys.argv[1:]])
 # Simulate a supervisor that inherited the root from an older launcher.

@@ -60,6 +60,13 @@ class Investigation:
     kind: InvestigationKind = InvestigationKind.INVESTIGATION
     submission: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
 
+    @property
+    def source_owner(self) -> staff.StaffId:
+        if isinstance(self.submission, new_item_dialog.ReviewSubmission):
+            return new_item_dialog.request_recipient(new_item_dialog.SubmissionKind(self.kind.value),
+                                                     self.submission.request_id)
+        return self.owner
+
 
 _NO_REVIEW_SUBMISSION = new_item_dialog.NoReviewSubmission()
 _held_recipients: ContextVar[frozenset[Path]] = ContextVar("investigation_locks", default=frozenset())
@@ -139,7 +146,7 @@ def investigation_numbers() -> AbstractContextManager[record_store.LockedRecordN
     return record_store.record_numbers(record_store.RecordKind.INVESTIGATION, _seed_id)
 
 
-def _record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple[Path, str]]:
+def review_record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple[Path, str]]:
     """Find native investigation records in the active store and archives."""
     roots = record_store.known_folders(record_store.RecordKind.INVESTIGATION, owner, strict=strict)
     for path in record_store.stored_paths(roots, strict=strict):
@@ -149,12 +156,12 @@ def _record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple
 
 def review_record_paths(owner: staff.StaffId, *, strict: bool = False) -> Iterator[Path]:
     """Find the paths of stored investigations."""
-    yield from (path for path, _ in _record_ids(owner, strict=strict))
+    yield from (path for path, _ in review_record_ids(owner, strict=strict))
 
 
 def _record_path(store: Investigations, identity: str, *, strict: bool = True) -> Path:
     _ = store.path(identity)
-    paths = [path for path, number in _record_ids(store.owner, strict=strict) if number == identity]
+    paths = [path for path, number in review_record_ids(store.owner, strict=strict) if number == identity]
     if len(paths) > 1:
         raise InvestigationError(f"{identity}: more than one investigation has this ID for owner {store.owner}")
     if not paths:
@@ -183,6 +190,14 @@ def read_review_record(path: Path) -> Investigation:
     store = _store(review_owner(path))
     identity = store.field(path.stem, "id", path=path)
     return _load(store, identity, path)
+
+
+def open_review_investigations(owner: staff.StaffId) -> Iterator[tuple[Path, Investigation]]:
+    """Find user filings that still need an answer or review."""
+    for path, identity in review_record_ids(owner, strict=True):
+        header = record_store.read_header(path, keys=frozenset(("state", "review_submission")), strict=True)
+        if header.get("state") != [InvestigationState.READ] and header.get("review_submission"):
+            yield path, _load(_store(owner), identity, path)
 
 
 def find_review_submission(owner: staff.StaffId, kind: InvestigationKind, request_id: str

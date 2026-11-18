@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
-from scripts.production import affected_modules, checkpoint_gate, gate
+from scripts.production import affected_modules, checkpoint_gate, gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
 from scripts.test_times import gate_record
@@ -359,6 +359,19 @@ class MergeGateSuitesTests(GateSuitesFixture):
         with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
             _ = gate.main(["--repo", str(self.checkout), "--module", "hooks/test_first.py"])
         self.assertIn("--module needs --tests-only", errors.getvalue())
+
+    def test_gate_commands_refuse_abbreviated_options(self) -> None:
+        for main, arguments, short in (
+            (gate.main, ["--tests-on", "--full"], "--tests-on"),
+            (targeted_test.main, ["--ful"], "--ful"),
+        ):
+            with (self.subTest(command=main.__module__),
+                  mock.patch.object(gate, "run_tests_only") as run,
+                  contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refusal):
+                _ = main(arguments)
+            self.assertEqual(refusal.exception.code, 2)
+            self.assertIn(f"unrecognized arguments: {short}", errors.getvalue())
+            run.assert_not_called()
 
     @gate_suites("hooks")
     def test_whole_machine_stops_a_module_at_its_time_limit(self) -> None:

@@ -2054,6 +2054,7 @@ class MemoryQueueFixture(unittest.TestCase):
         self.processes = {100: "first", 200: "second", 300: "head", 400: "warmup"}
         self.readings = {100: admission_records.MeasuredMemory(GIB, anonymous=admission_records.AnonymousRunUse(GIB)), 200: admission_records.MeasuredMemory(2 * GIB, anonymous=admission_records.AnonymousRunUse(2 * GIB))}
         _ = cast(object, self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root))))
+        (self.root / "sessions").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root), "BUILDLOG_PROC": str(self.root / "proc"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         _ = self.enterContext(patch.object(admission_records, "process_start_time", side_effect=self.processes.get))
         def table(_proc: Path) -> dict[int, gate.ProcessIdentity]:
@@ -3680,6 +3681,31 @@ class CurrentBlockerTests(MemoryQueueFixture):
         result = self.blocker()
         self.assertIsInstance(result, gate.ReservationBlocker)
         self.assertEqual(gate.blocker_fields(self.blocker()), {'session_id': 'owner-id', 'session_name': 'owner-name', 'pool': 'memory'})
+
+    def test_blocker_reports_an_incomplete_session_name_lookup(self) -> None:
+        _ = (self.root / "proc/100/environ").write_bytes(b"CLAUDE_CODE_SESSION_ID=owner-id\0")
+        for cause in ("missing folder", "unreadable record"):
+            registry = self.root / cause
+            unreadable = registry
+            name: str | gate.BlockerSessionNameUnknown = gate.BlockerSessionNameUnknown((unreadable,))
+            if cause == "unreadable record":
+                registry.mkdir()
+                unreadable = registry / "unfinished.json"
+                _ = unreadable.write_text("{")
+                name = "registry name"
+                _ = (registry / "good.json").write_text(json.dumps({
+                    "pid": 100, "sessionId": "owner-id", "name": name, "messagingSocketPath": "", "updatedAt": 1,
+                }))
+            with (self.subTest(cause=cause), patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                result = self.blocker()
+                self.assertEqual(result, gate.ReservationBlocker("owner-id", name))
+                self.assertIn(f"memory queue: session registry unreadable: {unreadable}", errors.getvalue())
+                fields = gate.blocker_fields(result)
+                if isinstance(name, gate.BlockerSessionNameUnknown):
+                    self.assertEqual(fields["session_name_unknown"], f"session registry unreadable: {unreadable}")
+                else:
+                    self.assertNotIn("session_name_unknown", fields)
 
     def test_check_reports_holder_changes_on_existing_poll_with_opt_in_field(self) -> None:
         for name in ("owner-name", "new-owner"):
