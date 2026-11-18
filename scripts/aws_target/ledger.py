@@ -1474,6 +1474,7 @@ class CostLedger:
     def __init__(self, directory: Path) -> None:
         self.directory: Path = directory
         self.path: Path = directory / "cost-ledger.json"
+        self.launch_history_path: Path = directory / 'cloud-gate-launches.jsonl'
 
     def _read(self) -> LedgerEvidence:
         """Read atomically published evidence without creating files or acquiring locks."""
@@ -1515,11 +1516,14 @@ class CostLedger:
         _ = _decode(document)
         write_text_atomic(self.path, json.dumps(document, sort_keys=True) + "\n")
 
+    def bill_paths(self) -> tuple[Path, ...]:
+        return tuple(sorted((self.directory / 'charges').glob('*.json')))
+
     def read_bills(self) -> tuple[ChargeRead, ...]:
-        return tuple(read_charge(path) for path in sorted((self.directory / 'charges').glob('*.json')))
+        return tuple(read_charge(path) for path in self.bill_paths())
 
     def launches(self) -> tuple[dict[str, object], ...]:
-        path = self.directory / 'cloud-gate-launches.jsonl'
+        path = self.launch_history_path
         return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
 
     def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int) -> None:
@@ -1636,10 +1640,19 @@ class CostLedger:
         reason = self.reservation_cap(state, policy, now, costs)
         return SpendingRefused(now, reason, decision.evidence) if reason else decision
 
+    def placement_spending_preview(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
+        """Project spending for placement with one read of the pricing inputs."""
+        return self._decide(state, settings_path, 'start', now, placement_preview=True)
+
     def reservation_cap(self, state: LedgerEvidence, settings: SpendingSettings, now: int, costs: CostEstimate) -> str:
-        """Apply the existing account bill cap to all proposed resource reservations."""
+        """Refresh prices and apply the account bill cap to the proposed reservations."""
         readings = self.read_bills()
         self._price_gates(state, readings, now)
+        return self._reservation_cap(state, settings, now, costs, readings)
+
+    def _reservation_cap(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
+                         costs: CostEstimate, readings: Sequence[ChargeRead]) -> str:
+        """Apply the account bill cap to the priced resource reservations."""
         days = gate_spend_days(state, settings, readings, now, reserve=True)
         fixed_daily, fixed_monthly = _reserved_fixed_costs(state, settings, costs)
         if any(is_billed_day(r) and r.period_end <= now for r in readings):
@@ -1847,12 +1860,13 @@ class CostLedger:
         return decode_permission(decision_record(decision))
 
     def _decide(self, state: LedgerEvidence, settings_path: Path,
-                purpose: SpendingPurpose, now: int) -> SpendingDecision:
+                purpose: SpendingPurpose, now: int, *, placement_preview: bool = False) -> SpendingDecision:
         evidence = GuardEvidence(purpose, (), CostEvidenceUnavailable("costs have not been validated"))
         try:
             settings = read_settings(settings_path)
             evidence = GuardEvidence(purpose, settings.limits, evidence.costs, settings)
-            self._price_gates(state, self.read_bills(), now)
+            readings = self.read_bills()
+            self._price_gates(state, readings, now)
             costs = _charges(state, settings, now, current_window=True)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings)
             if purpose != "deployment" and not any(r.state != "unknown" for r in state.observations):
@@ -1880,6 +1894,8 @@ class CostLedger:
                 if not any(event.event_id == event_id for event in state.events):
                     state.events.append(LimitEvent(event_id, now, period, total, limit,
                                                    settings.notification_recipient, settings.notification_timeout_s))
+            if not reason and placement_preview:
+                reason = self._reservation_cap(state, settings, now, costs, readings)
             return SpendingRefused(now, reason, evidence) if reason else SpendingAllowed(now, evidence)
         except SpendingConfigurationUnavailable as error:
             return SpendingUnavailable(now, str(error), GuardEvidence(purpose, error.limits, evidence.costs))
