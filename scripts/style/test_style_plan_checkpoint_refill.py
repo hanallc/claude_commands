@@ -335,6 +335,58 @@ class TicketWorkerTests(AssignLauncherFixture):
         ):
             self.assertIn(sentence, prompt.read_text())
 
+    def test_restore_starts_a_new_turn_after_a_failed_notice(self) -> None:
+        plan = self.project / "plan.md"
+        _ = plan.write_text("# Standing plan\n\n## Phases\n\n"
+                            + "### Phase 7 — 7 · status: todo\nEdit the assigned source.\n\n"
+                            + "### Phase 8 — 8 · status: todo\nEdit the other source.\n")
+        self.record("start-phase", "--phase-id", "8", "--phase-title", "8")
+        original = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        record_file = self.session_dir / "progress_history_state.json"
+        slot = "style-ticket-7"
+
+        def ticket_pass() -> dict[str, object]:
+            state = cast(dict[str, dict[str, dict[str, object]]], json.loads(record_file.read_text()))
+            return state["pass"][slot]
+
+        def command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args[:2] == ["bash", str(style_plan.SCRIPTS / "direct/assign.sh")]:
+                return invoke_assignment(args[2:], os.environ.copy())
+            return original(args, **kwargs)
+
+        def restore(ticket: str) -> None:
+            style_plan.restore_ticket_worker(self.session_dir, self.project, plan, ticket, ("src/worker.py",))
+
+        with mock.patch.object(subprocess, "run", side_effect=command):
+            restore("7")
+            restore("8")
+            self.assertEqual(self.turn_starts, 2)
+            instance = str(ticket_pass()["instance_id"])
+            progress_history.complete_dispatch(self.session_dir, slot, instance, status="error")
+            self.native.agent.notice_failures = 1
+            with self.assertRaises(style_ledger.LedgerError):
+                restore("7")
+            self.assertEqual(self.native.agent.notice_failures, 0)
+            self.assertEqual(self.turn_starts, 2)
+            self.assertEqual(self.native.agent.notices, [])
+            failed = ticket_pass()
+            self.assertEqual((failed["instance_id"], failed["status"]), (instance, "error"))
+            self.assertNotIn("hook_notice", failed)
+
+            restore("7")
+            self.assertEqual(self.turn_starts, 3)
+            notice, = self.native.agent.notices
+            self.assertIn(f"; pass {instance}", notice)
+            successor = ticket_pass()
+            self.assertNotEqual(successor["instance_id"], instance)
+            self.assertEqual(successor["status"], "active")
+            self.assertIn(f"DONE {successor['instance_id']}", self.turn_inputs[-1])
+
+            restore("7")
+            self.assertEqual(self.turn_starts, 3)
+            self.assertEqual(ticket_pass()["instance_id"], successor["instance_id"])
+            self.assertEqual(self.native.agent.notices, [notice])
+
     def test_refill_in_no_worker_mode_starts_no_worker(self) -> None:
         plan = self.project / "plan.md"
         _ = plan.write_text("# Standing plan\n\n## Phases\n\n### Phase 7 — 7 · status: todo\nEdit the assigned source.\n")
