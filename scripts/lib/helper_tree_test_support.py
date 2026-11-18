@@ -16,7 +16,7 @@ SOURCE = Path(__file__).resolve().parents[2]
 COPY_HELPERS = (
     "scripts/lib", "scripts/buildlog", "scripts/copies", "scripts/mac_test", "scripts/message",
     "scripts/production", "scripts/agents", "scripts/direct", "scripts/hooks", "scripts/lint", "scripts/herdr",
-    "scripts/build_hold", "scripts/build_queue", "scripts/build_targets", "scripts/test_times",
+    "scripts/build_hold", "scripts/build_queue", "scripts/build_targets", "scripts/test_times", "scripts/aws_target",
 )
 VERIFY_HELPERS = (*COPY_HELPERS, "scripts/whoami", "scripts/notify")
 
