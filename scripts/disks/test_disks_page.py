@@ -10,8 +10,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.etree import ElementTree
 from typing import cast, override
@@ -64,7 +66,9 @@ def session(name: str, size: int | None, state: str, held: list[dict[str, object
 SESSIONS: dict[str, object] = {"root": "/session", "sessions": [
     session("fps", 28 * GIB, "running", [{"name": "run", "task": "phase:fps/3", "ended": False},
                                          {"name": "center-shot", "task": "phase:fps/3", "ended": True}]),
-    session("lfo", 7 * GIB, "ended"), session("demo", GIB, "running"), session("<b>", 0, "unknown"), session("sdlc", None, "running")]}
+    session("lfo", 7 * GIB, "ended"),
+    session("demo", GIB, "running", [{"name": "<scratch>", "task": "phase:demo/1", "ended": False}]),
+    session("<b>", 0, "unknown"), session("sdlc", None, "running")]}
 
 
 class DisksPageTests(unittest.TestCase):
@@ -635,21 +639,180 @@ const localStorage={getItem:()=>null};
 
     def test_the_sessions_card_shows_every_session_and_a_size_filter_joins_the_smaller_ones(self) -> None:
         # The user, 11-16: "sessions should show all sessions and have a filter that limits the minimum size - like disks".
+        self.assertRegex(self.page_html(), r'id="cards">\s*<section[^>]+id="slots"[^>]*></section>\s*'
+                         + r'<section[^>]+id="sessions"[^>]*></section>')
+
         def cells(limit: int) -> list[str]:
             html = cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, {limit})"))
             rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", html))
             return ["|".join(part for part in re.split(r"<[^>]+>", row) if part.strip()) for row in rows]
 
-        self.assertEqual(cells(0), ["fps|28 GiB|run, center-shot |(unsaved work)|running", "lfo|7.0 GiB|—|ended",
-                                    "demo|1.0 GiB|—|running", "&lt;b&gt;|&lt; 256 MiB|—|—", "sdlc|—|—|running"])
-        self.assertEqual(cells(5 * GIB), ["fps|28 GiB|run, center-shot |(unsaved work)|running", "lfo|7.0 GiB|—|ended",
-                                          "3 smaller|1.0 GiB"])
+        self.assertEqual(cells(0), ["fps|28 GiB|run, center-shot |(unsaved work)|2 folders|running", "lfo|7.0 GiB|—|ended",
+                                    "demo|1.0 GiB|&lt;scratch&gt;|running", "&lt;b&gt;|&lt; 256 MiB|—|—", "sdlc|—|—|running"])
+        self.assertEqual(cells(5 * GIB), ["fps|28 GiB|run, center-shot |(unsaved work)|2 folders|running",
+                                          "lfo|7.0 GiB|—|ended", "3 smaller|1.0 GiB"])
         html = cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, 0)"))
+        self.assertEqual(re.findall(r'<td class="held">(.*?)</td>', html), [
+            '<div class="line"><span class="names">run, center-shot <span class="dim">(unsaved work)</span></span>'
+            + '<span class="count">2 folders</span></div>',
+            '<span class="dim">—</span>',
+            '<div class="line"><span class="names">&lt;scratch&gt;</span></div>',
+            '<span class="dim">—</span>',
+            '<span class="dim">—</span>',
+        ])
         self.assertEqual(re.findall(r'<i style="width:([0-9.]+)%">', html), ["100.0", "25.0", "3.6"])
         self.assertEqual(re.findall(r'data-tip="([^"]*)"', cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, {5 * GIB})"))),
                          ["session:fps", "session:lfo", "smaller:sessions"])
         self.assertEqual(self.run_page(f"[sessionRange({json.dumps(SESSIONS)}, {KEEP}), sessionLimitAt(0, {{min: 1, max: 2}})]"),
                          [{"min": KEEP, "max": 28 * GIB}, 0])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_session_rows_and_the_full_tooltip_fit_in_the_browser(self) -> None:
+        held: list[dict[str, object]] = [
+            {"name": f"scratch/phase-review-{index:02d}/long-folder-name-for-the-layout-check",
+             "task": "phase:disksdesign/1", "ended": index % 2 == 0} for index in range(40)]
+        measure = json.dumps({"state": "current", "slots": SLOTS, "sessions": {"root": "/session", "sessions": [
+            session("report", 28 * GIB, "running", held), session("other", 9 * GIB, "ended")]}}).encode()
+        reading = json.dumps({"measured_at": NOW, "render_seconds": 0.01, "keep_bytes": KEEP, "drives": []}).encode()
+        probe = """
+async function checkSessionLayout() {
+  const failures = [];
+  const check = (passed, detail) => { if (!passed) failures.push(detail); };
+  const bounds = element => element.getBoundingClientRect();
+  const close = (first, second) => Math.abs(first - second) < 1;
+  try {
+    check(matchMedia('(prefers-color-scheme: dark)').matches, 'Firefox uses the dark color scheme.');
+    const rows = [...document.querySelectorAll('.sessions tbody tr')];
+    check(rows.length === 2, 'The Sessions card shows both rows.');
+    const cell = rows[0].querySelector('.held');
+    if (innerWidth === 1440) {
+      const cards = bounds(document.querySelector('#cards'));
+      const slots = bounds(document.querySelector('#slots'));
+      const sessions = bounds(document.querySelector('#sessions'));
+      check(slots.height > 0 && slots.bottom <= sessions.top, 'Slots is above Sessions.');
+      check([slots, sessions].every(card => close(card.left, cards.left) && close(card.right, cards.right)),
+            'Both cards use the full width.');
+      for (const row of rows) {
+        const height = Math.max(...[...row.cells].map(cell => {
+          const style = getComputedStyle(cell);
+          return parseFloat(style.lineHeight) + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+            + parseFloat(style.borderBottomWidth);
+        }));
+        check(bounds(row).height <= height + 1, 'The session row uses one line.');
+      }
+      const count = rows[0].querySelector('.count');
+      const names = rows[0].querySelector('.names');
+      check(count.textContent === '40 folders' && close(bounds(count).right, bounds(cell).right),
+            'The count is at the right edge of the cell.');
+      check(names.scrollWidth > names.clientWidth && getComputedStyle(names).textOverflow === 'ellipsis',
+            'The cell shortens the list with an ellipsis.');
+    }
+    rows[0].scrollIntoView({block: 'center'});
+    rows[0].dispatchEvent(new PointerEvent('pointermove', {
+      bubbles: true, pointerType: 'mouse', clientX: bounds(cell).left, clientY: bounds(cell).top + 8
+    }));
+    const tip = document.querySelector('#tip.on');
+    const folders = [...tip.querySelectorAll('dt')].slice(2);
+    const box = bounds(tip);
+    check(innerHeight === 900 && box.top >= 0 && box.bottom <= innerHeight,
+          'The tooltip fits in the 900 px window. Bounds: ' + JSON.stringify(box));
+    check(box.left >= 0 && box.right <= innerWidth, 'The tooltip fits the window width.');
+    check(folders.every((folder, index) => {
+      const details = folder.nextElementSibling;
+      const state = index % 2 === 0 ? 'unsaved work' : 'held';
+      const number = String(index).padStart(2, '0');
+      return folder.textContent === 'scratch/phase-review-' + number + '/long-folder-name-for-the-layout-check'
+        && details.textContent === state + ' · Task phase:disksdesign/1'
+        && folder.scrollWidth <= folder.clientWidth && details.scrollWidth <= details.clientWidth
+        && Number(getComputedStyle(details).opacity) < 1;
+    }), 'Every displayed folder name and its dim details are visible in full.');
+    const summary = tip.querySelector('dl').lastElementChild;
+    check(summary.textContent === '+' + (40 - folders.length) + ' more folders'
+      && Number(getComputedStyle(summary).opacity) < 1, 'A dim last line gives the number of omitted folders.');
+    const textLines = element => {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      return range.getClientRects().length;
+    };
+    if (innerWidth === 1440) {
+      check(folders.length === 30 && folders.every(folder =>
+        textLines(folder) === 1 && textLines(folder.nextElementSibling) === 1
+        && close(bounds(folder).top, bounds(folder.nextElementSibling).top)),
+        'The tooltip shows the first 30 folders on one line each.');
+    } else {
+      check(folders.length > 0 && folders.length <= 30 && textLines(folders[0]) > 1,
+            'Long folder names wrap at phone width.');
+      const root = document.documentElement;
+      check(root.scrollWidth <= root.clientWidth, 'The phone page has no horizontal scroll.');
+    }
+  } catch (error) {
+    failures.push(String(error));
+  }
+  await fetch('/results', {method: 'POST', body: JSON.stringify({width: innerWidth, failures})});
+}
+"""
+        page = self.page_html().replace("void pageRefresh.refresh();",
+            "void pageRefresh.refresh().then(checkSessionLayout);" + probe)
+        page_bytes = page.replace("</body>", '<img hidden src="/complete"></body>').encode()
+        results: list[object] = []
+        complete = threading.Event()
+
+        class LayoutProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/":
+                    body, mime = page_bytes, "text/html; charset=utf-8"
+                elif self.path.startswith("/disks.json?"):
+                    body, mime = reading, "application/json"
+                elif self.path == "/complete":
+                    _ = complete.wait(test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.send_error(404)
+                    return
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.end_headers()
+                _ = self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                if self.path == "/results":
+                    results.append(cast(object, json.loads(body)))
+                    self.send_response(204)
+                    self.end_headers()
+                    complete.set()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    _ = self.wfile.write(measure)
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, ThreadingHTTPServer(("127.0.0.1", 0), LayoutProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+            thread.start()
+            try:
+                for width in (1440, 390):
+                    with self.subTest(width=width):
+                        results.clear()
+                        complete.clear()
+                        profile = Path(directory) / f"profile-{width}"
+                        profile.mkdir()
+                        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+                        done = subprocess.run(
+                            ["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                             "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
+                             f"http://127.0.0.1:{server.server_port}/"],
+                            capture_output=True, text=True, timeout=45, check=False)
+                        self.assertEqual(done.returncode, 0, done.stderr)
+                        self.assertEqual(results, [{"width": width, "failures": []}])
+            finally:
+                server.shutdown()
+                thread.join(test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def test_the_sessions_filter_keeps_its_card_and_limit_across_new_data(self) -> None:
         result = cast(dict[str, object], self.run_drive("""
@@ -735,7 +898,7 @@ const localStorage={getItem:()=>null};
         self.assertEqual(result["group"], "hana|2 slots|Size|70 GiB|In use|1 of 2|Limit|8 slots|")
         self.assertIn("The nightly sweep deletes a free slot unused for 7 days.", result["slots"])
         self.assertIn("A session folder holds the temporary files of one Claude session", result["sessions"])
-        self.assertEqual(result["session"], "fps|running|Size|28 GiB|run|held|Task phase:fps/3|center-shot|unsaved work|Task phase:fps/3|")
+        self.assertEqual(result["session"], "fps|running|Size|28 GiB|run|held · Task phase:fps/3|center-shot|unsaved work · Task phase:fps/3|")
         self.assertEqual(result["smaller"], "3 smaller sessions|1.0 GiB|Each is below 5.0 GiB. Move the size filter to the left to show them.|")
         self.assertEqual(result["gone"], "")
         self.assertTrue(result["stale"].startswith("hana-slot1|in use|Repository|hana|"), result["stale"])

@@ -53,6 +53,12 @@ class NoPass(NamedTuple):
     """The worker has no open pass."""
 
 
+class UnknownWorkerRuns(NamedTuple):
+    """The census could not read the worker's runs. The reason can include other unknown facts."""
+
+    reason: str
+
+
 class CensusWorker(NamedTuple):
     staff_id: staff.StaffId
     name: str
@@ -60,7 +66,13 @@ class CensusWorker(NamedTuple):
     status: str | None
     activity: str | None
     assignment: CensusPass | NoPass
-    runs: tuple[CensusRun, ...]
+    run_observation: tuple[CensusRun, ...] | UnknownWorkerRuns
+
+    @property
+    def runs(self) -> tuple[CensusRun, ...]:
+        """Return only the runs the census observed."""
+        observed = self.run_observation
+        return () if isinstance(observed, UnknownWorkerRuns) else observed
 
     @property
     def live_word(self) -> str:
@@ -146,11 +158,17 @@ def _session(value: object, where: str) -> CensusSession:
 
 def _worker(value: object, where: str) -> CensusWorker:
     fields = _object(value, where)
+    runs: tuple[CensusRun, ...] | UnknownWorkerRuns
+    if "runs" in fields and fields["runs"] is None:
+        unknown_path = f"{where}.unknown"
+        reason = _text(_object(fields.get("unknown"), unknown_path), "reason", unknown_path)
+        runs = UnknownWorkerRuns(reason)
+    else:
+        runs = tuple(_run(run, f"{where}.runs[{index}]") for index, run in enumerate(_list(fields, "runs", where)))
     return CensusWorker(staff.StaffId(_text(fields, "staff_id", where)), _text(fields, "name", where),
                         staff.StaffId(_text(fields, "parent_staff_id", where)), _optional_text(fields, "status", where),
                         _optional_text(fields, "activity", where), _assignment(fields.get("pass"), f"{where}.pass"),
-                        tuple(_run(run, f"{where}.runs[{index}]")
-                              for index, run in enumerate(_list(fields, "runs", where))))
+                        runs)
 
 
 def _machine(value: object, where: str) -> CensusMachine:

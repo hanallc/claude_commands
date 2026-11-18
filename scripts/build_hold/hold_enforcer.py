@@ -439,36 +439,29 @@ def stop_waiting_run(
                  stopped_run=identity)
     reason = f"stopped for {holder.purpose}; run again after the release"
 
-    def still_current() -> bool:
-        current = build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
-        if isinstance(detached, DetachedRun):
-            supervisor = detached.supervisor.identity
-            command = detached_runs.command_group(detached.path)
-            current = (current and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
-                       and command is not None
-                       and build_hold.process_start_time(command.group, proc_root) == command.started)
-        return current
+    def gate_is_current() -> bool:
+        return build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
 
-    def signal_run() -> None:
-        if isinstance(detached, DetachedRun):
-            # The command leads its own group; the supervisor stays alive to deliver the stopped result.
-            command = detached_runs.command_group(detached.path)
-            if command is None:
-                raise ProcessLookupError(f"{detached.path.name}: no running command group")
-            signal_group(command.group, signal.SIGTERM)
-        else:
-            signal_process(identity.pid, signal.SIGTERM)
+    def verify_group(run: DetachedRun) -> detached_runs.CommandGroup | detached_runs.CommandGroupUnverified:
+        supervisor = run.supervisor.identity
+        command = detached_runs.command_group(run.path)
+        if (command is not None and gate_is_current()
+                and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
+                and build_hold.process_start_time(command.group, proc_root) == command.started):
+            return command
+        return detached_runs.CommandGroupUnverified()
 
     try:
         agent = build_hold.run_agent(process, build_hold.audit_ancestors(process, processes))
         for recipient in notice_recipients(run.owner, agent):
             _ = build_hold.register_wait(recipient)
         if isinstance(detached, DetachedRun):
-            sent = detached_runs.stop_with_reason(detached.path, reason, still_current=still_current, signal_run=signal_run)
+            sent = detached_runs.stop_with_reason(
+                detached.path, reason, verify_group=lambda: verify_group(detached), signal_group=signal_group)
         else:
-            sent = still_current()
+            sent = gate_is_current()
             if sent:
-                signal_run()
+                signal_process(identity.pid, signal.SIGTERM)
         if not sent:
             set_stop_status(holder, identity, "not_stopped")
             return RunIdentityChanged(run)

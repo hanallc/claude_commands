@@ -36,6 +36,9 @@ from scripts.production.merge_checkpoint_test_support import (
     DELIVERS, REAL_MERGE_TESTS, STARTED, STUB, TRIAL, MergeCheckpointFixture, configure_test_environment,
 )
 
+MAC_RECOVERY = ("{ [ ! -f scripts/lib/waiting_rows.py ] || "
+                + "scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; }")
+
 
 def setUpModule() -> None:
     configure_test_environment()
@@ -1029,12 +1032,12 @@ class MacPromotionPathTests(unittest.TestCase):
 
     def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
         remote = self.remote_command("mac `~/.claude`")
-        self.assertTrue(remote.startswith('cd "$HOME"/.claude && tip=$(git ls-remote'), remote)
+        self.assertTrue(remote.startswith(f'cd "$HOME"/.claude && {MAC_RECOVERY} && tip=$(git ls-remote'), remote)
         self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
 
     def test_absolute_mac_path_is_kept(self) -> None:
         remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
-        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && tip=$(git ls-remote"), remote)
+        self.assertTrue(remote.startswith(f"cd '/Users/someone/my repo' && {MAC_RECOVERY} && tip=$(git ls-remote"), remote)
 
     def test_mac_pull_queues_only_connection_failures_and_preserves_zone_notices(self) -> None:
         cases = (("offline", 255, "", "", main_publish.MacPullPending),
@@ -1122,7 +1125,7 @@ print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
                     commands = [cast(list[str], json.loads(line))[-1]
                                 for line in (state / "ssh.log").read_text().splitlines()[before_drain:]]
                     for mac, source in targets:
-                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && tip=$(git ls-remote" in command
+                        self.assertTrue(any(f"cd {main_publish.remote_path(mac)} && {MAC_RECOVERY} && tip=$(git ls-remote" in command
                                             and f"natedev:{source} main" in command for command in commands), commands)
                     if text:
                         self.assertTrue(any("broadcast.py" in command and text in command for command in commands), commands)

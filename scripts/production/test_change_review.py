@@ -28,7 +28,7 @@ from unittest import mock
 
 
 from scripts.production import change_review
-from scripts.lib import copy_record, file_lock
+from scripts.lib import conf, copy_record, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
@@ -43,7 +43,7 @@ from scripts.production.change_review import Invisible, Malformed, Visible
 from scripts.production.change_review_test_support import (
     fixture_image, fixture_row_image, pictured_changes, pictured_publication, pictured_review_lines,
 )
-from scripts.review_links import image_store
+from scripts.review_links import image_store, review_events
 
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
@@ -94,7 +94,7 @@ def setUpModule() -> None:
         "REVIEW_LINKS_ROOT": str(Path(folder.name) / "links"), "CHANGE_REVIEW_DIR": folder.name,
         "SHOWRUNNER_STATE_DIR": f"{folder.name}/showrunner-state",
         "UNIT_HISTORY_DIR": f"{folder.name}/history", copy_record.ROOT_ENV: f"{folder.name}/scratch",
-        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
+        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro", scratch.HOLDS_ENV: f"{folder.name}/holds.json"}))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
                        doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
@@ -260,6 +260,55 @@ class ProducerImageRequirementTests(ProducerFixture):
         write.assert_not_called()
 
 class NativeVerdictTests(unittest.TestCase):
+    def test_withdraw_preserves_a_pending_verdict_until_recovery_delivers_it(self) -> None:
+        from scripts.review_links import change_page, review_page, test_review_page
+
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        delivery, _ = review_page.submit(case.root, case.body('page-owner/C1', 'works', 'Clear numbers'), case.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        listing = delivery.page.review_list
+        record = case.status.path(delivery.page, delivery.row)
+        before = listing.read_bytes(), record.read_bytes()
+        arguments = ('withdraw', '--production', 'page-owner', '--list', str(listing),
+                     '--row', delivery.row, '--reason', 'The change was reverted')
+        self.assertEqual(run(*arguments), (1, '', 'C1 has a pending verdict message. Withdraw it after delivery.\n'))
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == record:
+                raise PermissionError('fixture record is unreadable')
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with mock.patch.object(Path, 'read_text', new=read):
+            code, output, error = run(*arguments)
+        self.assertEqual((code, output), (1, ''))
+        self.assertIn('fixture record is unreadable', error)
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+
+        for damaged in (b'{', b'{"verdict":{"state":"pending"}}',
+                        b'{"kind":"verdict","state":"pending","attempt":""}'):
+            with self.subTest(damaged=damaged):
+                _ = record.write_bytes(damaged)
+                code, output, error = run(*arguments)
+                self.assertEqual((code, output), (1, ''))
+                self.assertIn('cannot read its verdict delivery record', error)
+                self.assertEqual((listing.read_bytes(), record.read_bytes()), (before[0], damaged))
+            _ = listing.write_bytes(before[0])
+        _ = record.write_bytes(before[1])
+        self.assertEqual(case.fixture.messages, [])
+
+        change_page.recover_pending(change_page.DeliveryStatus(case.root))
+        self.assertCountEqual([recipient for recipient, _, _ in case.fixture.messages],
+                              ['builder-unit', 'page-owner'])
+        for _, _, message in case.fixture.messages:
+            self.assertIn('C1: works: Clear numbers', message)
+        self.assertEqual(run(*arguments)[0], 0)
+        row = next(row for row in change_review.review_rows(listing) if row['#'] == delivery.row)
+        self.assertEqual(row['Verdict'], 'withdrawn')
+
     def test_native_verdict_keeps_the_exchange_locked_until_the_list_save(self) -> None:
         from scripts.review_links import change_page, review_page, test_review_page
 
@@ -2996,6 +3045,55 @@ class ActionTest(unittest.TestCase):
         self.assertNotIn("| C76 | Panels keep shields | 2026-10-14", text.split("## Reviewed")[0])
         self.assertIn("| # | Change | Verdict | Date | Merged |", text)
         self.assertIn("| --- | --- | --- | --- | --- |\n| C76 | Panels keep shields | Works, thanks | 2026-10-15 | 2026-10-14 |\n| C70 |", text)
+
+    def test_withdraw_an_open_row_and_keep_the_users_words_and_time(self) -> None:
+        words = "The panels are back | Keep the café sign.\u2028Keep the panels.\u2029Keep the shields.\u0085Keep the fonts."
+        arguments = ("withdraw", "--production", DOC, "--list", str(self.path), "--row", "C76", "--reason", words)
+        self.enterContext(mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.path.parent / "review-links")}))
+        folder = scratch.new(f"row:{self.path.stem}-C76", "withdraw")
+        _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
+        held = os.path.realpath(folder)
+        self.assertIn(held, scratch.holds())
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            with mock.patch.object(scratch, "end", side_effect=scratch.ScratchError("fixture cleanup failed")):
+                code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("scratch not removed: fixture cleanup failed", output)
+            self.assertIn(held, scratch.holds())
+            before = self.path.read_bytes()
+            with mock.patch.object(scratch, "end", side_effect=conf.Unusable("fixture scratch configuration is unavailable")):
+                code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("scratch not removed: fixture scratch configuration is unavailable", output)
+            self.assertIn(held, scratch.holds())
+            self.assertEqual(self.path.read_bytes(), before)
+            code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+        self.assertIn(f"removed {folder}\n", output)
+        self.assertFalse(folder.exists())
+        self.assertNotIn(held, scratch.holds())
+        self.assertEqual(self.path.read_bytes(), before)
+        snapshot = change_review.review_snapshot(self.path)
+        self.assertEqual([row["#"] for row in snapshot.pending], ["C77"])
+        row = next(row for row in snapshot.reviewed if row["#"] == "C76")
+        self.assertEqual((row["Verdict"], row["Date"], row["Merged"]), ("withdrawn", "2026-11-13", "2026-10-14"))
+        self.assertIn("café", row["Review log"])
+        self.assertEqual(review_events.decode(row["Review log"]),
+                         (review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"),))
+
+    def test_withdraw_a_reviewed_row_and_keep_its_previous_verdict(self) -> None:
+        words = "The change was reverted"
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            code, _, error = run("withdraw", "--production", DOC, "--list", str(self.path),
+                                 "--row", "C70", "--reason", words)
+            self.assertEqual(code, 0, error)
+        snapshot = change_review.review_snapshot(self.path)
+        self.assertEqual([row["#"] for row in snapshot.pending], ["C76", "C77"])
+        row, = snapshot.reviewed
+        self.assertEqual((row["#"], row["Verdict"], row["Date"]), ("C70", "withdrawn", "2026-11-13"))
+        previous, withdrawal = review_events.decode(row["Review log"])
+        self.assertEqual((previous.words, previous.time.date()), ("works", date(2026, 10, 13)))
+        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"))
 
     def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
         for action in ("edit", "verdict"):

@@ -1257,6 +1257,14 @@ class RosterTests(unittest.TestCase):
         self.assertIsInstance(found, send.LocalRosterIncomplete)
         peer.assert_not_called()
 
+    def test_roster_reports_every_unreadable_session_record(self) -> None:
+        unreadable = [self.sessions / filename for filename in ("first.json", "second.json")]
+        for path in unreadable:
+            _ = path.write_text("{")
+        result = roster.roster(os.environ, roster.ThisMachine())
+        for path in unreadable:
+            self.assertIn(f"Claude session records: cannot read {path}", result.problems)
+
     def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
         run = self.runs / "lost-owner-run"
         run.mkdir()
