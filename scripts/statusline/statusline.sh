@@ -8,16 +8,20 @@ if [ -n "${CONF_READ_LOG:-}" ]; then
   . "$statusline/../lib/conf_record.sh"
 fi
 
-config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+legacy_config="$HOME/.claude"
+config="${CLAUDE_CONFIG_DIR:-$legacy_config}"
+while [ "$config" != / ] && [ "${config%/}" != "$config" ]; do
+  config=${config%/}
+done
 account=
 { read -r account < "$config/account-label"; } 2>/dev/null
+legacy_home=
+[ "$config" != "$legacy_config" ] || legacy_home=1
 # The cache in the config home is valid only while its legacy login remains.
 home_config=/dev/null
-if [ "$config" = "$HOME/.claude" ] && [ -f "$HOME/.claude.json" ] && [ -r "$HOME/.claude.json" ]; then
+if [ "$legacy_home" = 1 ] && [ -f "$HOME/.claude.json" ] && [ -r "$HOME/.claude.json" ]; then
   home_config="$HOME/.claude.json"
 fi
-legacy_home=
-[ "$config" != "$HOME/.claude" ] || legacy_home=1
 
 staff="${STAFF_FILE:-$HOME/.local/state/staff/staff.json}"
 [ -f "$staff" ] && [ -r "$staff" ] || staff=/dev/null
