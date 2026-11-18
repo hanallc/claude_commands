@@ -449,7 +449,7 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
     if isinstance(state, land_queue.InLine):
         return f"{ordinal(state.place.number)} in {actor}'s merge line"
     if isinstance(state, land_queue.LandEnded) and not state.result["landed"]:
-        actor = state.result["production"] or actor
+        actor = state.result.get("production") or actor
         detail = state.result["detail"].strip()
         conflicts = re.findall(r"Merge conflict in (\S+)", detail)
         cause = ("merge conflict in " + ", ".join(dict.fromkeys(conflicts)) if conflicts else
@@ -461,7 +461,8 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
 def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
                on_main: Callable[[str], bool], unit_waits: Sequence[phase_waits.UnitWait] = (),
                done_ids: tuple[str, ...] = (), phase_titles: tuple[tuple[str, str], ...] = (),
-               production: str = "", merged_ids: Collection[str] = (), dropped_ids: Collection[str] = ()) -> UnitMergeNotes:
+               production: str = "", merged_ids: Collection[str] = (), dropped_ids: Collection[str] = (),
+               repository_available: bool = True) -> UnitMergeNotes:
     """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
     hidden = set(merged_ids) | set(dropped_ids)
@@ -560,6 +561,9 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
             text = unit_wait_state(holds[phase], now=now, zone=zone)
         elif isinstance(sent, SentCommit) and isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
             when = event_time({"timestamp_epoch": sent.timestamp_epoch}, now=now, zone=zone)
+            if not repository_available:
+                parts.append(WorkItem(named(phase), f"Checkpoint {sent.commit[:9]} at {when}; merge evidence unavailable"))
+                continue
             line = f"{production}'s merge line" if production else "the merge line"
             text = f"Checkpoint {sent.commit[:9]} at {when}; not in {line}"
         else:
@@ -703,7 +707,14 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
     return result
 
 
-def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
+class CheckpointRepositoryUnavailable(NamedTuple):
+    """The unit has no readable checkout or recorded merge destination."""
+
+
+DependencyState = waits_on.WaitState | CheckpointRepositoryUnavailable
+
+
+def wait_text(found: DependencyState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
     """Describe a dependency from the existing local records."""
     match found:
         case waits_on.OnMain():
@@ -725,6 +736,8 @@ def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: floa
             return "started"
         case waits_on.PhaseNotStarted():
             return "not started"
+        case CheckpointRepositoryUnavailable():
+            return "merge evidence unavailable"
         case _:
             return "dependency not found locally"
 
@@ -734,7 +747,7 @@ def phase_reference(phase: str) -> str:
     return f"phase {phase}" if phase.isdecimal() else phase
 
 
-def dependency_text(reference: str, unit: str, found: waits_on.WaitState, *, state: str,
+def dependency_text(reference: str, unit: str, found: DependencyState, *, state: str,
                     phase_ids: Sequence[str] = ()) -> str:
     """Name a local or external dependency with its recorded short state."""
     owner, slash, phase = reference.partition("/")
@@ -749,7 +762,7 @@ def dependency_text(reference: str, unit: str, found: waits_on.WaitState, *, sta
     return f"After {owner} phase {phase}; {state}"
 
 
-def dependency_state_text(reference: str, unit: str, found: waits_on.WaitState,
+def dependency_state_text(reference: str, unit: str, found: DependencyState,
                           land: land_queue.LandView, *, now: float, zone: ZoneInfo,
                           phase_ids: Sequence[str] = ()) -> str:
     """Use the shared dependency state and preserve any recorded merge hold."""
@@ -760,7 +773,7 @@ def dependency_state_text(reference: str, unit: str, found: waits_on.WaitState,
     return dependency_text(reference, unit, found, state=wait_text(found, land, now=now, zone=zone), phase_ids=phase_ids)
 
 
-def queued_text(item: unit_queue.QueuedItem, found: waits_on.WaitState | None,
+def queued_text(item: unit_queue.QueuedItem, found: DependencyState | None,
                 land: land_queue.LandView, *, now: float, zone: ZoneInfo, unit: str = "",
                 phase_ids: Sequence[str] = ()) -> WorkItem:
     """Separate the queue name from its short dependency state."""
@@ -935,7 +948,7 @@ class NoNextWork(NamedTuple):
 
 
 class NextUnavailable(NamedTuple):
-    """The queue could not establish the next item."""
+    """The next item's state is unavailable."""
 
 
 class NoPlanNext(NamedTuple):
@@ -975,7 +988,7 @@ class UnitBoardState(NamedTuple):
     @property
     def nothing_to_do(self) -> bool:
         """Readable sources show no current task, merge, hold, or next work."""
-        return (self.readable and not self.has_open and not self.tasks and not self.merge.pending
+        return (self.readable and not self.has_open and not self.tasks and not self.merge.entries
                 and not self.held and isinstance(self.next_work.first, NoNextWork))
 
     @property
@@ -1200,7 +1213,7 @@ def shell_waits(view: CensusView | census.CensusFailed, unit: live_units.LiveUni
 
 def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, open_ids: tuple[str, ...],
               read_plan: Callable[[Path], list[plan_history.PlanPhase]],
-              wait_state: Callable[[str], waits_on.WaitState], dependency_land: Callable[[str], land_queue.LandView],
+              wait_state: Callable[[str], DependencyState], dependency_land: Callable[[str], land_queue.LandView],
               now: float, zone: ZoneInfo, unit_waits: Sequence[phase_waits.UnitWait] = (), unit: str = "",
               events: Sequence[dict[str, object]] = (), facts: UnitTaskFacts) -> NextWork:
     """Name every pending task from the cached plan, run, and queue."""
@@ -1234,9 +1247,14 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
                 targets.add(target)
                 entry = WorkItem(entry.work, unit_wait_state(waits[target], now=now, zone=zone))
             if not items:
-                first = (BlockedNext(unit_wait_reason(waits[target], target), waits[target]) if target in waits
-                         else BlockedNext(entry.state_text)
-                         if item.after and not isinstance(found, waits_on.OnMain) else ReadyNext(entry.work))
+                if target in waits:
+                    first = BlockedNext(unit_wait_reason(waits[target], target), waits[target])
+                elif isinstance(found, CheckpointRepositoryUnavailable):
+                    first = NextUnavailable()
+                elif item.after and not isinstance(found, waits_on.OnMain):
+                    first = BlockedNext(entry.state_text)
+                else:
+                    first = ReadyNext(entry.work)
             items.append(entry)
     pending: list[WorkItem] = []
     done = {row.get("phase") for row in rows if row.get("status") == "done"}
@@ -1245,6 +1263,7 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
         if row.get("status") in ("done", "running", "open") or target in open_ids or target in queue_ids:
             continue
         text = "Not started"
+        unavailable_dependency = False
         detail = details.get(target)
         if detail is not None:
             dependencies = dict.fromkeys(dependency.removeprefix(unit + "/")
@@ -1255,6 +1274,7 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
                     continue
                 reference = dependency if "/" in dependency else f"{unit}/{dependency}"
                 found = wait_state(reference)
+                unavailable_dependency |= isinstance(found, CheckpointRepositoryUnavailable)
                 if not isinstance(found, waits_on.OnMain):
                     dependency_lines.append(dependency_state_text(dependency, unit, found, dependency_land(reference),
                                                                   now=now, zone=zone, phase_ids=phase_ids))
@@ -1268,7 +1288,10 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
             text = unit_wait_state(waits[target], now=now, zone=zone)
         work = work_name(target, row.get("title", ""))
         if not items and not pending:
-            first = BlockedNext(text, waits.get(target, phase_waits.NO_UNIT_WAIT)) if text != "Not started" else ReadyNext(work)
+            if unavailable_dependency and target not in waits:
+                first = NextUnavailable()
+            else:
+                first = BlockedNext(text, waits.get(target, phase_waits.NO_UNIT_WAIT)) if text != "Not started" else ReadyNext(work)
         pending.append(WorkItem(work, text))
     if isinstance(queue, UnreadableWorkQueue):
         first = NextUnavailable()
@@ -1412,10 +1435,6 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     zone = user_zone() if zone is None else zone
     view = census_view(census_read)
     evidence: dict[Path, RepositoryEvidence] = {}
-    owner_repositories: dict[staff.StaffId, Path] = {}
-    for unit in units:
-        if isinstance(unit.member, staff.StaffRow) and isinstance(unit.member.parent, staff.ReportsTo):
-            owner_repositories[unit.member.parent.id] = repository
 
     def repository_evidence(source: Path) -> RepositoryEvidence:
         if source not in evidence:
@@ -1423,17 +1442,20 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         return evidence[source]
 
     current_evidence = repository_evidence(repository)
-    land = current_evidence.land
-    phase_merges = current_evidence.phase_merges
-    merge_times = current_evidence.merge_times
-    on_main = current_evidence.on_main
+    recorded_land = current_evidence.land._replace(carried_running=frozenset(), carried_line={})
+    destinations: dict[str, land_runs.LandResult] = {}
+    for result in recorded_land.results.values():
+        previous = destinations.get(result["unit"])
+        if result.get("production") and (previous is None or result["time"] > previous["time"]):
+            destinations[result["unit"]] = result
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
     plan_failures: dict[Path, OSError | UnicodeError] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
-    wait_states: dict[tuple[Path, str], waits_on.WaitState] = {}
+    wait_states: dict[tuple[Path | CheckpointRepositoryUnavailable, str], DependencyState] = {}
     dependency_members = {row.name: row for row in staff.active(snapshot, "unit")}
-    unit_repositories: dict[staff.StaffId, Path] = {}
+    unit_repositories: dict[staff.StaffId, Path | CheckpointRepositoryUnavailable] = {}
+    destination_repositories: dict[str, Path | CheckpointRepositoryUnavailable] = {}
     try:
         evidence[worktrees.main_checkout(repository)] = current_evidence
     except worktrees.Refused:
@@ -1458,41 +1480,72 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             queues[identity] = read_work_queue(identity)
         return queues[identity]
 
-    def unit_repository(member: staff.StaffRow) -> Path:
+    def unit_repository(member: staff.StaffRow) -> Path | CheckpointRepositoryUnavailable:
         tree = member.worktree
         if isinstance(tree, staff.PresentWorktree) and local_worktree_exists(tree):
             try:
                 return worktrees.main_checkout(tree.path)
             except worktrees.Refused:
                 pass
-        owner = snapshot.parent_of(member)
-        if owner is None:
-            return repository
-        if owner.id not in owner_repositories:
+        result = destinations.get(member.name)
+        if result is None:
+            return CheckpointRepositoryUnavailable()
+        destination = result["production"]
+        if destination not in destination_repositories:
             try:
-                owner_repositories[owner.id] = read_production(owner).checkout
-            except (OSError, ValueError, Refusal):
-                owner_repositories[owner.id] = repository
-        return owner_repositories[owner.id]
+                checkout = read_production(destination, record=snapshot).checkout
+                destination_repositories[destination] = worktrees.main_checkout(checkout)
+            except (OSError, ValueError, Refusal, worktrees.Refused):
+                destination_repositories[destination] = CheckpointRepositoryUnavailable()
+        return destination_repositories[destination]
 
-    def dependency_evidence(after: str, viewer: live_units.LiveUnit) -> RepositoryEvidence:
-        unit_name, slash, phase = after.partition("/")
-        target = dependency_members.get(unit_name) if slash and phase else None
-        member = target if target is not None else viewer.member
-        if not isinstance(member, staff.StaffRow):
-            return current_evidence
+    def repository_for(member: live_units.LiveUnit) -> Path | CheckpointRepositoryUnavailable:
+        return member_repository(member.member) if isinstance(member.member, staff.StaffRow) else repository
+
+    def member_repository(member: staff.StaffRow) -> Path | CheckpointRepositoryUnavailable:
         if member.id not in unit_repositories:
             unit_repositories[member.id] = unit_repository(member)
-        return repository_evidence(unit_repositories[member.id])
+        return unit_repositories[member.id]
 
-    def wait_state(after: str, target: RepositoryEvidence) -> waits_on.WaitState:
-        key = (target.repository, after)
+    def dependency_repository(after: str, viewer: live_units.LiveUnit) -> Path | CheckpointRepositoryUnavailable:
+        unit_name, slash, phase = after.partition("/")
+        target = dependency_members.get(unit_name) if slash and phase else None
+        return member_repository(target) if target is not None else repository_for(viewer)
+
+    def wait_state(after: str, source: Path | CheckpointRepositoryUnavailable) -> DependencyState:
+        key = (source, after)
         if key not in wait_states:
-            found = waits_on.state(after, repo=target.repository, snapshot=snapshot, read_run=read_run)
-            if isinstance(found, waits_on.PhaseSent | waits_on.NotOnMain) and target.on_main(found.commit):
-                found = waits_on.OnMain(found.commit)
+            found: DependencyState
+            if isinstance(source, Path):
+                target = repository_evidence(source)
+                found = waits_on.state(after, repo=source, snapshot=snapshot, read_run=read_run)
+                if isinstance(found, waits_on.PhaseSent | waits_on.NotOnMain) and target.on_main(found.commit):
+                    found = waits_on.OnMain(found.commit)
+            else:
+                unit_name, slash, phase = after.partition("/")
+                found = source
+                if slash and phase and unit_name in dependency_members:
+                    # The run and named merge can establish facts without the unit's checkout.
+                    observed = waits_on.state(after, repo=repository, snapshot=snapshot, read_run=read_run)
+                    if isinstance(observed, waits_on.PhaseOpen | waits_on.PhaseNotStarted):
+                        found = observed
+                    elif isinstance(observed, waits_on.OnMain):
+                        merge = current_evidence.phase_merges.get((unit_name, phase))
+                        if merge is not None and merge.commit == observed.commit:
+                            found = observed
+                    elif isinstance(observed, waits_on.PhaseSent):
+                        state = land_queue.land_state(recorded_land, observed.commit)
+                        if isinstance(state, land_queue.LandEnded) and state.result["landed"]:
+                            found = waits_on.OnMain(observed.commit)
+                        elif isinstance(observed.wait, phase_waits.UnitWait) or isinstance(
+                                state, land_queue.LandEnded | land_queue.InLine | land_queue.LandRunning):
+                            found = observed
             wait_states[key] = found
         return wait_states[key]
+
+    def dependency_land(after: str, viewer: live_units.LiveUnit) -> land_queue.LandView:
+        source = dependency_repository(after, viewer)
+        return repository_evidence(source).land if isinstance(source, Path) else recorded_land
 
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
     newest = newest_unit_runs(unit_snapshot)
@@ -1506,6 +1559,11 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         record = records.get(unit.unit)
         progress_record = record
         member = unit.member
+        source = repository_for(unit)
+        unit_evidence = repository_evidence(source) if isinstance(source, Path) else current_evidence
+        repository_available = isinstance(source, Path)
+        land = unit_evidence.land if repository_available else recorded_land
+        on_main: Callable[[str], bool] = unit_evidence.on_main if repository_available else lambda _commit: False
         status = census_status(view, unit)
         busy = status == "busy"
         run_events: list[dict[str, object]] = []
@@ -1561,15 +1619,15 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         waits = [wait for wait in phase_waits.unit_waits(run_events) if wait.target not in dropped]
         done = {phase: sent for phase, sent in completed_unit_phases(run_events).items() if phase not in dropped}
         merged_phases = {phase for phase, sent in open_sent.items() if isinstance(sent, SentCommit)
-                         and (current_evidence.exact_checkpoint(unit.unit, phase, sent) or on_main(sent.commit))}
-        for (owner, phase), at in merge_times.items():
+                         and (unit_evidence.exact_checkpoint(unit.unit, phase, sent) or on_main(sent.commit))}
+        for (owner, phase), at in unit_evidence.merge_times.items():
             if owner != unit.unit or phase in open_sent:
                 continue
             sent = done.get(phase, NoSentWork())
             if not isinstance(sent, SentCommit):
                 merged_phases.add(phase)
             elif isinstance(sent.timestamp_epoch, CheckpointTimeUnrecorded):
-                subject = phase_merges.get((owner, phase))
+                subject = unit_evidence.phase_merges.get((owner, phase))
                 if subject is not None and sent.commit.lower().startswith(subject.checkpoint_commit):
                     merged_phases.add(phase)
             elif at >= sent.timestamp_epoch:
@@ -1577,7 +1635,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         for phase, sent in done.items():
             if phase in open_sent or phase in merged_phases or not isinstance(sent, SentCommit):
                 continue
-            if (current_evidence.exact_checkpoint(unit.unit, phase, sent) or on_main(sent.commit)):
+            if (unit_evidence.exact_checkpoint(unit.unit, phase, sent) or on_main(sent.commit)):
                 merged_phases.add(phase)
             else:
                 open_sent[phase] = sent
@@ -1588,12 +1646,13 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 open_sent[wait.target] = done[wait.target]
         merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main,
                            unit_waits=waits, done_ids=tuple(done), phase_titles=tuple(titles.items()),
-                           production=production_name, merged_ids=frozenset(merged_phases), dropped_ids=dropped)
+                           production=production_name, merged_ids=frozenset(merged_phases), dropped_ids=dropped,
+                           repository_available=repository_available)
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan,
-                              wait_state=lambda after: wait_state(after, dependency_evidence(after, unit)),
-                              dependency_land=lambda after: dependency_evidence(after, unit).land, now=now, zone=zone,
+                              wait_state=lambda after: wait_state(after, dependency_repository(after, unit)),
+                              dependency_land=lambda after: dependency_land(after, unit), now=now, zone=zone,
                               unit_waits=tuple(wait for wait in waits if wait.target not in merge.wait_targets),
                               unit=unit.unit, events=run_events, facts=facts)
         tasks = tuple(task for phase in phases if isinstance(open_sent[phase.phase], NoSentWork)

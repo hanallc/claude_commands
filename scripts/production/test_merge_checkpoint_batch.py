@@ -65,7 +65,7 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
         return merges
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
-        for outcome in ("shared list", "push failure", "separate lists"):
+        for outcome in ("shared list", "push failure", "separate lists", "second list fails"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -76,7 +76,7 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                 self.production_doc(change_review=review)
                 beta_review = review
                 beta_log = self.log
-                if outcome == "separate lists":
+                if outcome in ("separate lists", "second list fails"):
                     other_checkout = self.root / "other-production"
                     _ = self.git("init", "-b", "main", str(other_checkout))
                     other_doc = self.root / "other-production.md"
@@ -89,6 +89,9 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                     owner = recorded_showrunner("other", other_doc)
                     beta = unit_membership("example", "beta")
                     _ = staff.move(beta.id, staff.ReportsTo(owner.id))
+                    if outcome == "second list fails":
+                        beta_review.parent.mkdir(parents=True, exist_ok=True)
+                        _ = beta_review.write_text("# Incomplete list\n")
                 start = self.git("rev-parse", "HEAD")
                 first = self.checkpoint(subject="checkpoint(alpha): batch change\n\n"
                                         + "Change-Review: Alpha changes | Open alpha | The alpha change appears | image 012345abcdef")
@@ -130,7 +133,13 @@ raise SystemExit(1)
                     self.assertEqual([call[call.index("--unit") + 1] for call in self.events("review_regime.py")],
                                      ["alpha", "beta"])
                     self.assertIn("Alpha changes", review.read_text())
-                    self.assertIn("Beta changes", beta_review.read_text())
+                    if outcome == "second list fails":
+                        self.assertEqual(beta_review.read_text(), "# Incomplete list\n")
+                        self.assertIn(f"1 row(s) added to {review}; | C1 | Alpha changes |", result.stdout)
+                        self.assertIn(f"change review: failed — {beta_review} not written:", result.stdout)
+                        self.assertNotIn(f"{review} not written", result.stdout)
+                    else:
+                        self.assertIn("Beta changes", beta_review.read_text())
                     self.assertIn("alpha phase 2", self.log.read_text())
                     self.assertIn("beta phase 2", beta_log.read_text())
                     if outcome == "separate lists":

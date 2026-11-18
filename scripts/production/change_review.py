@@ -2344,6 +2344,15 @@ class WrittenReviewRow:
     markdown: str
 
 
+class ReviewListWriteFailed(ChangeReviewError):
+    """A list write failed after zero or more rows were saved."""
+
+    def __init__(self, list_path: Path, rows: list[WrittenReviewRow], error: Exception) -> None:
+        super().__init__(str(error))
+        self.list_path: Path = list_path
+        self.written_rows: tuple[WrittenReviewRow, ...] = tuple(rows)
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
@@ -2476,9 +2485,12 @@ def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
-            written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
-                                  on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                  merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+            try:
+                written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
+                                      on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+            except (ChangeReviewError, OSError, UnicodeError) as error:
+                raise ReviewListWriteFailed(path, rows, error) from error
             rows.extend(WrittenReviewRow(path, row) for row in written)
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")

@@ -619,13 +619,11 @@ add rows and no proposals.
 For each distinct user-visible result:
 
 1. Check the project's live log for entries it replaces.
-2. Take the rows `merge_checkpoint.py` added: its `change review: ok` line
-   names each `C<n>` row it wrote under `## To review` in the list the
-   production doc's **Change review** line names, one per `Change-Review:`
-   line in the unit's checkpoint commits. The script holds a checkpoint whose
-   commit lacks the line before it merges. On a `change review: failed` line,
-   add the rows by hand; a `change review: drift` line names an earlier merge
-   whose rows are missing, which you add the same way.
+2. Read every `change review: ok` line from `merge_checkpoint.py`.
+   Identify each `C<n>` row by the list path on its report line.
+   The script holds a checkpoint if a commit lacks a `Change-Review:` line.
+   On a `change review: failed` line, add the missing rows to the named list.
+   On a `change review: drift` line, add the missing rows for the named merge.
 3. Run `~/.claude/scripts/lib/py
    ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
    `--project hana` or `--project claude`, every owning crate (claude has none), kind, title, summary, current behavior,
