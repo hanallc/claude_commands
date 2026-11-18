@@ -941,9 +941,14 @@ class MixedRestartTests(ShutdownTestCase):
             for pane in panes:
                 kind = "codex" if int(pane[-1]) in (1, 4, 5) else "claude"
                 start(pane, [kind, "resume" if kind == "codex" else "--resume", str(rows[int(pane[-1])].current_session)])
+
+            def serial_executor(**_options: object) -> ThreadPoolExecutor:
+                return ThreadPoolExecutor(max_workers=1)
+
             with (patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as searches,
                   patch.object(herdr, "codex_conversations", wraps=herdr.codex_conversations) as scans,
                   patch.object(herdr, "_scan_herdr_processes", wraps=herdr._scan_herdr_processes) as processes,  # pyright: ignore[reportPrivateUsage]
+                  patch.object(restart, "ThreadPoolExecutor", side_effect=serial_executor),
                   patch.object(worker_panes, "start_or_resume", wraps=worker_panes.start_or_resume) as starts,
                   patch.object(pane_record, "seed", wraps=pane_record.seed) as seeds,
                   patch.object(herdr.Herdr, "order_tabs", autospec=True, side_effect=herdr.Herdr.order_tabs) as orders,

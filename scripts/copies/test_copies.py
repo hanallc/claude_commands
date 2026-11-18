@@ -25,7 +25,7 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture
-from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_protocol as wire, slot_wait
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
@@ -285,6 +285,13 @@ class StandingTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertEqual(result.stderr, "copies: calling session has no staff row or unit owner\n")
                     self.assertFalse(self.gates.exists())
+
+    def test_free_slot_does_not_resolve_the_queue_name(self) -> None:
+        command = ("bash", "-c", "bash /fixture/verify.sh check hana")
+        with mock.patch.object(slot_wait, "command_slot_name", wraps=slot_wait.command_slot_name) as resolve:
+            with copies.command_tree(self.owner_id, self.source, copies.CommittedSource(self.head), command) as tree:
+                self.assertTrue(tree.is_dir())
+        resolve.assert_not_called()
 
     def test_expired_slot_wait_stops_the_cli_before_it_starts_the_command(self) -> None:
         _ = write_config_fixture(self.base / "config/build_folders.conf",

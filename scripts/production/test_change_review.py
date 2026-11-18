@@ -219,7 +219,7 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("push", "origin", "main")
         return self.git("rev-parse", "HEAD")
 
-class ProducerWriterTests(ProducerFixture):
+class ProducerImageRequirementTests(ProducerFixture):
     def test_add_refuses_a_visible_row_without_an_image(self) -> None:
         code, output, error = run("add", "--production", "top", "--change", "No image", "--check", "Read", "--see", "Proof")
         self.assertEqual((code, output), (1, ""))
@@ -259,6 +259,7 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual((self.listing.read_bytes(), self.listing.stat().st_mtime_ns), before)
         write.assert_not_called()
 
+class NativeVerdictTests(unittest.TestCase):
     def test_native_verdict_keeps_the_exchange_locked_until_the_list_save(self) -> None:
         from scripts.review_links import change_page, review_page, test_review_page
 
@@ -413,6 +414,8 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(listing) if row['#'] == 'C1'),
                          'works')
 
+
+class ProducerWriterTests(ProducerFixture):
     def test_output_capture_adds_an_image_to_add_edit_and_batch_rows(self) -> None:
         output = self.root / "output.txt"
         _ = output.write_text("All checks passed\n", encoding="utf-8")
@@ -704,6 +707,21 @@ class ProducerWriterTests(ProducerFixture):
                 self.assertFalse(folder.exists())
                 reviewed = next(item for item in change_review.review_rows(self.listing) if item["#"] == row)
                 self.assertEqual(reviewed.get(change_review.IMAGE, ""), "")
+
+    def test_verdict_reports_failed_image_cleanup_after_the_write(self) -> None:
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        identity = image_store.register_change(shot)
+        day = date(2026, 11, 15)
+        _ = change_review.append_rows(self.listing, [Visible("Preview", "Read", "The image", image=identity)],
+            day, "", self.doc, producers=[self.unit.id], record=staff.snapshot())
+        warnings: list[str] = []
+        with mock.patch.object(image_store, "remove_change", side_effect=PermissionError("The image cannot be removed.")):
+            result = change_review.record_verdict(self.listing, "C1", "works", day, self.doc, report_warning=warnings.append)
+        self.assertIsInstance(result, change_review.VerdictRecorded)
+        self.assertEqual(change_review.review_snapshot(self.listing).reviewed[0]["Verdict"], "works")
+        warning, = warnings
+        self.assertIn("Image cleanup failed", warning)
 
     def test_open_cells_follow_staff_changes_without_rewriting_review_history(self) -> None:
         _ = change_review.append_rows(self.listing, pictured_changes([Visible("Unit", "Read", "Proof"),

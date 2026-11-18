@@ -38,7 +38,8 @@ from scripts.agents import pane_record as hook_pane_record
 
 from scripts.agents import inventory, pane_record
 from scripts.herdr import herdr, pane_launch
-from scripts.message import sessions
+from scripts.herdr.test_herdr import ClaudeForegroundSocket
+from scripts.message import session_records, sessions
 from scripts.production import unit_lookup
 from scripts.whoami import quota_alert
 from scripts.lib.atomic_file import write_text_atomic
@@ -127,9 +128,11 @@ class UnitWatchdogTests(unittest.TestCase):
         self.fixture.reading("four@example.invalid", 80)
         self.write_doc()
 
-    def session_liveness(self, identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-        return (sessions.LiveSessionProcess(self.units[identity]["pid"]) if identity in
-                {entry["sessionId"] for entry in self.fixture.live} else sessions.SessionNotLive())
+    def session_liveness(self, identity: str,
+                         ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+        registry = sessions.read_registry()
+        with patch.object(session_records, "running_session", return_value=True):
+            return session_records.session_liveness(identity, registry)
 
     def write_doc(self) -> None:
         for name in self.units:
@@ -301,8 +304,11 @@ class UnitWatchdogTests(unittest.TestCase):
         for owner in self.units.values():
             fake_unit_host.process({"HERDR_PROC": str(proc)}, owner["pid"], 1, ["claude"], {}, cwd=self.home)
 
-        def reader_liveness(identity: str) -> reader_sessions.LiveSessionProcess | reader_sessions.SessionNotLive:
+        def reader_liveness(identity: str) -> (
+                reader_sessions.LiveSessionProcess | reader_sessions.SessionNotLive | reader_sessions.SessionLivenessUnknown):
             observed = self.session_liveness(identity)
+            if isinstance(observed, sessions.SessionLivenessUnknown):
+                return reader_sessions.SessionLivenessUnknown(observed.reason)
             return (reader_sessions.LiveSessionProcess(observed.pid) if isinstance(observed, sessions.LiveSessionProcess)
                     else reader_sessions.SessionNotLive())
 
@@ -384,6 +390,8 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"alpha"})
 
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
+        from scripts.production import session_staff
+
         owner = self.add_unit("alpha")
         self.assertEqual(accounts.group_accounts().get("units"), "claude2")
         member = next(row for row in self.fixture.membership().find(kind="unit") if row.name == "alpha")
@@ -397,11 +405,14 @@ class UnitWatchdogTests(unittest.TestCase):
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
                            "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["environment"]["CLAUDE_CONFIG_DIR"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
+            proof = ClaudeForegroundSocket("shared", tab.pane_id, owner["pid"])
             with (patch.dict(os.environ, environment),
+                  patch.object(herdr, "session_socket_request", side_effect=proof.request),
                   patch.object(os, "getppid", return_value=owner["pid"]),
                   patch.object(staff, "runtime_id", return_value=owner["session_id"]),
                   patch.object(sys, "stdin", io.StringIO(payload)),
-                  patch.object(hook_pane_record, "claude_arguments", return_value=stop_resume.resume_arguments(entry))):
+                  patch.object(hook_pane_record, "process_arguments",
+                               return_value=["claude", *stop_resume.resume_arguments(entry)])):
                 with self.assertRaises(SystemExit) as exited:
                     _ = runpy.run_path(str(stop_resume.SCRIPTS / "hooks/session-start-pane-record.py"), run_name="__main__")
                 self.assertEqual(exited.exception.code, 0)
@@ -412,7 +423,10 @@ class UnitWatchdogTests(unittest.TestCase):
         with self.stop_process_leaves():
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
+            panes = self.marked().units.get("fixture", {})
+            evidence = session_staff.SessionLabelObservations(tuple(panes.values()))
             with (patch.object(stop_resume, "_start_session", side_effect=start),
+                  patch.object(unit_lookup, "observed_session_labels", return_value=evidence),
                   patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(stop_resume, "_detach"),
@@ -594,6 +608,23 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(len(launches), 1)
         self.assertEqual(launches[0][launches[0].index("--to") + 1], "claude4")
 
+    def test_unreadable_registry_prevents_queued_recovery(self) -> None:
+        source = self.queued_unit()
+        directory = sessions.sessions_dir()
+        iterdir = Path.iterdir
+
+        def denied(path: Path) -> Generator[Path]:
+            if path == directory:
+                raise PermissionError(path)
+            yield from iterdir(path)
+
+        with (patch.object(Path, "iterdir", new=denied),
+              patch.object(stop_resume, "resume", wraps=self.resume) as resume):
+            failure, launches = self.recover_queued(source)
+        self.assertEqual(failure, f"session registry unreadable: {directory}")
+        self.assertEqual(launches, [])
+        resume.assert_not_called()
+
     def test_queued_recovery_uses_its_launch_even_when_the_units_group_is_unavailable(self) -> None:
         source = self.queued_unit()
         with patch.object(accounts, "account_for_group_launch", side_effect=accounts.AccountsError("units unavailable")):
@@ -770,6 +801,22 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = result.write_text('"fixture evidence"')
         self.revive("unit", "claude4")
         return state, result
+
+    def test_unreadable_pane_list_preserves_the_outage_and_result(self) -> None:
+        from scripts.production import session_staff
+
+        state, result = self.finished_recovery()
+        self.die("unit")
+        every = unit_lookup.LabeledProductions({}, self.marked().members, unreadable_pane_lists=(
+            session_staff.UnreadablePaneList("agents", "pane list denied"),))
+        with patch.object(unit_lookup, "every_labeled_session", return_value=every):
+            dry_lines = self.pass_at(3, dry_run=True)
+            lines = self.pass_at(3)
+        self.assertTrue(any("pane list denied" in line for line in lines), lines)
+        self.assertFalse(any("would restart" in line for line in dry_lines), dry_lines)
+        self.assertEqual(result.read_text(), '"fixture evidence"')
+        self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(self.pending), 1)
 
     def test_finished_recovery_keeps_evidence_when_the_second_fresh_read_is_unreadable(self) -> None:
         state, result = self.finished_recovery()

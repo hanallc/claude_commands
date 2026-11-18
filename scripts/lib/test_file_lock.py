@@ -56,6 +56,14 @@ class FileLockTests(unittest.TestCase):
             with file_lock.exclusive(path, wait=False) as result:
                 self.assertIs(result, file_lock.LockResult.ACQUIRED)
 
+    def test_exclusive_acquires_a_write_only_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "controller.lock"
+            path.touch()
+            path.chmod(0o200)
+            with file_lock.exclusive(path) as result:
+                self.assertIs(result, file_lock.LockResult.ACQUIRED)
+
     def test_an_exception_releases_the_lock_for_the_next_operation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "operation.lock"

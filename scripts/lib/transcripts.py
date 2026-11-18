@@ -63,14 +63,18 @@ def distinct_files(paths: Iterable[Path]) -> list[Path]:
     return sorted({path.resolve() for path in paths})
 
 
+def transcript_source(path: Path) -> Path:
+    if path.suffix != ".zst" and not path.exists():
+        compressed = path.with_suffix(path.suffix + ".zst")
+        if compressed.exists():
+            return compressed
+    return path
+
+
 @contextmanager
 def open_transcript(path: Path) -> Generator[BinaryIO]:
     """Keep decompression outside memory and permit existing readers to seek."""
-    source = path
-    if source.suffix != ".zst" and not source.exists():
-        compressed = source.with_suffix(source.suffix + ".zst")
-        if compressed.exists():
-            source = compressed
+    source = transcript_source(path)
     if source.suffix != ".zst":
         with source.open("rb") as stream:
             yield stream
