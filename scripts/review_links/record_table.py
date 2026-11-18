@@ -385,7 +385,7 @@ function readPlace(params,followingItemLink=false){
  return saved?.top;
 }
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
- if(unappliedOnly && (location.hash===placeHash || history.state?.recordTable)) return false;
+ if(unappliedOnly && location.hash===placeHash) return false;
  const params=placeParams();
  const jumpKey=params.get('jump'),key=jumpKey || params.get('item');
  if(!key) return false;
@@ -611,7 +611,7 @@ function writePlace(push=false,top){
 }
 function restorePlace(event){
  // A changed fragment sends hashchange after popstate.
- if(event.type==='popstate' && location.hash!==placeHash) return;
+ if(event?.type==='popstate' && location.hash!==placeHash) return;
  const top=place();
  apply(false,{top});
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});

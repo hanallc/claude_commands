@@ -793,6 +793,9 @@ class ReviewPageTests(unittest.TestCase):
         self.assertRegex(revision, r'^[0-9a-f]{16}$')
         self.assertIn(f'name="revision" value="{revision}"', card)
         self.assertIn('How to check', done, 'A Done key loads its body directly.')
+        for hidden in ('<h3>Proof</h3>', 'data-later-toggle'):
+            with self.subTest(hidden=hidden):
+                self.assertNotIn(hidden, done)
         with self.assertRaises(LookupError):
             _ = snapshot.body('missing/key')
 
@@ -1152,12 +1155,13 @@ class ReviewPageTests(unittest.TestCase):
   check(document.querySelector('[data-review]').dataset.show==='Done' &&
    form('page-owner/C4').querySelector('[data-send-status]').textContent.includes('This item is already Done.'),
    'F015: HTTP 409 refreshes the index and reveals the Done card with the reason.');
+  await open('page-owner/C6');
   conflict='/remove-conflict';
-  const removed=form('page-owner/C4');
+  const removed=form('page-owner/C6');
   removed.elements.later.value='2030-12-02T18:30';
   const removalVersion=document.querySelector('[data-review]').dataset.version;
   removed.requestSubmit(removed.querySelector('button[value=later]'));
-  await until(()=>!row('page-owner/C4') && document.querySelector('[data-review]').dataset.version!==removalVersion,
+  await until(()=>!row('page-owner/C6') && document.querySelector('[data-review]').dataset.version!==removalVersion,
    'the refreshed view without the removed row');
   const notice=document.querySelector('[data-review-notice]');
   check(notice && !notice.hidden && notice.textContent.includes('This item is no longer on the list.'),
@@ -1180,7 +1184,7 @@ class ReviewPageTests(unittest.TestCase):
                 for item in newer.records.values()]):
             accepted = review_page.build_snapshot(self.root)
         with patch.object(review_items, 'read', return_value=[
-                item for item in accepted.records.values() if item.key != 'page-owner/C4']):
+                item for item in accepted.records.values() if item.key != 'page-owner/C6']):
             deleted = review_page.build_snapshot(self.root)
         counts = {'version':0,'index':0}
         spy = """<script>window.coldErrors=[];
@@ -1270,7 +1274,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 server.shutdown()
                 thread.join(5)
         self.assertEqual(results,[[]])
-        self.assertEqual(set(requested_bodies),{'page-owner/C399',key,'page-owner/C2','page-owner/C4'},
+        self.assertEqual(set(requested_bodies),{'page-owner/C399',key,'page-owner/C2','page-owner/C4','page-owner/C6'},
                          'Only opened keys request a body.')
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -3226,6 +3230,124 @@ window.fetch=async(url)=>{
             for number in range(4, 9)
         ]), datetime.now(user_zone()).date(), '', fixture.production, record=staff.snapshot())
         self.assertEqual(save_notice_failures(browser_markup(self.root).encode(), 'works'), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_reload_keeps_a_saved_verdict_and_the_selected_show(self) -> None:
+        setup = r"""<script>
+const sendProbe=fetch;
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method==='POST') return Promise.resolve(Response.json({answer:'works'}));
+ return sendProbe(url,options);
+};
+if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item=page-owner%2FC1');
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],key='page-owner/C1',check=(condition,message)=>{if(!condition) failures.push(message);};
+ const content=document.querySelector('[data-review]');
+ const row=()=>content.querySelector('[data-key="'+key+'"]');
+ const fetchCard=fetch;
+ window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
+  ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
+  : fetchCard(url,options);
+ try{
+  if(!sessionStorage.getItem('review-reload')){
+   if(CASE==='verdict'){
+    const form=await readyReviewCard(row());
+    const saved=new Promise(resolve=>{
+     const observer=new MutationObserver(()=>{
+      if(!form.dataset.sending){observer.disconnect();resolve();}
+     });
+     observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+    });
+    form.requestSubmit(form.querySelector('[value="works"]'));
+    await saved;
+    history.replaceState(null,'','#item=page-owner%2FC1');
+   }else content.querySelector('[data-show-chip="open"]').click();
+   sessionStorage.setItem('review-reload','1');
+   location.reload();return;
+  }
+  if(CASE==='verdict'){
+   const deadline=performance.now()+8000;
+   while(row() && !row().dataset.bodyLoaded && performance.now()<deadline)
+    await new Promise(resolve=>requestAnimationFrame(resolve));
+   check(row()?.dataset.state==='Done' && row()?.querySelector('[data-review-body]') &&
+      !row()?.querySelector('[value="works"]'),'A reload during publication retry hides the old verdict action.');
+  }else{
+   check(content.dataset.show==='open' && !row(),'A reload restores Open when the address names a Done Change.');
+  }
+ }catch(error){failures.push(String(error));}
+ await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for case in ('verdict', 'show'):
+            with self.subTest(case=case):
+                if case == 'show':
+                    _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
+                                                     datetime.now(user_zone()).date(), self.fixture.production)
+                page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
+                page = page.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>', 1)
+                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_back_during_a_save_keeps_the_link_for_a_change_and_question(self) -> None:
+        _ = self.question()
+        setup = r"""<script>
+const sendProbe=fetch;
+let finishSave;
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method!=='POST') return sendProbe(url,options);
+ return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',state:'Done'}));});
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const content=document.querySelector('[data-review]');
+ const row=key=>content.querySelector('[data-key="'+key+'"]');
+ const fetchCard=fetch;
+ window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
+  ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
+  : fetchCard(url,options);
+ const afterHash=()=>new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ const follow=async key=>{
+  const changed=afterHash();
+  location.hash=new URLSearchParams({item:key});
+  await changed;
+ };
+ try{
+  const question=content.querySelector('[data-type="question"][data-list-item]').dataset.key;
+  for(const [key,action] of [['page-owner/C1','works'],[question,'answer']]){
+   await follow(key);
+   const form=await readyReviewCard(row(key));
+   form.elements.feedback.value='The saved words.';
+   const previous={href:location.href,state:history.state};
+   const saved=new Promise(resolve=>{
+    const observer=new MutationObserver(()=>{
+     if(!form.dataset.sending){observer.disconnect();resolve();}
+    });
+    observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+   });
+   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+   await follow('page-owner/C2');
+   const oldURL=location.href;
+   history.replaceState(previous.state,'',previous.href);
+   dispatchEvent(new PopStateEvent('popstate',{state:previous.state}));
+   dispatchEvent(new HashChangeEvent('hashchange',{oldURL,newURL:previous.href}));
+   finishSave();await saved;
+   const target=row(key),item=new URLSearchParams(location.hash.slice(1)).get('item');
+   if(item!==key || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
+    failures.push('Back keeps the link and opens the Done card for '+key+'.');
+  }
+ }catch(error){failures.push(String(error));}
+ await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
+        page = page.replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
