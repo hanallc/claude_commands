@@ -2905,6 +2905,11 @@ Live case at 15:41 EST: the running `nextest` row in `/build/slot/hana-slot2` sh
 
 Work: find where the row name comes from, and why a showrunner session id gives no name. Fix it at that source, so every caller kind gets a name. A test replays this chain with a private staff record and a private socket.
 
+**Add-on from builds, 2026-11-18 18:0x: a reload leaves a journal line.** The admission service reloads in place on a source change (execv, same PID). systemd logs no line for it, so the live check after a merge could not see the reload.
+1. Before execv, the service prints one line that names the changed source file.
+2. After the new code sends READY, it prints one line that names the source hash.
+3. Add no new config key. A test checks both lines with a private socket.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
