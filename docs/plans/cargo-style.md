@@ -80,7 +80,7 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 **Repo:** cargo-liner. **Depends on:** the main-red fix in `~/.claude`.
 
-1. Copy `rust/style_reader` to `crates/cargo-style`. Package and binary `cargo-style`; `publish = false`; `[lints] workspace = true`.
+1. M1 copied the reader from `~/.claude` to `crates/cargo-style` in cargo-liner. The package and binary are `cargo-style`. The manifest sets `publish = false` and inherits workspace lints.
 2. Use the workspace pins. Changes: `sha2` 0.10.9 to the workspace 0.11.0 (digest API change), `rayon` 1.11.0 to 1.12.0, `libc` to the workspace pin. `gix =0.89.0` is the same.
 3. `cargo style` works: cargo passes `style` as the first argument; the binary accepts both forms.
 4. `cargo-style --version` prints the crate version and the request protocol version (an integer). The Python client checks both (M2).
