@@ -521,11 +521,11 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Pid','Target','vCPU','Slot','Tokens']);
             assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
             assert.equal(proof.queuedSlots,0);
             assert.equal(proof.answer,'Free for the next step');
-            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
+            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Pid','Target','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
@@ -821,7 +821,7 @@ try {
                 slots:tipText(proofTip('wait',latest.waiters.findIndex(row=>row.kind==='cloud')),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Pid','Target','vCPU','Slot','Tokens']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -1202,8 +1202,9 @@ try {
               return rows.map(({row,index})=>{
                 const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
                 const table=document.querySelector('.walk-table tr[data-tip="'+proofTip('row',index)+'"]');
-                return {name:row.name,stage:table.querySelector('.place').textContent,
-                  unit:table.querySelector('.unit').textContent,percent:table.querySelector('.done').textContent,
+                return {name:chart.querySelector('.name').textContent,stage:table.querySelector('.place').textContent,
+                  unit:tooltipRows(proofTip('row',index),latest)[0].labelStaffName ?? null,
+                  percent:table.querySelector('.done').textContent,
                   underBar:!!chart.querySelector('.progress-amount'),
                   used:chart.querySelector('.seg-remote').getBoundingClientRect().width,
                   color:getComputedStyle(chart.querySelector('.seg-remote')).backgroundColor,
@@ -1216,7 +1217,7 @@ try {
             assert.equal(macProof.length,3);
             assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
-            assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
+            assert.deepEqual(macProof.map(row=>row.unit),[null,'trunk',null]);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
               repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
@@ -1242,7 +1243,7 @@ try {
 
             const positions=()=>evaluate(`(() => {
               const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
-              return ['.duration','.unit','.pid'].map(selector=>{
+              return ['.duration','.pid','.machine'].map(selector=>{
                 const r=row.querySelector(selector).getBoundingClientRect(); return {left:r.left,width:r.width};
               });
             })()`);
@@ -1264,10 +1265,15 @@ try {
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
             await show(absent);
-            const absentCells=await evaluate(`({unit:document.querySelector('.walk-table td.unit').textContent,
-              owner:document.querySelector('.wrow[data-run] .owner').textContent,
-              machine:document.querySelector('.walk-table td.machine').textContent})`);
-            assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
+            const absentCells=await evaluate(`(() => {
+              const index=latest.walk.findIndex(row=>row.queued);
+              const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
+              const table=document.querySelector('.walk-table tr[data-tip="'+proofTip('row',index)+'"]');
+              return {name:chart.querySelector('.name').textContent,
+                colored:!!chart.querySelector('.name > .staff-name'),owner:chart.querySelector('.owner').textContent,
+                machine:table.querySelector('.machine').textContent};
+            })()`);
+            assert.deepEqual(absentCells,{name:absentRun.name,colored:false,owner:'',machine:'—'});
 
             for (const [name, expected] of [['pressure','memory'],['spacing','its turn'],['head','its turn']]) {
               await show(readings[name]);
@@ -1494,12 +1500,14 @@ try {
               const table=document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"]');
               return {name:chart.querySelector('.name').textContent,
                 small:chart.querySelector('.owner').textContent,
-                unit:table.querySelector('.unit').textContent,
+                unit:chart.querySelector('.name > .staff-name')?.textContent ?? null,
+                unitColor:chart.querySelector('.name > .staff-name')?.dataset.colorText ?? null,
                 machine:table.querySelector('.machine').textContent};
             })()`);
             assert.equal(row.machine,'aws');
             assert.equal(row.name,version==='before'?'nextest':'research nextest');
-            assert.equal(row.unit,version==='before'?'owner not recorded':'research');
+            assert.equal(row.unit,version==='before'?null:'research');
+            assert.equal(row.unitColor,version==='before'?null:'role.unit-director');
             if(version==='after') assert.equal(row.small,'hana');
             await capture(version+'-aws-row','#walk');
             await evaluate(`showTip(proofTip('row', 0),180,160)`);
@@ -1533,20 +1541,22 @@ try {
               const spacings=[...document.querySelectorAll('.walk-table thead th,.walk-table tr.queue-head th')]
                 .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling)
                 .map(cell=>parseFloat(getComputedStyle(cell).paddingRight));
-              const table=document.querySelector('tr[data-tip="'+proofTip('row',index)+'"]');
+              const queued=document.querySelector('.wrow.wait[data-tip="' + proofTip('wait', 0) + '"]');
               return {index,name:chart.querySelector('.name').textContent,small:chart.querySelector('.owner').textContent,
-                unit:table.querySelector('.unit').textContent,
-                waitingUnit:document.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
+                queuedName:queued.querySelector('.name').textContent,
+                unitColored:!!chart.querySelector('.name > .staff-name'),
+                queuedUnitColored:!!queued.querySelector('.name > .staff-name'),
                 headers,waiting,spacings,scroll:document.documentElement.scrollWidth,client:innerWidth,
                 tip:tooltipHtml(proofTip('row',index),latest)};
             })()`);
             if(version==='after') {
               assert.equal(state.name,'CI nextest');
-              assert.equal(state.unit,'CI');
-              assert.equal(state.waitingUnit,'CI');
+              assert.equal(state.queuedName,'CI nextest');
+              assert.equal(state.unitColored,false);
+              assert.equal(state.queuedUnitColored,false);
               assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
-              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
-              assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Pid','Target','vCPU','Slot','Tokens']);
+              assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Pid','Target','vCPU']);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
               assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
               assert.ok(state.scroll<=state.client, 'The owner table overflows.');
@@ -1587,12 +1597,20 @@ try {
           for(const width of [600,800,1200,1600]) {
             await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
             await show(readings.step_unknown);
-            const unitCells=await evaluate(`(() => {
-              const cells=[...document.querySelectorAll('.walk-table .unit .cell-text')].filter(cell=>cell.textContent==='owner not recorded');
-              return cells.map(cell=>({text:cell.textContent,scroll:cell.scrollWidth,width:cell.clientWidth}));
+            const unknownNames=await evaluate(`(() => {
+              const rows=[...document.querySelectorAll('.wrow[data-run],.wrow.wait')];
+              return rows.filter(row=>stepRow(row.dataset.tip,latest).unit==='owner not recorded').map(row=>{
+                const name=row.querySelector('.name');
+                return {text:name.textContent,expected:stepRow(row.dataset.tip,latest).name,
+                  colored:!!name.querySelector('.staff-name'),scroll:name.scrollWidth,width:name.clientWidth};
+              });
             })()`);
-            assert.ok(unitCells.length>0);
-            for(const cell of unitCells) assert.ok(cell.scroll<=cell.width, 'The Unit cell cuts its text. '+JSON.stringify({width,cell}));
+            assert.ok(unknownNames.length>0);
+            for(const name of unknownNames) {
+              assert.equal(name.text,name.expected);
+              assert.equal(name.colored,false);
+              assert.ok(name.scroll<=name.width, 'The step label cuts its text. '+JSON.stringify({width,name}));
+            }
           }
           await call('Emulation.setDeviceMetricsOverride',{width:600,height:1200,deviceScaleFactor:1,mobile:false});
           await show(readings.step_ci);
@@ -1609,10 +1627,10 @@ try {
             const displayed=await evaluate(`({pid:latest.walk[0].pid,
               name:document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .name').textContent,
               small:document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .owner').textContent,
-              unit:document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"] .unit').textContent,
+              unitColored:!!document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .name > .staff-name'),
               tooltip:tooltipHtml(proofTip('row', 0),latest)})`);
             assert.match(displayed.name,/^CI /);assert.match(displayed.small,/hana CI/);
-            assert.equal(displayed.unit,'CI');assert.match(displayed.tooltip,/hana CI/);
+            assert.equal(displayed.unitColored,false);assert.match(displayed.tooltip,/hana CI/);
             await writeFile(join(folder,'live-mac-ci-page.json'),JSON.stringify(displayed,null,2));
             await capture('live-mac-ci','#walk');
             await evaluate(`showTip(proofTip('row', 0),700,420)`);
@@ -2011,8 +2029,8 @@ try {
                   localColor:getComputedStyle(document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .seg-used')).backgroundColor,
                   machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
                   ciVisible:!!table.querySelector('tr[data-tip="' + proofTip('row', 3) + '"]'),
-                  waiting:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .unit').textContent,
-                  waitingOwner:table.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .owner').textContent,
+                  waiting:document.querySelector('.wrow.wait[data-tip="' + proofTip('wait', 0) + '"] .name').textContent,
+                  waitingOwner:document.querySelector('.wrow.wait[data-tip="' + proofTip('wait', 0) + '"] .owner').textContent,
                   pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
               })()`);
               if(version==='after') {
@@ -2026,7 +2044,7 @@ try {
                 assert.deepEqual(comparison.machineColors,['natedev','mac','aws'].map(machine=>rgb(review.colors[theme].machines[machine])));
                 assert.equal(new Set(comparison.machineColors).size,3);
                 assert.equal(comparison.ciVisible,false);
-                assert.equal(comparison.waiting,'CI');
+                assert.equal(comparison.waiting,'CI doctests');
                 assert.equal(comparison.waitingOwner,'hana CI');
                 assert.equal(comparison.pageOverflow,false);
               } else {

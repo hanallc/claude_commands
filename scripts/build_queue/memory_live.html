@@ -308,8 +308,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 /* A waiting step's targets wrap inside the Target column, so a queued row never moves the table columns. */
 .walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
-.walk-table .unit .cell-text { max-width: none; }
-.walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
+.walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); right: 0; width: auto; }
+.walk.beside .walk-table table { width: 100%; }
 .walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
 .walk.beside .walk-table tr.wait-first > * { border-top: 0; border-bottom: 0; }
@@ -323,11 +323,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-scroll { overflow-x: auto; }
 /* The table is measured at its own width, not cut to the walk. */
 .walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
-.walk.measuring .walk-table .unit .cell-text { max-width: none; }
 .walk.measuring .step { display: none; }
-.walk.measuring .walk-table .cell-text { max-width: 8rem; }
-/* A narrow pane cuts long unit names and narrows the column gaps, so the chart keeps its room beside the table. */
-.walk.tight .walk-table .unit .cell-text { max-width: 6rem; }
+/* Use smaller column gaps to keep room for the chart in a narrow pane. */
 .walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 8px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
@@ -801,10 +798,13 @@ function ownerFields(row) {
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
   return fields.filter(row => row.value);
 }
+function stepDisplayName(row) {
+  return row.kind === "repository-slot" && row.detail ? `${row.name} · ${row.detail}` : row.name;
+}
 function rowTitle(row) {
   if (ciRow(row)) return row.ci_label || `hana CI · ${row.detail || row.name}`;
   const unit = ownerText(row.unit);
-  const name = publicText(row.name || '');
+  const name = publicText(stepDisplayName(row) || '');
   return unit && !name.startsWith(unit+' ') && !name.startsWith(unit+' · ') ? `${unit} · ${name}`
     : unit && name.startsWith(unit+' ') ? `${unit} · ${name.slice(unit.length+1)}` : name;
 }
@@ -840,7 +840,8 @@ function stepTooltip(key, data) {
     return [stepTitle(row, 'unavailable')];
   const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
   // A gate job says what it does and what it changes (#109).
-  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts}, field('Changes', row.changes));
+  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
+  if (row.changes) rows.push(field('Changes', row.changes));
   if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
@@ -998,9 +999,6 @@ function publicParts(parts) {
   }
   return shown;
 }
-function rowUnit(row) {
-  return ciRow(row) ? "CI" : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
-}
 function rowOwner(row, waiting = false) {
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
   if (macRow(row)) return publicText(row.showrunner || "");
@@ -1010,9 +1008,18 @@ function rowOwner(row, waiting = false) {
   const owner = publicText(row.showrunner || "");
   return owner;
 }
-function rowLabel(name, owner = "") {
-  return `<span class="row-label"><span class="row-heading"><span class="name">${esc(name)}</span></span>` +
+function rowLabel(name, owner = "", leadingUnit = "") {
+  const label = leadingUnit ? roleName(leadingUnit) + esc(name.slice(leadingUnit.length)) : esc(name);
+  return `<span class="row-label"><span class="row-heading"><span class="name">${label}</span></span>` +
     `<span class="owner">${roleName(owner)}</span></span>`;
+}
+function stepLabel(row, waiting = false) {
+  const unit = ciRow(row) ? "" : ownerText(row.unit);
+  const first = row.name_parts?.[0];
+  const startsWithUnit = first
+    ? first.kind === "staff" && first.text === unit && partsText(row.name_parts) === row.name
+    : row.name === unit || row.name.startsWith(unit + " ");
+  return rowLabel(stepDisplayName(row), rowOwner(row, waiting), startsWithUnit ? unit : "");
 }
 function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
@@ -1454,11 +1461,11 @@ function renderWalk(d) {
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    `<th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
+  const cells = (place, name, duration, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${roleName(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1469,18 +1476,18 @@ function renderWalk(d) {
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
-    cells("", "Build tools", "", "", null, "", null, "tools", "tools");
+    cells("", "Build tools", "", null, "", null, "tools", "tools");
     rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
-    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
+    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${stepLabel(r)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
+  const columnClasses = ["place", "done", "step", "duration", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
   if (d.waiters.length) {
@@ -1496,8 +1503,8 @@ function renderWalk(d) {
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${rowLabel(w.name, rowOwner(w, true))}` +
+    cells(place, stepDisplayName(w), ago(w.since, d.read_at), w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${stepLabel(w, true)}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${w.key}`) : rowMemory(`wait:${w.key}`)) +
       `</div>`);
   });

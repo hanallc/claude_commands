@@ -533,47 +533,6 @@ class MacQueueViewTests(unittest.TestCase):
             self.assertNotIn("private raw error", path.read_text())
 
 
-class CloudQueueViewTests(unittest.TestCase):
-    def test_page_step_names_use_roles_and_configured_owner_templates(self) -> None:
-        model = self.cloud_model()[0]
-        reading = model.reading
-        assert isinstance(reading, wire.CloudQueueRead)
-        row = reading.cloud[0]
-        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
-        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
-        for step, owner, expected in (
-            ("targeted-test", director, "panes targeted"),
-            ("merge-gate", director, "panes merge"),
-            ("merge-gate", runner, "showrunner merge"),
-            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
-            ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
-            ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
-            ("build", director, "panes build"),
-            ("literal{step}", director, "panes literal{step}"),
-        ):
-            with self.subTest(step=step, owner=owner):
-                current = replace(row, identity=replace(row.identity, step=step))
-                labeled = replace(model, labels={row.identity.session_id: owner})
-                self.assertEqual(queue_view.cloud_step_name(current, labeled), expected)
-        current = replace(row, identity=replace(row.identity, step="targeted-test"))
-        settings = dict(model.names.settings)
-        settings["owned.targeted-test"] = "targeted for {unit}"
-        configured = replace(model, names=type(model.names)(settings), labels={row.identity.session_id: director})
-        self.assertEqual(queue_view.cloud_step_name(current, configured), "targeted for panes")
-        self.assertEqual(configured.names.shown("targeted-test"), "targeted test")
-        self.assertEqual(configured.names.prose("merge-gate"), "merge gate")
-
-    def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
-        fixture = self.enterContext(QueueFixture(captured=False))
-        empty_mac_reading(fixture)
-        write_memory_config(fixture.root / "build_admission.conf",
-            cloud_gate_slots="1", cloud_gate_stale_pushes="3")
-        _ = (fixture.root / "cloud_gate.conf").write_text(
-            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
-        model = fixture.model()
-        return replace(model, reading=cloud_reading(model.reading)), fixture
-
-
 class QueueViewFixtureTests(unittest.TestCase):
     fixture: QueueFixture = cast(QueueFixture, cast(object, None))
     @override

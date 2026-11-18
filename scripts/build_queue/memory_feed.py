@@ -428,6 +428,11 @@ class TargetNotes(TypedDict):
     because_parts: NotRequired[list[staff_names.NamePart]]
 
 
+def unit_name(unit: str) -> str:
+    """Return an empty name when the unit is absent."""
+    return "" if unit in ("", "—", unit_labels.OWNER_NOT_RECORDED) else unit
+
+
 def target_notes(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
                  package: str | admission_records.PackageNotRecorded) -> TargetNotes:
     """State the route reason once and name any Mac hold."""
@@ -445,7 +450,7 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
         mac = routes.mac
         if isinstance(mac, targets.TargetSnapshot) and isinstance(state := mac.states[0], targets.Held):
             identity = target_availability.holder_labels(state, routes.labels)
-            owner = identity.unit if identity.unit != "—" else identity.session
+            owner = unit_name(identity.unit) or identity.session
             parts = staff_names.text_parts("build hold by ", staff_names.StaffReference(owner))
             if identity.showrunner != "—":
                 parts.extend(staff_names.text_parts(" (", staff_names.StaffReference(identity.showrunner), ")"))
@@ -583,16 +588,18 @@ def job_step(job: StepJobReading, step: str) -> str:
 
 
 def job_notes(job: StepJobReading, unit: str, names: StepNames) -> RowQueueNotes:
-    """The description and changes rows of a gate job; empty for any other step."""
+    """Give each gate job its change notes and any available caption."""
     if not isinstance(job, StepJob):
         return {}
+    unit = unit_name(unit)
     about = names.about(job, unit)
+    changes = names.changes(job)
     if not about:
-        return {}
-    owner = job.unit or (unit if unit != "—" else "")
+        return {"changes": changes}
+    owner = job.unit or unit
     parts = staff_names.template_parts(names.settings.get(f"about.{job.step}", ""),
         {"unit": staff_names.StaffReference(owner), "branch": job.branch, "modules": job.modules})
-    return {"about": about, "about_parts": parts, "changes": names.changes(job)}
+    return {"about": about, "about_parts": parts, "changes": changes}
 
 
 def current_step_parts(step: admission_records.RunningStep | admission_records.WaitingStep,
@@ -601,7 +608,8 @@ def current_step_parts(step: admission_records.RunningStep | admission_records.W
     """Keep the recorded owner separate from the step text."""
     owner = step_owner_name(step, labels)
     shown_owner, shown_step = " ".join(owner.split()), " ".join(names.shown(step.step).split())
-    return staff_names.text_parts(staff_names.StaffReference(shown_owner) if owner == identity.unit else shown_owner,
+    unit = unit_name(identity.unit)
+    return staff_names.text_parts(staff_names.StaffReference(shown_owner) if unit and owner == unit else shown_owner,
                                  " " if shown_owner and shown_step else "", shown_step)
 
 
@@ -610,7 +618,7 @@ def step_name_parts(step: admission_records.RunningStep | admission_records.Wait
                     ci: bool = False) -> list[staff_names.NamePart]:
     """Mark the owner field before the feed creates its step label."""
     current = current_step_parts(step, names, identity, labels)
-    return staff_names.owned_step_parts(names, step.step, identity.unit if identity.unit != "—" else "",
+    return staff_names.owned_step_parts(names, step.step, unit_name(identity.unit),
                                         identity.role, ci=ci, current=current)
 
 
@@ -1122,11 +1130,13 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     gate = queue_view.gate_label_text(build)
     # A placed run is the normal case, so its name leaves out the placement id; the other labels mark an exception.
     shown_gate = "" if build.gate_label == queue_view.MacGateLabel.PLACEMENT else gate
-    name = queue_view.mac_step_name(build, names=names, identity=identity)
+    unit = unit_name(identity.unit)
+    name_identity = replace(identity, unit=unit) if unit != identity.unit else identity
+    name = queue_view.mac_step_name(build, names=names, identity=name_identity)
     # Use the existing command reader to select the template's step key.
     step = queue_view.mac_step_name(build, names=StepNames({"owned.default": "{step}",
-        "owned.showrunner-default": "{step}", "owned.ci-default": "{step}"}), identity=identity)
-    parts = staff_names.owned_step_parts(names, step, identity.unit if identity.unit != "—" else "", identity.role,
+        "owned.showrunner-default": "{step}", "owned.ci-default": "{step}"}), identity=name_identity)
+    parts = staff_names.owned_step_parts(names, step, unit, identity.role,
         ci=build.origin is queue_view.MacBuildOrigin.CI, current=staff_names.text_parts(name))
     parts.extend(staff_names.text_parts(" · " + shown_gate if shown_gate else ""))
     return {"kind": "mac-build",
@@ -2059,20 +2069,27 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         step = by_owner.get(hold.memory.owner)
         metadata = step if step is not None else run_steps.get(hold.memory.owner)
         identity = feed_step_labels(metadata, labels, ci_runners) if metadata is not None else unit_labels.UnitLabels("")
-        unit = identity.unit
+        unit = unit_name(identity.unit)
         ci_label = metadata.session_name if metadata is not None and metadata.unit in ci_runners else ""
         job: StepJobReading = step_job(step.step, step.pid) if step is not None and not ci_label else NotGateStep()
         shown = replace(step, step=job_step(job, step.step)) if step is not None else step
-        name = names.for_owner(shown.step, unit if unit != "—" else "", identity.role,
-            ci=bool(ci_label), current_name=step_text(shown, names, labels=labels)) if shown is not None else identity.session or hold.memory.owner
-        detail = unit if step is not None else SWAP_NAMES["between"]
+        if shown is not None:
+            name = names.for_owner(shown.step, unit, identity.role,
+                ci=bool(ci_label), current_name=step_text(shown, names, labels=labels))
+            name_parts = step_name_parts(shown, names, identity, labels, ci=bool(ci_label))
+        else:
+            owner = staff_names.StaffReference(identity.session) if identity.session else hold.memory.owner
+            if unit and not ci_label and unit != identity.session:
+                name_parts = staff_names.text_parts(staff_names.StaffReference(unit), " ", owner)
+            else:
+                name_parts = staff_names.text_parts(owner)
+            name = staff_names.parts_text(name_parts)
+        detail = identity.unit if step is not None else SWAP_NAMES["between"]
         use = gib(hold.memory.use.bytes) if isinstance(hold.memory.use, admission_records.AnonymousRunUse) else hold.memory.use
         run = hold.memory.run
         pid = (metadata.run.pid if isinstance(metadata.run, LiveBuildRun) else metadata.pid) if metadata is not None else (
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
-        walk.append({"name": name, "name_parts": step_name_parts(shown, names, identity, labels, ci=bool(ci_label))
-                     if shown is not None else staff_names.text_parts(staff_names.StaffReference(identity.session)
-                         if identity.session else hold.memory.owner),
+        walk.append({"name": name, "name_parts": name_parts,
                      **page_owner_labels(identity, ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
                      **(build_slot(metadata.folder, admission_records.execution_host(metadata, host_name()), slot_roots,
@@ -2085,7 +2102,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
-                     **job_notes(job, unit, names)})
+                     **job_notes(job, identity.unit, names)})
     if program_memory is not None:
         runs = zip((hold.memory.owner for hold in captured.runs), (row["started_at"] for row in walk), strict=True)
         for index, view in program_memory.views(runs, trace_reservations, explanation.now, host_name()):
@@ -2148,10 +2165,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if not service and isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses) and memory.bytes < GIB // 2:
                 program = memory.activity.program
                 group = "Codex servers" if program in ("codex", "codex-real") else "unowned processes"
-                row["detail"] = " · ".join(part for part in (detail, program) if part)
-                row["detail_parts"] = staff_names.text_parts(
-                    staff_names.StaffReference(detail) if detail and detail != unit_labels.OWNER_NOT_RECORDED else "",
-                    " · " if detail and detail != unit_labels.OWNER_NOT_RECORDED and program else "", program)
+                unit = unit_name(detail)
+                detail_parts = staff_names.text_parts(staff_names.StaffReference(unit), " · " if unit and program else "", program)
+                row["detail"] = staff_names.parts_text(detail_parts)
+                row["detail_parts"] = detail_parts
                 groups.setdefault(group, []).append(row)
             else:
                 walk.append(row)
@@ -2162,7 +2179,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
                      "queued": False, "keep_text": "Memory these processes hold. The queue did not start them.",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
-                     "group": name, "ci": False, "parts": [{"who": row["detail"].removeprefix("owner not recorded · "),
+                     "group": name, "ci": False, "parts": [{"who": row["detail"],
                          "who_parts": row.get("detail_parts", staff_names.text_parts(row["detail"])), "pid": row["pid"],
                          "gib": row["used"], "age": row.get("age", ""), "started_at": row["started_at"]}
                          for row in sorted(members, key=lambda row: gib(row["used"]), reverse=True)
@@ -2195,7 +2212,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
         job = NotGateStep() if ci_label else step_job(waiter.step, waiter.pid)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step))
-        waiters.append({"name": names.for_owner(shown_waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
+        waiters.append({"name": names.for_owner(shown_waiter.step, unit_name(identity.unit), identity.role,
                             ci=bool(ci_label), current_name=step_text(shown_waiter, names, labels=labels)),
                         "name_parts": step_name_parts(shown_waiter, names, identity, labels, ci=bool(ci_label)),
                         **page_owner_labels(identity, ci_label=ci_label),
@@ -2246,9 +2263,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         for cloud in rows:
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
             identity = queue_view.cloud_step_labels(cloud, model)
-            values: CloudWorkRow = {"kind": "cloud", "name": queue_view.cloud_step_name(cloud, model),
-                "name_parts": staff_names.owned_step_parts(names, cloud.identity.step,
-                    identity.unit if identity.unit not in ("", "—", unit_labels.OWNER_NOT_RECORDED) else "", identity.role),
+            unit = unit_name(identity.unit)
+            name_role = unit_labels.OwnerRole.UNIT if cloud.identity.unit and unit else identity.role
+            name_parts = staff_names.owned_step_parts(names, cloud.identity.step, unit, name_role)
+            values: CloudWorkRow = {"kind": "cloud", "name": staff_names.parts_text(name_parts), "name_parts": name_parts,
                 **page_owner_labels(identity), "pid": cloud.owner.pid,
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,

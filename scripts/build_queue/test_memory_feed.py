@@ -10,9 +10,10 @@ import io
 import os
 import re
 from collections import Counter
-from contextlib import nullcontext, redirect_stdout
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from http.client import HTTPConnection
 from pathlib import Path
 import shutil
@@ -475,7 +476,15 @@ class MemoryFeedTests(unittest.TestCase):
 
     def test_step_table_keeps_assignment_fields_with_report_tooltips(self) -> None:
         reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110)))
+        units = {"cloud-session": "cloud-unit", "cloud-waiter": "waiting-unit"}
+        labels = {session: unit_labels.make_labels(session, unit_labels.UnderShowrunner("hana", "hana", ""),
+                  unit_labels.DirectsUnit(unit)) for session, unit in
+                  {**units, "cloud-session": "reassigned-unit"}.items()}
+        members = staff.StaffSnapshot(tuple(staff.StaffRow(staff.StaffId(unit), "unit", unit, staff.StaffRoot(),
+            current_session=staff.StaffId(unit)) for unit in units.values()))
         with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
+              mock.patch.object(staff, "snapshot", return_value=members),
               mock.patch.object(os, "cpu_count", return_value=4)):
             page = memory_feed.reading()
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
@@ -497,7 +506,7 @@ class MemoryFeedTests(unittest.TestCase):
         functions = html[html.index("function field("):html.index("const tip =")]
         render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
         escape = html[html.index("function esc("):html.index("const consoleHidden =")]
-        javascript = functions + render + escape + """
+        javascript = "globalThis.window=globalThis;" + staff_names.script({})[8:-9] + functions + render + escape + """
 const elements = new Map();
 const $ = id => {
   if (!elements.has(id)) elements.set(id, {style:{}, classList:{toggle(){}}, innerHTML:""});
@@ -505,6 +514,7 @@ const $ = id => {
 };
 function fitLabels() {}
 const data = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+staffNames.set(data.staff_names);
 renderWalk(data);
 process.stdout.write(JSON.stringify({
   walk:data.walk.map(row=>tipText('row:'+row.key,data)),
@@ -518,6 +528,11 @@ process.stdout.write(JSON.stringify({
         rendered = cast(dict[str, object], json.loads(result.stdout))
         tips = {key: cast(list[list[str]], rendered[key]) for key in ("walk", "waiters")}
         table = cast(str, rendered["table"])
+        self.assertNotIn('class="unit"', table)
+        names = {f"{kind}:{key}": name for kind, key, name in cast(list[tuple[str, str, str]],
+            re.findall(r'<div class="wrow[^"]*" data-tip="(row|wait):([^"]+)"[^>]*>'
+                       + r'<span class="row-label"><span class="row-heading"><span class="name">(.*?)</span></span>'
+                       + r'<span class="owner">', table, flags=re.S))}
         matches = cast(list[tuple[str, str, str]],
             re.findall(r'<tr[^>]*data-tip="(row|wait):([^"]+)"[^>]*>(.*?)</tr>', table, flags=re.S))
         cells = {f"{kind}:{key}": body for kind, key, body in matches}
@@ -553,14 +568,41 @@ process.stdout.write(JSON.stringify({
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
-                    unit = str(row["unit"])
-                    self.assertIn(f'<td class="unit"><span class="cell-text">{unit}</span></td>', cell)
-                    self.assertIn(str(row["name"]), text)
+                    name = str(row["name"])
+                    shown_name = names[f"{kind}:{row['key']}"]
+                    self.assertIn(f'<th scope="row" class="step"><span class="cell-text">{name}</span></th>', cell)
                     if row.get("kind") == "cloud":
+                        unit = units["cloud-session" if kind == "row" else "cloud-waiter"]
+                        prefix, separator, step = name.partition(" ")
+                        self.assertEqual(row["unit"], unit)
+                        self.assertEqual(prefix, unit)
+                        self.assertRegex(shown_name, r'^<span class="staff-name" data-color-text="role\.unit-director" '
+                                                     + rf'style="color:[^"]+">{unit}</span>{separator}{re.escape(step)}$')
+                        self.assertIn(f"{unit} · {step}", text)
                         self.assertNotIn("Uses  ", text)
                         self.assertIn(str(row.get("activity")), text) if kind == "row" else self.assertIn("Waits for  AWS slot", text)
                         if kind == "row":
                             self.assertIn("Runs on  AWS", text)
+                    else:
+                        self.assertEqual(row["unit"], unit_labels.OWNER_NOT_RECORDED)
+                        self.assertEqual(shown_name, name)
+                        self.assertIn(name, text)
+
+    def test_cloud_step_keeps_its_unit_color_after_the_session_is_replaced(self) -> None:
+        reading = cloud_reading(reservation_reading())
+        running = reading.cloud[0]
+        unit = running.identity.unit
+        director = staff.StaffRow(staff.StaffId(unit), "unit", unit, staff.StaffRoot(),
+                                 current_session=staff.StaffId("replacement-session"))
+        members = staff.StaffSnapshot((director,))
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(staff, "snapshot", return_value=members)):
+            page = memory_feed.reading()
+        row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
+        self.assertEqual(row["unit"], unit)
+        self.assertEqual(row["name"], "cloud-unit merge")
+        self.assertEqual(row.get("name_parts"), [{"kind": "staff", "text": unit}, {"kind": "text", "text": " merge"}])
+        self.assertIn('data-color-text="role.unit-director"', page.get("staff_names", {}).get(unit, ""))
 
     def test_ci_memory_stays_in_the_taken_total_with_an_idle_or_running_job(self) -> None:
         cgroup = self.root / "ci"
@@ -698,6 +740,23 @@ process.stdout.write(JSON.stringify({
             self.assertEqual(row.get("changes"), "sdlc branch")
             self.assertIn("handler", row.get("about", ""))
             self.assertIn("integrate", row["name"])
+
+    def test_full_targeted_test_keeps_changes_without_a_unit(self) -> None:
+        reading = with_wait_reason(captured_reading(), admission_records.ReadyForAdmission())
+        waiter = replace(reading.view.waiting[0], step="targeted-test", session_id="missing-session", unit="")
+        reading = replace(reading, view=replace(reading.view, waiting=(waiter,)))
+        proc = self.root / "proc"
+        command = proc / str(waiter.pid) / "cmdline"
+        command.parent.mkdir()
+        _ = command.write_bytes(b"python3\0targeted_test.py\0--full\0")
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(memory_feed, "step_job", wraps=partial(memory_feed.step_job, proc=proc))):
+            page = memory_feed.reading()
+        row, = page["waiters"]
+        self.assertEqual(row.get("changes"), "no branch")
+        self.assertNotIn("about", row)
+        self.assertEqual(row["unit"], unit_labels.OWNER_NOT_RECORDED)
+        self.assertIn("test all", row["name"])
 
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
@@ -1499,6 +1558,35 @@ process.stdout.write(JSON.stringify({
         self.assertEqual({row["name"] for row in page["walk"]}, {"owner-a", "owner-b", "owner-c"})
         self.assertTrue(all(row.get("detail") == "between steps" for row in page["walk"]))
 
+    def test_between_steps_hold_starts_with_the_resolved_unit(self) -> None:
+        now = 200_000
+        run = LiveBuildRun(101, "retained-run", now - 60)
+        slot = admission_records.BetweenStepsSlot(run, "previous", admission_records.GIB, now + 10)
+        step = admission_records.RunningStep("worker-session", "worker", "between steps", "/fixture", 0,
+            admission_records.UnownedSliceMemory(0, pid=run.pid), run, run.started_at, pid=run.pid)
+        host = admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB)
+        inputs = admission_records.QueueInputs([], (step,), (), host, admission_records.NO_PRESSURE_HOLD,
+            admission_records.ReadyToStart(), now, slots=(slot,))
+        director = staff.StaffRow(staff.StaffId("panes"), "unit", "panes", staff.StaffRoot(),
+                                 current_session=staff.StaffId("director-session"))
+        for recorded_unit, session_unit in (("panes", "other"), ("", "panes")):
+            with self.subTest(recorded_unit=recorded_unit):
+                reading = gate.queue_read_from(replace(inputs, running=(replace(step, unit=recorded_unit),)),
+                                               admission_policy_fixture())
+                worker = unit_labels.make_labels("worker", unit_labels.NoShowrunner(),
+                                                 unit_labels.UnderDirector(session_unit, session_unit, ""))
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(unit_labels, "unit_labels_for", return_value={step.session_id: worker}),
+                      mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((director,)))):
+                    page = memory_feed.reading()
+                row, = [row for row in page["walk"] if row.get("between_steps")]
+                self.assertEqual(row["name"], "panes worker")
+                self.assertEqual(row.get("detail"), "between steps")
+                self.assertEqual(row.get("name_parts"), [{"kind": "staff", "text": "panes"},
+                                                         {"kind": "text", "text": " "},
+                                                         {"kind": "staff", "text": "worker"}])
+                self.assertIn('data-color-text="role.unit-director"', page.get("staff_names", {}).get("panes", ""))
+
     def test_pressure_failure_names_the_path_without_the_python_error(self) -> None:
         values = memory_feed.read_stalls()
         for value in values.values():
@@ -2071,9 +2159,9 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(remote["status"], expected)
 
     def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels) -> memory_feed.MemoryPage:
-        """Supply one owner for running and waiting cloud steps."""
+        """Read the owner from the session when the cloud step has no recorded unit."""
         reading = cloud_reading(reservation_reading())
-        rows = tuple(replace(row, identity=replace(row.identity, step=step)) for row in reading.cloud)
+        rows = tuple(replace(row, identity=replace(row.identity, step=step, unit="")) for row in reading.cloud)
         labels = {row.identity.session_id: owner for row in rows}
         with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
@@ -2137,13 +2225,17 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row.get("ci_label"), label)
 
     def test_unknown_owners_keep_their_current_names_on_every_machine(self) -> None:
-        page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", "owner not recorded"))
-        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["hana nextest"])
-        self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["nextest"])
-        local, = [row for row in page["walk"] if not row.get("kind")]
-        self.assertEqual(local["name"], "fixture-project nextest")
-        for row in (*page["walk"], *page["waiters"]):
-            self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
+        for unit, role in (("", unit_labels.OwnerRole.UNIT), ("—", unit_labels.OwnerRole.UNIT),
+                           (unit_labels.OWNER_NOT_RECORDED, unit_labels.OwnerRole.UNIT),
+                           (unit_labels.OWNER_NOT_RECORDED, unit_labels.OwnerRole.UNKNOWN)):
+            with self.subTest(unit=unit, role=role):
+                page = self.owner_machine_page(unit_labels.UnitLabels("unknown", "—", unit, role))
+                self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "mac-build"], ["hana nextest"])
+                self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], ["nextest"])
+                local, = [row for row in page["walk"] if not row.get("kind")]
+                self.assertEqual(local["name"], "fixture-project nextest")
+                for row in (*page["walk"], *page["waiters"]):
+                    self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
 
     def test_cloud_page_names_use_the_owner_in_running_and_waiting_tables(self) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
@@ -2165,10 +2257,13 @@ process.stdout.write(JSON.stringify({
             ("merge-gate", runner_worker, "showrunner merge"),
             ("targeted-test", unknown, "targeted test"),
             ("merge-gate", unknown, "merge gate"),
+            ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
             ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "targeted test"),
             ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "merge gate"),
             ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "targeted test"),
             ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "merge gate"),
+            ("build", director, "panes build"),
+            ("literal{step}", director, "panes literal{step}"),
         ):
             with self.subTest(step=step, owner=owner):
                 page = self.cloud_owner_page(step, owner)
@@ -2176,6 +2271,17 @@ process.stdout.write(JSON.stringify({
                 waiting = [row for row in page["waiters"] if row.get("kind") == "cloud"]
                 self.assertEqual([row["name"] for row in running], [expected])
                 self.assertEqual([row["name"] for row in waiting], [expected])
+
+    def test_cloud_page_uses_the_configured_owner_template(self) -> None:
+        _ = write_config_fixture(self.root / "build_steps.conf",
+            "owned.targeted-test=targeted for {unit}\nnames.targeted-test=targeted test\nnames.merge-gate=merge gate\n")
+        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
+        page = self.cloud_owner_page("targeted-test", director)
+        for rows in (page["walk"], page["waiters"]):
+            self.assertEqual([row["name"] for row in rows if row.get("kind") == "cloud"], ["targeted for panes"])
+        names = read_step_names()
+        self.assertEqual(names.shown("targeted-test"), "targeted test")
+        self.assertEqual(names.prose("merge-gate"), "merge gate")
 
     def test_cloud_rows_share_the_feed_without_memory_reservations(self) -> None:
         _ = (self.root / "cloud_gate.conf").write_text(
@@ -2733,19 +2839,25 @@ def write_browser_fixture(folder: Path) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        names = read_step_names()
         for version in ("before", "after"):
-            def recorded_name(row: wire.CloudRow, model: queue_view.QueueModel) -> str:
-                return model.names.shown(row.identity.step)
-            naming = mock.patch.object(queue_view, "cloud_step_name", side_effect=recorded_name)
-            with (naming if version == "before" else nullcontext()):
-                targeted = fixture.cloud_owner_page("targeted-test", director)
-                merge = fixture.cloud_owner_page("merge-gate", runner)
+            targeted = fixture.cloud_owner_page("targeted-test", director)
+            merge = fixture.cloud_owner_page("merge-gate", runner)
+            if version == "before":
+                for step, page in (("targeted-test", targeted), ("merge-gate", merge)):
+                    for row in (*page["walk"], *page["waiters"]):
+                        if "kind" in row and row["kind"] == "cloud":
+                            row["name"] = names.shown(step)
+                            row["name_parts"] = staff_names.text_parts(row["name"])
             targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
             targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
             pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))
         owner = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
                                         unit_labels.UnderDirector("research", "research", ""))
-        pages["step_owners"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(owner)))
+        research_director = staff.StaffRow(staff.StaffId("research"), "unit", "research", staff.StaffRoot(),
+                                           current_session=staff.StaffId("research"))
+        with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((research_director,))):
+            pages["step_owners"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(owner)))
         cast(dict[str, object], pages["step_owners"])["swap_by"] = fixture.owner_swap_reading(owner).rows
         ci_page = fixture.owner_machine_page(owner, ci=True)
         ci_row, = [row for row in ci_page["walk"] if row.get("kind") == "mac-build"]
