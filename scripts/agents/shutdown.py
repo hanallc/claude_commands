@@ -46,6 +46,7 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.worktree.worktrees import release_worktree_pair
 from scripts.agents import (
     producer_transfer,
     restart,
@@ -1232,6 +1233,7 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
         result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
         if result.returncode:
             return [retirement_failure(result)]
+        release_worktree_pair(unit.worktree)
         print(f"removed: worktree {unit.worktree}")
     if unit.branch:
         if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
