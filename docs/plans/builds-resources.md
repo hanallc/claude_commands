@@ -2836,7 +2836,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/test_measurement.py`.
 
-### Phase 153 — A gate uses the cheapest region again as soon as it has quota room  · status: todo
+### Phase 153 — A gate uses the cheapest region again as soon as it has quota room  · status: done
 
 `cloud_gate.rank_variants` (cloud_gate.py:548) cools a whole region for `capacity_cooldown_seconds` after one Spot quota refusal. Gates then use dearer regions while the cheap region has room again.
 
@@ -2845,7 +2845,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 3. A quota refusal at launch still moves to the next variant.
 4. Proof: the cheapest region refused 5 min ago, a box there ended, and the next gate picks that region.
 
-**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`.
+**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_ledger.py`.
 
 ### Phase 154 — A buildlog report day never falls back to UTC by itself  · status: done
 
@@ -2858,3 +2858,15 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `4d730e56f`; row `64e6cb9bf` on main `d26b82cff`.
 
 **Files:** `scripts/buildlog/cli.py`, `scripts/buildlog/test_report.py`.
+
+### Phase 155 — The hourly snapshot keeps Spot placement scores  · status: todo
+
+User via builds 11-18 10:04: an analysis of 32-vCPU availability and a price for gate time. This phase collects the availability data.
+
+1. Check the AWS limit for `get-spot-placement-scores` and fit the request set inside it.
+2. Ask for 4, 8 and 20 boxes of each gate type, per region and per zone, in all 19 regions.
+3. Store the scores beside the Spot prices; show them on the AWS page.
+4. Read-only call. Name the IAM permission (`ec2:GetSpotPlacementScores`) before any setup step reaches the user.
+5. No config change for gate placement and no gate placement code change.
+
+**Files:** `scripts/aws_target/aws_target.py`, `scripts/aws_target/ledger.py`, `scripts/aws_target/aws_page.py`, and their tests.

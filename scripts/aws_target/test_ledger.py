@@ -39,6 +39,15 @@ class LedgerTests(CostFixture):
         self.book.record_inventory(ledger.ResourceInventory(
             at, (ledger.PricedResource("retained-storage", Decimal(monthly)),), "priced fixture inventory"))
 
+    def test_quota_refusal_without_saved_time_is_expired(self) -> None:
+        pool = ledger.SpotQuotaPool('us-west-2', ledger.SpotQuotaClass.STANDARD)
+        self.book.record_gate_quota_refusal(pool, self.start)
+        document = ledger.mapping(cast(object, json.loads(self.book.path.read_text())))
+        row, = ledger.rows(document, 'gate_quota_refusals')
+        del row['at']
+        _ = self.book.path.write_text(json.dumps(document))
+        self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
+
     def observe(self, at: int, state: ledger.InstanceState) -> None:
         self.book.observe(ledger.InstanceObservation(at, state, "fake DescribeInstances"))
 
@@ -58,6 +67,27 @@ class LedgerTests(CostFixture):
     def running(self, at: int) -> None:
         self.inventory(at)
         self.observe(at, "running")
+
+    def test_spot_quota_classes_use_the_instance_families(self) -> None:
+        for instance_type, quota_class in (
+                ('g6.8xlarge', ledger.SpotQuotaClass.G_AND_VT),
+                ('vt1.3xlarge', ledger.SpotQuotaClass.G_AND_VT),
+                ('p4d.24xlarge', ledger.SpotQuotaClass.P),
+                ('m7a.8xlarge', ledger.SpotQuotaClass.STANDARD)):
+            with self.subTest(instance_type=instance_type):
+                self.assertEqual(ledger.spot_quota_class(instance_type), quota_class)
+
+    def test_spot_quota_snapshot_can_omit_the_p_limit(self) -> None:
+        path = self.state / 'spot-prices.json'
+        region = {'region': 'us-east-2', 'read_at': self.start, 'standard_vcpus': '128', 'gpu_vcpus': '32'}
+        p_limits: tuple[dict[str, str], ...] = ({}, {'p_vcpus': '96'})
+        for p_limit in p_limits:
+            with self.subTest(p_limit=p_limit):
+                _ = path.write_text(json.dumps({'regions': [{**region, **p_limit}]}))
+                quota, = ledger.read_spot_quotas(self.state)
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.STANDARD), Decimal(128))
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.G_AND_VT), Decimal(32))
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.P), Decimal(96) if p_limit else ledger.NoSpotQuota())
 
     def test_gpu_trial_budget_counts_booked_cost_and_open_maximum(self) -> None:
         self.inventory(self.start)
