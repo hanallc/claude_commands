@@ -348,6 +348,9 @@ class Refused:
     reason: str
 
 
+PLACEMENT_REQUEST_MISSING_REASON = "placement request is missing"
+
+
 @dataclass(frozen=True)
 class Ok:
     """The reply confirms that the request succeeded."""

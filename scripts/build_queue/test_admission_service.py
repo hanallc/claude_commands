@@ -62,6 +62,26 @@ def setUpModule() -> None:
 
 
 class PlacementStatusTests(unittest.TestCase):
+    def test_placement_control_distinguishes_missing_requests_from_owner_mismatches(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            _ = assignment_for(fixture, request)
+            other_owner = replace(request.owner, start_time=request.owner.start_time + "0")
+            missing = wire.PLACEMENT_REQUEST_MISSING_REASON
+            cases = (
+                (wire.CancelPlacement("wrong-owner", request.episode, other_owner, "ended"),
+                    "placement coordinator does not match"),
+                (wire.CancelPlacement("missing-cancel", "missing-episode", request.owner, "ended"), missing),
+                (wire.PrerequisiteReport("missing-report", "missing-episode", request.owner, request.prerequisite), missing),
+            )
+            for control, reason in cases:
+                with self.subTest(control=type(control).__name__, episode=control.episode):
+                    self.assertEqual(fixture.connect(control).replies(), [wire.Refused(reason)])
+            self.assertEqual(fixture.server.placement_requests.get(request.episode), request)
+
     def test_repeated_placement_polls_share_the_pass_until_the_next_reading(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
 
