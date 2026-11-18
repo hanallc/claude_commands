@@ -2825,7 +2825,7 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 **From the 44br review, 2026-11-18.** The user's rule: "the only reason you can skip the line is if you are going to a different target and things in front of you can't". Phase 44br makes the admission walk strict for the rows it sees. The review found rows that leave the walk, so a later natedev row can start first. This phase keeps each such row in the line. Built on the 44br checkpoint.
 1. A natedev placement row with a pending probe or a temporary hold stays in the walk as a waiting row (`admission_service.py:1733`, `:2969`).
 2. A held CI row stays in the walk and keeps its place (`admission_service.py:1479`, `:2016`).
-3. A natedev row that waits for a Cargo token holds the line, as a folder wait does in 44bq (`memory_admit.py:2039`, `:2068`; `admission_service.py:2192`).
+3. **Dropped (builds, 2026-11-18 03:35 EST).** A row does not hold the line for a Cargo token. Phase 44bw removes the token wait of each admitted step.
 4. After a service restart, a saved waiter with a live owner holds its place until it reconnects or its owner ends (`admission_service.py:1305`, `:1502`). The restart test grants during the reconnects, not only after them (`test_admission_service.py:4885`).
 5. A placement retry cannot change the saved route away from the constraint that placement enforces (`admission_service.py:3473`, `:2908`; `memory_admit.py:2002`).
 
@@ -2839,6 +2839,16 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 2. The line names the recorded hold of the row ahead. For a memory hold it shows the need and the room. For another hold it shows the resource, the holder or the deadline that applies.
 3. The Builds page and the wait line give the same reason for the same row.
 4. Acceptance: a test with room below the need of the head and host free memory above it. The line shows the room and the memory reason, and no host free memory figure. One test for each other hold kind of the row ahead.
+
+### Phase 44bw — A running step has all that it needs: no admitted step waits for a unit token  · status: todo
+**Ruling (builds, 2026-11-18 03:35 EST), from the user's rule of 2026-11-17:** "it shouldn't be locked down to a unit - if you get into the running that shoudl mean you have a cargo token to use". Measured in 7 days: 764 local calls waited for the unit Cargo token after their memory grant; median 707.5 s, longest 12,452 s. Built after 44bq, 44br and 44bt are on main. Facts with file and line: the token research of 2026-11-18 03:30 EST.
+1. No step that the queue admits takes the unit Cargo token (`verify.sh` `take_local_placement`, `buildlog_wait_for_memory`, `placement_once`, `buildlog_exec`).
+2. The Cargo folder claim of 44bq is the one lock for Cargo output. A row whose folder is busy waits in the line with no memory.
+3. A small worktree lock stays only for steps that the queue does not admit (the formatter, an in-place repair).
+4. Process group cleanup moves from the board release to the step owner.
+5. Proof (condition of builds): the test replays the user's case. Two rows of one unit in different folders both run, and none waits with memory held. Each caller form has a proof: check, build, nextest, doc, lint repair, fallback after a Mac or AWS refusal, `copies.py run` with verify and with a merge gate.
+6. Cutover (condition of builds): it needs no step from the user beyond what the service reload does by itself. If it needs a restart or a wait for old runs, tell builds before the hash.
+7. Send builds a time for this phase when 44bq is sent.
 
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
