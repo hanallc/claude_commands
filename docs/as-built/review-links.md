@@ -445,6 +445,7 @@ Each preset shows its time on the right, such as `Tue 09:00`, in the user zone.
 The page computes the preset times each time the menu opens.
 A preset click hides the item at once.
 **Choose a time…** shows a calendar and a time field in the same menu.
+Review Later and List Park until share the date and time picker in `record_table.py`.
 The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
 The month header has previous and next buttons.
@@ -709,7 +710,8 @@ The record keeps Evidence, and the open row has no separate Evidence section.
 The log shows its newest entry first.
 Each log writer saves a typed event.
 The table and log use the same format for staff names, local ETAs, and field values.
-The table, log, and Park response show parking dates in the user's zone.
+The table, log, and Park response show parking times in the user zone.
+At local midnight, the label shows the date.
 The log uses plain field labels, such as Next step and Latest status.
 The reader converts old Added, Updated, Parked, Closed, and feedback entries to the same format.
 An old entry keeps its text if the reader cannot parse it.
@@ -767,11 +769,17 @@ Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save a
 The answer adds one log entry and marks the item unread.
 The command refuses an unknown ID, a second answer, and empty text.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
-Park writes the chosen date through `the_list.park` with the same source.
-Park uses midnight in the user's time zone.
-The writer checks the date against the current time under the List lock.
-An exact retry can return the saved result after the date arrives.
-The page uses the date for Park and retains other words for Tell morty.
+**Park until** opens the shared calendar and 24-hour time field directly.
+The page refresh waits while the picker is open.
+**Save** sends the chosen time in UTC.
+Park writes the time through `the_list.park` with the same source.
+The server still accepts a date as midnight in the user zone.
+The writer checks a new parking time against the current time under the List lock.
+The writer compares the saved instant when it checks a Park retry.
+The writer requires the instant in the receipt or in a parking change with the same request ID.
+The picker can resend the original request and instant after the parking time passes.
+When the saved date has passed, the picker gives focus to an enabled day.
+The page keeps the words for Tell morty.
 Morty does not perform these two button actions.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
@@ -787,11 +795,12 @@ The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved date to update one parking label.
+The page uses the saved time to update one parking label.
 A refusal restores the last state and parking status from the server.
 A failed Mark read, Ask question, or Tell morty request restores the unread state.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
+After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
 Each row keeps its own inline failure notice.
 The List uses the same rules as Review for notices above the table.
 If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.

@@ -11,7 +11,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
@@ -92,6 +92,13 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
     return the_list.eta_text(eta)
 
 
+def parked_label(moment: datetime, zone: tzinfo) -> str:
+    local = moment.astimezone(zone)
+    if local.hour or local.minute:
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    return local.date().isoformat()
+
+
 def field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames) -> str:
     if field in ("owner", "producer"):
         owner = cast(the_list.ItemOwner, value)
@@ -103,7 +110,7 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
             return "Not parked"
         zone = today.tzinfo
         assert zone is not None
-        return the_list.parking_date(value, zone)
+        return parked_label(value, zone)
     if isinstance(value, datetime):
         return html.escape(local_time(value, today))
     if isinstance(value, the_list.CheckCondition):
@@ -194,8 +201,9 @@ def feedback_form(entry: ListRecord, secret: str) -> str:
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     return ('<form method="post" data-feedback-form>' + hidden + '<div class="list-actions">' + read
             + '<button name="action" value="remove">Remove</button>'
-            + f'<label for="park-{key}">Park until</label><input type="date" name="until" id="park-{key}">'
-            + '<button name="action" value="park">Park</button></div>'
+            + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
+            + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
+            + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="2" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status></span>'
@@ -345,7 +353,7 @@ def saved_action_state(keeper: str, identity: str) -> SavedActionState:
     item = the_list.load(staff.StaffId(keeper), identity)
     zone = user_zone()
     today = the_list.now()
-    parked_until = (the_list.parking_date(item.parked_until, zone)
+    parked_until = (parked_label(item.parked_until, zone)
                     if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
     return {"unread": str(isinstance(item.unread_since, datetime)).lower(), "item_state": item.state.value,
             "parked": str(bool(parked_until)).lower(), "parked_until": parked_until}
@@ -393,10 +401,13 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
         notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words)
         changed = the_list.close(morty.id, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "park":
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) is None:
-            raise question_record.AnswerRefused("enter a parking date")
-        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {until}.", "park", words)
-        changed = the_list.park(morty.id, identity, the_list.time_value(until), source=the_list.PAGE_SOURCE, notice=notice)
+        if the_list.ISO_TIME.fullmatch(until) is None:
+            raise question_record.AnswerRefused("enter a parking date or a time with a UTC offset")
+        parked_until = the_list.time_value(until)
+        assert isinstance(parked_until, datetime)
+        label = parked_label(parked_until, user_zone())
+        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
+        changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(morty.id, identity,
                                        the_list.PageFeedback(request, words, read_update=prefix.seen_update))
@@ -529,7 +540,8 @@ def render(root: Path) -> bytes:
     items = records()
     reviews = ({review.key: review for review in review_items.read(root, members=members)}
                if any(entry.item.reviews for entry in items) else {})
-    today = datetime.fromtimestamp(read_at, user_zone())
+    zone = user_zone()
+    today = datetime.fromtimestamp(read_at, zone)
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
     owners = staff_chips({str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}, names)
     producers = staff_chips({str(entry.item.producer): owner_name(members, entry.item.producer) for entry in items}, names)
@@ -537,9 +549,12 @@ def render(root: Path) -> bytes:
     shows = [record_table.Chip(value, label) for value, label in SHOWS if value != 'all']
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
-    seconds = conf.read("review_links").number("page_refresh_seconds")
+    settings = conf.read("review_links")
+    seconds = settings.number("page_refresh_seconds")
+    morning = record_table.clock_minutes(settings, "later_morning")
     content = (STYLE + page_frame.title("The List", "list")
-               + f'<div data-list data-refresh-seconds="{seconds}"><div data-record-filters>'
+               + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
+               + f' data-park-morning="{morning}"><div data-record-filters>'
                + record_table.words_box('list-search', 'Filter by number, owner, item or state')
                + record_table.chip_row('Show', shows, 'open')
                + record_table.chip_row('State', states, 'all')
@@ -556,8 +571,11 @@ def render(root: Path) -> bytes:
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
-STYLE = record_table.STYLE + '''<style>
+STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
+.list-actions{position:relative}.list-park>[data-later-menu]{left:0;right:auto}
+.list-table:has(.list-park>[data-later-menu]:not([hidden])),
+.list-table tbody:has(.list-park>[data-later-menu]:not([hidden])){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
@@ -577,7 +595,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 }
 </style>'''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + r'''(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
 let saving=0;
 const drafts=new Map();
@@ -652,16 +670,29 @@ function bind(){
   const retain=()=>{retainDraft();syncTell();};
   retain();
   words.addEventListener('input',retain);until.addEventListener('input',retain);
+  const zone=content.dataset.zone;
+  const parkToggle=form.querySelector('[data-later-toggle]');
+  bindDateTimePicker(form,{zone,defaultMinutes:()=>Number(content.dataset.parkMorning),summaryPrefix:'Parks until ',
+   retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(form.dataset.sending) return;
    const action=event.submitter?.value || 'tell';
    const usesWords=action==='tell' || action==='question';
    if(usesWords && !words.value.trim()) return;
-   if(action==='park' && !until.value){form.querySelector('[data-send-status]').textContent='Choose a parking date.';return;}
    const retry=matching(action);
-   const attempt=retry ?? {...fresh,action,words:words.value,until:until.value};
+   let parkingTime=retry?.parkingTime ?? until.value;
+   if(action==='park'){
+    if(!retry && !/^\d{4}-\d{2}-\d{2}$/.test(parkingTime)){
+     const at=dateTimeDraftEpoch(zone,parkingTime);
+     if(!(at>Date.now())){notice.textContent='Choose a future parking time.';return;}
+     parkingTime=new Date(at).toISOString();
+    }
+    closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+   }
+   const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',action);
+   if(action==='park') data.set('until',parkingTime);
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
    retainDraft();
    form.dataset.sending='true';saving++;pageRefresh.abandon();
@@ -712,20 +743,26 @@ function bind(){
     buttons=[...item.querySelectorAll('button')];
     delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);syncTell();
     retainDraft();
+    if(refused && action==='park'){
+     await tableView.settled();
+     if(document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
+      parkToggle.focus({preventScroll:true});
+     }
+    }
     if(saved) void pageRefresh.refresh(true);
    }
   });
  });
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving) return;
+ if(saving || dateTimePickerOpen(content)) return;
  const response=await fetch(location.pathname,{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
- if(saving || !current()) return;
+ if(saving || dateTimePickerOpen(content) || !current()) return;
  const top=scrollY,focus=document.activeElement?.id;
  const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;
  content.replaceWith(fresh);content=fresh;bind();apply(false);

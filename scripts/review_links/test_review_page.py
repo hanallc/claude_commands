@@ -2149,6 +2149,38 @@ window.fetch=async(_url,options={})=>{
                 self.assertEqual(results,[[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_later_focus_moves_to_the_calendar_when_previous_month_disables(self) -> None:
+        _ = self.question()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            source = review_page.render(self.root).decode()
+        setup = r"""<script>
+window.setInterval=()=>0;
+Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ try{
+  const row=document.querySelector('[data-type="question"]');
+  row.querySelector('.list-toggle').click();
+  const form=row.querySelector('form');
+  form.querySelector('[data-later-toggle]').click();
+  form.querySelector('[data-later-choose]').click();
+  const previous=form.querySelector('[data-later-month-step="-1"]');
+  const grid=form.querySelector('[data-later-grid]');
+  previous.focus();
+  check(document.activeElement===previous,'Previous month has focus in December');
+  previous.click();
+  const day=grid.querySelector('button:not(:disabled)[tabindex="0"]');
+  check(previous.disabled && day?.dataset.date==='2026-11-30','November has an enabled day');
+  check(document.activeElement===day,'Focus moves from Previous month to the enabled day');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_later_time_displays_and_saves_24_hour_time(self) -> None:
         _ = self.question()
         with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
