@@ -71,6 +71,7 @@ scripts/lib/session_paths.py
 scripts/lib/slot_root.py
 scripts/lib/suite_runners.py
 scripts/lib/test_phase.py
+scripts/lib/time_limit.py
 scripts/lib/transcripts.py
 scripts/lib/unit_runs.py
 scripts/lib/user_zone.py
