@@ -2656,7 +2656,7 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** `override_guard.py`, `override_guard.sh`, `memory_gate.sh`, `invoke.sh`, `verify.sh`, `top_level.py`, `shutdown.py`, `admission_test_support.py`, `helper_tree_test_support.py`, about 40 test and fixture files (list in checkpoint `7fad3a152`), `docs/as-built/build-memory-admission.md`.
 
-### Phase 138 — test_offload keeps its proof folder in a temp folder  · status: todo
+### Phase 138 — test_offload keeps its proof folder in a temp folder  · status: done
 **Source:** builds showrunner 2026-11-16 18:0x. A Phase 137 run without test startup showed the leak: `GeneratedSourceTests.test_no_envrc_source_requires_generated_source_outside_trusted_roots` (`scripts/mac_test/test_offload.py:54`) calls `scratch.new('gate:offload-generated-source', 'proof')`. It patches only `SCRATCH_ROOT`, so `scratch.new` puts `proof` under the live worker session (`/session/<worker>/proof`). Task cleanup by that name then removed a second worker's folder.
 **Depends on:** Phase 136 (queue order only).
 
