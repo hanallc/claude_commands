@@ -12,9 +12,9 @@ import sys
 from scripts.herdr import herdr  # noqa: E402
 from scripts.herdr.herdr import AgentBlocked, Herdr  # noqa: E402
 from scripts.herdr.herdr_types import HerdrFailure as HerdrFailure  # noqa: E402
-from scripts.message.sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from scripts.message.sessions import SessionRecord, live_session, read_registry  # noqa: E402
 from scripts.production.unit_lookup import (  # noqa: E402
-    LabeledSession, LiveSession, Place, ProvedAbsentUnit, ProvedLiveUnit, UnknownUnit, checked_unit, sessions_dir,
+    LabeledSession, LiveSession, Place, ProvedAbsentUnit, ProvedLiveUnit, UnknownUnit, checked_unit,
 )
 from scripts.lib.script_envelope import script_prompt  # noqa: E402
 
@@ -52,18 +52,11 @@ def where_place(place: Place) -> str:
 
 
 def session_place(session_id: str) -> Place:
-    unread = False
-    records: list[SessionRecord] = []
-    for path in sessions_dir().iterdir():
-        if path.suffix != ".json":
-            continue
-        record = read_session(path)
-        if isinstance(record, UnreadableSessionRecord):
-            unread = True
-        elif record["sessionId"] == session_id and live_session(record):
-            records.append(record)
+    registry = read_registry()
+    records = [item.record for item in registry.entries
+               if item.record["sessionId"] == session_id and live_session(item.record)]
     if not records:
-        if unread:
+        if registry.unreadable:
             raise OSError("one or more session records could not be read")
         raise NoSuchTarget(session_id)
     return record_place(max(records, key=lambda record: record["updatedAt"]))

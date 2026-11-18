@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -13,6 +14,7 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 from collections.abc import Iterator
+from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, override
 from unittest import mock
 
@@ -438,24 +440,19 @@ class SessionLookupTests(ShutdownTestCase):
             (result.returncode, result.stdout, result.stderr), (1, "", "sessions: no live session for 'session:missing'\n")
         )
 
-    def test_missing_registry_returns_unknown(self) -> None:
+    def test_missing_registry_returns_absent(self) -> None:
         self.sessions.rmdir()
         result = self.run_cli("socket", "session:missing")
-        self.assertEqual((result.returncode, result.stdout), (3, ""))
-        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (1, "", "sessions: no live session for 'session:missing'\n"))
 
     def test_registry_that_cannot_be_listed_returns_unknown(self) -> None:
-        self.sessions.chmod(0)
-        self.addCleanup(self.sessions.chmod, 0o700)
-        try:
-            _ = list(self.sessions.iterdir())
-        except PermissionError:
-            pass
-        else:
-            self.skipTest("current user can list a mode-zero directory")
-        result = self.run_cli("socket", "session:missing")
-        self.assertEqual((result.returncode, result.stdout), (3, ""))
-        self.assertEqual(len(result.stderr.splitlines()), 1)
+        with (mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+              mock.patch.object(Path, "iterdir", side_effect=PermissionError(self.sessions)),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = sessions.main([str(SCRIPT), "socket", "session:missing"])
+        self.assertEqual((code, output.getvalue()), (3, ""))
+        self.assertEqual(errors.getvalue(), "sessions: one or more registry files could not be read\n")
 
     def test_corrupt_registry_record_returns_unknown(self) -> None:
         _ = (self.sessions / "broken.json").write_text("{")

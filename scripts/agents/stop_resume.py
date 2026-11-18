@@ -673,12 +673,9 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
                 member = members[0]
         if member is not None:
             return member.current_session
-        registered = {row["sessionId"] for row in sessions.running_sessions()
-                      if session == row["sessionId"]}
-        if len(registered) > 1:
-            return StopFailed(session, f"{session}: several live sessions match")
-        if registered:
-            return registered.pop()
+        registry = sessions.read_registry()
+        if any(session == row["sessionId"] for row in sessions.running_sessions(registry=registry)):
+            return session
         entries = pane_record.read(herdr.shared_session())
         references = pane_launch.named_references(session, record, entries)
         identities: set[str] = set()
@@ -698,7 +695,11 @@ def stop_target(session: str) -> str | SessionNotFound | StopFailed:
             identities.add(reference.session)
         if len(identities) > 1:
             return StopFailed(session, f"{session}: several tabs match")
-        return identities.pop() if identities else SessionNotFound(session)
+        if identities:
+            return identities.pop()
+        if registry.unreadable:
+            return StopUnproved(session, "session registry unreadable")
+        return SessionNotFound(session)
     except (OSError, ValueError, herdr_types.HerdrFailure) as error:
         return StopFailed(session, str(error))
 

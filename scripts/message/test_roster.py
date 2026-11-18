@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
@@ -1241,11 +1241,17 @@ class RosterTests(unittest.TestCase):
         self.assertEqual((entry.cwd, entry.status), (solo.get("cwd"), "waiting"))
 
     def test_a_send_by_name_stops_when_the_session_folder_cannot_be_listed(self) -> None:
-        missing = self.root / "no-session-folder"
         membership = staff.snapshot()
-        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(missing)}):
+        iterdir = Path.iterdir
+
+        def list_folder(path: Path) -> Iterator[Path]:
+            if path == self.sessions:
+                raise PermissionError(path)
+            return iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", list_folder):
             result = roster.roster(os.environ, roster.ThisMachine())
-        self.assertIn(f"Claude session records: cannot list {missing}", result.problems)
+        self.assertIn(f"Claude session records: cannot list {self.sessions}", result.problems)
         with mock.patch.object(roster, "peer_roster") as peer:
             found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
         self.assertIsInstance(found, send.LocalRosterIncomplete)

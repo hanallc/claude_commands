@@ -9,13 +9,14 @@ import os
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from typing import final
+from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.production import add_unit
 from scripts.production import autocompact
 from scripts.agents import inventory
 from scripts.accounts import accounts
+from scripts.message import sessions
 
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
@@ -29,7 +30,19 @@ def setUpModule() -> None:
 
 @final
 class AddUnitAccountsTests(AddUnitTestCase):
+    fixture_only_processes = True
 
+    @override
+    def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": "/proc"})))
+        super().setUp()
+
+    def test_account_fixture_refuses_an_unexpected_pid_probe(self) -> None:
+        self.assertEqual(os.environ["HERDR_PROC"], str(self.root / "proc"))
+        with self.assertRaisesRegex(AssertionError, "unexpected process start probe"):
+            _ = sessions.process_start(991099)
+        with self.assertRaisesRegex(AssertionError, "unexpected liveness probe"):
+            os.kill(991099, 0)
 
     def test_explicit_account_environment_omits_every_prepared_removal(self) -> None:
         prior = self.root / "prior-session"

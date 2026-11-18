@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextvars import Context
 from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
@@ -3580,6 +3580,20 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(stop_resume.resume("elsewhere", why="maintenance"), stop_resume.ResumeFailed("elsewhere", "unknown name"))
         self.kill.assert_not_called()
         self.start.assert_not_called()
+
+    def test_stop_without_a_target_keeps_a_denied_registry_unknown(self) -> None:
+        registry = sessions.sessions_dir()
+        iterdir = Path.iterdir
+
+        def list_folder(path: Path) -> Iterator[Path]:
+            if path == registry:
+                raise PermissionError(path)
+            return iterdir(path)
+
+        with patch.object(Path, "iterdir", new=list_folder):
+            self.assertEqual(stop_resume.stop("elsewhere"),
+                             stop_resume.StopUnproved("elsewhere", "session registry unreadable"))
+        self.kill.assert_not_called()
 
     def test_tab_labels_are_exact_and_unidentified_or_ambiguous_tabs_never_signal(self) -> None:
         self.assertEqual(stop_resume.stop("alph"), stop_resume.SessionNotFound("alph"))

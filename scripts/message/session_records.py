@@ -94,10 +94,12 @@ class RegistryRecordGone:
 
 
 def read_registry(*, dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
-    """Keep unreadable directories and records visible to complete observers."""
+    """Treat an absent directory as empty and report unreadable evidence."""
     directory = sessions_dir()
     try:
         paths = [path for path in directory.iterdir() if path.suffix == ".json"]
+    except FileNotFoundError:
+        return RegistryRead((), ())
     except OSError:
         return RegistryRead((), (directory,))
     entries: list[RegistryObservation] = []
@@ -340,9 +342,19 @@ def running_records(registry: RegistryRead) -> list[SessionRecord]:
     return _running(item.record for item in registry.entries)
 
 
-def running_sessions() -> list[SessionRecord]:
+@dataclass(frozen=True)
+class ReadCurrentRegistry:
+    """Read the registry for this call."""
+
+
+CURRENT_REGISTRY = ReadCurrentRegistry()
+
+
+def running_sessions(*, registry: RegistryRead | ReadCurrentRegistry = CURRENT_REGISTRY) -> list[SessionRecord]:
     """Every running record, newest first, including processes without sockets."""
-    return _running(_readable_records())
+    if isinstance(registry, ReadCurrentRegistry):
+        return _running(_readable_records())
+    return running_records(registry)
 
 
 def live_sessions() -> list[SessionRecord]:
