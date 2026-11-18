@@ -36,7 +36,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page, review_page
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_page
 from scripts.review_links import question_record
 from scripts.review_links.review_link import private_name
 
@@ -285,6 +285,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                              + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
             return BytesIO(content)
+        if route.path == "/console/for-you.json":
+            try:
+                if route.query == "view=count":
+                    payload = console.for_you_count(for_you.read())
+                else:
+                    payload = console.for_you_payload()
+            except (OSError, ValueError) as error:
+                print(f"review-links actions: {error}", file=sys.stderr)
+                self.json_response(503, {"available": False})
+            else:
+                self.json_response(200, payload)
+            return None
         if route.path == accounts_page.PAGE_PATH:
             try:
                 content = cast(ReviewLinksServer, self.server).accounts_cache.get()
@@ -656,13 +668,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"})
-                    or any(len(values) != 1 for values in fields.values())):
-                raise ValueError("Use one color key and one color value, or one group and one account.")
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"})
+                    or any(len(values) != 1 for values in fields.values())
+                    or ("clear" in fields and fields["clear"] != ["first"])):
+                raise ValueError("Use one color key and one color value, one group and one account, or one group and clear=first.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
         result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+                  else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
                   else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):
             self.json_response(400, {"reason": result.reason})

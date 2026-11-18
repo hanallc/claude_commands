@@ -272,6 +272,7 @@ class CompareTests(ConfiguredTestCase):
             _ = paths[index].write_text(paths[index].read_text().replace(
                 'backlog_goal: "1 - Ship Hana"', 'backlog_goal: "2 - Find Collaborators"'))
         _ = self.run_file("heldout-validation", entries)
+        _ = self.configuration(**{"error_target.backlog_goal": "0.10"})
         # .73 is between sweep points. Ten answers qualify; the eleventh,
         # wrong answer is below this configured threshold and must be excluded.
         with patch_thresholds(backlog_goal=decide.Supported(.73)), \
@@ -429,6 +430,7 @@ class CompareTests(ConfiguredTestCase):
         wrong = Path(entries[1]["issue_path"])
         _ = wrong.write_text(wrong.read_text().replace('area: "[[rendering]]"', 'area: "[[tooling]]"'))
         _ = self.run_file("gap-risk", entries)
+        _ = self.configuration(**{"error_target.area": "0.10"})
         decisions = [decide.decide_answers(record["answers"]["main"]["answers"],
                                           record["answers"]["area"]["answers"])["area"] for record in entries]
         area = section(section(self.compare("gap-risk", split="holdout"), "## Risk-coverage"), "### area")
@@ -471,6 +473,7 @@ class CompareTests(ConfiguredTestCase):
         self.assertIn("Scored: 0; failed: 1; unscored: 1", holdout_report)
 
     def test_ordinal_metrics_and_confusion_use_current_labels_in_each_group(self) -> None:
+        _ = self.configuration(title_only_character_limit="200")
         paths = [self.issue("Target A", impact=3, score=25),
                  self.issue("Target B", impact=4, score=19, body="Long issue context. " * 20),
                  self.issue("Target C", impact=1, score=20, body="[[target|" + "x" * 199 + "]]")]
@@ -496,7 +499,7 @@ class CompareTests(ConfiguredTestCase):
     def test_reliability_bucket_boundaries_and_caption_follow_the_current_config(self) -> None:
         issue = self.issue("Target A")
         _ = self.run_file("bucket-fixture", [self.record(issue)])
-        config = self.configuration()
+        config = self.configuration(reliability_bucket_count="5")
         before = section(section(self.compare("bucket-fixture"), "## Group: all (N=1)"), "#### category")
         self.assertIn("Reliability (5 confidence buckets):", before)
         self.assertEqual(len(table(before, "Confidence")), 5)
@@ -513,6 +516,7 @@ class CompareTests(ConfiguredTestCase):
         self.assertIn("Reliability (1 confidence buckets):", single)
 
     def test_probability_metrics_read_raw_answers_instead_of_synthetic_decision_probabilities(self) -> None:
+        _ = self.configuration(reliability_bucket_count="5")
         paths = [self.issue("Target A"), self.issue("Target B"), self.issue("Target C")]
         records = [self.record(path) for path in paths]
         _ = paths[1].write_text(paths[1].read_text().replace("category: feature", "category: enhancement"))
@@ -553,6 +557,7 @@ class CompareTests(ConfiguredTestCase):
         self.assertEqual(run_path.read_bytes(), before_run)
 
     def test_examples_and_admitted_style_issues_are_listed_and_excluded_from_every_metric(self) -> None:
+        _ = self.configuration(title_only_character_limit="200", disagreement_count="20")
         target = self.issue("Target A")
         _ = self.run_file("baseline", [self.record(target)])
         baseline = self.compare("baseline")
@@ -589,6 +594,7 @@ class CompareTests(ConfiguredTestCase):
         self.assertIn("fixture request failed", section(failed, "### Failed issues"))
 
     def test_choice_unfiled_with_disagreeing_orders_keeps_probabilities_and_is_never_sure(self) -> None:
+        _ = self.configuration(reliability_bucket_count="5")
         path = self.issue("Target A")
         record = self.record(path)
         _ = path.write_text(path.read_text().replace('area: "[[rendering]]"', 'area: unfiled'))
@@ -787,6 +793,7 @@ class CompareTests(ConfiguredTestCase):
         self.score_answer(records[23], "impact", {"0": 0., "1": 0., "2": 0., "3": 1., "4": 0.})
         self.score_answer(records[24], "impact", {"0": 0., "1": 0., "2": 0., "3": 0., "4": 1.})
         _ = self.run_file("disagreements", records)
+        _ = self.configuration(disagreement_count="20")
         disagreements = section(self.compare("disagreements"), "## Largest disagreements (up to 20 per field)")
         rows = table(section(disagreements, "### backlog_impact"), "Issue")
         self.assertEqual(len(rows), 20)

@@ -540,8 +540,7 @@ class StaffRoutingTests(unittest.TestCase):
                                      f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
             settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
             _ = (config / "change_review.conf").write_text(settings.read_text())
-            source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
-            _ = (config / "review_links.conf").write_text(source.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
+            _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
             environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
                            "REVIEW_LINKS_ROOT": str(root / "links"),
                            "NEXT_STATE_DIR": str(root / "next"), "FEATURE_LOG_VAULT": str(root / "vault")}
@@ -607,6 +606,10 @@ class MergeWriterRoutingTests(ProducerFixture):
 
 
 class ChangeReviewConfigTests(unittest.TestCase):
+    def test_shipped_config_has_a_review_links_directory(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+        self.assertIsInstance(conf.read(path).origin("review_links_directory", str), conf.UsableLiveValue)
+
     def test_delivery_root_reads_the_folder_setting_at_use(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -617,10 +620,9 @@ class ChangeReviewConfigTests(unittest.TestCase):
                 _ = settings.write_text(f"review_links_directory={root / 'second'}\n")
                 self.assertEqual(change_routing.review_root(), root / "second")
 
-    def test_config_keeps_the_existing_values(self) -> None:
-        from scripts.lib import conf
-
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/change_review.conf")
-        for key, expected in {'lists_directory': '~/rust/hanadocs/change-review', 'review_links_directory': '~/.local/share/review-links'}.items():
-            with self.subTest(key=key):
-                self.assertEqual(settings.text(key), expected)
+    def test_config_reads_explicit_fixture_values(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = folder / "change_review.conf"
+        _ = write_config_fixture(path, f"lists_directory={folder / 'lists'}\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(folder)}):
+            self.assertEqual(change_routing.configured_lists_directory(), folder / "lists")

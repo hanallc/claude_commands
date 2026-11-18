@@ -1,6 +1,8 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from scripts.lib.checkout_test_support import python_tool_source
 
 import importlib.util
@@ -31,7 +33,7 @@ from uuid import uuid4
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review, investigation, staff, the_list
-from scripts.review_links import accounts_page, change_browser, change_page, console, images, investigations_page, list_page, review_page, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, images, investigations_page, list_page, review_page, serve
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -45,8 +47,15 @@ class HttpReply:
 
 def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    for stem in ("review_links", "change_review", "console", "scratch"):
-        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
+    _ = write_config_fixture(configuration / "change_review.conf")
+    _ = write_config_fixture(configuration / "review_links.conf",
+        "code_check_seconds=5\ntailscale_check_seconds=60\nsnapshot_sweep_seconds=3600\n")
+    _ = write_config_fixture(configuration / "console.conf",
+        "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
+        + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
+        + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+        + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
+    _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
 
@@ -176,6 +185,31 @@ class ReviewLinksServerTests(unittest.TestCase):
         start.reset_mock()
         self.assertEqual(self.post("/disks/measure", "force=1"), (200, answer))
         start.assert_called_once_with(ANY, force=True)
+
+    def test_for_you_json_reads_global_actions_without_caching_the_response(self) -> None:
+        payload: console.ForYouPayload = {"available": True, "count": 0, "entries": []}
+        with patch.object(console, "for_you_payload", return_value=payload) as read:
+            status, headers, body = self.head("/console/for-you.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(read.call_count, 1)
+        with patch.object(console, "for_you_payload", side_effect=OSError("Fixture read failed.")):
+            reply = self.request("/console/for-you.json")
+        self.assertEqual(reply.status, 503)
+        self.assertEqual(json.loads(reply.body), {"available": False})
+
+    def test_for_you_count_view_sends_no_command_text(self) -> None:
+        row = for_you.ForYouRow("action/fixture", "action", "Long command", "x" * 70000,
+                               "mac", "/fixture", "sdlc", "Login", "Release", "", "open", "manual", "")
+        with patch.object(for_you, "read", return_value=for_you.ForYouSnapshot((row,), ())) as read:
+            status, headers, body = self.head("/console/for-you.json?view=count")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(sorted(cast(dict[str, object], json.loads(body))), ["available", "count"])
+        self.assertEqual(json.loads(body), {"available": True, "count": 1})
+        self.assertEqual(read.call_count, 1)
 
     def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -561,15 +595,22 @@ class ReviewLinksServerTests(unittest.TestCase):
                     status, content = self.post(accounts_page.PAGE_PATH, "group=units&to=claude2")
                     self.assertEqual((status, json.loads(content)), (expected, body))
                     move.assert_called_once_with("units", "claude2")
+                with self.subTest(clear=result), patch.object(accounts_page, "clear_next_move", return_value=result) as clear:
+                    status, content = self.post(accounts_page.PAGE_PATH, "group=showrunners&clear=first")
+                    self.assertEqual((status, json.loads(content)), (expected, body))
+                    clear.assert_called_once_with("showrunners")
             for form in ("", "key=account.claude1", "label=claude1&value=x", "key=account.claude1&value=x&value=y",
                          "key=account.claude1&value=x&extra=y", "group=units", "group=units&to=claude2&value=x",
-                         "key=account.claude1&to=claude2"):
+                         "key=account.claude1&to=claude2", "group=units&clear=all", "group=units&clear=",
+                         "group=units&clear=first&to=claude2", "group=units&clear=first&clear=first"):
                 with (self.subTest(form=form), patch.object(accounts_page, "save_color") as save,
-                      patch.object(accounts_page, "save_next_move") as move):
+                      patch.object(accounts_page, "save_next_move") as move,
+                      patch.object(accounts_page, "clear_next_move") as clear):
                     status, _ = self.post(accounts_page.PAGE_PATH, form)
                     self.assertEqual(status, 400)
                     save.assert_not_called()
                     move.assert_not_called()
+                    clear.assert_not_called()
         with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"new color", .5, 101)):
             self.assertEqual(self.request(accounts_page.PAGE_PATH).body, b"new color")
 
@@ -878,8 +919,13 @@ class SnapshotSweepTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-sweep-test-")))
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        settings = configuration / "review_links.conf"
+        _ = write_config_fixture(settings, "snapshot_retention_seconds=604800\nsnapshot_sweep_seconds=3600\n")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
     def test_change_image_sweep_keeps_named_and_recent_images(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "change_image_unclaimed_days=10\n")
         now = 1_800_000_000.0
         listing = self.root / "lists"
         listing.mkdir()
@@ -1218,8 +1264,7 @@ class ServerCodeRestartTests(unittest.TestCase):
         _ = server_file.write_text("# The server uses this temporary checkout.\n")
         module_file = checkout / "review_restart_fixture.py"
         _ = module_file.write_text("VALUE = 'before'\n")
-        settings = (Path(__file__).resolve().parents[2] / "config/review_links.conf").read_text()
-        _ = (checkout / "review_links.conf").write_text(settings.replace("code_check_seconds=5", "code_check_seconds=0.05"))
+        _ = write_config_fixture(checkout / "review_links.conf", "code_check_seconds=0.05\n")
         root = checkout / "snapshots"
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
@@ -1481,17 +1526,21 @@ class ReviewLinksConfigTests(unittest.TestCase):
                 self.assertEqual(serve.sweep_snapshots(root, 50), 1)
                 self.assertFalse(snapshot.exists())
 
-    def test_config_keeps_the_existing_values(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/review_links.conf")
-        for key, expected in {'unrouted_alert_recipient': 'natedev'}.items():
+    def test_shipped_config_supplies_the_settings_used_by_review_links(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = folder / "review_links.conf"
+        _ = write_config_fixture(path)
+        settings = conf.read(path)
+        values = settings.values()
+        self.assertEqual(settings.text("unrouted_alert_recipient"), values["unrouted_alert_recipient"])
+        for key in ("delivery_tries", "server_port", "snapshot_allocation_tries"):
             with self.subTest(key=key):
-                self.assertEqual(settings.text(key), expected)
-        for key, expected in {'delivery_tries': 3, 'server_port': 8765, 'snapshot_allocation_tries': 10}.items():
+                self.assertEqual(settings.whole(key), int(values[key]))
+        for key in ("page_refresh_seconds", "delivery_pause_seconds", "unrouted_alert_retry_seconds",
+                    "tailscale_timeout_seconds", "snapshot_retention_seconds", "snapshot_sweep_seconds",
+                    "tailscale_check_seconds"):
             with self.subTest(key=key):
-                self.assertEqual(settings.whole(key), expected)
-        for key, expected in {'page_refresh_seconds': 15.0, 'delivery_pause_seconds': 5.0, 'unrouted_alert_retry_seconds': 60.0, 'tailscale_timeout_seconds': 10.0, 'snapshot_retention_seconds': 604800.0, 'snapshot_sweep_seconds': 3600.0, 'tailscale_check_seconds': 60.0}.items():
-            with self.subTest(key=key):
-                self.assertEqual(settings.number(key), expected)
+                self.assertEqual(settings.number(key), float(values[key]))
 
 if __name__ == "__main__":
     _ = unittest.main()

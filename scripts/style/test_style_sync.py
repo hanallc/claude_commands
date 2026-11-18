@@ -44,6 +44,8 @@ from scripts.production.staff_test_support import fixture_unit_location, recorde
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
 from scripts.style.style_config import StyleUnitAssignment
 from scripts.message import send_budget, session_send
+from scripts.message.test_send_budget import write_configs
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -192,8 +194,11 @@ class StyleSyncTests(unittest.TestCase):
         (rule_root / "rust").mkdir(parents=True)
         for tool in ("mend", "clippy", "rustfmt"):
             _ = (rule_root / "rust" / f"{tool}.md").write_text(f"---\ntier: A\nmechanism: {tool}\n---\n# {tool}\n")
+        environment = copies_environment(self.root)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
+            "patterns.legacy-unique={purpose}{suffix}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            **copies_environment(self.root),
+            **environment,
             "HOME": str(self.root / "gate-home"),
             **interpreter_cache_environment(self.root / "cache"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
@@ -605,17 +610,12 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_handoff_budget_tracks_a_raised_cleanup_grace_without_reload(self) -> None:
         config = self.root / "send-budget-config"
-        config.mkdir()
-        for name in ("send", "postmaster", "codex_daemon"):
-            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
-            _ = (config / source.name).write_text(source.read_text())
-        postmaster_config = config / "postmaster.conf"
-        _ = postmaster_config.write_text(postmaster_config.read_text().replace("claim_grace_seconds=15.0", "claim_grace_seconds=2.0"))
+        write_configs(config)
+        _ = write_config_fixture(config / "postmaster.conf", "claim_grace_seconds=2.0\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
             budgets: list[float] = []
             for grace in (10, 80):
-                source = Path(__file__).resolve().parents[2] / "config/send.conf"
-                _ = (config / "send.conf").write_text(source.read_text().replace("kill_grace=10", f"kill_grace={grace}"))
+                _ = write_config_fixture(config / "send.conf", f"kill_grace={grace}\n")
                 with (mock.patch.object(style_sync, "runner_value", return_value="session:fixture"),
                       mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture")) as sender):
                     self.assertEqual(style_sync.handoff_notice("style", "parent", "checkpoint"), "sent")
@@ -625,17 +625,12 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_handoff_budget_tracks_raised_postmaster_wait_and_claim_grace_without_reload(self) -> None:
         config = self.root / "postmaster-budget-config"
-        config.mkdir()
-        for name in ("send", "postmaster", "codex_daemon"):
-            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
-            _ = (config / source.name).write_text(source.read_text())
+        write_configs(config)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
             budgets: list[float] = []
             for wait, grace in ((3, 2), (120, 40)):
-                source = Path(__file__).resolve().parents[2] / "config/postmaster.conf"
-                _ = (config / "postmaster.conf").write_text(source.read_text()
-                    .replace("wait_seconds=3.0", f"wait_seconds={wait}")
-                    .replace("claim_grace_seconds=15.0", f"claim_grace_seconds={grace}"))
+                _ = write_config_fixture(config / "postmaster.conf",
+                                         f"wait_seconds={wait}\nclaim_grace_seconds={grace}\n")
                 with (mock.patch.object(style_sync, "runner_value", return_value="session:fixture"),
                       mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture")) as sender):
                     self.assertEqual(style_sync.handoff_notice("style", "parent", "checkpoint"), "sent")

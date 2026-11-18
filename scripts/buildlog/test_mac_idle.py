@@ -73,8 +73,8 @@ class MacIdleTests(NotificationGuardedTestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "UNIT_RUN_DIR": str(self.root / "unit"),
         }))
-        _ = (self.root / "mac_test.conf").write_text(
-            (mac_idle.SCRIPTS.parent / "config/mac_test.conf").read_text())
+        _ = write_config_fixture(self.root / "mac_test.conf",
+                                 "alert_seconds=180\npush_seconds=600\nstale_seconds=300\n")
         self.paths.proc.mkdir()
         self.paths.mac_state.mkdir()
         self.paths.admission.mkdir(parents=True)
@@ -84,6 +84,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.process(122, 1, "455", ("claude",))
         self.process(124, 123, "457", ("bash", "-c", "step"),
                      {"BUILDLOG_CALL_ID": self.call.call_id})
+        _ = write_config_fixture(self.root / "build_admission.conf", "min_pass_gap_seconds=0\n")
         self.admission = caller_admission(self, self.root, dict(os.environ))
         _ = self.admission.occupy_host()
         with self.admission.loop_turn():
@@ -725,6 +726,10 @@ done
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         fixture.environment["VERIFY_PROC_ROOT"] = "/proc"
+        configuration = Path(fixture.environment["CONF_DIR"])
+        _ = write_config_fixture(configuration / "build_folders.conf",
+            "patterns.tool={purpose}{suffix}\npatterns.legacy-stable={purpose}\n")
+        _ = write_config_fixture(fixture.root / "build_admission.conf", "running_pass_seconds=5\n")
         _ = fixture.hold_memory()
         fixture.write_executable(fixture.bin_directory / "ssh",
                                  "#!/bin/sh\nprintf 'free_gib=0\\nhost=test-mac\\nrc=0\\n'\n")

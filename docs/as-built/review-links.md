@@ -261,18 +261,34 @@ That function returns the configured Builds page URL without publishing a readin
 The AWS entry calls `aws_page.page_url`.
 That function returns the AWS page URL without publishing the page.
 
-The bottom-left rebuild link shows only while the Rebuilds page names a machine.
-`rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
+The bottom-left `For you` button shows the global action count.
+The collapsed rail keeps an icon and badge.
+The phone header keeps a compact button.
+The nonmodal panel shows two action entries with machine names, copy buttons, and card links.
+The panel footer opens Review with the reserved parameters `type=for-you` and `show=open`.
+The foryou-page phase adds the For you filter and card expansion.
+Notifier links preserve the console query entries for other pages.
+Escape closes the panel and focuses the visible For you button.
+
+`/console/for-you.json` reads the shared action reader and uses `Cache-Control: no-store`.
+The shell reads at each `page_refresh_seconds` interval while the tab is visible.
+It also reads on visibility, focus, panel opening, and a framed `for-you-completed` message.
+A completion message during a read schedules a second read.
+A hidden tab stops the timer.
+A refresh preserves focused commands and text selections.
+A transport failure keeps the last complete count and marks it stale.
+The phone badge shows a dotted outline for a stale count in both navigation states.
+An explicit unavailable response shows `?`, including with HTTP 503.
+A known zero uses a quiet button and shows `No actions required.` in the panel.
+
+`rebuilds.url` in `config/console.conf` still names `change_page.rebuilds_url`.
 That function returns `/console/rebuilds.html`.
-The link reads that page when the console loads, then at each `page_refresh_seconds` interval while the browser tab is visible.
-Its label names each machine, with no count: **Rebuild natedev**, **Rebuild the Mac** or **Rebuild natedev and the Mac**.
-A long label wraps to a second line and stays inside the sidebar.
-The collapsed rail shows the icon with a badge of the machine count, and hover or focus shows the label.
-At phone width the link fills a bar below the page, so it never covers the page content.
-A click opens the Rebuilds page in the frame, titled **Rebuilds needed**, as a navigation entry opens its page.
-`?page=rebuilds` selects it, and the link shows an inset outline while the page is open.
-Each read of the page for the link also replaces the list on an open Rebuilds page, so that page needs no refresh of its own.
-When no machine needs a rebuild, the link hides, and an open Rebuilds page shows `No rebuilds needed.`
+`?page=rebuilds` still selects that page for commit details.
+The shell refreshes its grouped details while that page is visible.
+The status line separates session `Review:` counts from the global `For you:` action count.
+The Mac requests `/console/for-you.json?view=count` to read the count without command text.
+The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this count.
+`tailscale ip -4` returns the peer address.
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
@@ -298,8 +314,9 @@ At phone width the menu button shows the icon while any page holds new items.
 Each poll reads the change lists once, about 0.1 seconds of server time.
 The Changes and Questions items functions share that read through `NewsRequest.shared`.
 
-The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+The console vendors SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
 They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
+The Accounts page also uses `chevron-down` and `minus` from the same set.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
@@ -542,15 +559,32 @@ A refused request returns 400 with its reason.
 A failed publication returns 503 with tune's last stderr line.
 A failed save restores the prior color and shows `<name>: <reason>` in the status line.
 
-A right click on the line of a selected Claude group (`units ✓` or `showrunners ✓`) opens a menu, not the browser menu.
+The `next` column follows the role color swatch.
+A selected Claude group (`units ✓` or `showrunners ✓`) shows its first target in that account's color and bold text.
+An empty group shows gray `none`.
+Its arrow button opens the move menu with a click, Enter, or Space.
+The button exposes its menu state through ARIA attributes.
+A selected Codex workers line shows its first target, or gray `auto`, without a button.
+The `auto` title explains that Codex workers move between Codex accounts by themselves.
+Other lines show a gray Lucide minus icon; the total cell stays empty.
+An unavailable queue shows gray `unavailable`; selected Claude groups retain their buttons.
+One status read supplies both the first targets and the upcoming list.
 The menu title is **When <account> reaches <percent>%, move <group> to**.
 `next_move_percent` in `config/accounts.conf` sets the percent.
 The menu lists the other Claude accounts in board order, each with its weekly percent left when known.
-Arrow keys, Home and End move between the items. Escape, Tab, a click outside, a scroll or a resize close the menu.
+The current target has a highlight and `aria-checked="true"` with `role="menuitemradio"`.
+Arrow keys, Home and End move between the items.
+Escape, Tab, a click outside, a scroll, or a resize closes the menu.
+Focus returns to the arrow button.
+The menu stays inside the viewport.
 The page pauses refresh while the menu is open and while a move save is pending.
 A choice posts `group` and `to` to `/console/accounts.html` as form data.
 The server checks the group and the account note, then calls `next_moves.set_first_next_move()`.
 The new entry replaces the group's first next move, or becomes its only one, with no hold.
+When the group has an entry, **No next move** posts `group` and `clear=first`.
+The server calls `next_moves.remove_next_move()` at `FIRST_GROUP_POSITION`.
+It refuses a clear for an empty group.
+The cell then shows the next queued target, or `none`.
 Success clears the kept page and refreshes the board, so the upcoming moves show the new entry.
 A refused request returns 400 and a failed write returns 503, each with its reason.
 A failed move shows `<group>: <reason>` in the status line.
@@ -880,11 +914,12 @@ An agent deletes an image with this command:
 
 ### Rebuilds page
 
-`/console/rebuilds.html` lists the machines that the status line names for a rebuild, for the console's rebuild link.
+`/console/rebuilds.html` lists machines that require a rebuild and shows commit details.
+The status line shows an action count or Unavailable.
 Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
-That answer joins the cached system comparison with the open rebuild needs, so the page and the status line name the same machines.
+The page combines the cached system comparison with open rebuild needs.
 The server serves it only in a folder that holds the browser manifest.
-It has no navigation entry; the rebuild link opens it.
+It has no navigation entry; `?page=rebuilds` opens it.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
 Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then the changes grouped by owner.
