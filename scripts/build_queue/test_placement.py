@@ -1578,6 +1578,44 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             return_value=eligibility.KnownRepository("hana", "https://github.com/example/hana")))
         return settings, request
 
+    def test_hana_probe_keeps_the_workload_used_to_select_transport(self) -> None:
+        from scripts.aws_target import hana_spend
+        from scripts.build_targets import target_config
+
+        with PlacementFixture() as fixture:
+            settings, request = self.idle_hana(fixture)
+            destination = request.constraints.candidates[0].destination
+            key = fixture.server.host_evidence_key(request, destination)
+            fixture.server.host_requests[key] = request
+            read_transport = target_config.read_execution_transport
+
+            def edit_workload(target: target_config.SshTarget, *,
+                              configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                              ) -> hana.ExecutionTransport:
+                transport = read_transport(target, configuration=configuration)
+                if isinstance(transport, hana.HanaControlTransport):
+                    _ = write_config_fixture(settings, "execution_transport=ssh\n")
+                return transport
+
+            with (mock.patch.object(target_config, "read_execution_transport", side_effect=edit_workload) as read,
+                  mock.patch.object(hana_spend.HanaSpending, "preview_start", return_value=hana_spend.StartAffordable(0))):
+                evidence = fixture.read_host_evidence(key)
+            assert isinstance(evidence, placement.FreshHostEvidence), evidence
+            self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+            read.assert_called_once()
+            self.assertEqual(conf.read(settings).text("execution_transport"), "ssh")
+
+    def test_hana_probe_reports_the_path_and_key_for_duplicate_fallback_types(self) -> None:
+        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()):
+            settings, request = self.idle_hana(fixture)
+            duplicate = "c7a.4xlarge,c7a.4xlarge"
+            _ = write_config_fixture(settings, f"fallback_instance_types={duplicate}\n")
+
+            evidence = self.read_target(fixture, request)
+
+            assert isinstance(evidence, placement.HostEvidenceUnavailable), evidence
+            self.assertIn(f"{settings}: fallback_instance_types={duplicate!r}", evidence.reason)
+
     def test_idle_hana_preview_uses_the_recovered_permit(self) -> None:
         from scripts.aws_target import hana_spend
 

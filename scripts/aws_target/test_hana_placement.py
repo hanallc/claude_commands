@@ -104,8 +104,11 @@ class HanaPlacementTests(CostFixture):
     def evidence(self, request: wire.PlacementRequest) -> placement.HostEvidence:
         key = placement.HostEvidenceKey(self.assignment.destination, request.constraints.session,
             request.constraints.command, 'fixture-config', str(self.root), 'hana', request.profile.step, command_kind='check')
+        workload = conf.read(self.target.settings, load=conf.read_bytes)
+        transport = target_config.read_execution_transport(self.target, configuration=workload)
+        assert isinstance(transport, hana.HanaControlTransport), transport
         with mock.patch('time.time', self.clock), mock.patch('time.monotonic', self.clock):
-            return hana.read_evidence(key, request)
+            return hana.read_evidence(key, request, transport=transport, workload=workload)
 
     def eligibility(self) -> placement.HostEligibility:
         evidence = self.evidence(self.request())
