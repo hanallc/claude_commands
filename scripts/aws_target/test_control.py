@@ -609,7 +609,7 @@ gate_wait_usd_per_minute=0
             self.assertEqual(aws_target.main(), 1)
         read.assert_called_once_with(self.settings, self.state)
 
-    def test_scaler_policy_allows_snapshot_reads_in_all_regions(self) -> None:
+    def test_scaler_policy_allows_spot_reads_in_all_regions(self) -> None:
         document = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
         resources = ledger.mapping(document['Resources'])
         policy = ledger.mapping(ledger.mapping(resources['GateGpuTrialScalerPolicy'])['Properties'])
@@ -618,9 +618,10 @@ gate_wait_usd_per_minute=0
         # Derive IAM actions from every API request in the snapshot path.
         actions = {arguments[5].replace('-', '') + ':' + ''.join(
             word.capitalize() for word in arguments[6].split('-')) for arguments in self.calls}
-        for action in actions:
-            self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
-                                and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
+        for action in sorted(actions | {'ec2:GetSpotPlacementScores'}):
+            with self.subTest(action=action):
+                self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
+                                    and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
 
     def test_initial_failure_saves_each_error_and_the_table_names_its_time(self) -> None:
         self.failure = 'describe-spot-price-history'

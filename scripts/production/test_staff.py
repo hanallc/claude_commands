@@ -793,6 +793,20 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        mark = staff.RetiredProducer("claude:sonnet:high")
+        stopped = staff.set_producer_retirement(producer.id, mark)
+        _ = fixture_member("showrunner", name="another-production")
+        record = staff.StaffSnapshot.decode(staff.snapshot().encode())
+        self.assertEqual(record.by_id(producer.id), stopped)
+        self.assertIsNone(record.by_path(producer.name))
+        self.assertIsNone(record.by_current_session(producer.current_session))
+        self.assertNotIn(producer, staff.active(record, "producer"))
+        restored = staff.set_producer_retirement(producer.id, staff.Active())
+        self.assertEqual(restored, producer)
+        self.assertEqual(staff.snapshot().by_path(producer.name), restored)
+
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()
         record = staff.local_snapshot()

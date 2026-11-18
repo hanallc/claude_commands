@@ -140,6 +140,7 @@ The simulations exclude those policies and the live versions of the proposed gat
 If the plan cannot identify a policy to exclude, it names the policy and refuses.
 The simulations include the proposed gate policies and the proposed S3 bucket policy.
 The simulations use the regional VPC, image, and Spot request conditions.
+The plan simulates `ec2:GetSpotPlacementScores` in each gate region.
 The plan reports each region in configuration order.
 It passes when every region passes.
 
@@ -773,11 +774,13 @@ The AWS CLI reads all pages, and the reader selects the latest price for each ty
 The reader also reads applied Standard Spot and G and VT Spot quotas.
 It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
 It removes inherited administrator keys and profiles from the AWS process environment.
-The only API actions are `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
+The snapshot calls `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
 The CLI service name is `service-quotas`; the IAM prefix is `servicequotas`.
 See the [AWS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_service-quotas.html).
 The snapshot test derives IAM actions from every request in the real snapshot path.
 It checks the scaler policy for each action, all resources, and no regional condition.
+The scaler policy also allows `ec2:GetSpotPlacementScores` on all resources.
+The grant has no regional condition because a score request can name several target regions.
 A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
 The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.

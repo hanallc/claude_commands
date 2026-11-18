@@ -35,7 +35,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import atomic_file, conf, urgency
+from scripts.lib import atomic_file, conf, scratch, urgency
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import change_routing, change_review, footer_counts, next_item, record_store, showrunners, staff, unrouted_alert, update_registration
@@ -2353,8 +2353,11 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(self.http_request(path, fields).status, 400)
             self.assertEqual(self.review_list.read_bytes(), before)
             self.assertNotIn("feedback", forms.outcomes["page-owner/C4"])
-        self.assertEqual(self.http_request(path, self.browser_fields(forms, "page-owner/C4")).status, 200)
-        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        with (patch.object(scratch, "end", side_effect=conf.Unusable("scratch settings unavailable")),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.http_request(path, self.browser_fields(forms, "page-owner/C4")).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertIn("scratch not removed: scratch settings unavailable", errors.getvalue())
         self.assertEqual(self.messages, [])
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C4")
         self.assertEqual(saved["Verdict"], "works")
@@ -2373,6 +2376,16 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Pass it on by hand", self.messages[0][2])
 
     def test_a_legacy_failed_verdict_shows_the_saved_answer_and_sends_nothing(self) -> None:
+        before = self.review_list.read_bytes()
+        conflict = change_review.VerdictConflict("not works", "2026-11-01")
+        with (patch.object(change_review, "record_verdict", return_value=conflict),
+              patch.object(scratch, "end", side_effect=conf.Unusable("scratch settings unavailable")),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.request(self.page_path, self.answer()).status, 400)
+        self.assertIn("scratch not removed: scratch settings unavailable", errors.getvalue())
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assert_record_cleared()
+
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
         status = change_page.DeliveryStatus(self.root)
         _ = status.path(self.page, "C1").write_text(json.dumps({"attempt": "old", "state": "failed", "kind": "verdict"}))
@@ -3970,25 +3983,50 @@ class ChangePageTests(unittest.TestCase):
 
     def test_a_feature_log_project_saves_when_the_writer_skips_an_absent_proposal(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        configured = self.temporary / "configured-lists"
+        configured.mkdir()
+        _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=configured))
+        published = self.command(change_page, change_page.main,
+                                 ["--production", "page-owner", "--list", str(self.review_list), "C1"])
+        self.assertEqual((published.returncode, published.stderr), (0, ""))
+        path = urlsplit(published.stdout.strip()).path
+        page = change_page.page_at(self.root, path)
+        cleanup = replace(change_review.PendingVerdictCleanup.for_row(self.root, self.review_list, "C1"),
+                          verdict="works", require_git_commit=False)
         with (patch.object(subprocess, "run", wraps=subprocess.run) as commands,
               patch.object(feature_log, "project_of", wraps=feature_log.project_of) as project,
               patch.object(feature_log, "land_review", wraps=feature_log.land_review) as land,
-              patch.object(change_review, "save_verdict", wraps=change_review.save_verdict) as save):
-            reply = self.request(self.page_path, self.answer())
-        self.assertEqual((reply.status, reply.location), (303, self.page_path))
+              patch.object(change_review, "save_verdict", wraps=change_review.save_verdict) as save,
+              patch.object(scratch, "end", side_effect=conf.Unusable("scratch settings unavailable"))):
+            reply = self.request(path, dict(self.answer(), token=page.token))
+        self.assertEqual((reply.status, reply.location), (303, path))
         invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
         self.assertTrue(invocations)
         self.assertTrue(all(args[0] == "git" for args in invocations), invocations)
         project.assert_called_once_with(str(self.repo))
         land.assert_called_once_with("page-owner/C1", if_proposed=True, check_only=True)
-        save.assert_called_once_with(self.review_list, "C1", "works", self.production)
+        save.assert_called_once_with(self.review_list, "C1", "works", self.production, cleanup=cleanup)
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
         self.assertEqual(saved["Verdict"], "works")
         self.assertEqual([row["#"] for row in change_review.pending(self.review_list)], ["C2", "C3"])
-        self.assertIn("Saved: works", self.request(self.page_path, {}).body)
+        self.assertIn("Saved: works", self.request(path, {}).body)
         self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
         self.assertIn("C1 landed", self.messages[0][2])
         self.assertFalse((feature_log.state_dir() / "proposals/page-owner/C1.json").exists())
+        self.assertEqual(change_review.PendingVerdictCleanup.load(cleanup.intent, self.temporary), cleanup)
+        shutil.rmtree(self.root / path.split("/")[1])
+        before = self.review_list.read_bytes()
+        with patch.object(scratch, "end", wraps=scratch.end) as end:
+            cleanup.intent.chmod(0o644)
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+            end.assert_not_called()
+            self.assertTrue(cleanup.intent.exists())
+            cleanup.intent.chmod(0o600)
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+            end.assert_called_once_with("row:page-owner-C1")
+        self.assertFalse(cleanup.intent.exists())
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
 
     def test_works_with_feedback_lands_the_proposal_after_saving_the_verdict(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
@@ -4326,8 +4364,9 @@ class ChangePageTests(unittest.TestCase):
     def test_an_interruption_after_the_verdict_preserves_a_pending_message_for_server_recovery(self) -> None:
         save = change_review.save_verdict
 
-        def interrupt_after_verdict(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictSaved | change_review.VerdictRefused:
-            result = save(path, row, verdict, production)
+        def interrupt_after_verdict(path: Path, row: str, verdict: str, production: Path, *,
+                                    cleanup: change_review.PendingVerdictCleanup) -> change_review.VerdictSaved | change_review.VerdictRefused:
+            result = save(path, row, verdict, production, cleanup=cleanup)
             if isinstance(result, change_review.VerdictSaved):
                 raise RuntimeError("interrupted after verdict")
             return result

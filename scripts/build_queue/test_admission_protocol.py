@@ -25,6 +25,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_code, admission_records as records
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
@@ -108,7 +109,8 @@ class ProtocolTests(unittest.TestCase):
 
 
     def test_client_startup_imports_only_the_wire_without_record_readers(self) -> None:
-        for operation in ("import", "release reply"):
+        identity = wire.Identity("session", "caller", "test-modules", "/fixture", job=StepJob("test-modules", modules=3))
+        for operation in ("import", "release reply", "recorded job"):
             with self.subTest(operation=operation):
                 source = "import json, sys; from scripts.build_queue import admission_client; "
                 if operation == "release reply":
@@ -116,8 +118,15 @@ class ProtocolTests(unittest.TestCase):
                         "wire = admission_client.wire; "
                         "reply = wire.parse_reply(wire.encode_reply(wire.Ok()), wire.ReleaseRequest('request', 'reservation', 0)); "
                         "assert isinstance(reply, wire.Ok); ")
+                arguments: list[str] = []
+                if operation == "recorded job":
+                    source += (
+                        "wire = admission_client.wire; "
+                        "identity = wire.parse_record(sys.argv[1], wire.Identity); "
+                        "assert identity.job.modules == 3; ")
+                    arguments.append(wire.encode_record(identity))
                 source += "print(json.dumps(sorted(sys.modules)))"
-                result = subprocess.run([sys.executable, "-c", source],
+                result = subprocess.run([sys.executable, "-c", source, *arguments],
                     cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
                     timeout=TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -395,8 +404,13 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
 
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
+        source = Path(__file__).resolve().parents[1]
+        test_modules = {"admission_protocol_v1_fixture.py", "admission_test_support.py"}
+        admission_modules = {str(path.relative_to(source))
+                             for path in (source / "build_queue").glob("admission_*.py")
+                             if path.name not in test_modules}
+        self.assertEqual(sorted(admission_modules.difference(admission_code.ADMISSION_CODE_PATHS)), [])
         with AdmissionFixture() as fixture:
-            source = Path(__file__).resolve().parents[1]
             scripts = fixture.root / "scripts"
             for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh", "lib/py"):
                 target = scripts / relative
