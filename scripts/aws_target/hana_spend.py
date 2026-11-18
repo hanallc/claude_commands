@@ -5,6 +5,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
+import time
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import hana_guest, ledger, remote
@@ -76,6 +78,93 @@ class StorageReserved:
     exposure: ledger.HanaStorageExposure
 
 
+@dataclass(frozen=True)
+class _PreviewFileVersion:
+    path: Path
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class _PreviewFileAbsent:
+    path: Path
+
+
+type _PreviewInputs = tuple[_PreviewFileVersion | _PreviewFileAbsent, ...]
+_REPOSITORY_GATE_CONFIG = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
+
+
+def _preview_inputs(book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path) -> _PreviewInputs:
+    versions: list[_PreviewFileVersion | _PreviewFileAbsent] = []
+    for path in (book.path, book.launch_history_path, account, workload, lifecycle,
+                 conf.path('cloud_gate'), _REPOSITORY_GATE_CONFIG, *book.bill_paths()):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            versions.append(_PreviewFileAbsent(path))
+        else:
+            versions.append(_PreviewFileVersion(path, stat.st_dev, stat.st_ino, stat.st_size,
+                                                stat.st_mtime_ns, stat.st_ctime_ns))
+    return tuple(versions)
+
+
+@dataclass(frozen=True)
+class _SharedPlacementPreview:
+    inputs: _PreviewInputs
+    result: StartAffordable | PermitRefused
+    checked_at: float
+    deadline: float
+    monotonic_deadline: float
+
+
+@dataclass(frozen=True)
+class _NoPlacementPreview:
+    """The process has no reusable decision for the Hana target."""
+
+
+class _PlacementPreview:
+    """Share the most recent Hana placement preview within the process."""
+
+    def __init__(self) -> None:
+        self.lock: Lock = Lock()
+        self.cached: _SharedPlacementPreview | _NoPlacementPreview = _NoPlacementPreview()
+
+    def read(self, book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path
+             ) -> StartAffordable | PermitRefused:
+        with self.lock:
+            inputs = _preview_inputs(book, account, workload, lifecycle)
+            now, started = time.time(), time.monotonic()
+            saved = self.cached
+            if (isinstance(saved, _SharedPlacementPreview) and saved.inputs == inputs
+                    and saved.checked_at <= now < saved.deadline and started < saved.monotonic_deadline):
+                return saved.result
+            self.cached = _NoPlacementPreview()
+            with conf.diagnostics() as configuration_warnings:
+                configuration = conf.read(workload)
+                settings = read_settings(configuration)
+                try:
+                    max_age = configuration.whole('preview_max_age_s')
+                except conf.Unusable:
+                    max_age = 0
+                result = HanaSpending(book, account, settings).preview_start(int(now), int(now) + settings.permit_max_seconds)
+            # Git recovery emits a warning and can change without a live file change.
+            if max_age > 0 and not configuration_warnings and inputs == _preview_inputs(book, account, workload, lifecycle):
+                self.cached = _SharedPlacementPreview(inputs, result, now, now + max_age, started + max_age)
+            return result
+
+
+_placement_preview = _PlacementPreview()
+
+
+def preview_placement_start(book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path
+                            ) -> StartAffordable | PermitRefused:
+    """Project eligibility for a stopped Hana box."""
+    return _placement_preview.read(book, account, workload, lifecycle)
+
+
 class HanaSpending:
     """Serialize permits and lifecycle evidence with the account ledger."""
 
@@ -84,8 +173,10 @@ class HanaSpending:
         self.account_settings: Path = account_settings
         self.settings: PermitSettings = settings
 
-    def _check(self, state: ledger.LedgerEvidence, now: int) -> PermitRefused | ledger.SpendingAllowed:
-        decision = self.book.spending_decision(state, self.account_settings, now)
+    def _check(self, state: ledger.LedgerEvidence, now: int, *, placement_preview: bool = False
+               ) -> PermitRefused | ledger.SpendingAllowed:
+        assess = self.book.placement_spending_preview if placement_preview else self.book.spending_decision
+        decision = assess(state, self.account_settings, now)
         if not isinstance(decision, ledger.SpendingAllowed):
             return PermitRefused(decision.reason)
         policy = decision.evidence.policy
@@ -159,7 +250,7 @@ class HanaSpending:
             if any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_compute):
                 return PermitRefused('Confirm the previous stop before another start')
             candidate, _proposed = self._project_compute(state, now, expires)
-            decision = self._check(candidate, now)
+            decision = self._check(candidate, now, placement_preview=True)
             return decision if isinstance(decision, PermitRefused) else StartAffordable(expires)
 
     def _project_compute(self, state: ledger.LedgerEvidence, now: int, expires: int
