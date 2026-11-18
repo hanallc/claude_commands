@@ -518,8 +518,22 @@ function shownReading(data) {
   const ram = Object.fromEntries(Object.entries(source).map(([key, value]) =>
     [key, key.endsWith('_bytes') && !totals.has(key) ? leaf(value) : value]));
   ram.programs = (source.programs || []).map(program => ({...program, bytes:leaf(program.bytes)}));
+  const splitTools = recorded(source.python_tests_bytes) && recorded(source.waiting_runs_bytes);
+  const otherTools = splitTools
+    ? leaf(source.python_tests_bytes + source.waiting_runs_bytes + source.other_build_tools_bytes)
+    : ram.other_build_tools_bytes;
   ram.build_tools_bytes = recorded(source.build_tools_bytes)
-    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,ram.other_build_tools_bytes]) : source.build_tools_bytes;
+    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,otherTools]) : source.build_tools_bytes;
+  ram.build_tool_parts = [['rust-analyzer', ram.rust_analyzer_bytes], ['+ sccache', ram.sccache_bytes]];
+  if (splitTools) {
+    // Round cumulative amounts so the split keeps the previous displayed total.
+    const tests = leaf(source.python_tests_bytes);
+    const testsAndWaiting = leaf(source.python_tests_bytes + source.waiting_runs_bytes);
+    ram.build_tool_parts.push(['+ Python tests', tests], ['+ Waiting runs', testsAndWaiting - tests]);
+    if (source.other_build_tools_bytes > 0) ram.build_tool_parts.push(['+ Other build tools', otherTools - testsAndWaiting]);
+  } else {
+    ram.build_tool_parts.push(['+ Other build tools', otherTools]);
+  }
   ram.other_programs_bytes = recorded(source.other_programs_bytes)
     ? sum([...ram.programs.map(program => program.bytes),ram.smaller_programs_bytes]) : source.other_programs_bytes;
   ram.kernel_bytes = recorded(source.kernel_bytes)
@@ -569,8 +583,7 @@ function legendTip(name, bytes, caption, parts = []) {
 const TIPS = {
   'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
     ['Build tools', d.ram.build_tools_bytes], ['+ Queued builds', d.ram.queued_builds_bytes], ['+ hana CI', d.ram.ci_bytes]])),
-  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows([
-    ['rust-analyzer', d.ram.rust_analyzer_bytes], ['+ sccache', d.ram.sccache_bytes], ['+ Other build tools', d.ram.other_build_tools_bytes]])),
+  tools: d => legendTip('Build tools', d.ram.build_tools_bytes, 'RAM that build tools use now', memoryRows(d.ram.build_tool_parts)),
   queued: d => legendTip('Queued builds', d.ram.queued_builds_bytes, 'RAM of builds the queue started'),
   ci: d => legendTip('hana CI', d.ram.ci_bytes, 'RAM of hana CI programs'),
   'g-free': d => legendTip('Free RAM', d.ram.available_bytes, 'RAM that no program holds', memoryRows([

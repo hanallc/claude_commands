@@ -2507,20 +2507,33 @@ process.stdout.write(JSON.stringify({
             with self.subTest(gpu_slot=code):
                 self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
-    def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
+    def test_python_tests_and_waiting_wrappers_split_tools_without_counting_cargo_twice(self) -> None:
+        gib = admission_records.GIB
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
                 python = fixture.fixture_owner(700001, "100")
                 process = fixture.proc.path / str(python.pid)
                 _ = process.joinpath("comm").write_text("python3\n")
                 _ = process.joinpath("cmdline").write_bytes(b"python3\0-m\0unittest\0")
-                python_use = 4 * admission_records.GIB
+                proc = fixture.proc.path
+                shell, waiter_pid, helper, unknown = 700010, 700011, 700012, 700013
+                for pid, parent, use, command in (
+                    (shell, 1, gib // 4, b"bash\0/fixture/verify.sh\0test\0"),
+                    (waiter_pid, shell, gib // 4, b"python3\0local_release_wait.py\0"),
+                    (helper, shell, gib // 2, b"python3\0verify_helper.py\0"),
+                    (unknown, 1, gib, b"python3\0tree_watch.py\0"),
+                ):
+                    write_process(proc, pid, use, parent=parent)
+                    _ = (proc / str(pid) / "cmdline").write_bytes(command)
+                python_use = 4 * gib
                 builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
                 detached = builds / "builds-detached.slice"
-                write_scope(builds, current=python_use + cargo_use, anonymous=python_use + cargo_use)
-                write_scope(detached, current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                write_scope(builds, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
+                write_scope(detached, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
                 write_scope(detached / "python.scope", members=(python.pid,),
                     current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                write_scope(detached / "verify.scope", members=(shell, waiter_pid, helper, unknown),
+                            current=2 * gib, anonymous=2 * gib)
                 if cargo_use:
                     cargo = fixture.fixture_owner(700002, "200")
                     sidecar = fixture.scope(cargo, folder="builds.slice/builds-detached.slice/python.scope/cargo.scope",
@@ -2529,20 +2542,28 @@ process.stdout.write(JSON.stringify({
                     grant = only_admitted(fixture.server.handle_request(request))
                     self.assertEqual(len(fixture.server.reservations), 1)
                     self.assertIn(grant.reservation, [record.reservation_id for record in fixture.server.reservations.values()])
-                fixture.free(60 * admission_records.GIB - python_use - cargo_use)
+                fixture.free(60 * gib - python_use - cargo_use - 2 * gib)
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
-                reading = reply.reading
-                with mock.patch.object(admission_client, "view", return_value=reading):
-                    page = memory_feed.reading()
-                self.assertEqual(page["used"], cargo_use / admission_records.GIB)
-                self.assertEqual(page["ram"]["other_build_tools_bytes"], python_use)
-                build_rows = [row for row in page["walk"] if not row.get("ci", False)]
-                self.assertEqual(len(build_rows), int(bool(cargo_use)))
-                self.assertEqual(page["leftovers"], [])
-                self.assertTrue(all(row.get("queued", False) for row in build_rows))
-                room = reading.explanation.room
+                inputs = reply.reading.explanation.decided_from
+                for start_time, wrapper_use in ((str(waiter_pid), gib), ("reused pid", 0)):
+                    waiter: admission_records.Waiter = {"pid": waiter_pid, "start_time": start_time,
+                        "since": inputs.now, "need": 60 * gib, "step": "nextest", "folder": "/fixture"}
+                    reading = gate.queue_read_from(replace(inputs, ordered=[(Path("waiter"), waiter)]),
+                                                   admission_policy_fixture())
+                    with (mock.patch.object(admission_client, "view", return_value=reading),
+                          mock.patch.object(memory_feed, "PROC", proc)):
+                        page = memory_feed.reading()
+                    ram = page["ram"]
+                    self.assertEqual((ram["python_tests_bytes"], ram["waiting_runs_bytes"], ram["other_build_tools_bytes"]),
+                                     (python_use, wrapper_use, 2 * gib - wrapper_use))
+                    self.assertEqual(ram["build_tools_bytes"], python_use + 2 * gib)
+                    self.assertEqual(page["used"], cargo_use / gib)
+                    build_rows = [row for row in page["walk"] if not row.get("ci", False)]
+                    self.assertEqual(len(build_rows), int(bool(cargo_use)))
+                    self.assertTrue(all(row.get("queued", False) for row in build_rows))
+                room = reply.reading.explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
                 self.assertEqual(len(room.runs), int(bool(cargo_use)))
                 self.assertEqual(room.used, cargo_use)

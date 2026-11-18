@@ -50,7 +50,7 @@ from scripts.build_queue import admission_client, admission_protocol as wire, he
 from scripts.build_queue.queue_lines import age, plain, step_owner_name, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import OtherCommand, StepJob, StepNames, command_job, read_step_names
-from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
@@ -1674,6 +1674,8 @@ class RamBlocks(TypedDict):
     build_tools_bytes: int
     rust_analyzer_bytes: int
     sccache_bytes: int
+    python_tests_bytes: int
+    waiting_runs_bytes: int
     other_build_tools_bytes: int
     # The CI use that the queue cap counts: swap-backed use.
     ci_bytes: int
@@ -1880,19 +1882,113 @@ class BuildToolRam:
     rust_analyzer: int
     sccache: int
     other: int
+    python_tests: int = 0
+    waiting_runs: int = 0
 
 
-def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int) -> BuildToolRam:
-    """Read the builds.slice program RAM that no queued build holds, on the same basis as the queued builds.
+def python_test_command(command: tuple[str, ...]) -> bool:
+    """Identify a Python test runner from its command line."""
+    if not command or not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", Path(command[0]).name):
+        return False
+    for index, arg in enumerate(command[1:], 1):
+        if arg == "-m":
+            return command[index + 1:index + 2] in (("unittest",), ("pytest",))
+        if arg in ("-c", "-"):
+            return False
+        if not arg.startswith("-"):
+            name = Path(arg).name
+            return name in ("pytest", "py.test") or name.startswith("test_") and name.endswith(".py")
+    return False
 
-    rust-analyzer and the compiler cache have their own lines. Other build tools is the rest of builds.slice
-    (the slice reading minus the queued use and the groups that another line or block counts), plus each
-    recorded tool group outside builds.slice.
-    """
+
+@dataclass(frozen=True)
+class WaitingToolProcesses:
+    """Keep the queued process trees and the Verify wrappers within them."""
+    queued: set[int]
+    wrappers: set[int]
+
+
+def waiting_tool_processes(waiters: Sequence[admission_records.RankedWaiter],
+                           activity: ScopeActivityReader,
+                           processes: dict[int, gate.ProcessIdentity]) -> WaitingToolProcesses:
+    verify_shells = {"verify.sh"}
+    wrappers = verify_shells | {"local_release_wait.py", "tree_watch.py", "verify_helper.py"}
+
+    def runs(pid: int, programs: set[str]) -> bool:
+        return any(Path(arg).name in programs for arg in activity.command(pid)[:2])
+
+    owners = {row["pid"]: row["start_time"] for row in waiters}
+    verify_roots: dict[int, str] = {}
+    for pid, start in owners.items():
+        if pid in processes and processes[pid].start == start:
+            for parent in activity.ancestors(pid):
+                if runs(parent, verify_shells):
+                    verify_roots[parent] = processes[parent].start
+                    break
+    queued = gate.process_tree({**owners, **verify_roots}, processes)
+    verify = gate.process_tree(verify_roots, processes)
+    return WaitingToolProcesses(queued, {pid for pid in verify if runs(pid, wrappers)})
+
+
+def split_tool_groups(roots: Sequence[Path], detached: Path, activity: ScopeActivityReader,
+                      waiting: WaitingToolProcesses, excluded: set[Path], charged: set[int]) -> tuple[int, int]:
+    """Read direct cgroup charges once and split mixed groups by process use."""
+    python_tests = waiting_runs = 0
+    pending = list(roots)
+    while pending:
+        path = pending.pop()
+        if path in excluded:
+            continue
+        try:
+            procs = path / "cgroup.procs"
+            gate.check_memory_reading(procs)
+            members = {int(pid) for pid in procs.read_text().split()}
+            children = [child for child in path.iterdir() if child.is_dir()]
+        except (OSError, ValueError):
+            continue
+        pending.extend(children)
+        wrappers = (members & waiting.wrappers) - charged
+        tests = ({pid for pid in members - waiting.queued - charged if python_test_command(activity.command(pid))}
+                 if path.is_relative_to(detached) else set[int]())
+        if not (tests or wrappers):
+            continue
+        try:
+            direct = max(0, swap_backed_bytes(path) - sum(swap_backed_bytes(child) for child in children))
+        except (OSError, ValueError, KeyError):
+            continue
+        if tests == members:
+            python_tests += direct
+        elif wrappers == members:
+            waiting_runs += direct
+        else:
+            # Mixed groups need process readings to leave unrelated RAM in the remainder.
+            wrapper_use = gate.process_memory(wrappers, PROC).anonymous
+            wrapper_bytes = min(direct, wrapper_use.bytes) if isinstance(wrapper_use, admission_records.AnonymousRunUse) else 0
+            test_use = gate.process_memory(tests, PROC).anonymous
+            waiting_runs += wrapper_bytes
+            if isinstance(test_use, admission_records.AnonymousRunUse):
+                python_tests += min(direct - wrapper_bytes, test_use.bytes)
+    return python_tests, waiting_runs
+
+
+def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int,
+                   waiters: Sequence[admission_records.RankedWaiter]) -> BuildToolRam:
+    """Split the existing tool budget after the queue and service charges."""
     builds = gate.builds_slice_cgroup()
-    rust_analyzer = sccache = outside_tools = named_inside = 0
+    detached = builds / "builds-detached.slice"
+    rust_analyzer = sccache = named_inside = 0
+    outside: dict[Path, int] = {}
+    excluded = {builds / "sccache.service"}
+    charged: set[int] = set()
     for entry in running:
         memory = entry.step.measured
+        if isinstance(memory, admission_records.MeasuredMemory) and gate.running_has_reservation(entry.step):
+            source = memory.anonymous_source
+            if isinstance(source, admission_records.ScopeSource):
+                excluded.add(source.directory)
+                charged.update(source.members)
+            elif isinstance(source, admission_records.ProcessSource):
+                charged.update(item.pid for item in source.processes)
         if isinstance(memory, admission_records.CompilerServiceMemory):
             path = builds / "sccache.service"
         elif isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup and not memory.diagnostic:
@@ -1913,11 +2009,12 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
         elif (not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
               or entry.step.step == SWAP_NAMES["between"]):
             # A CI service counts in hana CI, and a run between steps counts in its queued hold.
-            pass
+            excluded.add(path)
         elif isinstance(memory.activity, ScopeProcesses) and memory.activity.program == RUST_ANALYZER:
             rust_analyzer += amount
+            excluded.add(path)
         elif not inside:
-            outside_tools += amount
+            outside[path] = outside.get(path, 0) + amount
             continue
         else:
             continue
@@ -1926,7 +2023,25 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
         slice_bytes = swap_backed_bytes(builds)
     except (OSError, ValueError, KeyError):
         slice_bytes = queued_use + named_inside
-    return BuildToolRam(rust_analyzer, sccache, max(0, slice_bytes - queued_use - named_inside) + outside_tools)
+    inside_tools = max(0, slice_bytes - queued_use - named_inside)
+    other = inside_tools + sum(outside.values())
+    if not other:
+        return BuildToolRam(rust_analyzer, sccache, other)
+    try:
+        processes = gate.process_table(PROC) if waiters else {}
+    except OSError:
+        processes = {}
+    activity = ScopeActivityReader(processes, PROC)
+    waiting = waiting_tool_processes(waiters, activity, processes)
+    roots = (builds,) if waiting.wrappers else (detached,)
+    tests, wrappers = split_tool_groups(roots, detached, activity, waiting, excluded, charged)
+    waiting_runs = min(inside_tools, wrappers)
+    python_tests = min(inside_tools - waiting_runs, tests)
+    if waiting.wrappers:
+        for path in gate.owned_scope_roots(outside, Path("/")):
+            _, wrappers = split_tool_groups((path,), detached, activity, waiting, excluded, charged)
+            waiting_runs += min(outside[path], wrappers)
+    return BuildToolRam(rust_analyzer, sccache, other - python_tests - waiting_runs, python_tests, waiting_runs)
 
 
 def known_bytes(value: RamReading) -> int:
@@ -1951,7 +2066,7 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
     other_programs_bytes = sum(amount for _, amount in ranked)
-    build_tools = tools.rust_analyzer + tools.sccache + tools.other
+    build_tools = tools.rust_analyzer + tools.sccache + tools.python_tests + tools.waiting_runs + tools.other
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
     named = (room.used + build_tools + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
@@ -1970,7 +2085,8 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "safety_missing_bytes": safety - safety_covered, "swap_missing_bytes": swap - swap_covered,
         "build_missing_bytes": build - build_covered,
         "queued_builds_bytes": room.used, "build_tools_bytes": build_tools, "rust_analyzer_bytes": tools.rust_analyzer,
-        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
+        "sccache_bytes": tools.sccache, "python_tests_bytes": tools.python_tests, "waiting_runs_bytes": tools.waiting_runs,
+        "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
         "cap_bytes": room.used + build_tools + room.ci_use + build_covered + room.room,
         "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
@@ -2051,7 +2167,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                           if activity.started_at else "not recorded", "used": gib(memory.bytes), "members": scope_members})
     tokens = token_pool(captured.available, configuration.stevie_program)
     token_stage = token_wait_stage(tokens)
-    ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used),
+    ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used, explanation.ordered),
                      explanation.now, configuration.other_rows)
     cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap
     safety = gib(captured.safety)

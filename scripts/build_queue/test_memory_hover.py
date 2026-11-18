@@ -999,6 +999,19 @@ function fitLabels() {}
         groups = cast(list[int], self.page_expression("['builds', 'free', 'else'].map(group => groupBytes(data.ram, group))", {}))
         self.assertEqual(groups, [7 * GIB, 30 * GIB, 27 * GIB])
 
+    def test_build_tool_parts_keep_the_displayed_total_and_hide_an_empty_remainder(self) -> None:
+        for remainder, python_tests, expected in (
+            (0, 264, ["+ Python tests  0.3 GiB", "+ Waiting runs  0.2 GiB"]),
+            (128, 136, ["+ Python tests  0.1 GiB", "+ Waiting runs  0.3 GiB", "+ Other build tools  0.1 GiB"]),
+        ):
+            ram = {**RAM_FIXTURE, "python_tests_bytes": python_tests * MIB, "waiting_runs_bytes": 248 * MIB,
+                   "other_build_tools_bytes": remainder * MIB}
+            with self.subTest(remainder=remainder):
+                result = self.page_expression("[tipText('tools', data), tipText('cap', data)]", {"ram": ram, "cap": 31})
+                self.assertEqual(result, [["Build tools  2.0 GiB", "\n".join([
+                    "RAM that build tools use now", "rust-analyzer  1.0 GiB", "+ sccache  0.5 GiB", *expected])],
+                    ["Queue cap  31.0 GiB", "What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB"]])
+
     def test_missing_reserves_small_amounts_and_unavailable_readings_have_their_own_text(self) -> None:
         for description, needed, covered, expected in (
                 ("Running builds grow into it.", 9, 5,

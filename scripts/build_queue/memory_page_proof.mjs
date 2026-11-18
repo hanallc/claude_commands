@@ -10,6 +10,7 @@
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
 // Use --verify-call as the third argument for the Verify column proof.
+// Use --build-tools as the third argument for the Build tools proof.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
@@ -27,12 +28,14 @@ const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(
 try {
   await mkdir(folder, {recursive:true});
   const verifyCallProof = process.argv[3] === '--verify-call';
+  const buildToolsProof = process.argv[3] === '--build-tools';
+  const focusedProof = verifyCallProof || buildToolsProof;
   const fixtureOutput = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (verifyCallProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))' + (focusedProof ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
-  const systemTemporaryRoot = verifyCallProof ? tmpdir() : fixtureOutput;
+  const systemTemporaryRoot = focusedProof ? tmpdir() : fixtureOutput;
   const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePage = process.argv[3] && !verifyCallProof ? (await readFile(process.argv[3], 'utf8'))
+  const beforePage = process.argv[3] && !focusedProof ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
@@ -224,6 +227,62 @@ try {
           fitLabels();
           })()`);
         };
+        if (buildToolsProof) {
+          const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
+          const gib = 1024**3;
+          Object.assign(ram, {python_tests_bytes: 0.25*gib, waiting_runs_bytes: 0.125*gib,
+            other_build_tools_bytes: 0.125*gib});
+          servedReading = {...base, ram};
+          const views = [];
+          for (const theme of ['dark', 'light']) {
+            for (const width of [1600, 850, 390]) {
+              await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+              await call('Emulation.setDeviceMetricsOverride', {width,height:1100,deviceScaleFactor:1,mobile:false});
+              await navigate('memory_live.html');
+              const result = await evaluate(`(() => {
+                const row = document.querySelector('.legend [data-tip="tools"]');
+                row.scrollIntoView({block:'center'});
+                const bounds = row.getBoundingClientRect();
+                showTip('tools', (bounds.left + bounds.right) / 2, bounds.top + bounds.height / 2);
+                const box = tip.getBoundingClientRect();
+                const fields = Array.from(tip.querySelectorAll('dt')).map(label => {
+                  const value = label.nextElementSibling;
+                  const fits = cell => {
+                    const limit = cell.getBoundingClientRect();
+                    const range = document.createRange();
+                    range.selectNodeContents(cell);
+                    return Array.from(range.getClientRects()).every(rect => rect.left >= limit.left - 1
+                      && rect.right <= limit.right + 1 && rect.top >= limit.top - 1 && rect.bottom <= limit.bottom + 1);
+                  };
+                  return {label:label.textContent,value:value.textContent,fits:fits(label) && fits(value),
+                    align:getComputedStyle(value).textAlign,right:value.getBoundingClientRect().right};
+                });
+                const left = Math.max(0, Math.min(box.left, bounds.left)-4);
+                const right = Math.min(innerWidth, Math.max(box.right, bounds.right)+4);
+                const top = Math.max(0, Math.min(box.top, bounds.top)-4);
+                const bottom = Math.min(innerHeight, Math.max(box.bottom, bounds.bottom)+4);
+                return {fields,amount:document.querySelector('#v-tools').textContent,
+                  visible:[box,bounds].every(rect => rect.left >= 0 && rect.right <= innerWidth
+                    && rect.top >= 0 && rect.bottom <= innerHeight),
+                  clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+              })()`);
+              const fields = result.fields.filter(field => field.label);
+              assert.deepEqual(fields.map(({label,value}) => [label,value]), [['Build tools','2.0 GiB'],
+                ['rust-analyzer','1.0 GiB'],['+ sccache','0.5 GiB'],['+ Python tests','0.3 GiB'],
+                ['+ Waiting runs','0.1 GiB'],['+ Other build tools','0.1 GiB']]);
+              assert.equal(result.amount, fields[0].value);
+              assert.ok(result.visible && fields.every(field => field.fits && field.align === 'right'
+                && Math.abs(field.right-fields[0].right) < 1), JSON.stringify({theme,width,result}));
+              views.push({theme,width});
+              if (theme === 'dark' && width === 1600) {
+                const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:result.clip});
+                await writeFile(join(folder, 'builds-tools-split-dark.png'), Buffer.from(shot.data,'base64'));
+              }
+            }
+          }
+          console.log(JSON.stringify({pass:true,views}));
+          break browserProof;
+        }
         if (verifyCallProof) {
           servedReading = readings.verify_calls;
           const views = [];
