@@ -1,14 +1,48 @@
-"""Test the prices that the hourly snapshot supplies to the AWS page."""
+"""Test AWS CLI error codes and the prices that the AWS page shows."""
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 import json
 import subprocess
+import unittest
 
 from scripts.aws_target import aws_target, ledger, spot_table
+from scripts.aws_target.aws_cli import AwsUnavailable, aws_error_code
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
+
+
+class AwsErrorCodeTests(unittest.TestCase):
+    def test_aws_error_code_reads_named_service_code(self) -> None:
+        error = AwsUnavailable('aws: [ERROR]: An error occurred (InvalidInstance.NotFound) '
+                               + 'when calling the DescribeInstances operation: fixture')
+        self.assertEqual(aws_error_code(error), 'InvalidInstance.NotFound')
+
+    def test_aws_error_code_accepts_http_status_only_when_enabled(self) -> None:
+        for status, expected in (('99', ''), ('100', '100'), ('404', '404'), ('599', '599'), ('600', '')):
+            with self.subTest(status=status):
+                error = AwsUnavailable(f'An error occurred ({status}) when calling the GetObject operation: fixture')
+                self.assertEqual(aws_error_code(error), '')
+                self.assertEqual(aws_error_code(error, allow_status=True), expected)
+                self.assertEqual(aws_error_code(error, allow_status=True, first_attempt_of='GetObject'), '')
+
+    def test_aws_error_code_requires_the_expected_operation(self) -> None:
+        for code in ('AccessDenied', '403'):
+            with self.subTest(code=code):
+                error = AwsUnavailable(f'An error occurred ({code}) when calling the GetObject operation: fixture')
+                self.assertEqual(aws_error_code(error, allow_status=True, operation='GetObject'), code)
+                self.assertEqual(aws_error_code(error, allow_status=True, operation='ListObjectsV2'), '')
+
+    def test_aws_error_code_requires_zero_retries_for_first_attempt(self) -> None:
+        for retries, expected in (('', 'UnauthorizedOperation'), (' (reached max retries: 0)', 'UnauthorizedOperation'),
+                                  (' (reached max retries: 1)', '')):
+            with self.subTest(retries=retries):
+                error = AwsUnavailable('An error occurred (UnauthorizedOperation) when calling the '
+                                       + f'RunInstances operation{retries}: fixture')
+                self.assertEqual(aws_error_code(error, operation='RunInstances'), 'UnauthorizedOperation')
+                self.assertEqual(aws_error_code(error, first_attempt_of='RunInstances'), expected)
+                self.assertEqual(aws_error_code(error, first_attempt_of='ExecuteChangeSet'), '')
 
 
 class HanaGpuSnapshotTests(CostFixture):

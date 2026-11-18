@@ -30,7 +30,7 @@ from typing import cast, final
 from uuid import uuid4
 
 from scripts.aws_target import cloud_gate, ledger, run_cost, s3_presign
-from scripts.aws_target.aws_cli import AwsExecutor, execute_command
+from scripts.aws_target.aws_cli import AwsExecutor, aws_error_code, execute_command
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, largest_gate_vcpus, spot_quota
 from scripts.aws_target.config import gate_deployment, read_settings
 from scripts.build_targets.target_config import ssh_target_state_directory
@@ -1177,15 +1177,13 @@ def gpu_aws_executor(execute: AwsExecutor) -> AwsExecutor:
         except (OSError, subprocess.SubprocessError) as error:
             raise AwsUnavailable(f'{operation}: {type(error).__name__}') from None
         if result.returncode:
-            header = re.search(
-                r'^(?:aws: \[ERROR\]: )?An error occurred \(([A-Z][A-Za-z0-9_.-]*|[1-5][0-9]{2})\) when calling (?:the )?'
-                + r'([A-Za-z0-9]+)(?: operation)?(?: \(reached max retries: ([0-9]+)\))?(?=[:\n]|$)',
-                result.stderr, re.MULTILINE)
+            error = AwsUnavailable(result.stderr.strip())
             expected = ''.join(part.capitalize() for part in operation.split('-'))
-            if header is None or header[2] != expected:
+            code = aws_error_code(error, allow_status=True, operation=expected)
+            if not code:
                 raise AwsUnavailable(f'{operation}: AwsUnavailable')
-            raise cloud_gate.AwsServiceFailure(operation, header[1],
-                                               first_attempt=operation == 'run-instances' and header[3] in (None, '0'))
+            first_attempt = operation == 'run-instances' and bool(aws_error_code(error, first_attempt_of='RunInstances'))
+            raise cloud_gate.AwsServiceFailure(operation, code, first_attempt=first_attempt)
         return result
     return call
 

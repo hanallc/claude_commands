@@ -1135,12 +1135,13 @@ class FakeGpuAws:
             self.events[-1] += ':' + prefix.rsplit('/', 1)[-1]
             if self.result_list_error:
                 return subprocess.CompletedProcess(arguments, 1, '',
-                    f'An error occurred ({self.result_list_error}) when calling ListObjectsV2')
+                    f'An error occurred ({self.result_list_error}) when calling the ListObjectsV2 operation: fixture')
             reply = {'Contents': [{'Key': key} for key in sorted(self.objects) if key.startswith(prefix)][:1]}
         elif operation == 'get-object':
             if self.fail_result:
                 self.fail_result = False
-                return subprocess.CompletedProcess(arguments, 1, '', 'An error occurred (AccessDenied) when calling GetObject')
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    'An error occurred (AccessDenied) when calling the GetObject operation: fixture')
             key = arguments[arguments.index('--key') + 1]
             self.events[-1] += ':' + key.rsplit('/', 1)[-1]
             if self.result_missing_codes:
@@ -1148,7 +1149,8 @@ class FakeGpuAws:
                 return subprocess.CompletedProcess(arguments, 1, '',
                     f'aws: [ERROR]: An error occurred ({code}) when calling the GetObject operation: Not Found')
             if key not in self.objects:
-                return subprocess.CompletedProcess(arguments, 1, '', 'An error occurred (403) when calling GetObject')
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    'An error occurred (403) when calling the GetObject operation: fixture')
             _ = Path(arguments[arguments.index('--key') + 2]).write_bytes(self.objects[key])
             reply = {}
         elif operation == 'export-credentials' and service == 'configure':
