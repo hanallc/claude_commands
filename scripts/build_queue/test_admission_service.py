@@ -7344,6 +7344,17 @@ class RunPlaceTests(unittest.TestCase):
 
 
 class AdmissionConfigurationTests(unittest.TestCase):
+    def test_invalid_remote_start_hold_is_refused_during_configuration_read(self) -> None:
+        for value in (None, "invalid", "86401"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_memory_config(root / "build_admission.conf", remote_start_hold_seconds=value)
+                with AdmissionFixture(root=root) as fixture:
+                    reply, = fixture.connect(wire.ViewRequest()).replies()
+                    self.assertIsInstance(reply, wire.Refused)
+                    assert isinstance(reply, wire.Refused)
+                    self.assertIn("remote_start_hold_seconds", reply.reason)
+
     def test_slow_requests_log_wall_cpu_and_kind_but_fast_requests_do_not(self) -> None:
         for slow_configuration in (False, True):
             with self.subTest(slow_configuration=slow_configuration), AdmissionFixture() as fixture:

@@ -305,8 +305,10 @@ def waiter_state(row: Waiter) -> QueuedWaiter | TokenWaitingWaiter:
     return QueuedWaiter(row)
 
 
-def first_queued_waiter(rows: Iterable[Waiter]) -> QueuedWaiter | NoWaiter:
+def first_queued_waiter(rows: Iterable[Waiter], pending_remote_starts: frozenset[str]) -> QueuedWaiter | NoWaiter:
     for row in rows:
+        if records.waiter_owner(row) in pending_remote_starts:
+            return QueuedWaiter(row)
         state = waiter_state(row)
         if isinstance(state, QueuedWaiter):
             return state
@@ -587,6 +589,7 @@ class UsableAdmissionConfiguration:
     progress_profile_rank: int
     peak_history_share_percent: int
     progress_profile_sweep_seconds: float
+    remote_start_hold_seconds: int
 
 
 @dataclass(frozen=True)
@@ -604,11 +607,12 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             progress_profile_rank = settings.whole("progress_profile_rank")
             peak_history_share_percent = settings.whole("peak_history_share_percent")
             progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
+            remote_start_hold_seconds = settings.whole("remote_start_hold_seconds")
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
             cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
-            progress_profile_sweep_seconds)
+            progress_profile_sweep_seconds, remote_start_hold_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -1994,7 +1998,7 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs)
-    candidate = first_queued_waiter(row for _, row in ordered)
+    candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
     safety = policy.safety_bytes
     returned_claims: set[str] = set()
@@ -2057,7 +2061,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter(row for _, row in ordered if can_use_natedev(row))
+    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2084,7 +2088,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         extra = max(0, need - held)
         reused = claim is not None
         within = reused and need <= held
-        state = waiter_state(row)
+        remote_start_pending = owner in inputs.pending_remote_starts
+        state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
@@ -2102,7 +2107,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         room_passes = not isinstance(basis, DoesNotFit)
         spacing = (inputs.spacing.at if isinstance(inputs.spacing, NextStartAt) and not due else
                    next_start.at if new_started and now < next_start.at else 0.0)
-        ready = local and fresh and (within or readable and clear and room_passes) and (reused or not spacing)
+        wait = inputs.local_waits.get(owner)
+        ready = (local and wait is None and not remote_start_pending and fresh
+                 and (within or readable and clear and room_passes) and (reused or not spacing))
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
@@ -2190,6 +2197,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         owner = records.waiter_owner(row)
         first = head_owner == owner
         within = isinstance(decision.room.basis, WithinSlot)
+        remote_start_pending = owner in inputs.pending_remote_starts
+        local_wait = inputs.local_waits.get(owner)
         if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
             reason: WaitReason = entry.state
         else:
@@ -2207,6 +2216,10 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                     cause = StartSpacingWait(decision.starts_at)
                 else:
                     cause = queue_order_reason(decision, RecordedQueueIdentities())
+            elif remote_start_pending:
+                cause = BehindHead("remote startup", row["since"], "")
+            elif isinstance(local_wait, placement.EvidenceNeeded):
+                cause = ReadingUnavailable(local_wait.reason)
             elif estimate_expired(row, now, policy):
                 cause = EstimateExpired(row.get("estimated_at", now))
             else:
