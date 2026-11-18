@@ -30,6 +30,7 @@ from scripts.production.showrunners import registered_showrunners, require_compl
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 from scripts.production import staff  # noqa: E402
+from scripts.lib import names as display_names  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
@@ -196,6 +197,8 @@ def _claude_name(owner: pane_launch.ProvedPaneConversation) -> str:
 
 def _list_panes(client: herdr.Herdr, membership: staff.StaffSnapshot) -> None:
     classifier = herdr.UnitTabClassifier(membership)
+    loaded = display_names.runtime_names()
+    showrunner_name = loaded.job("showrunner") if isinstance(loaded, display_names.Names) else "unknown"
     documents = {runner["doc"] for runner in require_complete(registered_showrunners(membership=membership))}
     showrunner_ids = {row.id for row in membership.find(kind="showrunner")
                       if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and str(row.doc.path) in documents}
@@ -215,7 +218,7 @@ def _list_panes(client: herdr.Herdr, membership: staff.StaffSnapshot) -> None:
             if isinstance(unit, herdr.UnitTab):
                 role = f"unit {unit.parent.name}/{unit.row.name}"
             elif member is not None and member.id in showrunner_ids:
-                role = "showrunner"
+                role = showrunner_name
             name = _claude_name(owner)
         print(f"{title}\t{role}\t{name}")
 
