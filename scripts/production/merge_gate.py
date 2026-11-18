@@ -2766,7 +2766,7 @@ def _sweep_nightly_slots() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}")
+        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}", allow_abbrev=False)
         if arguments[0] == "nightly-assigned":
             _ = nightly_parser.add_argument("--unit", required=True)
             _ = nightly_parser.add_argument("--result", default="")
@@ -2779,7 +2779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
             return 1
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")

@@ -35,6 +35,7 @@ class AwsSourceObjects:
             raise hana_source.SourceRefused('InvalidDeployment: source prefix is invalid')
         self.provider: hana_provider.AwsHanaProvider = provider
         self.timeout: int = configuration.whole('aws_timeout_s')
+        self.upload_timeout: int = configuration.whole('source_upload_timeout_s')
         self.url_seconds: int = configuration.whole('source_url_seconds')
         self.prefix: str = 'source/' + deployment + '/'
         self.clock: Callable[[], float] = clock
@@ -48,7 +49,10 @@ class AwsSourceObjects:
         """Use S3's conditional write instead of an existence check and upload race."""
         try:
             _ = self.provider.api.call('put-object', '--bucket', self.provider.bucket, '--key', self.key(sha256),
-                '--body', str(source), '--if-none-match', '*', service='s3api', timeout_s=self.timeout)
+                '--body', str(source), '--if-none-match', '*', service='s3api', timeout_s=self.upload_timeout)
+        except subprocess.TimeoutExpired as error:
+            raise AwsUnavailable(f'put-object: the source bundle of {source.stat().st_size} bytes did not upload '
+                                 + f'in {self.upload_timeout} s (source_upload_timeout_s)') from error
         except AwsUnavailable as error:
             if not re.search(r'\((?:PreconditionFailed|412)\)', str(error)):
                 raise
@@ -86,11 +90,15 @@ def check_inputs(source: Path, configuration: conf.ConfigRead) -> None:
     if any(row.startswith(b'160000 ') for row in copies.git(source, 'ls-files', '--stage', '-z').split(b'\0')):
         raise hana_source.SourceRefused('SubmoduleInput: source contains an unsupported Git link')
     forbidden = configuration.words('source_forbidden_paths')
-    inputs = copies.git(source, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
-    for raw in inputs.split(b'\0'):
-        path = os.fsdecode(raw)
-        if raw and (path_matches(path, 'target/') or any(path_matches(path, pattern) for pattern in forbidden)):
-            raise hana_source.SourceRefused('CredentialOrBuildInput: source contains a forbidden path')
+    # A tracked target/ folder is source; only an untracked one is build output.
+    for build_output, selection in ((False, '--cached'), (True, '--others')):
+        for raw in copies.git(source, 'ls-files', selection, '--exclude-standard', '-z').split(b'\0'):
+            path = os.fsdecode(raw)
+            if raw and (build_output and path_matches(path, 'target/')
+                        or any(path_matches(path, pattern) for pattern in forbidden)):
+                # The reason goes into UTF-8 records, so a name that is not UTF-8 shows as escapes.
+                raise hana_source.SourceRefused('CredentialOrBuildInput: source contains the forbidden path '
+                                                + raw.decode('utf-8', 'backslashreplace'))
 
 
 class SourceSender:

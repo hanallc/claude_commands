@@ -18,10 +18,12 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from threading import Event
 from typing import cast, final, override
 from unittest import mock
 
@@ -34,6 +36,7 @@ from scripts.style import unit_plans
 from scripts.style import add_style, style_config
 from scripts.style.ledger_test_support import write_style_units
 from scripts.style import approved_renames
+from scripts.style import refill_facts
 from scripts.style import style_rules
 from scripts.production import footer_counts
 from scripts.production import proposal_issue
@@ -256,6 +259,58 @@ class StyleProposalsTests(unittest.TestCase):
     def file(self, ledger: style_ledger.Ledger) -> tuple[Path, ...]:
         with redirect_stdout(io.StringIO()):
             return style_proposals.file_proposals(ledger, self.proposals, "parent").filed
+
+    def test_filing_waits_for_a_refill_writer_before_publishing_finding_results(self) -> None:
+        with self.ledger() as ledger, ThreadPoolExecutor(max_workers=1) as workers:
+            path = "docs/commands.md"
+            text = "Use the old command."
+            _ = self.commit_tip(ledger, {path: text + "\n"})
+            blob = next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == self.rename)
+            finding = ledger.hold(self.rename, path, 1, text, "restructure", text, "Use the new command.", blob, "outside")
+            # Keep the immutable inputs. The next reading only publishes the finding result.
+            _ = ledger.declaration_reading((finding.finding_id,), lambda _: False)
+            with closing(sqlite3.connect(ledger.database)) as setup, setup:
+                _ = setup.execute("DELETE FROM refill_findings WHERE finding_id=? AND view='synced'", (finding.finding_id,))
+            writer_ready, publication_started = Event(), Event()
+
+            def refill_write() -> None:
+                with closing(sqlite3.connect(ledger.database)) as writer, writer:
+                    _ = writer.execute("BEGIN IMMEDIATE")
+                    _ = writer.execute("UPDATE refill_tables SET applied_version=-1 WHERE source_table='held_findings'")
+                    writer_ready.set()
+                    _ = publication_started.wait(timeout=5)
+
+            def release_writer(statement: str) -> None:
+                if statement.startswith(("BEGIN IMMEDIATE", "INSERT OR REPLACE INTO refill_findings")):
+                    publication_started.set()
+
+            flush = refill_facts.RefillWriteBatch.flush
+
+            def flush_with_writer(batch: refill_facts.RefillWriteBatch, facts: refill_facts.RefillFacts) -> None:
+                if not batch.operations or writer_ready.is_set():
+                    flush(batch, facts)
+                    return
+                writer = workers.submit(refill_write)
+                try:
+                    self.assertTrue(writer_ready.wait(timeout=5))
+                    facts.connection.set_trace_callback(release_writer)
+                    flush(batch, facts)
+                    self.assertTrue(publication_started.is_set())
+                finally:
+                    facts.connection.set_trace_callback(None)
+                    publication_started.set()
+                    writer.result()
+
+            with mock.patch.object(refill_facts.RefillWriteBatch, "flush", flush_with_writer):
+                issue, = self.file(ledger)
+            self.assertTrue(writer_ready.is_set())
+            filed, = ledger.proposal_findings(issue)
+            self.assertEqual(filed.finding_id, finding.finding_id)
+            with closing(sqlite3.connect(ledger.database)) as reader:
+                saved = cast(tuple[str] | None, reader.execute(
+                    "SELECT finding_id FROM refill_findings WHERE finding_id=? AND view='synced'",
+                    (finding.finding_id,)).fetchone())
+            self.assertEqual(saved, (finding.finding_id,))
 
     def assign_ticket(self, ledger: style_ledger.Ledger, unit: str) -> str:
         ticket = ledger.next_ticket_id()
@@ -3491,6 +3546,63 @@ class StyleProposalsTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
             code = style_proposals.main(["follow", "--repo", str(self.repo), "--proposals", str(self.proposals), *arguments])
         return code, output.getvalue()
+
+    def test_filing_reads_a_filed_markdown_finding_after_source_history_changes(self) -> None:
+        document, source, destination = "docs/commands.md", "alpha/src/a.rs", "alpha/src/b.rs"
+        text = "Use the old command."
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {document: text + "\n"})
+            legacy, = self.judge(ledger, ((document, 1, text),), kind="restructure",
+                                 before=text, after="Use the new command.")
+            issue, = self.file(ledger)
+            with closing(sqlite3.connect(ledger.database)) as writer, writer:
+                _ = writer.execute("UPDATE held_findings SET anchor_commit='' WHERE finding_id=?", (legacy.finding_id,))
+            filed, = ledger.proposal_findings(issue)
+            _ = self.commit_tip(ledger, {source: PARENT})
+            moved, = self.judge(ledger, ((source, 1, PARENT.splitlines()[0]),), kind="restructure",
+                                 before="the old layout", after="the new layout")
+            _ = self.commit_tip(ledger, {source: None, destination: PARENT})
+            outcome_of = cast(Callable[..., style_ledger.DeclarationOutcome], getattr(ledger, "_declaration_outcome"))
+            follow = ledger.follow_declarations
+            history_changed = False
+
+            def outcome_after_history_change(finding: style_ledger.HeldFinding, *args: object) -> style_ledger.DeclarationOutcome:
+                nonlocal history_changed
+                if finding.finding_id == moved.finding_id and not history_changed:
+                    with closing(sqlite3.connect(ledger.database)) as writer, writer:
+                        _ = writer.execute("UPDATE tickets SET updated_at='concurrent update' WHERE id=?", (moved.ticket,))
+                    history_changed = True
+                return outcome_of(finding, *args)
+
+            def follow_with_history_change(ids: Iterable[str], at: str,
+                                           approved: Callable[[Path], bool]) -> style_ledger.DeclarationReading:
+                with mock.patch.object(ledger, "_declaration_outcome", side_effect=outcome_after_history_change):
+                    return follow(ids, at, approved)
+
+            with mock.patch.object(ledger, "follow_declarations", side_effect=follow_with_history_change):
+                _ = self.file(ledger)
+            self.assertTrue(history_changed)
+            self.assertIn(filed, ledger.proposal_findings(issue))
+            followed, = ledger.named_held((moved.finding_id,))
+            self.assertEqual(followed.path, destination)
+
+            ticket = "4002"
+            ledger.ticket_add(ticket, ticket_owner_id("judge"), "read", "names", "alpha", [destination], [self.rename])
+            ledger.ticket_assign(ticket, "main")
+            _ = ledger.ticket_base(ticket)
+            yielded = self.hold(ledger, ticket=ticket, file="b.rs", record=False)
+
+            def outcome_after_yield(finding: style_ledger.HeldFinding, *args: object) -> style_ledger.DeclarationOutcome:
+                outcome = outcome_of(finding, *args)
+                if finding.finding_id == yielded.finding_id:
+                    with self.ledger() as writer:
+                        _ = writer.ticket_yield(ticket, destination)
+                    _ = ledger.finding_anchor(filed)
+                return outcome
+
+            with (mock.patch.object(ledger, "_declaration_outcome", side_effect=outcome_after_yield),
+                  self.assertRaisesRegex(style_ledger.LedgerError, f"unknown held finding {yielded.finding_id}")):
+                _ = follow((yielded.finding_id, filed.finding_id), self.tip, lambda _: False)
 
     def held_list(self, *arguments: str) -> str:
         with (mock.patch.object(sys, "argv", ["style_ledger.py", "held", "list", "--repo", str(self.repo), *arguments]),

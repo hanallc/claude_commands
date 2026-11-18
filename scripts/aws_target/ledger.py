@@ -4,14 +4,15 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
 from decimal import Decimal
 from enum import Enum
 import fcntl
 import json
-from math import ceil
+from math import ceil, inf
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -255,13 +256,180 @@ def read_spot_prices(directory: Path) -> tuple[RegionalSpotPrice, ...]:
     return prices
 
 
+SPOT_PLACEMENT_RETENTION_SECONDS = 72 * 3600
+SPOT_PLACEMENT_AWS_24_HOUR_CONFIGURATION_LIMIT = 10
+SPOT_PLACEMENT_FILE = 'spot-placement-scores.json'
+
+
+class SpotPlacementScope(str, Enum):
+    REGION = 'region'
+    ZONE = 'zone'
+
+
+class SpotPlacementTypeSet(str, Enum):
+    GATE_32_VCPU = 'gate_32_vcpu'
+    ALL_GATE_TYPES = 'all_gate_types'
+
+
+@dataclass(frozen=True)
+class SpotPlacementRequest:
+    scope: SpotPlacementScope
+    type_set: SpotPlacementTypeSet
+    boxes: int
+    instance_types: tuple[str, ...]
+    regions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'instance_types', tuple(sorted(self.instance_types)))
+
+
+@dataclass(frozen=True)
+class SpotPlacementRegion:
+    region: str
+
+
+@dataclass(frozen=True)
+class SpotPlacementZone:
+    region: str
+    zone_id: str
+
+
+SpotPlacementLocation = SpotPlacementRegion | SpotPlacementZone
+
+
+@dataclass(frozen=True)
+class SpotPlacementScore:
+    location: SpotPlacementLocation
+    score: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.score <= 10:
+            raise ValueError('The Spot placement score must be between 1 and 10')
+
+
+@dataclass(frozen=True)
+class SpotPlacementSample:
+    request: SpotPlacementRequest
+    at: int
+    scores: tuple[SpotPlacementScore, ...]
+
+
+@dataclass(frozen=True)
+class SpotPlacementFailure:
+    request: SpotPlacementRequest
+    at: int
+    reason: str
+
+
+SpotPlacementReading = SpotPlacementSample | SpotPlacementFailure
+
+
+def _placement_request_words(row: dict[str, object], key: str) -> tuple[str, ...]:
+    value = row.get(key)
+    if not isinstance(value, list):
+        raise LedgerUnavailable(f'{key}: expected text entries')
+    words = cast(list[object], value)
+    if not words or any(not isinstance(word, str) or not word for word in words):
+        raise LedgerUnavailable(f'{key}: expected nonempty text entries')
+    return tuple(cast(list[str], words))
+
+
+def _decode_spot_placement(row: dict[str, object]) -> SpotPlacementReading:
+    saved = mapping(row['request'])
+    request = SpotPlacementRequest(SpotPlacementScope(text(saved, 'scope')),
+        SpotPlacementTypeSet(text(saved, 'type_set')), instant(saved, 'boxes'),
+        _placement_request_words(saved, 'instance_types'), _placement_request_words(saved, 'regions'))
+    at = instant(row, 'at')
+    if 'reason' in row:
+        return SpotPlacementFailure(request, at, text(row, 'reason'))
+
+    scores: list[SpotPlacementScore] = []
+    for score in rows(row, 'scores'):
+        location = mapping(score['location'])
+        region = text(location, 'region')
+        place = (SpotPlacementZone(region, text(location, 'zone_id')) if request.scope is SpotPlacementScope.ZONE
+                 else SpotPlacementRegion(region))
+        scores.append(SpotPlacementScore(place, instant(score, 'score')))
+    return SpotPlacementSample(request, at, tuple(scores))
+
+
+def read_spot_placement_scores(directory: Path) -> tuple[SpotPlacementReading, ...]:
+    """Read saved Spot placement results without making an AWS request."""
+    try:
+        document = mapping(cast(object, json.loads((directory / SPOT_PLACEMENT_FILE).read_text())))
+    except FileNotFoundError:
+        return ()
+    if document.get('version') != 1:
+        raise LedgerUnavailable('Unsupported Spot placement score file version')
+    return tuple(_decode_spot_placement(row) for row in rows(document, 'readings'))
+
+
+def write_spot_placement_scores(directory: Path, readings: Sequence[SpotPlacementReading], now: int) -> None:
+    """Save the last 72 hours of Spot placement results atomically."""
+    first = now - SPOT_PLACEMENT_RETENTION_SECONDS
+    kept = [asdict(reading) for reading in readings if first <= reading.at <= now]
+    write_text_atomic(directory / SPOT_PLACEMENT_FILE, json.dumps({'version': 1, 'readings': kept}) + '\n')
+
+
+class SpotQuotaClass(str, Enum):
+    STANDARD = 'standard'
+    G_AND_VT = 'g_and_vt'
+    P = 'p'
+
+
+def spot_quota_class(instance_type: str) -> SpotQuotaClass:
+    family = instance_type.partition('.')[0]
+    if family.startswith(('g', 'vt')):
+        return SpotQuotaClass.G_AND_VT
+    if family.startswith('p'):
+        return SpotQuotaClass.P
+    return SpotQuotaClass.STANDARD
+
+
+def gate_vcpus(instance_type: str) -> int:
+    """Return the vCPU count that the type's size names, or zero for an unknown size."""
+    size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', instance_type)
+    if not size:
+        return 0
+    return 2 if size[1] == 'large' else 4 * int(size[2] or '1')
+
+
+@dataclass(frozen=True)
+class SpotQuotaPool:
+    region: str
+    quota_class: SpotQuotaClass
+
+
+@dataclass(frozen=True)
+class GateQuotaRefusal:
+    pool: SpotQuotaPool
+    live_vcpus_at_refusal: int
+    at: int
+
+    def is_active(self, live_vcpus: int, now: float, cooldown: float) -> bool:
+        return live_vcpus >= self.live_vcpus_at_refusal and now < self.at + cooldown
+
+
+@dataclass(frozen=True)
+class NoSpotQuota:
+    """The snapshot has no limit for this quota class."""
+
+
 @dataclass(frozen=True)
 class SpotQuota:
-    """The Standard and the G and VT Spot vCPU quotas of one region, from the hourly snapshot."""
+    """The Spot vCPU quotas of one region from the hourly snapshot."""
     region: str
     standard_vcpus: Decimal
     gpu_vcpus: Decimal
     read_at: int
+    p_vcpus: Decimal | NoSpotQuota = NoSpotQuota()
+
+    def limit(self, quota_class: SpotQuotaClass) -> Decimal | NoSpotQuota:
+        if quota_class is SpotQuotaClass.G_AND_VT:
+            return self.gpu_vcpus
+        if quota_class is SpotQuotaClass.P:
+            return self.p_vcpus
+        return self.standard_vcpus
 
 
 def read_spot_quotas(directory: Path) -> tuple[SpotQuota, ...]:
@@ -273,8 +441,10 @@ def read_spot_quotas(directory: Path) -> tuple[SpotQuota, ...]:
     if 'regions' not in document:
         return ()
     quotas = tuple(SpotQuota(text(row, 'region'), Decimal(text(row, 'standard_vcpus')), Decimal(text(row, 'gpu_vcpus')),
-                             instant(row, 'read_at')) for row in rows(document, 'regions'))
-    if any(not row.region or row.standard_vcpus < 0 or row.gpu_vcpus < 0 or row.read_at < 0 for row in quotas):
+                             instant(row, 'read_at'), Decimal(text(row, 'p_vcpus')) if 'p_vcpus' in row else NoSpotQuota())
+                   for row in rows(document, 'regions'))
+    if any(isinstance(limit, Decimal) and (not limit.is_finite() or limit < 0)
+           for row in quotas for limit in (row.standard_vcpus, row.gpu_vcpus, row.p_vcpus)):
         raise ValueError('The regional Spot quota snapshot has invalid rows')
     return quotas
 
@@ -505,6 +675,21 @@ class LedgerEvidence:
     hana_storage: list[HanaStorageExposure] = field(default_factory=list)
     hana_lifecycle_fence: HanaLifecycleFence | HanaLifecycleUnfenced = HanaLifecycleUnfenced()
     hana_attempts: list[hana_result.HanaAttemptCharge] = field(default_factory=list)
+    gate_quota_refusals: list[GateQuotaRefusal] = field(default_factory=list)
+
+    def live_gate_vcpus(self, now: float) -> dict[SpotQuotaPool, int]:
+        counts: dict[SpotQuotaPool, int] = {}
+        for row in self.gate_reservations:
+            if isinstance(row.state, GateRunning) and row.region and row.expires > now:
+                pool = SpotQuotaPool(row.region, spot_quota_class(row.instance_type))
+                counts[pool] = counts.get(pool, 0) + gate_vcpus(row.instance_type)
+        return counts
+
+    def clear_ended_quota_refusals(self, now: float, cooldown: float) -> None:
+        if self.gate_quota_refusals:
+            counts = self.live_gate_vcpus(now)
+            self.gate_quota_refusals = [row for row in self.gate_quota_refusals
+                                        if row.is_active(counts.get(row.pool, 0), now, cooldown)]
 
 
 class ObservationRejected(ValueError):
@@ -648,6 +833,11 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0)))))
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
+    if 'gate_quota_refusals' in row:
+        evidence.gate_quota_refusals = [
+            GateQuotaRefusal(SpotQuotaPool(text(item, 'region'), SpotQuotaClass(text(item, 'quota_class'))),
+                            instant(item, 'live_vcpus_at_refusal'), instant(item, 'at'))
+            for item in rows(row, 'gate_quota_refusals') if 'at' in item]
     for inventory in evidence.inventories:
         names = [resource.name for resource in inventory.resources]
         if not names and not inventory.builder_removed or len(set(names)) != len(names):
@@ -716,6 +906,10 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                     "owner": r.owner.token if isinstance(r.owner, DeliveryOwner) else ""} for r in state.events],
         "price_refresh_at": state.price_refresh_at, "decision": state.decision,
         "charge_refresh_at": state.charge_refresh_at,
+        **({'gate_quota_refusals': [
+            {'region': row.pool.region, 'quota_class': row.pool.quota_class.value,
+             'live_vcpus_at_refusal': row.live_vcpus_at_refusal, 'at': row.at} for row in state.gate_quota_refusals]}
+           if state.gate_quota_refusals else {}),
         'gate_reservations': [
             {'attempt': r.attempt, 'at': r.at, 'expires': r.expires, 'usd_per_hour': str(r.usd_per_hour),
              'allowance_usd': str(r.allowance_usd), 'instance_type': r.instance_type, 'region': r.region,
@@ -1693,14 +1887,33 @@ class CostLedger:
                                        for row in state.gate_reservations]
             self._save(state)
 
+    def record_gate_quota_refusal(self, pool: SpotQuotaPool, now: float) -> None:
+        """Save the time and live vCPU count for the refused quota class."""
+        with self._locked() as state:
+            state.gate_quota_refusals = [row for row in state.gate_quota_refusals if row.pool != pool]
+            state.gate_quota_refusals.append(GateQuotaRefusal(pool, state.live_gate_vcpus(now).get(pool, 0), int(now)))
+            self._save(state)
+
     def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
         """Preserve confirmed termination against every later outcome."""
         with self._locked() as state:
             if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
                 return
+            now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
+            cooldown = inf
+            if state.gate_quota_refusals:
+                try:
+                    cooldown = conf.read_or_repository('cloud_gate').whole('capacity_cooldown_seconds')
+                except conf.Unusable:
+                    # Save the outcome and clear marks by count even if the cooldown is unavailable.
+                    pass
+            if isinstance(outcome, GateRunning):
+                # Clear expired marks before this launch increases the count.
+                state.clear_ended_quota_refusals(now, cooldown)
             state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
                                        if row.attempt == attempt else row for row in state.gate_reservations]
-            self._price_gates(state, self.read_bills(), int(time.time()) if isinstance(outcome, GateRunning) else outcome.at)
+            state.clear_ended_quota_refusals(now, cooldown)
+            self._price_gates(state, self.read_bills(), now)
             self._save(state)
 
     def observe(self, observation: InstanceObservation, *, confirms_transition: bool = False) -> None:

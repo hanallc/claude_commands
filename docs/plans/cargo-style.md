@@ -80,7 +80,7 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 **Repo:** cargo-liner. **Depends on:** the main-red fix in `~/.claude`.
 
-1. Copy `rust/style_reader` to `crates/cargo-style`. Package and binary `cargo-style`; `publish = false`; `[lints] workspace = true`.
+1. M1 copied the reader from `~/.claude` to `crates/cargo-style` in cargo-liner. The package and binary are `cargo-style`. The manifest sets `publish = false` and inherits workspace lints.
 2. Use the workspace pins. Changes: `sha2` 0.10.9 to the workspace 0.11.0 (digest API change), `rayon` 1.11.0 to 1.12.0, `libc` to the workspace pin. `gix =0.89.0` is the same.
 3. `cargo style` works: cargo passes `style` as the first argument; the binary accepts both forms.
 4. `cargo-style --version` prints the crate version and the request protocol version (an integer). The Python client checks both (M2).
@@ -119,8 +119,8 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 1. Delete `Cargo.toml`, `Cargo.lock`, `rust/` and `taplo.toml` at the repo root. The generic gate code then finds no Rust: `hooks/checkpoint_gate.py:883`, `production/checkpoint_gate.py:83-109`, `merge_checkpoint.py:827-834`. No code change there.
 2. Docs: `config/mac_test.conf:56-57` and `docs/direct/final_gate_commit.md:11-15` are true again with no edit. Mark the old reader plan as replaced by this plan.
-3. Config, with nate's go: delete `install_folder`, `build_limit_seconds` and `build_stop_grace_seconds` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB).
-4. Leftovers: delete the two scratch copies `reader-start-716d7d` and `reader-store-62d7e7` and their outputs under `/build/cargo/scratch` (1.3 GiB) through `scratch.py`. Clean the reader target in the Mac mirror of `.claude` through the Mac queue only.
+3. Config, with nate's go: delete `install_folder`, `build_limit_seconds` and `build_stop_grace_seconds` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB). Done 2026-11-18 (nate's go through dwight: "delete").
+4. Leftovers: delete the two scratch copies `reader-start-716d7d` and `reader-store-62d7e7` and their outputs under `/build/cargo/scratch` (1.3 GiB) through `scratch.py`. Clean the reader target in the Mac mirror of `.claude` through the Mac queue only. Done 2026-11-18.
 5. Not in this phase: `config/cloud_gate.conf:111` keeps cargo and rustc on the AWS box. builds removes them only after a `gate_trial.py` pass without them, with nate's go.
 
 **Proof:** one `~/.claude` merge and one checkpoint commit with no Rust step and no `verify.sh doc` pass; one AWS gate with zero style failures.
@@ -209,6 +209,22 @@ S3 and S4 run at the same time. Each speed phase reports its result against its 
 2. `cargo-mend/src/rust_syntax` (about 2,400 lines: parsed sources, module map, identifier rules): evaluate in S3 for the module map and declarations. cargo-mend is a binary crate; use needs a shared library, which comes only with a measured need.
 3. `cargo-berth/src/git` (about 12,800 lines): it reads refs, status, worktrees and history. The reader's Git code (197 lines) reads blobs by tree. Evaluate in S4 for history and revision comparison, where the profile shows Git cost (about 12%). Same library rule.
 4. A shared library follows the `tui_pane` pattern: a path dependency on main, and the release step pins the published version. A library that cargo-mend uses must be published.
+
+## The end state after S8
+
+Source: nate, 2026-11-17, through dwight: "At some point can we retire the python code around style mgmt?" Answer: yes. No plan holds this work yet. These rules keep S3 to S8 from making it harder.
+
+1. All style management runs in `cargo style`: selection, the ledger, the rule catalog, setup, gate, verify, checkpoint, sync, lint, bulk runs, crate runs and proposals.
+2. Python keeps only the thin adapter to the production: the reservation board, the units and the workers.
+3. The ledger after S8. Today `cargo style` reads `ledger.sqlite` read-only, and Python is its only writer (`cargo-style-api.md`, "The request").
+   1. The ledger keeps its path and its schema. No migration step.
+   2. Each Python command that writes the ledger moves to `cargo style` as one unit: its reads, its writes and its tests. After a move, `cargo style` is the only writer of those tables.
+   3. The `ledger_revision` triggers are in the schema, so the stored-answer key stays correct while both languages write.
+   4. When the last Python writer moves, `cargo-style` owns the schema and its changes.
+4. In S3 to S8, no choice puts new style logic in Python. A new answer goes into `cargo style`, and the adapter only passes it on.
+5. Tests: a check moves to Rust with its command, or it stays in Python. A check is removed only with nate's go.
+6. S7 gives an inventory: each Python file in `scripts/style` that remains after S8, with its line count and its test count. On 2026-11-17 the folder has about 41,300 lines of code and 45,500 lines of tests.
+7. The unit moves from sdlc to the cargo-liner showrunner after M3 and before S3 (nate, 2026-11-17: "Later."). M2 and M3 do not change.
 
 ## Milestones (messages to dwight)
 
