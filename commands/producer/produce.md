@@ -29,7 +29,7 @@ Give that line in the same turn or in your next report.
 Get nate's approval to change or delete a config key or to remove a check.
 Get his approval to spend money or to choose or change a name.
 Write no code. Run no builds or tests. Assign no workers. Merge nothing.
-Change no files in a production, except the plan docs that `/producer:to_production` writes.
+Change no files in a production, except the plan docs and showrunner notes that `/producer:to_production` writes.
 Do not perform an action for a peer if it was denied that action.
 
 ## Work with showrunners and morty
