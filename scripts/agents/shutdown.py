@@ -245,7 +245,7 @@ USAGE = """usage: agents COMMAND
   agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
   agents resume --production SHOWRUNNER
-  agents retire NAME
+  agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
@@ -692,6 +692,7 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--except", dest="excluded", action="append", default=[])
     command = commands.add_parser("retire")
     _ = command.add_argument("session")
+    _ = command.add_argument("--to")
     command = commands.add_parser("rename")
     _ = command.add_argument("old")
     _ = command.add_argument("new")
@@ -804,10 +805,23 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{report['machine']}: unavailable (rc {report['rc']})")
             return 0
         if options.command == "rename":
+            if (producer_lifecycle.pending_rename(options.old)
+                    or producer_lifecycle.pending_admission(options.old)
+                    or producer_lifecycle.lookup(options.old, staff.initial_snapshot()) is not None):
+                if options.to_doc or options.to_branch:
+                    raise ValueError("producer rename keeps the document folder and has no branch option")
+                return producer_lifecycle.rename(options.old, options.new, rename_repair_displays)
             return rename_named_member(options.old, options.new, to_doc=options.to_doc, to_branch=options.to_branch)
         if options.command == "retire":
+            if (producer_lifecycle.pending_admission(options.session)
+                    or producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None):
+                return producer_lifecycle.retire(options.session, to=options.to)
+            if options.to:
+                raise ValueError("--to is only for producer retirement")
             return retire_named_unit(options.session)
         if options.command == "resume" and options.retired:
+            if producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None:
+                return _result_code(producer_lifecycle.restore(options.session, to=options.to, why=options.why))
             recovery_account = (accounts.NamedAccount(options.to, accounts.account_dir(options.to))
                                 if options.to else accounts.CURRENT_ACCOUNT_SETTINGS)
             return recover_named_unit(options.session, account=recovery_account)
@@ -2201,6 +2215,13 @@ def rename_repair_displays(row: staff.StaffRow) -> bool:
         write_text_atomic(path, json.dumps(raw, indent=2) + "\n")
         changed = True
     client = herdr.Herdr(herdr.shared_session())
+    if row.kind == "producer":
+        panes = restart.read_row_panes([row], client)
+        if isinstance(panes, restart.RowPanesUnreadable):
+            raise ValueError(f"{row.name}: cannot read producer panes: {panes.reason}")
+        for _, pane in panes:
+            changed = client.retitle(pane, row.name) or changed
+        return changed
     spaces: set[str] = set()
     for pane in client.panes():
         native_sessions: set[str] = set()

@@ -719,8 +719,8 @@ class ImageQuestionTests(ImagesFixture):
         source = images.render(self.status).decode()
         positions = [source.index(f'data-question="Q{number}"') for number in range(1, 11)]
         self.assertEqual(positions, sorted(positions))
-        self.assertIn('First answer', source)
-        self.assertIn('Second answer', source)
+        self.assertIn('<h3>Answer</h3><p>First answer</p>', source)
+        self.assertIn('<h3>Answer</h3><p>Second answer</p>', source)
         self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record['id']+':Q10',)))
 
     def test_a_failed_question_send_keeps_the_record_and_retries_the_same_question(self) -> None:
@@ -860,6 +860,7 @@ class ImageQuestionTests(ImagesFixture):
                 self.assertIn(f'data-image="{other["id"]}"', content)
                 self.assertNotIn('Not sent.', content)
                 self.assertIn('The send result is unknown.', content)
+                self.assertIn('<h3>Question Q1 — waiting for an answer</h3><p>Which check passed?</p>', content)
                 self.assertEqual(images.waiting_images(console.NewsRequest(self.root)),
                                  frozenset((record['id'], other['id'])))
 

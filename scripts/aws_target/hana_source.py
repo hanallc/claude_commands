@@ -147,11 +147,11 @@ class LeasedSource:
 
 
 def git(repository: Path, limits: SourceLimits, *arguments: str, accepted: tuple[int, ...] = (0,)) -> str:
-    result = subprocess.run(['git', '-C', str(repository), *arguments], capture_output=True,
-                            text=True, timeout=limits.git_timeout_s,
+    command = ['git', '-C', str(repository), *arguments]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=limits.git_timeout_s,
                             pass_fds=build_folders.held_build_folder_descriptors())
     if result.returncode not in accepted:
-        raise SourceRefused('GitSourceRefused: ' + ' '.join(arguments[:2]))
+        raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
     return result.stdout.strip()
 
 

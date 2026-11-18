@@ -184,7 +184,7 @@ class HanaSourceTests(unittest.TestCase):
         digest = hashlib.sha256(content).hexdigest()
         self.objects.objects[digest] = content
         invalid = replace(manifest, bundle_sha256=digest, bundle_url=self.objects.signed_get(digest))
-        with self.guest(), self.assertRaisesRegex(source.SourceRefused, 'GitSourceRefused'), self.materialize(invalid):
+        with self.guest(), self.assertRaises(subprocess.CalledProcessError), self.materialize(invalid):
             self.fail('invalid bundle was admitted')
 
     def test_full_pool_uses_existing_admission_and_never_creates_an_overflow_slot(self) -> None:
@@ -315,7 +315,7 @@ class HanaSourceTests(unittest.TestCase):
         _ = copies.git(nested, 'init', '--quiet')
         _ = (nested / 'file').write_text('nested source\n')
         _ = commit_repository(nested, 'nested source')
-        with self.assertRaisesRegex(copies.PreparationError, 'NestedRepository: nested'):
+        with self.assertRaisesRegex(source.SourceRefused, 'NestedRepository: nested'):
             _ = self.prepare()
         self.assertEqual(self.objects.uploads, [])
 
@@ -344,7 +344,7 @@ class HanaSourceTests(unittest.TestCase):
                 _ = (path / 'tracked').write_text('changed during capture\n')
             return tree
         with mock.patch.object(copies, 'staged_tree', side_effect=change_during_capture):
-            with self.assertRaisesRegex(copies.PreparationError, 'SourceChanged'):
+            with self.assertRaisesRegex(copies.SourceChangedDuringCapture, 'SourceChanged'):
                 _ = self.prepare()
         self.assertEqual(index.read_bytes(), before)
         self.assertEqual(self.objects.uploads, [])

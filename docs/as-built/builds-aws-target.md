@@ -100,7 +100,7 @@ deploy.py hana-setup --plan
 ```
 
 The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
-It refuses first-time setup, pending instance or volume work, direct-owned boxes, and merge gate setup.
+It refuses first-time Hana setup, pending instance or volume work, and direct-owned boxes.
 
 The plan checks the local credential file and reads the scaler identity with STS.
 It uses the same stack, instance, disk, and parameter checks as approved setup.
@@ -114,6 +114,35 @@ The S3 simulation uses the control bucket policy from the stack template.
 If the template has no policy or the plan cannot resolve it, the plan prints a note.
 The plan then simulates S3 without a bucket policy.
 Bucket policies added outside the stack are out of scope.
+
+To plan a merge gate update, run this command in a terminal on natedev.
+
+```sh
+deploy.py up --workload merge-gates --plan
+```
+
+The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
+It holds the same controller lock as approved gate setup and image removal.
+If the controller lock is busy, the plan refuses before it contacts AWS.
+It builds the same template and parameter values as approved gate setup.
+The plan previews updates in the home region and in each configured gate region.
+It removes each change set and confirms removal before it checks scaler permissions.
+Each removal has one deadline for all deletion and confirmation calls.
+An absent stack refuses because a CREATE change set can leave a stack in `REVIEW_IN_PROGRESS`.
+The plan identity has no permission to delete a stack.
+An existing stack in `REVIEW_IN_PROGRESS` also refuses.
+In a region with a rolled-back first create, the plan checks scaler permissions.
+Approved setup must delete and recreate that regional stack.
+
+The plan reads the change sets for managed policies that the updates remove or replace.
+If a preview fails or its removal is unconfirmed, all regions that share the scaler policies refuse.
+The simulations exclude those policies and the live versions of the proposed gate scaler policies.
+If the plan cannot identify a policy to exclude, it names the policy and refuses.
+The simulations include the proposed gate policies and the proposed S3 bucket policy.
+The simulations use the regional VPC, image, and Spot request conditions.
+The plan simulates `ec2:GetSpotPlacementScores` in each gate region.
+The plan reports each region in configuration order.
+It passes when every region passes.
 
 ## Hana guest safety files
 
@@ -745,11 +774,13 @@ The AWS CLI reads all pages, and the reader selects the latest price for each ty
 The reader also reads applied Standard Spot and G and VT Spot quotas.
 It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
 It removes inherited administrator keys and profiles from the AWS process environment.
-The only API actions are `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
+The snapshot calls `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
 The CLI service name is `service-quotas`; the IAM prefix is `servicequotas`.
 See the [AWS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_service-quotas.html).
 The snapshot test derives IAM actions from every request in the real snapshot path.
 It checks the scaler policy for each action, all resources, and no regional condition.
+The scaler policy also allows `ec2:GetSpotPlacementScores` on all resources.
+The grant has no regional condition because a score request can name several target regions.
 A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
 The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.
@@ -1229,6 +1260,12 @@ The existing tree key and a second private capture detect content and executable
 Both capture paths refuse new Git links with `NestedRepository`.
 The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
 It sends no ignored files, HOME, or target output.
+
+When capture raises `SourceRefused`, offload reports the cause and ends the build before any command runs.
+This applies to pinned builds and builds that the queue places on Hana.
+If the runner cannot release the claim, the queue worker releases it after the runner exits and the lifecycle operation ends.
+A source change during capture returns status 75 with `source_changed` and requests a fresh placement.
+A Git command failure reports its cause and returns status 75 with `runner`.
 
 A frozen `SourceManifest` carries the repository key, private commit, bundle digest, signed URL, basis commits, command, features, environment, and toolchain digest.
 Its JSON fits the receiver's 65536-byte control limit.

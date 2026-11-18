@@ -53,6 +53,8 @@ from scripts.production import staff
 
 from scripts.buildlog import store
 from scripts.lib import test_phase
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -355,6 +357,19 @@ class ReservationRecord:
     place: wire.LocalPlace | wire.CloudPlace = wire.LocalPlace()
     slot_staff: staff.StaffId | records.NoEndedStepStaff = records.NoEndedStepStaff()
     cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
+    gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+
+
+def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJobNotRecorded:
+    """Keep the request's gate job or read the local caller's command."""
+    if isinstance(request.identity.job, StepJob):
+        return request.identity.job
+    step = request.profile.step
+    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity) and step in GATE_PROGRAMS:
+        job = gate_job_from_process(step, proc / str(request.owner.pid), start_time=request.owner.start_time)
+        if isinstance(job, StepJob):
+            return job
+    return GATE_JOB_NOT_RECORDED
 
 
 def step_staff(row: records.Waiter, host: str) -> staff.StaffId | records.NoEndedStepStaff:
@@ -386,6 +401,8 @@ def reservation_row(record: ReservationRecord) -> records.Reservation:
         row["build_run"] = _live_run(record.run)
         row["run_origin"] = records.CallerRun(row["build_run"])
         row["slot_staff"] = record.slot_staff
+    if isinstance(record.gate_job, StepJob):
+        row["job"] = record.gate_job
     if record.repo_identity:
         row["repo_identity"] = record.repo_identity
     if record.shape:
@@ -1761,6 +1778,8 @@ class AdmissionServer:
             "repository_name": profile.repo,
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
+        if isinstance(identity.job, StepJob):
+            row["job"] = identity.job
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -2285,7 +2304,7 @@ class AdmissionServer:
                 continue
             waiter = record.queue_waiter
             identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
-                record.step, record.worktree, waiter.get("unit", ""))
+                record.step, record.worktree, waiter.get("unit", ""), job=record.gate_job)
             sidecar = Path(record.sidecar)
             rows.append(wire.CloudRow(record.owner, identity, record.place, waiter["since"],
                 step_estimator.epoch(record.admitted_at), cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress(),
@@ -2410,7 +2429,7 @@ class AdmissionServer:
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
-                row.get("unit", ""), route=records.waiter_route(row))
+                row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED))
                 for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
@@ -2523,7 +2542,8 @@ class AdmissionServer:
                 request.test_width, request.call, stem.name, records.stored_waiter(waiting.row),
                 profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
                 profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
-                shape, run=request.run, place=request.place, cargo_folder=cargo_folder)
+                shape, run=request.run, place=request.place, cargo_folder=cargo_folder,
+                gate_job=admitted_gate_job(request, self.proc.path))
             self.writes.register(record)
             if not cloud:
                 if isinstance(request.run, wire.RunIdentity):
@@ -3567,11 +3587,12 @@ done
         self.persist()
         self.next_pass = self.clock.monotonic()
 
-    def _settle_hana_refusal(self, saved: records.SavedPlacementAssignment,
-                             report: placement.TerminalAttemptReport) -> bool:
-        """Close a Hana refusal from a settled journal for an exact unlaunched attempt."""
+    def _settle_hana_prelaunch(self, saved: records.SavedPlacementAssignment,
+                               report: placement.TerminalAttemptReport) -> bool:
+        """Close a Hana attempt when its journal confirms release before launch."""
         assignment = saved.assignment
-        if (assignment.destination.provider != "ssh" or not isinstance(report.outcome, placement.PrelaunchRefused)
+        if (assignment.destination.provider != "ssh"
+                or not isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled))
                 or not isinstance(saved.permission, placement.PermissionAvailable)):
             return False
         from scripts.aws_target import hana_placement
@@ -3592,7 +3613,8 @@ done
             return False
         settled = replace(report, path=placement.DispatchPathSettled())
         reason = report.outcome.reason
-        self._close_placement(replace(saved, terminal_report=settled), reason, placement.DoNotRetry(reason))
+        state_reason = "cancelled" if isinstance(report.outcome, placement.AttemptCancelled) else reason
+        self._close_placement(replace(saved, terminal_report=settled), state_reason, placement.DoNotRetry(reason))
         return True
 
     def _settle_attempt_reports(self, keys: PlacementEvidenceKeys) -> None:
@@ -3603,7 +3625,7 @@ done
             report = saved.terminal_report
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
-                    and self._settle_hana_refusal(saved, report)):
+                    and self._settle_hana_prelaunch(saved, report)):
                 continue
             if (isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.path, placement.DispatchPathPending)
@@ -3643,7 +3665,7 @@ done
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
             self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
-        elif not self._settle_hana_refusal(saved, report):
+        elif not self._settle_hana_prelaunch(saved, report):
             self._close_placement(saved, outcome.reason,
                 saved.retry if isinstance(saved.retry, placement.RetryAt) else
                 placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at))
@@ -3673,7 +3695,9 @@ done
                         reservation = self.reservations[request.episode]
                         with retry_cleanup(Path(reservation.path)):
                             self._end(request.episode, OwnerExited())
-                    if self._start_pending(saved):
+                    report = saved.terminal_report
+                    if (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
+                            and isinstance(report.path, placement.DispatchPathPending))):
                         key = placement.attempt_key(saved.assignment.episode, saved.assignment.attempt)
                         self.assignments[key] = replace(saved, terminal_report=placement.TerminalAttemptReport(
                             placement.AttemptCancelled(request.reason), placement.DispatchPathPending('provider settlement remains pending'),
@@ -3760,7 +3784,7 @@ done
                 retained = request.claim if isinstance(request.claim, placement.ProviderClaimReference) else saved.provider
                 refused = replace(saved, terminal_report=terminal, provider=retained,
                                   refusal_settings=request.refusal_settings)
-                if not self._settle_hana_refusal(refused, terminal):
+                if not self._settle_hana_prelaunch(refused, terminal):
                     retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
                     if self._start_pending(saved):
                         self.assignments[key] = replace(refused, retry=retry)

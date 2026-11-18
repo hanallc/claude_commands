@@ -230,8 +230,7 @@ def release_assigned(assignment: placement.PlacementAssignment, holder: placemen
         return _release_claims(controller, execution, matching)
 
 
-def _release_claims(controller: box.HanaController, execution: str, matching: tuple[claim_state.HeldClaim, ...],
-                    *, detached_only: bool = False) -> bool:
+def _release_claims(controller: box.HanaController, execution: str, matching: tuple[claim_state.HeldClaim, ...]) -> bool:
     from scripts.aws_target import hana_box as box
 
     snapshot = controller.inspect()
@@ -239,10 +238,7 @@ def _release_claims(controller: box.HanaController, execution: str, matching: tu
         return False
     current = any(claim.execution == execution for claim in snapshot.claims)
     pending = isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution
-    if detached_only:
-        if current or pending or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING):
-            return False
-    elif not matching and not current:
+    if not matching and not current:
         return not pending
     elif snapshot.claims:
         if len(snapshot.claims) != 1 or not current or not controller.release(execution):
@@ -273,7 +269,7 @@ def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) ->
 
 
 def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest) -> placement.HostEvidence:
-    """Project existing lifecycle and execution records without provider mutations."""
+    """Read provider records and release claims for ended local holders when safe."""
     from functools import partial
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
@@ -315,8 +311,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
             if ('remote_host' not in record or record['remote_host'] != transport.host
                     or execution != placement.assigned_claim_id(record['episode'], record['attempt'])
                     or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
-                    or any(row.execution == execution for row in snapshot.claims)
-                    or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution):
+                    or isinstance(snapshot.operation, box.PendingOperation)):
                 held.append(claim)
                 continue
             owner = process_start.process_start(record['pid'])
@@ -324,11 +319,18 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
                     isinstance(owner, process_start.Started) and owner.start != record['proc_start']):
                 reference = placement.ProviderClaimReference('ssh', target.name, claim.scope,
                     execution, record['episode'], record['attempt'])
-                closed = settle_unpublished_claim(controller.directory, reference,
-                    release_claim=partial(_release_claims, controller, execution, (claim,), detached_only=True),
-                    reason='The Hana start owner exited')
-                if isinstance(closed, HanaSettled):
-                    continue
+                attached = any(row.execution == execution for row in snapshot.claims)
+                # The lifecycle controller owns a start until a journal proves that dispatch did not occur.
+                if not attached or isinstance(read_claim_execution(controller.directory, reference), placement.ExecutionNotStarted):
+                    closed = settle_unpublished_claim(controller.directory, reference,
+                        release_claim=partial(_release_claims, controller, execution, (claim,)),
+                        reason='The Hana start owner exited')
+                    if isinstance(closed, HanaSettled):
+                        if attached:
+                            snapshot = controller.inspect()
+                            if not isinstance(snapshot, HanaLifecycleEvidence):
+                                return placement.HostEvidenceUnavailable(key, now, 'The Hana lifecycle evidence is unavailable')
+                        continue
             held.append(claim)
         block = mac_test.blocking_claim_block(paths, key.session)
     adopted: list[placement.AdoptedProviderClaim] = []

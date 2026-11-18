@@ -35,6 +35,7 @@ class AwsSourceObjects:
             raise hana_source.SourceRefused('InvalidDeployment: source prefix is invalid')
         self.provider: hana_provider.AwsHanaProvider = provider
         self.timeout: int = configuration.whole('aws_timeout_s')
+        self.upload_timeout: int = configuration.whole('source_upload_timeout_s')
         self.url_seconds: int = configuration.whole('source_url_seconds')
         self.prefix: str = 'source/' + deployment + '/'
         self.clock: Callable[[], float] = clock
@@ -48,7 +49,10 @@ class AwsSourceObjects:
         """Use S3's conditional write instead of an existence check and upload race."""
         try:
             _ = self.provider.api.call('put-object', '--bucket', self.provider.bucket, '--key', self.key(sha256),
-                '--body', str(source), '--if-none-match', '*', service='s3api', timeout_s=self.timeout)
+                '--body', str(source), '--if-none-match', '*', service='s3api', timeout_s=self.upload_timeout)
+        except subprocess.TimeoutExpired as error:
+            raise AwsUnavailable(f'put-object: the source bundle of {source.stat().st_size} bytes did not upload '
+                                 + f'in {self.upload_timeout} s (source_upload_timeout_s)') from error
         except AwsUnavailable as error:
             if not re.search(r'\((?:PreconditionFailed|412)\)', str(error)):
                 raise
@@ -151,7 +155,10 @@ class SourceSender:
                 features: tuple[str, ...] = ()) -> hana_source.SourceManifest:
         """Capture once, exclude acknowledged objects, and return a bounded manifest."""
         check_inputs(source, self.configuration)
-        commit = copies.capture_source(source)
+        try:
+            commit = copies.capture_source(source)
+        except copies.NestedRepository as error:
+            raise hana_source.SourceRefused(os.fsencode(str(error)).decode('utf-8', 'backslashreplace')) from error
         check_inputs(source, self.configuration)
         # Use the common Git directory so linked worktrees share acknowledgement history.
         common = copies.git(source, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip()
@@ -198,11 +205,9 @@ class SourceSender:
                 with bundle.open('wb') as output:
                     _ = output.write(header.encode())
                     output.flush()
-                    result = subprocess.run(['git', '-C', str(temporary), 'pack-objects', '--stdout'],
+                    _ = subprocess.run(['git', '-C', str(temporary), 'pack-objects', '--stdout'],
                         input=new_objects.encode(), stdout=output, stderr=subprocess.PIPE, timeout=self.limits.git_timeout_s,
-                        pass_fds=(build_folders.build_folder_lock_fd(temporary),))
-                if result.returncode:
-                    raise hana_source.SourceRefused('SourceBundleRefused: Git could not pack the snapshot delta')
+                        pass_fds=(build_folders.build_folder_lock_fd(temporary),), check=True)
             else:
                 _ = hana_source.git(temporary, self.limits, 'bundle', 'create', str(bundle), 'refs/heads/hana-source')
             if bundle.stat().st_size > self.limits.max_bytes:

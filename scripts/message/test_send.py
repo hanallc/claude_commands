@@ -953,18 +953,278 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'new-session.sock'}")
         self.assertEqual(set(self.claims("fixed-id")), {"staff:fixed", "session:new-session"})
 
-    def test_duplicate_staff_paths_refuse_without_delivery_or_queue(self) -> None:
+    def test_fixed_staff_recipient_requires_the_current_kind_before_transport(self) -> None:
+        self.session("runner-session", "runner label")
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "builds", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        self.staff_rows[runner.id] = runner
+        options = local_options(["--to", runner.id, "--recipient-kind", "showrunner", "--from", "test", "--text", "Design"])
+        self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'runner-session.sock'}"])
+        self.relayed.clear()
+
+        self.staff_rows[runner.id] = replace(runner, kind="unit", unit_type=staff.UnitDetails("direct"))
+        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as caught:
+            _ = send.send(options)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(errors.getvalue(), "send.py: staff ID fixed-runner has no current showrunner row\n")
+        self.assertEqual(self.relayed, [])
+
+    def test_fixed_staff_socket_retry_uses_the_current_row_without_the_saved_relay_name(self) -> None:
+        initial = self.claude_row("runner-session", "runner")
+        self.session("unit-session", "another-unit")
+        self.session("replacement-session", "renamed-runner")
+        address = self.relay_record(42, "another-unit")
+        observed = roster.Roster([replace(initial, reach=roster.Messageable(address))], [])
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        initial_records: list[sessions.SessionRecord] = []
+        records: list[sessions.SessionRecord] = []
+        for record in sessions.live_sessions():
+            if record["sessionId"] == runner.current_session:
+                initial_records.append({**record, "messagingSocketPath": address.removeprefix("uds:")})
+            else:
+                records.append(record)
+        replacement = replace(runner, current_session=staff.StaffId("replacement-session"))
+        demoted = replace(replacement, kind="unit", unit_type=staff.UnitDetails("direct"))
+        options = local_options(["--to", runner.id, "--recipient-kind", "showrunner", "--from", "test", "--text", "Design"])
+        for current, expected in (
+            (runner, "no live Claude session answers to staff ID fixed-runner"),
+            (demoted, "staff ID fixed-runner has no current showrunner row"),
+            (replacement, ""),
+        ):
+            with self.subTest(current=current):
+                self.fresh_repeat_history()
+                self.staff_rows[runner.id] = runner
+                attempts: list[str] = []
+
+                def transport(message: send.Message, _timeout: float) -> send.Result:
+                    attempts.append(message.to)
+                    if message.to == address:
+                        self.staff_rows[runner.id] = current
+                        return send.Result("queued", "ECONNREFUSED")
+                    return send.Result("sent", "fixture delivery")
+
+                def live() -> list[sessions.SessionRecord]:
+                    if attempts:
+                        return records
+                    return [*records, *initial_records]
+
+                with (mock.patch.object(roster, "roster", return_value=observed),
+                      mock.patch.object(sessions, "live_sessions", side_effect=live),
+                      mock.patch.object(send, "relay", side_effect=transport)):
+                    result = send.send(options)
+                if expected:
+                    self.assertEqual((result.outcome, result.detail), ("failed", f"ECONNREFUSED; {expected}"))
+                    self.assertEqual(attempts, [address])
+                else:
+                    self.assertEqual(result.outcome, "sent")
+                    self.assertEqual(attempts, [address, f"uds:{self.root / 'replacement-session.sock'}"])
+                self.assertFalse((self.root / "queue").exists())
+
+    def test_fixed_staff_retry_refuses_a_demotion_during_the_registry_read(self) -> None:
+        self.session("runner-session", "runner")
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        self.staff_rows[runner.id] = runner
+        original_socket = str(self.root / "runner-session.sock")
+        unit_socket = str(self.root / "restarted-unit.sock")
+        records = sessions.live_sessions()
+        attempts: list[str] = []
+
+        def live() -> list[sessions.SessionRecord]:
+            if not attempts:
+                return records
+            self.staff_rows[runner.id] = replace(runner, kind="unit", unit_type=staff.UnitDetails("direct"))
+            updated = [row.copy() for row in records]
+            for row in updated:
+                if row["sessionId"] == runner.current_session:
+                    row["messagingSocketPath"] = unit_socket
+            return updated
+
+        def transport(message: send.Message, _timeout: float) -> send.Result:
+            attempts.append(message.to)
+            if message.to == f"uds:{original_socket}":
+                return send.Result("queued", "ECONNREFUSED")
+            return send.Result("sent", "fixture delivery")
+
+        options = local_options(["--to", runner.id, "--recipient-kind", "showrunner", "--from", "test", "--text", "Design"])
+        with (mock.patch.object(sessions, "live_sessions", side_effect=live),
+              mock.patch.object(send, "relay", side_effect=transport)):
+            result = send.send(options)
+        self.assertEqual(result, send.Result("failed", "ECONNREFUSED; staff ID fixed-runner has no current showrunner row"))
+        self.assertEqual(attempts, [f"uds:{original_socket}"])
+        self.assertFalse((self.root / "queue").exists())
+
+    def test_fixed_staff_postmaster_refuses_a_demotion_before_publication(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock)
+        self.session("runner-session", "runner")
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        wire_entry = postmaster.wire_entry
+
+        def prepare(entry_id: str, session: sessions.SessionRecord, sender: str,
+                    destination: postmaster.ReplyDestination, text: str, deadline_ms: int) -> postmaster.OutboxEntry:
+            entry = wire_entry(entry_id, session, sender, destination, text, deadline_ms)
+            self.staff_rows[runner.id] = replace(runner, kind="unit", unit_type=staff.UnitDetails("direct"))
+            return entry
+
+        for key_args in ([], ["--key", "design"]):
+            with self.subTest(key_args=key_args):
+                self.staff_rows[runner.id] = runner
+                self.fresh_repeat_history()
+                options = local_options(["--to", runner.id, "--recipient-kind", "showrunner",
+                                         "--from", "test", "--text", "Design", *key_args])
+                with mock.patch.object(postmaster, "wire_entry", side_effect=prepare) as prepared:
+                    result = send.send(options)
+                prepared.assert_called_once()
+                self.assertEqual(result, send.Result("failed", "staff ID fixed-runner has no current showrunner row"))
+                self.assertEqual(self.relayed, [])
+                self.assertEqual(texts, [])
+                self.assertEqual(list((self.root / "postmaster" / "outbox").iterdir()), [])
+                if key_args:
+                    self.assertEqual(self.claims("design"), {})
+
+    def test_fixed_staff_postmaster_fallback_refuses_a_demoted_recipient(self) -> None:
+        self.session("runner-session", "runner")
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        self.staff_rows[runner.id] = runner
+
+        def fallback(*_args: object, **_kwargs: object) -> postmaster.RelayRequired:
+            self.staff_rows[runner.id] = replace(runner, kind="unit", unit_type=staff.UnitDetails("direct"))
+            return postmaster.RelayRequired("unclaimed", 0)
+
+        options = local_options(["--to", runner.id, "--recipient-kind", "showrunner", "--from", "test", "--text", "Design"])
+        with mock.patch.object(postmaster, "attempt", side_effect=fallback):
+            result = send.send(options)
+        self.assertEqual((result.outcome, result.detail), ("failed", "staff ID fixed-runner has no current showrunner row"))
+        self.assertEqual(self.relayed, [])
+
+    def test_interrupted_fixed_staff_check_releases_the_postmaster_reservation(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock)
+        self.session("runner-session", "runner")
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        self.staff_rows[runner.id] = runner
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        options = local_options(["--to", runner.id, "--recipient-kind", "showrunner",
+                                 "--from", "test", "--text", "Design", "--key", "design"])
+
+        with (mock.patch.object(send, "_current_staff_session", side_effect=KeyboardInterrupt) as check,
+              self.assertRaises(KeyboardInterrupt)):
+            _ = send.send(options)
+        check.assert_called_once()
+        self.assertEqual(texts, [])
+        self.assertEqual(list((self.root / "postmaster" / "outbox").iterdir()), [])
+        self.assertEqual(self.claims("design"), {})
+
+        result = send.send(options)
+        self.assertEqual(result, send.Result("sent", "postmaster; verbatim; session:runner-session"))
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(self.relayed, [])
+
+    def test_keyed_postmaster_refuses_demotion_during_lock_acquisition(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock)
+        self.session("runner-session", "runner")
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        self.staff_rows[runner.id] = runner
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        options = local_options(["--to", runner.id, "--recipient-kind", "showrunner",
+                                 "--from", "test", "--text", "Design", "--key", "design"])
+        outbox = self.root / "postmaster" / "outbox"
+        locked = send.locked
+
+        @contextmanager
+        def demote_on_publication_lock() -> Generator[None]:
+            if next(outbox.glob(".*.json.tmp"), None) is not None:
+                self.staff_rows[runner.id] = replace(runner, kind="unit", unit_type=staff.UnitDetails("direct"))
+            with locked():
+                yield
+
+        with mock.patch.object(send, "locked", demote_on_publication_lock):
+            result = send.send(options)
+        self.assertEqual(result, send.Result("failed", "staff ID fixed-runner has no current showrunner row"))
+        self.assertEqual(texts, [])
+        self.assertEqual(list(outbox.iterdir()), [])
+        self.assertEqual(self.claims("design"), {})
+
+        self.staff_rows[runner.id] = runner
+        self.assertEqual(send.send(options), send.Result("sent", "postmaster; verbatim; session:runner-session"))
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(self.relayed, [])
+
+    def test_fixed_staff_codex_delivery_refuses_a_thread_change_during_roster_lookup(self) -> None:
+        producer = staff.StaffRow(staff.StaffId("fixed-producer"), "producer", "producer", staff.StaffRoot(),
+                                  current_session=staff.StaffId("previous-thread"))
+        self.staff_rows[producer.id] = producer
+        known = daemon_session_row(self.daemon_owner(), producer.current_session, producer.name)
+
+        def observe(*_args: object, **_kwargs: object) -> roster.Roster:
+            self.staff_rows[producer.id] = replace(producer, current_session=staff.StaffId("new-thread"))
+            return roster.Roster([known], [])
+
+        options = local_options(["--to", producer.id, "--recipient-kind", "producer",
+                                 "--from", "test", "--text", "Design"])
+        with (mock.patch.object(roster, "roster", side_effect=observe),
+              mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue):
+            self.assertEqual(send.send(options), send.Result("failed", "the session changed for staff ID fixed-producer"))
+        queue.assert_not_called()
+        self.assertEqual(self.relayed, [])
+
+    def test_fixed_staff_recipient_refuses_session_aliases_and_offline_queueing(self) -> None:
+        self.session("alias", "another showrunner")
+        alias = staff.StaffRow(staff.StaffId("different-id"), "showrunner", "another", staff.StaffRoot(),
+                               current_session=staff.StaffId("alias"))
+        offline = replace(alias, id=staff.StaffId("offline"), current_session=staff.StaffId("offline-session"))
+        self.staff_rows[alias.id] = alias
+        self.staff_rows[offline.id] = offline
+        for target, expected in (
+            ("alias", "staff ID alias has no current showrunner row"),
+            ("offline", "no live session answers to staff ID offline"),
+        ):
+            with self.subTest(target=target):
+                options = local_options(["--to", target, "--recipient-kind", "showrunner", "--text", "Design"])
+                with (redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as caught,
+                      mock.patch.object(send, "enqueue") as enqueue):
+                    _ = send.send(options)
+                self.assertEqual(caught.exception.code, 2)
+                self.assertEqual(errors.getvalue(), f"send.py: {expected}\n")
+                enqueue.assert_not_called()
+        self.assertEqual(self.relayed, [])
+
+    def test_refused_staff_targets_do_not_deliver_or_queue(self) -> None:
         parent = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("runner"))
         rows = [parent, *(staff.StaffRow(staff.StaffId(identity), "unit", "resources", staff.ReportsTo(parent.id),
                                         current_session=staff.StaffId(identity), unit_type=staff.UnitDetails("direct")) for identity in ("one", "two"))]
-        self.staff_rows = {row.id: row for row in rows}
-        for target in ("resources", "builds/resources"):
-            errors = io.StringIO()
-            with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
-                _ = send.send(local_options(["--to", target, "--text", "hello"]))
-            self.assertEqual(stopped.exception.code, 2)
-            self.assertIn(f"ambiguous staff row for {target!r}", errors.getvalue())
+        retired = staff.StaffRow(staff.StaffId("producer-fixed"), "producer", "planner", staff.StaffRoot(),
+                                 current_session=staff.StaffId("producer-current"),
+                                 retirement=staff.RetiredProducer("claude:sonnet:high"))
+        self.staff_rows = {row.id: row for row in (*rows, retired)}
+        cases = (
+            (("resources", "builds/resources"), "ambiguous staff row for {target!r}"),
+            ((retired.id, f"session:{retired.id}"), "{target}: planner is a retired producer"),
+        )
+        for targets, reason in cases:
+            for target in targets:
+                with self.subTest(target=target):
+                    errors = io.StringIO()
+                    with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+                        _ = send.send(local_options(["--to", target, "--text", "hello"]))
+                    self.assertEqual(stopped.exception.code, 2)
+                    self.assertIn(reason.format(target=target), errors.getvalue())
         self.assertEqual(self.relayed, [])
         self.assertFalse((self.root / "queue").exists())
 
@@ -5457,6 +5717,20 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
                     forwarded = self.forwarded()[-1]
                     self.assertEqual(forwarded[forwarded.index("--to") + 1], address)
         self.assertEqual(self.relayed + self.daemon_calls, [])
+
+    def test_remote_fixed_staff_recipient_forwards_the_id_and_required_kind(self) -> None:
+        peer = self.row("runner", "session:runner-session")
+        self.staff_rows.clear()
+        runner = staff.StaffRow(staff.StaffId("fixed-runner"), "showrunner", "runner", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        self.staff_rows[runner.id] = runner
+        self.peer([peer])
+        status, output, errors = self.run_main(runner.id, "--recipient-kind", "showrunner")
+        self.assertEqual((status, errors), (0, ""), output)
+        forwarded = self.forwarded()[-1]
+        self.assertEqual(forwarded[forwarded.index("--to") + 1], runner.id)
+        self.assertEqual(forwarded[forwarded.index("--recipient-kind") + 1], "showrunner")
+        self.assertEqual(self.relayed, [])
 
     def test_remote_only_claude_worker_and_daemon_recipients_forward_their_addresses(self) -> None:
         for address in ("session:peer", "worker:peer-run/impl", "codex:peer-thread"):

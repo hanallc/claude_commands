@@ -309,6 +309,32 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                             attempt.assignment.episode, attempt.assignment.attempt)].state, placement.ClosedAssignment)
                             for attempt in saved), repr(saved) + result.stdout + result.stderr)
 
+    def test_prelaunch_failure_ends_pinned_and_placed_builds_after_one_attempt(self) -> None:
+        self.configure("natedev,linux")
+        _ = self.hold_memory()
+        self.write_executable(self.runner, r'''
+import os
+from pathlib import Path
+import sys
+
+assert "--assignment-file" in sys.argv
+with (Path(os.environ["TEST_RUNNER_STATE"]) / "source-captures").open("a") as attempts:
+    attempts.write("capture\n")
+Path(sys.argv[sys.argv.index("--result") + 1]).write_text(
+    "outcome=prelaunch_failed\ntarget=linux\nreason=\nseconds=0\n")
+print("The build did not run on linux. Fix the source refusal (IgnoredInput).")
+raise SystemExit(1)
+''')
+        captures = self.runner_state / "source-captures"
+        for target in (("--target", "linux"), ()):
+            with self.subTest(pinned=bool(target)):
+                captures.unlink(missing_ok=True)
+                result = self.verify("check", "sample", *target)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(captures.read_text().splitlines(), ["capture"])
+                self.assertEqual(result.stdout.count("The build did not run on linux."), 1)
+                self.assertEqual(self.local_runs(), [])
+
     def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
         from scripts.mac_test import eligibility, offload
 

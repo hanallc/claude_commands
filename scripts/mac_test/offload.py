@@ -283,6 +283,13 @@ class FailedOnTarget:
 
 
 @dataclass(frozen=True)
+class HanaSourceCaptureRefused:
+    """Hana rejected the source before the command started."""
+    reason: str
+    seconds: float
+
+
+@dataclass(frozen=True)
 class UnclaimedMacRun:
     """The runner must acquire capacity before execution."""
 
@@ -317,7 +324,8 @@ class AttemptEvidence:
 
 
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
+    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+    | BusyMacDecline | HanaSourceCaptureRefused
 )
 
 
@@ -1230,6 +1238,12 @@ def write_result(
             print(f"mac_test: this ran on {label}. Treat the failure as real. Fix it in the local worktree.")
         else:
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
+    elif isinstance(result, HanaSourceCaptureRefused):
+        mac = "prelaunch_failed"
+        reason = ""
+        status = 1
+        cause = " ".join(result.reason.splitlines())
+        print(f"mac_test: The build did not run on {label}. Fix the Hana source refusal ({cause}) and run the build again.")
     elif isinstance(result, LostMacRun):
         mac = "lost"
         reason = result.detail if target else ""
@@ -1243,8 +1257,8 @@ def write_result(
         if isinstance(result, DeclinedMacRun) and result.reason == "disk":
             reason = "disk"
             description = f"disk: {result.detail}" if result.detail else reason
-        elif isinstance(result, DeclinedMacRun) and result.reason == "source_changed":
-            reason = "source_changed"
+        elif isinstance(result, DeclinedMacRun) and result.reason in ("source_changed", "runner"):
+            reason = result.reason
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({description})")
     fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
@@ -2745,8 +2759,9 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                      request: OffloadRequest, repository: KnownRepository, started: float) -> MacOffloadResult:
     """Keep the checked remote waiter until exact command and lifecycle settlement."""
     from scripts.aws_target import hana_box as box, hana_execution as execution, hana_placement as hana
-    from scripts.aws_target import hana_result, hana_transport
+    from scripts.aws_target import hana_result, hana_source, hana_transport
     from scripts.build_queue import admission_client
+    from scripts.copies import copies
     from scripts.buildlog import record
 
     if not isinstance(request.placement, AssignedOffloadRequest):
@@ -2768,10 +2783,7 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     controller.placement = request.placement
     controller.pending = PendingHanaOperation()
 
-    def close_prelaunch(reason: str) -> MacOffloadResult:
-        reference = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
-            assignment.destination.scope, placement.assigned_claim_id(assignment.episode, assignment.attempt),
-            assignment.episode, assignment.attempt)
+    def settle_prelaunch(reference: placement.ProviderClaimReference, reason: str) -> None:
         closed = execution.settle_unpublished_claim(lifecycle.directory, reference,
             release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=reason)
         if isinstance(closed, execution.HanaSettled):
@@ -2783,7 +2795,6 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         elif execution.execution_command_settled(lifecycle.directory, reference.claim_id):
             controller.pending = PendingHanaOperation(placement.PrelaunchRefused(reason))
             evidence.execution = placement.ExecutionNotStarted()
-        return DeclinedMacRun('state', elapsed_seconds(started), reason)
 
     claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     while isinstance(claim, hana.HanaClaimPending) and time.time() < claim.deadline:
@@ -2793,9 +2804,15 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     if isinstance(claim, (hana.HanaClaimPending, hana.HanaClaimRetained)):
         evidence.provider = claim.reference
-        return close_prelaunch('The Hana startup wait ended before command dispatch')
+        reason = 'The Hana startup wait ended before command dispatch'
+        settle_prelaunch(claim.reference, reason)
+        return DeclinedMacRun('state', elapsed_seconds(started), reason)
     if isinstance(claim, hana.HanaClaimRefused):
-        return close_prelaunch(claim.reason)
+        reference = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
+            assignment.destination.scope, placement.assigned_claim_id(assignment.episode, assignment.attempt),
+            assignment.episode, assignment.attempt)
+        settle_prelaunch(reference, claim.reason)
+        return DeclinedMacRun('state', elapsed_seconds(started), claim.reason)
     evidence.provider = claim.reserved.claim.reference
     # SourceSender owns source policy, snapshot creation, and immutable bundle publication.
     sender = hana_transport.SourceSender(MeasuredHanaSource(hana_transport.AwsSourceObjects(
@@ -2814,16 +2831,20 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             hana_result.LogicalStepLink(request.call_id, assignment.episode),
             current_source_key=lambda: hana_source_key(request), environment=dict(request.environment),
             features=tuple(dict.fromkeys(features)))
+    except hana_source.SourceRefused as error:
+        reason = str(error)
+        settle_prelaunch(claim.reserved.claim.reference, reason)
+        return HanaSourceCaptureRefused(reason, elapsed_seconds(started))
+    except copies.SourceChangedDuringCapture as error:
+        prepared = execution.ExecutionPreparationRefused(str(error))
+    except (copies.CopyError, subprocess.SubprocessError) as error:
+        reason = f'The Hana source capture failed: {error}'
+        settle_prelaunch(claim.reserved.claim.reference, reason)
+        return DeclinedMacRun('runner', elapsed_seconds(started), reason)
     except (OSError, ValueError, RuntimeError, ConnectionError) as error:
         prepared = execution.ExecutionPreparationRefused(f'The Hana source capture failed: {error}')
     if isinstance(prepared, execution.ExecutionPreparationRefused):
-        closed = execution.settle_unpublished_claim(lifecycle.directory, claim.reserved.claim.reference,
-            release_claim=lambda: hana.release_assigned(assignment, holder, lifecycle), reason=prepared.reason)
-        if isinstance(closed, execution.HanaSettled):
-            controller.hana_settlement = closed
-            controller.pending = SettledDispatchOperations()
-            evidence.cleanup = 'confirmed'
-            evidence.unresolved_count = 0
+        settle_prelaunch(claim.reserved.claim.reference, prepared.reason)
         return DeclinedMacRun('source_changed', elapsed_seconds(started), prepared.reason)
 
     def permission() -> box.CommandPermission | box.ClaimRefused:
@@ -2871,12 +2892,12 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                     continue
                 else:
                     reason = 'The captured Hana source needs a complete bundle'
-                    complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
                     source_update_sent = True
                     try:
+                        complete = sender.retry_complete(request.source_root, prepared.manifest, basis)
                         _ = execution.publish_source_update(lifecycle.directory, prepared, complete, objects)
-                    except (OSError, ValueError, RuntimeError, ConnectionError):
-                        reason = 'The Hana source update publication is unresolved'
+                    except (OSError, ValueError, RuntimeError, copies.CopyError, subprocess.SubprocessError) as error:
+                        reason = f'The Hana source update publication is unresolved: {error}'
                         break
                     time.sleep(configuration.whole('control_poll_seconds'))
                     continue
@@ -3203,6 +3224,8 @@ def persist_attempt(request: OffloadRequest, result: MacOffloadResult,
     }
     if isinstance(result, LostMacRun):
         attempt["reason"] = result.detail
+    if isinstance(result, HanaSourceCaptureRefused):
+        attempt["reason"] = result.reason
     if isinstance(result, (DeclinedMacRun, BusyMacDecline)):
         attempt["reason"] = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
     record.ssh_attempt(attempt)

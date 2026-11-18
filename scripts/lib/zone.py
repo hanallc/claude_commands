@@ -144,8 +144,8 @@ def broadcast_on_mac(text: str) -> tuple[bool, str]:
 def notice(zone: str, before: str) -> str:
     now = datetime.now(ZoneInfo(zone))
     label = now.tzname() or zone
-    return (f"From /zone ({now:%H:%M} {label}): the user's time zone is now {zone} ({label}, {_offset(now)}); "
-            + f"it was {before}. config/user_zone.conf says so on both machines. Write every time you give the user "
+    return (f"The user's time zone is now {zone} ({label}, {_offset(now)}) as of {now:%H:%M} {label}; it was {before}. "
+            + "config/user_zone.conf says so on both machines. Write every time you give the user "
             + f"in {label}, with its label. Read the clock with TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) "
             + "date '+%H:%M %Z', never with bare date, because each machine's clock keeps its own zone. "
             + "Scripts that read user_zone.py change by themselves. Change any note of yours that names the old zone.")
@@ -181,28 +181,29 @@ def set_zone(name: str) -> int:
     if conf.resolve() != config.path(STEM).resolve():
         raise Refusal(f"{conf} is not the live settings file {config.path(STEM)}")
     checkout = checkout_of(conf)
-    before = stored(conf)
     print(f"zone: {describe(zone)}")
     delivered = True
-    if before == zone:
+    label = datetime.now(ZoneInfo(zone)).tzname() or zone
+    message = f"{SUBJECT}{zone}): set with /zone ({label})"
+    saved = live_settings.stage_save(live_settings.WaitingChange(STEM, KEY, zone, message))
+    if isinstance(saved, live_settings.UnchangedSave):
         print("was: the same; nothing to change")
     else:
+        before = saved.replaced_value
         print(f"was: {before}")
-        label = datetime.now(ZoneInfo(zone)).tzname() or zone
-        message = f"{SUBJECT}{zone}): set with /zone ({label})"
-        _ = live_settings.stage(live_settings.WaitingChange(STEM, KEY, zone, message))
         print(f"live now: {KEY}={zone}")
-        mac = live_settings.write_mac(STEM, KEY, zone)
+        mac = live_settings.write_mac(STEM, KEY, zone, order=saved.order)
         print(mac)
-        text = notice(zone, before)
-        if mac.startswith("mac: live now"):
-            delivered, summary = broadcast(text, here=False)
-        else:
-            since = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M %Z")
-            queue(main_publish.PendingMacPull(label=zone, text=text, since=since, reason=mac))
-            _ = mac_wake.start()
-            delivered, summary = broadcast(text, here=True)
-        print(f"broadcast: {summary}")
+        if not isinstance(mac, live_settings.MacWriteSuperseded):
+            text = notice(zone, before)
+            if mac.startswith("mac: live now"):
+                delivered, summary = broadcast(text, here=False)
+            else:
+                since = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M %Z")
+                queue(main_publish.PendingMacPull(label=zone, text=text, since=since, reason=mac))
+                _ = mac_wake.start()
+                delivered, summary = broadcast(text, here=True)
+            print(f"broadcast: {summary}")
     try:
         lines = live_settings.publish(checkout, wait=True) or []
     except (Refusal, OSError) as error:
