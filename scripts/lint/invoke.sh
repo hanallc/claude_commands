@@ -23,6 +23,9 @@ fi
 [[ "${1:-}" == --prepare-temp ]] && return 0
 LINT_INVOKE_SOURCED=1
 
+source "${BASH_SOURCE[0]%/*}/../build_hold/override_guard.sh" || return 2
+BUILD_HELPER_ROOT="$(build_helper_root "${BASH_SOURCE[0]}")" || return 2
+
 # macOS sandboxes cannot nest. A dependency whose build script shells out to
 # Swift Package Manager — apple-cf, apple-metal, screencapturekit, anything
 # wrapping a macOS framework — makes SwiftPM call sandbox-exec, which fails
@@ -33,7 +36,7 @@ SANDBOX_SIGNATURE='sandbox_apply: Operation not permitted'
 
 # Lint policy. Missing reader means every check runs — a caller must never be
 # silently under-verified because a config script moved.
-LINT_CONFIG_READER="${LINT_CONFIG_READER:-$HOME/.claude/scripts/lint/lint_config.sh}"
+LINT_CONFIG_READER="${LINT_CONFIG_READER:-$BUILD_HELPER_ROOT/lint/lint_config.sh}"
 if [[ -f "$LINT_CONFIG_READER" ]]; then
     # shellcheck source=/dev/null
     source "$LINT_CONFIG_READER"
@@ -106,10 +109,10 @@ fi
 # charges that compiler to the step that names its scope. sccache hashes CARGO_*
 # variables and the variables that rustc dependency data names. No crate reads
 # BUILDLOG_STEP_SCOPE, so the name keeps cache keys unchanged.
-BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
+BUILDLOG_RECORD="$BUILD_HELPER_ROOT/buildlog/record.py"
 BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; BUILDLOG_STEP_SCOPE="$cgroup"; export BUILDLOG_STEP_SCOPE; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
 BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
-source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
+source "$BUILD_HELPER_ROOT/lint/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
     return 2
 }
@@ -125,7 +128,7 @@ buildlog_now() {
 
 buildlog_read_context() {
     local context known_folder="${BUILD_TARGET_DIR:-${BUILDLOG_TEST_TARGET_DIR:-}}"
-    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$HOME/.claude/scripts/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
+    context="$(BUILDLOG_KNOWN_TARGET_DIR="$known_folder" "$BUILD_HELPER_ROOT/lib/py" "${BUILDLOG_RECORD%/*}/step_context.py" step-context ${1+"$@"} <<< "${GATE_METADATA:-}" 2>/dev/null)" || context=$'\n'
     BUILDLOG_TREE="${context%%$'\n'*}"
     BUILDLOG_TARGET_FOLDER="${context#*$'\n'}"
 }
@@ -183,7 +186,7 @@ buildlog_exec() {
 buildlog_write_step() {
     BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
         BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" \
-        "$HOME/.claude/scripts/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
+        "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
 
 # buildlog_end STATUS LOG TTY ARGV...
@@ -354,6 +357,38 @@ buildlog_exec_with_progress() {
         buildlog_exec "$@"
 }
 
+cargo_seed_needed() {
+    [[ "${OSTYPE:-}" == linux* && -f "${BUILD_FOLDERS_SCRIPT%/*}/cargo_seed.py" ]] || return 1
+    local command="${1:-}" argument directory="${CARGO_BUILD_BUILD_DIR:-}" cwd evidence workspace target extra
+    if [[ "${command##*/}" == env ]]; then
+        shift
+        while [[ "${1:-}" == RUSTC_WRAPPER=* || "${1:-}" == RUSTC_WORKSPACE_WRAPPER=* ]]; do shift; done
+        command="${1:-}"
+        [[ "${command##*/}" == cargo ]] || return 0
+    fi
+    [[ "${command##*/}" == cargo ]] || return 1
+    for argument in "$@"; do
+        case "$argument" in
+            --) break ;;
+            --config|--config=*|--manifest-path|--manifest-path=*|--target-dir|--target-dir=*|-C|-C=*|+*) return 0 ;;
+        esac
+    done
+    if [[ -z "$directory" ]]; then
+        cwd=$(pwd -P) || return 0
+        IFS=$'\t' read -r evidence workspace target directory extra <<< "${BUILDLOG_OUTPUT_ROOTS:-}"
+        [[ -n "$evidence" && "$workspace" == "$cwd" && "$target" == /* && -z "$extra" ]] || return 0
+    fi
+    if [[ "$directory" == /* && ( -e "$directory" || -L "$directory" ) ]]; then
+        return 1
+    fi
+    return 0
+}
+
+cargo_seed_before_step() {
+    local script="${BUILD_FOLDERS_SCRIPT%/*}/cargo_seed.py"
+    "${script%/*}/py" "$script" "$@"
+}
+
 run_step_attempt() {
     buildlog_check_nested_step || return $?
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
@@ -385,7 +420,7 @@ run_step_attempt() {
         buildlog_begin "$@" || true
     fi
     BUILDLOG_PLACEMENT_PREPARED=0
-    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
+    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0 seed_notice="" seed_checked=0
     if buildlog_step_compiles "$@"; then
         while :; do
             buildlog_wait_for_memory "$@" || {
@@ -405,7 +440,17 @@ run_step_attempt() {
                 return 2
             fi
             if build_hold_check_local; then
-                break
+                if (( seed_checked != 0 )) || ! cargo_seed_needed "$@"; then
+                    break
+                fi
+                seed_checked=1
+                seed_notice=$(cargo_seed_before_step "$@" 2>/dev/null) || seed_notice="cargo seed: helper failed. Starting cold."
+                [[ -z "$seed_notice" ]] || printf '%s\n' "$seed_notice"
+                if build_hold_check_local; then
+                    break
+                else
+                    status=$?
+                fi
             else
                 status=$?
             fi
@@ -466,13 +511,14 @@ run_step_attempt() {
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
         log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
+        [[ -z "$seed_notice" ]] || printf '%s\n' "$seed_notice" > "$log" || true
         if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
             ln -sf -- "$log" "$BUILDLOG_PEAK.progress.log"
         fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
         buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
-            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
@@ -569,6 +615,9 @@ sweep_after_step() {
     # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
+        if [[ "${DOC_COPY_LEASE_FD:-}" =~ ^[0-9]+$ ]]; then
+            eval "exec $DOC_COPY_LEASE_FD>&-"
+        fi
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
@@ -885,5 +934,5 @@ invoke_sweep() {
         lint_config_skip_notice sweep "lint sweep"
         return 0
     fi
-    run "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lint/sweep.py" "$@"
+    run "$BUILD_HELPER_ROOT/lib/py" "$BUILD_HELPER_ROOT/lint/sweep.py" "$@"
 }

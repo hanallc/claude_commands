@@ -19,7 +19,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders, build_slots, copy_record, git_rescue
+from scripts.lib import build_folders, build_slots, copy_record, git_rescue, scratch
 from scripts.copies import copies
 from scripts.build_queue import admission_protocol as wire, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -288,6 +288,20 @@ class BuildSlotsTests(unittest.TestCase):
                 self.assertEqual(reused.number, 2)
         with self.take() as lowest:
             self.assertEqual(lowest.number, 1)
+
+    def test_busy_source_allows_ready_slot_and_reports_why_creation_fails(self) -> None:
+        with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
+                                   work="proof", purpose="test", selection=build_slots.ExactSlotRequest(2)) as slot:
+            path = slot.path
+        missing = path.with_name("widget-slot1")
+        self.assertFalse(missing.exists())
+        with scratch.busy_locks(self.source, create=True) as idle:
+            self.assertTrue(idle)
+            with self.take() as reused:
+                self.assertEqual(reused.path, path)
+                with self.assertRaisesRegex(build_folders.SlotSourceBusy, "slot source is busy"), self.take():
+                    self.fail("The busy source allowed slot creation.")
+        self.assertFalse(missing.exists())
 
     def test_exact_slot_preserves_affinity_and_refuses_without_scanning(self) -> None:
         def exact(number: int):

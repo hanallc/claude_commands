@@ -299,6 +299,7 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
         numbers = range(1, maximum + 1)
     repository = _slot_repository(pool)
     checkout = build_folders.SlotCheckout(repository, _git(pool.source, "rev-parse", f"{commit}^{{commit}}"))
+    source_busy: build_folders.SlotSourceBusy | None = None
     with _slot_commit(repository, pool.source, checkout.commit):
         for number in numbers:
             spec = build_folders.BuildFolderSpec(kind="slot", parent=pool.root, suffix_length=0,
@@ -308,6 +309,9 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
             with ExitStack() as held:
                 try:
                     path = held.enter_context(build_folders.slot_build_folder(spec))
+                except build_folders.SlotSourceBusy as error:
+                    source_busy = error
+                    continue
                 except BlockingIOError:
                     continue
                 descriptor = build_folders.build_folder_lock_fd(path)
@@ -339,6 +343,8 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 yield Slot(path, cargo, pool.repository, number,
                            MappingProxyType({"CARGO_BUILD_BUILD_DIR": str(cargo)}))
             return
+        if source_busy is not None:
+            raise source_busy
         raise SlotsFull(pool.repository, pool.machine, maximum)
 
 
@@ -506,7 +512,7 @@ def main(argv: Sequence[str]) -> int:
     except SlotsNotConfigured as error:
         _ = sys.stderr.write(f"{error}\n")
         return 2
-    except (SlotGitFailure, subprocess.SubprocessError) as error:
+    except (SlotGitFailure, build_folders.SlotSourceBusy, subprocess.SubprocessError) as error:
         _ = sys.stderr.write(f"{error}\n")
         return 2
 

@@ -15,7 +15,7 @@ import shlex
 import sys
 
 from scripts.lib import conf, conf_reads, live_settings, main_publish
-from scripts.lib.conf import Unusable, check
+from scripts.lib.conf import Unusable
 from scripts.build_hold.override_guard import refuse_overrides
 
 SUBJECT = "tune("
@@ -50,8 +50,8 @@ def _forward(arguments: list[str], ssh_program: str) -> int:
 def change(args: RequestedValueChange) -> int:
     """Make the value live here and on the Mac at once; main and the Mac pull follow."""
     source = conf.path(args.file).resolve()
-    _, old = conf.editable_line(args.file, args.key)
-    check(args.file, args.key, args.value)
+    setting = live_settings.editable_setting(args.file, args.key, args.value)
+    old = setting.value if isinstance(setting, live_settings.ExistingSetting) else "<missing>"
     checkout = main_publish.checkout_of(source)
     if old == args.value:
         print(f"already {args.key}={args.value}")
@@ -59,7 +59,8 @@ def change(args: RequestedValueChange) -> int:
         conf_reads.record(source.stem)
         message = (f"{SUBJECT}{args.file}): {args.key} {old} -> {args.value}\n\n"
                    + f"{args.why}\n\nUser-Approved: {args.user_words}")
-        _ = live_settings.stage(live_settings.WaitingChange(args.file, args.key, args.value, message))
+        _ = live_settings.stage(live_settings.WaitingChange(args.file, args.key, args.value, message),
+                                accepted=isinstance(setting, live_settings.NewModelColor))
         print(f"live now: {args.key}={args.value}")
         for line in live_settings.start_readers(args.file):
             print(line)
