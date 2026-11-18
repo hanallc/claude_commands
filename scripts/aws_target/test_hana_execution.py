@@ -12,7 +12,7 @@ from typing import cast, final, override
 
 from scripts.aws_target import hana_box as box, hana_execution as execution, hana_placement as hana, hana_result as result
 from scripts.aws_target import hana_source, hana_transport
-from scripts.aws_target.hana_guest import WorkPermit
+from scripts.aws_target.hana_guest import CommandAdmissionRefusalCode, WorkPermit
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.mac_test.claim_state import RepositoryScope
@@ -146,6 +146,30 @@ class HanaExecutionTests(unittest.TestCase):
         observation = self.objects.observe_execution(self.key)
         self.assertEqual(execution.decode_observation(execution.encode_observation(observation)), observation)
         self.assertNotIn(b'observation_url', execution.encode_request(self.request))
+        no_code = execution.NoCommandAdmissionRefusalCode()
+        rows = (
+            (CommandAdmissionRefusalCode.ADMISSION_DISABLED, 'Guest policy refused the command', True),
+            (CommandAdmissionRefusalCode.DATA_NOT_MOUNTED, 'The Hana data directory is not mounted', True),
+            (CommandAdmissionRefusalCode.PERMIT_REJECTED, 'The Hana permit is not fresh: the wall-clock expiry has passed', True),
+            (no_code, 'The data mount and a fresh permit are required', True),
+            (no_code, 'The data mount and a fresh permit are required during setup', False),
+            (no_code, 'Hana command admission is disabled on the guest', False),
+            (no_code, 'The Hana data directory is not mounted', False),
+            (no_code, 'The Hana permit is not fresh: unrelated diagnostic', False),
+        )
+        for code, reason, refused in rows:
+            with self.subTest(code=code, reason=reason):
+                reply = replace(observation, accepted=True, terminated=True, lease_free=True,
+                                evidence=placement.ExecutionEvidenceUnavailable(reason, 1000), refusal_code=code)
+                decoded = execution.decode_observation(execution.encode_observation(reply))
+                self.assertEqual(decoded, reply)
+                expected = (placement.HanaCommandAdmissionRefused(reason) if refused
+                            else execution.NoCommandAdmissionRefusal())
+                self.assertEqual(execution.command_admission_refusal(decoded), expected)
+        invalid = execution.encode_observation(replace(observation, evidence=placement.ExecutionEvidenceUnavailable('refused', 1000)))
+        with self.assertRaises(ValueError):
+            _ = execution.decode_observation(invalid.replace(
+                b'"kind":"unavailable"', b'"kind":"unavailable","refusal_code":"invalid"'))
 
     def test_codecs_reject_wrong_claim_source_command_and_boolean_slot(self) -> None:
         for request in (replace(self.request, key=replace(self.key, claim_id='wrong')),
@@ -207,6 +231,22 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
         self.objects.release_lease = True
         self.assertIsInstance(self.settle(), execution.HanaSettled)
+        self.assertEqual(self.releases, 1)
+
+        with self.subTest('Guest admission refusal before claim release'):
+            self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
+            self.objects = FakeExecutionObjects(self.request, fail_fence=True)
+            _ = self.dispatch()
+            reason = 'The data mount and a fresh permit are required'
+            observation = replace(self.objects.observe_execution(self.request.key), terminated=True, lease_free=True,
+                                  evidence=placement.ExecutionEvidenceUnavailable(reason, 1000))
+            with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
+                _ = execution.observe_execution(self.root, self.request, self.objects)
+            settled = execution.HanaAdmissionRefusalSettled(placement.HanaCommandAdmissionRefused(reason),
+                                                            placement.ExecutionNotStarted())
+            self.assertEqual(self.settle(), settled)
+            self.assertEqual(self.settle(), settled)
+            self.assertEqual(self.releases, 1)
 
     def test_cancellation_and_restart_keep_one_settlement(self) -> None:
         _ = self.dispatch()
@@ -231,13 +271,24 @@ class HanaExecutionTests(unittest.TestCase):
 
     def test_edited_replaced_and_fenced_results_never_become_accepted(self) -> None:
         _ = self.dispatch()
+        replaced = replace(self.command_result(), key=replace(self.key, attempt='replacement'))
         for remote, live in ((self.command_result(), placement.SourceKeyKnown('edited')),
-                             (replace(self.command_result(), key=replace(self.key, attempt='replacement')), self.source_key),
                              (replace(self.command_result(), argv=('cargo', 'clippy')), self.source_key)):
             with self.subTest(remote=remote, live=live):
                 decision = execution.accept_result(self.root, self.request, result.encode_result(remote), 'fixture-host', lambda: live)
                 self.assertIsInstance(decision, result.RejectedHanaResult)
-        _ = self.settle()
+        with self.subTest('Replaced result with a pending guest result'):
+            observation = replace(self.objects.observe_execution(self.key), terminated=True, lease_free=True,
+                                  evidence=placement.ExecutionEvidenceUnavailable(execution.COMMAND_RESULT_PENDING, 1000))
+            with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
+                _ = execution.observe_execution(self.root, self.request, self.objects)
+            rejected = execution.accept_result(self.root, self.request, result.encode_result(replaced),
+                                               'fixture-host', lambda: self.source_key)
+            assert isinstance(rejected, result.RejectedHanaResult)
+            settled = execution.settle_execution(self.root, self.request, self.objects,
+                                                  release_claim=self.release, reason=rejected.reason)
+            assert isinstance(settled, execution.HanaGuestEndedWithoutResult)
+            self.assertEqual(settled.outcome, placement.AttemptDeclined('The Hana attempt or host generation changed'))
         decision = execution.accept_result(self.root, self.request, result.encode_result(self.command_result()),
                                            'fixture-host', lambda: self.source_key)
         self.assertIsInstance(decision, result.RejectedHanaResult)

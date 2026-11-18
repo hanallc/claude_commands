@@ -36,7 +36,7 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -76,7 +76,6 @@ from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
-from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
@@ -499,7 +498,10 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = build_targets.caller_waits_on_hold(holds, directory)
+            # Load the hold check here to avoid the GPU routing import cycle.
+            caller_waits_on_hold = cast(Callable[[build_hold.NatedevHolds, Path], bool], getattr(
+                import_module("scripts.build_targets.build_targets"), "caller_waits_on_hold"))
+            held = caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:
@@ -2766,7 +2768,7 @@ def _sweep_nightly_slots() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}")
+        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}", allow_abbrev=False)
         if arguments[0] == "nightly-assigned":
             _ = nightly_parser.add_argument("--unit", required=True)
             _ = nightly_parser.add_argument("--result", default="")
@@ -2779,7 +2781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
             return 1
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")

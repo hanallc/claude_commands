@@ -8,11 +8,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 import json
-import re
 from statistics import median
 from typing import cast
 
 from scripts.aws_target import ledger
+from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
 
@@ -239,14 +239,6 @@ def median_run_time(seconds: list[Decimal]) -> str:
         return '—'
     minutes, remainder = divmod(int(median(seconds)), 60)
     return f'{minutes}m {remainder}s'
-
-
-def gate_vcpus(instance_type: str) -> int:
-    """Return the vCPU count that the type's size names, or zero for an unknown size."""
-    size = re.fullmatch(r'[^.]+\.(large|([1-9][0-9]*)?xlarge)', instance_type)
-    if not size:
-        return 0
-    return 2 if size[1] == 'large' else 4 * int(size[2] or '1')
 
 
 class BoxTimeSource(Enum):

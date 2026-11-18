@@ -16,7 +16,8 @@ from scripts.aws_target.hana_placement import (
 )
 if TYPE_CHECKING:
     from scripts.aws_target import hana_box as box
-    from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
+    from scripts.aws_target.hana_placement import HanaEvidenceRequest
+    from scripts.build_queue import admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
     from scripts.lib import conf
     from scripts.mac_test import claim_state
@@ -275,12 +276,12 @@ def configured_route(configuration: conf.ConfigRead, repository: str, kind: str)
     return settings
 
 
-def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest) -> placement.HostEvidence:
+def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) -> placement.HostEvidence:
     """Project existing lifecycle and execution records without provider mutations."""
     from functools import partial
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
-    from scripts.aws_target.hana_execution import HanaSettled, read_claim_execution, settle_unpublished_claim
+    from scripts.aws_target.hana_execution import HanaSettled, claim_admission_refused, read_claim_execution, settle_unpublished_claim
     from scripts.build_queue import admission_records, placement
     from scripts.build_targets import target_config
     from scripts.lib import conf, process_start
@@ -327,10 +328,14 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
                     isinstance(owner, process_start.Started) and owner.start != record['proc_start']):
                 reference = placement.ProviderClaimReference('ssh', target.name, claim.scope,
                     execution, record['episode'], record['attempt'])
-                closed = settle_unpublished_claim(controller.directory, reference,
-                    release_claim=partial(_release_claims, controller, execution, (claim,), detached_only=True),
-                    reason='The Hana start owner exited')
-                if isinstance(closed, HanaSettled):
+                release = partial(_release_claims, controller, execution, (claim,), detached_only=True)
+                if claim_admission_refused(controller.directory, reference):
+                    released = release()
+                else:
+                    closed = settle_unpublished_claim(controller.directory, reference, release_claim=release,
+                        reason='The Hana start owner exited')
+                    released = isinstance(closed, HanaSettled)
+                if released:
                     continue
             held.append(claim)
         block = mac_test.blocking_claim_block(paths, key.session)
@@ -446,7 +451,7 @@ def gpu_claim_pending(target: str, claim_id: str) -> bool:
 
 
 def read_gpu_evidence(transport: HanaGpuNextestTransport, key: placement.HostEvidenceKey,
-                      request: wire.PlacementRequest, *, configuration: conf.ConfigRead | None = None
+                      request: HanaEvidenceRequest, *, configuration: conf.ConfigRead | None = None
                       ) -> placement.FreshHostEvidence:
     """Publish exact adopted claims and retain any unconfirmed GPU cleanup."""
     import time

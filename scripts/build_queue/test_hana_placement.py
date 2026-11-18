@@ -13,7 +13,8 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.test_placement import (
-    PlacementFixture, ManualEvidenceWorker, placement_request, publish_candidate, assignment_for, adopt_assignment, local_candidate,
+    PlacementFixture, ManualEvidenceWorker, placement_request, publish_candidate, assignment_for, adopt_assignment,
+    consume_permission, local_candidate,
 )
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.aws_target import hana_box, hana_execution, hana_placement
@@ -73,6 +74,60 @@ class HanaQueueTests(unittest.TestCase):
                 assert isinstance(fallback, wire.LocalPlacementGranted)
                 self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
                 self.assertEqual(fallback.assignment.episode, assignment.episode)
+
+    def test_command_admission_refusal_excludes_hana_from_the_same_build(self) -> None:
+        for next_target, stale_absence in (('natedev', False), ('mac', False), ('natedev', True)):
+            with (self.subTest(next_target=next_target, stale_absence=stale_absence), PlacementFixture() as fixture,
+                  mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker)):
+                target = hana_target(fixture)
+                mac_settings = fixture.root / 'fixture-mac.conf'
+                _ = mac_settings.write_text('# range: 1..60\nprobe_timeout_s=7\n')
+                registry = (target, target_config.SshTarget('mac', 'macos', mac_settings),
+                            target_config.LocalTarget('natedev', 'linux'))
+
+                def read_targets(*, selected: str = '', **_options: object) -> tuple[target_config.Target, ...]:
+                    return tuple(entry for entry in registry if not selected or entry.name == selected)
+
+                request = placement_request(fixture)
+                mac = request.constraints.candidates[0]
+                remote = replace(mac, destination=replace(mac.destination,
+                    provider='ssh', target=target.name, host='fixture-hana'))
+                local = local_candidate(fixture)
+                candidates = (remote, mac, local) if next_target == 'mac' else (remote, local)
+                request = replace(request, prerequisite=placement.TokenNotRequired(),
+                    constraints=replace(request.constraints, candidates=candidates))
+                with mock.patch.object(target_config, 'read_targets', side_effect=read_targets):
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    claim = adopt_assignment(fixture, request, assignment)
+                    self.assertIsInstance(fixture.connect(consume_permission('consume', assignment, claim)).replies()[-1],
+                                          wire.FirstAuthorization)
+                    if next_target == 'mac':
+                        _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(mac,))))
+                    other = replace(placement_request(fixture), prerequisite=placement.TokenNotRequired(),
+                        constraints=replace(request.constraints, candidates=(remote,)))
+                    if stale_absence:
+                        _ = publish_candidate(fixture, other)
+                        fixture.clock.advance(1)
+                    cause = 'The data mount and a fresh permit are required'
+                    report = wire.ExecutionReport('admission-refused', assignment, claim,
+                        placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
+                        placement.DispatchPathSettled())
+                    _ = fixture.connect(report).replies()
+                    key = placement.attempt_key(assignment.episode, assignment.attempt)
+                    saved = fixture.server.assignments[key]
+                    self.assertEqual(saved.retry, placement.DoNotRetry(cause))
+                    self.assertEqual(saved.state, placement.ClosedAssignment(cause))
+                    fallback = fixture.connect(request).replies()[-1]
+                    self.assertIsInstance(fallback, wire.Assignment if next_target == 'mac' else wire.LocalPlacementGranted)
+                    assert isinstance(fallback, (wire.Assignment, wire.LocalPlacementGranted))
+                    self.assertEqual(fallback.assignment.destination.target, next_target)
+                    self.assertEqual(fallback.assignment.episode, assignment.episode)
+                    self.assertNotEqual(fallback.assignment.attempt, assignment.attempt)
+                    if stale_absence:
+                        self.assertIsInstance(fixture.connect(other).replies()[-1], wire.PlacementWait)
+                        _ = publish_candidate(fixture, other)
+                        self.assertEqual(assignment_for(fixture, other).destination, remote.destination)
 
     def test_dead_coordinator_releases_an_assignment_that_never_bound(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker):

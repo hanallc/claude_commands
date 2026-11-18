@@ -309,6 +309,18 @@ def cleanup(path: Path) -> CleanupReady | Kept:
     return CleanupReady(local, origin)
 
 
+def release_worktree_pair(path: Path) -> None:
+    try:
+        result = build_folders.release_removed_folder(path)
+    except (OSError, ValueError) as error:
+        print(f"Worktree pair kept for {str(path)!r}: {str(error)!r}", file=sys.stderr)
+        return
+    if result is build_folders.FolderPairRelease.PARTIAL:
+        print(f"Worktree pair partially released for {str(path)!r}", file=sys.stderr)
+    elif result not in (build_folders.FolderPairRelease.RELEASED, build_folders.FolderPairRelease.PAIR_ABSENT):
+        print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
+
+
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
     resolver = session_staff.RowResolver(snapshot)
@@ -461,7 +473,12 @@ def main() -> int:
     check_cleanup = commands.add_parser("cleanup")
     _ = check_cleanup.add_argument("path")
     _ = check_cleanup.add_argument("--checked-tips", action="store_true")
+    release = commands.add_parser("release-pair")
+    _ = release.add_argument("path")
     arguments = parser.parse_args()
+    if cast(str, arguments.command) == "release-pair":
+        release_worktree_pair(Path(cast(str, arguments.path)).absolute())
+        return 0
     if cast(str, arguments.command) == "cleanup":
         try:
             result = cleanup(Path(cast(str, arguments.path)).expanduser().resolve())

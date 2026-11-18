@@ -28,17 +28,21 @@ class StopPayload(TypedDict, total=False):
 
 
 def current_name(session_id: str) -> str:
-    """The name in this session's record now, or empty when no record carries the id."""
-    for path in sessions.sessions_dir().glob("*.json"):
-        record = sessions.read_session(path)
-        if isinstance(record, sessions.UnreadableSessionRecord):
-            continue
-        if record["sessionId"] == session_id and not sessions.headless(record):
-            return record["name"]
-    return ""
+    """Read the session name. An empty name means a complete read found no record."""
+    registry = sessions.read_registry()
+    records = _title_records(session_id, registry)
+    if not records and registry.unreadable:
+        raise OSError("session registry unreadable")
+    return records[0]["name"] if records else ""
 
 
-def _clear_handoff_pending(session_id: str, shared: str, pane: str, record: staff.StaffSnapshot) -> bool:
+def _title_records(session_id: str, registry: sessions.RegistryRead) -> tuple[sessions.SessionRecord, ...]:
+    return tuple(item.record for item in registry.entries
+                 if item.record["sessionId"] == session_id and not sessions.headless(item.record))
+
+
+def _clear_handoff_pending(session_id: str, shared: str, pane: str, record: staff.StaffSnapshot,
+                           records: tuple[sessions.SessionRecord, ...]) -> bool:
     """Match the current process to a retained member launch before reporting an incomplete clear."""
     try:
         entry = pane_record.read_strict(shared).get(pane)
@@ -50,15 +54,8 @@ def _clear_handoff_pending(session_id: str, shared: str, pane: str, record: staf
     if (not isinstance(pid, int) or isinstance(pid, bool) or not started
             or record.by_member_reference(pane_launch.reference_id(entry)) is None):
         return False
-    for path in sessions.sessions_dir().glob("*.json"):
-        current = sessions.read_session(path)
-        if isinstance(current, sessions.UnreadableSessionRecord):
-            continue
-        if (current["sessionId"] == session_id and not sessions.headless(current)
-                and current["pid"] == pid and current.get("procStart") == started
-                and sessions.process_start(pid) == started):
-            return True
-    return False
+    return any(current["pid"] == pid and current.get("procStart") == started
+               for current in records) and sessions.process_start(pid) == started
 
 
 def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
@@ -70,7 +67,9 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     shared = herdr.shared_session()
     if environment.get("HERDR_SESSION") != shared:
         return False
-    name = current_name(session_id)
+    registry = sessions.read_registry()
+    records = _title_records(session_id, registry)
+    name = records[0]["name"] if records else ""
     try:
         record = staff.snapshot()
     except staff.StaffAbsent:
@@ -86,7 +85,10 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
         title = (worker_panes.agent_name(record.rows_by_id[cast(staff.ReportsTo, row.parent).id], row.name)
                  if row.kind == "worker" else row.name)
         return client.retitle(pane, title, tab=row.kind != "worker")
-    if _clear_handoff_pending(session_id, shared, pane, record):
+    if not records and registry.unreadable:
+        print(f"herdr title: session registry unreadable for {session_id}.", file=sys.stderr)
+        return False
+    if _clear_handoff_pending(session_id, shared, pane, record, records):
         print(f"herdr title: no staff row for current session {session_id}.", file=sys.stderr)
     if not name:
         return False
