@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 
 from scripts.direct import verify_token_wait_test_support as support
@@ -144,55 +144,71 @@ fi
         self.assertFalse(request_file.exists())
         self.assertFalse((self.root / "cargo-calls").exists())
 
-    def test_replaces_the_grant_if_the_build_folder_changes_before_launch(self) -> None:
+    def cargo_with_configured_folders(self) -> Path:
         config = self.root / ".cargo/config.toml"
         config.parent.mkdir()
-        old_folder = self.root / "old-build"
-        new_folder = self.root / "new-build"
-
-        def set_folder(folder: Path) -> None:
-            _ = config.write_text(f'[build]\nbuild-dir = "{folder}"\n')
-
-        set_folder(old_folder)
         cargo = self.root / "stubs/cargo"
         source = cargo.read_text()
         start = source.index("    printf '{")
-        end = source.index("    exit 0", start)
-        _ = cargo.write_text(source[:start] + r'''    build=$(sed -n 's/^build-dir = "\(.*\)"$/\1/p' "$PACKAGE_ROOT/.cargo/config.toml")
-    printf '{"workspace_root":"%s","target_directory":"%s/target","build_directory":"%s","packages":[{"name":"sample","targets":[{"name":"sample","kind":["lib"],"test":true}]}]}\n' "$PACKAGE_ROOT" "$PACKAGE_ROOT" "$build"
+        end = source.index('if [ "$1" = check ]; then', start)
+        _ = cargo.write_text(source[:start] + r'''    target=$(sed -n 's/^target-dir = "\(.*\)"$/\1/p' "$PACKAGE_ROOT/.cargo/config.toml")
+    build=$(sed -n 's/^build-dir = "\(.*\)"$/\1/p' "$PACKAGE_ROOT/.cargo/config.toml")
+    printf '{"workspace_root":"%s","target_directory":"%s","build_directory":"%s","packages":[{"name":"sample","targets":[{"name":"sample","kind":["lib"],"test":true}]}]}\n' "$PACKAGE_ROOT" "$target" "$build"
+    exit 0
+fi
+if [ -n "${TEST_BUILD_ALIAS:-}" ]; then ln -sfn "$TEST_BUILD_REPLACEMENT" "$TEST_BUILD_ALIAS"; fi
+target=$(sed -n 's/^target-dir = "\(.*\)"$/\1/p' "$PACKAGE_ROOT/.cargo/config.toml")
+build=$(sed -n 's/^build-dir = "\(.*\)"$/\1/p' "$PACKAGE_ROOT/.cargo/config.toml")
+printf '%s\n' "${CARGO_TARGET_DIR:-$target}" "$(realpath -m "${CARGO_BUILD_BUILD_DIR:-$build}")" > "$PACKAGE_ROOT/cargo-folders"
+printf '%s\n' "$*" >> "$CARGO_CALLS"
 ''' + source[end:])
+        _ = self.environment.pop("CARGO_TARGET_DIR")
+        return config
+
+    def test_uses_the_first_grant_after_a_cargo_config_edit(self) -> None:
+        config = self.cargo_with_configured_folders()
+        old_target = self.root / "old-target"
+        old_folder = self.root / "old-build"
+        new_folder = self.root / "new-build"
+        _ = config.write_text(f'[build]\ntarget-dir = "{old_target}"\nbuild-dir = "{old_folder}"\n')
         admission = caller_admission(self, self.root, self.environment)
         previous = admission.server.handle_request
-        folders: dict[str, placement.CargoFolder | placement.NoCargoFolder] = {}
-        events: list[tuple[str, str]] = []
+        grants: list[str] = []
 
         def handle(request: wire.Request,
                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if isinstance(request, wire.PlacementRequest):
-                folders[request.episode] = request.constraints.cargo_folder
             replies = previous(request, connection)
             if isinstance(request, wire.CancelPlacement):
-                events.append(("cancel", request.episode))
                 admission.allow_next_start()
             for reply in replies:
-                if isinstance(reply, wire.LocalPlacementGranted):
-                    events.append(("grant", reply.assignment.episode))
-                    if len(events) == 1:
-                        set_folder(new_folder)
+                if isinstance(reply, wire.LocalPlacementGranted) and reply.assignment.episode not in grants:
+                    grants.append(reply.assignment.episode)
+                    _ = config.write_text(
+                        f'[build]\ntarget-dir = "{self.root / "new-target"}"\nbuild-dir = "{new_folder}"\n')
             return replies
 
         with mock.patch.object(admission.server, "handle_request", side_effect=handle):
             result = self.verify(self.environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event for event, _ in events], ["grant", "cancel", "grant"])
-        _, first = events[0]
-        _, cancelled = events[1]
-        _, second = events[2]
-        self.assertEqual(cancelled, first)
-        self.assertNotEqual(second, first)
-        self.assertEqual(folders[first], placement.CargoFolder(old_folder))
-        self.assertEqual(folders[second], placement.CargoFolder(new_folder))
-        self.assertEqual(len((self.root / "cargo-calls").read_text().splitlines()), 1)
+        self.assertEqual((self.root / "cargo-folders").read_text().splitlines(), [str(old_target), str(old_folder)])
+        self.assertEqual(len(grants), 1)
+        self.assertIn(str(new_folder), config.read_text())
+
+    def test_pins_the_resolved_folder_after_the_build_symlink_changes(self) -> None:
+        config = self.cargo_with_configured_folders()
+        target = self.root / "target"
+        build = self.root / "original-build"
+        build.mkdir()
+        replacement = self.root / "replacement-build"
+        replacement.mkdir()
+        alias = self.root / "build-alias"
+        alias.symlink_to(build, target_is_directory=True)
+        _ = config.write_text(f'[build]\ntarget-dir = "{target}"\nbuild-dir = "{alias}"\n')
+        result = self.verify({**self.environment, "TEST_BUILD_ALIAS": str(alias),
+                              "TEST_BUILD_REPLACEMENT": str(replacement)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(alias.resolve(), replacement)
+        self.assertEqual((self.root / "cargo-folders").read_text().splitlines(), [str(target), str(build)])
 
     def test_remote_handoff_places_again_for_a_local_grant(self) -> None:
         script = shell_functions(support.VERIFY, "place_compiling_step") + r"""
@@ -218,7 +234,6 @@ route_compiling_step() {
         *) return 1 ;;
     esac
 }
-local_cargo_build_folder() { printf '%s\n' "$PWD"; }
 verify_helper() {
     [[ "$2" == cancel-placement && "$3" == --episode && "$4" == parent-episode ]]
     [[ "$5" == --pid && "$6" == 42 ]]
@@ -245,6 +260,6 @@ place_compiling_step cargo check
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, output + "\n")
+        self.assertEqual(result.stdout.splitlines(), [str(self.root / "target"), output])
         self.assertEqual((self.root / "metadata-calls").read_text().splitlines(),
                          ["+nightly", "metadata", "--format-version", "1", "--no-deps", "--manifest-path", "other/Cargo.toml"])

@@ -877,10 +877,12 @@ run_step() {
         set -m
         (
             set +m
-            if [[ "${OSTYPE:-}" == linux* && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
-                if ! verify_helper "$VERIFY_START_DIR/verify_step_lifetime.py" "$$" "$BASHPID"; then
-                    build_check_stop 2 'cannot watch the local step for caller exit'
-                    exit 2
+            if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+                export CARGO_TARGET_DIR="$PLACEMENT_CARGO_TARGET"
+                export CARGO_BUILD_BUILD_DIR="$PLACEMENT_CARGO_FOLDER"
+                if [[ -n "${BUILDLOG_PEAK:-}" && "${OSTYPE:-}" == linux* ]]; then
+                    local step_leader=$BASHPID
+                    buildlog_exec() { run_placed_scope "$step_leader" "$@"; }
                 fi
             fi
             if (
@@ -2466,6 +2468,9 @@ route_compiling_step() {
         exit "$request_status"
     fi
     buildlog_begin "$@" || true
+    if [[ "${OSTYPE:-}" == linux* && "${BUILDLOG_SCOPE:-1}" != 0 && -z "$BUILDLOG_PEAK" ]]; then
+        BUILDLOG_PEAK="${TMPDIR:-/tmp}/buildlog.$$.$RANDOM.peak"
+    fi
     BUILDLOG_PLACEMENT_PREPARED=1
     if [[ "${STEP_WRITES_TREE:-0}" == 0 ]]; then
         shift
@@ -2642,49 +2647,51 @@ local_cargo_build_folder() {
     verify_helper "$VERIFY_START_DIR/verify_cargo_folder.py" "$@"
 }
 
-# Check the local grant against the current Cargo inputs before launch.
 place_compiling_step() {
-    local folder status BUILDLOG_MEM_WAIT_SINCE="${BUILDLOG_MEM_WAIT_SINCE:-}"
-    while :; do
-        LINT_REPAIR_REUSED_GRANT=0
-        route_compiling_step "$@" || return $?
-        [[ "$STEP_RAN_ON_MAC" == 0 && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] || return 0
-        status=0
-        folder=$(local_cargo_build_folder "$@") || status=$?
-        # A remote handoff keeps the parent's placement constraints.
-        if (( status == 0 )) && [[ "$PLACEMENT_OWNER_PID" == "$$" &&
-                -n "$folder" && "$folder" == "${PLACEMENT_CARGO_FOLDER:-}" ]]; then
-            if [[ "$CMD" == test && "${LOCAL_ONLY:-0}" == 0 && -z "${COPY_WATCH_PID:-}" ]]; then
-                start_copy_watch
-            fi
-            return 0
-        fi
+    local BUILDLOG_MEM_WAIT_SINCE="${BUILDLOG_MEM_WAIT_SINCE:-}"
+    route_compiling_step "$@" || return $?
+    [[ "$STEP_RAN_ON_MAC" == 0 && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] || return 0
+    # The inherited remote request has no local launch paths or scope.
+    if [[ "$PLACEMENT_OWNER_PID" != "$$" ]]; then
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-            --pid "$PLACEMENT_OWNER_PID" --reason "the local grant does not cover the current Cargo build folder" >/dev/null || return $?
+            --pid "$PLACEMENT_OWNER_PID" --reason "local execution needs its own placement request" >/dev/null || return $?
         BUILDLOG_MEM_WAIT_SINCE="$PLACEMENT_SINCE"
         unset BUILDLOG_SELECTED_LOCAL_GRANT BUILDLOG_PLACEMENT_FILE
         PLACEMENT_EPISODE="" BUILDLOG_PLACEMENT_EPISODE="" PLACEMENT_OUTCOME=""
-        if (( status != 0 )); then
-            placement_failed "$status"
-            return "$status"
-        fi
-    done
+        route_compiling_step "$@" || return $?
+        [[ "$STEP_RAN_ON_MAC" == 0 && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] || return 0
+    fi
+    if [[ "$CMD" == test && "${LOCAL_ONLY:-0}" == 0 && -z "${COPY_WATCH_PID:-}" ]]; then
+        start_copy_watch
+    fi
+    return 0
+}
+
+run_placed_scope() {
+    local leader=$1 BUILDLOG_RESERVED_STEP
+    shift
+    printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+        "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+    export BUILDLOG_RESERVED_STEP
+    "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@" 3>&2
 }
 
 placement_once() {
-    local reply line route="" status=0 monitor=0 prerequisite=none target="${PINNED_TARGET:-}"
+    local reply line roots route="" status=0 monitor=0 prerequisite=none target="${PINNED_TARGET:-}"
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "$target" && "${STEP_FORCE_MAC:-0}" != 0 ]]; then target=mac; fi
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
-        PLACEMENT_CARGO_FOLDER=""
+        PLACEMENT_CARGO_FOLDER="" PLACEMENT_CARGO_TARGET=""
         # Tree writes and --local take precedence over remote pins.
         if [[ "${STEP_WRITES_TREE:-0}" == 1 || "${LOCAL_ONLY:-0}" == 1 ||
                 ( "${MAC_ONLY:-0}" == 0 && "${target:-natedev}" == natedev ) ]]; then
-            PLACEMENT_CARGO_FOLDER=$(local_cargo_build_folder "${PLACEMENT_COMMAND[@]}") || {
+            roots=$(local_cargo_build_folder "${PLACEMENT_COMMAND[@]}") || {
                 status=$?
                 placement_failed "$status"
                 return "$status"
             }
+            PLACEMENT_CARGO_TARGET=${roots%%$'\n'*}
+            PLACEMENT_CARGO_FOLDER=${roots#*$'\n'}
         fi
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
         PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER}"

@@ -1,4 +1,4 @@
-"""Read the Cargo build folder for the local placement candidate."""
+"""Read the Cargo paths for the local placement candidate."""
 from __future__ import annotations
 
 try:
@@ -16,7 +16,10 @@ from scripts.lib.cargo_output import CargoOutputRoots
 def main(argv: list[str]) -> int:
     roots = step_output_roots(argv, os.getcwd())
     if isinstance(roots, CargoOutputRoots):
-        print(roots.build_directory)
+        if "\n" in str(roots.target_directory) or "\n" in str(roots.build_directory):
+            print("verify.sh: a Cargo output path contains a newline", file=sys.stderr)
+            return 2
+        print(roots.target_directory, roots.build_directory, sep="\n")
         return 0
     print(f"verify.sh: cannot resolve the Cargo build folder: {roots.reason}", file=sys.stderr)
     return 2

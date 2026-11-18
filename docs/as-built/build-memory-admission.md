@@ -204,8 +204,11 @@ A local grant starts the step without a unit board token.
 The placement request includes the resolved Cargo build folder for the local candidate.
 Verify refuses local-capable placement when Cargo cannot resolve the folder.
 The queue checks that folder together with memory before a local grant.
-Verify checks the folder again before launch and requests a new grant when the folder changes.
-On Linux, a process from the verify helper watches the caller and stops the step group if the caller dies.
+Verify sets `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the paths it resolved for the local grant.
+On Linux, a local placement grant names the build scope through its sidecar.
+The scope publishes that path before Cargo starts.
+The step supervisor stops the scope if the verify caller or step shell exits.
+On normal completion, the supervisor waits for the scope to empty before verify releases the grant.
 Remote candidates use their target slots.
 An older caller sends `--token required` (`TokenUnavailable`) and gets no local grant until it reports `TokenHeld`.
 
