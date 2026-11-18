@@ -1216,7 +1216,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on the phase 70 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 77 — Change review hardening  · status: todo
+### Phase 77 — Change review hardening  · status: done
 **Depends on:** phase 73
 
 #### Work Order
@@ -1236,6 +1236,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on the phase 73 tip. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** The strict delivery read rejects a pending verdict slot with no attempt id. `end_row_scratch` reports an unusable scratch config and a retry finishes the cleanup. Every browser verdict path keeps a cleanup record, which loads only when private and owned by the current user. Three rare races moved to a follow-up item (F003, F004, F005). On main ebbb81613 (hash 3cfa74c4f).
 
 ### Phase 78 — Cross-repo units  · status: todo
 **Depends on:** phase 74
