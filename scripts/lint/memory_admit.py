@@ -37,6 +37,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, MacOnly, PinnedTarget
 from scripts.build_hold.override_guard import require_shared_state_write
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text as _read_proc_text
 
 from scripts.lib.test_phase import (
     CallRecord,
@@ -928,7 +929,7 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
     for child in sorted(source):
         path = proc / str(child) / "status"
         try:
-            contents = path.read_text().splitlines()
+            contents = _read_proc_text(path).splitlines()
         except OSError as error:
             use = (AnonymousRunUse(0) if error.errno in (errno.ENOENT, errno.ESRCH) else
                    RunUseUnavailable(f"{path}: {error.strerror or error}"))
@@ -1118,7 +1119,7 @@ def member_programs(members: Iterable[int], proc: Path, *, skip_unreadable: bool
     programs: dict[int, str] = {}
     for pid in members:
         try:
-            programs[pid] = (proc / str(pid) / "comm").read_text().strip()
+            programs[pid] = _read_proc_text(proc / str(pid) / "comm").strip()
         except OSError as error:
             if not skip_unreadable and error.errno != errno.ENOENT:
                 raise
@@ -1227,7 +1228,7 @@ class SwapInHistory:
         """Return swap-in bytes between the newest and oldest samples inside the window."""
         check_memory_reading(path)
         try:
-            rows = [line.split() for line in path.read_text().splitlines()]
+            rows = [line.split() for line in _read_proc_text(path).splitlines()]
             counters = [parts for parts in rows if parts and parts[0] == "pswpin"]
             if len(counters) != 1 or len(counters[0]) != 2 or not counters[0][1].isdecimal():
                 raise ValueError("expected one nonnegative pswpin page count")
@@ -1235,7 +1236,7 @@ class SwapInHistory:
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             if window_seconds < 1 or page_size < 1:
                 raise ValueError("the swap-in window and page size must be positive")
-        except (OSError, UnicodeError, ValueError) as error:
+        except (OSError, ValueError) as error:
             return ReadingUnavailable(f"{path}: swap-in reading unavailable: {error}")
         if self.samples and (pages < self.samples[-1].pages or now < self.samples[-1].at):
             self.samples.clear()
@@ -1249,7 +1250,7 @@ def read_meminfo(path: Path) -> HostMemory:
     check_memory_reading(path)
     values: dict[str, int] = {}
     try:
-        text = path.read_text()
+        text = _read_proc_text(path)
     except (OSError, UnicodeError) as error:
         raise ValueError(f"cannot read MemAvailable from {path}") from error
     for line in text.splitlines():
@@ -1271,7 +1272,7 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
     path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
     check_memory_reading(path)
     try:
-        for line in path.read_text().splitlines():
+        for line in _read_proc_text(path).splitlines():
             parts = line.split()
             if parts and parts[0] in ("full", "some"):
                 value = next(float(part.removeprefix("avg10=")) for part in parts[1:] if part.startswith("avg10="))
@@ -1369,7 +1370,7 @@ def waiter_label(row: Waiter) -> str:
     process = Path("/proc") / str(row["pid"])
     try:
         folder = (process / "cwd").readlink().name
-        argv = (process / "cmdline").read_bytes().decode(errors="replace").split("\0")
+        argv = _read_proc_text(process / "cmdline").split("\0")
         caller = "verify" if any(item.endswith("/verify.sh") for item in argv) else Path(argv[0]).name
         return f"{folder} ({caller} pid {row['pid']})"
     except (OSError, IndexError):
@@ -1683,7 +1684,7 @@ class QueueIdentityReader:
             current = self.processes[current].parent
         if not step:
             try:
-                argv = (self.proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0")
+                argv = _read_proc_text(self.proc / str(pid) / "cmdline").split("\0")
                 verb = next((item for item in argv if item in ("test", "lint", "check", "build", "doc", "clippy")), "build")
                 step = verb
             except OSError:

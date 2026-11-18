@@ -808,6 +808,36 @@ class EndedPlacementPruneTests(unittest.TestCase):
             self.assertEqual(set(service.read_state(fixture.state_dir).placement_requests), kept)
 
 
+class ProcessTextTests(unittest.TestCase):
+    def test_process_names_with_invalid_utf8_preserve_memory_readings(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            _ = only_admitted(fixture.server.handle_request(request))
+            record = fixture.server.reservations[request.episode]
+            row = service.reservation_row(record)
+            proc = fixture.proc.path
+            pid = request.owner.pid
+            directory = proc / str(pid)
+            write_process(proc, pid, 8 * 1024, start=request.owner.start_time, anonymous=5 * 1024, swap=3 * 1024)
+            status = directory / "status"
+            memory_fields = status.read_bytes()
+            for field in ("status", "comm"):
+                with self.subTest(field=field):
+                    name = b"verify\xff" if field == "status" else b"rustc\xff"
+                    _ = status.write_bytes(b"Name:\t" + (name if field == "status" else b"verify")
+                                           + b"\nUid:\t1234\n" + memory_fields)
+                    _ = (directory / "comm").write_bytes((name if field == "comm" else b"verify") + b"\n")
+                    reading = service.raw_reservation_memory(record, row, gate.LiveOwnerProcess(),
+                                                            gate.process_table(proc), proc)
+                    assert isinstance(reading, records.MeasuredMemory)
+                    self.assertEqual(reading.bytes, 8 * 1024)
+                    self.assertEqual(reading.anonymous, records.AnonymousRunUse(5 * 1024))
+                    self.assertEqual(reading.swap_bytes, 3 * 1024)
+                    self.assertEqual(service.process_uid(pid, proc), 1234)
+                    self.assertEqual(gate.member_programs([pid], proc),
+                                     {pid: "rustc\ufffd" if field == "comm" else "verify"})
+
+
 class ImportTests(unittest.TestCase):
     def test_clean_import_omits_cli_and_reading_alert_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
