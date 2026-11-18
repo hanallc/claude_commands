@@ -136,6 +136,8 @@ mount_timeout_seconds=15
 # whole: 1..
 aws_timeout_s=10
 # whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
 idle_stop_seconds=600
 # whole: 1..
 start_timeout_seconds=120

@@ -46,31 +46,33 @@ class HanaQueueTests(unittest.TestCase):
         # Load the target helpers before a test replaces the configuration reader.
         _ = import_module('scripts.build_targets.build_targets')
 
-    def test_stale_image_refusal_keeps_the_same_episode_off_hana(self) -> None:
-        with PlacementFixture() as fixture:
-            target = hana_target(fixture)
-            request = placement_request(fixture)
-            remote = replace(request.constraints.candidates[0], destination=replace(
-                request.constraints.candidates[0].destination, provider='ssh', target=target.name, host='fixture-hana'))
-            request = replace(request, prerequisite=placement.TokenNotRequired(),
-                constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
-            with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
-                _ = publish_candidate(fixture, request)
-                assignment = assignment_for(fixture, request)
-                cause = placement.HANA_IMAGE_STALE
-                claim = adopt_assignment(fixture, request, assignment)
-                _ = fixture.connect(wire.ExecutionReport('image-refusal', assignment, claim,
-                    placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
-                    placement.DispatchPathSettled())).replies()
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
-                closed = fixture.server.assignments[key]
-                self.assertEqual(closed.retry, placement.DoNotRetry(cause))
-                assert isinstance(closed.terminal_report, placement.TerminalAttemptReport)
-                self.assertEqual(closed.terminal_report.outcome, placement.HanaCommandAdmissionRefused(cause))
-                _ = publish_candidate(fixture, request)
-                fallback = fixture.connect(request).replies()[-1]
-                assert isinstance(fallback, wire.LocalPlacementGranted)
-                self.assertFalse(fallback.hana_image_stale)
+    def test_refusal_keeps_the_same_episode_off_hana(self) -> None:
+        for cause, claim_adopted in ((placement.HANA_IMAGE_STALE, True), (hana_box.HANA_CLAIM_BUSY, False)):
+            with self.subTest(cause=cause), PlacementFixture() as fixture:
+                target = hana_target(fixture)
+                request = placement_request(fixture)
+                remote = replace(request.constraints.candidates[0], destination=replace(
+                    request.constraints.candidates[0].destination, provider='ssh', target=target.name, host='fixture-hana'))
+                request = replace(request, prerequisite=placement.TokenNotRequired(),
+                    constraints=replace(request.constraints, candidates=(remote, local_candidate(fixture))))
+                with mock.patch.object(target_config, 'read_targets', return_value=(target,)):
+                    _ = publish_candidate(fixture, request)
+                    assignment = assignment_for(fixture, request)
+                    claim = (adopt_assignment(fixture, request, assignment) if claim_adopted
+                             else placement.assigned_claim_reference(assignment))
+                    _ = fixture.connect(wire.ExecutionReport('admission-refusal', assignment, claim,
+                        placement.ExecutionNotStarted(), placement.HanaCommandAdmissionRefused(cause),
+                        placement.DispatchPathSettled())).replies()
+                    key = placement.attempt_key(assignment.episode, assignment.attempt)
+                    closed = fixture.server.assignments[key]
+                    self.assertEqual(closed.retry, placement.DoNotRetry(cause))
+                    assert isinstance(closed.terminal_report, placement.TerminalAttemptReport)
+                    self.assertEqual(closed.terminal_report.outcome, placement.HanaCommandAdmissionRefused(cause))
+                    _ = publish_candidate(fixture, request)
+                    fallback = fixture.connect(request).replies()[-1]
+                    assert isinstance(fallback, wire.LocalPlacementGranted)
+                    self.assertEqual(fallback.assignment.episode, assignment.episode)
+                    self.assertFalse(fallback.hana_image_stale)
 
     def test_routed_fallback_prints_the_stale_hana_image_once(self) -> None:
         with PlacementFixture() as fixture:
