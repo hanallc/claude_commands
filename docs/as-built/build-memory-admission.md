@@ -250,12 +250,14 @@ Verify sets `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the paths it resol
 On Linux, a local placement grant names the build scope through its sidecar.
 The scope publishes that path before Cargo starts.
 The supervisor stops a published scope through the kernel's `cgroup.kill` file.
+If the write fails, the supervisor checks whether the scope already emptied.
 The same path handles caller exit, cancellation, and a winning Mac copy.
 The supervisor holds the launch lock until `cgroup.events` confirms the scope is empty.
 Cargo writes to a file. A separate reader sends the file contents to the step log.
 The supervisor can return a shutdown error while a process still has the file open.
 Verify closes the launch before it releases or cancels the grant.
 If shutdown fails, verify reports the error and keeps the reservation for the service to reclaim.
+For a local doc step, a separate process holds the checkout lease until the scope empties.
 Verify returns status 125 for that error even if a Mac copy passes.
 After a local build, verify reports the binary from the pinned target folder.
 Remote candidates use their target slots.

@@ -18,10 +18,12 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
-from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
-from scripts.direct.wait_for_test_state import wait_for_pid
+from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap, wait_for_marker_exit
+from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
+from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_admit import scope_members
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 
 
@@ -70,6 +72,64 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(len(self.cargo_calls()), 1)
             self.assertEqual(len(self.pass_records()), 1)
+
+    def assert_doc_retains_checkout_until_scope_empties(self, *, interrupt: bool) -> None:
+        write_real_scope_launcher(self.root / "bin")
+        admission = caller_admission(self, self.root, self.environment)
+        use_fixture_scope_readings(self, self.root, admission)
+        scope_file = self.root / "doc-scope"
+        child_pid = self.root / "doc-descendant"
+        pending_pid = child_pid.with_suffix(".new")
+        release = self.root / "end-cargo"
+        helper = VERIFY.with_name("wait_for_test_state.py")
+        self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
+            '    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))', f'''
+    sys.path.insert(0, {str(VERIFY.parents[2])!r})
+    from scripts.direct.wait_for_test_state import wait_for_file
+
+    child = subprocess.Popen([sys.executable, {str(helper)!r}, {str(self.root / "end-descendant")!r}],
+                             close_fds=True)
+    Path({str(scope_file)!r}).write_text(os.environ["BUILDLOG_STEP_SCOPE"])
+    Path({str(pending_pid)!r}).write_text(str(child.pid))
+    Path({str(pending_pid)!r}).replace({str(child_pid)!r})
+    wait_for_file(Path({str(release)!r}))
+    raise SystemExit(0)
+'''))
+        process, log, marker = self.start_doc()
+        wait_until(lambda: child_pid.is_file() or process.poll() is not None, self.root, processes=(process,))
+        self.assertTrue(child_pid.is_file(), log.read_text())
+        descendant = int(child_pid.read_text())
+        scope = Path(scope_file.read_text())
+        call, = self.cargo_calls()
+        checkout = Path(call["cwd"])
+        kill_file = scope / "cgroup.kill"
+        self.assertIn(descendant, scope_members(scope))
+        kill_file.chmod(0)
+        try:
+            if interrupt:
+                process.terminate()
+            else:
+                release.touch()
+            status = process.wait(TEST_HANG_GUARD_SECS)
+            self.assertIn(descendant, scope_members(scope))
+            self.assertEqual(build_folders.build_folder_state(checkout), "held", log.read_text())
+            self.assertEqual(status, 125, log.read_text())
+            self.assertIn("keeping the reservation", log.read_text())
+            _ = admission.run_pass()
+            self.assertTrue(admission.caller_reservations())
+            self.assertFalse(self.pass_records())
+        finally:
+            kill_file.chmod(0o200)
+            _ = kill_file.write_text("1\n")
+            self.assertEqual(wait_for_marker_exit(marker, TEST_HANG_GUARD_SECS), set())
+            _ = admission.run_pass()
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+
+    def test_doc_scope_stop_failure_retains_checkout_after_cargo_exits(self) -> None:
+        self.assert_doc_retains_checkout_until_scope_empties(interrupt=False)
+
+    def test_doc_scope_stop_failure_retains_checkout_after_interrupt(self) -> None:
+        self.assert_doc_retains_checkout_until_scope_empties(interrupt=True)
 
     def test_doc_refuses_a_tree_staged_during_the_copy_slot_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)

@@ -9,16 +9,35 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 from typing import override
-from unittest import mock
+from unittest import TestCase, mock
 
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
+from scripts.direct.verify_scoped_step import drain_scope
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+class ScopeShutdownTests(TestCase):
+    def test_kill_write_error_is_safe_if_the_scope_emptied(self) -> None:
+        scope = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        events = scope / "cgroup.events"
+        write_text = Path.write_text
+        _ = write_text(events, "populated 1\n")
+
+        def finish_before_kill(path: Path, contents: str) -> int:
+            self.assertEqual(path, scope / "cgroup.kill")
+            self.assertEqual(contents, "1\n")
+            _ = write_text(events, "populated 0\n")
+            raise FileNotFoundError("the scope ended before the kill write")
+
+        with mock.patch.object(Path, "write_text", autospec=True, side_effect=finish_before_kill):
+            drain_scope(scope)
 
 
 class VerifyTokenReclaimTests(VerifyTokenOwnershipFixture):

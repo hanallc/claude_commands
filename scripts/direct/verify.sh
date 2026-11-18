@@ -929,12 +929,9 @@ run_step() {
         fi
         RUN_STEP_PID=""
         if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
-        if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then settle_placed_scope || status=125; fi
-        if [[ "$CMD" == doc ]]; then
-            local doc_status=0
-            doc_close_checkout || doc_status=$?
-            if (( status != 125 && doc_status != 0 )); then status=$doc_status; fi
-        fi
+        local cleanup_status=0
+        finish_placed_step || cleanup_status=$?
+        if (( status != 125 && cleanup_status != 0 )); then status=$cleanup_status; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
@@ -2677,6 +2674,7 @@ PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
 PLACEMENT_OUTCOME=""
 PLACEMENT_SCOPE_STATE=""
+PLACEMENT_SCOPE_UNRESOLVED=0
 MAC_BACKOFF_PROBED=0
 
 apply_placement_outcome() {
@@ -2752,11 +2750,14 @@ run_placed_scope() {
     printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
         "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
     export BUILDLOG_RESERVED_STEP
-    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0
+    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_pipe=/dev/null
+    # Reopen the pipe because the coprocess descriptor closes on exec.
+    if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then checkout_pipe="/dev/fd/$DOC_COPY_LEASE_FD"; fi
     # The scope writes to a file. Only the reader can write to the log pipeline.
     : > "$output" || return 125
-    "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
-        "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@" > "$output" 2>&1 &
+    VERIFY_DOC_LEASE_FD="${DOC_COPY_LEASE_FD:+9}" \
+        "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
+        "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@" 9>"$checkout_pipe" > "$output" 2>&1 &
     supervisor=$!
     tail -n +1 --follow --pid="$supervisor" --sleep-interval=0.1 "$output" &
     reader=$!
@@ -2788,9 +2789,11 @@ close_scope_launch() (
 ) 8<"$PLACEMENT_SCOPE_STATE"
 
 settle_placed_scope() {
+    if (( ${PLACEMENT_SCOPE_UNRESOLVED:-0} )); then return 125; fi
     [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]] || return 0
     local status=0
     if ! close_scope_launch; then
+        PLACEMENT_SCOPE_UNRESOLVED=1
         PLACEMENT_OUTCOME=unresolved
         PLACEMENT_CLEANUP_ERROR="the build scope did not confirm exit; keeping the reservation"
         local reason=""
@@ -2800,6 +2803,13 @@ settle_placed_scope() {
     fi
     PLACEMENT_SCOPE_STATE=""
     return "$status"
+}
+
+finish_placed_step() {
+    settle_placed_scope || return $?
+    if [[ "$CMD" == doc && -n "${DOC_CALLER_DIR:-}" ]]; then
+        doc_close_checkout "$@"
+    fi
 }
 
 placement_once() {
@@ -3564,10 +3574,11 @@ verify_cleanup() {
     if [[ "$EXIT_STATUS" == "$TREE_CHANGED_STATUS" ]]; then status=cancelled; fi
     if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then stop_run_step KILL; fi
     apply_placement_outcome
-    if ! settle_placed_scope && (( EXIT_STATUS == 0 )); then
+    local cleanup_status=0
+    finish_placed_step stop || cleanup_status=$?
+    if (( cleanup_status == 125 )); then
         EXIT_STATUS=125 code=125 status=error
     fi
-    if [[ -n "${DOC_COPY_OWNER_PID:-${DOC_COPY_PID:-}}" ]]; then doc_close_checkout stop; fi
     stop_tree_watch
     [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
