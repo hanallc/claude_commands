@@ -2355,16 +2355,25 @@ class DispatchDelivery:
     actions: CompletionActions = CompletionActions()
 
 
-def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object) -> None:
+def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object, *,
+                     stopped_notice: bool = False) -> None:
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = _read_state(session_dir)
+        changed = False
+        if stopped_notice:
+            notice = _object_dict((_object_dict(state.get("stopped_pass_notices")) or {}).get(instance_id))
+            if notice is not None and notice.get("delivered") is not True:
+                notice["delivered"] = True
+                changed = True
         for passed in _pass_slots(state).values():
             if passed.get("instance_id") == instance_id:
                 if passed.get(key) != value:
                     passed[key] = value
-                    _write_state(session_dir, state)
-                return
+                    changed = True
+                break
+        if changed:
+            _write_state(session_dir, state)
 
 
 def worker_artifact(path: Path, slot: str, worker: str) -> Path:
@@ -2426,14 +2435,109 @@ def save_hook_completion(run: Path, instance_id: str, completion: HookCompletion
     _update_dispatch(run, instance_id, "hook_completion", asdict(completion))
 
 
+@dataclass(frozen=True)
+class StoppedPassNotice:
+    instance_id: str
+    run_id: str
+    worker_id: staff.StaffId
+    worker_name: str
+    director_id: staff.StaffId
+    phase_id: str
+    reason: str
+    delivered: bool = False
+
+
+class NoStoppedPassNotice(Enum):
+    UNRECORDED = "no stopped pass notice was recorded"
+
+
+@dataclass(frozen=True)
+class StoppedPassReceipt:
+    instance_id: str
+    line: str
+    completion_id: str
+    reply_file: str
+
+
+def stopped_pass_receipts(run: Path, worker_id: staff.StaffId) -> Generator[StoppedPassReceipt]:
+    """Read the archived receipts for this worker's stopped passes."""
+    try:
+        state = worker_lifecycle.read_json_object(_state_path(run))
+    except worker_lifecycle.WorkerStateUnreadable as error:
+        unit_runs.report_anomaly(" ".join(f"anomaly: stopped pass receipts: {error}".splitlines()))
+        return
+    notices = _object_dict(state.get("stopped_pass_notices")) or {}
+    for instance_id, value in notices.items():
+        fields = _object_dict(value) or {}
+        receipt = _object_dict(fields.get("receipt")) or {}
+        completion_id = _string(receipt.get("completion_id"))
+        if fields.get("worker_id") == worker_id and completion_id:
+            yield StoppedPassReceipt(instance_id, _string(receipt.get("line")), completion_id,
+                                     _string(receipt.get("reply_file")))
+
+
+def stopped_run_notice(run: Path, run_id: str) -> StoppedPassNotice | NoStoppedPassNotice:
+    """Read the notice even if another pass now occupies the slot."""
+    if not _state_path(run).is_file():
+        return NoStoppedPassNotice.UNRECORDED
+    state = _read_state(run, resolve_staff=False)
+    notices = _object_dict(state.get("stopped_pass_notices")) or {}
+    for value in notices.values():
+        fields = _object_dict(value)
+        if fields is not None and fields.get("run_id") == run_id:
+            return StoppedPassNotice(
+                _string(fields.get("instance_id")), run_id, staff.StaffId(_string(fields.get("worker_id"))),
+                _string(fields.get("worker_name")), staff.StaffId(_string(fields.get("director_id"))),
+                _string(fields.get("phase_id")), _string(fields.get("reason")), fields.get("delivered") is True,
+            )
+    return NoStoppedPassNotice.UNRECORDED
+
+
+def stopped_notice_delivered(run: Path, instance_id: str) -> bool:
+    state = _read_state(run, resolve_staff=False)
+    notices = _object_dict(state.get("stopped_pass_notices")) or {}
+    fields = _object_dict(notices.get(instance_id)) or {}
+    return fields.get("delivered") is True
+
+
+class StopDispatchRefused(Enum):
+    CHANGED = "the recorder no longer has the exact open pane pass"
+
+
+def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow,
+                  director: staff.StaffId, *, run_id: str, reason: str) -> StoppedPassNotice | StopDispatchRefused:
+    """Commit the stopped outcome, pass status, and notice in one state write."""
+    with (run / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_state(run)
+        passed = _open_passes(state).get(slot)
+        if (passed is None or passed.get("instance_id") != instance_id or passed.get("worker_id") != worker.id
+                or state.get(unit_runs.OWNER_FIELD) != director
+                or isinstance(hook_completion(passed), HookCompletion)):
+            return StopDispatchRefused.CHANGED
+        passed["hook_completion"] = asdict(HookCompletion("stopped", "", (reason,)))
+        phase = _object_dict(passed.get("phase")) or {}
+        notice = StoppedPassNotice(instance_id, run_id, worker.id, worker.name, director,
+                                   _string(phase.get("id")), reason)
+        delivery = dispatch_delivery(passed)
+        notices = _object_dict(state.get("stopped_pass_notices")) or {}
+        notices[instance_id] = {**asdict(notice), "receipt": {
+            "line": delivery.line, "completion_id": delivery.completion_id or instance_id,
+            "reply_file": delivery.reply_file,
+        }}
+        state["stopped_pass_notices"] = notices
+        _ = _close_slot_pass(run, state, slot, "canceled", plan_history.now_epoch())
+        return notice
+
+
 def dispatch_completed(run: Path, slot: str, instance_id: str) -> bool:
     passed = _pass_slots(_read_state(run)).get(slot, {})
     return passed.get("instance_id") == instance_id and passed.get("status") == "completed"
 
 
-def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str) -> None:
+def record_dispatch_notice(session_dir: Path, instance_id: str, notice: str, *, stopped_pass: bool = False) -> None:
     """Record a notice only after its message succeeds."""
-    _update_dispatch(session_dir, instance_id, "hook_notice", notice)
+    _update_dispatch(session_dir, instance_id, "hook_notice", notice, stopped_notice=stopped_pass)
 
 
 def record_quota_refusal(session_dir: Path, instance_id: str, refusal_id: str) -> None:

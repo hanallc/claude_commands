@@ -142,9 +142,13 @@ def _prompt_names_completion(text: str, completion_id: str) -> bool:
             or f"End your final reply with this line alone: DONE {completion_id}\n" in text)
 
 
+NO_LATE_RESULT_IDS: frozenset[str] = frozenset()
+
+
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
-                       stop_at_done: bool = False) -> TranscriptReceipt:
+                       stop_at_done: bool = False, accept_late_done: bool = False,
+                       late_result_ids: frozenset[str] = NO_LATE_RESULT_IDS) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
     submitted = False
     responding = False
@@ -187,13 +191,18 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                 elif "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
                         "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
                     responding = False
-                elif submitted and responding and results:
+                elif submitted:
+                    if not responding:
+                        results.intersection_update(late_result_ids)
+                    if not results:
+                        continue
                     if isinstance(reply, DispatchAwaitingReply):
                         reply = replace(reply, runs=tuple(sorted(results.union(reply.runs))))
                     else:
                         matching_done = reply if isinstance(reply, DispatchComplete) else NoMatchingDone.UNRECORDED
                         reply = DispatchAwaitingReply(reply.reply, tuple(sorted(results)), matching_done)
-            elif (responding or isinstance(line, DispatchPrompt)) and entry.startswith("assistant:\n"):
+            elif (responding or isinstance(line, DispatchPrompt) or accept_late_done and submitted
+                  ) and entry.startswith("assistant:\n"):
                 text = entry.removeprefix("assistant:\n")
                 if isinstance(completion, FinalReply):
                     complete = bool(text.strip())
@@ -201,6 +210,8 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                     if second_stage and worker_admission.reply_ends_dispatch(text, second_stage):
                         completion_id = second_stage
                     complete = worker_admission.reply_ends_dispatch(text, completion_id)
+                if accept_late_done and not responding and not complete:
+                    continue
                 if complete and stop_at_done and isinstance(completion, DoneReply):
                     return TranscriptReceipt(DispatchComplete(text), frozenset(received))
                 if complete and isinstance(line, DispatchPrompt):
@@ -255,8 +266,14 @@ def _receipt_records(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.C
     yield from worker_admission.transcript_records(source)
 
 
+class CurrentPanePass(Enum):
+    CURRENT = "read the current pane pass"
+
+
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
-                     run: Path, require_transcript: bool = False) -> DispatchReceipt:
+                     run: Path, require_transcript: bool = False,
+                     pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt = CurrentPanePass.CURRENT,
+                     ) -> DispatchReceipt:
     """Read the shared receipt and require delivery of detached results."""
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
@@ -264,20 +281,28 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     def records() -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
         return _receipt_records(row, backend, require_transcript=require_transcript)
 
-    transcript = transcript_receipt(records(), line, DoneReply(dispatch_id))
+    directory = run / worker_lifecycle.DETACHED_RUNS_DIR
+    if isinstance(pane_pass, progress_history.StoppedPassReceipt):
+        deliveries = detached_runs.worker_results(directory, row, since=0, pane_dispatch_id=pane_pass.instance_id)
+        transcript = transcript_receipt(records(), line, DoneReply(dispatch_id), accept_late_done=True,
+                                        late_result_ids=frozenset(deliveries))
+    else:
+        deliveries = {}
+        transcript = transcript_receipt(records(), line, DoneReply(dispatch_id))
     if isinstance(transcript.receipt, DispatchNotSubmitted):
         transcript = transcript_receipt(records(), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
-    received = transcript.received_runs
-    passed = worker_panes.worker_pass(row, run)
-    started = passed.get("started_at", 0)
-    since = float(started) if isinstance(started, (int, float)) else 0
-    directory = run / worker_lifecycle.DETACHED_RUNS_DIR
-    deliveries = detached_runs.worker_results(directory, row, since=since)
-    unseen = deliveries.keys() - received
     live = detached_runs.live_runs(directory, row.name)
+    if isinstance(pane_pass, progress_history.StoppedPassReceipt):
+        live = [record for record in live if record.get("pane_dispatch_id") == pane_pass.instance_id]
+    else:
+        passed = worker_panes.worker_pass(row, run)
+        started = passed.get("started_at", 0)
+        since = float(started) if isinstance(started, (int, float)) else 0
+        deliveries = detached_runs.worker_results(directory, row, since=since)
+    unseen = deliveries.keys() - transcript.received_runs
     pending = unseen.union(record["run_id"] for record in live)
     if isinstance(reply, DispatchAwaitingReply):
         pending.update(reply.runs)

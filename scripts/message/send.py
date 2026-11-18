@@ -2311,6 +2311,8 @@ def _staff_recipient_match(
         reference = target.split(":", 1)[1]
     member = membership.by_id(staff.StaffId(reference)) or membership.by_current_session(reference)
     if member is not None:
+        if isinstance(member.retirement, staff.RetiredProducer):
+            return RecipientLookupFailed(f"{target}: {member.name} is a retired producer")
         return member
     if target.startswith(("session:", "codex:", "worker:")) or not reference:
         return NoStaffRecipient()

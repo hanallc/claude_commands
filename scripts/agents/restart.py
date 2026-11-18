@@ -755,9 +755,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         return result.pane
 
 
-def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
+@dataclass(frozen=True)
+class RowPanesUnreadable:
+    reason: str
+
+
+def _read_row_panes(rows: list[staff.StaffRow], client: herdr.Herdr, *, strict: bool
+                    ) -> list[tuple[staff.StaffRow, str]] | RowPanesUnreadable:
     try:
-        entries = pane_record.read(client.session)
+        entries = pane_record.read_strict(client.session) if strict else pane_record.read(client.session)
         record = staff.initial_snapshot()
         record = staff.StaffSnapshot((*record.rows, *(row for row in rows if record.by_id(row.id) is None)))
         with herdr.pane_evidence_run():
@@ -770,11 +776,22 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
                              key=lambda entry: entry["written_at"], default=None)
                 retained = {newest["pane_id"]: newest} if newest is not None else {}
                 found.extend((row, str(pane["pane_id"])) for pane in pane_launch.reference_panes(
-                    reference, record, client, retained, evidence=evidence))
+                    reference, record, client, retained, evidence=evidence, strict_retained_reads=strict))
         return found
-    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-        print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        return RowPanesUnreadable(_error_reason(error))
+
+
+def read_row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]] | RowPanesUnreadable:
+    return _read_row_panes(rows, client, strict=True)
+
+
+def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
+    result = _read_row_panes(rows, client, strict=False)
+    if isinstance(result, RowPanesUnreadable):
+        print(f"restart: layout anomaly: {result.reason}", file=sys.stderr)
         return []
+    return result
 
 
 @dataclass(frozen=True)

@@ -13,7 +13,7 @@ Use the `agents` program.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
-- `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]`: rename a unit, showrunner, or worker.
+- Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
 - `agents resume NAME --retired`: restore a retired unit and its retained workers.
@@ -65,6 +65,23 @@ It saves the proved cleanup targets before the first change.
 A repeated command uses that record to complete failed steps.
 It deletes the cleanup record after every step completes.
 A repeated command prints `unchanged` when no cleanup record or selected resource remains.
+
+## Rename or retire a producer
+
+Use `agents rename OLD NEW` to rename a producer.
+The command keeps the staff id and document folder.
+It reports the path of the document folder.
+
+Use `agents retire NAME [--to PRODUCER]` to retire a producer.
+The command requires the producer to close its open questions.
+If the producer has no `handoff.md`, the command requests the file.
+Repeat the command after the file exists.
+The command stops the conversation and closes its tab before it moves open List items.
+Open List items move to the selected producer, or to morty by default.
+Use `--to` only with a producer whose conversation is live.
+The command retains the conversation and document folder.
+Use `agents resume NAME --retired` to restore the profile and conversation.
+You cannot rename or retire morty.
 
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
 Resume removes the record. A paused director receives one continuation message.

@@ -3929,7 +3929,8 @@ class WorkerPaneTests(StaffTestCase):
         terminal = str(location["terminal_id"])
         codex_process: dict[str, object] = {"pid": pid, "name": "codex"}
         child_process = {"pid": child, "name": "claude", "argv": claude_arguments}
-        reply = {"process_info": {"foreground_processes": [child_process, codex_process]}}
+        reply = {"process_info": {"shell_pid": pid - 1, "foreground_process_group_id": pid,
+                                  "foreground_processes": [child_process, codex_process]}}
         with (patch.object(self.world, "result", return_value=reply),
               patch.object(self.world, "pane_row", return_value=location)):
             for has_argv in (True, False):

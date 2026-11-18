@@ -774,6 +774,16 @@ class CompletedWorkerPass:
     dispatch_id: str
 
 
+@dataclass(frozen=True)
+class StoppedRunPassCompletion:
+    outcome: str
+    send_notice: Callable[[], object]
+
+
+class NoOwningPanePass(Enum):
+    UNRECORDED = "the run has no open or stopped pane pass"
+
+
 class ReleasedWorkerPass(Enum):
     NO_PROMPT_DELIVERED = "no prompt was delivered"
     ENDED = "the pass ended"
