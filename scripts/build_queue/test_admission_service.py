@@ -1051,8 +1051,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 read_transport.reset_mock()
                 _ = fixture.run_pass()
                 self.assertEqual((settings_opens(), read_transport.call_count), first_counts)
-                # The transport selector reads the file separately.
-                self.assertEqual(first_counts, (2, 1))
+                self.assertEqual(first_counts, (1, 1))
                 current = fixture.server.placement_host_keys[(request.episode, destination)]
                 self.assertNotEqual(current.configuration_generation, first.configuration_generation)
                 self.assertEqual(fixture.server.host_readers[current].timeout, 4)

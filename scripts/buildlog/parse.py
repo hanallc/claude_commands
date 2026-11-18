@@ -15,10 +15,10 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import TypedDict
+from typing import BinaryIO, TypedDict
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 
@@ -235,11 +235,44 @@ def manifest_path(argv: list[str]) -> str | None:
     return None
 
 
+def last_displayed_line(line: str) -> str:
+    """Keep the text after the last carriage return."""
+    return line.rstrip("\r").rsplit("\r", 1)[-1]
+
+
+def clean_line(line: str) -> str:
+    """Remove terminal controls and keep the last displayed text."""
+    return last_displayed_line(ANSI.sub("", line))
+
+
 def clean_lines(text: str) -> list[str]:
-    lines: list[str] = []
-    for raw in ANSI.sub("", text).split("\n"):
-        lines.append(raw.rstrip("\r").rsplit("\r", 1)[-1])
-    return lines
+    return [last_displayed_line(line) for line in ANSI.sub("", text).split("\n")]
+
+
+def bounded_displayed_lines(log: BinaryIO, limit: int) -> Iterator[str]:
+    """Read at most limit bytes at a time and keep one prefix per redraw."""
+    prefix = b""
+    last_frame = ""
+    while block := log.readline(limit):
+        complete = block.endswith(b"\n")
+        block = block.removesuffix(b"\n")
+        if complete and not prefix and not last_frame:
+            yield clean_line(block.decode("utf-8", errors="replace"))
+            continue
+        frames = block.split(b"\r")
+        unfinished = frames.pop()
+        for frame in frames:
+            prefix += frame[:limit - len(prefix)]
+            if prefix:
+                last_frame = clean_line(prefix.decode("utf-8", errors="replace")) or last_frame
+            prefix = b""
+        prefix += unfinished[:limit - len(prefix)]
+        if complete:
+            yield clean_line(prefix.decode("utf-8", errors="replace")) or last_frame
+            prefix = b""
+            last_frame = ""
+    if prefix or last_frame:
+        yield clean_line(prefix.decode("utf-8", errors="replace")) or last_frame
 
 
 def seconds(minutes: str | None, secs: str) -> float:
