@@ -410,7 +410,7 @@ The validation message asks the row's showrunner to check the change for the use
 3. Save `works (validated by the showrunner: <evidence>; not seen live: <what>)` if the check passes.
 4. Save a verdict that names the fault if the check fails.
 
-Use `verdict --production <name> --row <id> --validation <validation id> --verdict "<result>"` for either result.
+Use the verdict command from the validation message for either result. It includes `--validation <id>`.
 A fault returns the row to For you with the evidence in its log.
 The command refuses a missing or old validation ID.
 

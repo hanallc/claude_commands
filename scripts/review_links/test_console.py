@@ -196,7 +196,7 @@ class ConsoleTests(unittest.TestCase):
         root = self.root / "snapshots"
         owner = staff.StaffId("orphan-owner")
         self.assertEqual(console.news(root, pages, "changes"), ())
-        item = investigation.file(owner, "Find the cause", "Why?")
+        item = investigation.file(owner, "Find the cause", "Why?", waiting_why='The owner must complete the investigation.')
         self.assertEqual(console.news(root, pages, "changes"), ())
         ready = investigation.answer(owner, item.id, "Found it.")
         self.assertEqual(investigations_page.waiting_investigations(console.NewsRequest(root)),

@@ -51,8 +51,20 @@ class ReadSlotsTests(unittest.TestCase):
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         environment = config_environment(folder)
         _ = write_config_fixture(folder / "build_steps.conf",
-            "names.integrate=integrate\nowned.default={unit} {step}\n")
+            "names.integrate=integrate\nowned.default={unit} {step}\nowned.integrate={unit} {step}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+
+    def test_lease_names_keep_staff_references_separate_from_work_text(self) -> None:
+        from scripts.lib.build_steps import StepNames
+
+        names = StepNames({"names.build": "helper", "owned.default": "{unit} {step}"})
+        for step, expected in (("build", "helper"), ("", "helper")):
+            with self.subTest(step=step):
+                use = slots.slot_use({"unit": "unit-id", "showrunner": "showrunner-id",
+                                      "work": step, "purpose": "helper"}, names, lambda owner: "builder")
+                self.assertEqual(use["name"], "builder " + expected)
+                self.assertEqual(use.get("name_parts"), [{"kind": "staff", "text": "builder"},
+                    {"kind": "text", "text": " " + expected}])
 
     def test_slots_group_by_repository_with_size_use_and_the_nightly_delete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -81,12 +93,14 @@ class ReadSlotsTests(unittest.TestCase):
                          [("hana", 8, ["hana-slot1", "hana-slot2", "hana-slot10"]), ("organon", 2, ["organon-slot1"])])
         first, second, tenth = report["groups"][0]["slots"]
         self.assertEqual((first["size"], first["last_used"], first["used_by"], first["deleted_tonight"]),
-                         (70 * GIB, NOW, {"name": "natemerge integrate", "showrunner": "builds"}, False))
+                         (70 * GIB, NOW, {"name": "natemerge integrate", "showrunner": "builds", "name_parts": [
+                             {"kind": "staff", "text": "natemerge"}, {"kind": "text", "text": " integrate"}]}, False))
         self.assertEqual((second["size"], second["used_by"], second["deleted_tonight"]), (40 * GIB, None, True))
         self.assertEqual((tenth["size"], tenth["last_used"], tenth["deleted_tonight"]), (0, NOW - 2 * DAY, False))
         self.assertFalse(report["groups"][1]["slots"][0]["deleted_tonight"])
         # A lease with no step key keeps its owner and its purpose text.
-        self.assertEqual(report["groups"][1]["slots"][0]["used_by"], {"name": "id-of-organon-slot1 verify", "showrunner": "builds"})
+        self.assertEqual(report["groups"][1]["slots"][0]["used_by"], {"name": "id-of-organon-slot1 verify", "showrunner": "builds",
+            "name_parts": [{"kind": "staff", "text": "id-of-organon-slot1"}, {"kind": "text", "text": " verify"}]})
 
     def test_slot_report_reads_the_common_or_machine_pool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -212,7 +212,7 @@ class CandidatesTests(unittest.TestCase):
         other = "- 2026-10-05 config: Other [gain/week: 2 min waiting] — proposed"
         moment = datetime(2026, 10, 13, 9, 0, tzinfo=ZoneInfo("America/New_York"))
         cases: tuple[tuple[str, list[str], str], ...] = (("accepted", ["--applied", "claude abc123"], "accepted 2026-10-13, applied (claude abc123)"),
-                 ("declined", [], "declined"), ("deferred", [], "deferred"),
+                 ("declined", [], "declined"), ("deferred", ["--waiting-why", "The owner must finish the earlier check."], "deferred"),
                  ("done", [], "done 2026-10-13"), ("relayed", [], "relayed 2026-10-13"))
         with mock.patch.object(candidates, "now", return_value=moment):
             for state, options, words in cases:

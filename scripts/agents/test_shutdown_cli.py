@@ -2232,7 +2232,8 @@ class WorkerRenameTests(StaffTestCase):
                                 self.assertEqual(result.returncode, 0, result.stderr)
                             unqualified = scenario in (QualifiedWorkerCase.UNDECIDED, QualifiedWorkerCase.UNDECIDED_DASHED_ROLE)
                             unchanged_count = len(bare_twins) + int(unqualified)
-                            summary = (f"{unchanged_count} worker names unchanged: no qualified prefix for {owner.name}\n"
+                            worker_names = "worker name" if unchanged_count == 1 else "worker names"
+                            summary = (f"{unchanged_count} {worker_names} unchanged: no qualified prefix for {owner.name}\n"
                                        if unchanged_count else "")
                             self.assertTrue(result.stderr.endswith(summary), result.stderr)
                             migration_errors = result.stderr.removesuffix(summary) if summary else result.stderr
@@ -2282,7 +2283,8 @@ class WorkerRenameTests(StaffTestCase):
                             current = staff.by_id(qualified.id)
                             still_qualified = current is not None and current.name == qualified.name and not unqualified
                             unchanged_count = len(remaining) - int(still_qualified)
-                            repeated_summary = (f"{unchanged_count} worker names unchanged: no qualified prefix for {owner.name}\n"
+                            worker_names = "worker name" if unchanged_count == 1 else "worker names"
+                            repeated_summary = (f"{unchanged_count} {worker_names} unchanged: no qualified prefix for {owner.name}\n"
                                                 if unchanged_count else "")
                             self.assertEqual(again.stderr, migration_errors + repeated_summary)
                             self.assertEqual(again.stdout, "unchanged\n")
@@ -2346,7 +2348,7 @@ class WorkerRenameTests(StaffTestCase):
                 result = invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments,
                                     dict(os.environ), CHECKOUT)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stderr, "1 worker names unchanged: no qualified prefix for TEST-widget\n")
+                self.assertEqual(result.stderr, "1 worker name unchanged: no qualified prefix for TEST-widget\n")
                 self.assertEqual(staff.by_id(old_worker.id), old_worker)
                 self.assertEqual(fixture.staff_file.read_bytes(), before)
 
@@ -2983,6 +2985,23 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual(self.git("branch", "--show-current", cwd=folder), branch)
         self.assertEqual(staff.by_id(row.id), row)
 
+    def test_rename_replaces_the_old_suffix_when_it_also_matches_the_new_name(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.rename(row.id, "demo-alpha")
+        folder = self.rust / "claude-demo-alpha"
+        destination = self.rust / "claude-alpha"
+        _ = self.git("branch", "-m", "topic-demo-alpha", cwd=folder)
+
+        with FolderSessionFixture(row, live=False).installed(), RenameDisplays(row).installed():
+            result = self.invoke(["rename", str(row.id), "alpha"])
+
+        self.assert_ok(result)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(folder.exists())
+        self.assertEqual(self.git("branch", "--show-current", cwd=destination), "topic-alpha")
+        self.assertEqual(staff.by_id(row.id), replace(row, name="alpha",
+            worktree=staff.PresentWorktree("natedev", destination)))
+
     def test_review_push_uses_an_explicit_refspec_for_the_move_and_retry(self) -> None:
         from scripts.production import unit_move
 
@@ -3475,7 +3494,7 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertEqual(len(messages), 3)
                         settled = self.invoke(["rename", str(row.id), "omega"])
                         self.assertEqual((settled.returncode, settled.stdout, settled.stderr),
-                                         (0, "unchanged\n", "1 worker names unchanged: no qualified prefix for omega\n"))
+                                         (0, "unchanged\n", "1 worker name unchanged: no qualified prefix for omega\n"))
                         self.assertEqual(len(messages), 3)
                         continue
                     if followup == "first notice timeout":
@@ -3487,7 +3506,7 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertEqual([message[0] for message in messages], [str(worker.id), str(row.id)])
                     rerun = self.rename()
                     self.assertEqual((rerun.returncode, rerun.stdout, rerun.stderr),
-                                     (0, "unchanged\n", "1 worker names unchanged: no qualified prefix for gamma\n"))
+                                     (0, "unchanged\n", "1 worker name unchanged: no qualified prefix for gamma\n"))
                     if followup == "document rename after promotion":
                         self.assertIsInstance(row.parent, staff.ReportsTo)
                         assert isinstance(row.parent, staff.ReportsTo)
@@ -3773,6 +3792,46 @@ class FolderRenameTests(FolderRenameFixture):
         self.assertFalse(self.destination.exists())
         self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-x")
         self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, name="x"))
+
+
+@final
+class StartupRenameTests(FolderRenameFixture):
+    old_name: str = "startup"
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(mock.patch.object(shutdown, "rename_send_notice"))
+        _ = self.enterContext(mock.patch.object(shutdown, "rename_repair_displays", return_value=False))
+        _ = staff.rename(self.owner.id, "startup-unit")
+
+    def restore_startup_name(self) -> subprocess.CompletedProcess[str]:
+        arguments = ["rename", str(self.owner.id), "startup"]
+        return invoke_cli(shutdown, lambda: shutdown.main(arguments), arguments, dict(os.environ), self.checkout)
+
+    def test_restore_startup_name_keeps_the_matching_folder_and_branch_quiet(self) -> None:
+        result = self.restore_startup_name()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done\n", ""))
+        self.assertEqual(staff.by_id(self.owner.id), self.owner)
+        self.assertTrue(self.source.is_dir())
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.source), "cargo-liner-startup")
+        self.assertIsNone(unit_move.pending_rename(self.owner.id))
+
+    def test_restore_startup_name_reports_only_the_unmatched_folder(self) -> None:
+        folder = self.source.with_name("unmatched")
+        _ = self.git("worktree", "move", str(self.source), str(folder))
+        location = staff.PresentWorktree(remote.local_machine(), folder)
+        _ = staff.set_worktree(self.owner.id, location, expected=self.owner.worktree)
+
+        result = self.restore_startup_name()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (0, "done\n", f"anomaly: folder {folder} does not end with -startup-unit\n"))
+        self.assertEqual(staff.by_id(self.owner.id), replace(self.owner, worktree=location))
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(self.git("branch", "--show-current", cwd=folder), "cargo-liner-startup")
+        self.assertIsNone(unit_move.pending_rename(self.owner.id))
 
 
 class UnitRenameSessionsTests(UnitRenameFixture):
