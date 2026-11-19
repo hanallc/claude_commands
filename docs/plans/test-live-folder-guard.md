@@ -34,15 +34,17 @@ A bind mount can expose the same files at two paths. Check the mount tree, inclu
 
 ## One file guard at test start
 
-Use a shared natedev launcher. Put the file guard after trusted setup and before the first interpreter, shell, test binary, or candidate build script.
+Use the same Bubblewrap launcher for all three guards on natedev. Bubblewrap provides the mounts, namespaces, and PID 1 reaper in one launch.
+Start the guard after trusted setup and before any candidate interpreter, shell, test binary, or build script.
+Use the [Part 2 launch profile](test-live-folder-guard-walls.md#natedev--one-guarded-launch) for process and outside-access controls.
 
 1. Allocate one leased folder with the build folder maker.
 2. Create the run's `TMPDIR`, `HOME`, XDG directories, logs, and writable fixtures inside it.
 3. Select the source checkout and any read-only build inputs.
-4. Start `unshare` with a private mount view and a fresh `/proc` for the file boundary.
-5. Expose only approved read-only inputs, private `/proc`, and the devices listed below.
-6. Bind only the new leased folder writable.
-7. Remove capabilities and set `no_new_privs` before executing the command.
+4. Start Bubblewrap inside the verified job scope with an empty root and the namespaces from Part 2.
+5. Add approved inputs with `--ro-bind`, a fresh private `/proc`, and the devices listed below.
+6. Use `--bind` for the job's leased storage.
+7. Apply `--remount-ro /` and `--cap-drop ALL`. Bubblewrap sets `no_new_privs` before exec.
 8. Send output through pipes to the trusted parent.
 9. Release the folder only after the supervisor proves that the owner and all test descendants exited.
 
@@ -81,48 +83,46 @@ Verify nextest admission and token return through the queue route after Builds r
 ### Gate parent-death handoff
 
 Run the trusted launcher as a direct child of the gate. Keep the gate PID in trusted host setup.
-Set `PR_SET_PDEATHSIG` to `SIGKILL` in that child and then compare `getppid()` with the expected gate PID.
-Abort on a mismatch or a failed setup call. Exec the trusted `unshare` binary in the same process without a credential change.
-Use `unshare --fork --kill-child=SIGKILL` with its pidfd parent check to tie namespace PID 1 to the launcher.
-The unshare pidfd check covers a launcher exit before PID 1 arms its death signal.
+After scope registration, exec Bubblewrap in the same process with `--unshare-pid --proc /proc --die-with-parent`.
+Keep the Bubblewrap reaper as PID 1. Bubblewrap uses its parent-death option for the monitor, the reaper, and the command.
+The scope record lets recovery stop the job if a parent exits before Bubblewrap arms its parent-death signal.
 
 Remove the inherited `MERGE_GATE_PARENT_PID` in the launcher before entering the namespace.
-Run the candidate command as a direct child of trusted PID 1.
+Run the candidate command as a direct child of the Bubblewrap reaper.
 Set `MERGE_GATE_PARENT_PID=1` in the candidate environment before the first shim or interpreter starts.
-Remove the Linux parent-death block from the candidate-side `SUITE_BOOTSTRAP`.
+Skip `SUITE_BOOTSTRAP` on the guarded path. The trusted launcher applies its startup rules before candidate exec.
 `sitecustomize.py` still uses the variable to skip startup folder allocation. The launcher already supplies a lease.
 `module_run.py` consumes the variable and watches a pidfd for namespace PID 1.
 The module runner still sets a parent-death signal for its own test child.
-PID 1 waits for the candidate command and returns its status. When PID 1 exits, the kernel stops all remaining namespace members.
-[Gate bootstrap](../../scripts/production/merge_gate.py#L121), [Gate launch](../../scripts/production/merge_gate.py#L1086), [Python startup](../../scripts/lib/python_startup/sitecustomize.py#L220), [Module runner](../../scripts/test_times/module_run.py#L610), [Linux parent-death signal](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html), [PID namespaces](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html), [unshare source](https://github.com/util-linux/util-linux/blob/v2.42.2/sys-utils/unshare.c#L1092-L1184)
+The Bubblewrap monitor reports the candidate status. When PID 1 exits, the kernel stops all remaining namespace members.
+[Gate bootstrap](../../scripts/production/merge_gate.py#L121), [Gate launch](../../scripts/production/merge_gate.py#L1086), [Python startup](../../scripts/lib/python_startup/sitecustomize.py#L220), [Module runner](../../scripts/test_times/module_run.py#L610), [PID namespaces](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html), [Bubblewrap parent-death option](https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c#L349-L374)
 
 #### Cancellation
 
-The gate defers `SIGTERM` and `SIGINT` during spawn and registration. The launcher inherits that mask.
-In the launcher, restore the default dispositions and unblock both signals after the parent check and cgroup registration, before exec.
-Send cancellation directly from the gate to PID 1 through a pidfd.
-In PID 1, block both signals during setup. Install cancellation handlers, then unblock both signals before reporting readiness.
-Pass a pidfd for PID 1 to the gate over the private setup socket with `SCM_RIGHTS`.
-The gate must authorize candidate start after it receives the pidfd. If cancellation is pending, cancel the job before this authorization.
-If setup fails or does not complete before the deadline, stop the job through its cgroup.
-Start the candidate in its own process group. If cancellation arrives before the fork, PID 1 exits.
-If cancellation arrives during the fork, PID 1 records it and forwards the signal once the process group is ready.
-Forced cleanup covers all process groups.
-In the candidate child, restore default signal dispositions and set an empty signal mask before the first exec.
-Close setup and recovery descriptors before candidate exec.
+The existing gate code blocks cancellation signals during spawn and registration. The launcher inherits that mask.
+After registration, exec the trusted GNU `env --default-signal` with the absolute Bubblewrap path as its command.
+GNU `env` restores default signal dispositions and unblocks inherited signals before it execs Bubblewrap.
+Bubblewrap keeps its built-in reaper. It unblocks its internal `SIGCHLD` mask before candidate exec.
+Keep the default cancellation dispositions in PID 1 and the candidate.
+Add no signal handlers, masks, or disposition changes in new Python or shell code, including fixtures.
+On cancellation, timeout, or setup failure, write `1` to the verified job's `cgroup.kill`.
+The kernel sends `SIGKILL` to every member, regardless of its mask or process group.
+[GNU env implementation](https://github.com/coreutils/coreutils/blob/v9.10/src/env.c#L751-L754), [Bubblewrap candidate exec](https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c#L3370-L3392)
 
 #### Lease release and recovery
 
-Use one host-owned cgroup v2 child per job under the build scope. Keep accounting and user manager requests on the host.
-Record its unique identity with the lease before launch. Keep the launcher blocked until the gate places it in the cgroup.
-Do not fork if the setup channel closes before placement. Keep the gate as the launcher's parent.
-Hide cgroup control files from the candidate. Keep the cgroup available after a gate crash until recovery confirms it is empty.
-On forced stop, write `1` to the recorded `cgroup.kill`. This reaches descendants that called `setsid()` or changed process groups.
+Use the [Part 2 scope layout](test-live-folder-guard-walls.md#cgroup-layout). Each job has its own host-owned cgroup v2.
+Keep the launcher blocked until the gate verifies its cgroup placement and records the scope's invocation identity with the lease.
+Authorize Bubblewrap start after the existing cancellation deferral ends.
+If the setup channel closes before approval, exit before starting Bubblewrap. Keep the gate as the launcher's parent.
+Hide cgroup control files from the candidate. Keep accounting and user manager requests on the host.
+If the Bubblewrap monitor exits and the cgroup still has members, stop the remaining processes through `cgroup.kill`.
+Reap the launcher on the live gate path, including when cancellation occurs before cgroup placement.
 For normal exit, forced stop, and crash recovery, require `cgroup.events` to report `populated 0` before releasing the lease.
 This proves that PID 1 and all descendants exited. Reaping the host launcher alone cannot give this proof.
 Retain the lease and recovery record if the cgroup identity or empty state cannot be verified.
 Require the same proof in the folder sweeper, even if a crash closes the lease lock.
-Remove the cgroup after recording the proof. Refuse launch if the required cgroup controls are unavailable.
+Keep the cgroup available until the gate or recovery records the proof. Refuse launch if the required cgroup controls are unavailable.
 [Gate recovery](../../scripts/production/merge_gate.py#L700), [Gate cleanup](../../scripts/production/merge_gate.py#L1000)
 
 The `start_gate_job()` proof is pending. Use separate fixture launches through that entry point after Builds releases the hold.
@@ -131,11 +131,11 @@ The `start_gate_job()` proof is pending. Use separate fixture launches through t
 | --- | --- |
 | Normal test module and type check | The candidate shim can write only to its lease. A wrong-root write in the shim fails. The gate receives the command status. |
 | Python startup and module runner | A host PID in the input environment never reaches either reader. Startup uses the supplied lease. The module runner watches namespace PID 1. |
-| Gate exits before the host child arms the death signal | The host parent check refuses to start candidate code. |
-| Host launcher exits between the namespace fork and the pidfd check | The namespace refuses to start candidate code. |
+| Gate exits before scope registration | The launcher's setup channel closes. The launcher exits before starting Bubblewrap. |
+| Gate or Bubblewrap monitor exits during Bubblewrap setup | Recovery stops any remaining members of the recorded cgroup before it releases the lease. |
 | Gate exits or forces a stop after a fixture calls `setsid()` | Recovery waits for the cgroup to become empty after the launcher exits. The fixture process and PID 1 exit before lease release. |
-| `SIGTERM` and `SIGINT` during registration | Cancellation prevents candidate start. The gate keeps the lease until the cgroup is empty. |
-| `SIGTERM` and `SIGINT` after readiness | PID 1 handles both signals. The candidate starts with default dispositions and an empty mask. |
+| Cancellation during launch or after candidate start | The gate stops the recorded cgroup. The lease remains held until the cgroup is empty. |
+| Candidate startup from the existing deferred spawn | The first exec receives default dispositions for `SIGTERM`, `SIGHUP`, and `SIGINT`. Its signal mask is empty. |
 | Gate timeout | The gate reaps the host job and records its status. The lease remains held until the cgroup is empty. |
 
 Represent a leased path as `PrivateTestFolder` after the launcher verifies its owner, mount, and lifetime.
@@ -166,12 +166,13 @@ The timing commands saved the count, median, minimum, and maximum. The individua
 | Direct start in the mapped-user batch | 3.64 ms, 2.65–5.69 ms | Baseline. |
 | Plain `unshare -m` | — | Refused with `EPERM`. |
 | `unshare -rm` and recursive read-only mount | 27.22 ms, 22.30–38.74 ms | Works without host root. The child maps UID 1000 to UID 0. |
-| Mapped-user mount and private proc | 18.25 ms, 15.62–64.18 ms | Works without host root. Keeps UID 1000. This is the Part 1 prototype. |
+| Mapped-user mount and private proc | 18.25 ms, 15.62–64.18 ms | Works without host root. Keeps UID 1000. This was the first file guard prototype. |
 | Current `systemd-run --user --scope` | 16.28 ms, 14.11–73.03 ms | The scope starts. It rejects `ReadOnlyPaths` as an unknown assignment. |
 | Transient `systemd-run --user --pipe` service | 57.82 ms, 45.66–106.60 ms | `ProtectSystem=strict`, `ReadWritePaths`, and `ReadOnlyPaths` worked without host root. The service changes launch and recovery behavior. |
 | Python Landlock probe, ABI 7 | 47.28 ms, 30.01–232.05 ms | Blocked append, truncate, and unlink with `EACCES`. The tested rules allowed `chmod`. |
 
-The mapped-user prototype added 14.61 ms to the paired median. The complete launcher timing is pending.
+The mapped-user prototype added 14.61 ms to the paired median.
+Part 2 records the [Bubblewrap pilot timings](test-live-folder-guard-walls.md#natedev-timing-output). The integrated gate timing with Bubblewrap is pending.
 The root-map probe and user service blocked a fixture Git commit at `index.lock` with `EROFS`.
 The root-map batch timed out after five seconds on `test_process_failure.py`. Its result under the production launcher is pending.
 The mapped-user probe blocked append, truncate, chmod, dirfd unlink, and a symlink alias with `EROFS`. A rename across the bind returned `EXDEV`.
@@ -181,26 +182,12 @@ The probe wrote inside the private mount. `findmnt` reported `ro` for `/`, `/ses
 The host mount source identifies `/session` as a bind of the `session` directory on `/build`. The host still reported `rw` for `/session`.
 Mutation checks through both bind paths of the same disposable fixture are pending.
 The mapped-user probe showed a private read-only `/proc`. A lookup of a known host process through `/proc/<pid>/root` is pending.
-The selected file guard passed `scripts/lib/test_git_index.py` through `module_run.py` with private `TMPDIR`. It ran one test.
+The mapped-user prototype passed one test from `scripts/lib/test_git_index.py` through `module_run.py` with private `TMPDIR`.
 
-The prototype uses a new folder from the trusted caller. Pass the folder as the first argument and the test command after it.
-
-```bash
-unshare --map-current-user --keep-caps --mount --pid --fork --kill-child \
-  --mount-proc --propagation private -- sh -eu -c '
-    folder=$1
-    shift
-    mount -o remount,bind,ro=recursive /
-    mount --bind "$folder" "$folder"
-    mount -o remount,bind,rw,nosuid,nodev "$folder"
-    exec setpriv --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all "$@"
-  ' test-file-guard "$private_test_folder" ./scripts/lib/py scripts/test_times/module_run.py scripts/lib test_git_index.py
-```
-
-The production launcher sets `TMPDIR`, `HOME`, and XDG paths before exec. It also applies the FIFO, device, descriptor, and parent-death rules above.
+The Bubblewrap launcher sets `TMPDIR`, `HOME`, and XDG paths before exec. Apply the mount, device, descriptor, and parent-death rules above.
 Check the bootstrap with `findmnt -T`, a disposable sibling canary, and `/proc/self/status`. Record setup errors separately from test failures.
 Keep the existing build scope for accounting. Start it outside the file guard. Keep parent identity and recovery checks on the side that can see the host PIDs.
-Record raw timing samples and raw proof output during the first authorized integration run. Part 2 will verify the full process and outside-access rules.
+Record raw timing samples and proof output during the first authorized integration run. Verify all three guards in that launch.
 
 ## Test starts and repairs
 
