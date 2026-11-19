@@ -184,18 +184,23 @@ result.update(paired_trial())
 '''
 
 
-GUEST_TRANSFERS = r'''import json, subprocess, time
-def stage(name):
+BOX_CURL_RETRY = ('--retry', '2', '--retry-all-errors', '--retry-delay', '1')
+GUEST_TRANSFERS = f'''import json, subprocess, time
+transfer_retries = {BOX_CURL_RETRY!r} if (
+    gate_request.get('task') != 'paired' and gate_request.get('mode') in ('merge-gate', 'targeted-test')
+) else ()
+''' + r'''def stage(name):
     try:
         with (root / 'boot.log').open('a') as output:
             output.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stage=' + name + '\n')
     except OSError:
         pass
 def get(url, destination):
-    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '60', url, '-o', str(destination)], check=True)
+    subprocess.run(['curl', '--fail', '--silent', '--show-error', *transfer_retries, '--max-time', '60',
+                    url, '-o', str(destination)], check=True)
 def put(url, content):
-    subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '30', '-X', 'PUT', '--data-binary', '@-', url],
-                   input=content, check=True)
+    subprocess.run(['curl', '--fail', '--silent', '--show-error', *transfer_retries, '--max-time', '30',
+                    '-X', 'PUT', '--data-binary', '@-', url], input=content, check=True)
 def publish(name):
     put(links[name], json.dumps(result).encode())
 '''
@@ -296,26 +301,25 @@ finally:
 
 def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -> None:
     """Run the verified candidate with its own suite and record code."""
+    request = (cast(dict[str, object], json.loads((root / 'request.json').read_text()))
+               if links.get('production') else {})
     namespace: dict[str, object] = {
-        'root': root, 'links': links, 'result': result, 'log': root / 'gate.log',
+        'root': root, 'links': links, 'result': result, 'log': root / 'gate.log', 'gate_request': request,
         'encode_run': encode_run, 'completion_record': completion_record,
     }
     exec(GUEST_TRANSFERS, namespace)
-    if links.get('production'):
-        request = cast(dict[str, object], json.loads((root / 'request.json').read_text()))
-        namespace['gate_request'] = request
-        if request.get('task') == 'paired':
-            from scripts.production import merge_gate
-            from scripts.lib.descendants import adopt_descendants
-            from scripts.lib.process_group import send_process_group
-            namespace.update(
-                timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
-                           'kernel_boot_at', 'instance_running_at') if key in result},
-                adopt_descendants=adopt_descendants, send_process_group=send_process_group,
-                test_module_environment=merge_gate.test_module_environment,
-                process_memory_mib=merge_gate.process_memory_mib)
-            exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
-            return
+    if request.get('task') == 'paired':
+        from scripts.production import merge_gate
+        from scripts.lib.descendants import adopt_descendants
+        from scripts.lib.process_group import send_process_group
+        namespace.update(
+            timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
+                       'kernel_boot_at', 'instance_running_at') if key in result},
+            adopt_descendants=adopt_descendants, send_process_group=send_process_group,
+            test_module_environment=merge_gate.test_module_environment,
+            process_memory_mib=merge_gate.process_memory_mib)
+        exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
+        return
     exec(CANDIDATE_GUEST, namespace)
 
 
@@ -324,8 +328,7 @@ GUEST = (r'''import concurrent.futures, datetime, importlib, json, os, pathlib, 
 root = pathlib.Path(os.environ.pop('GATE_BOX_DIR', '/var/lib/gate-trial'))
 os.environ.pop('box_dir', None)
 links = json.loads((root / 'links.json').read_text())
-if links.get('production'):
-    gate_request = json.loads((root / 'request.json').read_text())
+gate_request = json.loads((root / 'request.json').read_text()) if links.get('production') else {}
 timestamps = {'nix_ready_at': time.time()}
 started_at = os.environ.pop('GATE_USER_DATA_STARTED_AT', '')
 if started_at:
@@ -437,6 +440,7 @@ finally:
             put(links['log'], content)
         except Exception as error:
             result['log_error'] = str(error)
+    stage('result upload')
     publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
     if links['step'] == 'start' and result['verdict'] == 'ready':
         (root / 'prepared').touch()
@@ -444,8 +448,9 @@ finally:
     .replace('__GATE_STARTUP_FILENAME__', repr(python_startup.__file__)))
 
 
-def log_upload(links: dict[str, str]) -> str:
-    transfer = f'curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @- {shlex.quote(links["log"])}'
+def log_upload(links: dict[str, str], *, retry: bool = True) -> str:
+    transfer = shlex.join(['curl', '--fail', '--silent', '--show-error', *(BOX_CURL_RETRY if retry else ()),
+                          '--max-time', '30', '-X', 'PUT', '--data-binary', '@-', links['log']])
     return f'''{{ cat "${{box_dir:-/var/lib/gate-trial}}/boot.log" "${{box_dir:-/var/lib/gate-trial}}/gate.log" "${{box_dir:-/var/lib/gate-trial}}/timeline.log" 2>/dev/null || :
     ps -eo etimes,pcpu,rss,args --sort=-etimes 2>/dev/null | awk '!/curl/ {{print substr($0,1,200); if (++n==60) exit}}' || :
     printf '\\n'
@@ -480,16 +485,24 @@ def boot_trap(links: dict[str, str]) -> str:
     """Publish a shell failure before the tool shell can publish a result."""
     cold = links.get('boot_error', links['result']) if links['step'] == 'size' else links['ready-cold']
     warm = links.get('boot_error', links['result']) if links['step'] == 'size' else links['ready-warm']
-    return f'''boot_failed() {{
+    return fr'''boot_failed() {{
     status=$?
     trap - EXIT
     if [ -n "${{log_push_pid:-}}" ]; then kill "$log_push_pid" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ]; then
         destination={shlex.quote(cold)}
         if [ -e "${{box_dir:-/var/lib/gate-trial}}/prepared" ]; then destination={shlex.quote(warm)}; fi
-        {log_upload(links)}
-        printf '{{"verdict":"error","error":"Tool preparation failed (exit %s)"}}' "$status" > "${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
-        curl --fail --silent --show-error --max-time 30 -X PUT --data-binary @"${{box_dir:-/var/lib/gate-trial}}/boot-error.json" "$destination" || :
+        {log_upload(links, retry=False)}
+        stage=$(sed -n 's/^[0-9T:Z-]\{{20\}} stage=//p' "${{box_dir:-/var/lib/gate-trial}}/boot.log" | tail -n 1)
+        if [ "$stage" = 'tool preparation' ]; then
+            message='Tool preparation failed'
+        else
+            message="The box failed at stage ${{stage:-boot}}"
+        fi
+        message=$(printf '%s' "$message" | LC_ALL=C tr -d '[:cntrl:]' | sed 's/[\\"]/\\&/g')
+        file="${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
+        printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"
+        curl --fail --silent --show-error {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @"$file" "$destination" || :
     fi
     exit "$status"
 }}
@@ -508,7 +521,7 @@ def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_p
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     def download(key: str, name: str) -> str:
         url, destination = shlex.quote(links[key]), '"$box_dir/' + name + '"'
-        return f'curl --fail --silent --show-error --max-time 60 {url} -o {destination}\n'
+        return f'curl --fail --silent --show-error {shlex.join(BOX_CURL_RETRY)} --max-time 60 {url} -o {destination}\n'
     downloads = download('guest', 'guest.py')
     if 'request' in links:
         downloads += download('request', 'request.json')
@@ -554,6 +567,7 @@ touch "$box_dir/timeline.log"
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial
 loginctl enable-linger gate-trial
 export PYTHONUNBUFFERED=1
+printf '%s stage=tool preparation\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 nix --extra-experimental-features 'nix-command flakes' shell {tools} --command bash -ec {shlex.quote(session)}
 '''
 
