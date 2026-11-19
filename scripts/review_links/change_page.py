@@ -178,6 +178,8 @@ class StoredReviewMessage(TypedDict):
     # A record saved before efficiencies has no row; its row is the source's stem.
     row: NotRequired[str]
     image_question_dispatch: NotRequired[ImageQuestionDispatch]
+    submission_request: NotRequired[str]
+    submission_delivered: NotRequired[bool]
 
 
 class StoredDeliveryCloseout(TypedDict):
@@ -880,12 +882,15 @@ class DeliveryStatus:
         fields = self.closeout_fields(page, row)
         dispatch = fields.get("review_dispatch")
         if dispatch is not None and dispatch["attempt"] == intent.attempt:
-            if dispatch["state"] == "finished":
-                self.finish_intent_locked(delivery, slots, intent)
-            else:
+            if dispatch["state"] != "finished":
                 print(f"review-links delivery {row}: send result unknown for attempt {intent.attempt}; message kept",
                       file=sys.stderr)
-            return False
+                return False
+            failed = fields.get("failed_delivery")
+            if not (isinstance(page, ReviewMessagePage) and page.saved.get("submission_request")
+                    and failed is not None and failed["attempt"] == intent.attempt):
+                self.finish_intent_locked(delivery, slots, intent)
+                return False
         path = self.closeout_path(page, row)
         started: StoredDeliveryCloseout = {**fields, "review_dispatch": {"attempt": intent.attempt, "state": "started"}}
         try:
@@ -1054,6 +1059,9 @@ class DeliveryStatus:
             for current in slots.intents():
                 if current.attempt == delivery.attempt:
                     self.record_result_locked(delivery, result, alerts)
+                    if (isinstance(result, FailedDelivery) and isinstance(page, ReviewMessagePage)
+                            and page.saved.get("submission_request")):
+                        return
                     self.finish_intent_locked(delivery, slots, current)
                     return
 
@@ -1063,6 +1071,8 @@ class DeliveryStatus:
             updated = replace(slots, validation=ValidationRequested(intent.attempt, intent.feedback))
         else:
             updated = slots.updated(intent.kind, NoDelivery())
+        if intent.kind == "verdict" and isinstance(page, ReviewMessagePage) and page.saved.get("submission_request"):
+            page = replace(page, saved={**page.saved, "submission_delivered": True})
         self.write_slots(page, row, updated)
         if intent.kind == "verdict" and isinstance(page, (ReviewMessagePage, UserQuestionPage)):
             try:
@@ -1562,7 +1572,8 @@ def publish_next(page: ReviewPage, body: str) -> str:
 
 
 def publish(production: Path, review_list: Path, rows: list[str]) -> str:
-    page = ReviewPage(review_list.resolve(), production.resolve(), tuple(dict.fromkeys(rows)), secrets.token_urlsafe())
+    listing = change_review.review_list_source(review_list)
+    page = ReviewPage(listing, production.resolve(), tuple(dict.fromkeys(rows)), secrets.token_urlsafe())
     if not page.rows or any(re.fullmatch(r"C\d+", row) is None for row in page.rows):
         raise ValueError("name one or more row IDs such as C27")
     _ = shown_rows(page)
@@ -1736,7 +1747,6 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         return NoMessageDelivery()
     doc = assignment.production if defer_verdict_cleanup else row_production(page, row)
     recipients = verdict_recipients(owner, verdict)
-    cleanup: change_review.PendingVerdictCleanup | change_review.NoVerdictCleanup = change_review.NO_VERDICT_CLEANUP
     attempt = ''
     with status.locked():
         slots = status.slots(page, row_id)
@@ -1748,8 +1758,6 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         with status.locked():
             if attempt and status.slots(page, row_id).verdict != slots.verdict:
                 status.write_slots(page, row_id, slots)
-            if isinstance(cleanup, change_review.PendingVerdictCleanup):
-                cleanup.intent.unlink(missing_ok=True)
 
     if recipients and not defer_verdict_cleanup:
         attempt = status.begin(page, row_id, "verdict", recipients=recipients, user_verdict=True)
@@ -1757,25 +1765,25 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         if recipients and defer_verdict_cleanup:
             attempt = status.begin(page, row_id, "verdict", recipients=recipients, user_verdict=True)
         review = closeout_before_save(page, doc, row_id, verdict, status)
-        if defer_verdict_cleanup or review:
-            cleanup = replace(change_review.PendingVerdictCleanup.for_row(status.root, page.review_list, row_id),
-                              verdict=verdict, feature_review=review)
         production_name = unit_lookup.doc_owner(page.production, staff.snapshot()).name
         production = change_review.production_doc(production_name)
-        if isinstance(cleanup, change_review.PendingVerdictCleanup):
-            with change_review.checked_review_write(page.review_list, status.root, lambda: None):
-                recorded = answer_row(page, row_id).get('Verdict')
-                if recorded == verdict:
-                    cancel_preparation()
-                    return NoMessageDelivery()
-                if recorded:
-                    raise AnswerRefused("this row already has a different saved answer")
+        with change_review.checked_review_write(page.review_list, status.root, lambda: None):
+            recorded = answer_row(page, row_id).get('Verdict')
+            if recorded == verdict:
+                cancel_preparation()
+                return NoMessageDelivery()
+            if recorded:
+                raise AnswerRefused("this row already has a different saved answer")
+            cleanup = replace(change_review.PendingVerdictCleanup.for_row(status.root, page.review_list, row_id),
+                              verdict=verdict, feature_review=review, require_git_commit=defer_verdict_cleanup or bool(review))
+            try:
                 cleanup.save()
                 result = change_review.save_verdict(page.review_list, row_id, verdict, production, cleanup=cleanup)
-                if isinstance(result, change_review.VerdictSaved) and isinstance(result.cleanup, change_review.NoVerdictCleanup):
-                    cleanup.intent.unlink(missing_ok=True)
-        else:
-            result = change_review.save_verdict(page.review_list, row_id, verdict, production)
+            except (change_review.ChangeReviewError, OSError):
+                cleanup.intent.unlink(missing_ok=True)
+                raise
+            if isinstance(result, change_review.VerdictRefused) or isinstance(result.cleanup, change_review.NoVerdictCleanup):
+                cleanup.intent.unlink(missing_ok=True)
     except change_review.VerdictDurabilityUnconfirmed:
         with status.locked():
             _ = status.request_attempts.pop(attempt, None)
@@ -1788,11 +1796,14 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         if defer_verdict_cleanup:
             raise question_record.AnswerRefused("The answer could not be saved.") from error
         raise question_record.AnswerRefused(str(error).strip()) from error
-    if isinstance(result, change_review.VerdictRefused):
-        cancel_preparation()
-        raise question_record.AnswerRefused(result.reason)
     for warning in result.warnings:
         print(f"review-links {warning}", file=sys.stderr)
+    if isinstance(result, change_review.VerdictRefused):
+        for line in result.lines:
+            if line.startswith("scratch not removed:"):
+                print(f"review-links {line}", file=sys.stderr)
+        cancel_preparation()
+        raise question_record.AnswerRefused(result.reason)
     details = (f"Merged: {row.get('Merged', '')}", f"User feedback: {feedback if feedback.strip() else verdict}",
                "\n".join(result.lines).strip())
     try:
@@ -1849,10 +1860,11 @@ def finish_verdict_cleanup(delivery: MessageDelivery | NoMessageDelivery,
     if not isinstance(cleanup, change_review.PendingVerdictCleanup):
         return delivery
     lines = finish_saved_verdict(cleanup, status)
+    for line in lines:
+        if isinstance(delivery, NoMessageDelivery) or line.startswith("scratch not removed:"):
+            print(f"review-links {line}", file=sys.stderr)
     if isinstance(delivery, MessageDelivery):
         return replace(delivery, message='\n'.join((delivery.message, *lines)), scratch_cleanup=change_review.NO_VERDICT_CLEANUP)
-    for line in lines:
-        print(f"review-links {line}", file=sys.stderr)
     return NoMessageDelivery()
 
 
@@ -2010,7 +2022,7 @@ def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, sour
     return reached
 
 
-def recover_verdict_cleanups(status: DeliveryStatus, lists: Path, intents: tuple[Path, ...],
+def recover_verdict_cleanups(status: DeliveryStatus, intents: tuple[Path, ...],
                              unreadable: set[Path]) -> set[Path]:
     """Finish each durable verdict and return the deliveries that must wait."""
     unready: set[Path] = set()
@@ -2019,7 +2031,7 @@ def recover_verdict_cleanups(status: DeliveryStatus, lists: Path, intents: tuple
             continue
         try:
             with status.locked():
-                cleanup = change_review.PendingVerdictCleanup.load(intent, lists)
+                cleanup = change_review.PendingVerdictCleanup.load(intent)
                 listing = cleanup.path
                 if listing in unreadable:
                     continue
@@ -2063,9 +2075,8 @@ def recover_pending(status: DeliveryStatus, *,
     intents = (only.intent,) if targeted else tuple(sorted(status.root.glob(change_review.VERDICT_CLEANUP_PREFIX+'*')))
     if not intents and not status.read_view().paths:
         return
-    lists = change_review.lists_directory().resolve()
     unreadable: set[Path] = set()
-    unready = recover_verdict_cleanups(status, lists, intents, unreadable)
+    unready = recover_verdict_cleanups(status, intents, unreadable)
     if not targeted:
         recover_question_answers(status)
         recover_review_messages(status)
@@ -2074,7 +2085,7 @@ def recover_pending(status: DeliveryStatus, *,
         listings: Iterable[Path] = (only.path,)
     else:
         paths = status.read_view().paths
-        listings = lists.glob(change_review.PREFIX+"*.md")
+        listings = change_review.lists_directory().resolve().glob(change_review.PREFIX+"*.md")
     if not paths:
         return
     snapshots: dict[Path, change_review.ReviewListSnapshot] = {}
@@ -2163,6 +2174,8 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 fields = cast(StoredDeliverySlots,json.loads(path.read_text()))
                 saved = fields.get('review_message')
                 if saved is None:
+                    continue
+                if saved.get('submission_delivered'):
                     continue
                 source = Path(saved['source'])
                 row = saved.get('row',source.stem)

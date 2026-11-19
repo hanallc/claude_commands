@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from scripts.agents.remote import local_machine
@@ -36,11 +37,11 @@ from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
-from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, staff, update_registration
+from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
-from scripts.review_links import efficiency_reviews, review_actions, review_events, review_later, review_submissions
+from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -49,7 +50,7 @@ from scripts.statusline import counts_row
 
 def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
     """Decode the compact wire fields for exact index assertions."""
-    packed = cast(dict[str,list[list[str | int | float | list[str]]]],json.loads(payload))
+    packed = cast(dict[str,list[list[str | int | float | list[str] | None]]],json.loads(payload))
     names = cast(list[list[str]],packed['n'])
     entries: list[review_page.ReviewIndexEntry] = []
     for row in packed['r']:
@@ -63,6 +64,8 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
             ownerHtml=owner[2], sourceHtml=source[2])
         if len(row) > 11 and isinstance(handoff := row[11], list):
             entry['handoff'] = (handoff[0], handoff[1])
+        if len(row) > 12 and isinstance(why := row[12], str):
+            entry['waitingWhy'] = why
         entries.append(entry)
     return entries
 
@@ -178,6 +181,209 @@ class ReviewPageTests(unittest.TestCase):
 
     def question(self, title: str = 'Which layout should the page use?') -> str:
         return self.fixture.file_user_question(title)
+
+    def ready_submission_recipient(self) -> staff.StaffRow:
+        doc = self.fixture.production
+        issues = doc.parent / 'native-proposals'
+        _ = doc.write_text(doc.read_text() + f'> **Status: PRODUCTION — running.**\n- **Proposals:** {issues}\n')
+        owner = staff.snapshot().by_doc(local_machine(), doc)
+        assert owner is not None
+        return owner
+
+    def submission_request(self, kind: new_item_dialog.SubmissionKind, recipient: staff.StaffId
+                           ) -> new_item_dialog.NewItemRequest:
+        return new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-{kind}-{recipient}', kind, recipient,
+                                              f'Check the {kind} record.', new_item_dialog.NoEvidence())
+
+    def test_sent_rows_keep_native_types_and_return_to_open(self) -> None:
+        owner = self.ready_submission_recipient()
+        doc = self.fixture.temporary / 'producer.md'
+        proposals = doc.parent / 'producer-proposals'
+        _ = doc.write_text(f'# Producer\n- **Proposals:** {proposals}\n')
+        producer = fixture_member('producer', name='producer', doc=staff.LiveDoc(local_machine(), doc))
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        initial = cache.get()
+        cases = ((new_item_dialog.SubmissionKind.QUESTION, owner, review_items.ReviewType.QUESTION),
+                 (new_item_dialog.SubmissionKind.PROPOSAL, producer, review_items.ReviewType.PROPOSAL),
+                 (new_item_dialog.SubmissionKind.INVESTIGATION, owner, review_items.ReviewType.INVESTIGATION),
+                 (new_item_dialog.SubmissionKind.BUG, owner, review_items.ReviewType.BUG))
+        published: list[review_page.PublishedSubmission] = []
+        for kind, recipient, review_type in cases:
+            with self.subTest(kind=kind):
+                request = self.submission_request(kind, recipient.id)
+                created = cache.create_submission(request)
+                published.append(created)
+                snapshot = cache.get()
+                row = snapshot.records[created.key]
+                self.assertEqual((row.state, row.type, row.owner), (review_items.ReviewState.WAITING, review_type, recipient.id))
+                self.assertEqual(review_items.source_path(row), created.saved.path)
+                self.assertIn(created.saved.path.parent, snapshot.source_stamps)
+                entries = {entry['key']: entry for entry in unpack_index(review_page.index_json(snapshot.entries))}
+                self.assertEqual(entries[created.key].get('waitingWhy'), f'{recipient.name} answers this')
+                self.assertNotIn(created.saved.reply_token.encode(), snapshot.body(created.key))
+                self.assertNotIn(created.saved.key.encode(), snapshot.index_response())
+                self.assertNotIn(created.key, initial.records)
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertIn(b'data-type-chip="bug"', snapshot.page)
+        self.assertEqual([item.key for item in review_items.read(
+            self.root, kinds=(review_items.ReviewType.BUG,))], [published[-1].key])
+        self.assertIn(proposals, snapshot.source_stamps)
+        for created in published:
+            with self.subTest(key=created.key):
+                self.assertEqual(snapshot.records[created.key], cache.get().records[created.key])
+                self.assertNotIn(created.key, {item.key for item in review_items.read_open(self.root)})
+                self.assertTrue(change_page.answer_item(created.saved.key, 'The check passed.', created.saved.reply_token, self.status))
+        open_keys = {item.key for item in review_items.read_open(self.root)}
+        self.assertTrue({item.key for item in published} <= open_keys)
+        self.assertEqual(review_items.investigations(self.fixture.production, staff.snapshot()), 2)
+
+    def test_moved_reports_display_the_original_source_unit(self) -> None:
+        owner = self.ready_submission_recipient()
+        unit = self.fixture.unit
+        reports: list[investigation.Investigation] = []
+        for kind in investigation.InvestigationKind:
+            request = self.submission_request(new_item_dialog.SubmissionKind(kind.value), unit.id)
+            origin = new_item_dialog.ReviewSubmission(
+                request.request_id, 'a'*64, request.evidence, (), new_item_dialog.new_reply_token())
+            reports.append(investigation.file(owner.id, request.words, request.words, kind=kind,
+                                               waiting_why='The owner checks the report.', submission=origin))
+        snapshot = review_page.build_snapshot(self.root)
+        entries = {entry['key']:entry for entry in unpack_index(review_page.index_json(snapshot.entries))}
+        owner_html = snapshot.names.html(owner.id, owner.name)
+        unit_html = snapshot.names.html(unit.id, unit.name)
+        for report in reports:
+            with self.subTest(kind=report.kind):
+                key = f'investigation/{owner.id}/{report.id}'
+                entry = entries[key]
+                self.assertEqual((entry['owner'], entry['ownerName']), (owner.id, owner.name))
+                self.assertEqual((entry['sourceOwner'], entry['sourceName']), (unit.id, unit.name))
+                details = snapshot.body(key).decode()
+                self.assertIn(f'Owner: {owner_html} · Source: {unit_html}</p>', details)
+
+    def test_send_rejects_a_snapshot_built_before_publication(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root)
+        self.addCleanup(cache.close)
+        previous = cache.get()
+        entered, release = threading.Event(), threading.Event()
+        original = review_page.build_snapshot
+
+        def rebuild(root: Path) -> review_page.ReviewSnapshot:
+            snapshot = original(root)
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(TEST_HANG_GUARD_SECS):
+                    raise TimeoutError('The test did not release the snapshot.')
+            return snapshot
+
+        with patch.object(review_page, 'build_snapshot', side_effect=rebuild):
+            cache.invalidate()
+            self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+            try:
+                created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id))
+                self.assertNotIn(created.key, previous.records)
+                self.assertIn(created.key, cache.get().records)
+            finally:
+                release.set()
+            cache.synchronize()
+            self.assertIn(created.key, cache.get().records)
+
+    def test_sent_proposal_uses_its_own_prerequisite(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.PROPOSAL, owner.id))
+        source = created.saved.path
+        related = source.parent / 'prerequisite.md'
+        _ = source.write_text(source.read_text().replace('---\n', '---\ndepends_on: [prerequisite]\n', 1))
+        for proposer, expected in ((self.fixture.unit.id, str(related)), ('another-owner', '')):
+            with self.subTest(proposer=proposer):
+                _ = related.write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+                                       + f'proposed_by: {proposer}\n---\n')
+                fresh = review_page.build_snapshot(self.root)
+                retained = fresh.records[created.key]
+                self.assertEqual(retained.queue_after, expected)
+                self.assertEqual(review_items.read_current(self.root, retained, fresh.members), retained)
+
+    def test_current_proposal_prerequisite_precedes_an_archive_with_the_same_name(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        request = self.submission_request(new_item_dialog.SubmissionKind.PROPOSAL, owner.id)
+        created = cache.create_submission(request)
+        source = created.saved.path
+        _ = source.write_text(source.read_text().replace('---\n', '---\ndepends_on: [aardvark]\n', 1))
+        current = source.with_name('aardvark.md')
+        archived = source.parent / 'archive' / current.name
+        archived.parent.mkdir()
+        header = ('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+                  f'proposed_by: {self.fixture.unit.id}\n---\n')
+        _ = archived.write_text(header)
+        archive_cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        archive_snapshot = archive_cache.get()
+        record = archive_snapshot.records[created.key]
+        self.assertEqual(record.queue_after, str(archived))
+        with (patch.object(review_items, 'proposal_store_folders', side_effect=AssertionError('The exact read scanned folders.')),
+              patch.object(review_items, 'store_paths', side_effect=AssertionError('The exact read listed records.'))):
+            self.assertEqual(review_items.read_current(self.root, record, archive_snapshot.members), record)
+            retry = archive_cache.create_submission(request)
+            self.assertEqual(retry.version, archive_snapshot.version)
+            outcome = archive_cache.save(
+                self.card_body(archive_snapshot, created.key, 'question', 'Which archive supplied the prerequisite?'),
+                self.status)
+            self.assertEqual(outcome.answer, 'question sent')
+            assert isinstance(outcome.item, review_items.ReviewItem)
+            self.assertEqual(outcome.item.queue_after, str(archived))
+
+        _ = current.write_text(header)
+        rebuilt = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        snapshot = rebuilt.get()
+        record = snapshot.records[created.key]
+        self.assertEqual(record.queue_after, str(current))
+        self.assertEqual(review_items.read_current(self.root, record, snapshot.members), record)
+        outcome = rebuilt.save(self.card_body(snapshot, created.key, 'feedback', 'Check the current prerequisite.'),
+                               self.status)
+        self.assertEqual(outcome.answer, 'feedback sent')
+
+    def test_save_sent_proposal_with_local_urgency_times(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        local_time = datetime(2026, 11, 30, 15, 30)
+        for level in (urgency.Urgency(urgency.SOON, due=local_time), urgency.mark(local_time)):
+            with self.subTest(level=level.level):
+                request = self.submission_request(new_item_dialog.SubmissionKind.PROPOSAL, owner.id)
+                created = cache.create_submission(replace(request, words=f'Check the {level.level} Proposal.'))
+                _ = proposal_issue.set_urgency(created.saved.path, level, local_time.date())
+                rebuilt = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+                snapshot = rebuilt.get()
+                time = local_time.replace(tzinfo=snapshot.zone)
+                expected = replace(level, due=time if level.due else None, marked=time if level.marked else None)
+                self.assertEqual(snapshot.records[created.key].urgency, expected)
+                outcome = rebuilt.save(self.card_body(snapshot, created.key, 'feedback', 'Check the urgency.'),
+                                       self.status)
+                self.assertEqual(outcome.answer, 'feedback sent')
+                assert isinstance(outcome.item, review_items.ReviewItem)
+                self.assertEqual(outcome.item.urgency, expected)
+
+    def test_asking_a_sent_proposal_keeps_its_card_after_the_reply_token_changes(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.PROPOSAL, owner.id))
+        self.assertTrue(change_page.answer_item(created.saved.key, 'The proposal is ready.',
+                                                created.saved.reply_token, self.status))
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        words = 'Which checks should the proposal run?'
+        before = cache.get()
+        self.assertEqual(before.records[created.key].state, review_items.ReviewState.OPEN)
+        reply = cache.save(self.card_body(before, created.key, 'question', words), self.status)
+        self.assertEqual(reply.answer, 'question sent')
+        snapshot = cache.get()
+        record = snapshot.records[created.key]
+        self.assertEqual((record.state, record.waiting_why), (review_items.ReviewState.WAITING, words))
+        origin = review_items.submission_origin(record)
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        self.assertEqual(origin.request_id, created.saved.request_id)
+        self.assertNotEqual(origin.reply_token, created.saved.reply_token)
+        self.assertEqual(snapshot.submission_keys[origin.request_id], created.key)
+        self.assertIn(words.encode(), snapshot.body(created.key))
 
     def assert_index_title(self, item: review_items.ReviewItem, title: str) -> None:
         entry, = review_page.filter_index([item], staff.snapshot())
@@ -790,7 +996,9 @@ class ReviewPageTests(unittest.TestCase):
             shell = snapshot.render(show='all').decode()
             card = snapshot.body(key).decode()
             done = snapshot.body('page-owner/C1').decode()
-        self.assertNotIn('<form', shell.split('<script>')[0], 'The shell contains no card bodies or forms.')
+        self.assertNotRegex(shell, r'<form[^>]*\bdata-review-form\b')
+        self.assertRegex(shell, r'<dialog id="review-new-item"[^>]*>\s*<form>')
+        self.assertEqual(len(re.findall(r'<form\b', shell)), 1)
         self.assertNotIn('<tbody data-list-item', shell.split('<script>')[0], 'The browser mounts summaries from the index.')
         self.assertIn('data-review-index', shell)
         self.assertIn('Which layout gives each review card enough space for its controls?', card)
@@ -1595,7 +1803,8 @@ requestAnimationFrame(focusRow);
         records = review_items.read(self.root)
         actionable = [item for item in records if item.for_you(datetime.now(user_zone()))]
         self.assertEqual(len(actionable), 7, 'The user totals retain all seven actionable records.')
-        self.assertEqual({item.type for item in actionable}, set(review_items.ReviewType))
+        self.assertEqual({item.type.value for item in actionable},
+                         {'question', 'change', 'investigation', 'proposal', 'efficiency'})
         self.assertEqual({item.state.value for item in actionable}, {'Open'})
         self.assertEqual(tuple(state.value for state in review_items.ReviewState), ('Open', 'Validating', 'Waiting', 'Done'))
         self.assertTrue(all(item.actions for item in actionable))
@@ -2136,6 +2345,8 @@ window.fetch=async(url,options)=>{
         _ = self.decisions()
         _ = self.question()
         _ = self.investigation()
+        _ = investigation.file(self.fixture.unit.id, 'Check the build', 'Which step stopped?',
+                               waiting_why='The owner checks the build.', kind=investigation.InvestigationKind.BUG)
         examples = {item.type: item for item in review_items.read(self.root)}
         owners = {fixture_member('showrunner', name=name).id: name
                   for name in ('natedev', 'second-owner', 'third-owner')}
@@ -3016,6 +3227,110 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         self.assertEqual(review_page.legacy_url('/console/changes.html', 'type=questions&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc'),
             '/console/review.html?type=question&owner=page-owner&show=Waiting&q=layout&sort=Age&dir=desc')
 
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_legacy_investigations_bookmark_shows_bugs_and_investigations(self) -> None:
+        _ = self.investigation(False)
+        _ = investigation.file(self.fixture.unit.id, 'Check the build', 'Which step stopped?',
+                               waiting_why='The owner checks the build.', kind=investigation.InvestigationKind.BUG)
+        redirect = review_page.legacy_url('/console/investigations.html', 'show=all')
+        page = browser_markup(self.root, show='all')
+        setup = '<script>history.replaceState(null,"",'+json.dumps(redirect)+');</script>'
+        probe = r"""<script>(async()=>{
+ const failures=[];
+ const mounted=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.type).sort().join(',');
+ const combined=document.querySelector('[data-type-chip="investigations"]');
+ if(mounted()!=='bug,investigation') failures.push('The bookmark must show both report types.');
+ if(combined?.hidden || combined?.getAttribute('aria-pressed')!=='true')
+  failures.push('Select the combined filter on the legacy bookmark.');
+ document.querySelector('[data-type-chip="investigation"]').click();
+ if(mounted()!=='investigation') failures.push('The Investigation filter must show only Investigations.');
+ document.querySelector('[data-type-chip="bug"]').click();
+ if(mounted()!=='bug') failures.push('The Bug filter must show only Bugs.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_bug_opens_after_refresh_and_keeps_the_matching_owner_filter(self) -> None:
+        owner = self.ready_submission_recipient()
+        _ = self.question('Keep this question')
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        before = cache.get()
+        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id))
+        fresh = cache.get()
+        values = {
+            'owner': owner.id, 'key': created.key, 'id': created.saved.id,
+            'body': fresh.body(created.key).decode(), 'snapshot': cast(object, json.loads(fresh.index_response())),
+        }
+        setup = r'''<script>
+const fixture=FIXTURE, nativeFetch=fetch;
+let sent=false;
+history.replaceState(null,'','#'+new URLSearchParams({
+ owner:fixture.owner,type:'question',show:'open',q:'keep this question'
+}));
+window.fetch=async(url,options={})=>{
+ const route=new URL(url,location.href);
+ if(route.pathname==='/console/review/new-item'){
+  if(options.method==='POST'){
+   sent=true;
+   return Response.json({id:fixture.id,key:fixture.key,version:fixture.snapshot.version});
+  }
+  return Response.json({token:'fixture',recipients:[{id:fixture.owner,name:'page-owner'}]});
+ }
+ if(sent && route.searchParams.has('body')) return new Response(fixture.body,{
+  headers:{'X-Review-Version':fixture.snapshot.version}
+ });
+ if(sent && (route.searchParams.has('index') || route.searchParams.has('version')))
+  return Response.json(fixture.snapshot);
+ return nativeFetch(url,options);
+};
+</script>'''.replace('FIXTURE', json.dumps(values).replace('</', '<\\/'))
+        probe = r'''<script>(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const review=document.querySelector('[data-review]'), dialog=document.querySelector('#review-new-item');
+ const params=()=>new URLSearchParams(location.hash.slice(1));
+ try {
+  const previous=history.length;
+  check(params().get('owner')===fixture.owner, 'The original owner filter is active.');
+  const recipients=dialog.querySelector('[data-recipients]');
+  const ready=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    const recipient=recipients.querySelector('input');
+    if(recipient){observer.disconnect();resolve(recipient);}
+   });
+   observer.observe(recipients,{childList:true});
+  });
+  review.querySelector('[data-review-new]').click();
+  if(!dialog.open) throw new Error('New must open the dialog.');
+  dialog.querySelector('[name="kind"][value="bug"]').click();
+  (await ready).click();
+  const words=dialog.querySelector('[name="words"]');
+  words.value='Check the Bug record.';
+  words.dispatchEvent(new Event('input',{bubbles:true}));
+  const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
+  dialog.querySelector('[type="submit"]').click();
+  await refreshed;
+  const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
+  check(row?.dataset.type==='bug' && !row.hidden && row.querySelector('[data-detail]').hidden===false,
+        'The refreshed index reveals and opens the new Bug.');
+  check(params().get('item')===fixture.key && params().get('show')==='all' &&
+        !params().get('type') && !params().get('q') && params().get('owner')===fixture.owner,
+        'The jump keeps the matching owner and clears the filters that hide the new Bug.');
+  check(history.length===previous+1, 'The jump adds one history entry.');
+  if(history.length===previous+1){
+   const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   history.back();
+   await restored;
+   check(params().get('type')==='question' && params().get('show')==='open' &&
+         params().get('q')==='keep this question', 'Back restores the former filters.');
+  }
+ }catch(error){failures.push(String(error));}
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        markup = before.render().decode().replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
         _ = self.investigation(False)
@@ -3038,7 +3353,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         self.assertFalse(any(item.title == 'Remind the owner to check the gate' for item in items), 'F011: reminders are not user questions')
         count, _ = review_items.question_counts(owner, user_zone(), identities, None)
         self.assertEqual(count, 1, 'F011: count the question without counting the reminder')
-        self.assertEqual({item.type for item in items},set(review_items.ReviewType))
+        self.assertEqual({item.type.value for item in items},
+                         {'question', 'change', 'investigation', 'proposal', 'efficiency'})
         self.assertEqual(review_items.efficiency(doc),1)
         deferred = next(item for item in items if 'deferred change' in item.title)
         self.assertEqual(deferred.state,review_items.ReviewState.WAITING)

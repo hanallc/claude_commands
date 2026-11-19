@@ -99,10 +99,11 @@ Run this command in a terminal on natedev.
 deploy.py hana-setup --plan
 ```
 
-The plan covers one policy update for an existing, idle, stopped, stack-owned Hana box.
-It refuses first-time Hana setup, pending instance or volume work, and direct-owned boxes.
+The plan reports whether the deployed Hana image is current or stale.
+It refuses first-time Hana setup and setup with pending instance or volume work.
+It can preview one policy update for an idle, stopped, stack-owned Hana box.
 
-The plan checks the local credential file and reads the scaler identity with STS.
+The policy preview checks the local credential file and reads the scaler identity with STS.
 It uses the same stack, instance, disk, and parameter checks as approved setup.
 It previews one modification to `ScalerPolicy` without resource replacement.
 The plan deletes the change set and confirms its removal with CloudFormation.
@@ -140,15 +141,14 @@ The simulations exclude those policies and the live versions of the proposed gat
 If the plan cannot identify a policy to exclude, it names the policy and refuses.
 The simulations include the proposed gate policies and the proposed S3 bucket policy.
 The simulations use the regional VPC, image, and Spot request conditions.
+The plan simulates `ec2:GetSpotPlacementScores` in each gate region.
 The plan reports each region in configuration order.
 It passes when every region passes.
 
 ## Hana guest safety files
 
-`scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
-These files do not provision a machine or add a deployment command.
-Phase D must install and enable the units before the box accepts work.
-`config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
+`scripts/aws_target/hana_guest.py` renders safety files for the kept Hana box.
+`config/hana_aws.conf` supplies the image's admission setting, safety timing, and resource values.
 
 `scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
 It writes nine files by base name and applies each `GuestFile` mode.
@@ -156,9 +156,15 @@ Without `tool_setup`, `hana_guest.render_files()` omits `hana-tools.service`.
 Phase F2 supplies the tool setup service.
 
 The NixOS build uses the renderer from its pinned `claude-commands` input.
+`hana_render` puts the guest transfer limit in `receiver.json` and copies the receiver code into the image.
+Update that NixOS input and build the Hana image to install a guest transfer change.
+The box must boot from that image to use the change.
 `scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
 The filter excludes unrelated repository changes from the image inputs.
 The NixOS integration replaces the manually copied guest files.
+The image installs the rendered settings and guest code.
+User data supplies the boot descriptor and signed control access.
+A change to guest admission requires a rebuilt image and a box provisioned from that image.
 
 Run this command from the repository root:
 
@@ -190,6 +196,10 @@ An unchanged permit retains that deadline across later reads and service restart
 A renewal with a changed expiry records a new bounded deadline when safety next reads it.
 The watchdog stops at the earlier of wall-clock expiry and the boot-clock deadline.
 A backward wall-clock change cannot extend the boot-clock deadline.
+Command admission reports disabled guest settings, a missing data mount, or an invalid permit separately.
+The receiver sends a refusal code with the diagnostic text.
+The permit refusal names the failed identity, expiry, or deadline check.
+An invalid or missing expiry field in a permit with valid identity fields gets a specific expiry refusal.
 
 Safety, permit renewal, and command admission share `/run/hana-aws/permit.lock` through `fcntl.flock`.
 Safety holds the lock from the permit read through the shutdown decision.
@@ -440,6 +450,73 @@ After a failed ordinary setup update, setup deletes resources retained during ro
 Run `prepare --workload hana` again before retrying with changed inputs.
 The launch template sets `DeleteOnTermination` on the root disk. AWS deletes each root disk with its box.
 
+### Hana image freshness
+
+`hana_render` hashes the paths, modes, and bytes of the rendered guest files.
+It adds this digest to the rendered `safety.json` that the image installs during activation.
+The digest excludes its own field.
+The renderer copies only the Hana settings used by the guest.
+
+- Safety reads `enabled`, `guard_grace_seconds`, `watchdog_check_seconds`, and `permit_max_seconds`.
+- The guest also reads `step_cpu_limit`, `step_memory_gib`, and `mount_timeout_seconds`.
+- The receiver reads `aws_timeout_s` and `control_poll_seconds`.
+- The runner reads `execution_shell` and `free_floor_gib`.
+- Source materialization reads `source_max_bytes`, `source_download_timeout_s`, `source_git_timeout_s`, and `source_allowed_environment`.
+
+The renderer writes the resolved values under plain keys.
+The renderer selects overrides by the Hana target alias in `hana_aws.conf`.
+The renderer and runner use one list of timeout keys from `build_targets.conf`.
+The digest covers the guest files that this repository renders.
+NixOS sets the slot settings, compiler version, and runner environment outside those files.
+Changes to those NixOS settings take effect when a new image uses them.
+
+The guest uses `enabled` as an independent admission switch in addition to the live permit.
+Removing the guest switch would avoid an image rebuild for this setting.
+That change would leave an already issued permit usable until the guest revokes it or it expires.
+
+`hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
+Registration requires the build derivation and the renderer output to be present in the local store.
+The registered image description and the local registration record carry the same digest.
+Setup records the digest for the instance after EC2 confirms its image identity.
+Registering another image does not refresh the digest of an existing instance.
+A missing or mismatched digest makes the deployed image stale.
+
+The queue excludes a stale Hana box before assignment.
+The controller checks the image before accepting a claim, starting the box, or granting command permission.
+A stale image detected after assignment records `HanaCommandAdmissionRefused` with `DoNotRetry`.
+The queue can place that build on another eligible target after it settles the Hana attempt.
+The build and target status report this message.
+
+> The Hana image is stale. Run deploy.py hana-setup --plan to review replacement.
+
+After it saves an effective guest setting, `tune.py` reports this message.
+
+> The Hana image is now stale. Build and register a current Hana image.
+
+### Replace a Hana image
+
+The NixOS configuration builds the guest files from its pinned `claude-commands` input.
+Use a reviewed pin that contains the current rendered guest files.
+Use the following sequence only when deletion of the Hana data disk is approved.
+
+1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
+2. Register it with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
+3. Delete the saved deployment with `scripts/aws_target/deploy.py down --workload hana --approve-destroy`.
+4. Prepare the new deployment with `scripts/aws_target/deploy.py prepare --workload hana`.
+5. Provision the new box with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
+
+The third command deletes the data disk and its data.
+Direct setup refuses changed image parameters on a saved box.
+The stack update also refuses replacement of an instance, volume, or attachment.
+
+A replacement that keeps the disk requires a separate setup procedure.
+It must hold the box idle, journal the replacement intent, and launch the replacement in the disk's zone.
+It must detach the same disk, attach it to the replacement, then verify the attachment and stopped state.
+It must persist the new lifecycle identity before it ends the old Spot request.
+Each rerun must confirm the saved intent and resume its last unfinished step.
+Stack-owned boxes also need a separate change that retains the disk and replaces the attachment.
+A combined build and registration command needs an explicit source pin and the local build evidence that registration checks.
+
 ## Ending persistent Spot boxes
 
 AWS opens a persistent Spot request again when its box is terminated.
@@ -473,7 +550,8 @@ User-data changes also require `ec2:Attribute=userData`.
 EC2 describe actions use the required wildcard resource.
 Object reads and writes apply only to this deployment's control prefix.
 No guest instance role or SSH key is created.
-Every provider AWS request uses the configured `aws_timeout_s` bound.
+Small provider requests use `aws_timeout_s`.
+Source uploads and result downloads have separate limits.
 Provider errors expose safe action names rather than cloud identifiers or signed URLs.
 
 The provider persists its operation before dispatch and holds a separate mutation lock.
@@ -773,11 +851,13 @@ The AWS CLI reads all pages, and the reader selects the latest price for each ty
 The reader also reads applied Standard Spot and G and VT Spot quotas.
 It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
 It removes inherited administrator keys and profiles from the AWS process environment.
-The only API actions are `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
+The snapshot calls `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
 The CLI service name is `service-quotas`; the IAM prefix is `servicequotas`.
 See the [AWS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_service-quotas.html).
 The snapshot test derives IAM actions from every request in the real snapshot path.
 It checks the scaler policy for each action, all resources, and no regional condition.
+The scaler policy also allows `ec2:GetSpotPlacementScores` on all resources.
+The grant has no regional condition because a score request can name several target regions.
 A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
 The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.
@@ -839,41 +919,32 @@ The snapshot does not change `controller.json`.
 `spot_table.spot_tables` reads only the local snapshot, cost ledger and configuration.
 It is the one source of the price tables of the AWS page; no terminal output remains.
 The user, 2026-11-15, removed the `/aws_prices` command and its `deploy.py spot-table` output because the page shows the prices.
-It gives two price tables: the standard types, then the GPU types.
-Each has candidate regions as rows and machine types as columns.
-The user asked for this layout on 2026-11-15 through builds, because the regions outnumber the types.
-Each cell shows the lowest zone price in USD/h.
-A type that a region does not sell shows `—` (`spot_table.NOT_SOLD`), in `Table.not_sold`.
-Another empty cell says `no snapshot` or `read failed`.
-Cached prices and quotas remain visible after a read failure.
-Their price cells include `read failed`, and the regional detail gives the last good age.
-Old prices include `old <minutes> min` in their cells.
-Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
-Each region without evidence says `no snapshot was ever taken`.
-The table never uses a bare `-` for an unavailable value.
-Each region shows its snapshot age and a stale mark after `price_max_age_seconds`, under the prices.
-Below the prices, two quota tables show the Standard quota and the G and VT quota in vCPUs.
-Each also shows the number of boxes of its types that fit: standard types in the first, GPU types in the second.
-One region read writes the prices and both quotas together, so the quota cells show no age.
-The box counts divide the quota by the existing type-size vCPU calculation and round downward.
-An absent snapshot explains missing quotas and box counts without creating files.
-The standard rows are `instance_types`, then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
-The hourly snapshot reads prices for all three lists, so the page can compare types the gates do not use yet.
-Below the quotas, the page shows one run table for each standard type, with one line for each candidate region.
-The user asked for this layout on 2026-11-14 through builds. Each line shows:
-1. The lowest zone Spot price in USD/h.
-2. The median merge gate box time in minutes with one decimal, such as `7.5`, from launch to finish, boot included.
+It supplies Spot prices and quotas for Standard and GPU. It calculates gate estimates only for Standard.
+Each data table has one row per candidate region.
+Spot prices use the lowest zone price in USD/h.
+The snapshot retains prices and quotas from the last successful read.
+The snapshot lines give the age and result of each region's last read.
+A failure line gives the time, failed read, error class, and AWS error message.
+A region without a snapshot says that it has no snapshot.
+The standard types come from `instance_types` and `price_compare_instance_types`.
+The GPU types come from `gpu_instance_types`.
+The hourly snapshot reads all three lists.
+Below the Prices and quotas card, the page shows one run table per standard type.
+Each run table has one line per candidate region.
+The user asked for this layout on 2026-11-14 through builds. Each line has these columns.
+
+1. The median box time for the selected runs in minutes, from launch through finish, with one decimal such as `7.5`.
    Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
-3. Runs: the run count of that time.
+2. Runs gives the number of runs used to calculate the median.
    A region without its own runs uses the type's runs in other regions, and the cell says `elsewhere`.
    A type without runs uses the runs of the types with its vCPU count, and the cell says `same vCPUs`.
-4. The estimate: Spot price times that box time, plus the refusal wait cost.
-5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
-6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
+3. Paid USD/h divides the bill's `SpotUsage:<type>` cost for the type and region by its billed hours.
+4. Paid USD/run gives the selected runs' share of the bill, which splits between runs of both kinds by box time.
    The cell also counts the runs whose day has no bill yet, such as `0.0314 (17 bill due)`.
    A bill comes up to about a day late.
    A region whose runs all wait for a bill shows `17 bill due`; a region with no own runs of the type shows `no runs`.
-7. Paid runs: the count of runs that paid USD/run covers.
+5. Paid runs gives the number of runs that Paid USD/run covers.
+
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
@@ -893,35 +964,37 @@ A Spend card at the top shows today, yesterday and the month to date, with the m
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again
 when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
-The Prices and Quotas sections follow the Spend card.
-The user asked for these page changes on 2026-11-14 through builds:
-1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
-   `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
-   The cost cells are the estimate in USD for one run (`RunCosts.prices`), the estimate that gate placement uses.
-   A type and region with no estimate shows a dash. GPU types have no runs, so their cost cells are dashes.
-   The run kind switch also sets the run tables below. The URL keeps both choices, as `?prices=cost&runs=merge-gate`.
-2. Each column has a three-color scale: green at the minimum, white at the median and red at the maximum.
-   In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
-   A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
-   The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
-   A column with only two values has no box, because the colors already show which is which.
-   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text and a 2 px white outline (`--mark-edge`).
-   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and the same white outline.
-   Both are the same in both themes, and they replace the scale color and the box of that cell.
-   The user asked for them on 2026-11-15 through builds, because bold alone did not make the cheapest cell stand out.
-   The user asked for the white outline on the gold cell too, so both table marks match.
-   A legend line above the cards explains the colors.
-   A legend line under each price card that has a mark names the box, the gold cell and the black cell.
-   Builds removed the vCPU group mark on 2026-11-15.
-3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
-   The content fills the window width, less a 16 px gutter on each side; the user asked for it on 2026-11-15 through builds.
-   The region chips have 6 px padding and a 4 px gap, so the 21 chips fit one row in a 1920 px window.
-   The user asked for the side by side cards on 2026-11-15 through builds.
-4. A header of the form `name (unit)` shows the unit on a smaller second line.
-5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
-   The page run tables have no Spot or estimate column, because the cost view shows those numbers.
-6. A `Table.not_sold` cell shows the lucide `ban` icon, with the title `Not sold here` on hover, and no legend.
-   The user asked for it on 2026-11-15 through builds.
+The Prices and quotas card follows the Spend card.
+The user approved the combined table on 2026-11-18.
+1. The sticky filter area shows Geography, Regions, Show, Types, and Runs in that order.
+   Show starts with Spot price, Cost per gate, and Quota on.
+   Each Show chip toggles its columns.
+   Types selects Standard or GPU, with Standard on the first view.
+2. The first two columns show the region and its quota in vCPUs.
+   The quota is Standard quota or G and VT quota for the selected types.
+   The quota has a blue-gray tint and stays visible when all Show chips are off.
+3. Each type header includes its vCPU count.
+   When multiple values show, each type groups the Spot (USD/h), Gate (USD), or Fit (boxes) columns.
+   Fit divides the region quota by the type's vCPU count and rounds down.
+   GPU types omit Gate and show `GPU types have no gate runs.` when only Cost per gate is on.
+   Gate estimates use the Spot price times the median box time, plus the refusal wait cost.
+   A region with a cached Spot price shows `read failed` or `old` next to its name.
+   A ban icon with the title `Not sold here` identifies a type that the region does not sell.
+   Unavailable values show a dash with the reason where known.
+4. The Runs chips show when Cost per gate is on.
+   Merge gates, Targeted runs, and Both select the Gate estimates and the run tables.
+   The choice also selects the refused and launched tables.
+   The billed hours table does not depend on the run choice.
+   The run tables omit Spot price and estimate because the Prices and quotas card shows them.
+5. The Spot and Gate columns use separate color scales and marks.
+   The scale uses green for the minimum and red for the maximum.
+   A median between those limits uses the theme's middle color.
+   A white box with a dark edge marks column extremes when the column has more than two values and the extremes differ.
+   Gold marks the cheapest value of each measure, and black marks the most expensive value.
+   These marks replace the scale and white box for those cells.
+   Quota and Fit cells have no scale or marks.
+6. One legend, the snapshot lines, and the quota case instructions follow the table.
+   A page refresh keeps the horizontal scroll position.
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it. `All` shows every region again.
@@ -931,10 +1004,10 @@ A region filter at the top of the page shows all regions by default; the user as
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
 3. The colors, the box and the table marks use only the chosen regions. `Table.values` holds the number of each cell.
-   One region shows no color and no box.
+   One region has no column scale or column box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
-6. The page keeps the region choice in browser storage. The URL keeps the price view and the run kind.
+6. The page keeps the region choice in browser storage. The URL keeps Show, Types, and Runs as `?show=spot,cost,quota&types=standard&runs=merge-gate`.
 
 ### Billed hours check
 
@@ -1242,7 +1315,8 @@ Existing configuration values remain unchanged.
 | `ami_owner_id` | Empty | Require the reviewed image owner. |
 | `vpc_id` | Empty | Require an explicit network. |
 | `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
-| `aws_timeout_s` | `10` | Bound each provider and receiver request. |
+| `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
+| `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
 
@@ -1269,11 +1343,13 @@ A typed `MissingBasis` answer clears that repository's basis before a complete b
 `AwsSourceObjects` implements the typed object boundary through the existing provider.
 It uses conditional `PutObject` and signed `GetObject` access under `source/<deployment>/`.
 The scaler policy grants only `s3:PutObject` and `s3:GetObject` for that deployment's source prefix.
-Each AWS call uses `aws_timeout_s`.
+The sender bounds the 1 GiB source bundle upload with `source_upload_timeout_s` (300 seconds).
+Credential export uses `aws_timeout_s` (10 seconds).
 The guest receives no AWS credentials.
 
 `hana_source.materialize` bounds the download, verifies sha256 and Git prerequisites, checks the advertised commit, and fetches verified objects.
 Curl enforces the total download timeout and maximum file size.
+The guest bounds the source bundle download with `source_download_timeout_s` (120 seconds).
 The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
 The shared maker allocates mirror metadata and temporary bundle files.
 `build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
@@ -1285,6 +1361,36 @@ Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots
 Those values remain unset until the user approves them.
 The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
 Phase F2 will deliver manifests and execute commands with inherited slot locks.
+
+## Hana result transport
+
+The guest sends `result.json` with both compiler output streams and the command status.
+The JSON limit is 32 MiB.
+The guest and sender use `result_transfer_timeout_s` for the upload and download.
+The guest uses curl for the upload and keeps the signed URL out of process arguments.
+The receiver starts curl as a child process with `--max-time`.
+It checks the child once per pass while it continues to read permits and fences.
+The controller starts permit renewal with 105 seconds left under the default settings.
+The separate watchdog can stop the guest before a 120-second upload ends.
+The receiver reads and processes the fence before the permit in every pass.
+A control step can fail during a read, a write, decoding, or validation.
+The receiver continues to process the other control requests in the same pass.
+A fence sends SIGKILL to the upload process and reaps it before the receiver acknowledges the fence.
+The receiver records an upload attempt before the PUT and records its result before it publishes the observation.
+After a restart, the receiver records an unconfirmed upload as `HanaResultUploadFailed` and reports the loss.
+Command and fence documents and execution observations have a 64 KiB protocol limit.
+They use `aws_timeout_s` (10 seconds).
+The guest publishes the terminal observation after the result upload completes or the receiver records a loss.
+The guest checks the expiry of the boot URLs and the attempt URLs before starting an upload.
+The sender reads the boot expiry from the saved bootstrap record.
+The guest and sender reserve 161 seconds under the default settings for fence settlement.
+The sender polls for the exact fence acknowledgement at the control poll interval.
+It polls after every fence PUT attempt, including when S3 returns an error status.
+The sender retains the claim if the window ends before it confirms the fence, command termination, and lease release.
+The offload reports a loss if the transfer cannot fit, times out, or the guest cannot confirm its PUT.
+The offload requires an accepted result before it reports a build verdict.
+The sender also works with older guests.
+Older guests upload results with the 10-second control timeout.
 
 ## Hana placement adapter
 
@@ -1314,6 +1420,21 @@ Permit renewals retain that generation.
 F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
 Only an adopted claim can request the queue's first launch authorization.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
+An exact guest observation can settle an accepted execution that ended without a compiler result.
+The observation must confirm termination and lease release, and the sender must have issued no source update.
+The sender uses the guest cause when it is available and keeps a specific sender rejection if the guest reports a pending result.
+For other confirmed departures, the sender attempts to release the claim without another fence observation.
+The sender requires a fence acknowledgement after a result transfer loss or when it resumes an unsettled fence.
+The sender uses the refusal code from a new image to report `HanaCommandAdmissionRefused`.
+For the old image, the sender recognizes only the exact reason `The data mount and a fresh permit are required`.
+The refusal proves the command did not start.
+The sender reports the refusal before claim cleanup.
+The controller checks whether the holder exited in every lifecycle state, including after a Spot interruption.
+An unresolved start still requires provider recovery.
+The next Hana evidence read can remove the detached target claim.
+The queue excludes Hana for the refused build and continues in the configured candidate order.
+For a different build, the queue needs provider evidence at or after the refusal report before it can assign the same scope.
+For a pinned build, `verify.sh` prints one line with the refusal cause and exits with status 2.
 An ended local holder cannot settle an unresolved Hana dispatch.
 A failed boot needs a terminal `ExecutionReport`; pending settlement retains capacity and the live retry deadline.
 The queue permits fallback only after settlement.

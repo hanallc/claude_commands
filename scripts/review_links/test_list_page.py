@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from xml.etree import ElementTree
@@ -34,7 +34,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, serve, staff_names
-from scripts.review_links import change_browser, change_page, question_record
+from scripts.review_links import change_browser, change_page, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
@@ -170,9 +170,7 @@ class ListPageTests(unittest.TestCase):
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const rows=[...document.querySelectorAll('[data-list-item]')];
 const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+value+'"]');
-const selectOwner=value=>{
- const menu=document.getElementById('list-owner');menu.value=value;menu.dispatchEvent(new Event('change'));
-};
+const selectOwner=value=>chip('owner',value ? 'staff:'+value : 'all').click();
 const isExpanded=(row,expanded)=>row.querySelector('[data-detail]').hidden===!expanded &&
  row.querySelector('.list-toggle').getAttribute('aria-expanded')===String(expanded);
 try{
@@ -251,6 +249,17 @@ function ids(doc){
   check(range.getClientRects().length===1,'the ID text has one line');
  }
 }
+function reviewPlaceRecorded(win,matches){
+ return new Promise(resolve=>{
+  const recordedPlace=event=>{
+   const at=new URL(location.href).searchParams.get('at.review');
+   if(event.source!==win || event.data!=='console-place' || !at ||
+      !matches(new URLSearchParams(new URL(at,location.href).hash.slice(1)))) return;
+   removeEventListener('message',recordedPlace);resolve();
+  };
+  addEventListener('message',recordedPlace);
+ });
+}
 async function configureReview(show,words){
  nav('review').click();
  const frame=document.querySelector('iframe:not([hidden])');
@@ -272,14 +281,7 @@ async function configureReview(show,words){
  const sort=doc.querySelector('[data-sort="3"]');
  if(sort.parentElement.getAttribute('aria-sort')==='none') sort.click();
  const search=doc.querySelector('#list-search');
- const recorded=new Promise(resolve=>{
-  const recordedPlace=event=>{
-   const at=new URL(location.href).searchParams.get('at.review');
-   if(event.source!==win || !at || new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('q')!==words) return;
-   removeEventListener('message',recordedPlace);resolve();
-  };
-  addEventListener('message',recordedPlace);
- });
+ const recorded=reviewPlaceRecorded(win,place=>place.get('q')===words);
  search.value=words;search.dispatchEvent(new win.Event('input',{bubbles:true}));
  await recorded;
  nav('list').click();
@@ -450,6 +452,7 @@ async function inspect(frame){
      });
      observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
     });
+    const recorded=reviewPlaceRecorded(doc.defaultView,place=>!place.has('item') && !place.has('linked'));
     form.querySelector('[data-later-toggle]').click();
     form.querySelector('[data-later-preset="morning"]').click();
     if(!form.hasAttribute('data-sending')) throw new Error('Later did not start.');
@@ -460,7 +463,7 @@ async function inspect(frame){
     const place=new URLSearchParams(doc.location.hash.slice(1));
     check(!place.has('item') && !place.has('linked'),'Later removes the linked target from the Review address');
     sessionStorage.setItem('later-reload','yes');
-    await frames(doc.defaultView);
+    await recorded;
     location.reload();
    }
   }
@@ -627,10 +630,8 @@ frame.addEventListener('load',async()=>{
   const source=row(1),target=row(number),search=doc.querySelector('#list-search');
   const chip=(name,value)=>doc.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
   const selected=name=>doc.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
-  const menu=name=>doc.getElementById('list-'+name);
   const unread=doc.getElementById('list-unread');
-  const setMenu=(name,value)=>{const field=menu(name);field.value=value;field.dispatchEvent(new win.Event('change'));};
-  const filters=()=>[menu('owner').value,menu('producer').value,search.value,unread.checked];
+  const filters=()=>[selected('owner'),selected('producer'),search.value,unread.checked];
   const pendingWords=scenario==='pending-words' ? 'item' : '';
   const originalFilters=filters();
   if(pendingWords) originalFilters[2]=pendingWords;
@@ -698,8 +699,8 @@ frame.addEventListener('load',async()=>{
    }
   }
   const expected=originalFilters.slice();
-  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='';
-  if(scenario==='producer') expected[1]='';
+  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='all';
+  if(scenario==='producer') expected[1]='all';
   if(['open','unread-words'].includes(scenario) || pendingWords) expected[2]='';
   check(filters().every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters()));
   if(scenario==='repeat'){
@@ -725,7 +726,7 @@ frame.addEventListener('load',async()=>{
     check(inView(link) && Math.abs(win.scrollY-originalTop)<=1,'Back restored scroll '+win.scrollY+' instead of '+originalTop);
    }
    check(selected('show')===originalShow && !source.hidden && expanded(source),'Back restores the open source');
-   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the menus, search and switch.');
+   check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the staff chips, search and switch.');
    check(!target || !expanded(target),'Back collapses the target row');
    if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
   }
@@ -740,8 +741,8 @@ frame.addEventListener('load',async()=>{
    const changes=[
     ['Show',()=>chip('show','all').click()],
     ['Unread only',()=>unread.click()],
-    ['Owner',()=>setMenu('owner','')],
-    ['Producer',()=>setMenu('producer','')],
+    ['Owner',()=>chip('owner','all').click()],
+    ['Producer',()=>chip('producer','all').click()],
     ['Search',clearSearch],
     ['sort',()=>doc.querySelector('[data-sort]').click()],
    ];
@@ -1180,20 +1181,22 @@ document.body.append(result);
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
         controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
-        self.assertEqual(controls.count('<select'), 2)
+        self.assertNotIn('<select', controls)
         self.assertEqual(controls.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
-                         ['show'])
-        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', controls),
+                         ['owner', 'producer', 'show'])
+        shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
+        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("morty-answering", "Morty answering"),
                           ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked"), ("closed", "Closed")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
-        owners = controls.split('<select id="list-owner">', 1)[1].split('</select>', 1)[0]
-        self.assertRegex(owners, f'value="{OWNER.id}"[^>]*>sdlc</option>')
-        self.assertRegex(owners, f'value="{OTHER.id}"[^>]*>builds</option>')
-        producers = controls.split('<select id="list-producer">', 1)[1].split('</select>', 1)[0]
-        self.assertEqual(re.findall(r'<option value="([^"]*)"[^>]*>([^<]+)</option>', producers),
-                         [('', 'All'), (DWIGHT.id, 'dwight'), (MORTY.id, 'morty')])
+        owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
+        producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
+        chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>(\d+)</b>'
+        self.assertEqual(re.findall(chip, owners),
+                         [('all', 'All', '6'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '5')])
+        self.assertEqual(re.findall(chip, producers),
+                         [('all', 'All', '6'), (f'staff:{DWIGHT.id}', 'dwight', '1'), (f'staff:{MORTY.id}', 'morty', '5')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 1)
         self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 5)
         self.assertIn(f'data-producer="{DWIGHT.id}"', body)
@@ -1344,15 +1347,15 @@ document.body.append(result);
         for owner in (missing, the_list.UnassignedOwner.NATE, the_list.UnassignedOwner.NOT_RECORDED):
             _ = self.add("Work for " + owner, owner=owner)
         body = list_page.render(self.root / "reviews").decode()
-        owners = body.split('<select id="list-owner">', 1)[1].split('</select>', 1)[0]
+        owners = body.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         for label in (str(missing), "nate", "Not recorded"):
-            self.assertIn('>' + label + '</option>', owners)
+            self.assertIn('>' + label + '<b>1</b></button>', owners)
         _ = (self.root / "staff.json").write_text('{"schema":1,"rows":[]}')
         self.assertEqual(len(list_page.records()), 3)
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", NOW, ())
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -1528,10 +1531,12 @@ check(!row(18).hidden && row(18).dataset.parked==='true' && detail(18)?.querySel
 check(!row(19).hidden && detail(19)?.querySelector('[value="resend-Q1"]'),
  'The failed question stays in Morty answering with Resend.');
 chips[4].click();
-expand(20);
+document.getElementById('list-expand-all').click();
+const answer=detail(20)?.querySelector('.list-panel [data-question="Q1"]');
 check(!row(20).hidden && row(20).querySelector('[aria-label="Unread update"]') &&
- detail(20)?.querySelector('.list-log').textContent.includes('The gate passed.'),
- 'The answered item returns to Blocked and has an unread answer.');
+ answer?.textContent.includes('The gate passed.') && answer.querySelector('.question-unread') &&
+ !detail(20).querySelector('[data-log-index="Q1-answered"]'),
+ 'The answered item returns to Blocked with its unread answer in the panel.');
 const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
 document.body.append(result);
 </script>'''
@@ -1624,7 +1629,7 @@ document.body.append(result);
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
         folder = change_page.console_folder(self.root / "reviews")
         secret = change_browser.browser_manifest(folder)[0]
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret, NOW, ())
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
 
@@ -1715,8 +1720,9 @@ document.body.append(result);
             _ = list_page.submit(root, urlencode({**park, "action": "read"}))
         self.assertEqual(the_list.load(MORTY.id, item.id), parked)
 
-        read = {**park, "action": "read", "request": park["request"] + "." + uuid4().hex}
+        read = self.fields(parked, "read")
         _ = list_page.submit(root, urlencode(read))
+        self.assertIs(the_list.load(MORTY.id, item.id).unread_since, the_list.NoTimestamp.UNSET)
         newer = the_list.update(MORTY.id, item.id, {"latest_status": "Keep this newer update unread."}, source="morty")
         _ = list_page.submit(root, urlencode(read))
         self.assertEqual(the_list.load(MORTY.id, item.id), newer)
@@ -2516,28 +2522,94 @@ observer.observe(original.parentNode,{childList:true});
         status = change_page.DeliveryStatus(root)
         item = self.add("Inspect the List", number=106)
         fields = self.fields(item, "question", words="What changed in <List>?")
-        delivery = list_page.submit(root, urlencode(fields), status)
-        opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
-        self.assertIn('data-waiting-for-answer="true"', opened)
-        self.assertIn('<p data-waiting-note>The producer will answer.</p>', opened)
-        self.assertNotIn('value="question"', opened)
-        self.assertNotIn('aria-label="Unread update"', opened)
-        with patch.object(change_page, "send_question", return_value=question_outcome()):
-            list_page.deliver(delivery)
-        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
+        asked_at = NOW - timedelta(days=1)
+        answered_at = NOW - timedelta(minutes=25)
+        asked_time = f'<time datetime="{asked_at.isoformat()}">2026-11-15 13:00 EST</time>'
+        answer_time = f'<time datetime="{answered_at.isoformat()}">12:35 EST</time>'
+        question_clock = Mock(wraps=datetime)
+        question_clock.configure_mock(**{"now.side_effect": (asked_at, answered_at)})
+        with patch.object(page_question, "datetime", question_clock):
+            delivery = list_page.submit(root, urlencode(fields), status)
+            opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
+            self.assertIn('data-waiting-for-answer="true"', opened)
+            self.assertIn('<p data-waiting-note>The producer will answer.</p>', opened)
+            self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
+            self.assertIn("What changed in &lt;List&gt;?", opened)
+            self.assertNotIn('value="question"', opened)
+            self.assertNotIn('aria-label="Unread update"', opened)
+            with patch.object(change_page, "send_question", return_value=question_outcome()):
+                list_page.deliver(delivery)
+            with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
+                  patch.object(the_list, "now", return_value=answered_at), redirect_stdout(io.StringIO())):
+                self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
         _ = list_page.submit(root, urlencode(fields))
         answered = list_page.render(root).decode().split('<script>', 1)[0]
         self.assertIn('data-waiting-for-answer="false"', answered)
         self.assertIn('value="question"', answered)
         self.assertIn('aria-label="Unread update"', answered)
         self.assertIn('value="read">Mark read</button>', answered)
-        log = answered.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
-        self.assertIn("Answered question Q1 <small>", log)
+        panel, log = answered.split('<ol class="list-log">', 1)
         self.assertIn("Marked read <small>", log)
-        self.assertIn("What changed in &lt;List&gt;?", log)
-        self.assertIn("<h3>Answer</h3><p>The &lt;filter&gt; changed.</p>", log)
+        self.assertNotIn("Answered question Q1 <small>", log)
+        self.assertNotIn('What changed in &lt;List&gt;?', log)
+        self.assertNotIn('The &lt;filter&gt; changed.', log)
+        self.assertIn('Question Q1</h3>' + asked_time + '<p>What changed in &lt;List&gt;?</p>', panel)
+        self.assertIn('<h3>Answer <span class="question-unread">Unread</span></h3>'
+                      + answer_time + '<p>The &lt;filter&gt; changed.</p>', panel)
+
+        current = the_list.load(MORTY.id, item.id)
+        _ = list_page.submit(root, urlencode(self.fields(current, "read")))
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer update arrived."}, source="morty")
+        read = list_page.render(root).decode().split('<script>', 1)[0]
+        self.assertIn('aria-label="Unread update"', read)
+        panel, log = read.split('<ol class="list-log">', 1)
+        self.assertNotIn('data-question="Q1"', panel)
+        self.assertNotIn('class="question-unread"', panel)
+        log = re.sub(r'<span class="staff-name"[^>]*>(.*?)</span>', r'\1', log)
+        question_row = '<li data-log-index="Q1-asked">' + asked_time + '<div>Question Q1 <small>— nate</small>'
+        answer_row = '<li data-log-index="Q1-answered">' + answer_time + '<div>Answer <small>— morty</small>'
+        self.assertIn(question_row + '<p>What changed in &lt;List&gt;?</p></div></li>', log)
+        self.assertIn(answer_row + '<p>The &lt;filter&gt; changed.</p></div></li>', log)
+        self.assertLess(log.index(answer_row), log.index(question_row))
+
+    def test_stale_mark_read_keeps_the_newer_answer_in_the_panel(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Read the answer shown by the form")
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        already_read = self.fields(the_list.load(MORTY.id, item.id), "read")
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
+            first = self.fields(the_list.load(MORTY.id, item.id), "question", words="Which check passed?")
+            list_page.deliver(list_page.submit(root, urlencode(first), status))
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The first check passed."]), 0)
+            current = the_list.load(MORTY.id, item.id)
+            stale = self.fields(current, "read")
+            second = self.fields(item, "question", words="Did the next check pass?")
+            list_page.deliver(list_page.submit(root, urlencode(second), status))
+            waiting = list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", "")
+            self.assertIn('data-question="Q1"', waiting)
+            credential = re.search(r'data-open-read-request="([^"]+)" data-open-read-token="([^"]+)"', waiting)
+            assert credential is not None
+            request, token = credential.groups()
+            _ = list_page.submit(root, urlencode({**stale, "request": request, "token": token}), status)
+            self.assertIn('data-log-index="Q1-answered"',
+                          list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", ""))
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q2", "--text", "The next check passed."]), 0)
+
+        current = the_list.load(MORTY.id, item.id)
+        for fields in (stale, already_read):
+            with self.subTest(request=fields["request"]):
+                _ = list_page.submit(root, urlencode(fields), status)
+                saved = the_list.load(MORTY.id, item.id)
+                self.assertEqual(the_list.unread_update(saved), the_list.unread_update(current))
+                markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
+                panel, log = markup.split('<ol class="list-log">', 1)
+                self.assertIn('data-question="Q2"', panel)
+                self.assertIn('class="question-unread">Unread</span>', panel)
+                self.assertIn('The next check passed.', panel)
+                self.assertIn('data-log-index="Q1-answered"', log)
+                self.assertNotIn('data-log-index="Q2-answered"', log)
 
     def test_answer_returns_a_parked_item_with_its_current_parking(self) -> None:
         root = self.root / "reviews"
@@ -3019,10 +3091,10 @@ observer.observe(original.parentNode,{childList:true});
  check(changes.join()==='POST','The chip changes without a refresh.');
  check(count.textContent==='2 of 2 items shown · 0 need you · 1 unread','All counts the saved row.');
  const needsMe=document.getElementById('filter-show-needs-me');
- const option=(menu,value)=>[...document.getElementById('list-'+menu).options].find(choice=>choice.value===value);
- check(needsMe.dataset.filterCount==='0' && option('owner',row.dataset.owner).dataset.filterCount==='1',
+ const staffChip=(name,id)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
+ check(needsMe.dataset.filterCount==='0' && staffChip('owner',row.dataset.owner).dataset.filterCount==='1',
   'Needs me excludes the saved row and Owner includes it.');
- check(option('producer',row.dataset.producer).dataset.filterCount==='2','Producer counts the saved row.');
+ check(staffChip('producer',row.dataset.producer).dataset.filterCount==='2','Producer counts the saved row.');
  for(const view of ['needs-me','blocked','parked','closed','working']){
   show(view);check(row.hidden,view+' hides the saved row');
  }
@@ -3170,10 +3242,24 @@ observer.observe(original.parentNode,{childList:true});
   'Closed with Unread only shows the answer and Mark read.');
  check(document.getElementById('filter-show-closed').dataset.filterCount==='1' &&
   !row.querySelector('[data-open-question-note]'),'The answer counts in Closed and clears the question note.');
+ const answer=row.querySelector('.list-panel [data-question="Q1"]');
+ check(answer?.querySelectorAll('time[datetime]').length===2 &&
+  answer.querySelector('.question-unread')?.textContent==='Unread' &&
+  answer.textContent.includes('The gate passed.') && !row.querySelector('[data-log-index="Q1-answered"]'),
+  'The Closed answer stays in the panel with both times until read.');
  submit('read');finishPost({item_state:'Closed',unread:'false',open_question:'false'});await flush();
  check(row.hidden && document.getElementById('filter-show-closed').dataset.filterCount==='0',
   'Mark read removes the item from Unread only.');
-""", add_item=False, reduced_motion=True)
+""", add_item=False, reduced_motion=True, bulk_expand=True)
+        current = the_list.load(MORTY.id, item.id)
+        _ = list_page.submit(root, urlencode(self.fields(current, "read")), status)
+        read = the_list.load(MORTY.id, item.id)
+        self.assertIs(read.state, the_list.ItemState.CLOSED)
+        self.assertIs(the_list.unread_update(read), the_list.NoUnreadUpdate.ABSENT)
+        panel, log = list_page.render(root, include_counts=False, status=status).decode().split('<ol class="list-log">', 1)
+        self.assertNotIn('data-question="Q1"', panel)
+        self.assertIn('data-log-index="Q1-asked"', log)
+        self.assertIn('data-log-index="Q1-answered"', log)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_refusal_restores_unread_after_a_lost_remove(self) -> None:
@@ -3331,9 +3417,10 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence(r"""
  const search=document.getElementById('list-search');
  const target=document.querySelector('[data-number="2"]');
- const owner=document.getElementById('list-owner');
  show('working');
- owner.value=row.dataset.owner;owner.dispatchEvent(new Event('change'));
+ const staffChip=(name,id)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
+ staffChip('owner',row.dataset.owner).click();
+ staffChip('producer',row.dataset.producer).click();
  search.value='check';search.dispatchEvent(new CustomEvent('filterchange',{detail:search.value}));
  check(target.hidden,'The waiting item stays out of Working.');
  row.querySelector('a[data-record-jump]').click();
@@ -3342,6 +3429,10 @@ observer.observe(original.parentNode,{childList:true});
   !target.querySelector('[data-detail]').hidden,'The related link opens the waiting item outside the results.');
  check(place.get('show')==='working' && place.get('owner')===row.dataset.owner && search.value==='check',
   'The related link keeps Show, Owner and the search');
+ staffChip('producer',row.dataset.producer).click();
+ check(!target.hidden && !target.querySelector('[data-detail]').hidden &&
+  target.closest('[data-linked-item]:not([hidden])'),'Clicking the selected Producer keeps the linked item open.');
+ check(location.hash==='#'+place,'Clicking the selected Producer keeps the address.');
  const results=document.querySelector('table[aria-label="The List"]');
  check(results.querySelectorAll('[data-list-item]:not([hidden])').length===1 &&
   document.querySelector('[data-list-count]').textContent.startsWith('1 of 2'),
@@ -3546,22 +3637,240 @@ observer.observe(original.parentNode,{childList:true});
  check(parent.document.activeElement===nav,'The response preserves the console focus');
 """, add_item=False, reduced_motion=True, in_frame=True)
 
+    def render_unread_answer(self, *, latest_status: str = "",
+                             questions_and_answers: tuple[tuple[str, str], ...] = (
+                                 ("Which check passed?", "The gate passed."),)) -> tuple[the_list.ListItem, str]:
+        root = self.root / "reviews"
+        item = self.add("Read the answer after opening the tab")
+        if latest_status:
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": latest_status}, source="morty")
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=MORTY.current_session), redirect_stdout(io.StringIO())):
+            for question, _answer in questions_and_answers:
+                current = the_list.load(MORTY.id, item.id)
+                fields = self.fields(current, "question", words=question)
+                list_page.deliver(list_page.submit(root, urlencode(fields)))
+            for number, (_question, answer) in enumerate(questions_and_answers, start=1):
+                self.assertEqual(the_list.main(["answer", item.id, "--question", f"Q{number}", "--text", answer]), 0)
+        markup = list_page.render(root, include_counts=False).decode()
+        markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
+        return item, markup
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_direct_answer_link_waits_for_visibility(self) -> None:
+        item, markup = self.render_unread_answer()
+        fragment = urlencode({"show": "unread", "item": f"{MORTY.id}/{item.id}"})
+        setup = """<script>
+let visibility='hidden';
+Object.defineProperty(document,'visibilityState',{get:()=>visibility});
+window.frameElement.hidden=true;
+history.replaceState(null,'','#FRAGMENT');
+const reads=[];
+window.fetch=async(_url,options)=>{
+ if(options?.method!=='POST') return new Response('',{status:503});
+ reads.push(new URLSearchParams(options.body));
+ return new Response(JSON.stringify({unread:'true'}));
+};
+</script>""".replace('FRAGMENT', fragment)
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
+ const panel=detail.querySelector('.list-panel');
+ const unread=()=>row.dataset.unread==='true' && panel.querySelector('.question-unread');
+ const showTab=()=>{visibility='visible';document.dispatchEvent(new Event('visibilitychange'));};
+ const showFrame=()=>{
+  window.frameElement.hidden=false;
+  window.dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ };
+ const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
+ try{
+  check(!row.hidden && !detail.hidden,'The direct link opens the unread row');
+  check(!reads.length && unread(),'A hidden tab keeps the answer unread');
+  if(CLOSE_ROW){
+   row.querySelector('.list-toggle').click();
+   document.getElementById('list-expand-all').click();
+  }
+  REVEAL_FIRST();
+  await paint();
+  check(!reads.length && unread(),'The answer stays unread while the tab or frame is hidden');
+  REVEAL_SECOND();
+  await paint();
+  if(CLOSE_ROW) check(!reads.length && unread(),'Closing the row cancels its deferred read');
+  else check(reads.length===1 && reads[0].get('action')==='read' &&
+   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
+   'The visible row sends its signed read once');
+ }catch(error){failures.push(String(error));}
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for first, second, close_row in (('showTab', 'showFrame', False), ('showFrame', 'showTab', False),
+                                         ('showTab', 'showFrame', True)):
+            with self.subTest(first=first, close_row=close_row):
+                case = (probe.replace('REVEAL_FIRST', first).replace('REVEAL_SECOND', second)
+                        .replace('CLOSE_ROW', str(close_row).lower()))
+                self.browser_answer_visibility(markup, setup, case)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_direct_answer_link_waits_until_the_answer_scrolls_into_view(self) -> None:
+        item, markup = self.render_unread_answer(latest_status="\n\n".join(f"Check {n} passed." for n in range(55)))
+        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
+        setup = """<script>
+history.replaceState(null,'','#FRAGMENT');
+const reads=[];
+window.fetch=async(_url,options)=>{
+ if(options?.method!=='POST') return new Response('',{status:503});
+ reads.push(new URLSearchParams(options.body));
+ return new Response(JSON.stringify({unread:'true'}));
+};
+</script>""".replace('FRAGMENT', fragment)
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
+  const panel=detail.querySelector('.list-panel');
+  const answer=[...panel.querySelectorAll('[data-question="Q1"] p')].find(p=>p.textContent==='The gate passed.');
+  const sample=()=>new Promise(resolve=>{
+   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
+   observer.observe(answer);
+  });
+  check(!row.hidden && !detail.hidden && row.querySelector('.list-row').getBoundingClientRect().bottom<innerHeight,
+   'The direct link opens a row within the viewport');
+  check(!(await sample()).isIntersecting && answer.getBoundingClientRect().top>innerHeight,
+   'The answer starts below the viewport');
+  check(!reads.length && panel.querySelector('.question-unread'),'The answer below the viewport stays unread');
+  answer.scrollIntoView({block:'center',behavior:'instant'});
+  check((await sample()).isIntersecting,'Scrolling brings the answer into the viewport');
+  check(reads.length===1 && reads[0].get('action')==='read' &&
+   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
+   'The answer sends one signed read when it enters the viewport');
+ }catch(error){failures.push(String(error));}
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        self.browser_answer_visibility(markup, setup, probe)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_item_link_waits_for_every_unread_answer(self) -> None:
+        item, markup = self.render_unread_answer(questions_and_answers=(
+            ("Which checks passed?", "\n".join(f"Check {number} passed." for number in range(65))),
+            ("Did the final check pass?", "The final check passed.")))
+        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
+        setup = """<script>
+const fragment='#FRAGMENT',reads=[];
+if(LINK_ON_LOAD) history.replaceState(null,'',fragment);
+window.fetch=async(_url,options)=>{
+ if(options?.method!=='POST') return new Response('',{status:503});
+ reads.push(new URLSearchParams(options.body));
+ return new Response(JSON.stringify({unread:'true'}));
+};
+</script>""".replace('FRAGMENT', fragment)
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
+  if(!LINK_ON_LOAD){
+   check(detail.hidden && !reads.length,'The loaded List starts with a closed and unread row');
+   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+   const link=document.createElement('a');
+   link.href=fragment;document.body.append(link);link.click();
+   await changed;
+  }
+  const panel=detail.querySelector('.list-panel');
+  const first=panel.querySelector('[data-question="Q1"] p:last-child');
+  const second=panel.querySelector('[data-question="Q2"] p:last-child');
+  const sample=target=>new Promise(resolve=>{
+   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
+   observer.observe(target);
+  });
+  check(!row.hidden && !detail.hidden,'The item link opens the row');
+  check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
+  check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
+   'The second answer starts below the viewport');
+  check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
+   'The first answer alone leaves both answers unread');
+  document.body.style.paddingBottom='100vh';
+  second.scrollIntoView({block:'start',behavior:'instant'});
+  check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
+   'The second answer enters the viewport after the first leaves it');
+  check(reads.length===1 && reads[0].get('action')==='read' &&
+   reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
+   'The last answer to enter the viewport sends one signed read');
+ }catch(error){failures.push(String(error));}
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for link_on_load in (True, False):
+            with self.subTest(link_on_load=link_on_load):
+                enabled = str(link_on_load).lower()
+                self.browser_answer_visibility(markup, setup.replace('LINK_ON_LOAD', enabled),
+                                               probe.replace('LINK_ON_LOAD', enabled))
+
+    def browser_answer_visibility(self, markup: str, setup: str, probe: str) -> None:
+        page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
+        console_page = (b'<!doctype html><style>iframe{border:0;width:100%;height:calc(100vh - 24px)}'
+                        b'iframe[hidden]{display:block;visibility:hidden}</style>'
+                        b'<iframe src="/page"></iframe><img hidden src="/complete">')
+        results: list[list[str]] = []
+        complete = threading.Event()
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == '/complete':
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                    self.json_response(200, {})
+                else:
+                    self.html_response(200, page if self.path == '/page' else console_page)
+                return None
+
+            @override
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                self.json_response(200, {})
+                complete.set()
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
+              patch.object(change_page, "recover_pending"),
+              patch.object(list_page, "recover_pending"),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              serve.ReviewLinksServer(("127.0.0.1", 0), self.root / "reviews") as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.root / "answer-profile"
+                profile.mkdir(exist_ok=True)
+                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                    '--window-size', '1280,900', '--screenshot', str(self.root / 'answer.png'),
+                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join()
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
         item = self.add("Check the current result")
         root = self.root / "reviews"
         results: list[list[str]] = []
         complete = threading.Event()
-        probe = b"""<!doctype html><iframe></iframe><img hidden src="/complete"><script>
+        probe = """<!doctype html><meta charset="utf-8">
+<style>iframe{width:100%;height:calc(100vh - 24px);border:0}</style>
+<iframe></iframe><img hidden src="/complete"><script>
 const frame=document.querySelector('iframe'), errors=[];
 const check=(ok,message)=>{if(!ok) errors.push(message);};
 const open=(show,key='',unread='')=>new Promise(resolve=>{
  frame.onload=resolve;
- frame.src='LIST_PATH?fixture='+show+'#'+new URLSearchParams({show,unread,...(key ? {item:key} : {})});
+ frame.src='LIST_PATH?fixture='+show+unread+'#'+new URLSearchParams({show,unread,...(key ? {item:key} : {})});
 });
 const row=()=>frame.contentDocument.querySelector('[data-list-item]');
 const hasDot=()=>Boolean(row().querySelector('.list-dot'));
-const ask=async words=>{
+const act=async (action,words='')=>{
  const win=frame.contentWindow, current=row();
  const form=current.querySelector('form'), input=form.elements.words;
  const fetch=win.fetch.bind(win);
@@ -3574,10 +3883,13 @@ const ask=async words=>{
   ? (post=fetch(url,options))
   : Promise.resolve(new win.Response('',{status:503}));
  try{
-  current.querySelector('.list-toggle').click();
+  if(current.querySelector('[data-detail]').hidden){
+   if(action==='read') frame.contentDocument.getElementById('list-expand-all').click();
+   else current.querySelector('.list-toggle').click();
+  }
   input.value=words;input.dispatchEvent(new win.Event('input'));
-  form.querySelector('[value="question"]').click();
-  if(!post || !(await post).ok) throw new Error('The question POST must succeed.');
+  form.querySelector('[value="'+action+'"]').click();
+  if(!post || !(await post).ok) throw new Error('The List POST must succeed.');
   await settled;
   return form.querySelector('[data-send-status]').textContent;
  }finally{observer.disconnect();win.fetch=fetch;}
@@ -3589,8 +3901,10 @@ const change=async path=>{
  try{
   await open('all','','1');
   check(!row().hidden && hasDot(),'the item starts in Unread');
-  check(await ask('Which check passed?')==='Question saved','the first question saves');
+  check(await act('question','Which check passed?')==='Question saved','the first question saves');
   check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
+  check(row().querySelector('[data-waiting-questions] time[datetime]'),
+   'the save response supplies the asked time for the waiting row');
   const key=row().dataset.key;
   await open('working');
   check(row().hidden && !row().querySelector('[data-open-question-note]').hidden,
@@ -3599,22 +3913,75 @@ const change=async path=>{
   check(!row().hidden && !row().querySelector('[data-detail]').hidden &&
    row().querySelector('[data-waiting-note]')?.textContent==='The producer will answer.' &&
    !row().querySelector('[value="question"]'),'a direct link shows the waiting line without Ask');
+  const waitingQuestion=row().querySelector('[data-waiting-questions] [data-question="Q1"]');
+  check(/(?:EST|EDT)$/.test(waitingQuestion?.querySelector('time[datetime]')?.textContent),
+   'the waiting question shows the asked time in the user zone');
   await change('/answer');
   await open('working','','1');
-  check(!row().hidden && hasDot() && row().querySelector('.list-log').textContent.includes('Which check passed?') &&
-   row().querySelector('.list-log').textContent.includes('The gate passed.') &&
-   !row().querySelector('[data-open-question-note]'),
-   'The answer returns the item to Working with the unread answer in the log.');
+  const unreadQuestion=row().querySelector('.list-panel [data-question="Q1"]');
+  check(!row().hidden && hasDot() && unreadQuestion?.textContent.includes('Which check passed?') &&
+   unreadQuestion.textContent.includes('The gate passed.') && !row().querySelector('[data-open-question-note]'),
+   'Working with Unread only shows the answer in the panel and clears the question note.');
+  check(unreadQuestion?.querySelectorAll('time[datetime]').length===2 &&
+   unreadQuestion.querySelector('.question-unread')?.textContent==='Unread',
+   'the unread answer shows both times and the Unread mark');
+  check(!row().querySelector('.list-log').textContent.includes('The gate passed.'),
+   'the log has no unread answer');
+  check(await act('read')==='Marked read','Mark read saves the existing read action');
+  await open('working',key);
+  const log=row().querySelector('.list-log');
+  check(!hasDot() && !row().querySelector('[data-question="Q1"]'),
+   'the read question leaves the panel');
+  check(log.querySelector('[data-log-index="Q1-answered"]').textContent.includes('Answer — morty') &&
+   log.querySelector('[data-log-index="Q1-asked"]').textContent.includes('Question Q1 — nate'),
+   'the log shows both parts of the read question with their authors');
+  await change('/update');
+  await open('working','','1');
   await change('/newer');
-  check(await ask('Which check is next?')==='Question saved; update remains unread',
+  check(await act('question','Which check is next?')==='Question saved; update remains unread',
    'the notice says the newer update remains unread');
   check(hasDot() && row().hidden,'The unread item leaves Working after the question saves.');
   frame.contentDocument.getElementById('filter-show-morty-answering').click();
   check(hasDot() && !row().hidden,'Morty answering shows the unread item.');
+  const nextQuestion=(current)=>current.querySelector('[data-waiting-questions] [data-question="Q2"]');
+  const firstAnswer=(current)=>current.querySelector('[data-log-index="Q1-answered"]');
+  check(nextQuestion(row()) && firstAnswer(row())?.textContent.includes('The gate passed.'),
+   'the Ask response keeps the first answer in the log beside the new waiting question');
+  await open('all',key);
+  check(!row().querySelector('[data-detail]').hidden && nextQuestion(row()) && firstAnswer(row()),
+   'a direct link shows both the waiting question and the first answer in the log');
+  await change('/second-answer');
+  await open('working','','1');
+  const original=row(), doc=frame.contentDocument;
+  const panelQuestion=original.querySelector('[data-question="Q2"]');
+  const [askedAt,answeredAt]=[...panelQuestion.querySelectorAll('time')].map(time=>Date.parse(time.dateTime));
+  check(hasDot() && original.querySelector('[data-question="Q2"] .question-unread'),
+   'the second answer stays unread before the row opens');
+  const refreshed=new Promise(resolve=>{
+   const observer=new frame.contentWindow.MutationObserver(()=>{
+    if(row()!==original && row().querySelector('[data-log-index="Q2-answered"]')){
+     observer.disconnect();resolve();
+    }
+   });
+   observer.observe(doc.body,{childList:true,subtree:true});
+  });
+  original.querySelector('.list-toggle').click();
+  await refreshed;
+  check(!hasDot() && !row().hidden && !row().querySelector('[data-detail]').hidden,
+   'opening the row marks the answer read and keeps the row open in Unread');
+  check(row().querySelector('[data-log-index="Q2-answered"]').textContent.includes('The next check passed.'),
+   'opening the row moves the answer to the log');
+  const asked=row().querySelector('[data-log-index="Q2-asked"]');
+  const answered=row().querySelector('[data-log-index="Q2-answered"]');
+  check(asked?.textContent.includes('Which check is next?') && Date.parse(asked.querySelector('time').dateTime)===askedAt &&
+   Date.parse(answered.querySelector('time').dateTime)===answeredAt && !row().querySelector('[data-question="Q2"]'),
+   'The log shows the question and answer with their recorded times after the panel clears.');
+  row().querySelector('.list-toggle').click();
+  check(row().hidden,'closing the read row removes it from Unread');
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
-</script>""".replace(b'LIST_PATH', list_page.PAGE_PATH.encode())
+</script>""".replace('LIST_PATH', list_page.PAGE_PATH).encode()
 
         class Probe(serve.ReviewLinksHandler):
             @override
@@ -3630,11 +3997,13 @@ const change=async path=>{
 
             @override
             def do_POST(self) -> None:
-                if self.path == '/newer':
-                    _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
+                if self.path in ('/update', '/newer'):
+                    _ = the_list.update(MORTY.id, item.id, {"latest_status": f"New result from {self.path}."}, source="morty")
                     self.json_response(200, {})
-                elif self.path == '/answer':
-                    result = the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."])
+                elif self.path in ('/answer', '/second-answer'):
+                    question_id, words = (("Q1", "The gate passed.") if self.path == '/answer'
+                                          else ("Q2", "The next check passed."))
+                    result = the_list.main(["answer", item.id, "--question", question_id, "--text", words])
                     self.json_response(200 if result == 0 else 500, {})
                 elif self.path == '/results':
                     results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
@@ -3644,6 +4013,7 @@ const change=async path=>{
                     super().do_POST()
 
         with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(list_page, "counts_strip", return_value=""),
               patch.object(staff, "caller_identity", return_value=MORTY.current_session),
@@ -3665,7 +4035,8 @@ const change=async path=>{
                 thread.join()
 
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
-                                window_size: tuple[int, int] | None = None, in_frame: bool = False) -> None:
+                                window_size: tuple[int, int] | None = None, in_frame: bool = False,
+                                bulk_expand: bool = False) -> None:
         if add_item:
             _ = self.add("Test List action retries", number=1)
         with patch.object(list_page, "counts_strip", return_value=""):
@@ -3701,13 +4072,15 @@ window.fetch=async(_path,options={})=>{
  const onlyUnread=(on=true)=>{const control=document.getElementById('list-unread');if(control.checked!==on) control.click();};
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  try{
-  row.querySelector('.list-toggle').click();
+  document.querySelector('OPEN_CONTROL').click();
 ''' + steps + '''
  }catch(error){failures.push(String(error));}
  const result=parent.document.createElement('p');result.id='probe-results';
  result.textContent=JSON.stringify(failures);parent.document.body.append(result);
 })();
 </script>'''
+        open_control = '#list-expand-all' if bulk_expand else '[data-number="1"] .list-toggle'
+        probe = probe.replace('OPEN_CONTROL', open_control)
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion,
                              window_size=window_size, in_frame=in_frame)
 
@@ -3949,7 +4322,8 @@ window.fetch=async(_path,options={})=>{
  result.textContent=before && after && notice==='NOTICE' ? 'PASS' : 'FAIL';document.body.append(result);
 })();
 </script>'''
-        for action, unread, notice in (("read", "false", "Marked read"), ("tell", "false", "sent to morty"),
+        for action, unread, notice in (("read", "false", "Marked read"), ("read", "true", "Update remains unread"),
+                                      ("tell", "false", "sent to morty"),
                                       ("tell", "true", "sent to morty; update remains unread")):
             with self.subTest(action=action, unread=unread):
                 page = self.root / f"{action}-{unread}.html"
@@ -4095,6 +4469,65 @@ window.fetch=async(_path,options={})=>{
         _ = self.fixture_items()
         self.browser(list_page.render(self.root / "reviews").decode())
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_staff_chip_rows_wrap_and_fit(self) -> None:
+        for number in range(1, 13):
+            _ = self.add(f"Item {number}", owner=staff.StaffId(f"delivery-team-{number:02d}"), number=number)
+        all_staff = staff.StaffId("all")
+        item = self.add("Item for all", owner=all_staff, number=13)
+        _ = the_list.update(MORTY.id, item.id, {"producer": all_staff}, source="morty")
+        _ = self.add("Item for builds", owner=OTHER.id, number=14)
+        _ = self.add("Item for builds support", owner=staff.StaffId("builds-support"), number=15)
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            member.to_json() for member in (MORTY, DWIGHT, OWNER, replace(OTHER, name="builds-unit"))]}))
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = """<script>
+(async()=>{
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+try{
+const rows=[...document.querySelectorAll('[data-record-filters] [data-filter-row]')];
+const left=row=>row.querySelector('button').getBoundingClientRect().left;
+for(const row of rows){
+ const bounds=row.getBoundingClientRect();
+ for(const chip of row.querySelectorAll('button')){
+  const box=chip.getBoundingClientRect();
+  check(box.left>=bounds.left && box.right<=bounds.right+1,'The chip fits inside its row.');
+ }
+}
+const ownerChips=[...rows[0].querySelectorAll('button')];
+check(new Set(ownerChips.map(button=>button.getBoundingClientRect().top)).size>1,
+ 'The owner chips wrap onto more than one line.');
+check(rows.every(row=>Math.abs(left(row)-left(rows[0]))<1),'The three rows align.');
+check(document.documentElement.scrollWidth<=innerWidth,'The filter rows fit without horizontal scrolling.');
+const producerBox=rows[1].getBoundingClientRect(),words=document.getElementById('list-search').getBoundingClientRect();
+check(innerWidth>620 ? words.top<producerBox.bottom && words.left>=producerBox.right :
+ words.top>=producerBox.bottom,'The words box sits beside Producer on desktop and wraps below it on a phone.');
+const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
+const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
+check(allChips.every(chip=>chip.textContent==='All15') && staffChips.every(chip=>chip?.textContent==='all1'),
+ 'Each staff row has distinct All and all chips with separate counts.');
+check(ownerChips[2].textContent==='builds1' && ownerChips[3].textContent==='builds-support1',
+ 'The owner chips omit the suffix and sort by the displayed name.');
+const matchesAllStaff=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).join()==='13';
+staffChips.forEach(chip=>chip.click());
+const selectedPlace=new URLSearchParams(location.hash.slice(1));
+check(matchesAllStaff() && selectedPlace.get('owner')==='all' && selectedPlace.get('producer')==='all',
+ 'Selecting the staff ID all filters the items and stores the raw IDs.');
+allChips.forEach(chip=>chip.click());
+const restored=new Promise(done=>addEventListener('hashchange',done,{once:true}));
+location.hash='show=all&owner=all&producer=all';
+await restored;
+check(matchesAllStaff() && staffChips.every(chip=>chip.getAttribute('aria-pressed')==='true'),
+ 'An existing address with the staff ID all selects both staff chips.');
+}catch(error){failures.push(String(error));}
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>"""
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                self.browser_actions(markup, "", probe, window_size=(width, 900))
+
     def browser(self, markup: str) -> None:
         setup = r'''<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, errors=[], reads=[],posts=[];
@@ -4147,13 +4580,17 @@ const until=async (ready,label)=>{
 };
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
-const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+const filterRow=name=>document.querySelector('[data-filter-row="'+name+'"]');
+const staffChip=(name,value)=>filterRow(name).querySelector('[data-filter-value="'+
+ (name==='show' || value==='all' ? value : 'staff:'+value)+'"]');
+const chip=value=>staffChip('show',value);
 const show=value=>chip(value).click();
-const selectedShow=()=>document.querySelector('[data-filter-row="show"] [aria-pressed="true"]').dataset.filterValue;
-const menu=name=>document.getElementById('list-'+name);
-const select=(name,value)=>{const field=menu(name);field.value=value;field.dispatchEvent(new Event('change'));};
+const pressed=name=>filterRow(name).querySelector('[aria-pressed="true"]');
+const selectedFilter=name=>pressed(name).dataset.filterValue;
+const selectedShow=()=>selectedFilter('show');
+const select=(name,value)=>staffChip(name,value).click();
 const count=value=>Number(chip(value).querySelector('b').textContent);
-const menuCount=(name,value)=>Number([...menu(name).options].find(option=>option.value===value).dataset.filterCount);
+const staffCount=(name,value)=>Number(staffChip(name,value).dataset.filterCount);
 const unread=()=>document.getElementById('list-unread');
 const bulk=action=>document.querySelector('.list-table-tools [data-list-expansion="'+action+'"]');
 const search=value=>new Promise(done=>{
@@ -4232,13 +4669,13 @@ try{
   return .2126*r+.7152*g+.0722*b;
  };
  show('working');select('owner',OWNER);select('producer',MORTY);
- check(menu('owner').selectedOptions[0].textContent.startsWith('sdlc (') &&
-  menu('producer').selectedOptions[0].textContent.startsWith('morty ('),'The menus show the selected names and counts.');
+ check(pressed('owner').textContent==='sdlc1' && pressed('producer').textContent==='morty1',
+  'The selected staff chips show the names and counts.');
  for(const themeName of ['light','dark']){
   document.documentElement.dataset.theme=themeName;
   for(const view of ['working','blocked']){
    show(view);
-   for(const control of [chip(view),menu('owner'),menu('producer')]){
+   for(const control of [chip(view),pressed('owner'),pressed('producer')]){
     const background=luminance(getComputedStyle(control).backgroundColor);
     for(const element of [control,...control.querySelectorAll('b')]){
      const ink=luminance(getComputedStyle(element).color);
@@ -4251,33 +4688,41 @@ try{
  }
  if(theme===undefined) delete document.documentElement.dataset.theme;
  else document.documentElement.dataset.theme=theme;
- select('producer','');select('owner','');show('all');
+ select('producer','all');select('owner','all');show('all');
  select('owner',OWNER);check(visible().length===5,'Owner');
- select('owner','');
+ check(selectedFilter('owner')==='staff:'+OWNER && new URLSearchParams(location.hash.slice(1)).get('owner')===OWNER,
+  'The address keeps the selected owner.');
+ select('owner','all');
  select('producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
  check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'the address keeps the producer');
- select('producer','');
+ select('producer','all');
  check(visible().length===6 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
- check(showRow.querySelector('button').dataset.filterValue==='all' &&
-  menu('owner').options[0].value==='' && menu('producer').options[0].value==='','Each filter starts with All.');
+ check(['show','owner','producer'].every(name=>filterRow(name).querySelector('button').dataset.filterValue==='all'),
+  'Each filter row starts with All.');
  show('working');
  check(visible().length===2 && count('working')===2 && count('blocked')===0,
   'Working shows both matching records. Blocked counts zero.');
+ check(staffCount('owner',OWNER)===1 && staffCount('producer',DWIGHT)===1,
+  'The staff chips count the records in Working.');
  const zero=chip('blocked'),zeroPosition=zero.getBoundingClientRect();
  check(!zero.hidden && !zero.disabled && Number(getComputedStyle(zero).opacity)<1 && zeroPosition.width>0,
   'a zero chip stays in the row, dimmed and enabled');
  show('blocked');
  check(visible().length===0 && count('working')===2,'Selecting a zero chip keeps the other status counts.');
+ const zeroStaff=[staffChip('owner',OWNER),staffChip('producer',DWIGHT)];
+ check(zeroStaff.every(button=>button.dataset.filterCount==='0' && !button.hidden && !button.disabled &&
+  Number(getComputedStyle(button).opacity)<1 && button.getBoundingClientRect().width>0),
+  'The zero staff chips stay visible, enabled and dimmed.');
  show('closed');
  check(visible().map(row=>row.dataset.number).sort().join()==='54,63','Closed replaces the Blocked selection.');
  show('working');select('owner',OWNER);select('producer',DWIGHT);
- check(visible().length===0 && menuCount('owner','')===1 && menuCount('producer','')===1 && count('all')===0,
+ check(visible().length===0 && staffCount('owner','all')===1 && staffCount('producer','all')===1 && count('all')===0,
   'Each count ignores only its own filter.');
- select('producer','');await search('console');
+ select('producer','all');await search('console');
  check(visible().map(row=>row.dataset.number).join(',')==='106' && count('working')===1 &&
-  menuCount('producer',DWIGHT)===0 && menuCount('owner','')===2,'The search, menus and status chip combine.');
+  staffCount('producer',DWIGHT)===0 && staffCount('owner','all')===2,'The search and chip rows combine.');
  check(zero.getBoundingClientRect().left===zeroPosition.left,'a zero chip retains its place');
- await search('');show('all');select('owner','');
+ await search('');show('all');select('owner','all');
  await search('#106');
  check(visible().length===1 && visible()[0].dataset.number==='106','number search');
  await search('console');check(visible().length===2,'title search');
@@ -4373,23 +4818,23 @@ try{
  check(selectedShow()==='closed' && visible().map(row=>row.dataset.number).sort().join()==='54,63',
   'An old Done address opens Closed.');
  location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
- check(menu('producer').value===DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
+ check(selectedFilter('producer')==='staff:'+DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
- check(menu('producer').value==='' && visible().length===6,'an unknown producer shows all items');
+ check(selectedFilter('producer')==='all' && visible().length===6,'an unknown producer shows all items');
  location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
- check(selectedShow()==='working' && menu('owner').value===OWNER && unread().checked &&
-  visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Working chip, switch, menu and search.');
+ check(selectedShow()==='working' && selectedFilter('owner')==='staff:'+OWNER && unread().checked &&
+  visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
-  check(selectedShow()==='all' && menu('owner').value==='' && !unread().checked &&
-    menu('producer').value==='' && document.getElementById('list-search').value==='','an item link clears filters');
+  check(selectedShow()==='all' && selectedFilter('owner')==='all' && !unread().checked &&
+    selectedFilter('producer')==='all' && document.getElementById('list-search').value==='','an item link clears filters');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
  location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'working',q:'106',sort:'#',dir:'desc'});await flush();
- check(menu('owner').value===retained.dataset.owner && selectedShow()==='working' &&
+ check(selectedFilter('owner')==='staff:'+retained.dataset.owner && selectedShow()==='working' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');

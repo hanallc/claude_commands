@@ -731,7 +731,10 @@ The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
-The List starts with All selected in its single row of status chips.
+The List starts with All selected in the Owner, Producer, and Show rows.
+Owner and Producer list staff in name order after All and omit the `-unit` suffix from names.
+The address keeps the original staff IDs, including `all` when it identifies a staff member.
+The words box sits beside the Producer chips and wraps below them when space is limited.
 The chip order is All, Needs me, Morty answering, Working, Blocked, Parked, and Closed.
 Morty answering includes all items with an open question, including parked items and items that need Resend.
 The other status chips contain items with no open question.
@@ -742,9 +745,10 @@ Parked includes items with a future parking time in states other than Done and C
 Closed includes items in Done or Closed, even when they have a future parking time.
 Each item belongs to one status category. The six counts add up to All.
 The Unread only switch limits the visible items and chip counts to unread items.
-The Owner and Producer menus and the words box also limit the chip counts.
+Each chip count reflects the words box and the filters in the other rows.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
+The chip rows wrap when the available width decreases.
 
 The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
 They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.
@@ -924,17 +928,31 @@ After a successful Ask keeps the row visible, the row toggle receives lost focus
 Focus stays on the user's selection if they move it during the request, including to the parent console.
 On refresh, the List restores focus to an available action button with the same item key and action.
 Column sort buttons keep focus through refresh.
-A waiting row shows “The producer will answer” and no action buttons.
+A waiting row shows “The producer will answer” and has no action buttons.
+The panel shows each open question with its asked time.
+The waiting row keeps its log after Ask saves.
 A link opens a filtered-out question or read item in a separate section and preserves the current filters.
 The section does not change the results count.
 An open question adds a Morty answering note below the saved state.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one log entry and marks the item unread, including when the item is Closed.
+The answer adds one record event and marks the item unread, including when the item is Closed.
 After the last answer, the next refresh returns the row to its status chip.
 Parked shows the item after the last answer if its parking time is still active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
 That request keeps the item in Morty answering and shows its confirmation next to Show.
-The log shows each answered question with its answer.
+An unread answer appears in the panel with the question, both times, and an Unread mark.
+Mark read clears the signed update shown by the form.
+Opening an individual row with an unread answer uses the same signed read operation.
+The List sends this request after the text of each unread answer enters the viewport while the row is open.
+The tab and console frame must also be visible.
+Expand all leaves answers unread.
+A newer update stays unread if it arrives before the read saves.
+With Unread only on, an item can stay visible after this read until the user closes its row or changes Show.
+Changing the Unread only switch ends this exception.
+After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
+The panel clears the question when the log shows it.
+The List uses its local date and time format for questions and answers.
+A newer unread update leaves previously read answers in the log.
 The command refuses an unknown ID, a second answer, and empty text.
 
 List and Images questions share one delivery record for each question and recipient.

@@ -15,7 +15,7 @@ from scripts.lib.testing_folders import test_run_folder
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     merge_gate.add_suite_arguments(parser)
     args = cast(merge_gate.GateArguments, parser.parse_args(argv))
     with test_run_folder():

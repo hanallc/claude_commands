@@ -14,7 +14,8 @@ import re
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -897,6 +898,20 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
         raise store.invalid(identity, error) from None
 
 
+def _require_active_open_producers(items: Sequence[ListItem]) -> None:
+    producers = dict.fromkeys(item.producer for item in items if item.state != ItemState.CLOSED)
+    if not producers:
+        return
+    try:
+        record = staff.authority_snapshot()
+    except staff.StaffAbsent:
+        return
+    for identity in producers:
+        producer = record.by_id(identity)
+        if producer is not None and isinstance(producer.retirement, staff.RetiredProducer):
+            raise ListError(f"{producer.name}: retired producer. Choose an active producer.")
+
+
 def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
@@ -1021,6 +1036,7 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
             if store.path(item.id).exists():
                 raise ListError(f"{item.id}: the item already exists")
             _check_links(read, item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to})
+        _require_active_open_producers(items)
         for item in items:
             _save(store, item)
 
@@ -1048,6 +1064,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
         _validate(item)
         _check_links(lambda number: load(keeper, f"L{number}"), item.number, changes)
+        _require_active_open_producers((item,))
         _save(store, item)
         return item
 
@@ -1095,6 +1112,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             return UnchangedEdit(item)
         changed = replace(changed, log=(*item.log, *entries))
         _validate(changed)
+        if item.state == ItemState.CLOSED or changed.producer != item.producer:
+            _require_active_open_producers((changed,))
         if isinstance(request, PageRequest):
             changed = _save_page_request(store, keeper, changed, request)
         else:
@@ -1181,6 +1200,30 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
     return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=assigned_to)
+
+
+def move_open_producer(keeper: staff.StaffId, identity: str, previous: staff.StaffId,
+                       producer: staff.StaffId, *, source: str) -> ListItem:
+    """Move an open item only while it belongs to the previous producer."""
+    def edit(item: ListItem, _: datetime) -> ListItem:
+        if item.state == ItemState.CLOSED or item.producer != previous:
+            return item
+        return replace(item, producer=producer)
+
+    return _change(keeper, identity, edit, FieldChange("Updated", {"producer": producer}), source).item
+
+
+@contextmanager
+def require_no_open_producer_items(keeper: staff.StaffId, producer: staff.StaffId) -> Generator[None]:
+    """Hold the List lock after confirming the producer has no open items."""
+    store = _store(keeper)
+    with store.locked():
+        for path in store.folder().iterdir():
+            if path.suffix == ".md" and store.valid_id(path.stem):
+                item = load(keeper, path.stem)
+                if item.state != ItemState.CLOSED and item.producer == producer:
+                    raise ListError("new open items belong to the producer. Run agents retire again.")
+        yield
 
 
 def link(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, source: str) -> ListItem:
@@ -1270,11 +1313,26 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
 
 
+def unread_answer_ids(item: ListItem) -> frozenset[str]:
+    """Find answers since the last action that cleared the item's unread state."""
+    if not isinstance(item.unread_since, datetime):
+        return frozenset()
+    unread: set[str] = set()
+    for change in reversed(item.log):
+        content = change.what
+        if (isinstance(content, (MarkedRead, Reopened)) or content in ("Marked read", "Reopened")
+                or isinstance(content, FieldChange) and content.action == "Closed"):
+            break
+        if isinstance(content, QuestionAnswered):
+            unread.add(content.question_id)
+    return frozenset(unread)
+
+
 def mark_read(keeper: staff.StaffId, identity: str, *, source: str,
-              update: UnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
+              update: UnreadUpdate | NoUnreadUpdate | ReadCurrentUpdate = ReadCurrentUpdate.CURRENT,
               page_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
     def edit(item: ListItem, _: datetime) -> ListItem:
-        if isinstance(update, UnreadUpdate) and unread_update(item) != update:
+        if update is not ReadCurrentUpdate.CURRENT and unread_update(item) != update:
             return item
         return replace(item, unread_since=NoTimestamp.UNSET)
     return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request).item

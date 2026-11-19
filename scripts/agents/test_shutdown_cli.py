@@ -135,6 +135,7 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertIn("resume NAME", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
+        self.assertIn("retire NAME [--to PRODUCER]", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)
