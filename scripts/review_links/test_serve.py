@@ -375,8 +375,18 @@ class ReviewLinksServerTests(unittest.TestCase):
                 request = replace(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
                                   page="list", request_id="r2-" + uuid4().hex)
                 capture_key, body = capture_body(request)
+                deliveries: list[change_page.MessageDelivery] = []
+                deliver = change_page.deliver
+
+                def record_delivery(delivery: change_page.MessageDelivery | change_page.NoMessageDelivery,
+                                    status: change_page.DeliveryStatus) -> None:
+                    if isinstance(delivery, change_page.MessageDelivery):
+                        deliveries.append(delivery)
+                    deliver(delivery, status)
+
                 with (patch.object(self.server, "review_cache", cache),
                       patch.object(self.server, "delivery_status", case.status),
+                      patch.object(change_page, "deliver", record_delivery),
                       patch.object(change_page, "send_message") as send,
                       patch.object(self.server, "attach_page_screenshot",
                                    wraps=self.server.attach_page_screenshot) as attach):
@@ -408,7 +418,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                               self.assertRaises(RemoteDisconnected)):
                             _ = self.new_item_http(later_body, finished=True)
                         self.assertTrue(delivered_id)
-                        send.assert_called_once_with(f"session:{later_owner.current_session}", change_page.SENDER, ANY)
+                        delivery, = deliveries
+                        send.assert_called_once_with(
+                            f"session:{later_owner.current_session}", change_page.SENDER, delivery.message,
+                            key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
+                            recipient_key=later_owner.id)
                         attach.assert_called_once()
                         if scenario == "transfer-two-reopen":
                             sources += (later_owner,)
@@ -528,7 +542,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 _ = hidden.rename(other_record.path)
                         continue
                     sent_to = later_owner if later_owner is not None else target
-                    send.assert_called_once_with(f"session:{sent_to.current_session}", change_page.SENDER, ANY)
+                    delivery, = deliveries
+                    send.assert_called_once_with(
+                        f"session:{sent_to.current_session}", change_page.SENDER, delivery.message,
+                        key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
+                        recipient_key=sent_to.id)
                     attach.assert_called_once()
 
     def test_f014_standard_new_replays_the_item_filed_for_the_new_page_owner(self) -> None:
@@ -2175,7 +2193,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture(changes=1)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'question', 'What changed?'), case.status)
+        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
         listing = case.fixture.review_list
         claim = change_routing.delivery_path(case.root, listing, 'C1')
         before = (listing.read_bytes(), claim.read_bytes(), dict(case.status.request_attempts))
@@ -2190,8 +2208,30 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(status, 400, body)
         self.assertIn(change_page.WITH_SHOWRUNNER.encode(), body)
         self.assertEqual((listing.read_bytes(), claim.read_bytes(), case.status.request_attempts), before)
-        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.WAITING)
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.VALIDATING)
         self.assertEqual(list(case.root.glob('.review-link-scratch-*')), [])
+
+    def test_review_body_serves_the_validating_question_in_both_card_views(self) -> None:
+        case = self.review_fixture(changes=1)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        key = 'page-owner/C1'
+        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
+        with patch.object(self.server, 'review_cache', cache):
+            table = self.request(review_page.PAGE_PATH + '?' + urlencode({'body': key}))
+            card = self.request(review_page.card_url(key))
+            missing = self.request(review_page.card_url('missing/key'))
+        self.assertEqual(table.status, 200)
+        self.assertEqual(card.status, 200)
+        self.assertIn(b'<template data-card-body><div class="list-panel review-panel change">', card.body)
+        for body in (table.body, card.body):
+            self.assertIn(b'<h3>How to check</h3>', body)
+            self.assertIn(b'Sends to page-owner', body)
+            self.assertIn(b'value="question">Ask a question</button>', body)
+            self.assertNotIn(b'value="works"', body)
+            self.assertNotIn(b'data-later-toggle', body.split(b'</template>', 1)[0])
+        self.assertEqual(missing.status, 404)
+        self.assertIn(b'role="status"', missing.body)
 
     def test_review_recovery_isolates_unreadable_lists_and_releases_locks_before_cleanup(self) -> None:
         case = self.review_fixture(changes=3)
@@ -2389,16 +2429,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         previous = cache.get()
         request = case.card_body(previous, proposal, 'approve')
         path = Path(proposal.removeprefix('proposal/'))
-        _ = path.write_text(path.read_text().replace('Run fewer checks.', 'Run a different check.'))
-        fresh, _ = cache.publish_record(previous, proposal)
-        self.assertEqual(fresh.records[proposal].state, previous.records[proposal].state)
-        self.assertIn(b'Run a different check.', fresh.body(proposal))
         with patch.object(self.server, 'review_cache', cache), patch.object(
                 serve, 'tailscale_ip', return_value='127.0.0.1'), patch.object(
                 review_actions, 'decision_action', return_value=(change_page.NoMessageDelivery(), 'approved')) as action:
+            first = self.request(review_page.card_url(proposal))
+            self.assertEqual(first.status, 200)
+            _ = path.write_text(path.read_text().replace('Run fewer checks.', 'Run a different check.'))
             status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 409, reply)
             action.assert_not_called()
+            fresh = cache.get()
+            self.assertEqual(fresh.records[proposal].state, previous.records[proposal].state)
+            revision = review_page.record_revision(fresh.records[proposal], fresh.assets)
+            self.assertNotIn(revision.encode(), first.body)
+            card = self.request(review_page.card_url(proposal))
+            self.assertEqual(card.status, 200)
+            self.assertIn(b'Run a different check.', card.body)
+            self.assertIn(f'name="revision" value="{revision}"'.encode(), card.body)
+            table_body = self.request(review_page.PAGE_PATH + '?' + urlencode({'body': proposal, 'version': fresh.version}))
+            self.assertEqual(table_body.status, 200)
+            self.assertIn(b'Run a different check.', table_body.body)
+            self.assertIn(f'name="revision" value="{revision}"'.encode(), table_body.body)
             status, reply = self.post(review_page.PAGE_PATH, case.card_body(fresh, proposal, 'approve'))
             self.assertEqual(status, 200, reply)
             action.assert_called_once()

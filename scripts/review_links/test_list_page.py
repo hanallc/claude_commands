@@ -57,7 +57,7 @@ NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
 
-    def test_review_links_keep_the_console_and_jump_to_cards_in_every_state(self) -> None:
+    def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
         ready = review_items.ReviewItem("proposal/sdlc/P10", "sdlc/P10", review_items.ReviewType.PROPOSAL,
             OWNER.id, OWNER.id, "Check this proposal", review_items.ReviewState.OPEN,
@@ -66,23 +66,18 @@ class ListPageTests(unittest.TestCase):
             with self.subTest(state=state):
                 review = replace(ready, state=state)
                 link = ElementTree.fromstring(list_page.review_card(review.key, {review.key: review}))
-                query = parse_qs(urlsplit(link.attrib["href"]).query)
-                self.assertEqual(query["page"], ["review"])
-                place = urlsplit(query["at.review"][0])
+                place = urlsplit(link.attrib["href"])
                 self.assertEqual(place.path, review_page.PAGE_PATH)
-                self.assertEqual(parse_qs(place.query), {"show": ["all"]})
-                self.assertEqual(parse_qs(place.fragment), {"show": ["open"], "jump": [review.key]})
-                self.assertEqual(link.attrib["target"], "_top")
+                self.assertEqual(parse_qs(place.query), {"body": [review.key], "view": ["card"]})
+                self.assertFalse(place.fragment)
+                self.assertNotIn("target", link.attrib)
+                self.assertEqual(link.attrib["aria-haspopup"], "dialog")
+                self.assertIn("data-list-review-card", link.attrib)
         item = replace(self.add("Linked work"), reviews=("proposal/sdlc/P10", "change/sdlc/C1830"))
         for state in review_items.ReviewState:
             with self.subTest(summary=state):
                 reviews = {key: replace(ready, key=key, state=state) for key in item.reviews}
-                link = ElementTree.fromstring(list_page.review_summary(item, reviews, NOW))
-                query = parse_qs(urlsplit(link.attrib["href"]).query)
-                self.assertEqual(query["page"], ["review"])
-                place = urlsplit(query["at.review"][0])
-                self.assertEqual(parse_qs(place.query), {"show": ["all"]})
-                self.assertEqual(parse_qs(place.fragment), {"key": list(item.reviews)})
+                self.assertNotIn("<a ", list_page.review_summary(item, reviews, NOW))
 
     def test_review_summary_reports_a_missing_link_as_unavailable(self) -> None:
         item = replace(self.add("Linked work"), reviews=("sdlc/C1", "sdlc/C2"))
@@ -389,405 +384,423 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         self.browser_actions(markup, "", probe)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_browser_review_links_jump_inside_the_full_review_list(self) -> None:
-        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1830", "How to check": "Read the card."},
-            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
-            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
-        ready = review_items.ReviewItem("change/sdlc/C1830", "sdlc/C1830", review_items.ReviewType.CHANGE,
-            OWNER.id, OWNER.id, "Check the linked change", review_items.ReviewState.OPEN,
-            review_items.ReviewTimes(NOW, NOW), (), (), source)
-        reviews = [ready, replace(ready, key="change/sdlc/C1829", id="sdlc/C1829",
-                                  title="Read the release notes", state=review_items.ReviewState.WAITING),
-                   replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
-                   replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
-                           times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))]
-        item = self.add("Linked review cards", number=111)
-        linked_keys = tuple(review.key for review in reviews)
-        _ = the_list.link(MORTY.id, item.id, linked_keys, source="morty")
-        missing = replace(ready, key="change/sdlc/C1833", id="sdlc/C1833", state=review_items.ReviewState.DONE)
-        missing_item = self.add("Review is Done", number=112)
-        _ = the_list.link(MORTY.id, missing_item.id, (missing.key,), source="morty")
-        for number in range(1, 16):
-            _ = self.add(f"List fixture {number}", number=number)
-        reviews.append(replace(ready, key="change/other/C9", id="other/C9", title="Unlinked review"))
-        reviews.append(replace(ready, key="change/other/C10", id="other/C10", title="Check another change"))
-        reviews.append(replace(ready, key="change/builds/C17", id="builds/C17", title="Check a build",
-                               owner=OTHER.id, source_unit=OTHER.id))
-
-        def read_reviews(_root: Path, *, show: str = "all", owner_options: dict[staff.StaffId, str] | None = None,
-                         **_kwargs: object) -> list[review_items.ReviewItem]:
-            if owner_options is not None:
-                owner_options.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
-            states = review_items.selected_states(show)
-            return [review for review in reviews if review.state in states]
-
-        with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
-            reviews.append(missing)
-            listing = list_page.render(self.root / "reviews")
-            review = review_page.build_snapshot(self.root / "reviews")
-            reviews[0] = replace(ready, times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))
-            parked_review = review_page.build_snapshot(self.root / "reviews")
+    def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        listing = self.root / f"{change_review.PREFIX}sdlc.md"
+        _ = doc.write_text(f'# Production\n- **Showrunner checkout:** `{self.root}`\n- **Change review:** `{listing}`\n')
+        now = datetime.now(UTC)
+        original = (change_review.BODY.replace("\n## Reviewed",
+            f"| C1 | Check the List review overlay | {now.date().isoformat()} | Open the linked change. |\n\n## Reviewed")
+            + "| C2 | A completed change | works | 2026-11-15 |\n")
+        members = staff.StaffSnapshot((MORTY, DWIGHT, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc)), OTHER))
+        item = self.add("Check the linked reviews", number=111)
+        _ = the_list.link(MORTY.id, item.id, ("sdlc/C1", "sdlc/C2"), source="morty")
+        _ = self.add("An unrelated List row", number=112)
+        waiting = investigation.file(OWNER.id, "Check the waiting review", "What caused the error?",
+                                     waiting_why="The owner checks the error.")
+        waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
+        waiting_item = self.add("Check the linked reviews that are waiting", number=113)
+        _ = the_list.link(MORTY.id, waiting_item.id, (waiting_key,), source="morty")
+        _ = write_config_fixture(self.root / "config/review_links.conf",
+                                 "page_request_timeout_seconds=7\ncard_fade_out_ms=180\ncard_fade_in_ms=260\n")
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
-        list_url = "/console/" + console.place_query("list", list_page.PAGE_PATH + '#' + urlencode({"item": f"{MORTY.id}/{item.id}"}))
+        list_place = list_page.PAGE_PATH + '#' + urlencode({"show": "working", "item": f"{MORTY.id}/{item.id}"})
+        review_place = review_page.PAGE_PATH + '#' + urlencode({"show": "Done", "type": "question", "q": "keep"})
+        destination = "/proof" + console.place_query("list", list_place) + "&" + urlencode({"at.review": review_place})
         probe = r'''<script>
-const listUrl=LIST_URL,keys=KEYS,ownerId=OWNER_ID,otherId=OTHER_ID;
-const params=new URLSearchParams(location.search),proof=params.get('proof'),returnWords=params.get('pending') || '';
-let finished=false,inspected=false;
-const frames=win=>new Promise(done=>win.requestAnimationFrame(()=>win.requestAnimationFrame(done)));
-const nav=name=>document.querySelector('[data-page="'+name+'"]');
-const selected=(doc,name)=>doc.querySelector('[data-'+name+'-chip][aria-pressed="true"]').dataset[name+'Chip'];
-const failures=JSON.parse(sessionStorage.getItem('link-failures') || '[]');
-const check=(ok,text)=>{
- if(!ok){failures.push(text);sessionStorage.setItem('link-failures',JSON.stringify(failures));}
-};
-async function finish(){
- if(finished) return;finished=true;
- await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-}
-function ids(doc){
+const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+const shot=new URLSearchParams(location.search).has('shot');
+const waitingKey=WAITING_KEY;
+const report=async()=>{await fetch('/results',{method:'POST',body:JSON.stringify(failures)});};
+const listFrame=document.querySelector('iframe:not([hidden])');
+const direct=!listFrame;
+const animationFrames=win=>new Promise(resolve=>win.requestAnimationFrame(()=>win.requestAnimationFrame(resolve)));
+async function inspect(){
+ const doc=listFrame?.contentDocument || document,win=doc.defaultView;
+ const dialog=doc.querySelector('[data-list-review-dialog]');
+ const row=()=>doc.querySelector('[data-number="111"]');
+ const link=key=>[...row().querySelectorAll('a[data-list-review-card]')].find(link=>
+  new URL(link.href).searchParams.get('body')===key);
+ const changed=(node,ready,description)=>new Promise((resolve,reject)=>{
+  const observer=new win.MutationObserver(checkReady);
+  const timer=setTimeout(()=>{
+   observer.disconnect();reject(new Error('Timed out: '+description));
+  },8000);
+  function checkReady(){
+   try{
+    if(ready()){clearTimeout(timer);observer.disconnect();resolve();}
+   }catch(error){clearTimeout(timer);observer.disconnect();reject(error);}
+  }
+  observer.observe(node,{attributes:true,childList:true,subtree:true});checkReady();
+ });
+ const readCard=source=>{
+  source.click();
+  const frame=dialog.querySelector('iframe:not([hidden])');
+  if(!frame) throw new Error('The card frame is missing.');
+  return new Promise(resolve=>frame.addEventListener('load',()=>resolve(frame.contentDocument),{once:true}));
+ };
+ check(!dialog.querySelector('iframe'),'List loads no card before a click.');
  for(const cell of doc.querySelectorAll('.record-id')){
   if(cell.closest('tbody').hidden) continue;
-  const button=cell.querySelector('.list-toggle'),style=doc.defaultView.getComputedStyle(cell);
-  check(style.whiteSpace==='nowrap','the ID cell does not wrap');
-  check(button.scrollWidth<=cell.clientWidth-16,'the ID and arrow fit their column: '+button.textContent);
+  const button=cell.querySelector('.list-toggle');
+  check(win.getComputedStyle(cell).whiteSpace==='nowrap','The ID cell does not wrap.');
+  check(button.scrollWidth<=cell.clientWidth,'The ID and arrow fit in their column.');
   const range=doc.createRange();range.selectNodeContents(button.lastChild);
-  check(range.getClientRects().length===1,'the ID text has one line');
+  check(range.getClientRects().length===1,'The ID text has one line.');
  }
-}
-function reviewPlaceRecorded(win,matches){
- return new Promise(resolve=>{
-  const recordedPlace=event=>{
-   const at=new URL(location.href).searchParams.get('at.review');
-   if(event.source!==win || event.data!=='console-place' || !at ||
-      !matches(new URLSearchParams(new URL(at,location.href).hash.slice(1)))) return;
-   removeEventListener('message',recordedPlace);resolve();
-  };
-  addEventListener('message',recordedPlace);
- });
-}
-async function configureReview(show,words){
- nav('review').click();
- const frame=document.querySelector('iframe:not([hidden])');
- const loaded=frame.contentDocument?.querySelector('[data-review]') ? frame.contentDocument :
-  await new Promise(resolve=>frame.addEventListener('load',()=>resolve(frame.contentDocument),{once:true}));
-
- const doc=loaded,win=doc.defaultView;
- if(doc.querySelector('[data-review]').dataset.show!==show){
-  await new Promise(resolve=>{
-   const observer=new win.MutationObserver(()=>{
-    if(doc.querySelector('[data-review]').dataset.show===show){observer.disconnect();resolve();}
-   });
-   observer.observe(doc.body,{childList:true,subtree:true});
-   doc.querySelector('[data-show-chip="'+show+'"]').click();
-  });
- }
- doc.querySelector('[data-type-chip="change"]').click();
- doc.querySelector('[data-owner-chip="'+ownerId+'"]').click();
- const sort=doc.querySelector('[data-sort="3"]');
- if(sort.parentElement.getAttribute('aria-sort')==='none') sort.click();
+ await animationFrames(win);
+ const listURL=win.location.href,historyLength=history.length;
+ const reviewPlace=()=>new URL(location.href).searchParams.get('at.review');
+ let savedReviewPlace=reviewPlace();
  const search=doc.querySelector('#list-search');
- const recorded=reviewPlaceRecorded(win,place=>place.get('q')===words);
- search.value=words;search.dispatchEvent(new win.Event('input',{bubbles:true}));
- await recorded;
- nav('list').click();
-}
-async function inspect(frame){
- try{
-  const doc=frame.contentDocument;
-  if(inspected || !doc?.querySelector('[data-list-item]')) return;
-  inspected=true;
-  check(!!document.querySelector('.sidebar .nav-entry'),'the console navigator remains visible');
-  const stage=proof==='review' ? keys.length : Number(sessionStorage.getItem('link-stage') || 0);
-  if(doc.querySelector('[data-list]')){
-   ids(doc);
-   const row=doc.querySelector('[data-number="111"]');
-   check(!row.hidden && !row.querySelector('[data-detail]').hidden,'List item 111 is open');
-   if(proof==='list'){await finish();return;}
-   const win=doc.defaultView;
-   if(stage===0 && !proof){
-    await configureReview('all','Check');
-    const extra=doc.querySelector('[data-number="15"]');
-    extra.querySelector('.list-toggle').click();
-    check(!extra.querySelector('[data-detail]').hidden,'the extra List row is open before leaving');
-    const stale=new URL(win.location.href),filters=new URLSearchParams(stale.hash.slice(1));
-    filters.set('producer','unavailable');stale.hash=filters;
-    win.history.replaceState(win.history.state,'',stale);
-    const outer=new URL(location.href);outer.searchParams.set('at.list',stale.pathname+stale.hash);
-    history.replaceState(history.state,'',outer);
-    win.history.scrollRestoration='manual';
-    win.scrollTo({top:120,behavior:'instant'});
-    sessionStorage.setItem('list-top',String(win.scrollY));
-    check(win.scrollY>0,'the List has a scroll position to restore');
-   }
-   if(stage===1 && !proof){
-    await frames(win);
-    const restored=new URLSearchParams(win.location.hash.slice(1));
-    check(!restored.has('producer') && restored.get('item')===row.dataset.key,'Back normalizes the stale List filter and keeps the source');
-    check(!doc.querySelector('[data-number="15"] [data-detail]').hidden,'Back restores the extra open List row');
-    check(Math.abs(win.scrollY-Number(sessionStorage.getItem('list-top')))<=1,
-      'Back restores the List scroll from '+sessionStorage.getItem('list-top')+' to '+win.scrollY);
-    check(doc.querySelector('#list-search').value===returnWords,'Back restores words typed just before the link click');
-    const returns=Number(sessionStorage.getItem('list-returns') || 0)+1;
-    sessionStorage.setItem('list-returns',String(returns));
-    if(returns===1){
-     doc.body.dataset.firstReturn='';
-     history.forward();return;
-    }
-    check(!doc.body.hasAttribute('data-first-return'),'the second Back loads a new List document');
-    await configureReview('open','Unlinked review');
-   }
-   const source=stage===keys.length+1 ? doc.querySelector('[data-number="112"]') : row;
-   if(source!==row) source.querySelector('.list-toggle').click();
-   const links=[...source.querySelector('[data-detail]').querySelectorAll('a')];
-   const key=stage<keys.length ? keys[stage] : stage===keys.length+2 ? keys[0] : '';
-   const link=key ? links.find(link=>{
-    const at=new URL(link.href).searchParams.get('at.review');
-    return at && new URLSearchParams(new URL(at,location.href).hash.slice(1)).get('jump')===key;
-   }) : source.querySelector('[data-label="State"] a');
-   check(!!link,'the selected List link exists');
-   if(stage===0 && returnWords){
-    const search=doc.querySelector('#list-search');
-    search.value=returnWords;search.dispatchEvent(new win.Event('input',{bubbles:true}));
-   }
-   if(link) link.click();else await finish();
-  }else if(doc.querySelector('[data-review]')){
-   if(stage===1 && sessionStorage.getItem('list-returns')==='1'){history.back();return;}
-   ids(doc);
-   const visibleRows=()=>[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
-   const visible=visibleRows();
-   if(stage<keys.length){
-    const target=visible.find(row=>row.dataset.key===keys[stage]);
-    check(!!target && visible.some(row=>row.dataset.key==='change/other/C10'),'the linked card and an unlinked card are shown');
-    check(target?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the linked card is expanded');
-    check(!target?.querySelector('[data-detail]').hidden,'the linked card detail is open');
-    const place=new URLSearchParams(doc.location.hash.slice(1)),search=doc.querySelector('#list-search');
-    check(!place.has('key') && !place.has('jump') && place.get('item')===keys[stage],'the address keeps only an open item target');
-    const expectedShow=['all','all','all','open'][stage];
-    check(selected(doc,'show')===expectedShow,'Review selects '+expectedShow+' for '+keys[stage]);
-    const reloaded=sessionStorage.getItem('review-reload')===String(stage);
-    if(!reloaded){
-     const row=target?.querySelector('.list-row'),box=row?.getBoundingClientRect();
-     check(box?.top>=0 && box?.bottom<=doc.defaultView.innerHeight,'the linked row is in view');
-     check(row?.hasAttribute('data-record-highlight'),'the linked row has the shared highlight');
-     const reduced=doc.defaultView.matchMedia('(prefers-reduced-motion: reduce)').matches;
-     check(row?.getAnimations().some(animation=>animation.playState==='running')===!reduced,
-       'the highlight respects reduced motion');
-    }
-    if(stage===0){
-     check(selected(doc,'owner')===ownerId && selected(doc,'type')==='change' && search.value==='Check',
-       'the generated link keeps the Review filters selected in the controls');
-     check(doc.querySelector('[data-sort="3"]').parentElement.getAttribute('aria-sort')==='ascending',
-       'the generated link keeps the Review sort selected in the controls');
-    }
-    if(stage===1){
-     check(selected(doc,'owner')===ownerId,'The jump keeps the matching Owner.');
-     check(search.value==='' && selected(doc,'type')==='change','the jump clears conflicting words and keeps the matching type');
-    }
-    if(stage===0 && !reloaded){
-     const input=value=>{
-      search.value=value;search.dispatchEvent(new doc.defaultView.Event('input',{bubbles:true}));
-     };
-     input('Unlinked review');
-     check(visibleRows().length===1 && visibleRows()[0].dataset.key==='change/other/C9','the words box still filters');
-     input('');
-     doc.querySelector('[data-type-chip="question"]').click();
-     check(visibleRows().length===0,'the type chips still filter');
-     doc.querySelector('[data-type-chip=""]').click();
-     doc.querySelector('[data-owner-chip="'+otherId+'"]').click();
-     check(visibleRows().length===1 && visibleRows()[0].dataset.owner===otherId,'the owner chips still filter');
-     doc.querySelector('[data-owner-chip=""]').click();
-     doc.querySelector('[data-show-chip="open"]').click();
-     check(visibleRows().every(row=>row.dataset.state==='Open'),'the Show chips still filter');
-     doc.querySelector('[data-show-chip="all"]').click();
-     doc.querySelector('[data-owner-chip="'+ownerId+'"]').click();
-     doc.querySelector('[data-type-chip="change"]').click();
-     input('Check');
-     await frames(doc.defaultView);
-    }
-    if((stage===0 || stage===3) && !reloaded){
-     sessionStorage.setItem('review-reload',String(stage));
-     location.reload();return;
-    }
-    sessionStorage.setItem('link-stage',String(stage+1));
-    if(stage===0) history.back();else location.href=listUrl;
-   }else if(stage===keys.length){
-    check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
-    const waiting=visible.find(row=>row.dataset.key===keys[1]);
-    if(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') waiting?.querySelector('.list-toggle').click();
-    check(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Waiting card can open in the linked view');
-    if(proof){await finish();return;}
-    const group=doc.querySelector('[data-clear-linked-reviews]');
-    check(group && !group.hidden,'the linked group has one visible filter chip');
-    group?.click();
-    check(visibleRows().some(row=>row.dataset.key==='change/other/C9'),'one click restores the normal Review list');
-    check(group?.hidden && !new URLSearchParams(doc.location.hash.slice(1)).has('key'),'the group chip clears the selection');
-    sessionStorage.setItem('link-stage',String(stage+1));
-    location.href=listUrl;
-   }else if(stage===keys.length+1){
-    const notice=doc.querySelector('[data-missing-item]');
-    check(notice && !notice.hidden && notice.textContent==='This review is no longer on the Review page.',
-      'a linked Done review shows a missing-target notice');
-    check(visibleRows().some(row=>row.dataset.key==='change/other/C9'),'a missing link leaves the normal Review list visible');
-    sessionStorage.setItem('link-stage',String(stage+1));
-    location.href=listUrl;
-   }else{
-    const target=doc.querySelector('[data-key="'+keys[0]+'"]');
-    if(sessionStorage.getItem('later-reload')){
-     const response=await doc.defaultView.fetch('/console/review.html?index=1');
-     const payload=await response.json(),entry=payload.index.r.find(row=>row[0]===keys[0]);
-     check(entry?.[9]>Date.now() && !target && !new URLSearchParams(doc.location.hash.slice(1)).has('item'),
-       'a parked linked card stays hidden and closed after reload');
-     await finish();return;
-    }
-    check(!target.hidden && !target.querySelector('[data-detail]').hidden,'the card opens from List before Later');
-    const form=await new Promise((resolve,reject)=>{
-     const observe=new doc.defaultView.MutationObserver(()=>{
-      const form=target.querySelector('form');
-      if(form){observe.disconnect();resolve(form);}
-     });
-     const form=target.querySelector('form');
-     if(form) resolve(form);
-     else{
-      observe.observe(target,{childList:true,subtree:true});
-      setTimeout(()=>{observe.disconnect();reject(new Error('The Review card body did not load.'));},8000);
-     }
-    });
-    const settled=new Promise(resolve=>{
-     const observer=new doc.defaultView.MutationObserver(()=>{
-      if(!form.hasAttribute('data-sending')){observer.disconnect();resolve();}
-     });
-     observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
-    });
-    const recorded=reviewPlaceRecorded(doc.defaultView,place=>!place.has('item') && !place.has('linked'));
-    form.querySelector('[data-later-toggle]').click();
-    form.querySelector('[data-later-preset="morning"]').click();
-    if(!form.hasAttribute('data-sending')) throw new Error('Later did not start.');
-    await settled;
-    check(form.querySelector('[data-send-status]').textContent==='Saved: parked','Later confirms the save on the card');
-    const status=doc.querySelector('[data-hidden-action-status]');
-    check(status.hidden && !status.textContent,'Later shows no success notice above the table');
-    const place=new URLSearchParams(doc.location.hash.slice(1));
-    check(!place.has('item') && !place.has('linked'),'Later removes the linked target from the Review address');
-    sessionStorage.setItem('later-reload','yes');
-    await recorded;
-    location.reload();
-   }
-  }
- }catch(error){failures.push(String(error));await finish();}
-}
-for(const frame of document.querySelectorAll('iframe')) frame.addEventListener('load',()=>inspect(frame));
-addEventListener('pageshow',event=>{
- if(event.persisted){
-  inspected=false;
-  const active=document.querySelector('iframe:not([hidden])');
-  requestAnimationFrame(()=>requestAnimationFrame(()=>inspect(active)));
+ search.value='linked reviews';search.dispatchEvent(new win.Event('input',{bubbles:true}));
+ await changed(doc.body,()=>link('sdlc/C1') && link('sdlc/C2'),'the List loads the linked cards');
+ const waitingLink=doc.querySelector('[data-number="113"] [data-label="State"] a[data-list-review-card]');
+ const waitingCard=await readCard(waitingLink);
+ check(dialog.open && waitingCard.querySelector('[data-key="'+waitingKey+'"][data-state="Waiting"]'),
+  'The summary opens the linked Waiting card.');
+ dialog.querySelector('button').click();
+ const doneLink=link('sdlc/C2'),done=await readCard(doneLink);
+ check(dialog.open && done.querySelector('[data-state="Done"]'),'Done opens in the dialog.');
+ check(!done.querySelector('[data-review-form] textarea'),'The Done card has no action.');
+ check(!done.querySelector('[data-review-index]'),'The dialog loads one card.');
+ const close=dialog.querySelector('button');
+ done.body.tabIndex=-1;done.body.focus();
+ done.body.dispatchEvent(new done.defaultView.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+ check(!dialog.open && doc.activeElement===doneLink,'Escape closes the dialog and focuses the same link.');
+ let readyLink=link('sdlc/C1');
+ const ready=await readCard(readyLink);
+ await animationFrames(win);
+ check(ready.querySelector('[data-review-body]').textContent.includes('Open the linked change.'),'The open card shows the Review body.');
+ const form=ready.querySelector('[data-review-form]');
+ check(!!form.querySelector('[value="works"]') && !!form.querySelector('[value="feedback"]') &&
+  !!form.querySelector('[data-later-toggle]'),'The card shows the Review actions.');
+ const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
+ check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
+ if(phone){
+  const box=dialog.getBoundingClientRect();
+  const top=listFrame?.getBoundingClientRect().top ?? box.top;
+  check(Math.abs(box.width-innerWidth)<=1 && Math.abs(box.height-innerHeight)<=1 && top===0,
+   'The phone dialog fills the screen. '+JSON.stringify({width:innerWidth,height:innerHeight,box,top}));
+  check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the phone width.');
+ }else{
+  const box=dialog.getBoundingClientRect();
+  check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20,'The desktop dialog is centered.');
+  check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
-});
-if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complete';document.body.append(keepOpen);}
-</script>'''.replace('LIST_URL', json.dumps(list_url)).replace('KEYS', json.dumps(linked_keys)).replace(
-            'OWNER_ID', json.dumps(OWNER.id)).replace('OTHER_ID', json.dumps(OTHER.id))
+ if(direct){await report();return;}
+ if(shot){
+  check(win.matchMedia('(prefers-color-scheme:dark)').matches,'The desktop uses dark mode.');
+  await report();return;
+ }
+ if(!phone){
+  dialog.dispatchEvent(new win.PointerEvent('pointerdown',{clientX:0,clientY:0,bubbles:true}));
+  dialog.dispatchEvent(new win.MouseEvent('click',{clientX:0,clientY:0,bubbles:true}));
+  check(!dialog.open && doc.activeElement===readyLink,'A click outside closes the dialog and focuses the link.');
+  await readCard(readyLink);
+ }
+ close.click();
+ check(!dialog.open && doc.activeElement===readyLink,'Close returns focus to the link.');
+ check(reviewPlace()===savedReviewPlace,'Opening and closing a card keeps the saved Review address.');
+ if(!phone){
+  await readCard(readyLink);
+  document.querySelector('.nav-entry[data-page="review"]').click();
+  const reviewFrame=document.querySelector('iframe[data-console-page="review"]');
+  await new Promise(resolve=>reviewFrame.addEventListener('load',resolve,{once:true}));
+  await animationFrames(window);
+  const entries=JSON.parse(reviewFrame.contentDocument.querySelector('[data-review-index]').textContent).r;
+  check(entries.some(entry=>entry[0]===waitingKey) && entries.every(entry=>entry[0]!=='sdlc/C2'),
+   'The Review index includes the Waiting card and excludes the Done card.');
+  check(listFrame.hidden && !dialog.open,'Changing the console page closes an idle card.');
+  const oldRow=row();
+  document.querySelector('.nav-entry[data-page="list"]').click();
+  await changed(doc.body,()=>row()!==oldRow,'the List refreshes on return');
+  check(!listFrame.hidden && !dialog.open && !dialog.querySelector('iframe'),'Returning to List shows no old card.');
+  savedReviewPlace=reviewPlace();
+  await changed(doc.body,()=>link('sdlc/C1'),'the refreshed List loads the linked card');
+  readyLink=link('sdlc/C1');
+  const draft=await readCard(readyLink);
+  draft.querySelector('[name=feedback]').value='Keep this draft when I switch tabs.';
+  const beforeVisibilityRefresh=row();
+  for(const visibility of ['hidden','visible']){
+   Object.defineProperty(doc,'visibilityState',{configurable:true,value:visibility});
+   doc.dispatchEvent(new win.Event('visibilitychange'));
+   await animationFrames(win);
+   check(dialog.open && dialog.querySelector('iframe')?.contentDocument===draft &&
+     draft.querySelector('[name=feedback]').value==='Keep this draft when I switch tabs.',
+    'A browser tab switch keeps the open card and its draft.');
+  }
+  delete doc.visibilityState;
+  await changed(doc.body,()=>row()!==beforeVisibilityRefresh && link('sdlc/C1'),
+   'the visible List refreshes the row and reloads the link');
+  document.querySelector('.nav-entry[data-page="review"]').click();
+  await animationFrames(window);
+  check(listFrame.hidden && dialog.open,'Changing console pages keeps a card that has a draft.');
+  const beforeReturn=row(),fetchBeforeReturn=win.fetch.bind(win);
+  let releaseCounts,countsStarted;
+  const heldCounts=new Promise(resolve=>{releaseCounts=resolve;});
+  const readingCounts=new Promise(resolve=>{countsStarted=resolve;});
+  win.fetch=async(url,options)=>{
+   if(String(url).includes('?counts=')){countsStarted();await heldCounts;}
+   return fetchBeforeReturn(url,options);
+  };
+  document.querySelector('.nav-entry[data-page="list"]').click();
+  await changed(doc.body,()=>row()!==beforeReturn,'the List replaces the row before loading the links');
+  await readingCounts;
+  check(draft.querySelector('[name=feedback]').value==='Keep this draft when I switch tabs.',
+   'The draft is still available on the List.');
+  close.click();
+  check(!dialog.open && !link('sdlc/C1') && doc.activeElement===row().querySelector('.list-toggle'),
+   'Close focuses the row while the List loads its links.');
+  releaseCounts();
+  await changed(doc.body,()=>link('sdlc/C1'),'the pending link appears');
+  await animationFrames(win);
+  check(doc.activeElement===link('sdlc/C1'),'The loaded link receives focus.');
+  win.fetch=fetchBeforeReturn;
+  readyLink=link('sdlc/C1');
+ }
+ const fetchList=win.fetch.bind(win);
+ if(!phone){
+  const timeout=win.AbortSignal.timeout,deadlines=[];
+  win.AbortSignal.timeout=milliseconds=>{deadlines.push(milliseconds);return timeout(milliseconds);};
+  for(const dismiss of ['close','escape','outside']){
+   const saved=await readCard(link('sdlc/C1')),savedWindow=saved.defaultView;
+   const savedForm=saved.querySelector('[data-review-form]');
+   let finishRead,beginRead;
+   const reading=new Promise(resolve=>{beginRead=resolve;});
+   const heldRead=new Promise(resolve=>{finishRead=resolve;});
+   win.fetch=(url,options)=>{
+    if(url===win.location.pathname && options?.signal){
+     beginRead();return heldRead;
+    }
+    return fetchList(url,options);
+   };
+   savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response(JSON.stringify({answer:'Works'})));
+   savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
+   await reading;
+   check(dialog.open && !close.disabled,'A saved verdict enables Close before the List refresh ends.');
+   if(dismiss==='close') close.click();
+   if(dismiss==='escape') saved.body.dispatchEvent(new savedWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+   if(dismiss==='outside'){
+    dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
+    dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
+   }
+   check(!dialog.open && doc.activeElement===link('sdlc/C1'),'The pending List refresh allows '+dismiss+'.');
+   const pageStatus=doc.querySelector('[data-page-status]');
+   const readFailed=changed(pageStatus,()=>pageStatus.dataset.state==='Failed','the held refresh fails');
+   finishRead(new win.Response(null,{status:503}));
+   await readFailed;
+   await animationFrames(win);
+   if(dialog.open) close.click();
+  }
+  check(deadlines.length>=3 && deadlines.every(value=>value===7000),
+   'List refresh uses the configured seven-second request timeout.');
+  win.AbortSignal.timeout=timeout;
+  win.fetch=fetchList;
+  readyLink=link('sdlc/C1');
+ }
+ let releaseList,releaseRefresh,listReads=0,delayRefresh=false;
+ const listSave=new Promise(resolve=>{releaseList=resolve;});
+ const listRefresh=new Promise(resolve=>{releaseRefresh=resolve;});
+ if(!phone){
+  win.fetch=async(url,options)=>{
+   if(url===win.location.pathname){
+    if(options?.method==='POST') return listSave;
+    if(delayRefresh){listReads++;await listRefresh;}
+   }
+   return fetchList(url,options);
+  };
+  const listWords=row().querySelector('textarea[name="words"]');
+  listWords.value='A List action is pending.';listWords.dispatchEvent(new win.Event('input',{bubbles:true}));
+  const listForm=listWords.form;
+  listForm.querySelector('[value="tell"]').click();
+  check(!!listForm.dataset.sending,'The List action starts before the Review save.');
+ }
+ const card=await readCard(readyLink),cardWin=card.defaultView;
+ const formInCard=()=>card.querySelector('[data-review-form]');
+ const status=()=>card.querySelector('[data-send-status]').textContent;
+ const button=outcome=>formInCard().querySelector('[value="'+outcome+'"]');
+ const submit=outcome=>formInCard().requestSubmit(button(outcome));
+ let reviewPosts=0;
+ const fades=[];
+ if(!phone){
+  for(const realm of [win,cardWin]){
+   const animate=realm.Element.prototype.animate;
+   realm.Element.prototype.animate=function(keyframes,options){
+    if(this.matches('[data-review-card] tbody, [data-list-review-dialog] iframe'))
+     fades.push([this.tagName,options.duration]);
+    return animate.call(this,keyframes,options);
+   };
+  }
+  const fetchCard=cardWin.fetch.bind(cardWin);
+  let releaseFailure;
+  const failure=new Promise(resolve=>{releaseFailure=resolve;});
+  cardWin.fetch=(url,options)=>{
+   if(options?.method==='POST' && ++reviewPosts===1) return failure;
+   return fetchCard(url,options);
+  };
+  const words='Keep these words through the failure and conflict.';
+  formInCard().elements.feedback.value=words;
+  submit('feedback');
+  close.click();
+  dialog.dispatchEvent(new win.Event('cancel',{cancelable:true}));
+  card.body.dispatchEvent(new cardWin.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  dialog.dispatchEvent(new win.PointerEvent('pointerdown',{bubbles:true}));
+  dialog.dispatchEvent(new win.MouseEvent('click',{bubbles:true}));
+  check(dialog.open && close.disabled,'Close, Escape, and a click outside keep a saving card open.');
+  releaseFailure(new cardWin.Response(JSON.stringify({reason:'The test save failed.'}),{status:503}));
+  await changed(card.body,()=>status()==='Not saved: The test save failed.' && !close.disabled,'the failure remains visible');
+  check(dialog.open && formInCard().elements.feedback.value===words,'The open card shows the failure and keeps the words.');
+  const revision=formInCard().elements.revision.value;
+  const updated=await fetch('/advance-overlay',{method:'POST'});
+  check(updated.ok,'The source change is updated.');
+  submit('works');
+  await changed(dialog,()=>!close.disabled,'the card recovers from a conflict');
+  check(formInCard().elements.revision.value!==revision &&
+   status().startsWith('Not saved:') && formInCard().elements.feedback.value===words &&
+   card.querySelector('[data-review-body]').textContent.includes('The source changed while the card was open.'),
+   'A conflict loads the new revision and keeps the words and the reason. '+status());
+  if(formInCard().elements.revision.value===revision){await report();return;}
+  delayRefresh=true;
+ }
+ const before=row();
+ const refreshed=new Promise((resolve,reject)=>{
+  const notice=card.querySelector('[data-send-status]');
+  const saveObserver=new card.defaultView.MutationObserver(()=>{
+   if(notice.textContent.startsWith('Not saved:')){
+    saveObserver.disconnect();observer.disconnect();reject(new Error(notice.textContent));
+   }
+  });
+  const observer=new win.MutationObserver(()=>{
+   if(row()!==before && !dialog.open){saveObserver.disconnect();observer.disconnect();resolve();}
+  });
+  saveObserver.observe(notice,{childList:true});
+  observer.observe(doc.body,{childList:true,subtree:true,attributes:true,attributeFilter:['open']});
+ });
+ submit('works');
+ if(!phone){
+  await changed(card.body,()=>status().startsWith('Saved:'),'the verdict is saved');
+  await animationFrames(win);
+  check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
+  releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
+  await changed(doc.body,()=>!row().querySelector('textarea[name="words"]').form.dataset.sending,
+   'the refused List action ends');
+  check(listReads===1 && dialog.open && !close.disabled && button('works').disabled,
+   'A refused List action starts one refresh and keeps the saved form disabled.');
+  submit('works');
+  check(reviewPosts===3,'The saving form sends no second POST during the refresh.');
+  releaseRefresh();
+ }
+ await refreshed;
+ if(!phone) check(JSON.stringify(fades)===JSON.stringify([['TBODY',180],['TBODY',260],['IFRAME',180]]),
+  'The overlay uses the configured card fade durations.');
+ check(row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),'The saved verdict updates the List row.');
+ check(doc.activeElement===link('sdlc/C1'),'The refreshed link receives focus.');
+ check(location.pathname==='/proof' && listFrame.contentDocument===doc && history.length===historyLength,
+  'Opening, closing, and saving do not navigate.');
+ check(reviewPlace()===savedReviewPlace,'The Review filters stay the same.');
+ const filters=new URLSearchParams(win.location.hash.slice(1));
+ check(new URL(listURL).pathname===win.location.pathname && filters.get('show')==='working' &&
+  filters.get('q')==='linked reviews' && doc.querySelector('#list-search').value==='linked reviews' &&
+  !row().querySelector('[data-detail]').hidden,'The List keeps the filters, search, and open row.');
+ await report();
+}
+(listFrame || window).addEventListener('load',()=>{void inspect().catch(error=>{failures.push(String(error));void report();});},{once:true});
+if(shot){const image=new Image();image.hidden=true;image.src='/complete';document.body.append(image);}
+</script>'''.replace('WAITING_KEY', json.dumps(waiting_key))
         shell = shell.replace('</body>', probe + '</body>')
-        output = Path(os.environ.get("LISTLINKS_PROOF_DIR", str(self.root)))
-        output.mkdir(parents=True, exist_ok=True)
-        for shot in ("clicks", "reduced", "review", "list"):
-            with self.subTest(shot=shot):
+        proof = os.environ.get("LIST_OVERLAY_SCREENSHOT")
+        _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={self.root / 'scratch'}\n")
+        for size in ("1440,1000", "600,900", "430,900", *(("screenshot",) if proof else ())):
+            with self.subTest(size=size):
+                _ = listing.write_text(original)
+                browser_root = root / size.replace(",", "x")
                 results: list[list[str]] = []
                 complete = threading.Event()
-                later_saved = threading.Event()
 
-                class Probe(BaseHTTPRequestHandler):
-                    def do_GET(self) -> None:
-                        route = urlsplit(self.path)
-                        path = route.path
-                        if path == '/complete':
-                            _ = complete.wait(30)
-                        fields = parse_qs(route.query)
-                        current = parked_review if later_saved.is_set() else review
-                        content_type = 'text/html; charset=utf-8'
-                        if path == review_page.PAGE_PATH:
-                            if 'body' in fields:
-                                try:
-                                    body = current.body(fields['body'][0])
-                                except LookupError:
-                                    self.send_error(404)
-                                    return
-                            elif 'index' in fields:
-                                body = current.index_response()
-                                content_type = 'application/json'
-                            elif 'version' in fields:
-                                body = json.dumps({'version':current.version, 'facts':current.facts()}).encode()
-                                content_type = 'application/json'
-                            else:
-                                body = current.render(show=fields.get('show', ['open'])[0])
-                        elif path == list_page.PAGE_PATH:
-                            body = listing
-                        elif path.endswith('.json'):
-                            body = b'{}'
-                            content_type = 'application/json'
-                        else:
-                            body = shell.encode()
-                        self.send_response(200)
-                        self.send_header('Cache-Control', 'no-store')
-                        self.send_header('Content-Type', content_type)
-                        self.send_header('X-Review-Version', current.version)
-                        self.end_headers()
-                        try:
-                            _ = self.wfile.write(body)
-                        except BrokenPipeError:
-                            pass
-
-                    def do_POST(self) -> None:
-                        body = self.rfile.read(int(self.headers['Content-Length']))
-                        if self.path == review_page.PAGE_PATH and parse_qs(body.decode()).get('outcome') == ['later']:
-                            later_saved.set()
-                            self.send_response(200)
-                            self.send_header('Content-Type', 'application/json')
-                            self.end_headers()
-                            _ = self.wfile.write(b'{"answer":"parked"}')
-                            return
-                        if self.path == '/results':
-                            results.append(cast(list[str], json.loads(body)))
-                            complete.set()
-                        self.send_response(204)
-                        self.end_headers()
+                class Probe(serve.ReviewLinksHandler):
+                    @override
+                    def html_response(self, status: int, content: bytes) -> None:
+                        if self.path == list_page.PAGE_PATH + "?direct=1":
+                            content = content.replace(b'</body>', probe.encode() + b'</body>')
+                        super().html_response(status, content)
 
                     @override
-                    def log_message(self, format: str, *args: object) -> None:
-                        pass
+                    def send_head(self) -> BinaryIO | None:
+                        path = urlsplit(self.path).path
+                        if path == "/proof":
+                            self.html_response(200, shell.encode())
+                            return None
+                        if path == "/complete":
+                            _ = complete.wait(25)
+                            self.json_response(200, {})
+                            return None
+                        return super().send_head()
 
-                with ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+                    @override
+                    def do_POST(self) -> None:
+                        if self.path == "/advance-overlay":
+                            _ = listing.write_text(original.replace('Open the linked change.',
+                                'The source changed while the card was open.'))
+                            self.json_response(200, {})
+                            return
+                        if self.path == "/results":
+                            results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                            self.json_response(200, {})
+                            complete.set()
+                            return
+                        super().do_POST()
+
+                with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(browser_root)}),
+                      patch.object(time, "time", return_value=now.timestamp()),
+                      patch.object(serve, "ReviewLinksHandler", Probe),
+                      patch.object(serve, "loaded_module_stamps", return_value={}),
+                      patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+                      patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+                      patch.object(change_page, "deliver"), patch.object(change_review, "_commit"),
+                      patch.object(change_review, "lists_directory", return_value=self.root),
+                      patch.object(staff, "snapshot", return_value=members),
+                      patch.object(list_page, "counts_strip", return_value=""),
+                      serve.ReviewLinksServer(("127.0.0.1", 0), browser_root, initialize_review=True) as server):
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        profile = self.root / f'links-profile-{shot}'
+                        profile = self.root / f'overlay-profile-{size}'
                         profile.mkdir()
-                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n'
-                            + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n'
-                            + f'user_pref("ui.prefersReducedMotion", {int(shot == "reduced")});\n')
-                        destination = list_url + ('&pending=i' if shot == 'reduced' else '')
-                        if shot == 'review':
-                            destination = '/console/' + console.place_query('review', review_page.PAGE_PATH + '?show=all#'
-                                + urlencode([('key', key) for key in linked_keys] + [('item', reviews[1].key)]))
+                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+                        viewport = '1440,1000' if size == "screenshot" else size
+                        width, height = viewport.split(',')
+                        browser_env = {**os.environ, "MOZ_HEADLESS_WIDTH": width, "MOZ_HEADLESS_HEIGHT": height}
+                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', viewport]
                         url = f'http://127.0.0.1:{server.server_port}' + destination
-                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
-                        if shot in ('clicks', 'reduced'):
-                            with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as browser:
+                        if size == "430,900":
+                            url = f'http://127.0.0.1:{server.server_port}' + list_place.replace('#', '?direct=1#', 1)
+                        if size == "screenshot":
+                            assert proof is not None
+                            result = subprocess.run([*command, '--screenshot', proof, url + '&shot=1'],
+                                                    capture_output=True, text=True, timeout=45, env=browser_env)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                        else:
+                            if size == "600,900":
+                                url += '&phone=1'
+                            with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.DEVNULL, env=browser_env) as browser:
                                 try:
-                                    self.assertTrue(complete.wait(35), "The browser must report its click results")
+                                    self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
                                 finally:
                                     browser.terminate()
                                     _ = browser.wait(timeout=10)
-                        else:
-                            done = subprocess.run([*command, '--screenshot', str(output / f'listlinks-{shot}-dark.png'),
-                                url + '&proof=' + shot], capture_output=True, text=True, timeout=45)
-                            self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
                         complete.set()
                         server.shutdown()
                         thread.join(5)
                 self.assertEqual(results, [[]])
+                if size in ("1440,1000", "600,900"):
+                    reviewed = {row["#"]: row["Verdict"] for row in change_review.review_snapshot(listing).reviewed}
+                    self.assertIn("works", reviewed["C1"].casefold())
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_list_links_show_the_target_inside_the_console(self) -> None:
@@ -1535,22 +1548,18 @@ document.body.append(result);
                 self.assertIn(expected, state)
                 self.assertEqual(row.count(expected), 2)
                 found = [key for key in identities if any(review.key == key for review in reviews)]
-                if not found:
+                if len(found) != 1:
                     self.assertNotIn('<a ', state)
                 else:
-                    target = ([('show', 'open'), ('jump', found[0])] if len(found) == 1
-                              else [('key', key) for key in found])
-                    place = review_page.PAGE_PATH + '?show=all#' + urlencode(target)
-                    href = html.escape('/console/' + console.place_query('review', place), quote=True)
-                    self.assertIn(f'href="{href}" target="_top" data-list-review-link="">{expected}</a>', state)
+                    href = html.escape(review_page.card_url(found[0]), quote=True)
+                    self.assertIn(f'href="{href}" data-list-review-card="" aria-haspopup="dialog">{expected}</a>', state)
                 detail = row.split('<div class="list-panel"><div>', 1)[1]
                 self.assertLess(detail.index(expected), detail.index('<form'))
                 positions: list[int] = []
                 for identity in identities:
                     matching = [review for review in reviews if review.key == identity]
-                    place = review_page.PAGE_PATH + '?show=all#' + urlencode({'show': 'open', 'jump': identity})
-                    href = html.escape('/console/' + console.place_query('review', place), quote=True)
-                    anchor = f'<a href="{href}" target="_top" data-list-review-link="">'
+                    href = html.escape(review_page.card_url(identity), quote=True)
+                    anchor = f'<a href="{href}" data-list-review-card="" aria-haspopup="dialog">'
                     if matching:
                         card = f'{anchor}{html.escape(matching[0].id)}</a>'
                     else:
@@ -1626,8 +1635,7 @@ document.body.append(result);
                 self.assertEqual(item.reviews, (key,))
                 row = after.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
                 self.assertIn('data-state="Delivered" data-unread="true" data-parked="false"', row)
-                place = review_page.PAGE_PATH + '?show=all#' + urlencode({"show": "open", "jump": key})
-                link = html.escape('/console/' + console.place_query('review', place), quote=True)
+                link = html.escape(review_page.card_url(key), quote=True)
                 self.assertIn(f'href="{link}"', row)
             self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 2)
             self.assertEqual(the_list.load(MORTY.id, first.id), first)
@@ -1703,7 +1711,7 @@ document.body.append(result);
             self.assertIn("Parked until delivered", pending)
             self.assertIn('value="unpark"', pending)
             self.assertNotIn(' hidden>Unpark', pending)
-            self.assertIn('data-list-review-link="">C1</a>', pending)
+            self.assertIn('data-list-review-card="" aria-haspopup="dialog">C1</a>', pending)
             _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
             after = list_page.render(root, include_counts=False, status=status).decode()
             self.assertRegex(after, r'data-filter-value="needs-me"[^>]*data-filter-count="1"')
@@ -1715,7 +1723,7 @@ document.getElementById('filter-show-parked').click();
 row.querySelector('.list-toggle').click();
 const unpark=row.querySelector('[value="unpark"]');
 if(row.hidden || !unpark?.getClientRects().length) failures.push('The waiting row shows Unpark in Parked');
-if(!row.querySelector('[data-list-review-link]')) failures.push('The waiting row shows its change link');
+if(!row.querySelector('[data-list-review-card]')) failures.push('The waiting row shows its change link');
 const result=document.createElement('p');result.id='probe-results';
 result.textContent=JSON.stringify(failures);document.body.append(result);
 </script>""", reduced_motion=True)
@@ -1725,7 +1733,7 @@ const row=document.querySelector('[data-number="1"]');
 document.getElementById('filter-show-needs-me').click();
 if(row.hidden || !row.querySelector('.list-dot')) failures.push('Needs me shows the unread delivery');
 row.querySelector('.list-toggle').click();
-if(!row.querySelector('[value="read"]') || !row.querySelector('[data-list-review-link]'))
+if(!row.querySelector('[value="read"]') || !row.querySelector('[data-list-review-card]'))
  failures.push('The waiting row shows Mark read and its change link');
 document.getElementById('filter-show-morty-answering').click();
 if(!row.hidden) failures.push('Morty answering excludes the unread delivery');
@@ -1763,10 +1771,10 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
                 read.assert_called_once()
                 row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
                 self.assertIn(expected, row)
-                place = review_page.PAGE_PATH + '?show=all#' + urlencode({'show': 'open', 'jump': review.key})
-                card = '/console/' + console.place_query('review', place)
+                card = review_page.card_url(review.key)
                 if review.type in review_page.TYPES:
-                    self.assertIn(f'<a href="{html.escape(card, quote=True)}" target="_top" data-list-review-link="">{review.id}</a>', row)
+                    self.assertIn(f'<a href="{html.escape(card, quote=True)}" data-list-review-card="" '
+                                  + f'aria-haspopup="dialog">{review.id}</a>', row)
                 else:
                     self.assertNotIn(card, row)
                     self.assertIn('<p>' + review.id + '</p>', row)
@@ -2063,11 +2071,11 @@ window.fetch=async (url,options)=>{
         first_updates = update(changed, "Old review status") + update(stable, "Unchanged review status")
         current_updates = update(renewed, "Current review status") + update(stable, "Unchanged review status")
         setup = """<script>
-const requests=[],deadlines=[];
+const requests=[],deadlines=new Map();
 let page=INITIAL_PAGE;
 AbortSignal.timeout=milliseconds=>{
  const timer=new AbortController();
- deadlines.push({milliseconds,timer});
+ deadlines.set(timer.signal,{milliseconds,timer});
  return timer.signal;
 };
 window.fetch=(url,options)=>{
@@ -2108,7 +2116,7 @@ window.fetch=(url,options)=>{
   'The response skips a changed row with the same review links.');
  check(requests.length===2,'The changed row starts one follow-up without another refresh.');
  const timedOut=changed(summary(1));
- deadlines[1].timer.abort();
+ deadlines.get(requests[1].signal).timer.abort();
  await timedOut;
  check(summary(1).textContent===UNAVAILABLE && document.querySelector('.list-toggle').matches(':enabled'),
   'A timeout leaves the row usable and identifies the unavailable status.');
@@ -2141,7 +2149,7 @@ window.fetch=(url,options)=>{
   check(summary(2).textContent==='Unchanged review status',
    'The follow-up fills the new row without another refresh.');
  }
- check(requests.length===5 && deadlines.every(deadline=>deadline.milliseconds===4000),
+ check(requests.length===5 && [...deadlines.values()].every(deadline=>deadline.milliseconds===4000),
   'Each request uses the configured time limit.');
  const result=document.createElement('p');
  result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);

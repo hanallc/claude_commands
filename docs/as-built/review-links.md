@@ -412,10 +412,12 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The State row offers Open, Validating and All below the Type row.
-Responses uses Open and All.
+The State row sets the Show filter.
+It offers Open, Validating and All below the Type row.
+With Responses selected, it offers Open and All.
 Old Waiting links open All.
-The Owner row follows the Show row.
+Old Done links use the default Open filter.
+The Owner row follows the State row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
 Each Show count uses the selected type, owner and words.
@@ -437,6 +439,7 @@ The browser uses the index for every count and filter.
 The Show chips replace the right count text.
 Open and Validating select their states.
 All includes the active records.
+The Review table excludes Done records.
 **Ask showrunner to check** moves a change to Validating.
 **Ask question** and **Send feedback** move an open change to Waiting.
 The change leaves Open and its counts when the request starts.
@@ -521,8 +524,8 @@ An Efficiency save checks the ledger in the production document retained for its
 An unreadable Proposal prerequisite leaves its relationship empty in both the snapshot and the save.
 The save checks the revision under the store's write lock.
 The server returns HTTP 409 if the record is missing or its revision differs from the form revision.
-A current Done card accepts Later.
 The browser refreshes the index and shows a conflict reason above the table.
+The refresh keeps the selected filters.
 The reason stays visible if the refresh removes the card.
 After a save, the server reads and publishes the saved record if it can.
 If publication fails, the server retains the current snapshot and requests a full rebuild.
@@ -548,7 +551,6 @@ The body uses the time zone from the snapshot.
 A change to the time zone changes the snapshot version.
 A proposal body includes its issue text without front matter.
 An item fragment selects its summary before any body request.
-A Done item uses the same direct body request.
 An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
@@ -856,24 +858,36 @@ An item without links shows no review line.
 The open row repeats the line above its actions and shows each review's shown ID.
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
-Review links use the console place query, so the navigator remains visible.
-A card link opens and highlights that card in the full Review list.
-The link uses the current Review filters. The same jump rule applies to List and Review.
-If the filters hide the target, the jump sets Show and Owner to All.
-The jump also clears other filters that hide the target.
-The linked parked card stays visible while its details are open, including after reload.
-A successful action that closes the linked card removes its target from the address.
-Back restores the List search text, scroll position, and surviving open rows for that history entry.
-The List saves the search text that is in the box when the user clicks the link.
-The List removes stale filters after it restores the open rows.
-The browser tab keeps at most eight return records for up to one hour.
-Repeated Back navigation can use the same record until it expires or the tab removes it.
-Reload keeps the Review card open with the current filters.
-A summary for one available review opens its card in the full list.
-A summary for multiple available reviews selects those reviews through the All view.
-The Linked reviews chip clears that selection with one click.
-A summary without an available review shows plain text.
-If the linked card disappears after the List renders, Review shows a missing-card message.
+A review ID opens one card in a dialog on the List.
+A summary links to the card when exactly one review is available.
+A summary for zero or multiple available reviews is plain text.
+The List loads the card document only when the dialog opens.
+The existing Review body route supplies the summary, body, styles, and controls.
+The Review table uses the same card renderer and action code.
+The dialog reads a Done card on demand and shows it without actions.
+A Validating card lets the user ask the validator a question.
+If the record disappears, the dialog shows a message.
+Escape, Close, and a click outside the card close the dialog.
+Focus returns to the List link.
+The dialog fills the screen at the console's phone breakpoint, including on the direct List page.
+On a desktop, the List centers the dialog.
+Switching browser tabs keeps the dialog and its draft.
+Changing console pages closes an idle dialog when it has no draft.
+The dialog preserves the List and Review addresses and filters.
+The dialog uses the Review save path for its actions.
+During a save, the dialog stays open and disables its buttons.
+A failed save keeps the draft and shows the reason.
+Review and the dialog use the same recovery code to load the current revision and keep the draft.
+The draft store uses the record key and tracks edits across form replacements.
+Recovery preserves edits made after the conflict, including cleared words.
+The recovery lock applies to the stale revision.
+After a save, Close, Escape, and a click outside work while the List refreshes.
+A completed refresh fades the card out and closes the dialog.
+A revision replacement fades the old card out and slides the new card in.
+Both transitions use the configured card durations and respect reduced motion.
+If the List request fails or times out, the next periodic refresh can update the row.
+List and Review refresh, counts, and linked record requests use `page_request_timeout_seconds`.
+If a List action is pending, the refresh starts after that action ends.
 An explicit item target joins the linked selection and opens its card.
 The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.
@@ -1175,7 +1189,6 @@ A refresh keeps the current counts until the next counts request succeeds.
 A refresh lets an active counts request finish.
 The response updates linked Review status only when the row version matches the request and the response.
 If a row starts waiting for linked Review status during a request, the List starts a follow-up when that request ends.
-`page_request_timeout_seconds` sets the request time limit.
 The counts strip uses the status line readers for questions, changes, and rebuilds.
 Each count links to its existing page.
 The strip omits proposals and efficiencies.
