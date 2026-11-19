@@ -509,9 +509,11 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assertEqual(self.git("rev-parse", "HEAD"), published)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
         self.assertFalse(self.batch_record().exists())
+        self.assertEqual(self.git("for-each-ref", "refs/merge-checkpoint/"), "")
 
     def test_a_stopped_batch_resumes_after_fetching_a_later_checkpoint(self) -> None:
-        for case in ("unit branch hash", "unit branch ref", "phase branch only", "unit branch missing"):
+        for case in ("unit branch hash", "unit branch ref", "phase branch only", "unit branch missing",
+                     "private ref from a killed run"):
             with self.subTest(case=case):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -527,11 +529,13 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                 _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m",
                              "beta work\n\nChange-Review: none — fixture code only", cwd=writer)
                 second = self.git("rev-parse", "HEAD", cwd=writer)
-                phase_branch = case in ("phase branch only", "unit branch missing")
+                phase_branch = case in ("phase branch only", "unit branch missing", "private ref from a killed run")
                 target = "HEAD:refs/heads/beta-phase" if phase_branch else "beta-branch"
                 _ = self.git("push", "origin", target, cwd=writer)
                 if case == "unit branch missing":
                     _ = self.git("update-ref", "-d", "refs/heads/beta-branch", cwd=self.origin)
+                if case == "private ref from a killed run":
+                    _ = self.git("update-ref", "refs/merge-checkpoint/origin/beta-phase", published)
                 absent = subprocess.run(["git", "cat-file", "-e", f"{second}^{{commit}}"], cwd=self.checkout,
                                         env=self.env, capture_output=True, text=True, check=False,
                                         timeout=TEST_HANG_GUARD_SECS)
@@ -544,6 +548,8 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), second)
                     self.assertEqual(self.git("rev-parse", "production^1^2", cwd=self.origin), first)
+                    if case == "private ref from a killed run":
+                        self.assertEqual(self.git("for-each-ref", "refs/merge-checkpoint/"), "")
                     continue
 
                 unpublished = self.interrupt_batch(*lines)
@@ -587,6 +593,7 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         result = self.land_batch([self.batch_line("alpha", "2", commit)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.batch_record().exists())
+        self.assertEqual(self.git("for-each-ref", "refs/merge-checkpoint/"), "")
         beta = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
         fresh = self.land_batch([self.batch_line("beta", "2", beta)])
         self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)

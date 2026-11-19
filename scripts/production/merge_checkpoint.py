@@ -1823,22 +1823,31 @@ def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchRe
     filename = f"checkpoint-batches/{production.merge_branch}"
     path = Path(good(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", filename), "batch"))
     upstream = f"refs/remotes/origin/{production.merge_branch}"
-    # Use private refs so stale tracking refs cannot block the fetch.
-    _ = good(git(checkout, "fetch", "--prune", "--no-write-fetch-head", "--refmap=", "origin",
-                 f"+refs/heads/{production.merge_branch}:{upstream}",
-                 f"+refs/heads/*:{BATCH_ORIGIN_HEADS}/*"), "batch")
-    for branch in dict.fromkeys(request.unit.branch for request in requests):
-        head = git(checkout, "rev-parse", "--verify", "--quiet", f"{BATCH_ORIGIN_HEADS}/{branch}")
-        if head.returncode == 1:
-            continue
-        commit = good(head, "batch")
-        _ = good(git(checkout, "update-ref", f"refs/remotes/origin/{branch}", commit), "batch")
     checkpoints: list[MergeRequest] = []
-    for request in requests:
-        try:
-            checkpoints.append(resolved_checkpoint(request))
-        except checkpoint_gate.Stop as error:
-            raise Refusal(f"{request.unit.name} phase {request.phase}: {error}") from error
+    try:
+        # Use private refs so stale tracking refs cannot block the fetch.
+        _ = good(git(checkout, "fetch", "--prune", "--no-write-fetch-head", "--refmap=", "origin",
+                     f"+refs/heads/{production.merge_branch}:{upstream}",
+                     f"+refs/heads/*:{BATCH_ORIGIN_HEADS}/*"), "batch")
+        for branch in dict.fromkeys(request.unit.branch for request in requests):
+            head = git(checkout, "rev-parse", "--verify", "--quiet", f"{BATCH_ORIGIN_HEADS}/{branch}")
+            if head.returncode == 1:
+                continue
+            commit = good(head, "batch")
+            _ = good(git(checkout, "update-ref", f"refs/remotes/origin/{branch}", commit), "batch")
+        for request in requests:
+            try:
+                checkpoints.append(resolved_checkpoint(request))
+            except checkpoint_gate.Stop as error:
+                raise Refusal(f"{request.unit.name} phase {request.phase}: {error}") from error
+    finally:
+        refs = git(checkout, "for-each-ref", "--format=%(refname)", f"{BATCH_ORIGIN_HEADS}/")
+        _ = good(refs, "batch")
+        if refs.stdout:
+            deletes = "".join(f"delete {ref}\n" for ref in refs.stdout.rstrip("\n").split("\n"))
+            removed = subprocess.run(["git", "-C", str(checkout), "update-ref", "--no-deref", "--stdin"],
+                                     input=deletes, capture_output=True, text=True, check=False)
+            _ = good(removed, "batch")
     record = BatchResumeRecord(path, tuple(checkpoints))
     contents = record.contents()
     sources = unpushed_merge_sources(checkout, upstream)

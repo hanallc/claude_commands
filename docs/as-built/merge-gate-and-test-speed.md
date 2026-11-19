@@ -717,6 +717,7 @@ A batch can contain one item.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
 2. Fetch the origin branches and resolve every item to a commit before writing the record or starting a merge.
    Refuse the batch and name the item if it cannot resolve to a commit.
+   Delete the private origin refs after resolution, on refusal, or on fetch failure.
    Record each item's argument line and resolved commit in Git's internal directory, in batch order.
    Normalize shell quoting and keep the argument order.
    Resume unpushed merges only when the arguments and resolved commits match the record and an unpushed checkpoint belongs to the batch.
