@@ -112,10 +112,21 @@ def reservation_reading(*, project: str = "fixture-project") -> admission_record
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
 
-def with_wait_reason(reading: admission_records.QueueRead, reason: admission_records.WaitReason) -> admission_records.QueueRead:
-    waiter = admission_records.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", 10,
+def with_wait_reason(reading: admission_records.QueueRead, reason: admission_records.WaitReason, *,
+                     since: float = 10) -> admission_records.QueueRead:
+    waiter = admission_records.WaitingStep(200, "fixture", "fixture", "nextest", "/fixture", since,
                               admission_records.GIB, reason, project="fixture-project")
     return replace(reading, view=replace(reading.view, waiting=(waiter,)))
+
+
+def with_mac_slot_wait(reading: admission_records.QueueRead, *, busy_tries: int = 2) -> admission_records.QueueRead:
+    now = reading.explanation.now
+    waiter: admission_records.Waiter = {"pid": 700003, "start_time": "mac-wait", "since": now - 240,
+        "need": 8 * admission_records.GIB, "step": "nextest", "repository_name": "hana"}
+    attempts = tuple(admission_records.MacBusyAttempt(f"try-{index}", now - 60 * (index + 1))
+                     for index in range(busy_tries))
+    wait = admission_records.MacSlotWait("mac-slot-episode", "mac", waiter, attempts)
+    return replace(reading, view=replace(reading.view, mac_waits=(wait,)))
 
 
 def leftover_step(minutes: int, *, small: bool = False, members: tuple[ScopeProcess, ...] = ()) -> admission_records.RunningStep:
@@ -2086,6 +2097,37 @@ process.stdout.write(JSON.stringify({
                 decoded = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
                 self.assertEqual(decoded["queued_priority_units"], expected)
 
+    def test_mac_slot_waits_stay_out_of_the_memory_line(self) -> None:
+        base = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
+        for busy_tries in (None, 0, 2):
+            with self.subTest(busy_tries=busy_tries):
+                reading = base if busy_tries is None else with_mac_slot_wait(base, busy_tries=busy_tries)
+                raw = cast(dict[str, object], codec.snapshot_value(reading))
+                if busy_tries is None:
+                    del cast(dict[str, object], raw["view"])["mac_waits"]
+                decoded = cast(admission_records.QueueRead, codec.parse_snapshot_value(raw, admission_records.QueueRead))
+                with mock.patch.object(admission_client, "view", return_value=decoded):
+                    payload = memory_feed.reading()
+                local, = payload["waiters"]
+                self.assertEqual(local.get("place"), 1)
+                self.assertTrue(local.get("first_in_line"))
+                self.assertEqual(payload["smallest_need"], 1.0)
+                if busy_tries is None:
+                    self.assertEqual(payload["mac_waits"], [])
+                    self.assertEqual(payload["waiting"], 1)
+                else:
+                    row, = payload["mac_waits"]
+                    self.assertEqual(payload["waiting"], 2)
+                    self.assertEqual(row["machine"], "mac")
+                    self.assertEqual(row["since"], base.explanation.now - 240)
+                    self.assertEqual(row["reason"], "Waiting for a Mac slot")
+                    self.assertEqual(row["busy_tries"], busy_tries)
+                    if busy_tries:
+                        self.assertEqual(row.get("last_busy_at"), base.explanation.now - 60)
+                    else:
+                        self.assertNotIn("last_busy_at", row)
+                    self.assertTrue({"place", "first_in_line", "head_room", "need"}.isdisjoint(row))
+
     def test_queue_notes_follow_the_head_and_the_priority_unit(self) -> None:
         reading = cloud_reading(with_queue_priority(with_wait_reason(
             reservation_reading(), admission_records.StartSpacingWait(110))))
@@ -3303,6 +3345,10 @@ def write_browser_fixture(folder: Path) -> None:
         memory_feed.publish_page(configuration)
         base = reservation_reading()
         inputs = base.explanation.decided_from
+        mac_wait_now = datetime(2026, 11, 18, 18, tzinfo=UTC).timestamp()
+        mac_wait_base = gate.queue_read_from(replace(inputs, now=mac_wait_now), admission_policy_fixture())
+        mac_slot_wait = with_mac_slot_wait(with_wait_reason(
+            mac_wait_base, admission_records.NeedsMemory(), since=mac_wait_now - 60))
         live = leftover_step(30)
         memory = live.measured
         assert isinstance(memory, admission_records.UnownedSliceMemory)
@@ -3315,7 +3361,7 @@ def write_browser_fixture(folder: Path) -> None:
             members=(ScopeProcess(45, "python3"), ScopeProcess(46, "helper"))),
             leftover_step(19 * 60, small=True), leftover_step(2 * 24 * 60, small=True), live, compiler))
         base = gate.queue_read_from(inputs, admission_policy_fixture())
-        readings: dict[str, admission_records.QueueRead] = {"good": base}
+        readings: dict[str, admission_records.QueueRead] = {"good": base, "mac_slot_wait": mac_slot_wait}
         for name, available, swapped in (("head_memory", 8, 0), ("head_shortfall", 2, 0), ("head_swap_shortfall", 4, 6)):
             held = gate.queue_read_from(replace(inputs, pressure=admission_records.NoPressureHold(),
                 host=admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB,

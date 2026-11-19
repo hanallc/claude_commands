@@ -4,15 +4,17 @@ from scripts.build_queue import admission_records
 
 import json
 import re
+from dataclasses import replace
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
 import subprocess
 import unittest
+from unittest import mock
 from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import admission_client, memory_feed, progress_profile as progress
 from scripts.build_queue import test_memory_feed
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
@@ -145,9 +147,9 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_queued_titles_share_the_header_row_without_moving_the_room_row(self) -> None:
         for units, expected in (([], "Queued, in order of submission"),
-                                (["research"], "Queued, research first, then in submission order"),
-                                (["research", "cables"], "Queued, research followed by cables and then in submission order"),
-                                (["a<&", "b"], "Queued, a<& followed by b and then in submission order")):
+                                (["research"], "Queued, research first on natedev"),
+                                (["research", "cables"], "Queued, research followed by cables on natedev"),
+                                (["a<&", "b"], "Queued, a<& followed by b on natedev")):
             with self.subTest(units=units):
                 data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "queued_priority_units": units,
                     "walk": [{"name": "running", "queued": True}, {"name": "second running", "queued": True}],
@@ -731,6 +733,80 @@ class MemoryHoverTests(unittest.TestCase):
         rows = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-0', data)", data))
         self.assertEqual({row["label"]: row["value"] for row in rows}["Waits for"], "build slot")
         self.assertTrue({"Needs", "Free", "Short by"}.isdisjoint(row["label"] for row in rows))
+
+    def test_mac_slot_wait_has_an_age_and_busy_details_without_a_memory_place(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        base = test_memory_feed.reservation_reading()
+        for busy_tries in (0, 2):
+            with self.subTest(busy_tries=busy_tries):
+                reading = test_memory_feed.with_mac_slot_wait(
+                    replace(base, view=replace(base.view, waiting=())), busy_tries=busy_tries)
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    data = memory_feed.reading()
+                row, = data["mac_waits"]
+                key = row.get("key")
+                assert key is not None
+                markup, tip = cast(list[str], self.page_expression(
+                    f"(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:{key}', data)])",
+                    cast(object, json.loads(memory_feed.page_json(data))), walk=True))
+                root = ElementTree.fromstring(f"<root>{markup}</root>")
+                table_row = root.find(f".//tr[@data-tip='wait:{key}']")
+                chart_row = root.find(f".//div[@class='wrow wait'][@data-tip='wait:{key}']")
+                assert table_row is not None and chart_row is not None
+                self.assertEqual(table_row.get("class"), "wait")
+                self.assertEqual(table_row.findtext("td[@class='place']"), "")
+                self.assertEqual(table_row.findtext("td[@class='duration']"), "4 min")
+                self.assertEqual(table_row.findtext("td[@class='machine']/span/span"), "mac")
+                self.assertEqual(chart_row.findtext("span/span[@class='wait-note']"), "Waiting for a Mac slot")
+                tooltip = ElementTree.fromstring(tip)
+                fields = {label.text: value.text for label, value in zip(
+                    tooltip.findall("dt"), tooltip.findall("dd"), strict=True)}
+                self.assertEqual(fields["Waits for"], "Mac slot")
+                self.assertEqual(fields["Runs on"], "mac")
+                self.assertEqual(fields["Busy tries"], str(busy_tries))
+                self.assertEqual(fields.get("Last busy try"), "1 min ago" if busy_tries else None)
+                self.assertTrue({"Place in line", "Needs", "Free", "Short by"}.isdisjoint(fields))
+
+    def test_mac_slot_waits_join_the_table_by_time_and_keep_natedev_places(self) -> None:
+        data = {"total": 64, "cap": 48, "read_at": 360, "queued_priority_units": ["research"],
+            "waiters": [
+                {"name": "priority", "unit": "research", "since": 200, "pid": 201},
+                {"name": "older", "since": 100, "pid": 202},
+                {"name": "later", "since": 300, "pid": 203},
+            ],
+            "mac_waits": [
+                {"kind": "mac-slot", "name": "mac later", "key": "mac-later", "since": 250, "pid": 301},
+                {"kind": "mac-slot", "name": "mac older", "key": "mac-older", "since": 50, "pid": 302},
+            ],
+        }
+        markup = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{markup}</root>")
+        table = [row for row in root.findall(".//tbody/tr") if row.get("class", "").startswith("wait")]
+        self.assertEqual([(row.findtext("td[@class='pid']"), row.findtext("td[@class='place']")) for row in table],
+                         [("302", ""), ("201", "1"), ("202", "2"), ("301", ""), ("203", "3")])
+        chart = [row for row in root.findall("./div[@class='walk-chart']/div")
+                 if row.get("class", "").startswith("wrow wait")]
+        self.assertEqual([row.get("data-tip") for row in chart], [row.get("data-tip") for row in table])
+        self.assertEqual([row.get("class") for row in table],
+                         ["wait", "wait wait-first", "wait", "wait", "wait"])
+
+    def test_queued_heading_scopes_priority_to_natedev_when_a_mac_wait_is_older(self) -> None:
+        data = {"total": 64, "cap": 48, "read_at": 300, "queued_priority_units": ["research"],
+            "waiters": [{"name": "priority", "unit": "research", "since": 200}],
+            "mac_waits": [{"kind": "mac-slot", "name": "mac wait", "key": "mac-wait", "since": 100}]}
+        markup = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{markup}</root>")
+        head = root.find(".//div[@class='walk-chart-head queue-head']")
+        assert head is not None
+        title = head.find("./span[@class='queue-title section-head']")
+        assert title is not None
+        self.assertEqual(title.get("title"), "Queued, research first on natedev")
+        self.assertEqual("".join(title.itertext()), "Queued, research first on natedev (2)")
+        chart_waits = [row.get("data-tip") for row in root.findall("./div[@class='walk-chart']/div")
+                       if row.get("class", "").startswith("wrow wait")]
+        self.assertEqual(chart_waits, ["wait:mac-wait", "wait:fixture-wait-0"])
 
     def test_heading_keeps_all_structured_priority_entries(self) -> None:
         data = {"unmatched_priority_entries": [{"unit": "research", "why": "first"},

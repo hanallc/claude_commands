@@ -11,6 +11,7 @@
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
 // Use --headcount to compare the Running and Queued headers.
+// Add --macwait as the fourth argument to save the Mac slot wait image.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -46,7 +47,8 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = process.argv.slice(2);
 const gateMode = args[0] === '--gate';
 if (gateMode) args.shift();
-const [callerFolder, previousPage, comparison] = args;
+const [callerFolder, previousPage, requestedComparison] = args;
+const comparison = gateMode ? undefined : requestedComparison;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
@@ -56,9 +58,9 @@ try {
     'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePage = previousPage ? (await readFile(previousPage, 'utf8'))
+  const beforePage = !gateMode && previousPage ? (await readFile(previousPage, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
-  const swapBeforePage = process.env.SWAP_BEFORE_PAGE
+  const swapBeforePage = !gateMode && process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
   const queuedComparison = comparison === '--queued';
   const consoleComparison = comparison === '--console';
@@ -70,8 +72,9 @@ try {
   const waitTipComparison = comparison === '--wait-tip';
   const macrouteComparison = comparison === '--macroute';
   const headcountComparison = comparison === '--headcount';
-  const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
-  const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
+  const macWaitComparison = comparison === '--macwait';
+  const comparisonImages = !gateMode && Boolean(comparison || beforePage || swapBeforePage || process.env.MEMORY_PAGE_SHOT);
+  const {mac_slot_wait: macSlotWait, ...readings} = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const fixtureTime = readings.good.read_at;
   for (const reading of Object.values(readings)) {
     const shift = fixtureTime - reading.read_at;
@@ -307,9 +310,9 @@ try {
         await evaluate('window.render = window.renderReading');
         const longUnit = 'research-with-a-long-unit-name'.repeat(8);
         for (const [units, walk, count, queued] of [
-          [['research'], [local, aws, macStatus], 2, 'Queued, research first, then in submission order (2)'],
-          [[longUnit], [local, aws, macStatus], 2, `Queued, ${longUnit} first, then in submission order (2)`],
-          [['research', 'cables'], [local], 1, 'Queued, research followed by cables and then in submission order (1)'],
+          [['research'], [local, aws, macStatus], 2, 'Queued, research first on natedev (2)'],
+          [[longUnit], [local, aws, macStatus], 2, `Queued, ${longUnit} first on natedev (2)`],
+          [['research', 'cables'], [local], 1, 'Queued, research followed by cables on natedev (1)'],
           [['research'], [macStatus], 0, 'Queued, in order of submission (0)'],
         ]) {
           servedReading = {...headingReading, walk, waiters:headingReading.waiters.slice(0,count), queued_priority_units:units};
@@ -532,6 +535,45 @@ try {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of widths) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+            if (theme === 'dark' && width === 1400) {
+              await show(macSlotWait);
+              const macWait = await evaluate(`(() => {
+                const [wait] = latest.mac_waits;
+                const key = 'wait:' + wait.key;
+                const table = document.querySelector('tr[data-tip="' + key + '"]');
+                const chart = document.querySelector('.wrow[data-tip="' + key + '"]');
+                const heading = document.querySelector('.walk-chart .queue-head');
+                chart.scrollIntoView({block:'center', inline:'nearest'});
+                const box = chart.getBoundingClientRect();
+                showTip(key, box.left + box.width * 0.35, box.bottom);
+                const tip = document.querySelector('#tip');
+                const fields = [...tip.querySelectorAll('dt')].map(label => [label.textContent, label.nextElementSibling.textContent]);
+                const bounds = document.querySelector('#walk').getBoundingClientRect();
+                const tipBounds = tip.getBoundingClientRect();
+                const top = Math.min(heading.getBoundingClientRect().top, tipBounds.top) - 8;
+                const queuedRows = [...document.querySelectorAll('tr.wait')];
+                const bottom = Math.max(queuedRows.at(-1).getBoundingClientRect().bottom, tipBounds.bottom) + 8;
+                return {label:chart.querySelector('.wait-note').textContent, place:table.querySelector('.place').textContent,
+                  target:table.querySelector('.machine').textContent, age:table.querySelector('.duration').textContent,
+                  head:chart.classList.contains('wait-first') || table.classList.contains('wait-first'),
+                  places:queuedRows.map(row=>row.querySelector('.place').textContent),
+                  memory:!!chart.querySelector('.waitb,.bar-amount'), fields:Object.fromEntries(fields),
+                  clip:{x:Math.max(0,bounds.left+scrollX-8),y:top+scrollY,width:bounds.width+16,height:bottom-top,scale:1}};
+              })()`);
+              assert.equal(macWait.label, 'Waiting for a Mac slot');
+              assert.equal(macWait.place, '');
+              assert.equal(macWait.target, 'mac');
+              assert.equal(macWait.age, '4 min');
+              assert.equal(macWait.head, false);
+              assert.deepEqual(macWait.places, ['', '1']);
+              assert.equal(macWait.memory, false);
+              assert.equal(macWait.fields['Waits for'], 'Mac slot');
+              assert.equal(macWait.fields['Busy tries'], '2');
+              assert.equal(macWait.fields['Last busy try'], '1 min ago');
+              assert.ok(!('Needs' in macWait.fields));
+              if (macWaitComparison)
+                await saveScreenshot('after-macwait-dark',{captureBeyondViewport:true,clip:macWait.clip});
+            }
             await show(base);
             // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
             await evaluate('scrollTo(0,0)');
@@ -1792,12 +1834,12 @@ try {
           assert.ok(beforePage, 'The queued comparison needs the previous page.');
           const cases = [
             ['queued_none','Queued, in order of submission'],
-            ['queued_one','Queued, research first, then in submission order'],
-            ['queued_two','Queued, research followed by cables and then in submission order'],
+            ['queued_one','Queued, research first on natedev'],
+            ['queued_two','Queued, research followed by cables on natedev'],
           ];
           readings.queued_long = structuredClone(readings.queued_two);
           readings.queued_long.queued_priority_units = ['research-with-a-long-unit-name'.repeat(4),'cables'.repeat(8)];
-          cases.push(['queued_long',`Queued, ${readings.queued_long.queued_priority_units.join(' followed by ')} and then in submission order`]);
+          cases.push(['queued_long',`Queued, ${readings.queued_long.queued_priority_units.join(' followed by ')} on natedev`]);
           for (const theme of ['light','dark']) {
             await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
             for (const width of [1400,900,390]) {
@@ -1880,7 +1922,7 @@ try {
               if(version==='before') {
                 beforeRoomTop=state.roomTop;
                 beforeWaitTop=state.waitTop;
-                assert.equal(state.title,cases[2][1]);
+                assert.equal(state.title,'Queued, research followed by cables and then in submission order');
               } else {
                 assert.ok(Math.abs(state.roomTop-beforeRoomTop)<=1,'The room row moved.');
                 assert.equal(state.title,`${cases[2][1]} (${readings.queued_two.waiters.length})`);

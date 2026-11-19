@@ -863,6 +863,38 @@ class MemoryWaitRow(WaitRow):
     place: int
 
 
+class MacSlotWaitRow(RowQueueNotes, NamedQueueRow):
+    kind: Literal["mac-slot"]
+    machine: str
+    showrunner: str
+    unit: str
+    pid: int
+    since: float
+    reason: str
+    busy_tries: int
+    last_busy_at: NotRequired[float]
+
+
+def mac_slot_wait_row(wait: admission_records.MacSlotWait, names: StepNames,
+                      owner: unit_labels.UnitLabels) -> MacSlotWaitRow:
+    waiter = wait.waiter
+    step = waiter.get("step", "")
+    project = waiter.get("repository_name", "")
+    title = build_row_step(step, waiter.get("package", ""), project, waiter.get("folder", ""), names)
+    if isinstance(title, NoNamedStep):
+        title = QueueRowName.fixed(QueueKind.MAC)
+    unit = staff_unit(owner)
+    name = title.for_owner(names, step, owner.unit, owner.role, prefix=unit or project)
+    row: MacSlotWaitRow = {**queue_row_labels(title, name, unit=unit), **page_owner_labels(owner, unit=unit),
+        "key": "mac-slot-" + hashlib.sha256(wait.episode.encode()).hexdigest()[:24],
+        "kind": "mac-slot", "machine": wait.target, "runs_on": wait.target,
+        "pid": waiter["pid"], "since": waiter["since"], "reason": "Waiting for a Mac slot",
+        "busy_tries": len(wait.busy_attempts)}
+    if wait.busy_attempts:
+        row["last_busy_at"] = max(attempt.reported_at for attempt in wait.busy_attempts)
+    return row
+
+
 class MacBuildRow(RowQueueNotes, SlotPlace, NamedQueueRow):
     kind: Literal["mac-build"]
     repository: str
@@ -1009,6 +1041,7 @@ class MemoryPage(TypedDict):
     swap: SwapTotals
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
+    mac_waits: list[MacSlotWaitRow]
     swap_by: list[SwapRow]
     priority_text: str
     queued_priority_units: list[str]
@@ -2265,8 +2298,15 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     with staff.supplied_snapshot(staff_display.members):
         labels = unit_labels.unit_labels_for(
             [*(step.session_id for step in (*parsed.view.running, *parsed.view.waiting)),
+             *(wait.waiter.get("session_id", "") for wait in parsed.view.mac_waits),
              *target_availability.holder_sessions(snapshots)], os.environ)
     members = FeedStaff(staff_display.members)
+    mac_waits: list[MacSlotWaitRow] = []
+    for wait in parsed.view.mac_waits:
+        session = wait.waiter.get("session_id", "")
+        folder = Path(wait.waiter.get("folder", ""))
+        owner = members.labels_for(session, machine, folder) or labels.get(session) or unit_labels.UnitLabels("")
+        mac_waits.append(mac_slot_wait_row(wait, names, owner))
     zone = user_zone()
     routes = target_availability.MacRoutes(snapshots, labels, zone)
     ci_rows: dict[str, RunRow] = {}
@@ -2650,12 +2690,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "limit": "room and head protection", "ram": ram,
         "memory_status": memory_status(explanation, captured, len(by_owner)),
         "ci_name": ci_name, "ci_ram": ci_ram,
-        "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
+        "waiting": len(waiting_rows) + len(mac_waits),
+        "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
                  "outside_bytes": swap.used - swap.builds_ci,
                  "reserve_share_percent": explanation.policy.agent_swap_share_percent},
-        "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
+        "walk": work_rows, "waiters": waiting_rows, "mac_waits": mac_waits,
+        "swap_by": swap.rows, "psi": pressure_values,
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
         "unmatched_priority_text": unmatched_priority_text,

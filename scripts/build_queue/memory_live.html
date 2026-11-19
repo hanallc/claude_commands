@@ -745,6 +745,9 @@ function level(d) {
 function macRow(row) {
   return row.kind === "mac-build" || row.kind === "mac-unavailable";
 }
+function remoteSlotWait(row) {
+  return row.kind === "cloud" || row.kind === "mac-slot";
+}
 function ciRow(row) { return row.ci || !!row.ci_label; }
 const STEP_TABLE_HEADERS = {target: "Target", duration: "Dur", waiting: "Waiting"};
 function ownerText(text) {
@@ -822,8 +825,15 @@ function stepTooltip(key, data) {
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
+      row.kind === 'mac-slot' ? 'Mac slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
-    if (!['cloud', 'repository-slot'].includes(row.kind)) {
+    if (row.kind === 'mac-slot') {
+      rows.push(field('Busy tries', row.busy_tries));
+      if (recorded(row.last_busy_at)) {
+        const age = ago(row.last_busy_at, data.read_at);
+        rows.push(field('Last busy try', age === '<1 min' ? age : age + ' ago'));
+      }
+    } else if (!remoteSlotWait(row) && row.kind !== 'repository-slot') {
       if (row.head_room?.unavailable) return [stepTitle(row, 'unavailable')];
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
@@ -878,7 +888,9 @@ function stepTooltip(key, data) {
 function stepRow(key, data) {
   const kind = key.slice(0, key.indexOf(':'));
   const identity = key.slice(kind.length + 1);
-  return (kind === 'row' ? data.walk : kind === 'wait' ? data.waiters : [])?.find(row => row.key === identity);
+  const matches = row => row.key === identity;
+  if (kind === 'wait') return data.waiters?.find(matches) ?? data.mac_waits?.find(matches);
+  if (kind === 'row') return data.walk?.find(matches);
 }
 function tipDuration(key, row, data) {
   const since = key.startsWith('wait:') ? row.since : row.started_at;
@@ -1351,22 +1363,32 @@ function renderWalk(d) {
   const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
-  const waitingCount = d.waiters.length;
+  const macWaits = (d.mac_waits || []).toSorted((a, b) => a.since - b.since);
+  const queued = [];
+  let macIndex = 0;
+  for (const waiter of d.waiters) {
+    while (macIndex < macWaits.length && macWaits[macIndex].since < waiter.since)
+      queued.push(macWaits[macIndex++]);
+    queued.push(waiter);
+  }
+  queued.push(...macWaits.slice(macIndex));
+  const waitingCount = queued.length;
   if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
   const units = waitingCount ? d.queued_priority_units || [] : [];
-  const title = !units.length ? "Queued, in order of submission"
-    : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
-    : `Queued, ${units.join(" followed by ")} and then in submission order`;
-  const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
-    : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
+  const heading = names => !names.length ? "Queued, in order of submission"
+    : `Queued, ${names.join(" followed by ")}${names.length === 1 ? " first" : ""} on natedev`;
+  const title = heading(units);
+  const titleHtml = heading(units.map(roleName));
   rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
-  d.waiters.forEach((w, i) => {
-    const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
+  queued.forEach(w => {
+    const macWait = w.kind === "mac-slot";
+    const place = macWait ? "" : w.kind === "cloud" ? "cloud" : String(++localPosition);
+    const classes = w === d.waiters[0] ? "wait wait-first" : "wait";
     const tip = `wait:${w.key}`;
-    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, `wait${i === 0 ? " wait-first" : ""}`);
-    const note = w.why === "the build in the same Cargo folder" ? w.reason : "";
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
+    cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, classes);
+    const note = macWait || w.why === "the build in the same Cargo folder" ? w.reason : "";
+    rows.push(`<div class="wrow ${classes}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });
@@ -1627,7 +1649,7 @@ function placeMemoryBars(d) {
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = stepRow(row.dataset.tip, d);
-    if (waiter.kind === "cloud") continue;
+    if (remoteSlotWait(waiter)) continue;
     // A wait bar stops at the room end or the cap line, whichever is first.
     const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
     const waitWidth = Math.min(waitEnd, waiter.need * unit);
