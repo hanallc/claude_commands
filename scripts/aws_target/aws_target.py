@@ -8,6 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -19,9 +20,10 @@ import os
 import subprocess
 import sys
 import time
+from time import monotonic
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement, price_days, run_cost
+from scripts.aws_target import ledger, measurement, price_days, quota_requests, run_cost
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
@@ -51,7 +53,7 @@ def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
     return max((run_cost.gate_vcpus(name) for name in instance_types), default=0)
 
 
-def spot_quota(api: AwsCli, code: str = 'L-34B43A08') -> Decimal:
+def spot_quota(api: AwsCli, code: str = quota_requests.STANDARD_SPOT_QUOTA) -> Decimal:
     """Read the applied regional Spot quota in vCPUs."""
     reply = api.call('get-service-quota', '--service-code', 'ec2',
                      '--quota-code', code, service='service-quotas')
@@ -324,6 +326,55 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
     return status
 
 
+def read_snapshot_quota_requests(regions: tuple[str, ...], timeout: float,
+                                 execute: AwsExecutor) -> tuple[quota_requests.RegionalQuotaRequests, ...]:
+    """Collect independent quota request readings with the plan identity."""
+    from scripts.aws_target import plan_identity, plan_run
+
+    if not regions:
+        return ()
+    deadline = monotonic() + timeout
+    missed_deadline = quota_requests.QuotaRequestsNotMeasured('The quota request history deadline expired.')
+    plan = plan_run.PlanRun(plan_identity.plan_credentials, execute, time.sleep)
+
+    def read(region: str, code: str) -> quota_requests.QuotaRequestReading:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return missed_deadline
+        api = plan.api(region, remaining)
+        try:
+            requests = quota_requests.read_quota_requests(api, code)
+            reading: quota_requests.QuotaRequestReading = max(requests, key=lambda request: request.order_time,
+                                                              default=quota_requests.NoQuotaRequest())
+        except Exception as error:
+            code_text = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
+            known_codes = {'AccessDenied', 'AccessDeniedException', 'NoSuchResourceException',
+                           'ServiceException', 'ThrottlingException', 'TooManyRequestsException'}
+            reading = quota_requests.QuotaRequestReadFailed(
+                code_text if code_text in known_codes else 'QuotaHistoryUnavailable')
+        return reading if monotonic() < deadline else missed_deadline
+
+    workers = ThreadPoolExecutor(max_workers=8)
+    try:
+        try:
+            _ = workers.submit(lambda: plan.credential).result(timeout=max(0, deadline - monotonic()))
+        except TimeoutError:
+            return tuple(quota_requests.RegionalQuotaRequests(region, missed_deadline, missed_deadline)
+                         for region in regions)
+        except plan_identity.PlanIdentityRefused as error:
+            not_measured = quota_requests.QuotaRequestsNotMeasured(str(error))
+            return tuple(quota_requests.RegionalQuotaRequests(region, not_measured, not_measured)
+                         for region in regions)
+        codes = (quota_requests.STANDARD_SPOT_QUOTA, quota_requests.GPU_SPOT_QUOTA)
+        pending = {(region, code): workers.submit(read, region, code) for region in regions for code in codes}
+        done, _ = wait(pending.values(), timeout=max(0, deadline - monotonic()))
+        readings = {key: future.result() if future in done else missed_deadline for key, future in pending.items()}
+        return tuple(quota_requests.RegionalQuotaRequests(
+            region, readings[region, codes[0]], readings[region, codes[1]]) for region in regions)
+    finally:
+        workers.shutdown(wait=False, cancel_futures=True)
+
+
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
              clock: Callable[[], float] = time.time,
              notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice,
@@ -368,7 +419,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 read_name = 'Standard quota'
                 standard = spot_quota(target)
                 read_name = 'G and VT quota'
-                gpu = spot_quota(target, 'L-3819A6DF')
+                gpu = spot_quota(target, quota_requests.GPU_SPOT_QUOTA)
                 prices = [row for row in prices if row.get('region') != region]
                 prices.extend(dict(region=row.region, zone=row.zone, instance_type=row.instance_type,
                     usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in regional)
@@ -394,6 +445,16 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         output: dict[str, object] = {'prices': prices, 'regions': readings, 'failures': [
             dict(region=row.region, at=row.at, read=row.read, error=row.error, reason=row.reason)
             for row in current_failures]}
+        try:
+            request_readings = read_snapshot_quota_requests(regions, api.timeout_s, execute)
+        except Exception:
+            unavailable = quota_requests.QuotaRequestReadFailed('QuotaHistoryUnavailable')
+            request_readings = tuple(quota_requests.RegionalQuotaRequests(region, unavailable, unavailable)
+                                     for region in regions)
+        output['quota_requests'] = [
+            {'region': row.region, 'standard': quota_requests.request_record(row.standard),
+             'gpu': quota_requests.request_record(row.gpu)}
+            for row in request_readings]
         # Success drops an unsent notice because no user action remains.
         streak: SnapshotFailureStreak | SnapshotHealthy = SnapshotHealthy()
         if current_failures:

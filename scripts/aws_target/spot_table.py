@@ -11,6 +11,7 @@ from typing import Literal
 
 from scripts.aws_target import ledger, run_cost
 from scripts.aws_target.aws_target import SnapshotFailure, gate_sizes, gpu_price_sizes, largest_gate_vcpus, read_snapshot, snapshot_failures
+from scripts.aws_target.quota_requests import RegionalQuotaRequests, snapshot_quota_requests
 from scripts.lib import conf
 
 
@@ -121,6 +122,7 @@ class SpotTables:
     runs: tuple[RunCosts, ...]
     hours: Table
     hours_note: str
+    quota_requests: tuple[RegionalQuotaRequests, ...] = ()
 
     @property
     def snapshot_rows(self) -> tuple[tuple[str, str], ...]:
@@ -168,7 +170,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
         run_costs(directory, now, standard, frozenset(values.words('instance_types')), regions, minimum, not_sold,
                   days, home),
-        hours, hours_note)
+        hours, hours_note, snapshot_quota_requests(document, regions))
 
 
 def price_table(sizes: tuple[str, ...], regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal],

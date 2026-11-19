@@ -34,7 +34,7 @@ from uuid import uuid4
 
 
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target import admin_secrets, aws_test_identity, box, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, aws_test_identity, box, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
@@ -387,21 +387,6 @@ def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...
     )
 
 
-def quota_timestamp(value: object) -> float:
-    """Convert AWS timestamps to seconds for request ordering."""
-    if value is None:
-        return float('-inf')
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        moment = datetime.fromtimestamp(value, UTC)
-    elif isinstance(value, str):
-        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=UTC)
-    else:
-        raise ValueError('The quota request date is invalid')
-    return moment.timestamp()
-
-
 def _quota_request_age(created: float, now: float) -> str:
     """Show the age in the largest whole unit."""
     if not math.isfinite(created):
@@ -413,40 +398,19 @@ def _quota_request_age(created: float, now: float) -> str:
     return f'{elapsed}s old'
 
 
-class _KnownQuotaRequestStatus(StrEnum):
-    PENDING = 'PENDING'
-    CASE_OPENED = 'CASE_OPENED'
-    IN_PROGRESS = 'IN_PROGRESS'
-    APPROVED = 'APPROVED'
-    DENIED = 'DENIED'
-    CASE_CLOSED = 'CASE_CLOSED'
-    NOT_APPROVED = 'NOT_APPROVED'
-    INVALID_REQUEST = 'INVALID_REQUEST'
-
-
-CLOSED_QUOTA_REQUEST_STATUSES: frozenset[str] = frozenset((
-    _KnownQuotaRequestStatus.APPROVED, _KnownQuotaRequestStatus.DENIED, _KnownQuotaRequestStatus.CASE_CLOSED,
-    _KnownQuotaRequestStatus.NOT_APPROVED, _KnownQuotaRequestStatus.INVALID_REQUEST,
-))
-
-
 @dataclass(frozen=True)
-class _UnknownQuotaRequestStatus:
-    value: str
-
-
-def _quota_request_status(value: str) -> _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus:
-    try:
-        return _KnownQuotaRequestStatus(value)
-    except ValueError:
-        return _UnknownQuotaRequestStatus(value)
-
-
-@dataclass(frozen=True)
-class _QuotaRequest:
-    created_at: float
+class _ReportedQuotaRequest:
+    order_time: float
     requested_vcpus: Decimal
-    status: _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus
+    status_label: str
+
+
+def _reported_quota_request(row: dict[str, object]) -> _ReportedQuotaRequest:
+    created = row.get('Created')
+    moment = quota_requests.request_time(row.get('LastUpdated') if created is None else created)
+    order_time = moment.timestamp() if isinstance(moment, datetime) else float('-inf')
+    return _ReportedQuotaRequest(order_time, conf.decimal(str(row['DesiredValue'])).normalize(),
+                                 ledger.text(row, 'Status'))
 
 
 def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
@@ -457,14 +421,13 @@ def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool
         if quota >= desired:
             print(f'{region}: {label} quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
             return True
-        history = api.call('list-requested-service-quota-change-history-by-quota',
-            '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in CLOSED_QUOTA_REQUEST_STATUSES]
+        opened = [row for row in quota_requests.read_quota_request_rows(api, code)
+                  if ledger.text(row, 'Status') not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES]
         if opened:
             for row in opened:
                 status = ledger.text(row, 'Status')
-                value = conf.decimal(str(row['DesiredValue']))
-                print(f'{region}: open {label} quota request {value.normalize():f} vCPUs; status {status}')
+                value = conf.decimal(str(row['DesiredValue'])).normalize()
+                print(f'{region}: open {label} quota request {value:f} vCPUs; status {status}')
             return True
         reply = api.call('request-service-quota-increase', '--service-code', 'ec2',
             '--quota-code', code, '--desired-value', str(desired), service='service-quotas')
@@ -2750,25 +2713,18 @@ class Deployment:
                     lines.append(f'  {name}: {applied.normalize():f} vCPUs applied, {desired} vCPUs needed')
                     if code == 'L-3819A6DF' and applied >= needed:
                         ready.append(region)
-                    history = target.call('list-requested-service-quota-change-history-by-quota',
-                        '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-                    requests: list[_QuotaRequest] = []
-                    for request in ledger.rows(history, 'RequestedQuotas'):
-                        created_value = request.get('Created')
-                        created = quota_timestamp(request.get('LastUpdated') if created_value is None else created_value)
-                        asked = conf.decimal(str(request['DesiredValue'])).normalize()
-                        status = _quota_request_status(ledger.text(request, 'Status'))
-                        requests.append(_QuotaRequest(created, asked, status))
-                    requests.sort(key=lambda request: request.created_at, reverse=True)
+                    requests = sorted((_reported_quota_request(row)
+                                       for row in quota_requests.read_quota_request_rows(target, code)),
+                                      key=lambda request: request.order_time, reverse=True)
                     if requests:
                         newest = requests[0]
-                        age = _quota_request_age(newest.created_at, now)
-                        lines.append(f'    Newest request: {newest.status.value} for {newest.requested_vcpus:f} vCPUs ({age}).')
+                        age = _quota_request_age(newest.order_time, now)
+                        lines.append(f'    Newest request: {newest.status_label} for {newest.requested_vcpus:f} vCPUs ({age}).')
                     else:
                         lines.append('    No requests.')
                     for item in requests:
-                        if item.status.value not in CLOSED_QUOTA_REQUEST_STATUSES:
-                            opened.append(f'{region} {name} {item.requested_vcpus:f} vCPUs ({item.status.value})')
+                        if item.status_label not in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+                            opened.append(f'{region} {name} {item.requested_vcpus:f} vCPUs ({item.status_label})')
                 except (KeyError, OSError, OverflowError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
                     code_text = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
                     if code_text in QUOTA_PLAN_AUTH_FAILURES:

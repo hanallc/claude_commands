@@ -3516,7 +3516,8 @@ sys.exit(7)
             else:
                 self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
                 reply = {'RequestedQuotas': [{'DesiredValue': 4, 'Status': 'CASE_CLOSED', 'CaseId': 'case-private',
-                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120}]}
+                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120,
+                    'LastUpdated': 'invalid date'}]}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
         subject.execute = execute
@@ -3666,8 +3667,11 @@ sys.exit(7)
                     elif operation == get_quota:
                         reply = {'Quota': {'Value': quota}}
                     elif operation == history:
-                        reply = {'RequestedQuotas': [{'Status': history_status, 'DesiredValue': 256.0,
-                            'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []}
+                        rows = [{'Status': history_status, 'DesiredValue': 256.0,
+                                 'Id': request_id, 'CaseId': case_id, 'Requester': account_id}] if history_status else []
+                        if history_status == 'CASE_CLOSED':
+                            del rows[0]['DesiredValue']
+                        reply = {'RequestedQuotas': rows}
                     else:
                         self.assertEqual(operation, request)
                         reply = {'RequestedQuota': {'Status': request_status, 'DesiredValue': 128.0,

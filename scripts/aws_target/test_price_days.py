@@ -11,7 +11,7 @@ import subprocess
 from typing import override
 from unittest import mock
 
-from scripts.aws_target import aws_target, ledger, price_days
+from scripts.aws_target import aws_target, ledger, plan_identity, price_days
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import conf
@@ -35,6 +35,8 @@ class PriceDayTests(CostFixture):
         self.enterContext(mock.patch.dict(os.environ, {
             'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'private-scaler'),
         }))
+        _ = self.enterContext(mock.patch.object(plan_identity, 'plan_credentials',
+                                                side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')))
 
     def keep(self) -> int:
         return conf.read(self.settings).whole('spot_price_days_keep')

@@ -14,7 +14,7 @@ from typing import override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_target, ledger, run_cost, spot_table
+from scripts.aws_target import aws_target, ledger, plan_identity, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsUnavailable, aws_error_code
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import conf
@@ -73,7 +73,9 @@ class HanaGpuSnapshotTests(CostFixture):
             self.assertIn('get-service-quota', arguments)
             return subprocess.CompletedProcess(arguments, 0, '{"Quota":{"Value":8}}', '')
 
-        status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=lambda: now)
+        with mock.patch.object(plan_identity, 'plan_credentials',
+                               side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')):
+            status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=lambda: now)
         self.assertEqual(status, 0)
         self.assertEqual(reads.count('g6.2xlarge'), 1)
         self.assertEqual(reads.count('g4dn.2xlarge'), 1)
