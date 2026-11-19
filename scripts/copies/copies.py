@@ -46,7 +46,7 @@ from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
 from scripts.direct.cleanup_lease import (
-    ForegroundCleanupLease, NoCleanupLease, acquire_cleanup, mark_cleanup_incomplete,
+    CleanupLeaseUse, ForegroundCleanupLease, NoCleanupLease, acquire_cleanup, mark_cleanup_incomplete,
 )
 from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
@@ -2243,6 +2243,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
     with ExitStack() as scope:
         captured = ""
         cleanup: ForegroundCleanupLease | NoCleanupLease = NoCleanupLease.NONE
+        lease_use = CleanupLeaseUse.KEEP_IN_SUPERVISOR
         if standing_slot:
             tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge))
             environment = dict(os.environ)
@@ -2258,12 +2259,11 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                            "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(owner_pid), "UNIT_DETACHED_RUN": "1"}
             target = tree / environment.setdefault("CARGO_TARGET_DIR", str(tree / "target"))
             locks = COMMAND_LOCKS.get()
+            cleanup = ForegroundCleanupLease(lease)
             if isinstance(invocation, CopyRunScope) and invocation.payload is CopyPayload.BATCH_BASELINE:
                 # The baseline coordinator passes the lease to its foreground guards.
                 environment["COPIES_STEP_LOCK_FD"] = str(lease)
-                locks = (*locks, lease)
-            else:
-                cleanup = ForegroundCleanupLease(lease)
+                lease_use = CleanupLeaseUse.SHARE_WITH_COORDINATOR
             if args.publish:
                 output = tree.parent / "step-output"
                 output.mkdir()
@@ -2272,7 +2272,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
         payload = [part.replace("{tree}", str(tree)) for part in command]
         before = publication_candidates(tree, target, payload, args.publish)
         if isinstance(cleanup, ForegroundCleanupLease):
-            result = cleanup.run(payload, cwd=tree, environment=environment, pass_fds=locks)
+            result = cleanup.run(payload, cwd=tree, environment=environment, retain_fds=locks, use=lease_use)
         else:
             result = subprocess.run(payload, cwd=tree, pass_fds=locks, env=environment)
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
@@ -2729,7 +2729,7 @@ def release_run_scope(parent: Path) -> int:
         try:
             with os.fdopen(os.open(lease, os.O_RDONLY | os.O_NOFOLLOW), "rb") as lock:
                 if not acquire_cleanup(lock.fileno()):
-                    raise ValueError(f"the command still uses {parent}")
+                    raise ValueError(f"foreground cleanup is incomplete; kept {parent}")
         except FileNotFoundError:
             pass
         build_folders.sweep_temporary_build_folders(parent, wait=False)

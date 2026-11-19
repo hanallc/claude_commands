@@ -19,6 +19,7 @@ from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixtu
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
+from scripts.message import process_table
 from scripts.production import staff
 
 
@@ -38,17 +39,36 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
     def test_pid_only_term_cleans_up_when_verify_is_stopped(self) -> None:
         self.assert_batch_cancelled(stop_verify=True)
 
-    def assert_batch_cancelled(self, *, stop_verify: bool = False) -> None:
+    def test_pid_only_term_cleans_up_when_the_step_group_is_stopped(self) -> None:
+        self.assert_batch_cancelled(stop_step=True)
+
+    def stop_batch_step(self, verify: int) -> None:
+        table = process_table.snapshot()
+        cargo_child = int((self.control / "descendant.pid").read_text())
+        ancestor = table[cargo_child]
+        while ancestor.parent != verify:
+            self.assertIn(ancestor.parent, table, "Cargo is outside Verify's process tree")
+            ancestor = table[ancestor.parent]
+        group = ancestor.pid
+        self.assertEqual(os.getpgid(group), group)
+        self.started_groups.add(group)
+        send_process_group(group, signal.SIGSTOP)
+        stopped = subprocess.check_output(["ps", "-p", str(group), "-o", "stat="], text=True, timeout=5)
+        self.assertTrue(stopped.strip().startswith("T"), stopped)
+
+    def assert_batch_cancelled(self, *, stop_verify: bool = False, stop_step: bool = False) -> None:
         process = self.start_verify("batch", arguments=("--packages", "sample", "--lint", "packages"))
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()
+        verify = int((self.board / "locks/cargo.d/holder_pid").read_text())
+        self.assertNotEqual(verify, process.pid)
         if stop_verify:
-            verify = int((self.board / "locks/cargo.d/holder_pid").read_text())
-            self.assertNotEqual(verify, process.pid)
             os.kill(verify, signal.SIGSTOP)
             stopped = subprocess.check_output(["ps", "-p", str(verify), "-o", "stat="],
                                               text=True, timeout=5)
             self.assertTrue(stopped.strip().startswith("T"), stopped)
+        if stop_step:
+            self.stop_batch_step(verify)
         process.send_signal(signal.SIGTERM)
         try:
             output, errors = process.communicate(timeout=5)

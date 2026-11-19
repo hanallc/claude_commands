@@ -4375,7 +4375,7 @@ verify_interrupted() {
     EXIT_STATUS=$((128 + $1))
     interrupt_hold_wait
     if [[ -n "$RUN_STEP_PID" ]]; then
-        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
+        "$PY" "$VERIFY_START_DIR/cleanup_lease.py" cancel-group "$RUN_STEP_PID" "$1" || printf 'verify.sh: could not stop step group %s\n' "$RUN_STEP_PID" >&2
         release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""

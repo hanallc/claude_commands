@@ -27,6 +27,7 @@ from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue import admission_protocol as wire, slot_wait
+from scripts.direct.cleanup_lease import mark_cleanup_incomplete
 from scripts.direct.wait_for_test_state import wait_for_pid
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -265,6 +266,21 @@ Path(ready).write_text(str(worker.pid))
                 _ = release.touch()
                 if process.poll() is None:
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_private_snapshot_cleanup_keeps_a_marked_folder(self) -> None:
+        parent = self.base / "temporary" / "copies-run.marked"
+        parent.mkdir()
+        with build_folders.tool_folder(copies.PRIVATE_SOURCE_TOOL, parent=parent) as snapshot:
+            source = snapshot / "source"
+            source.mkdir()
+            mark_cleanup_incomplete(build_folders.build_folder_lock_fd(snapshot))
+        self.assertTrue(source.is_dir(), "copy teardown removed the marked source")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(copies.release_run_scope(parent), 2)
+        self.assertIn(str(parent), errors.getvalue())
+        build_folders.sweep_temporary_build_folders(parent, wait=False)
+        self.assertTrue(source.is_dir(), "the sweep removed the marked source")
 
     def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
         unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")

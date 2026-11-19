@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+from enum import Enum, auto
 from pathlib import Path
 import signal
 import subprocess
@@ -101,6 +102,12 @@ def blob(path: bytes) -> bytes:
     return mode + b" blob " + git_blob_id(data).encode()
 
 
+class TreeEntryScope(Enum):
+    EXCLUDED = auto()
+    CACHE_ONLY = auto()
+    CACHE_AND_WATCH = auto()
+
+
 class TreeInputs:
     """One call's fixed scope, shared by cache records and the live watch."""
 
@@ -162,16 +169,21 @@ class TreeInputs:
                     if dependency_root in packages:
                         pending.append(dependency_root)
 
-    def counts(self, path: bytes) -> bool:
+    def entry_scope(self, path: bytes, entry: bytes) -> TreeEntryScope:
+        """Select the cache and watch keys that include this entry."""
         full = os.path.join(self.real_top, path)
+        if entry.startswith((b"160000 commit ", b"gitlink ")):
+            roots = self.built if self.package else self.members
+            if any(root == full or root.startswith(full + b"/") for root in roots):
+                return TreeEntryScope.CACHE_AND_WATCH
         owner = next((root for root in self.members if full.startswith(root + b"/")), b"")
-        return not self.package or not owner or owner in self.built or full == os.path.join(owner, b"Cargo.toml")
-
-    def watched(self, path: bytes) -> bool:
-        full = os.path.join(self.real_top, path)
+        if owner:
+            if self.package and owner not in self.built and full != os.path.join(owner, b"Cargo.toml"):
+                return TreeEntryScope.EXCLUDED
+            return TreeEntryScope.CACHE_AND_WATCH
         cargo_path = os.path.relpath(full, self.workspace_root) if self.workspace_root else b""
         cargo_root = cargo_path in (b"Cargo.toml", b"Cargo.lock", b"rust-toolchain", b"rust-toolchain.toml") or cargo_path.startswith(b".cargo/")
-        return self.counts(path) and (cargo_root or any(full.startswith(root + b"/") for root in self.members))
+        return TreeEntryScope.CACHE_AND_WATCH if cargo_root else TreeEntryScope.CACHE_ONLY
 
     def keys(self, *, cache: bool = True, watch: bool = True, lint_versions: bool = True) -> tuple[str, str]:
         self.tree_content_key = ""
@@ -198,20 +210,21 @@ class TreeInputs:
                 else:
                     _ = entries.pop(path, None)
         watched = hashlib.sha256(self.top + b"\0")
+        key = hashlib.sha256(self.top + b"\0")
         if watch:
             self.watch_entries = {}
-            for path in sorted(filter(self.watched, entries)):
-                self.watch_entries[os.fsdecode(path)] = entries[path].decode()
-                watched.update(path + b"\0" + entries[path] + b"\0")
+        for path, entry in sorted(entries.items()):
+            scope = self.entry_scope(path, entry)
+            if watch and scope is TreeEntryScope.CACHE_AND_WATCH:
+                self.watch_entries[os.fsdecode(path)] = entry.decode()
+                watched.update(path + b"\0" + entry + b"\0")
+            if cache and self.package and scope is not TreeEntryScope.EXCLUDED:
+                key.update(path + b"\0" + entry + b"\0")
         watch_key = watched.hexdigest() if watch else ""
         if not cache:
             return "", watch_key
-        if self.package:
-            key = hashlib.sha256(self.top + b"\0")
-            for path in sorted(filter(self.counts, entries)):
-                key.update(path + b"\0" + entries[path] + b"\0")
-        else:
-            key = hashlib.sha256(self.top + b"\0" + run("git", "--no-optional-locks", "-C", self.top, "rev-parse", "HEAD^{tree}"))
+        if not self.package:
+            key.update(run("git", "--no-optional-locks", "-C", self.top, "rev-parse", "HEAD^{tree}"))
             for path in changed:
                 key.update(path + b"\0" + treekey.content(os.path.join(self.top, path)))
         key.update(run("rustc", "-vV"))

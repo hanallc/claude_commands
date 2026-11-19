@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
 import select
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -20,6 +20,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
+from scripts.lib.socket_test_support import ShortUnixSocket
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
@@ -319,10 +320,9 @@ wait_for_file(Path({str(release)!r}))
     def test_batch_stop_releases_the_baseline_grant_and_copy(self) -> None:
         self.fail_first(status=100)
         admission = caller_admission(self, self.root, self.environment)
-        ready = self.root / "baseline-ready"
-        environment = {**self.environment, "TEST_BASELINE_READY": str(ready)}
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-            listener.bind(str(ready))
+        with ShortUnixSocket() as listener:
+            ready = listener.bind_socket()
+            environment = {**self.environment, "TEST_BASELINE_READY": str(ready)}
             listener.listen(1)
             listener.settimeout(TEST_HANG_GUARD_SECS)
             with subprocess.Popen(
@@ -358,6 +358,44 @@ wait_for_file(Path({str(release)!r}))
 
 
 class BatchCancellationTests(unittest.TestCase):
+    def test_baseline_patch_stops_when_its_coordinator_exits(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        git = scratch / "git"
+        pid_file = scratch / "git-pid"
+        _ = git.write_text(f"""#!{sys.executable}
+import os
+from pathlib import Path
+import signal
+
+Path({str(pid_file)!r}).write_text(str(os.getpid()))
+signal.pause()
+""")
+        git.chmod(0o755)
+        batch = support.VERIFY.with_name("verify_batch.py")
+        lock = scratch / "cleanup.lock"
+        with lock.open("w+b") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            with subprocess.Popen(
+                [sys.executable, str(batch), "--baseline", "verify", "done", "patch", "sample=regression", "--"],
+                cwd=scratch, pass_fds=(lease.fileno(),), start_new_session=True,
+                env={**os.environ, "PATH": f"{scratch}:{os.environ['PATH']}",
+                     "COPIES_STEP_LOCK_FD": str(lease.fileno())},
+            ) as process:
+                try:
+                    git_pid = wait_for_pid(pid_file, processes=(process,))
+                    with os.fdopen(os.pidfd_open(git_pid), "rb") as git_exit:
+                        process.terminate()
+                        self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+                        self.assertTrue(select.select([git_exit], [], [], 5)[0],
+                                        "the patch process survived its coordinator")
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    try:
+                        send_process_group(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def run_python(self, program: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, "-c", program, *arguments], capture_output=True, text=True,
                               check=False, timeout=TEST_HANG_GUARD_SECS)

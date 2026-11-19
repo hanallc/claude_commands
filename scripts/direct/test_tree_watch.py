@@ -9,7 +9,7 @@ import subprocess
 import sys
 import unittest
 from unittest import mock
-from typing import final
+from typing import cast, final
 
 from scripts.direct import tree_watch
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
@@ -27,14 +27,26 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 @final
 class TreeWatchTests(TreeWatchFixture):
     def test_package_keys_follow_edits_inside_a_dirty_submodule(self) -> None:
-        module = self.root / "sample" / "nested"
+        self.assert_package_keys_follow_submodule(self.root / "sample" / "nested")
+
+    def test_package_keys_follow_its_gitlink_under_an_unrelated_member(self) -> None:
+        module = self.root / "unrelated" / "submodule"
+        self.assert_package_keys_follow_submodule(module, package_root=module)
+
+    def assert_package_keys_follow_submodule(self, module: Path, *, package_root: Path | None = None) -> None:
         module.mkdir()
         _ = subprocess.run(["git", "-C", str(module), "init", "-q"], check=True,
                            capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        if package_root is not None:
+            manifest = package_root / "Cargo.toml"
+            _ = shutil.copyfile(self.root / "sample/Cargo.toml", manifest)
+            packages = cast(list[tree_watch.Package], self.metadata["packages"])
+            sample = next(package for package in packages if package["name"] == "sample")
+            sample["manifest_path"] = str(manifest)
         source = module / "input"
         _ = source.write_text("original\n")
         _ = commit_repository(module, "Add the submodule input")
-        _ = commit_repository(self.root, "Add a submodule", "sample/nested")
+        _ = commit_repository(self.root, "Add a submodule", str(module.relative_to(self.root)))
         _ = subprocess.run(["git", "config", "diff.ignoreSubmodules", "all"], check=True,
                            capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         inputs = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata))
@@ -43,8 +55,10 @@ class TreeWatchTests(TreeWatchFixture):
         first_cache, first_watch = inputs.keys()
         _ = source.write_text("second edit\n")
         second_cache, second_watch = inputs.keys()
-        self.assertNotEqual(first_cache, second_cache)
-        self.assertNotEqual(first_watch, second_watch)
+        with self.subTest(key="cache"):
+            self.assertNotEqual(first_cache, second_cache)
+        with self.subTest(key="watch"):
+            self.assertNotEqual(first_watch, second_watch)
         _ = source.write_text("original\n")
         self.assertEqual(inputs.keys(), clean)
 

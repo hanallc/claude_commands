@@ -18,7 +18,7 @@ from typing import final
 
 from scripts.buildlog import treekey
 from scripts.direct import recorder_state
-from scripts.direct.cleanup_lease import ForegroundCleanupLease, NoCleanupLease
+from scripts.direct.cleanup_lease import CleanupLeaseUse, ForegroundCleanupLease, NoCleanupLease
 
 
 class LintScope(Enum):
@@ -69,9 +69,14 @@ class BatchCommands:
         self.environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
         _ = self.environment.pop("UNIT_DETACHED_RECORD", None)
 
-    def run(self, command: Sequence[str], changes: dict[str, str], *, pass_fds: tuple[int, ...] = ()) -> int:
-        result = subprocess.run(command, env={**self.environment, **changes}, stdin=subprocess.DEVNULL,
-                                pass_fds=pass_fds, check=False)
+    def run(self, command: Sequence[str], changes: dict[str, str], *,
+            use: CleanupLeaseUse = CleanupLeaseUse.KEEP_IN_SUPERVISOR) -> int:
+        environment = {**self.environment, **changes}
+        if isinstance(self.cleanup, ForegroundCleanupLease):
+            result = self.cleanup.run(command, cwd=Path.cwd(), environment=environment,
+                                      stdin=subprocess.DEVNULL, use=use)
+        else:
+            result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, check=False)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
     def verify_step(self, step: str, args: Sequence[str], cache_hit: Path,
@@ -82,12 +87,7 @@ class BatchCommands:
             "VERIFY_BATCH_STEP": step, "VERIFY_BATCH_CACHE_HIT": str(cache_hit),
             "VERIFY_BATCH_LINT_PACKAGES": format_packages,
         }
-        if isinstance(self.cleanup, ForegroundCleanupLease):
-            child = self.cleanup.run(command, cwd=Path.cwd(), environment={**self.environment, **changes},
-                                     stdin=subprocess.DEVNULL)
-            status = child.returncode if child.returncode >= 0 else 128 - child.returncode
-        else:
-            status = self.run(command, changes)
+        status = self.run(command, changes)
         return BatchStepResult(status, cache_hit.is_file())
 
 
@@ -164,7 +164,7 @@ def run_baseline_copy(commands: BatchCommands, repo: Path, plan: BaselineProof, 
     cleanup = commands.cleanup
     if isinstance(cleanup, ForegroundCleanupLease):
         status = commands.run(command, {"COPIES_RUN_SCOPE_LOCK_FD": str(cleanup.descriptor)},
-                              pass_fds=(cleanup.descriptor,))
+                              use=CleanupLeaseUse.SHARE_WITH_COORDINATOR)
     else:
         status = commands.run(command, {})
     baseline_status = done.read_text() if done.is_file() else ""
@@ -215,9 +215,9 @@ def main(argv: list[str]) -> int:
         done = Path(marker)
         lease = os.environ.pop("COPIES_STEP_LOCK_FD", "")
         cleanup = ForegroundCleanupLease(int(lease)) if lease else NoCleanupLease.NONE
-        if subprocess.run(["git", "apply", "--index", "--", patch], check=False).returncode != 0:
-            return 2
         commands = BatchCommands(Path(verify), route, cleanup=cleanup)
+        if commands.run(["git", "apply", "--index", "--", patch], {}) != 0:
+            return 2
         result = run_baseline_tests(commands, [RegressionCase(*case.split("=", 1)) for case in cases],
                                     done.with_name("baseline-cache-hit"))
         _ = done.write_text(str(result))

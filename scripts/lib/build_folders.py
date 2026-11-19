@@ -767,6 +767,25 @@ class HeldFolderRemovalLease:
 
 FolderRemovalLease = RefusedRemovalLease | UnreservedRemovalFolder | HeldFolderRemovalLease
 
+_INCOMPLETE_CLEANUP_MARKER = b"foreground cleanup incomplete\n"
+
+
+def mark_cleanup_incomplete(descriptor: int) -> None:
+    """Mark the lock before the supervisor releases it."""
+    _ = os.pwrite(descriptor, _INCOMPLETE_CLEANUP_MARKER, 0)
+
+
+def cleanup_incomplete(descriptor: int) -> bool:
+    """Read the marker while the caller holds the cleanup lock."""
+    marker = os.pread(descriptor, len(_INCOMPLETE_CLEANUP_MARKER), 0)
+    return bool(marker) and _INCOMPLETE_CLEANUP_MARKER.startswith(marker)
+
+
+def _take_removal_lock(path: Path, directory: int, descriptor: int, *, wait: bool) -> bool:
+    return (_take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
+            and build_folder_lock.lock_current(path, directory, descriptor)
+            and not cleanup_incomplete(descriptor))
+
 
 def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
                      create: bool = False) -> FolderRemovalLease:
@@ -776,7 +795,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     except FileNotFoundError:
         return UnreservedRemovalFolder()
     _ = stack.callback(os.close, descriptor)
-    if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) or not build_folder_lock.lock_current(path, directory, descriptor):
+    if not _take_removal_lock(path, directory, descriptor, wait=wait):
         return RefusedRemovalLease()
     _ = stack.callback(_locks.pop, descriptor, None)
     _locks[descriptor] = path
@@ -870,9 +889,7 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
             return cleanup() is not False
         descriptor = build_folder_lock.open_lock(path, directory, create=True)
         try:
-            if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
-                return False
-            if not build_folder_lock.lock_current(path, directory, descriptor):
+            if not _take_removal_lock(path, directory, descriptor, wait=wait):
                 return False
             if cleanup() is False:
                 return False
