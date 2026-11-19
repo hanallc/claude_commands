@@ -3058,6 +3058,16 @@ Work:
 2. Cache only a good result. A timeout or an error is not kept, so the next request parses again.
 3. Stub bash in the feed test, so the test does not depend on load.
 
+### Phase 44cw — A nested cargo in a Hana gate test does not hang in a slot  · status: todo
+**From builds (from the hana showrunner), 2026-11-19 04:2x:** slots and the jobserver are queue's.
+
+Case: hana_rigging `production_prelude_compiles_without_test_support` runs a nested `cargo check` of an external-client fixture. It timed out at 600 s two times at 9fb84353b1 (slots copies-source-2 and copies-source). It passed at 64baa5ef66 (89 s) and at e261f340f7 (19 s, slot copies-source-3). The nested cargo did no work (target/external-client held 12 KiB), so it was blocked, not slow. Suspects: a cargo lock or a jobserver token (`CARGO_MAKEFLAGS` fifo) held in those slots. nextest runs "one jobserver token for each thread". Evidence: /tmp/claude/scratch/rr_hang_record_9fb84353b1.txt, /tmp/claude/scratch/rr2_64baa5ef66.log.
+
+Work:
+1. Name the cause with evidence, read-only on live state.
+2. Replay the cause with a small test that hangs before the fix.
+3. Fix the cause where it lives; no longer timeout and no retry.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
