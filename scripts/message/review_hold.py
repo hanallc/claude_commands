@@ -43,6 +43,7 @@ class ReviewState:
     last_activity: float | EndedReview
     messages: tuple[ReviewMessage, ...] = ()
     reserved: tuple[ReviewMessage, ...] = ()
+    release_pending: bool = False
 
 
 class UnconfirmedRelease(Enum):
@@ -133,7 +134,8 @@ def _read_state(count: Path, path: Path) -> ReviewState:
     activity = EndedReview.HOLD_ENDED if at is None else float(cast(float, at))
     messages = cast(list[dict[str, str | float]], value["messages"])
     reserved = cast(list[dict[str, str | float]], value.get("reserved", []))
-    return ReviewState(activity, _read_messages(messages), _read_messages(reserved))
+    return ReviewState(activity, _read_messages(messages), _read_messages(reserved),
+                       release_pending=value.get("release_pending") is True)
 
 
 def _read_messages(messages: list[dict[str, str | float]]) -> tuple[ReviewMessage, ...]:
@@ -148,7 +150,8 @@ def _write_state(path: Path, state: ReviewState) -> None:
     at = state.last_activity
     record = {"last_activity": None if isinstance(at, EndedReview) else at,
               "messages": [asdict(item) for item in state.messages],
-              "reserved": [asdict(item) for item in state.reserved]}
+              "reserved": [asdict(item) for item in state.reserved],
+              "release_pending": state.release_pending}
     write_text_atomic(path, json.dumps(record), new_file_mode=0o600)
 
 
@@ -218,7 +221,11 @@ def _reserve(path: Path, state: ReviewState, delivery: ExitStack, *, key: str = 
     """Move saved messages to the reservation while the review lock is held."""
     saved = (*state.reserved, *state.messages)
     held = tuple(item for item in saved if not key or item.key == key)
-    if not held or not delivery.enter_context(_delivery_turn(path)):
+    if not held:
+        return ()
+    if not delivery.enter_context(_delivery_turn(path)):
+        if not key and not state.release_pending:
+            _write_state(path, replace(state, release_pending=True))
         return ()
     remaining = tuple(item for item in saved if key and item.key != key)
     _write_state(path, replace(state, messages=remaining, reserved=held))
@@ -247,7 +254,8 @@ def _settle_release(count: Path, path: Path, batch: ReleasedMessages,
                     if not messages and not _read_count(count):
                         path.unlink(missing_ok=True)
                     else:
-                        _write_state(path, replace(state, messages=messages, reserved=()))
+                        _write_state(path, replace(state, messages=messages, reserved=(),
+                                                   release_pending=state.release_pending and bool(messages)))
             except OSError as error:
                 print(f"review hold: cannot settle the delivery: {error}", file=sys.stderr)
 
@@ -269,7 +277,7 @@ def set_count(session: str, remaining: int, at: float, emit: Callable[[str], Non
             state = _read_state(count, path)
             if remaining > 0:
                 if item_count(session) == 0:
-                    _write_state(path, replace(state, last_activity=_last_prompt(path, at)))
+                    _write_state(path, replace(state, last_activity=_last_prompt(path, at), release_pending=False))
                 elif not path.exists():
                     _write_state(path, state)
                 write_text_atomic(count, str(remaining))
@@ -313,6 +321,22 @@ def deliver_at_session_start(session: str, emit: Callable[[str], None], *, recor
                 return
             held = _reserve(path, _end_review(path, state), delivery)
         _emit_saved(count, path, held, datetime.now(timezone.utc).timestamp(), emit, record_keys)
+
+
+@contextmanager
+def pending_release(session: str, *, record_keys: RecordReleasedKeys) -> Generator[ReleasedMessages]:
+    """Take a release that had to wait for a sender to settle."""
+    count = _count_file(session)
+    path = _state_file(count)
+    held: tuple[ReviewMessage, ...] = ()
+    with ExitStack() as delivery:
+        if path.exists():
+            with _locked(path):
+                state = _read_state(count, path)
+                if state.release_pending:
+                    held = _reserve(path, state, delivery)
+        with _settle_release(count, path, ReleasedMessages(held, held), record_keys) as batch:
+            yield batch
 
 
 @contextmanager

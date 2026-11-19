@@ -4993,7 +4993,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "") -> Result:
+                        review_text: str = "", allow_holder_fallback: bool = True) -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5083,7 +5083,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             reason = "worker is stopped"
         else:
             reason = "worker pane is closed"
-    if isinstance(selection, FixedStaffLookup):
+    if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
     address = f"session:{holder.current_session}"
     options = parse(["--here", "--to", address, "--from", sender,
@@ -5318,159 +5318,171 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         else:
             new_message_result = Result("kept", f"{options.to} is in a review; delivered at its end")
 
-    transport_message = message
-    review_text = ""
-    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages:
-        batch_only = new_message_result is not None
-        review_text = review_hold.render(review_route.held if batch_only else review_route.messages)
-        transport_message = replace(message, summary="Messages from the review", text=review_text,
-                                    review_batch=True, key=None if batch_only else message.key,
-                                    urgent=message.urgent and not batch_only)
-    delivery_identity = replace(postmaster_identity, key=transport_message.key)
+    def review_transport(batch: review_hold.ReleasedMessages, *, batch_only: bool) -> Message:
+        body = review_hold.render(batch.held if batch_only else batch.messages)
+        return replace(message, summary="Messages from the review", text=body, review_batch=True,
+                       key=None if batch_only else message.key, urgent=message.urgent and not batch_only)
 
-    if new_message_result is not None and not review_text:
-        result = new_message_result
-    elif isinstance(route, RecipientLookupFailed):
-        from scripts.message import failed_lookup
+    def deliver(transport_message: Message, *, batch_only: bool = False) -> Result:
+        nonlocal claim_result, log_route
+        delivery_identity = replace(postmaster_identity, key=transport_message.key)
+        if isinstance(route, RecipientLookupFailed):
+            from scripts.message import failed_lookup
 
-        failed_lookup.report(sender, options.to, f"FAILED: {route.reason}")
-        result = Result("failed", route.reason)
-    elif isinstance(route, RemoteDelivery):
-        forwarded = options._replace(selection=ForwardedConversation(route.address)) if route.selected_conversation else options
-        result = remote(message, route.host, forwarded)
-    elif isinstance(route, UserDelivery):
-        if isinstance(options.action, NoUserRecipient):
-            raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender), silence_policy=options.silence_policy)
-        if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
-            _ = rca.open_case(refusal_report(options), defer_owner=True)
-    elif isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)):
-        result = deliver_codex(message, route, options.timeout, selection=options.selection,
-                               review_recipient=stable.value)
-    elif isinstance(route, QueuedStaffRecipient):
-        result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
-                        + " so it is kept for it")
-        assert isinstance(plan, SessionIdWithoutLiveRecipient)
-        queue_mailbox = conversation_recipient(plan.recipient) if review_text else plan.recipient
-        enqueue(replace(transport_message, key=None if review_text else message.key), result.detail, started,
-                recipient=attempt_recipient, order=order, membership=membership, mailbox=queue_mailbox)
-    elif isinstance(route, PaneWorkerRecipient):
-        if review_text:
-            result = deliver_worker_text(route.row, membership, agent_text(message),
-                                         sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                         review_text=agent_text(transport_message))
-        else:
-            result = deliver_worker_text(route.row, membership, agent_text(message),
-                                         sender=message.sender, timeout=options.timeout, selection=options.selection)
-    else:
-        claude_started = time.monotonic()
-        def relay_and_queue(relay_message: Message, timeout: float) -> Result:
-            if review_text:
-                delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection,
-                                                                review_session=review_session)
+            failed_lookup.report(sender, options.to, f"FAILED: {route.reason}")
+            result = Result("failed", route.reason)
+        elif isinstance(route, RemoteDelivery):
+            forwarded = options._replace(selection=ForwardedConversation(route.address)) if route.selected_conversation else options
+            result = remote(message, route.host, forwarded)
+        elif isinstance(route, UserDelivery):
+            if isinstance(options.action, NoUserRecipient):
+                raise AssertionError("a user message must state its action")
+            result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values, due=options.due, reference=options.reference, remote_forward=isinstance(options.sender_origin, ForwardedSender), silence_policy=options.silence_policy)
+            if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
+                _ = rca.open_case(refusal_report(options), defer_owner=True)
+        elif isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)):
+            result = deliver_codex(message, route, options.timeout, selection=options.selection,
+                                   review_recipient=stable.value)
+        elif isinstance(route, QueuedStaffRecipient):
+            result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
+                            + " so it is kept for it")
+            assert isinstance(plan, SessionIdWithoutLiveRecipient)
+            queue_mailbox = conversation_recipient(plan.recipient) if transport_message.review_batch else plan.recipient
+            enqueue(replace(transport_message, key=None if transport_message.review_batch else message.key), result.detail, started,
+                    recipient=attempt_recipient, order=order, membership=membership, mailbox=queue_mailbox)
+        elif isinstance(route, PaneWorkerRecipient):
+            if batch_only:
+                result = deliver_worker_text(route.row, membership, agent_text(transport_message),
+                                             sender=message.sender, timeout=options.timeout, selection=options.selection,
+                                             allow_holder_fallback=False)
+            elif transport_message.review_batch:
+                result = deliver_worker_text(route.row, membership, agent_text(message),
+                                             sender=message.sender, timeout=options.timeout, selection=options.selection,
+                                             review_text=agent_text(transport_message))
             else:
-                delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection)
-            if isinstance(options.selection, FixedStaffLookup):
-                if relayed_result.outcome == "queued":
-                    return Result("failed", relayed_result.detail)
-                if relayed_result.outcome == "sent":
-                    owner = delivery_message.claude_attempt
-                    assert isinstance(owner, ClaudeDeliveryAttempt) and isinstance(owner.recipient, StaffClaudeRecipient)
-                    return relayed_result._replace(receiver=owner.recipient.current.address)
-            if relayed_result.outcome != "queued":
-                return relayed_result
-            attempt = delivery_message.claude_attempt
-            assert isinstance(attempt, ClaudeDeliveryAttempt)
-            queue_recipient = attempt.recipient
-            if isinstance(queue_recipient, RelayProcessRecipient):
-                return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
-            if review_text:
-                queue_recipient = conversation_recipient(queue_recipient)
-            enqueue(replace(delivery_message, key=None if review_text else delivery_message.key),
-                    relayed_result.detail, started, order=order, membership=membership, mailbox=queue_recipient)
-            return relayed_result
-
-        def relay_with_claim(attempt: Message, timeout: float, entry_id: str) -> Result:
-            nonlocal claim_result
-            relayed = relay_and_queue(attempt, timeout)
-            if not complete_postmaster_fallback(delivery_identity, stable, entry_id, started, relayed):
-                claim_result = RepeatPending("a later send took the key")
-            elif delivery_identity.key is not None and relayed.outcome in ("sent", "queued"):
-                return RecordedDeliveryAcceptance(*relayed)
-            return relayed
-
-        if isinstance(plan, SessionIdWithoutLiveRecipient):
-            result = Result(
-                "queued",
-                f"no live session answers to {plan.address}, so it is kept under that name",
-            )
-            queue_mailbox = conversation_recipient(plan.recipient) if review_text else plan.recipient
-            enqueue(replace(transport_message, key=None if review_text else message.key), result.detail, started,
-                    recipient=attempt_recipient, order=order,
-                    membership=membership, mailbox=queue_mailbox, generation=plan.generation)
-            if isinstance(plan.generation, session_staff.ProvedProcessGeneration):
-                log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
+                result = deliver_worker_text(route.row, membership, agent_text(message),
+                                             sender=message.sender, timeout=options.timeout, selection=options.selection)
         else:
-            assert isinstance(plan, RelayAttempt)
-            live = records
-            relay_message = replace(transport_message, to=plan.message.to, claude_attempt=plan.message.claude_attempt)
-            postmaster_recipient = _postmaster_recipient(plan, live, membership)
-            entry_id = postmaster.new_entry_id()
-            try:
-                if isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
-                    reservation = reserve_postmaster_claim(delivery_identity, started, options.timeout, entry_id)
+            claude_started = time.monotonic()
+            def relay_and_queue(relay_message: Message, timeout: float) -> Result:
+                if transport_message.review_batch:
+                    delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection,
+                                                                    review_session=review_session)
                 else:
-                    reservation = _reserve_claude_delivery(delivery_identity, started, options.timeout, entry_id,
-                                                        direct_relay=True)
-            except BaseException:
-                cancel_unpublished_postmaster_claim(delivery_identity, entry_id)
-                raise
-            if not isinstance(reservation, ClaimGranted):
-                claim_result = reservation
-                if isinstance(reservation, RepeatUnconfirmed):
-                    result = UnconfirmedPostmasterDelivery("failed", reservation.reason)
-                elif isinstance(reservation, RepeatAccepted):
-                    result = Result("skipped", reservation.reason)
-                else:
-                    result = Result("retry" if options.review_delivery else "pending", reservation.reason)
-            elif isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
+                    delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection)
+                if isinstance(options.selection, FixedStaffLookup):
+                    if relayed_result.outcome == "queued":
+                        return Result("failed", relayed_result.detail)
+                    if relayed_result.outcome == "sent":
+                        owner = delivery_message.claude_attempt
+                        assert isinstance(owner, ClaudeDeliveryAttempt) and isinstance(owner.recipient, StaffClaudeRecipient)
+                        return relayed_result._replace(receiver=owner.recipient.current.address)
+                if relayed_result.outcome != "queued":
+                    return relayed_result
+                attempt = delivery_message.claude_attempt
+                assert isinstance(attempt, ClaudeDeliveryAttempt)
+                queue_recipient = attempt.recipient
+                if isinstance(queue_recipient, RelayProcessRecipient):
+                    return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
+                if transport_message.review_batch:
+                    queue_recipient = conversation_recipient(queue_recipient)
+                enqueue(replace(delivery_message, key=None if transport_message.review_batch else delivery_message.key),
+                        relayed_result.detail, started, order=order, membership=membership, mailbox=queue_recipient)
+                return relayed_result
+
+            def relay_with_claim(attempt: Message, timeout: float, entry_id: str) -> Result:
+                nonlocal claim_result
+                relayed = relay_and_queue(attempt, timeout)
+                if not complete_postmaster_fallback(delivery_identity, stable, entry_id, started, relayed):
+                    claim_result = RepeatPending("a later send took the key")
+                elif delivery_identity.key is not None and relayed.outcome in ("sent", "queued"):
+                    return RecordedDeliveryAcceptance(*relayed)
+                return relayed
+
+            if isinstance(plan, SessionIdWithoutLiveRecipient):
+                result = Result(
+                    "queued",
+                    f"no live session answers to {plan.address}, so it is kept under that name",
+                )
+                queue_mailbox = conversation_recipient(plan.recipient) if transport_message.review_batch else plan.recipient
+                enqueue(replace(transport_message, key=None if transport_message.review_batch else message.key), result.detail, started,
+                        recipient=attempt_recipient, order=order,
+                        membership=membership, mailbox=queue_mailbox, generation=plan.generation)
+                if isinstance(plan.generation, session_staff.ProvedProcessGeneration):
+                    log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
+            else:
+                assert isinstance(plan, RelayAttempt)
+                live = records
+                relay_message = replace(transport_message, to=plan.message.to, claude_attempt=plan.message.claude_attempt)
+                postmaster_recipient = _postmaster_recipient(plan, live, membership)
+                entry_id = postmaster.new_entry_id()
                 try:
-                    delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
-                                                  delivered_text(transport_message, entry_id), live,
-                                                  reply_identity=sender_native_id(message.stamp), membership=membership,
-                                                  deadline=claude_started + options.timeout,
-                                                  publish=partial(publish_postmaster_entry, delivery_identity, entry_id,
-                                                                  selection=options.selection, session=postmaster_recipient.session),
-                                                  resolve=partial(record_postmaster_result, delivery_identity, entry_id))
+                    if isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
+                        reservation = reserve_postmaster_claim(delivery_identity, started, options.timeout, entry_id)
+                    else:
+                        reservation = _reserve_claude_delivery(delivery_identity, started, options.timeout, entry_id,
+                                                            direct_relay=True)
                 except BaseException:
                     cancel_unpublished_postmaster_claim(delivery_identity, entry_id)
                     raise
-                if isinstance(delivery, postmaster.Delivered):
-                    _ = finish_postmaster_claim(delivery_identity, entry_id, delivery, recipient=stable)
-                    result = Result("sent", f"postmaster; {'verbatim' if delivery.verbatim else 'NOT VERBATIM'}; "
-                                    + f"session:{postmaster_recipient.session['sessionId']}")
-                    if delivery_identity.key is not None:
-                        result = RecordedDeliveryAcceptance(*result)
-                    log_route = ClaudeRoute("postmaster", "delivered", time.monotonic() - claude_started)
-                elif isinstance(delivery, postmaster.DeliveryUnconfirmed):
-                    result = UnconfirmedPostmasterDelivery("failed", POSTMASTER_UNCONFIRMED)
-                    log_route = ClaudeRoute("postmaster", "claimed-no-result", time.monotonic() - claude_started)
-                else:
-                    if finish_postmaster_claim(delivery_identity, entry_id, delivery, recipient=stable):
-                        result = relay_with_claim(relay_message, max(1.0, options.timeout - delivery.seconds), entry_id)
-                        log_route = ClaudeRoute("relay", delivery.reason, time.monotonic() - claude_started)
+                if not isinstance(reservation, ClaimGranted):
+                    claim_result = reservation
+                    if isinstance(reservation, RepeatUnconfirmed):
+                        result = UnconfirmedPostmasterDelivery("failed", reservation.reason)
+                    elif isinstance(reservation, RepeatAccepted):
+                        result = Result("skipped", reservation.reason)
                     else:
-                        reason = "a later send took the key; no relay or queued copy was started"
-                        claim_result = RepeatPending(reason)
-                        result = Result("failed", reason)
-            else:
-                result = relay_with_claim(relay_message, options.timeout, entry_id)
-                log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
-    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.held:
+                        result = Result("retry" if options.review_delivery else "pending", reservation.reason)
+                elif isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
+                    try:
+                        delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
+                                                      delivered_text(transport_message, entry_id), live,
+                                                      reply_identity=sender_native_id(message.stamp), membership=membership,
+                                                      deadline=claude_started + options.timeout,
+                                                      publish=partial(publish_postmaster_entry, delivery_identity, entry_id,
+                                                                      selection=options.selection, session=postmaster_recipient.session),
+                                                      resolve=partial(record_postmaster_result, delivery_identity, entry_id))
+                    except BaseException:
+                        cancel_unpublished_postmaster_claim(delivery_identity, entry_id)
+                        raise
+                    if isinstance(delivery, postmaster.Delivered):
+                        _ = finish_postmaster_claim(delivery_identity, entry_id, delivery, recipient=stable)
+                        result = Result("sent", f"postmaster; {'verbatim' if delivery.verbatim else 'NOT VERBATIM'}; "
+                                        + f"session:{postmaster_recipient.session['sessionId']}")
+                        if delivery_identity.key is not None:
+                            result = RecordedDeliveryAcceptance(*result)
+                        log_route = ClaudeRoute("postmaster", "delivered", time.monotonic() - claude_started)
+                    elif isinstance(delivery, postmaster.DeliveryUnconfirmed):
+                        result = UnconfirmedPostmasterDelivery("failed", POSTMASTER_UNCONFIRMED)
+                        log_route = ClaudeRoute("postmaster", "claimed-no-result", time.monotonic() - claude_started)
+                    else:
+                        if finish_postmaster_claim(delivery_identity, entry_id, delivery, recipient=stable):
+                            result = relay_with_claim(relay_message, max(1.0, options.timeout - delivery.seconds), entry_id)
+                            log_route = ClaudeRoute("relay", delivery.reason, time.monotonic() - claude_started)
+                        else:
+                            reason = "a later send took the key; no relay or queued copy was started"
+                            claim_result = RepeatPending(reason)
+                            result = Result("failed", reason)
+                else:
+                    result = relay_with_claim(relay_message, options.timeout, entry_id)
+                    log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
+        return result
+
+    def confirm_review_delivery(batch: review_hold.ReleasedMessages, result: Result) -> None:
         accepted = (isinstance(result, PaneTextDelivered) if isinstance(route, PaneWorkerRecipient)
                     else result.outcome in ("sent", "queued"))
-        if accepted:
-            review_route.accepted_at = now().timestamp()
+        if batch.held and accepted:
+            batch.accepted_at = now().timestamp()
+
+    batch_only = new_message_result is not None
+    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages:
+        result = deliver(review_transport(review_route, batch_only=batch_only), batch_only=batch_only)
+    elif new_message_result is not None:
+        result = new_message_result
+    else:
+        result = deliver(message)
+    if isinstance(review_route, review_hold.ReleasedMessages):
+        confirm_review_delivery(review_route, result)
     if new_message_result is not None:
         result = new_message_result
     if result.outcome == "sent" and message.key is not None:
@@ -5511,6 +5523,16 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         log(replace(message, to=reported_to), result, started, log_route)
     if options.report_recipient:
         print("SEND_RECIPIENT: " + (result.receiver or reported_to), file=sys.stderr)
+    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.held and not review_route.messages:
+        # Settle the urgent key before taking the pending batch.
+        review_access.close()
+        try:
+            with review_hold.pending_release(review_session, record_keys=record_released_acceptances) as pending:
+                if pending.held:
+                    released = deliver(review_transport(pending, batch_only=True), batch_only=True)
+                    confirm_review_delivery(pending, released)
+        except (OSError, ValueError) as error:
+            print(f"review hold for {destination}: {error}", file=sys.stderr)
     return result._replace(receiver="")
 
 

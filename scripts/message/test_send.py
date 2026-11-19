@@ -2079,6 +2079,39 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertIn("Other update.", batches[0])
         self.assertNotIn("Old update.", batches[0])
 
+    def test_urgent_send_releases_the_remaining_messages_when_the_review_ends_in_transport(self) -> None:
+        self.session("recipient", "Recipient")
+        at = send.now()
+        review_hold.set_count("recipient", 3, at.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+        args = ["--to", "session:recipient", "--from", "test"]
+        for index, (key, text) in enumerate((
+                ("first", "First saved update."), ("urgent", "Old urgent update."), ("last", "Last saved update."))):
+            with mock.patch.object(send, "now", return_value=at + timedelta(seconds=index)):
+                result = send.send(local_options([*args, "--key", key, "--text", text]))
+            self.assertEqual(result.outcome, "kept", result.detail)
+        urgent_at = at + timedelta(seconds=3)
+
+        def end_review_in_transport(message: send.Message, timeout: float) -> send.Result:
+            if message.urgent:
+                review_hold.set_count("recipient", 0, urgent_at.timestamp(), self.fail,
+                    record_keys=send.record_released_acceptances)
+                self.assertEqual(review_hold.item_count("recipient"), 0)
+            return self.relay(message, timeout)
+
+        with (mock.patch.object(send, "now", return_value=urgent_at),
+              mock.patch.object(send, "relay", side_effect=end_review_in_transport)):
+            result = send.send(local_options([*args, "--key", "urgent", "--urgent", "--text", "New urgent update."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        urgent, release = self.relayed
+        self.assertEqual(urgent.text, "New urgent update.")
+        self.assertTrue(release.review_batch)
+        self.assertLess(release.text.index("First saved update."), release.text.index("Last saved update."))
+        self.assertNotIn("Old urgent update.", release.text)
+        self.assertNotIn("New urgent update.", release.text)
+        review_hold.set_count("recipient", 0, urgent_at.timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+
     def test_each_local_release_restarts_the_repeat_window_for_a_held_key(self) -> None:
         released = send.now()
         at = released - timedelta(minutes=20)
@@ -8043,6 +8076,42 @@ class PaneWorkerMessageTests(unittest.TestCase):
         prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
         self.assertEqual([command[2] for command in prompts], ["w1:p1"])
         self.assertIn("Read the private report.", prompts[0][3])
+
+    def test_skipped_send_keeps_the_review_batch_when_the_worker_pane_is_blocked(self) -> None:
+        worker = self.row
+        session = str(worker.current_session)
+        _ = self.fixture.session_record(session, worker.name)
+        registry = session_records.read_registry()
+        _ = write_send_config(self.fixture.root / "conf/send.conf", "review_hold_idle_minutes=1")
+        at = send.now()
+        args = ["--here", "--to", f"worker:{self.fixture.parent.name}/{worker.name}", "--from", "fixture",
+                "--forwarded-shown-sender", "fixture"]
+        repeated = send.parse([*args, "--key", "repeat", "--repeat-minutes", "60", "--text", "Skip this report."])
+        with (mock.patch.object(sessions, "read_registry", return_value=registry),
+              mock.patch.object(send, "now", return_value=at) as clock):
+            first = send.send(repeated._replace(text="Initial report."))
+            self.assertEqual(first.outcome, "sent", first.detail)
+            review_hold.set_count(session, 2, at.timestamp(), self.fail,
+                record_keys=send.record_released_acceptances)
+            saved = send.send(send.parse([*args, "--text", "Saved review update."]))
+            self.assertEqual(saved.outcome, "kept", saved.detail)
+
+            world = self.fixture.world
+            world.commands.clear()
+            world.locations["w1:p1"]["agent_status"] = "blocked"
+            clock.return_value = at + timedelta(minutes=2)
+            self.assertEqual(send.send(repeated).outcome, "skipped")
+            self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+            self.assertFalse(any(command[:2] == ("agent", "prompt") for command in world.commands))
+
+            world.locations["w1:p1"]["agent_status"] = "idle"
+            self.assertEqual(send.send(repeated).outcome, "skipped")
+            prompt, = [command for command in world.commands if command[:2] == ("agent", "prompt")]
+            self.assertEqual(prompt[2], "w1:p1")
+            self.assertIn("Saved review update.", prompt[3])
+            self.assertNotIn("Skip this report.", prompt[3])
+            review_hold.set_count(session, 0, (at + timedelta(minutes=2)).timestamp(), self.fail,
+                record_keys=send.record_released_acceptances)
 
     def test_worker_message_requires_one_prompt_to_start_a_turn(self) -> None:
         message = "Detached run: private-run\nResult: PASS"
