@@ -3162,7 +3162,7 @@ Work:
 2. Landing signal (scripts/production/land_runs.py): `landing_active()` is on when a live land record exists (running_lands), or when the lease process is alive and its state is `taking`. A dead runner frees the queue at once. A line with items and no live runner does not hold.
 3. Queue (scripts/build_queue/admission_service.py): while the signal is on, the admission walk starts no natedev step whose repository and step are in the key, except the landing's own test (44cy LandingTest). Held waiters keep their places. An AWS placement is not held.
 4. A held waiter's wait reason reads "waits for natemerge's landing" in verify.sh and on the Builds page.
-5. One new key in config/build_admission.conf: `landing_hold_steps=claude_commands:merge-gate claude_commands:targeted-test` (name pending nate's go). Empty turns the rule off.
+5. One new key in config/build_admission.conf: `landing_wait_steps=claude_commands:test-all claude_commands:test-modules claude_commands:test-affected` (name pending nate's go). Each entry is <repository>:<gate job>, as build_steps.command_job names it. Empty turns the rule off. integrate and promote are the merge itself; fast-track runs no suite; toolchain-trial runs only in Hana. test-nightly waits for bob's answer.
 6. Update the as-built text (build-memory-admission.md, the land line doc).
 7. After merge, natemerge removes hold_begin, hold_end and hold_off from its runner; the build_hold drain is no longer used for landings.
 
