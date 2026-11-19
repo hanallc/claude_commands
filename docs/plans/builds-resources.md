@@ -2966,22 +2966,17 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/spot_table.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_control.py`.
 
-### Phase 162 — The Gate column takes only zones with gate boxes  · status: todo
-**Source:** builds, 2026-11-19 00:5x EST, from the Phase 161 blind review.
-**Cause:** `spot_table` prices each Gate cell at the lowest Spot price of any zone in the snapshot. Placement and the break-even card take only the zones in `gate-deployment.json` (`run_cost.gate_variant_eligibility`). A cheap zone with no gate boxes makes the Gate column and the cheapest-gate line show a price placement cannot get.
+### Phase 162 — The Gate column takes only zones with gate boxes  · status: done
+**Source:** builds, 2026-11-19, from the Phase 161 blind review.
 
-#### Work Order
+#### As-built
+- The Gate column and the cheapest-gate line take the lowest current price among the zones in `gate-deployment.json`, placement's slow filter (`max_gate_minutes`) and placement's run history window. The Spot column keeps the lowest price of any zone.
+- A Gate cell with no price shows a dash; its tooltip says `too slow`, `no current gate price` or `no runs`.
+- `run_cost` holds the shared readers: `read_deployed_gate_variants`, `slow_gate_types`, `placement_run_evidence`. The page and the break-even card use them. `placement_run_evidence` matches `cloud_gate.rank_variants` lines 571-579; `cloud_gate.py` is unchanged, so a later phase can switch placement to it.
+- Each page build reads current zone prices once and passes them to the Gate table and the card (`aws_page.py`).
+- The per-type run and paid tables keep the full launch ledger read.
+- Review: 3 passes, 7 findings (2 blockers, 5 minor); 6 fixed in 2 rounds. Accepted: a `max_gate_minutes` change during one page build can make the Gate cell and the card differ until the next build.
+- Tests on the row in both layouts, 0 failures: 9 suites, 314 tests; types 0.
+- Checkpoint `b3ba4334c`; row `7a8fc310f` on the Phase 161 row `2604acf72`, branch `builds-resources-p162`.
 
-**Goal:** a Gate cell uses only the zones where that type has gate boxes in that region, as placement does.
-
-**Spec:**
-1. The Gate grid and the cheapest-gate line take the lowest price among the deployed zones of the region and type. The Spot column keeps the lowest price of any zone.
-2. A region and type with no deployed zone, or no current price in one, shows a short note in the Gate cell, not a price.
-3. Read the deployment through the code that placement uses; keep one reader.
-4. No change to placement, `cloud_gate.py` or any config key.
-
-**Base:** row `2604acf72` (Phase 161).
-
-**Files:** `scripts/aws_target/spot_table.py`, `scripts/aws_target/run_cost.py` (only to share the deployment reader), tests in `test_aws_page.py` or `test_control.py`.
-
-**Acceptance gate:** a test with a cheap zone that has no gate boxes shows the Gate cell at the deployed zone's price, equal to the break-even card; a type with no deployment shows the note. Types 0; the aws page and aws_target suites pass on the row.
+**Files:** `scripts/aws_target/spot_table.py`, `run_cost.py`, `aws_page.py`, `test_aws_page.py`, `test_control.py`.
