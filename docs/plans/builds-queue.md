@@ -2998,6 +2998,17 @@ Work:
 3. Use the one parser. Move it to a module both scripts import if needed; keep no copy of the rule.
 4. Rules that only merge time can check (for example, the merged main or the gate result) stay at merge time.
 
+### Phase 44ct — One head-stall alert for one stall, to builds and bob only  · status: todo
+**From builds, 2026-11-19 01:3x (bob item 135; user: "I just want you to fix it"):** rank after 44bw, before 44cl. The head-stall alert sent the user 4 emergency phone pushes for one stall (23:26, 23:44, 23:45, 23:58 EST). Today `send_alert` (`scripts/build_queue/head_stall.py:168`) sends to builds and pushes to the user, keyed on the head (`stall.key`, :175, :195), so each head change sends again.
+
+Work:
+1. Replay tonight's case with a test: one stall (one last-admission time) whose head changes three times. Today it sends four alerts and four user pushes.
+2. The alert goes to builds and bob only. Remove the `push_texts` user send and its `--clears-when` hook.
+3. Key the alert on the stall: the time of the last admission. A head change in the same stall sends nothing new. A new admission ends the stall.
+4. The alert names each build that holds the memory and how long it has run.
+5. Stack on 44cn (both edit `builds_text`), or merge main after 44cn merges.
+6. As-built note: `head_stall_alert_minutes` goes back from 600 to 30. builds runs the /tune after the merge (builds set 600 on 11-19 to mute the pushes).
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
