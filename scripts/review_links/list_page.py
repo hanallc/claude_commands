@@ -41,12 +41,12 @@ HEADERS = ("#", FIELD_LABELS["owner"], FIELD_LABELS["producer"], "Item",
 
 
 class ListChip(StrEnum):
+    ALL = "all"
     NEEDS_ME = "needs-me"
     MORTY_ANSWERING = "morty-answering"
     WORKING = "working"
     BLOCKED = "blocked"
     PARKED = "parked"
-    CLOSED = "closed"
 
 
 CHIP_BY_STATE = {
@@ -55,18 +55,17 @@ CHIP_BY_STATE = {
     the_list.ItemState.BLOCKED: ListChip.BLOCKED,
     the_list.ItemState.WAITING_FOR_NATE: ListChip.NEEDS_ME,
     the_list.ItemState.DELIVERED: ListChip.NEEDS_ME,
-    the_list.ItemState.DONE: ListChip.CLOSED,
+    the_list.ItemState.DONE: ListChip.ALL,
     the_list.ItemState.PAUSED: ListChip.BLOCKED,
-    the_list.ItemState.CLOSED: ListChip.CLOSED,
 }
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool) -> ListChip:
     """Find the one status chip for this item."""
-    if open_question:
-        return ListChip.MORTY_ANSWERING
     chip = CHIP_BY_STATE[state]
-    return ListChip.PARKED if parked and chip is not ListChip.CLOSED else chip
+    if parked:
+        return ListChip.PARKED
+    return ListChip.MORTY_ANSWERING if open_question else chip
 
 
 def has_open_question(item: the_list.ListItem) -> bool:
@@ -89,7 +88,7 @@ def page_url() -> str:
     return PAGE_PATH
 
 
-def records() -> list[ListRecord]:
+def records(*, include_closed: bool = False) -> list[ListRecord]:
     """Read the list folders even when a producer has no current staff row."""
     try:
         owners = sorted(record_store.state_root().iterdir())
@@ -97,7 +96,7 @@ def records() -> list[ListRecord]:
         return []
     found = [ListRecord(staff.StaffId(owner.name), item) for owner in owners
              if owner.is_dir() and not owner.is_symlink()
-             for item in the_list.records(staff.StaffId(owner.name), include_closed=True)]
+             for item in the_list.records(staff.StaffId(owner.name), include_closed=include_closed)]
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
@@ -183,6 +182,9 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = label + by + change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
         body = "Answered question " + html.escape(content.question_id) + by
+    elif isinstance(content, the_list.QuestionClosed):
+        body = ("Question " + html.escape(content.question.question_id) + " closed with the item" + by
+                + change_browser.question_paragraphs(content.question.words))
     elif isinstance(content, the_list.MarkedRead):
         body = "Marked read" + by
     elif isinstance(content, the_list.Reopened):
@@ -278,12 +280,11 @@ def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tupl
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     parked = '' if parking_label else ' hidden'
-    unpark = ' hidden' if entry.item.state == the_list.ItemState.CLOSED else parked
     note = 'Parked until ' + parking_label if parking_label else ''
     retry = "".join(question_resend(resend, today) for resend in resends)
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
-            + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button>'
+            + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
             + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
             + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
             + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
@@ -405,9 +406,6 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
                  for number in item.related_to)
     if links:
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
-    if item.state == the_list.ItemState.CLOSED:
-        sections += (f'<section><h3>{FIELD_LABELS["closing_words"]}</h3>'
-                     + field_html("closing_words", item.closing_words, today, names) + '</section>')
     if item.reviews:
         cards = (review_card(identity, reviews) for identity in item.reviews)
         sections += '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
@@ -451,12 +449,11 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
         state += '<small data-open-question-note>Morty answering</small>'
-    if item.state != the_list.ItemState.CLOSED:
-        if isinstance(item.next_check, datetime):
-            label = "Check overdue " if item.next_check < today else "Check "
-            state += '<small>' + label + field_html("next_check", item.next_check, today, names) + '</small>'
-        elif isinstance(item.next_check, the_list.CheckCondition):
-            state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
+    if isinstance(item.next_check, datetime):
+        label = "Check overdue " if item.next_check < today else "Check "
+        state += '<small>' + label + field_html("next_check", item.next_check, today, names) + '</small>'
+    elif isinstance(item.next_check, the_list.CheckCondition):
+        state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
@@ -526,9 +523,11 @@ class SavedActionState(TypedDict):
     waiting_for_answer: str
     open_question: str
     waiting_details_html: NotRequired[str]
+    park_request_saved: NotRequired[bool]
 
 
-def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None) -> SavedActionState:
+def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None,
+                       park_request: str = "") -> SavedActionState:
     owner = staff.StaffId(keeper)
     item = the_list.load(owner, identity)
     zone = user_zone()
@@ -537,13 +536,16 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                     if isinstance(item.parked_until, datetime) and item.parked_until > today else "")
     unread = item.unread_since
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
-    waiting = isinstance(the_list.question_visibility(owner, item, reading), the_list.WaitingForAnswer)
+    open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
+    waiting = open_question and isinstance(the_list.question_visibility(owner, item, reading), the_list.WaitingForAnswer)
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
                                "parked": str(bool(parked_until)).lower(), "parked_until": parked_until,
                                "waiting_for_answer": str(waiting).lower(),
-                               "open_question": str(has_open_question(item)).lower()}
+                               "open_question": str(open_question).lower()}
+    if park_request:
+        saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
     if waiting:
         names = staff_names.StaffNames(staff.snapshot())
         secret = change_browser.browser_manifest(change_page.console_folder(reading.root))[0]
@@ -662,7 +664,7 @@ def deliver(submission: ListActionSubmission) -> None:
 
 def recover_pending() -> None:
     """Retry each pending request once at server start."""
-    for entry in records():
+    for entry in records(include_closed=True):
         for feedback in the_list.feedback_requests(entry.item).values():
             if feedback.state == "pending":
                 try:
@@ -732,7 +734,7 @@ def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) ->
 
 def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner]) -> list[record_table.Chip]:
     """Build a counted chip for each staff ID, in name order."""
-    choices = [(owner_name(members, identity).removesuffix("-unit"), identity, count)
+    choices = [(re.sub(r"(?:-unit)+\Z", "", owner_name(members, identity)) or str(identity), identity, count)
                for identity, count in counts.items()]
     choices.sort(key=lambda choice: (choice[0].casefold(), choice[1]))
     return [record_table.Chip("all", "All", counts.total()),
@@ -745,7 +747,13 @@ def render(root: Path, *, include_counts: bool = True,
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
-    items = records()
+    items: list[ListRecord] = []
+    closed_keys: list[str] = []
+    for entry in records(include_closed=True):
+        if entry.item.state == the_list.ItemState.CLOSED:
+            closed_keys.append(entry.key)
+        else:
+            items.append(entry)
     if status == "standalone":
         status = change_page.DeliveryStatus(root)
     reviews = ({review.key: review for review in review_items.read(root, members=members)}
@@ -767,9 +775,9 @@ def render(root: Path, *, include_counts: bool = True,
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question)] += 1
         rows.append(item_rows(entry, names, today, index, secret, reviews, parked=parked,
                               open_question=open_question, visibility=visibility))
-    shows = [record_table.Chip("all", "All", chip_counts.total()),
+    shows = [record_table.Chip("all", "All", chip_counts.total() - chip_counts[ListChip.PARKED]),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
-               for chip in ListChip)]
+               for chip in ListChip if chip != ListChip.ALL)]
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     linked_headers = ''.join(f'<th scope="col">{label}</th>' for label in HEADERS)
@@ -787,6 +795,7 @@ def render(root: Path, *, include_counts: bool = True,
                                                     ("collapse", "Collapse all", "chevrons-down-up")))
     content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
+               + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', staff_chips(members, owners), 'all')
@@ -851,7 +860,7 @@ background:var(--ink-2);border-radius:50%}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-actions{position:relative}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
-.list-row.open [data-parked-note]{display:none}
+[data-waiting-for-answer=false] .list-row.open [data-parked-note]{display:none}
 .list-table:has(.list-park>[data-later-menu]:not([hidden])),
 .list-table tbody:has(.list-park>[data-later-menu]:not([hidden])){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
@@ -882,13 +891,15 @@ SCRIPT = (page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TI
 const chipsByQuestion=''' + json.dumps({
     str(open_question).lower(): {
         str(parked).lower(): {
-            state.value: list_chip(state, parked=parked, open_question=open_question).value for state in the_list.ItemState
+            state.value: list_chip(state, parked=parked, open_question=open_question).value for state in CHIP_BY_STATE
         } for parked in (False, True)
     } for open_question in (False, True)
 }) + ''';
-const shows=''' + json.dumps(["all", *ListChip]) + r''';
+const shows=''' + json.dumps(list(ListChip)) + r''';
 const chipsByState=chipsByQuestion.false.false;
+const chipFor=data=>chipsByQuestion[data.openQuestion][data.parked][data.state];
 let content=document.querySelector('[data-list]');
+let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0;
 const drafts=new Map();
 const unparkMessages={
@@ -950,7 +961,7 @@ function syncUnread(item,form,unread,unreadSort){
    empty.setAttribute('aria-label','No unread update');empty.textContent='—';update.prepend(empty);}
  }
 }
-const pendingOpenReads=new Set(),keepOpenAfterRead=new Set();
+const pendingOpenReads=new Map(),keepOpenAfterRead=new Set();
 /** @type {Map<string, {unseen: Set<Element>, seen: Set<string>}>} */
 const watchedAnswers=new Map();
 let unreadShow='',unreadFilterVersion=0;
@@ -960,14 +971,14 @@ const answerVisibility=new IntersectionObserver(entries=>{
  for(const entry of entries){
   if(!entry.isIntersecting || !entry.intersectionRect.width || !entry.intersectionRect.height) continue;
   const item=entry.target.closest('[data-list-item]');
-  if(!item?.isConnected || item.hidden) continue;
+  if(!item?.isConnected || item.hidden || entry.target.closest('[data-detail]').hidden) continue;
   const watch=watchedAnswers.get(item.dataset.key);
   if(!watch?.unseen.delete(entry.target)) continue;
   watch.seen.add(entry.target.parentElement.dataset.question);
   answerVisibility.unobserve(entry.target);
-  if(!watch.unseen.size) void markOpenedAnswerRead(item);
+  if(!watch.unseen.size) void markOpenedAnswerRead(item,watch);
  }
-},{threshold:[0,Number.EPSILON]});
+},{threshold:[0,0.000001]});
 function listIsHidden(){
  return document.visibilityState!=='visible' || window.frameElement?.hidden===true;
 }
@@ -992,8 +1003,9 @@ function resumeOpenedAnswerReads(){
   answerVisibility.observe(answer);
  }
 }
-async function markOpenedAnswerRead(item){
+async function markOpenedAnswerRead(item,watch){
  const key=item.dataset.key;
+ if(watchedAnswers.get(key)!==watch || watch.unseen.size) return;
  if(item.hidden || !tableView.opened.has(key) || listIsHidden()) return;
  const panel=item.querySelector('[data-detail]:not([hidden]) .list-panel');
  const request=panel?.dataset.openReadRequest;
@@ -1004,7 +1016,8 @@ async function markOpenedAnswerRead(item){
  const [keeper,id]=key.split('/');
  const body=new URLSearchParams({keeper,id,request,token,action:'read',words:'',until:''});
  const submission=tableView.startAction(item);
- pendingOpenReads.add(key);saving++;pageRefresh.abandon();
+ const pending={keepOpen:true};
+ pendingOpenReads.set(key,pending);saving++;pageRefresh.abandon();
  let saved=false;
  try{
   const response=await fetch(location.pathname,{method:'POST',body});
@@ -1013,7 +1026,8 @@ async function markOpenedAnswerRead(item){
   saved=true;
   if(result.unread==='false'){
    delete panel.dataset.openReadRequest;
-   if(unreadShow && filterVersion===unreadFilterVersion && tableView.opened.has(key)) keepOpenAfterRead.add(key);
+   if(pending.keepOpen && unreadShow && filterVersion===unreadFilterVersion && tableView.opened.has(key))
+    keepOpenAfterRead.add(key);
   }
  }catch(error){
   tableView.showActionResult(item,submission,'Item '+item.dataset.number,
@@ -1029,9 +1043,9 @@ const tableView=createRecordTable({content:()=>content,
  place:params=>{
   const show=params.get('show');
   if(show==='unread'){params.set('show','all');params.set('unread','1');}
-  if(show==='done') params.set('show','closed');
-  const stateChip=chipsByState[params.get('state')];
-  if((show==='open' || show==='all' || show==='unread' || !show) && Object.hasOwn(chipsByState,params.get('state')))
+  const state=params.get('state'),stateChip=chipsByState[state];
+  if(show==='done' || show==='closed' || state==='Closed') params.set('show','all');
+  else if((show==='open' || show==='all' || show==='unread' || !show) && Object.hasOwn(chipsByState,state))
    params.set('show',stateChip);
  },
  filters:['producer','unread'],
@@ -1049,18 +1063,24 @@ const tableView=createRecordTable({content:()=>content,
  itemOpened:watchOpenedAnswer,
  expandedSelection:(data,selection)=>selection.filters.unread && selection.show===unreadShow &&
   keepOpenAfterRead.has(data.key) ? {...selection,filters:{...selection.filters,unread:''}} : undefined,
+ requiredShow:data=>data && chipFor(data)==='parked' ? 'parked' : undefined,
+ hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
-  return number ? 'Item #'+number+' is not on the List' : '';
+  if(!number) return '';
+  return 'Item #'+number+(closedKeys.has(key) ? ' is closed' : ' is not on the List');
  },
  filterValues:(data,search,{filters})=>{
-  if((filters.unread && data.unread!=='true') || !matchesWords(data,search)) return null;
-  return {show:[chipsByQuestion[data.openQuestion][data.parked][data.state]],owner:[data.owner],producer:[data.producer]};
+  const chip=chipFor(data);
+  if(!chip || (filters.unread && data.unread!=='true') || !matchesWords(data,search)) return null;
+  return {show:chip==='all' ? [] : [chip],owner:[data.owner],producer:[data.producer]};
  },
- counts:(items,count,{counts})=>count+' of '+items.length+' items shown · '+
-  (counts.show['needs-me'] ?? 0)+' need you · '+
-  items.filter(item=>item.dataset.unread==='true').length+' unread',
+ counts:(items,count,{counts})=>{
+  const open=items.filter(item=>item.dataset.state!=='Closed');
+  return count+' of '+open.length+' items shown · '+(counts.show['needs-me'] ?? 0)+' need you · '+
+   open.filter(item=>item.dataset.unread==='true').length+' unread';
+ },
 });
 function listOwnsFocus(){
  if(parent===window || document.hasFocus()) return true;
@@ -1095,6 +1115,53 @@ function bindListControls(){
    item.dataset.parked=confirmed.parked;
    unpark.hidden=confirmed.parked!=='true' || confirmed.state==='Closed';
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
+  };
+  const applySavedState=result=>{
+   if(typeof result.item_state==='string') confirmed.state=result.item_state;
+   if(confirmed.state==='Closed'){
+    closedKeys.add(key);
+    tableView.closeCard(key);
+   }
+   const unread=result.unread==='true';
+   if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
+   if(['true','false'].includes(result.unread)){
+    confirmed.unread=unread;
+    confirmed.unreadSort=unread ? (result.unread_sort ?? confirmed.unreadSort) : 0;
+   }
+   syncConfirmed();
+   const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
+   state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
+   const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
+   if(typeof result.parked_until==='string'){
+    let note=item.querySelector('[data-parked-note]');
+    parkedDetail.hidden=!result.parked_until;
+    parkedDetail.textContent=result.parked_until ? 'Parked until '+result.parked_until : '';
+    if(result.parked_until){
+     if(!note){note=document.createElement('small');note.dataset.parkedNote='';state.parentElement.append(note);}
+     note.textContent=parkedDetail.textContent;
+    }else note?.remove();
+   }
+   if(['true','false'].includes(result.open_question)) item.dataset.openQuestion=result.open_question;
+   const questionNote=item.querySelector('[data-open-question-note]');
+   if(item.dataset.openQuestion==='true'){
+    if(!questionNote){
+     const note=document.createElement('small');
+     note.dataset.openQuestionNote='';
+     note.textContent='Morty answering';
+     state.after(note);
+    }
+   }else questionNote?.remove();
+   const waiting=result.waiting_for_answer==='true';
+   if(waiting){
+    item.dataset.waitingForAnswer='true';
+    const detail=item.querySelector('[data-detail] td');
+    if(typeof result.waiting_details_html==='string') detail.innerHTML=result.waiting_details_html;
+    else{
+     const note=detail.querySelector('[data-waiting-note]');
+     note.hidden=false;
+     detail.querySelector('.list-panel > div').replaceChildren(note);
+    }
+   }
   };
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
@@ -1157,15 +1224,21 @@ function bindListControls(){
    }
    if(action==='park') item.dataset.parked='true';
    if(clearsUnread) item.dataset.unread='false';
+   const releasesHolds=action==='read' || action==='park' || action==='remove';
+   const restoreLink=releasesHolds ? tableView.releaseLink(key) : undefined;
+   const readFilterVersion=unreadFilterVersion;
+   const hadReadHold=releasesHolds && keepOpenAfterRead.delete(key);
+   const pendingRead=releasesHolds ? pendingOpenReads.get(key) : undefined;
+   if(pendingRead) pendingRead.keepOpen=false;
    const submission=tableView.startAction(item);
    const hidUnread=clearsUnread && wasVisible && item.hidden;
    try{
     const response=await fetch(location.pathname,{method:'POST',body:data});
-    refused=!response.ok && (!asksQuestion || response.status<500);
+    refused=!response.ok && (response.status<500 || (!asksQuestion && action!=='park' && action!=='remove'));
     const result=await response.json();
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
-    if(typeof result.item_state==='string') confirmed.state=result.item_state;
+    applySavedState(result);
     const unread=result.unread==='true';
     const unparked=action==='unpark' && result.unpark_outcome==='cleared';
     const message=action==='remove' ? 'Removed' : action==='park' ? 'Parked' :
@@ -1175,45 +1248,6 @@ function bindListControls(){
      action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     if(usesWords && words.value===data.get('words')) words.value='';
     if(unparked) until.value='';
-    if(['true','false'].includes(result.parked)) confirmed.parked=result.parked;
-    if(['true','false'].includes(result.unread)){
-     confirmed.unread=unread;
-     confirmed.unreadSort=unread ? (result.unread_sort ?? confirmed.unreadSort) : 0;
-    }
-    syncConfirmed();
-    const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
-    state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
-    const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
-    if(typeof result.parked_until==='string'){
-     let note=item.querySelector('[data-parked-note]');
-     parkedDetail.hidden=!result.parked_until;
-     parkedDetail.textContent=result.parked_until ? 'Parked until '+result.parked_until : '';
-     if(result.parked_until){
-      if(!note){note=document.createElement('small');note.dataset.parkedNote='';state.parentElement.append(note);}
-      note.textContent=parkedDetail.textContent;
-     }else note?.remove();
-    }
-    if(['true','false'].includes(result.open_question)) item.dataset.openQuestion=result.open_question;
-    const questionNote=item.querySelector('[data-open-question-note]');
-    if(item.dataset.openQuestion==='true'){
-     if(!questionNote){
-      const note=document.createElement('small');
-      note.dataset.openQuestionNote='';
-      note.textContent='Morty answering';
-      state.after(note);
-     }
-    }else questionNote?.remove();
-    const waiting=result.waiting_for_answer==='true';
-    if(waiting){
-     item.dataset.waitingForAnswer='true';
-     const detail=item.querySelector('[data-detail] td');
-     if(typeof result.waiting_details_html==='string') detail.innerHTML=result.waiting_details_html;
-     else{
-      const note=detail.querySelector('[data-waiting-note]');
-      note.hidden=false;
-      detail.querySelector('.list-panel > div').replaceChildren(note);
-     }
-    }
     if(action==='unpark'){
      const label='Item #'+item.dataset.number;
      tableView.showActionResult(item,submission,label,
@@ -1224,8 +1258,29 @@ function bindListControls(){
     }
    }catch(error){
     const wasHidden=item.hidden;
+    let restore=refused || releasesHolds;
     if(refused) syncConfirmed();
-    else if(clearsUnread) item.dataset.unread=unreadBefore;
+    else if(action==='park' || action==='remove'){
+     restore=false;
+     try{
+      const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
+      if(action==='park') query.set('park-request',attempt.request);
+      const response=await fetch(location.pathname+'?'+query,{cache:'no-store'});
+      if(!response.ok) throw new Error('HTTP '+response.status);
+      const current=await response.json();
+      applySavedState(current);
+      restore=confirmed.state!=='Closed' && (action!=='park' || current.park_request_saved===false);
+     }catch(_){
+      // Keep the pending row state until a refresh can read the record.
+     }
+    }else if(clearsUnread) item.dataset.unread=unreadBefore;
+    if(restore){
+     restoreLink?.();
+     if(readFilterVersion===unreadFilterVersion){
+      if(hadReadHold) keepOpenAfterRead.add(key);
+      if(pendingRead) pendingRead.keepOpen=true;
+     }
+    }
     if(refused || hidUnread) tableView.opened.add(key);
     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
     tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
@@ -1252,7 +1307,7 @@ function bindListControls(){
       }
      }
     }
-    if(refused && action==='park'){
+    if(!saved && action==='park'){
      await tableView.settled();
      if(listOwnsFocus() && document.activeElement===document.body && parkToggle.getClientRects().length && !parkToggle.disabled){
       parkToggle.focus({preventScroll:true});
@@ -1271,7 +1326,8 @@ function bindListControls(){
       }
      }
     }
-    if(saved && item.dataset.waitingForAnswer!=='true') void pageRefresh.refresh(true);
+    if((saved && item.dataset.waitingForAnswer!=='true') ||
+      (!saved && !refused && (action==='park' || action==='remove'))) void pageRefresh.refresh(true);
    }
   });
  });
@@ -1295,6 +1351,7 @@ async function refresh(_supersede=false,current=()=>true){
  const priorWatches=new Map(watchedAnswers);
  for(const key of priorWatches.keys()) stopWatchingOpenedAnswer(key);
  content.replaceWith(fresh);content=fresh;
+ closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
  if(priorWatches.size) for(const item of content.querySelectorAll('[data-list-item]')){
   const watch=priorWatches.get(item.dataset.key);
@@ -1307,7 +1364,9 @@ async function refresh(_supersede=false,current=()=>true){
   const button=action && row?.querySelector('[data-detail]:not([hidden]) button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
  }
- scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
+ scrollTo({top,behavior:'instant'});
+ watchLinkedAnswer();
+ return pageRefreshFacts(page);
 }
 const listReturnParam='list-return',listReturnsKey='console.list.review-returns';
 const maxListReturns=8,maxOpenRows=128,maxRowKeyLength=128,listReturnAge=60*60*1000;
