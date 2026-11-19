@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePath
-from typing import BinaryIO, TypedDict, cast
+from typing import BinaryIO, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 from scripts.buildlog import store, parse
@@ -904,6 +904,10 @@ def build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild:
     return CargoBuildKey(json.dumps(base, sort_keys=True, separators=(",", ":")), tuple(sorted(items)))
 
 
+def _is_string_list(value: object) -> TypeGuard[list[str]]:
+    return isinstance(value, list) and all(isinstance(item, str) for item in cast(list[object], value))
+
+
 def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     argv = record.get("argv")
     charge = record.get("test_phase_charge")
@@ -915,9 +919,7 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
     if not target_directory or not build_directory:
         target_directory = build_directory = store.UNKNOWN_IDENTITY
     checkout = record.get("worktree") or record.get("cwd")
-    key = (build_keys(cast(list[str], argv))
-           if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
-           else NonCargoBuild())
+    key = build_keys(argv) if _is_string_list(argv) else NonCargoBuild()
     record = {
         **record,
         "src": src,
@@ -976,15 +978,23 @@ def nextest_gpu_class(connection: sqlite3.Connection, step_id: str,
         return NextestGpuClass.UNKNOWN
     try:
         if isinstance(argv_json, str):
-            argv = cast(list[str], json.loads(argv_json))
-            if not parse.nextest_status_is_trusted(argv, {}):
+            argv = cast(object, json.loads(argv_json))
+            if not _is_string_list(argv) or not parse.nextest_status_is_trusted(argv, {}):
                 return NextestGpuClass.UNKNOWN
-        observed = cast(parse.ObservedNextestTests, json.loads(saved))
-        if observed["complete"] is not True:
-            return NextestGpuClass.UNKNOWN
-        names = [(binary, test) for binary, tests in observed["by_binary"].items() for test in tests]
-    except (ValueError, AttributeError, KeyError, TypeError):
+        observed = cast(object, json.loads(saved))
+    except (ValueError, RecursionError):
         return NextestGpuClass.UNKNOWN
+    if not isinstance(observed, dict):
+        return NextestGpuClass.UNKNOWN
+    fields = cast(dict[str, object], observed)
+    by_binary = fields.get("by_binary")
+    if fields.get("complete") is not True or not isinstance(by_binary, dict):
+        return NextestGpuClass.UNKNOWN
+    names: list[tuple[str, str]] = []
+    for binary, tests in cast(dict[str, object], by_binary).items():
+        if not _is_string_list(tests):
+            return NextestGpuClass.UNKNOWN
+        names.extend((binary, test) for test in tests)
     if len(names) != ran or len(set(names)) != len(names):
         return NextestGpuClass.UNKNOWN
     classes = {proof.get(name, NextestGpuClass.UNKNOWN) for name in names}

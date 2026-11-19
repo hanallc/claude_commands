@@ -838,6 +838,22 @@ class IndexTests(unittest.TestCase):
         summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
         partial = "Summary [ 0.020s] 2 tests run: 2 passed, 0 skipped\n"
         retry = "TRY 1 FAIL [ 0.008s] (───) hana tests::fast\n"
+        captured = parse.log_facts("nextest", """\
+PASS [ 0.010s] hana tests::fast
+  stdout ───
+PASS [ 0.001s] hana tests::printed
+Summary [ 0.011s] 2 tests run: 2 passed, 0 skipped
+  ──────────
+PASS [ 0.010s] hana tests::gpu
+Summary [ 0.020s] 2 tests run: 2 passed, 1 skipped
+""")
+        self.assertEqual(captured["tests_skipped"], 1)
+        malformed: dict[str, object] = {
+            "string-names": {"by_binary": {"hana": "x"}, "complete": True},
+            "nested-names": {"by_binary": {"hana": [["tests::fast"]]}, "complete": True},
+            "array-by-binary": {"by_binary": ["tests::fast"], "complete": True},
+            "numeric-complete": {"by_binary": {"hana": ["tests::fast"]}, "complete": 1},
+        }
         self.write(self.host_file,
                    step("complete", step="nextest", **parse.log_facts("nextest", passed + summary)),
                    step("hidden", step="nextest", **parse.log_facts("nextest", summary)),
@@ -847,8 +863,11 @@ class IndexTests(unittest.TestCase):
                    step("retry", step="nextest", **parse.log_facts("nextest", retry + summary)),
                    step("missing-proof", step="nextest", **parse.log_facts(
                        "nextest", passed + "PASS [ 0.010s] hana tests::other\n" + partial)),
+                   step("captured-output", step="nextest", **captured),
                    step("legacy", step="nextest", tests_run=1,
-                        tests=[{"binary": "hana", "test": "tests::fast", "status": "passed"}]))
+                        tests=[{"binary": "hana", "test": "tests::fast", "status": "passed"}]),
+                   *(step(name, step="nextest", tests_run=1, observed_tests=observed)
+                     for name, observed in malformed.items()))
         _ = index.update()
         self.assertEqual(self.rows("SELECT step_id FROM tests ORDER BY step_id"), [("legacy",), ("retry",)])
         classes = index.NextestGpuClass
@@ -862,6 +881,13 @@ class IndexTests(unittest.TestCase):
                         self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
             proof["hana", "tests::fast"] = classes.NO_GPU
             self.assertEqual(index.nextest_gpu_class(database, "missing-proof", proof), classes.UNKNOWN)
+            proof["hana", "tests::printed"] = classes.NO_GPU
+            proof["hana", "tests::gpu"] = classes.GPU
+            self.assertEqual(index.nextest_gpu_class(database, "captured-output", proof), classes.UNKNOWN)
+            proof["hana", "x"] = classes.NO_GPU
+            for step_id in malformed:
+                with self.subTest(step_id=step_id):
+                    self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))

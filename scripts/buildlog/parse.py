@@ -394,19 +394,23 @@ class NextestResults:
 def test_results(lines: list[str]) -> NextestResults:
     """Read result names and keep timing rows for failures, retries and slow tests.
 
-    Nextest can repeat failures and retries after the summary. Read only the
-    statuses before the summary.
+    Captured test output can contain a summary. Use the last summary to
+    exclude any results that nextest repeats after it.
     """
-    tests: dict[tuple[str, str], TestRow] = {}
-    unfinished: set[tuple[str, str]] = set()
-    completed = 0
+    summary_line = len(lines)
     summaries: list[Summary] = []
-    for line in lines:
-        found = SUMMARY.match(line)
-        if found:
+    for position in range(len(lines) - 1, -1, -1):
+        if found := SUMMARY.match(lines[position]):
             counts = summary_counts(found.group(2))
             counts["run"] = int(found.group(1))
             summaries.append(counts)
+            summary_line = position
+            break
+    tests: dict[tuple[str, str], TestRow] = {}
+    unfinished: set[tuple[str, str]] = set()
+    completed = 0
+    for position, line in enumerate(lines):
+        if position == summary_line:
             break
         match = TEST_LINE.match(line)
         if not match:
