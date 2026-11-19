@@ -392,12 +392,20 @@ window.fetch=async(url,options={})=>{
    Math.abs(mainBox.left-(width-mainBox.right))<1,'the page uses the shared centered column');
   check(main.classList.contains('page-wide')===(document.title==='Builds'),'only the Builds page is wide');
   check(titleBox.x===mainBox.x+32 && headingBox.y+scrollY===32,'the title starts at the shared column edge');
-  check(lineBox.x===titleBox.x && lineBox.y===headingBox.bottom+8,'the line follows the title row in the same column');
-  check(lineBox.width===headingBox.width && lineBox.height===21,'the line uses the full title row width and shared height');
+  const search=main.querySelector('[data-review] #list-search')?.getBoundingClientRect();
+  if(search){
+   check(lineBox.x===titleBox.x && search.top===headingBox.bottom+8,'the status and search row follows the title');
+   check(lineBox.right<=search.left && Math.abs((lineBox.top+lineBox.bottom)-(search.top+search.bottom))<2,
+    'the live status and search share the row');
+  }else{
+   check(lineBox.x===titleBox.x && lineBox.y===headingBox.bottom+8,'the line follows the title row in the same column');
+   check(lineBox.width===headingBox.width,'the line uses the full title row width');
+  }
+  check(lineBox.height===21,'the line uses the shared height');
   check(getComputedStyle(title).fontSize==='26px' && getComputedStyle(title).fontWeight==='700',
    'the title uses the shared size and weight');
   check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px' &&
-   getComputedStyle(line).marginBottom==='20px','the line uses the shared font and lower space');
+   getComputedStyle(line).marginBottom===(search ? '0px' : '20px'),'the line uses the shared font and the expected lower space');
   const ink=document.createElement('span');ink.style.color='var(--ink)';line.append(ink);
   check(getComputedStyle(title).color===getComputedStyle(ink).color,'the title uses the shared ink color');ink.remove();
   check(getComputedStyle(document.body).backgroundColor===getComputedStyle(line).backgroundColor,

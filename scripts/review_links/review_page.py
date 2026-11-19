@@ -875,18 +875,21 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     new_button = '<button class="review-new" type="button" data-review-new><span aria-hidden="true">+</span>New</button>'
-    content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review', action=new_button)
+    content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +snapshot.card_motion.attributes()+' '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
+        +page_frame.title('Review', 'review', action=new_button)
+        +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
+        +'<input type="search" id="list-search" placeholder="Filter by id or words"></div>'
+        +'<div class="review-queue">'
         +record_table.labelled_chip_row('Type', chips, chip_classes='review-types')
         +record_table.labelled_chip_row('State', shows, chip_classes='review-types review-shows', chip_id='list-show')
         +record_table.labelled_chip_row('Owner', owner_chips, chip_classes='review-types', chip_id='list-owner')
         +'<div class="list-filters">'
         +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
         +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
-        +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
         +'</div><p data-missing-item role="status" hidden></p><p role="status" data-review-notice hidden></p><p data-hidden-action-status role="status" hidden></p>'
         +'<ul data-review-source-notices'+('' if snapshot.notices else ' hidden')+'>'
         +''.join('<li>'+html.escape(notice)+'</li>' for notice in snapshot.notices)+'</ul>'
@@ -895,7 +898,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
         +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
-        +'</table><p data-empty hidden>No items in this view.</p></div></div>'
+        +'</table><p data-empty hidden>No items in this view.</p></div></div></div>'
         +new_item_dialog.render()+'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -1083,11 +1086,17 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 
 STYLE = '''<style>
+main:has(>[data-review]){max-width:1124px}
+[data-review]{display:grid;grid-template-columns:minmax(0,1fr) 300px;align-items:center;column-gap:16px}
+[data-review]>:is(.page-heading,.review-queue){grid-column:1/-1;min-width:0}
+[data-review]>:is(.page-status,.record-filter-words){margin:0}
+.review-queue{margin-top:12px}
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-new span{font-size:1.2em;line-height:1}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
 [data-review] .record-filter-row{margin-bottom:12px}
+[data-review] .list-filters:has(>[data-clear-linked-reviews][hidden]){display:none}
 .record-filter-row>.review-types{gap:8px}
 .review-types button{max-width:100%;overflow-wrap:anywhere}
 :is(.review-types button,[data-clear-linked-reviews],.review-new){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
@@ -1123,6 +1132,9 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-handoff>.staff-name{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
+@media(max-width:800px){[data-review]{grid-template-columns:minmax(0,1fr)}
+[data-review]>.record-filter-words{margin-top:8px}
+[data-review]>.record-filter-words input{width:100%}}
 @media(max-width:480px){[data-review] .record-filter-row{grid-template-columns:minmax(0,1fr)}}
 </style>'''
 
