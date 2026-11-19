@@ -12,7 +12,7 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import aws_target, hana_box, hana_provider, hana_render, hana_spend, ledger
+from scripts.aws_target import aws_target, hana_box, hana_placement, hana_provider, hana_render, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
 from scripts.lib import conf, process_start
@@ -238,14 +238,14 @@ class HanaBoxTests(CostFixture):
 
         self.ready()
         self.controller.bind_execution('execution-one')
-        self.assertFalse(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleaseRefused)
         reference = placement.ProviderClaimReference('ssh', 'fixture-target', RepositoryScope('hana', 'fixture-repository', 1),
             'execution-one', 'fixture-episode', 'fixture-attempt')
         settled = hana_execution.settle_unpublished_claim(self.state, reference,
             release_claim=lambda: self.controller.release('execution-one'), reason='The capture was refused')
         self.assertIsInstance(settled, hana_execution.HanaSettled)
         self.assertEqual(self.record()['claims'], [])
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
 
     def test_missing_or_corrupt_execution_journal_keeps_the_exact_claim_after_restart(self) -> None:
         from scripts.aws_target import hana_execution
@@ -253,10 +253,14 @@ class HanaBoxTests(CostFixture):
         self.ready()
         self.controller.bind_execution('execution-one')
         restarted = hana_box.HanaController(self.state, self.settings, self.workload_path, self.provider, clock=self.clock)
-        self.assertFalse(restarted.release('execution-one'))
         journal = hana_execution.execution_path(self.state, 'execution-one')
-        _ = journal.write_text('{')
-        self.assertFalse(restarted.release('execution-one'))
+        for state in ('missing', 'corrupt'):
+            with self.subTest(state=state):
+                if state == 'corrupt':
+                    _ = journal.write_text('{')
+                refusal = restarted.release('execution-one')
+                assert isinstance(refusal, hana_placement.HanaClaimReleaseRefused)
+                self.assertEqual(refusal.reason, 'The Hana command settlement is unconfirmed')
 
     def test_execution_bound_checks_lifecycle_under_the_controller_lock(self) -> None:
         def read_locked() -> hana_box.NoDeployment:
@@ -323,7 +327,7 @@ class HanaBoxTests(CostFixture):
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).start_timeout_seconds)
         self.assertEqual(self.controller.claim_status('execution-one'),
                          hana_box.ClaimRefused('The Hana start deadline expired'))
-        self.assertFalse(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleaseRefused)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
         self.assertEqual(len(ledger.rows(self.record(), 'claims')), 1)
 
@@ -552,7 +556,7 @@ class HanaBoxTests(CostFixture):
 
     def test_committed_incoming_claim_prevents_idle_stop(self) -> None:
         self.ready()
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
         _ = self.tick()
@@ -562,7 +566,7 @@ class HanaBoxTests(CostFixture):
 
     def test_idle_stop_intent_refuses_a_concurrent_new_claim(self) -> None:
         self.ready()
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
         received: list[hana_box.ClaimCommitted | hana_box.ClaimRefused | hana_box.HanaResourcesHeld] = []
@@ -601,7 +605,7 @@ class HanaBoxTests(CostFixture):
 
     def test_interruption_during_idle_stop_forbids_a_manual_restart(self) -> None:
         self.ready()
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
         self.assertEqual(self.record()['stop_cause'], hana_box.StopCause.IDLE.value)
