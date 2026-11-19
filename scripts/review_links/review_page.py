@@ -36,8 +36,8 @@ HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug'}
-INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.DONE, ReviewState.VALIDATING)
-SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('Done', 'Done'), ('all', 'All'))
+INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.VALIDATING)
+SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs'}
 LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
@@ -81,7 +81,7 @@ def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
 def filter_index(records: list[ReviewItem], members: staff.StaffSnapshot) -> list[ReviewIndexEntry]:
     """Build the index for the filters and columns."""
     names = staff_names.StaffNames(members)
-    return [card_entry(item, members, names) for item in records]
+    return [card_entry(item, members, names) for item in records if item.state != ReviewState.DONE]
 
 
 def index_json(entries: list[ReviewIndexEntry]) -> str:
@@ -302,7 +302,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     assets: dict[str, str] = {}
     submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
-    for item in review_items.read(root, members=members, sources=sources, assign_ids=False):
+    for item in review_items.read(root, members=members, show='active', sources=sources, assign_ids=False):
         path = review_items.source_path(item)
         with guard_source(path, sources, entry=item.id):
             item = review_items.normalize_times(item, zone)
@@ -372,18 +372,20 @@ class ReviewSnapshotCache:
     root: Path
     interval: float = 0.5
     start_worker: bool = True
+    initialize_on_start: bool = False
     _snapshot: ReviewSnapshot | SnapshotUnavailable = field(default_factory=SnapshotUnavailable,init=False)
     _condition: threading.Condition = field(default_factory=threading.Condition,init=False)
     _save_lock: threading.Lock = field(default_factory=threading.Lock,init=False)
     _wake: threading.Event = field(default_factory=threading.Event,init=False)
     _stop: threading.Event = field(default_factory=threading.Event,init=False)
     _busy: bool = field(default=False,init=False)
-    _initialize: bool = field(default=False,init=False)
+    _initialization_requested: bool = field(default=False,init=False)
     _generation: int = field(default=0,init=False)
     _thread: threading.Thread = field(init=False)
 
     def __post_init__(self) -> None:
-        if (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+        if not self.initialize_on_start and (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+            self._initialization_requested = True
             try:
                 self._snapshot = build_snapshot(self.root)
             except Exception as error:
@@ -393,13 +395,19 @@ class ReviewSnapshotCache:
             self.start()
 
     def start(self) -> None:
+        if self.initialize_on_start:
+            self._initialization_requested = True
+            self._wake.set()
         self._thread.start()
+
+    def _after_snapshot_update(self, _snapshot: ReviewSnapshot, /) -> None:
+        """Run background work after the worker publishes a snapshot."""
 
     def get(self) -> ReviewSnapshot:
         with self._condition:
             if isinstance(self._snapshot, SnapshotUnavailable) and self._thread.is_alive():
                 if not self._busy:
-                    self._initialize = True
+                    self._initialization_requested = True
                     self._wake.set()
                 _ = self._condition.wait_for(
                     lambda: not isinstance(self._snapshot, SnapshotUnavailable) or
@@ -411,6 +419,7 @@ class ReviewSnapshotCache:
 
     def invalidate(self) -> None:
         with self._condition:
+            self._initialization_requested = True
             self._generation += 1
             self._wake.set()
 
@@ -433,8 +442,7 @@ class ReviewSnapshotCache:
                     self.invalidate()
                 raise
             try:
-                updated = self.publish_record(current, key)
-                item = updated.records.get(key, ReviewRecordNotPublished())
+                updated, item = self.publish_record(current, key)
                 if (isinstance(item, ReviewItem) and isinstance(item.source, review_items.ChangeSource)
                         and fields['outcome'][0] in ('works', 'not works')):
                     answer = item.source.row.get('Verdict') or answer
@@ -445,14 +453,14 @@ class ReviewSnapshotCache:
             finally:
                 self.invalidate()
 
-    def publish_record(self, current: ReviewSnapshot, key: str) -> ReviewSnapshot:
+    def publish_record(self, current: ReviewSnapshot, key: str) -> tuple[ReviewSnapshot, ReviewItem | ReviewRecordNotPublished]:
         """Replace or remove one record while serving the previous version to readers."""
         members = staff.snapshot()
         try:
-            item = review_items.read_current(self.root, current.records[key], members)
-            return self.publish_item(current, key, item, members)
+            item: ReviewItem | ReviewRecordNotPublished = review_items.read_current(self.root, current.records[key], members)
         except (FileNotFoundError, review_items.ReviewRecordMissing):
-            return self.publish_item(current, key, ReviewRecordNotPublished(), members)
+            item = ReviewRecordNotPublished()
+        return self.publish_item(current, key, item, members), item
 
     def create_submission(self, request: new_item_dialog.NewItemRequest) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
@@ -500,9 +508,9 @@ class ReviewSnapshotCache:
             if isinstance(previous_origin, new_item_dialog.ReviewSubmission):
                 _ = submission_keys.pop(previous_origin.request_id, None)
         names = staff_names.StaffNames(members)
-        if isinstance(item, ReviewRecordNotPublished):
+        if isinstance(item, ReviewRecordNotPublished) or item.state == ReviewState.DONE:
             _ = records.pop(key, None)
-            entries = [entry for entry in current.entries if entry['key'] != key]
+            entries = [entry for entry in current.entries if entry['key'] not in (key, previous_key)]
             record_version = key
         else:
             item = review_items.normalize_times(item, current.zone)
@@ -557,25 +565,24 @@ class ReviewSnapshotCache:
                 unchanged = (isinstance(snapshot, ReviewSnapshot) and time.monotonic()-checked<30
                              and all(source_stamp(path)==stamp for path, stamp in snapshot.source_stamps.items()))
                 with self._condition:
-                    if (isinstance(snapshot, SnapshotUnavailable) and not self._initialize
-                            and not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists()):
-                        self._wake.clear()
+                    if isinstance(snapshot, SnapshotUnavailable) and not self._initialization_requested:
                         continue
                     if unchanged and not self._wake.is_set():
                         continue
-                    self._initialize = False
                     self._wake.clear()
                     self._busy = True
                 if not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
                     _ = change_page.console_folder(self.root)
                 fresh = build_snapshot(self.root)
                 with self._save_lock, self._condition:
-                    if self._snapshot is snapshot and self._generation == generation:
-                        self._snapshot = fresh
-                    else:
+                    if self._snapshot is not snapshot or self._generation != generation:
                         self._wake.set()
+                        continue
+                    self._snapshot = fresh
+                    self._condition.notify_all()
                 checked = time.monotonic()
                 last_failure = None
+                self._after_snapshot_update(fresh)
             except Exception as error:
                 failure = ' '.join(str(error).splitlines())
                 if failure != last_failure:
@@ -780,6 +787,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         raise review_items.ReviewRecordMissing('This item is no longer on the list.')
     def validate() -> ReviewItem:
         current = review_items.read_current(root, retained, staff.snapshot())
+        if current.state == ReviewState.DONE:
+            raise review_items.ReviewRecordChanged('This item is already Done.')
         assets: dict[str, str] = {}
         try:
             retain_asset(current, assets)
@@ -914,9 +923,9 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .list-log span{white-space:pre-wrap}
 .review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
 min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
-.review-actions [data-later-menu] [role=menuitem]:is(:hover,:focus){background:var(--accent);color:#fff;outline:none}
+.review-actions [data-later-menu] [role=menuitem]:focus{background:var(--accent);color:#fff;outline:none}
 [data-later-menu] small{font-size:12px;color:var(--ink-3)}
-[data-later-menu] [role=menuitem]:is(:hover,:focus) small{color:inherit;opacity:.85}
+[data-later-menu] [role=menuitem]:focus small{color:inherit;opacity:.85}
 [data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
 [data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
@@ -957,7 +966,7 @@ const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
 const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
-const kinds=['question','change','investigation','proposal','efficiency','bug'],states=['Open','Waiting','Done','Validating'];
+const kinds=['question','change','investigation','proposal','efficiency','bug'],states=['Open','Waiting','Validating'];
 let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
 let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated='';
@@ -974,12 +983,13 @@ function readIndex(payload){
 function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
+const entrySortValues=entry=>[entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
 const detailId=key=>'review-detail-'+encodeURIComponent(key);
 function summary(entry){
  const node=document.createElement('tbody'),panel=detailId(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
-  order:entry.order,updated:entry.updated,parked:'false'});
+  order:entry.order,updated:entry.updated,parked:'false',sortValues:JSON.stringify(entrySortValues(entry))});
  const limit=Number(content.dataset.titleLimit),first=entry.title.split(/\r?\n/)[0],short=first.slice(0,limit);
  const age=Math.max(0,Math.floor(Date.now()/1000-entry.filed));
  const stamp=age>=86400 ? Math.floor(age/86400)+' d' : age>=3600 ? Math.floor(age/3600)+' h' : Math.floor(age/60)+' min';
@@ -1013,6 +1023,7 @@ function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function matching(filters){return allEntries().filter(entry=>!pendingSaves.has(entry.key) && matches(entry,filters));}
 function savedEntry(key,result){
+ if(result.state==='Done'){index.delete(key);return;}
  const entry=index.get(key);if(!entry) return;
  entry.state=result.state;entry.hiddenUntil=result.later;
 }
@@ -1050,17 +1061,13 @@ const view=createRecordTable({content:()=>content,single:true,
  },
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
  hasKey:key=>allEntries().some(entry=>entry.key===key),
- shows:['open','Validating','Done','all'],
+  shows:['open','Validating','all'],
  visible:(data,filters)=>{
   const key=data.key,entry=index.get(key),departure=saved.get(key);
   if(!entry || pendingSaves.get(key)?.departing) return false;
-  const reopened=departure?.closes && view.linkedItem===key && view.opened.has(key);
-  return (!departure || entry.state==='Validating' && entry.type==='change' || reopened) && matches(entry,filters);
+  return (!departure || entry.handoff) && matches(entry,filters);
  },
- sortValues:data=>{
-  const entry=index.get(data.key);
-  return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
- },
+ sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
  applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
   selectedShow=show;content.dataset.show=show;loadBodies();
   const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));
@@ -1144,9 +1151,6 @@ function loadBodies(){
    const current=mountedRow(key);
    if(!current || current.dataset.bodyLoaded) return;
    current.dataset.bodyLoaded='true';current.querySelector('[data-detail]>td').innerHTML=text;
-   const departure=saved.get(key);
-   if(departure?.closes && departure.awaitingSnapshot)
-    current.querySelector('[data-review-form]')?.remove();
    const panel=current.querySelector('.review-panel');if(panel) updateTitleFallback(panel);
    bindForm(current);restoreFocus(key);view.drawWindow();
   };
@@ -1234,7 +1238,7 @@ function bindForm(row){
     const marker={updated:row.dataset.updated,previousState:row.dataset.state,
      handed,state:result.state ?? (handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
-     question:data.get('outcome')==='question',
+     question:outcome==='question',
      closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true};
     const applySaved=()=>{
      saved.set(key,marker);savedEntry(key,marker);
