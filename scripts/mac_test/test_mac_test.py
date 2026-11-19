@@ -1262,6 +1262,7 @@ finally:
         return sorted(path.name for path in claims.iterdir()) if claims.exists() else []
 
     def test_two_repositories_claim_the_mac_at_once(self) -> None:
+        self.write_config(max_active_builds="2")
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         first, second = self.start_child(), self.start_child()
         self.assert_command(self.claim_in(first.pid, "hana tests", hana), 0, "claimed\n")
@@ -1714,6 +1715,7 @@ for arguments in (
         self.assertEqual(self.logged_arguments("send-delivered"), [])
 
     def test_pending_block_waits_on_other_or_unrecorded_claim_beside_own_claim(self) -> None:
+        self.write_config(max_active_builds="2")
         own_repository = self.repository("alpha")
         other_repository = self.repository("beta")
         owner = self.start_child()

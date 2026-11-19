@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coordinate build-step use of the Mac: one claim per repository, and the Mac block."""
+"""Coordinate Mac build capacity, repository claims, and the Mac block."""
 
 from __future__ import annotations
 try:
@@ -8,7 +8,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -109,7 +109,7 @@ class ClaimFinished:
 
 @dataclass(frozen=True)
 class ClaimBusy:
-    """A claim attempt refused by a live claim whose scope overlaps."""
+    """A claim attempt that must wait for another claim to release capacity."""
 
     holder: RunRecord
 
@@ -669,6 +669,37 @@ def copy_gives_way(run: RunRecord) -> bool:
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
     return run.get("copy") is True and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
+
+
+@dataclass(frozen=True)
+class MacBuildCapacity:
+    """The host limit and its active claims, including claims kept for cleanup."""
+
+    limit: int
+    claims: tuple[HeldClaim, ...]
+
+    def at_limit(self, *, unclaimed_grants: int = 0, yielding_claims: int = 0) -> bool:
+        return len(self.claims) + unclaimed_grants - yielding_claims >= self.limit
+
+    def blocks_placement(self, scope: ClaimScope, *, copy: bool, uses_claim: bool,
+                         grants: Iterable[placement.PlacementAssignment]) -> bool:
+        """Apply the limit and permit cleanup takeover or an overlapping copy to yield."""
+        claimed_attempts = {(claim.record["episode"], claim.record["attempt"]) for claim in self.claims}
+        unclaimed = tuple(grant for grant in grants if (grant.episode, grant.attempt) not in claimed_attempts)
+        if any(scopes_overlap(grant.destination.scope, scope) for grant in unclaimed):
+            return True
+        if not uses_claim:
+            return self.at_limit(unclaimed_grants=len(unclaimed))
+        overlapping = tuple(claim for claim in self.claims if scopes_overlap(claim.scope, scope))
+        if any(run_is_kept(claim.record) for claim in overlapping):
+            # A takeover allows cleanup under the original claim.
+            return False
+        yielding = sum(not copy and copy_gives_way(claim.record) for claim in overlapping)
+        return self.at_limit(unclaimed_grants=len(unclaimed), yielding_claims=yielding)
+
+
+def mac_build_capacity(configuration: conf.ConfigRead, claims: tuple[HeldClaim, ...]) -> MacBuildCapacity:
+    return MacBuildCapacity(configuration.value("max_active_builds", conf.positive_whole), claims)
 
 
 def claim_scope(worktree: str) -> ClaimScope:
@@ -1891,6 +1922,14 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
+    if paths.platform == "macos":
+        try:
+            capacity = mac_build_capacity(conf.read("mac_test"), claims)
+        except (OSError, ValueError) as error:
+            print(f"state unreadable: {error}")
+            return ClaimFinished(12)
+        if capacity.at_limit():
+            return ClaimBusy(claims[0].record)
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)

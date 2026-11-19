@@ -115,7 +115,7 @@ class RepositorySlotTests(unittest.TestCase):
         for name in ("mac", "linux"):
             _ = write_config_fixture(self.root / f"{name}.conf", f"host=fake-{name}\n" + settings,
                                      template="mac_test")
-        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\nmirror_root=~/.local/state/mac-test/test-mirror\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\nmirror_root=~/.local/state/mac-test/test-mirror\nmax_active_builds=1\n")
         registry = self.root / "build_targets.conf"
         _ = registry.write_text(
             "targets=mac,linux,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
@@ -239,8 +239,38 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual([identity.name for identity in known], ["hana", "phase-copy", "hana"])
         self.assertIsInstance(identities[0], eligibility.KnownRepository)
         self.assertEqual(cast(eligibility.KnownRepository, identities[0]).name, "hana")
+        _ = write_config_fixture(self.root / "mac_test.conf", "max_active_builds=2\n")
         self.assertEqual(self.claim("mac", main, 101)[0], 0)
         self.assertEqual(self.claim("mac", clone, 102)[0], 0)
+
+    def test_mac_limit_one_starts_other_repository_after_release(self) -> None:
+        hana = self.repository("hana", "https://github.com/nate/hana.git")
+        liner = self.repository("cargo-liner", "https://github.com/nate/cargo-liner.git")
+
+        self.assertEqual(self.claim("mac", hana, 101)[0], 0)
+        status, output = self.claim("mac", liner, 102)
+        self.assertEqual(status, 11)
+        self.assertIn("busy: check hana since", output)
+        self.assertEqual(set(self.claims("mac")), {101})
+
+        self.release("mac", 101)
+        self.assertEqual(self.claim("mac", liner, 102)[0], 0)
+        self.assertEqual(set(self.claims("mac")), {102})
+
+    def test_mac_limit_counts_a_retained_claim_until_release(self) -> None:
+        hana = self.repository("hana", "https://github.com/nate/hana.git")
+        liner = self.repository("cargo-liner", "https://github.com/nate/cargo-liner.git")
+
+        self.assertEqual(self.claim("mac", hana, 101, remote=True)[0], 0)
+        self.dead.add(101)
+        status, output = self.claim("mac", liner, 102)
+        self.assertEqual(status, 11)
+        self.assertIn("busy: leftovers of check hana", output)
+        self.assertEqual(set(self.claims("mac")), {101})
+
+        self.release("mac", 101)
+        self.assertEqual(self.claim("mac", liner, 102)[0], 0)
+        self.assertEqual(set(self.claims("mac")), {102})
 
     def test_linux_clones_with_different_names_share_origin_capacity(self) -> None:
         main = self.repository("project", "git@github.com:nate/project.git")

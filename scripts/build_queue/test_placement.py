@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -532,6 +532,82 @@ class CargoFolderTests(unittest.TestCase):
                     self.assertEqual(snapshot.get("cargo_folder"), tagged)
                     self.assertEqual(codec.parse_snapshot_value(snapshot, placement.PlacementConstraints), decoded.constraints)
                     self.assertEqual(wire.parse_request(wire.encode_request(decoded)), decoded)
+
+
+class MacBuildLimitTests(unittest.TestCase):
+    @contextmanager
+    def mac_fixture(self, limit: int) -> Generator[tuple[PlacementFixture, mac_test.StatePaths]]:
+        with PlacementFixture() as fixture:
+            paths = mac_test.StatePaths(fixture.root / "mac-state")
+            with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(paths.directory)}):
+                _ = write_config_fixture(fixture.root / "mac_test.conf", f"max_active_builds={limit}\n")
+                yield fixture, paths
+
+    def request(self, fixture: PlacementFixture, repository: str, *,
+                kind: placement.CommandKind = "test") -> wire.PlacementRequest:
+        request = placement_request(fixture)
+        candidate, = request.constraints.candidates
+        destination = replace(candidate.destination, scope=RepositoryScope(repository))
+        request = replace(request, constraints=replace(request.constraints, selection=placement.MacOnlyHost(),
+            repository=str(fixture.root / repository), command_kind=kind,
+            candidates=(replace(candidate, destination=destination),)))
+        _ = publish_candidate(fixture, request)
+        return request
+
+    def assert_mac_busy(self, fixture: PlacementFixture, request: wire.PlacementRequest) -> None:
+        reply, = fixture.connect(request).replies()
+        self.assertIsInstance(reply, wire.PlacementWait)
+        assert isinstance(reply, wire.PlacementWait)
+        self.assertEqual(reply.wait, wire.PlacementResourceWait("mac", "busy"))
+
+    def claim(self, assignment: placement.PlacementAssignment, paths: mac_test.StatePaths, *, remote: bool = False
+              ) -> mac_test.CliArguments:
+        args = mac_test.CliArguments()
+        args.target = "mac"
+        args.pid = assignment.owner.pid
+        args.what = "nextest hana"
+        if remote:
+            args.remote = assignment.destination.host
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 0)
+        return args
+
+    def test_mac_limit_counts_grants_before_and_after_claim(self) -> None:
+        for limit in (1, 2):
+            with self.subTest(limit=limit), self.mac_fixture(limit) as (fixture, paths):
+                first = self.request(fixture, "hana")
+                second = self.request(fixture, "cargo-liner")
+                assignment = assignment_for(fixture, first)
+                if limit == 1:
+                    self.assert_mac_busy(fixture, second)
+                    waiting = second
+                else:
+                    claim = self.claim(assignment, paths)
+                    _ = assignment_for(fixture, second)
+                    waiting = self.request(fixture, "bevy_brp")
+                    self.assert_mac_busy(fixture, waiting)
+                    self.assertEqual(mac_test.command_release(claim, paths), 0)
+                reply, = fixture.connect(wire.CancelPlacement(
+                    "done", first.episode, first.owner, "the step ended")).replies()
+                self.assertIsInstance(reply, wire.Ok)
+                self.assertEqual(assignment_for(fixture, waiting).episode, waiting.episode)
+
+    def test_mac_limit_counts_a_retained_claim_until_settlement(self) -> None:
+        cases: tuple[tuple[placement.CommandKind, str], ...] = (("test", "cargo-liner"), ("run", "hana"))
+        for kind, repository in cases:
+            with self.subTest(kind=kind), self.mac_fixture(1) as (fixture, paths):
+                first = self.request(fixture, "hana")
+                second = self.request(fixture, repository, kind=kind)
+                assignment = placement.PlacementAssignment(first.episode, "lost", first.constraints.candidates[0].destination,
+                    first.constraints.source_key, first.owner, first.constraints.session, first.since)
+                args = self.claim(assignment, paths, remote=True)
+                fixture.end_owner(wire.Owner(first.owner.pid, first.owner.start_time))
+                retained, = mac_test.read_claims(paths)
+                self.assertTrue(mac_test.run_is_kept(retained.record))
+                self.assert_mac_busy(fixture, second)
+
+                self.assertEqual(mac_test.command_release(args, paths), 0)
+                self.assertEqual(assignment_for(fixture, second).episode, second.episode)
 
 
 class PlacementTests(unittest.TestCase):

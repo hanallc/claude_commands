@@ -2,7 +2,30 @@
 
 ## What it is
 
-`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `/build:page` prints the shared build page link. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
+`verify.sh test` tries the first free eligible build target.
+The Mac is first in the default order.
+A Mac pass or failure ends the call.
+Verify waits when every eligible target is held or full.
+A Mac block admits claims from the holder session.
+It refuses new claims from other sessions across all repositories.
+It turns off Hana's CI use of the Mac.
+It lists skipped macOS runs on release.
+It sends the holder one message when existing work ends.
+Expiry attempts to remove the block.
+A failed CI restore keeps the block active.
+The claim watcher releases a claim after 15 minutes without Mac work.
+It sends the holder a message.
+An offloaded run removes its mirror's build output after the run if disk space is below the floor.
+`/build:page` prints the shared build page link.
+The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
+
+`max_active_builds` in `config/mac_test.conf` sets the Mac host limit to one build.
+Each repository also has one claim for its mirror.
+Placement counts outstanding grants and active claims across repositories.
+A grant and its claim count once.
+Claim acquisition checks the same limit under the provider lock.
+Retained claims count until settlement.
+A full Mac uses the existing busy route.
 
 Converted verify steps execute only at the destination assigned by the queue.
 The queue preserves configured target order.
@@ -63,7 +86,8 @@ A PID alone cannot release another attempt.
 - `free-now --settings FILE [--repo-root DIR]` reads local records without a lock or remote command.
   It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
   It exits 0 only for `free`.
-  A live claim blocks only its repository.
+  This preview checks live claims for the requested repository.
+  Placement checks the Mac host limit.
   A kept claim, whose holder process is gone, does not answer `busy`: the next claim takes it over and cleans its leftovers.
   A live mirror refusal time also answers `busy` for that repository.
   A failed target probe blocks every repository.

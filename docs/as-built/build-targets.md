@@ -5,7 +5,7 @@
 Each build target has its own platform, capacity, hold, and admission rules.
 natedev uses the local memory gate, Cargo token, and build-folder limits.
 SSH targets use their configured runner and claims.
-The Mac admits one job per repository, so different repositories can run together.
+The Mac uses a host limit across repositories and permits one claim per repository.
 `verify.sh` selects targets through `step_routing_rule` and the configured target order.
 A held target admits only work that its hold rules permit.
 [Mac step offload](mac-test-offload.md) describes remote execution and claims.
