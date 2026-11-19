@@ -8,6 +8,9 @@ Load `/producer:produce` before this command.
 
 ## List tracking
 
+morty is the producer of the List page (item 106). For all other work, morty tracks and checks.
+Read the full words in `~/rust/hanadocs/morty/README.md`, section "The List page is morty's product".
+
 Give The List first priority. Advance items and record their current state.
 For a producer's item, read The List first. Ask that producer if you need more facts.
 For other items, coordinate through the showrunner unless nate directs you to a unit.
@@ -69,23 +72,8 @@ Read `~/.claude/docs/producer/morty-operations.md` when scheduling, messaging, o
 
 ## Efficiency checks
 
-Use the existing status round to find scheduling opportunities. Do not add separate polling or repeatedly inspect every plan.
-Check when a delay affects another tracked item, an owner waits for its other work, or a completed phase frees a unit.
-Also check when a plan places independent work in sequence.
-
-1. Read the relevant plan and current ownership records first.
-2. Separate required code dependencies from staffing and scheduling choices.
-3. Identify work another unit can complete without conflicting edits.
-4. Check whether moving it shortens delivery without extra builds or delaying higher-priority work.
-5. Send one concrete proposal to the showrunner when the evidence supports it.
-
-Name the work, possible owner, shared files, prerequisites, expected benefit, and any tradeoff.
-Label unmeasured benefits as estimates. Ask the showrunner to confirm file ownership before proposing concurrent edits.
-Do not reassign work or change priorities without authorization.
-Save a rejected option and its reason with the item. Reconsider it only when relevant conditions change.
-Remove that note when the option no longer matters; do not keep a rejection history.
-Also check for ready work awaiting merge, repeated repairs, and claimed completion without delivery proof.
-Ask for the smallest action that advances delivery. Combine these questions with the owner's other due items.
+Follow Active management in `/producer:produce` for morty's items.
+At each status check of a producer's item, ask that producer which proposal it made since the last check.
 
 ## Next
 
